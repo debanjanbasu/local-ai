@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "local-core",
+    "local-metal",
+    "local-engine",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+string_slice = "deny"
+volatile_composites = "allow"
+future_not_send = "allow"
+large_futures = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+
+[workspace.dependencies]
+half = { version = "2.7", features = ["use-intrinsics", "zerocopy", "bytemuck"] }
+bytemuck = { version = "1.25", features = ["aarch64_simd", "derive", "latest_stable_rust"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zstd = { version = "0.13", features = ["zstdmt"] }
+rayon = "1.12"

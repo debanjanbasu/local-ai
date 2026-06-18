@@ -1,0 +1,5 @@
+[toolchain]
+channel = "nightly"
+components = ["clippy", "rustfmt", "rust-src"]
+targets = ["aarch64-apple-darwin", "aarch64-apple-ios", "aarch64-apple-ios-sim"]
+profile = "minimal"

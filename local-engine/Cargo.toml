@@ -1,0 +1,57 @@
+[package]
+name = "local-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+local-core = { path = "../local-core" }
+local-metal = { path = "../local-metal" }
+half.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLBuffer"] }
+zstd.workspace = true
+rayon.workspace = true
+tokenizers.workspace = true
+tempfile = "3"
+fastrand = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rustfft = "6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+axum = { version = "0.8", features = ["http2"] }
+tower-http = { version = "0.6", features = [
+    "compression-br",
+    "compression-zstd",
+    "compression-gzip",
+    "compression-deflate",
+] }
+brotli = "8"
+base64 = "0.22"
+tokio-stream = "0.1"
+# HTTP/3 (QUIC) transport. `ring` crypto avoids the aws-lc-rs C/cmake build dep.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rcgen = "0.14"
+bytes = "1"
+http = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+ahash = "0.8"
+
+[[bench]]
+name = "forward_bench"
+harness = false
+
+[[bin]]
+name = "local-ai"
+path = "src/bin/local-ai.rs"

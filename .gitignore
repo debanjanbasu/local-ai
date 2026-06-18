@@ -1,0 +1,30 @@
+# Build artifacts
+*.air
+*.metallib
+/target/
+
+# Models
+/models/
+imatrix-e2b.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python virtual environment
+.venv/
+
+# Editor files
+*.swp
+*.swo
+*~
+*.bak
+
+# Python build artifacts
+*.so
+__pycache__/
+*.pyc
+python-kolibri/
+
+# graphify knowledge graph (generated, rebuilt on commit via git hook)
+graphify-out/

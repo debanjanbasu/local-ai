@@ -1,0 +1,30 @@
+[build]
+rustflags = [
+    "--cfg", "tokio_unstable",
+    "-Zthreads=32",
+    "-Zlocation-detail=none",
+    "-Zfmt-debug=none",
+    "-Zmerge-functions=aliases",
+]
+
+[unstable]
+build-std = ["std", "panic_abort", "core", "alloc"]
+profile-rustflags = true
+
+[profile.release]
+rustflags = []
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=apple-m4",
+    "-C", "target-feature=+neon,+fp16,+bf16,+dotprod,+i8mm,+sha3",
+    "-Z", "tune-cpu=apple-m4",
+]
+
+# Device floor: iPhone SE 3rd gen (A15). `target-cpu=apple-a15` implies
+# exactly the features that chip has — explicit newer features (bf16/i8mm
+# from A16+) would emit instructions the SE 3 cannot execute.
+[target.aarch64-apple-ios]
+rustflags = [
+    "-C", "target-cpu=apple-a15",
+]
