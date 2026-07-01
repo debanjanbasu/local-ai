@@ -164,8 +164,8 @@ pub fn dequant_into(
         GGUFType::BF16 => {
             out.clear();
             out.reserve(num_elements);
-            for chunk in data.chunks_exact(2).take(num_elements) {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            for chunk in data.as_chunks::<2>().0.iter().take(num_elements) {
+                let bits = u16::from_le_bytes(*chunk);
                 out.push(half::f16::from_f32(half::bf16::from_bits(bits).to_f32()));
             }
             Ok(())

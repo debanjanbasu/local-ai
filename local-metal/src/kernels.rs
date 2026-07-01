@@ -10200,7 +10200,14 @@ mod tests {
             let mut batch = crate::batch::CommandBatch::new(&ctx).expect("batch");
             kernels
                 .hadamard_rotate_into(
-                    &mut batch, &q_f32, &signs_buf, &rq_all, head_dim as u32, vecs, true, false,
+                    &mut batch,
+                    &q_f32,
+                    &signs_buf,
+                    &rq_all,
+                    head_dim as u32,
+                    vecs,
+                    true,
+                    false,
                 )
                 .expect("rotate all");
             kernels
@@ -10360,7 +10367,14 @@ mod tests {
             let mut batch = crate::batch::CommandBatch::new(&ctx).expect("batch");
             kernels
                 .hadamard_rotate_into(
-                    &mut batch, &q_f32, &signs_buf, &rq_all, head_dim as u32, vecs, true, false,
+                    &mut batch,
+                    &q_f32,
+                    &signs_buf,
+                    &rq_all,
+                    head_dim as u32,
+                    vecs,
+                    true,
+                    false,
                 )
                 .expect("rotate all");
             batch.commit_and_wait().expect("commit");

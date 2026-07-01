@@ -686,7 +686,16 @@ impl QuantizedKvCache {
             )?;
         }
         // Inverse-rotate each row's accumulation back to model space → f16.
-        kernels.hadamard_rotate_fh_into(batch, vacc, &self.signs, attn_out, hd, vecs, false, true)?;
+        kernels.hadamard_rotate_fh_into(
+            batch,
+            vacc,
+            &self.signs,
+            attn_out,
+            hd,
+            vecs,
+            false,
+            true,
+        )?;
         Ok(())
     }
 }

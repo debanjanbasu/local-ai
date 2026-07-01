@@ -218,8 +218,10 @@ fn encode_chw_soft_tokens(
 
     let flat = projected.as_slice::<f16>();
     Ok(flat
-        .chunks_exact(TEXT_HIDDEN)
-        .map(<[f16]>::to_vec)
+        .as_chunks::<TEXT_HIDDEN>()
+        .0
+        .iter()
+        .map(|c| c.to_vec())
         .collect())
 }
 

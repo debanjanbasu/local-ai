@@ -401,15 +401,7 @@ impl TransformerLayer {
                 kernels.qk_norm_gpu_into(batch, &scratch.k, kn, hd, n_kv, eps)?;
             }
             // V is RMS-normalized with no weight (ones) per Gemma 4.
-            kernels.rms_norm_into(
-                batch,
-                &scratch.v,
-                &scratch.ones,
-                &scratch.v,
-                hd,
-                n_kv,
-                eps,
-            )?;
+            kernels.rms_norm_into(batch, &scratch.v, &scratch.ones, &scratch.v, hd, n_kv, eps)?;
             kernels.rope_into(
                 batch,
                 &scratch.k,
