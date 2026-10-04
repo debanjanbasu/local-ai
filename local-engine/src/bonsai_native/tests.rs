@@ -128,7 +128,7 @@ fn kv_growth_reproduces_full_allocation_bitwise_across_prefill_decode_and_specul
         model.reset();
         let mut logits = Vec::new();
         let mut allocations = Vec::new();
-        model.prefill(&prompt).expect("prefill");
+        model.prefill(&prompt, &mut |_| {}).expect("prefill");
         logits.push(model.scratch.logits.as_slice::<f32>().to_vec());
         allocations.push(model.kv_allocated());
         for &step in &steps {
@@ -621,7 +621,9 @@ fn chunked_prefill_ingests_output_normalized_rows_for_every_chunk() {
     // Production path: chunked prefill with fused head ingestion.
     model.reset();
     poison_head(model.speculation.as_mut().expect("speculation"));
-    model.prefill(&prompt).expect("chunked prefill");
+    model
+        .prefill(&prompt, &mut |_| {})
+        .expect("chunked prefill");
     assert_eq!(model.position, prompt.len());
     let fused = snapshot(&mut model);
     assert!(
@@ -778,7 +780,7 @@ fn dump_full_attention_kv_caches() {
         KvOptions::default(),
     )
     .expect("load");
-    model.prefill(&prompt).expect("prefill");
+    model.prefill(&prompt, &mut |_| {}).expect("prefill");
     std::fs::create_dir_all(&dir).expect("dump dir");
     let bytes = prompt.len() * KV_TOKEN_BYTES;
     let mut dumped = 0usize;

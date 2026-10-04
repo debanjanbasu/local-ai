@@ -18,6 +18,25 @@ pub const DEFAULT_MIN_P: f32 = 0.0;
 /// one megabyte even in the worst case.
 pub const EVENT_BUFFER: usize = 64;
 
+/// One prefill-chunk boundary: the engine is about to submit this many tokens.
+///
+/// Prefill is the only phase of a generation that emits nothing per token. The
+/// chunk is one forward pass over up to `PREFILL_CHUNK` tokens, so a prompt
+/// longer than one chunk is silent for the whole of that pass — about 35 s per
+/// 128 tokens on this M2, or roughly 14 minutes for a 3000-token prompt. A
+/// consumer that watches only for generated text cannot tell a working engine
+/// from an abandoned socket during it, so each boundary is reported instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefillProgress {
+    /// Prompt tokens committed before this chunk was submitted. Tokens restored
+    /// from the prompt cache are counted, because they are already in the K/V
+    /// cache this chunk continues from.
+    pub tokens: usize,
+    /// Chunks this request has entered, counting the one in flight, so the first
+    /// is 1 rather than 0.
+    pub chunks: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerateParams {
     pub temperature: f32,

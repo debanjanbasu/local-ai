@@ -18,6 +18,7 @@ use local_engine::{Engine, EngineHandle};
 
 use crate::resources::Resources;
 
+mod chunked;
 mod http3;
 mod options;
 mod request;
@@ -27,18 +28,17 @@ mod sse;
 #[cfg(test)]
 use self::request::message_text;
 #[cfg(test)]
-use self::response::wants_zstd;
-#[cfg(test)]
 use axum::http::HeaderMap;
 #[cfg(test)]
 use local_engine::Event;
 
+use self::chunked::start_chunked;
 use self::http3::serve_h3;
 use self::options::{parse, usage};
 use self::request::{GenerationRequest, prepare_generation};
 use self::response::{
-    add_alt_svc, collect_response, error_response, error_status, error_status_message,
-    json_response, queue_full_response,
+    add_alt_svc, error_response, error_status, error_status_message, json_response,
+    queue_full_response, wants_zstd,
 };
 use self::sse::start_stream;
 
@@ -234,23 +234,31 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             }
         }
     } else {
+        // The body streams as the generation produces it, so the first byte is on
+        // the wire while prefill is still running and a client that has gone away
+        // fails a write instead of being waited out. `zstd` is decided from the
+        // request here and reported back from the body, because the response may
+        // only claim an encoding it is really using.
         let model = Arc::clone(&state.model);
-        let stall = state.stall;
-        match tokio::task::spawn_blocking(move || collect_response(events, chat, &model, stall))
-            .await
-        {
-            Ok(Ok(value)) => json_response(StatusCode::OK, value, &state, &parts.headers).await,
-            Ok(Err(error)) => {
-                error_response(error_status_message(&error), &error, &state, &parts.headers).await
+        let zstd = wants_zstd(&parts.headers);
+        match start_chunked(events, chat, model, admitted, state.stall, zstd).await {
+            Ok((frames, compressed)) => {
+                let mut response = Response::new(Body::from_stream(ReceiverStream::new(frames)));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("application/json"),
+                );
+                if compressed {
+                    response.headers_mut().insert(
+                        header::CONTENT_ENCODING,
+                        header::HeaderValue::from_static("zstd"),
+                    );
+                }
+                add_alt_svc(&mut response, &state);
+                response
             }
             Err(error) => {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("generation task failed: {error}"),
-                    &state,
-                    &parts.headers,
-                )
-                .await
+                error_response(error_status_message(&error), &error, &state, &parts.headers).await
             }
         }
     }

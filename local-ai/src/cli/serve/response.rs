@@ -1,5 +1,4 @@
 use std::io::Cursor;
-use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -8,7 +7,6 @@ use axum::response::Response;
 use serde_json::{Value, json};
 
 use local_engine::resources::SERVE_QUEUE;
-use local_engine::{Event, EventStream, Stats};
 
 use super::AppState;
 
@@ -48,7 +46,7 @@ use super::AppState;
 /// bytes, so every stock client — `curl`, `httpx`, `requests`, `undici` — would
 /// break. The frame header does carry a `Dictionary_ID`, but there is no HTTP
 /// mechanism to deliver the dictionary it points at.
-const ZSTD_LEVEL: i32 = 22;
+pub(super) const ZSTD_LEVEL: i32 = 22;
 
 /// Served with the 503 so a rejected client can retry instead of guessing.
 const RETRY_AFTER_SECONDS: u32 = 1;
@@ -56,98 +54,37 @@ const RETRY_AFTER_SECONDS: u32 = 1;
 const JSON_ENCODE_FAILED: &[u8] =
     b"{\"error\":{\"message\":\"JSON encoding failed\",\"type\":\"server_error\"}}";
 
-/// How long the collector may wait for the next event.
+/// How long the collector may wait for the next item of a response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EventWait {
-    /// No deadline at all, used for the first event.
+    /// No deadline at all, used until the engine has produced an event.
     Unbounded,
     /// The stall budget, used once the engine has shown it is producing.
     Bounded(Duration),
 }
 
-/// The wait to give the next event of a non-streaming collection.
+/// The wait to give the next item of a non-streaming response.
 ///
-/// The first event is deliberately unbounded, and the stall budget starts only
-/// once it has arrived. Nothing is emitted during prefill, `PREFILL_CHUNK` is
-/// 128 and this M2 prefills at 3.6-4.2 tok/s, so one prefill chunk is about
-/// 35 s of complete silence, and a prompt over 128 tokens is ordinary. A stall
-/// means the engine was producing and the client stopped consuming, which is
-/// only knowable after the first event; a slow first token is the model
-/// working. Putting a deadline on the first wait would cancel long prefills
-/// that were never stalled, so `Unbounded` is a separate outcome here rather
-/// than a large timeout that would quietly become one.
+/// The first *event* is deliberately unbounded, and the stall budget starts only
+/// once one has arrived. A prefill boundary does not count as one, which is the
+/// whole reason this is a named rule and not a flag someone can flip: nothing is
+/// emitted per token during prefill, `PREFILL_CHUNK` is 128 and this M2 prefills
+/// at 3.6-4.2 tok/s, so one chunk is about 35 s of working, and the
+/// `--stall-timeout` floor is 10 s. A boundary therefore says the engine is alive
+/// and is written to the client, but it does not start a clock, because arming
+/// that clock on it would cancel every prompt longer than one chunk.
+///
+/// A stall means the engine was producing and the client stopped consuming, which
+/// is only knowable after an event; a slow first token is the model working.
+/// Putting a deadline on the wait for the first of those would cancel long
+/// prefills that were never stalled, so `Unbounded` is a separate outcome here
+/// rather than a large timeout that would quietly become one.
 pub(super) const fn event_wait(first_seen: bool, stall: Duration) -> EventWait {
     if first_seen {
         EventWait::Bounded(stall)
     } else {
         EventWait::Unbounded
     }
-}
-
-/// Collect a whole response, bounding the wait for each event after the first.
-///
-/// This path cannot see a client disconnect: the body is buffered here and
-/// written once at the end, so the engine is never backpressured and it keeps
-/// generating for a socket nobody is reading. What it can bound is a
-/// generation that has stopped producing, which is the same engine-side
-/// silence the streaming path treats as a stall.
-pub(super) fn collect_response(
-    mut events: EventStream,
-    chat: bool,
-    model: &str,
-    stall: Duration,
-) -> Result<Value, String> {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut stats = None;
-    let mut first_seen = false;
-    loop {
-        let event = match event_wait(first_seen, stall) {
-            EventWait::Unbounded => events.next(),
-            EventWait::Bounded(budget) => match events.next_timeout(budget) {
-                Ok(event) => event,
-                Err(RecvTimeoutError::Timeout) => {
-                    // Dropping `events` cancels too, but setting the handle
-                    // first stops the engine without waiting for the unwind.
-                    events.cancel_handle().cancel();
-                    eprintln!(
-                        "dropping request: no event for {}s after the first token, so the \
-                         generation is cancelled and the queue slot released",
-                        budget.as_secs()
-                    );
-                    return Err(format!(
-                        "generation stalled: no event for {}s after the first token, so it \
-                         was cancelled",
-                        budget.as_secs()
-                    ));
-                }
-                Err(RecvTimeoutError::Disconnected) => None,
-            },
-        };
-        let Some(event) = event else {
-            break;
-        };
-        first_seen = true;
-        match event {
-            Event::Content(piece) => content.push_str(&piece),
-            Event::Reasoning(piece) => reasoning.push_str(&piece),
-            Event::Finished(value) => stats = Some(*value),
-            Event::Error(error) => return Err(error),
-            Event::TokenIds(_) => {}
-        }
-    }
-    let stats = stats.ok_or_else(|| "engine worker stopped".to_owned())?;
-    let choice = if chat {
-        json!({"index":0,"message":{"role":"assistant","content":content,"reasoning_content":reasoning},"finish_reason":finish_reason(stats.stop_reason)})
-    } else {
-        json!({"index":0,"text":content,"finish_reason":finish_reason(stats.stop_reason)})
-    };
-    Ok(response_json(&choice, chat, model, &stats))
-}
-
-fn response_json(choice: &Value, chat: bool, model: &str, stats: &Stats) -> Value {
-    let generation = &stats.generation;
-    json!({"id":"local","object":if chat {"chat.completion"} else {"text_completion"},"model":model,"choices":[choice],"usage":{"prompt_tokens":generation.prompt_tokens,"prompt_tokens_details":{"cached_tokens":generation.reused_prompt_tokens,"cache_source":stats.cache_source},"completion_tokens":generation.generated_tokens,"total_tokens":generation.prompt_tokens+generation.generated_tokens},"timings":{"prefill_seconds":generation.prefill.as_secs_f64(),"first_token_seconds":generation.first_token.map(|duration| duration.as_secs_f64()),"elapsed_seconds":generation.elapsed.as_secs_f64()},"speculation":{"mtp":{"rounds":generation.mtp.rounds,"proposed_tokens":generation.mtp.proposed_tokens,"accepted_tokens":generation.mtp.accepted_tokens},"lookup":{"rounds":generation.ngram.rounds,"proposed_tokens":generation.ngram.proposed_tokens,"accepted_tokens":generation.ngram.accepted_tokens,"cpu_seconds":generation.ngram.lookup.as_secs_f64()}}})
 }
 
 /// Encode and optionally compress a JSON body off the runtime.

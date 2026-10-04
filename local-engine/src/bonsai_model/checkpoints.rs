@@ -1,6 +1,6 @@
 use super::{
-    BonsaiEngine, DiskEntry, HostPromptSnapshot, PromptCacheSource, PromptCheckpoint,
-    PromptSnapshot, prompt_cache,
+    BonsaiEngine, DiskEntry, HostPromptSnapshot, PrefillProgress, PromptCacheSource,
+    PromptCheckpoint, PromptSnapshot, prompt_cache,
 };
 const MAX_HOST_PROMPT_SNAPSHOTS: usize = 16;
 pub(super) struct SessionSnapshot {
@@ -52,12 +52,14 @@ impl BonsaiEngine {
         &mut self,
         prompt: &[u32],
         session_id: Option<&str>,
+        progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<(usize, PromptCacheSource, Option<PromptSnapshot>, bool)> {
         let bounds: ReuseBounds = self.reuse_bounds(prompt);
         let (reused, source) = self.restore_reusable_prefix(prompt, &bounds, session_id)?;
         let (snapshot, persisted_reusable_boundary) =
-            self.materialize_boundary(prompt, &bounds, reused, session_id)?;
-        self.model.prefill(&prompt[bounds.penultimate..])?;
+            self.materialize_boundary(prompt, &bounds, reused, session_id, progress)?;
+        self.model
+            .prefill(&prompt[bounds.penultimate..], progress)?;
         self.cached_tokens.clear();
         self.cached_tokens.extend_from_slice(prompt);
         self.prompt_checkpoints.retain(|checkpoint| {

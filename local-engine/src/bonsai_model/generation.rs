@@ -1,7 +1,7 @@
 use super::{
     BonsaiEngine, BonsaiGeneration, BonsaiModel, CancelToken, GenerateParams, GenerationStats,
-    Instant, LookupPolicy, MtpStats, PromptCacheSource, Sampler, SamplingParams, SamplingResult,
-    StopReason, VOCAB, fill_verify_tile,
+    Instant, LookupPolicy, MtpStats, PrefillProgress, PromptCacheSource, Sampler, SamplingParams,
+    SamplingResult, StopReason, VOCAB, fill_verify_tile,
 };
 impl BonsaiEngine {
     pub fn generate(
@@ -39,14 +39,39 @@ impl BonsaiEngine {
     /// A trip is the success value [`StopReason::Cancelled`], never an error,
     /// and it clears the reusable prompt-cache tiers below, so a cancelled
     /// request cannot poison the next one.
-    #[allow(clippy::too_many_lines)]
     pub fn generate_session_cancellable(
+        &mut self,
+        prompt: &[u32],
+        params: &GenerateParams,
+        session_id: Option<&str>,
+        emit: impl FnMut(&str) -> bool,
+        cancel: &CancelToken,
+    ) -> crate::Result<BonsaiGeneration> {
+        let mut silent = |_| {};
+        self.generate_session_progress(prompt, params, session_id, emit, cancel, &mut silent)
+    }
+
+    /// Generate, reporting every prefill chunk boundary to `progress`.
+    ///
+    /// Prefill is the one phase that emits no [`crate::Event`], so this is the
+    /// only place a caller learns the engine is alive between the request and
+    /// the first token. The report is a hint, not a record: the boundary is
+    /// taken at the same place as the cancel poll, immediately before the chunk
+    /// is submitted, so it counts a chunk that is about to run rather than one
+    /// that has finished.
+    ///
+    /// Reporting costs one call per chunk on the prefill critical path of a
+    /// single-flight engine, so the reporter must not block; it is called before
+    /// any GPU work for that chunk, never after.
+    #[allow(clippy::too_many_lines)]
+    pub fn generate_session_progress(
         &mut self,
         prompt: &[u32],
         params: &GenerateParams,
         session_id: Option<&str>,
         mut emit: impl FnMut(&str) -> bool,
         cancel: &CancelToken,
+        progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<BonsaiGeneration> {
         // Installed before anything can prefill, so the model always polls the
         // token belonging to the request in flight.
@@ -84,7 +109,7 @@ impl BonsaiEngine {
         );
         sampler.observe(prompt);
         let (reused, cache_source, prompt_snapshot, persisted_reusable_boundary) =
-            self.prepare_prompt(prompt, session_id)?;
+            self.prepare_prompt(prompt, session_id, progress)?;
         stats.reused_prompt_tokens = reused;
         stats.prefill = started.elapsed();
         let mut decoder = self.tokenizer.stream_decoder();

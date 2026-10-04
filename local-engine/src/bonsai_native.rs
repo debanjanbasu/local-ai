@@ -31,7 +31,7 @@ use crate::bonsai_model::{BonsaiInfo, CancelToken, SpeculativeBatch, draft_depth
 use crate::bonsai_mtp::{BonsaiMtp, DRAFT_CHAIN_MIN_MARGIN, MtpSettings, Shared as MtpShared};
 use crate::bonsai_ngram::NgramSettings;
 use crate::sampler::{Sampler, SamplingResult, verify_greedy_drafts};
-use crate::{MtpStats, NgramStats};
+use crate::{MtpStats, NgramStats, PrefillProgress};
 
 mod block;
 mod checkpoint;
@@ -545,6 +545,14 @@ pub struct BonsaiModel {
     /// Whether a cancelled request made the model stop before submitting a
     /// chunk or a round. Reported once, by [`Self::take_cancel_observed`].
     cancel_observed: bool,
+    /// Prefill chunks reported to the request in flight. Reset by
+    /// [`Self::set_cancel`], which is installed once per request.
+    ///
+    /// It lives here rather than in `prefill` because a request prefills in up to
+    /// three separate calls — the reusable boundary, the gap up to the
+    /// penultimate token, then the tail — so a count local to one call would
+    /// restart at 1 three times and describe nothing.
+    prefill_chunks: usize,
     /// GPU execution time of every command buffer this model waited on since
     /// the last [`Self::take_gpu_time`], from Metal's own timestamps: what the
     /// GPU was busy for, excluding CPU encoding and inter-buffer gaps.
@@ -721,6 +729,7 @@ impl BonsaiModel {
             position: 0,
             cancel: CancelToken::new(),
             cancel_observed: false,
+            prefill_chunks: 0,
             gpu_time: std::cell::Cell::new(std::time::Duration::ZERO),
             context,
             package,
@@ -764,6 +773,7 @@ impl BonsaiModel {
     pub(crate) fn set_cancel(&mut self, cancel: CancelToken) {
         self.cancel = cancel;
         self.cancel_observed = false;
+        self.prefill_chunks = 0;
     }
 
     /// Whether a cancelled request stopped this model short of the work it
@@ -1051,12 +1061,31 @@ impl BonsaiModel {
     /// and `position` keeps their exact total, which is a boundary the next
     /// request can still resume from. `Ok` rather than an error: cancellation
     /// is a successful outcome, reported by [`Self::take_cancel_observed`].
-    pub(crate) fn prefill(&mut self, prompt: &[u32]) -> crate::Result<()> {
+    ///
+    /// `progress` is called once per chunk, next to the cancel poll, immediately
+    /// before that chunk is submitted. Prefill is the only phase of a generation
+    /// with no per-token output, so without it a consumer sees one prefill chunk
+    /// as about 35 s of silence on this M2 and a long prompt as minutes of it.
+    /// The site is shared with the poll because it is the one place per chunk
+    /// where the engine is between dispatches, and a second poll site would be a
+    /// second thing to keep correct. Reporting before the chunk rather than after
+    /// means the first boundary arrives as soon as prefill starts, which is what
+    /// lets a caller stop waiting for a first token before the first chunk is done.
+    pub(crate) fn prefill(
+        &mut self,
+        prompt: &[u32],
+        progress: &mut dyn FnMut(PrefillProgress),
+    ) -> crate::Result<()> {
         let end = self.position + prompt.len();
         for block in prompt.chunks(self.info.prefill_chunk_size) {
             if self.stop_for_cancel() {
                 return Ok(());
             }
+            self.prefill_chunks += 1;
+            progress(PrefillProgress {
+                tokens: self.position,
+                chunks: self.prefill_chunks,
+            });
             let output = if self.position + block.len() == end {
                 BlockOutput::LastLogits
             } else if self.speculation.is_some() {
