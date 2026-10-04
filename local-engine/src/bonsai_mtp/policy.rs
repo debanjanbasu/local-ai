@@ -100,33 +100,32 @@ pub fn artifact_beside(head: &Path) -> Option<PathBuf> {
 /// by default; `bonsai --no-speculation` opts out for A/B runs.
 pub const DEFAULT_MTP_ENABLED: bool = true;
 
-/// Why an `Off` mode leaves speculation disabled, for the policy record.
-pub const MTP_OFF_REASON: &str = "speculation disabled by request (--no-mtp)";
+/// The record an `Off` mode falls back to when its constructor recorded none.
+///
+/// `Off` carries its own reason, so a caller that knows why it turned speculation
+/// off — `Resources::discover` does, for both an explicit opt-out and a missing
+/// install — says so instead of landing here. The request is the remaining way to
+/// reach `Off`, and `--no-speculation` is the flag that asks for it: the CLI
+/// rejects `--no-mtp` as an unknown option, so naming that would name a flag no
+/// user can pass.
+pub const MTP_OFF_REASON: &str = "speculation disabled by request (--no-speculation)";
 
 /// Why `Auto` leaves speculation disabled when the build default is off.
 pub const MTP_DEFAULT_OFF_REASON: &str =
     "speculation is off by build default (DEFAULT_MTP_ENABLED); pass --mtp to enable";
 
-/// Why an `Off` mode leaves speculation disabled when no head is installed.
-///
-/// `Resources::discover` builds `Off` both for an explicit opt-out and for a
-/// missing install, so [`MTP_OFF_REASON`] covers only half of what `Off` means.
-/// This names the absence, which holds whichever way `Off` was reached, and
-/// names the request as the other way to the same state rather than claiming it
-/// happened.
-pub const MTP_ABSENT_REASON: &str = "speculation is off: no MTP head or int8 artifact installed beside the model, or the request disabled it";
-
 /// How a caller wants speculation.
 ///
 /// `Auto` follows [`DEFAULT_MTP_ENABLED`] when a head is installed, preferring the
 /// int8 artifact over the BF16 source. `Head` names a head file, which may be
-/// either. `Off` never speculates. Drafts never change the emitted tokens because
-/// the target verifies every one.
+/// either. `Off` never speculates and carries why, so the caller that built it —
+/// which is the one that knows — is the only one that has to supply a reason.
+/// Drafts never change the emitted tokens because the target verifies every one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MtpMode {
     Auto { depth: usize },
     Head(MtpSettings),
-    Off,
+    Off(Option<String>),
 }
 
 impl Default for MtpMode {
@@ -146,23 +145,6 @@ pub enum MtpResolution {
     Disabled(String),
 }
 
-/// The head `crate::Resources::discover` looks for beside `model`.
-///
-/// Discovery resolves `models/bonsai2-27b-mtp/model_mtp.safetensors` next to the
-/// model directory, so an engine opened on an explicit `--model` path has to ask
-/// about that same place and not about the default under the working directory.
-/// Both names are read back out of [`DEFAULT_BONSAI_MTP_HEAD`], leaving the
-/// pinned layout named once; a model with no directory to look beside yields
-/// `None`, which discovery accounts for as no head either.
-fn head_beside_model(model: &Path) -> Option<PathBuf> {
-    let default = Path::new(DEFAULT_BONSAI_MTP_HEAD);
-    let root = model.parent().and_then(Path::parent)?;
-    Some(
-        root.join(default.parent()?.file_name()?)
-            .join(default.file_name()?),
-    )
-}
-
 impl MtpMode {
     /// Decide whether to speculate.
     pub fn resolve(&self) -> crate::Result<MtpResolution> {
@@ -176,7 +158,11 @@ impl MtpMode {
         auto_enabled: bool,
     ) -> crate::Result<MtpResolution> {
         match self {
-            Self::Off => Ok(MtpResolution::Disabled(MTP_OFF_REASON.into())),
+            // A reason the constructor recorded is the record; `None` means the
+            // caller had none to give, and the generic opt-out text stands in.
+            Self::Off(carried) => Ok(MtpResolution::Disabled(
+                carried.clone().unwrap_or_else(|| MTP_OFF_REASON.into()),
+            )),
             Self::Head(settings) => {
                 if !settings.path.is_file() {
                     return Err(crate::Error::InvalidArgument(format!(
@@ -207,114 +193,5 @@ impl MtpMode {
                 }
             }
         }
-    }
-
-    /// The reason to record for an `Off` mode whose model is `model`.
-    ///
-    /// `None` for every other mode, which keeps the reason its own resolution
-    /// produced: `Auto`'s missing-head and build-default messages, and `Head`'s
-    /// missing-file error, stay exactly as [`Self::resolve`] words them.
-    ///
-    /// An `Off` mode carries no record of which way it was reached, so
-    /// [`Self::resolve`] can only name one of them. A head installed beside
-    /// `model` is the discriminator: discovery would have speculated on it, so
-    /// an opt-out is then the only explanation left. Its absence is the other
-    /// explanation, and is reported as the fact it is.
-    #[must_use]
-    pub fn off_reason(&self, model: &Path) -> Option<String> {
-        if !matches!(self, Self::Off) {
-            return None;
-        }
-        Some(match head_beside_model(model) {
-            Some(head)
-                if head.is_file() || artifact_beside(&head).is_some_and(|path| path.is_file()) =>
-            {
-                MTP_OFF_REASON.into()
-            }
-            _ => MTP_ABSENT_REASON.into(),
-        })
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    /// A model at the pinned install path, so discovery would look for the head
-    /// beside it exactly as it does for the shipped layout.
-    fn model(root: &Path) -> PathBuf {
-        root.join("models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf")
-    }
-
-    /// Put `file` where the pinned default layout puts a head beside `model`.
-    fn install(model: &Path, file: &str) {
-        let directory = model
-            .parent()
-            .and_then(Path::parent)
-            .expect("model root")
-            .join(
-                Path::new(DEFAULT_BONSAI_MTP_HEAD)
-                    .parent()
-                    .and_then(Path::file_name)
-                    .expect("head directory"),
-            );
-        std::fs::create_dir_all(&directory).expect("head directory");
-        std::fs::write(directory.join(file), b"stub").expect("stub head");
-    }
-
-    /// An `Off` mode is reached two ways, and the record must not confuse them.
-    ///
-    /// `Resources::discover` builds `Off` for an explicit `--no-speculation` and
-    /// again when it finds no head, so a record that always names the request
-    /// claims one that never happened.
-    #[test]
-    fn off_names_the_request_only_when_a_head_is_installed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = model(dir.path());
-
-        // Nothing installed: the discoverer chose `Off` on its own.
-        let absent = MtpMode::Off.off_reason(&path);
-        assert_ne!(absent.as_deref(), Some(MTP_OFF_REASON), "{absent:?}");
-        assert!(
-            absent
-                .as_deref()
-                .is_some_and(|why| why.contains("no MTP head")),
-            "{absent:?}"
-        );
-
-        // A source head beside the model means discovery would have speculated,
-        // so `Off` can only be the request.
-        install(&path, "model_mtp.safetensors");
-        assert_eq!(
-            MtpMode::Off.off_reason(&path).as_deref(),
-            Some(MTP_OFF_REASON)
-        );
-
-        // An artifact-only install counts too: discovery prefers it and
-        // speculates without the 849 MB source.
-        let artifact_only = tempfile::tempdir().expect("tempdir");
-        let bare = model(artifact_only.path());
-        install(&bare, MTP_HEAD_ARTIFACT);
-        assert_eq!(
-            MtpMode::Off.off_reason(&bare).as_deref(),
-            Some(MTP_OFF_REASON)
-        );
-
-        // Every other mode keeps the reason its own resolution produced, so
-        // `Auto`'s missing-head and build-default messages, and `Head`'s missing
-        // file error, stay as they were.
-        assert!(
-            MtpMode::Auto {
-                depth: DEFAULT_MTP_DEPTH
-            }
-            .off_reason(&path)
-            .is_none()
-        );
-        assert!(
-            MtpMode::Head(MtpSettings::new(path.clone(), 1).expect("settings"))
-                .off_reason(&path)
-                .is_none()
-        );
     }
 }

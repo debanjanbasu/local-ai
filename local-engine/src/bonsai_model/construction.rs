@@ -38,10 +38,9 @@ impl BonsaiEngine {
         let context = max_context.unwrap_or(0);
         let (settings, disabled) = match mtp.resolve()? {
             MtpResolution::Native(settings) => (Some(settings), None),
-            // A discoverer that found no head builds `Off` too, and the mode cannot
-            // say so, so the reason it resolved with is only the record when the
-            // head `Off` might have been declined over is actually installed.
-            MtpResolution::Disabled(reason) => (None, Some(mtp.off_reason(path).unwrap_or(reason))),
+            // Whatever the mode resolved with is the record; an `Off` mode carries
+            // the reason that turned it off, so nothing has to re-derive it here.
+            MtpResolution::Disabled(reason) => (None, Some(reason)),
         };
         let model = BonsaiModel::load(
             package,

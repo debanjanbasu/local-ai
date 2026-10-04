@@ -16,6 +16,11 @@ pub(super) struct CachedCheckpoint {
     reusable_boundary: bool,
 }
 
+mod boundary;
+mod reuse;
+
+use self::reuse::ReuseBounds;
+
 impl BonsaiEngine {
     pub(super) fn save_prompt_checkpoint(
         &mut self,
@@ -43,177 +48,16 @@ impl BonsaiEngine {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn prepare_prompt(
         &mut self,
         prompt: &[u32],
         session_id: Option<&str>,
     ) -> crate::Result<(usize, PromptCacheSource, Option<PromptSnapshot>, bool)> {
-        let lcp = self
-            .cached_tokens
-            .iter()
-            .zip(prompt)
-            .take_while(|(cached, new)| cached == new)
-            .count();
-        let reusable = lcp.min(prompt.len().saturating_sub(1));
-        let snapshot_reusable = prompt.len().saturating_sub(1);
-        let selected = self
-            .prompt_checkpoints
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, checkpoint)| {
-                checkpoint.state.position <= reusable
-                    && checkpoint.tokens.as_slice() == &prompt[..checkpoint.state.position]
-            })
-            .map(|(index, _)| index);
-        let selected = if let Some(index) = selected {
-            if self
-                .model
-                .restore_prompt_checkpoint(&self.prompt_checkpoints[index].state)?
-            {
-                Some(index)
-            } else {
-                self.prompt_checkpoints.remove(index);
-                None
-            }
-        } else {
-            None
-        };
-        let (reused, source) = if let Some(index) = selected {
-            self.prompt_checkpoints.rotate_left(index + 1);
-            let checkpoint = self
-                .prompt_checkpoints
-                .pop()
-                .ok_or_else(|| crate::Error::Generation("prompt checkpoint disappeared".into()))?;
-            let position = checkpoint.state.position;
-            self.prompt_checkpoints.push(checkpoint);
-            (position, PromptCacheSource::Gpu)
-        } else {
-            let host = self
-                .session_snapshots
-                .iter()
-                .enumerate()
-                .filter(|(_, snapshot)| {
-                    snapshot.state.position() <= snapshot_reusable
-                        && snapshot.tokens.as_slice() == &prompt[..snapshot.state.position()]
-                })
-                .max_by_key(|(_, snapshot)| {
-                    (
-                        snapshot.state.position(),
-                        snapshot.session_id.as_deref() == session_id,
-                    )
-                })
-                .map(|(index, _)| index);
-            let host = if let Some(index) = host {
-                if self
-                    .model
-                    .restore_host_prompt_snapshot(&self.session_snapshots[index].state)?
-                {
-                    Some(index)
-                } else {
-                    self.session_snapshots.remove(index);
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(index) = host {
-                let position = self.session_snapshots[index].state.position();
-                let snapshot = self.session_snapshots.remove(index);
-                self.session_snapshots.push(snapshot);
-                self.prompt_checkpoints.clear();
-                (position, PromptCacheSource::Host)
-            } else {
-                let disk = self
-                    .disk_snapshots
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, snapshot)| {
-                        snapshot.tokens.len() <= snapshot_reusable
-                            && snapshot.tokens.as_slice() == &prompt[..snapshot.tokens.len()]
-                    })
-                    .max_by_key(|(_, snapshot)| {
-                        (
-                            snapshot.tokens.len(),
-                            snapshot.session_id.as_deref() == session_id,
-                        )
-                    })
-                    .map(|(index, _)| index);
-                if let Some(index) = disk {
-                    let snapshot = prompt_cache::load(
-                        &self.disk_snapshots[index].path,
-                        &self.prompt_cache_model_key,
-                    );
-                    // A snapshot that fails to load or restore is a cache miss,
-                    // never a failed request.
-                    if let Ok(snapshot) = snapshot
-                        && self.model.restore_prompt_snapshot(&snapshot).is_ok()
-                    {
-                        self.prompt_checkpoints.clear();
-                        (snapshot.position, PromptCacheSource::Disk)
-                    } else {
-                        self.disk_snapshots.remove(index);
-                        self.model.reset();
-                        (0, PromptCacheSource::None)
-                    }
-                } else {
-                    self.model.reset();
-                    (0, PromptCacheSource::None)
-                }
-            }
-        };
-        // The next turn's re-rendered history usually diverges at the final
-        // prompt token (the assistant-turn opener), so the reusable boundary
-        // for checkpoints and session snapshots is the penultimate position.
-        let penultimate = prompt.len() - 1;
-        // Recurrent state is valid only at an exact position. Materialize one
-        // semantic checkpoint per prefill: prefer a newly observed divergence,
-        // otherwise the end of the system turn. The minimum follows the
-        // resource-selected prefill chunk, avoiding copies for short prefixes.
-        let minimum = self.info.prefill_chunk_size;
-        let divergence = (lcp >= minimum && lcp > reused && lcp <= penultimate).then_some(lcp);
-        let system_boundary = prompt
-            .iter()
-            .position(|token| self.tokenizer.eos_ids().contains(token))
-            .map(|index| index + 1)
-            .filter(|&position| {
-                position >= minimum && position > reused && position <= penultimate
-            });
-        let reusable_boundary = divergence.or(system_boundary);
-        let mut persisted_reusable_boundary = false;
-        if let Some(boundary) = reusable_boundary {
-            self.model.prefill(&prompt[reused..boundary])?;
-            self.save_prompt_checkpoint(&prompt[..boundary], true)?;
-            if self.prompt_cache_bytes > 0
-                || (self.prompt_cache_disk_bytes > 0 && self.prompt_cache_dir.is_some())
-            {
-                let snapshot = self.model.prompt_snapshot()?;
-                self.save_session_snapshot(
-                    &prompt[..boundary],
-                    session_id,
-                    Some(snapshot),
-                    true,
-                    true,
-                )?;
-                persisted_reusable_boundary = true;
-            }
-        }
-        let prefilled = reusable_boundary.unwrap_or(reused);
-        if prefilled < penultimate {
-            self.model.prefill(&prompt[prefilled..penultimate])?;
-            if self.max_prompt_checkpoints > 0 {
-                self.cached_tokens.clear();
-                self.cached_tokens.extend_from_slice(&prompt[..penultimate]);
-                self.save_prompt_checkpoint(&prompt[..penultimate], false)?;
-            }
-        }
-        let snapshot = (penultimate > 0
-            && (self.prompt_cache_bytes > 0
-                || (self.prompt_cache_disk_bytes > 0 && self.prompt_cache_dir.is_some())))
-        .then(|| self.model.prompt_snapshot())
-        .transpose()?;
-        self.model.prefill(&prompt[penultimate..])?;
+        let bounds: ReuseBounds = self.reuse_bounds(prompt);
+        let (reused, source) = self.restore_reusable_prefix(prompt, &bounds, session_id)?;
+        let (snapshot, persisted_reusable_boundary) =
+            self.materialize_boundary(prompt, &bounds, reused, session_id)?;
+        self.model.prefill(&prompt[bounds.penultimate..])?;
         self.cached_tokens.clear();
         self.cached_tokens.extend_from_slice(prompt);
         self.prompt_checkpoints.retain(|checkpoint| {

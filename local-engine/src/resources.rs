@@ -60,7 +60,8 @@ impl Resources {
         // The artifact first: it loads without the 849 MB source, and an invalid
         // one is reported by the loader instead of quietly costing throughput.
         let (mtp, mtp_reason) = if !speculation {
-            (MtpMode::Off, "disabled by --no-speculation".into())
+            let reason = "disabled by --no-speculation";
+            (MtpMode::Off(Some(reason.into())), reason.into())
         } else if let Some((path, reason)) =
             describe_head(mtp_artifact.as_ref(), mtp_source.as_ref())
         {
@@ -71,10 +72,10 @@ impl Resources {
                 reason,
             )
         } else {
-            (
-                MtpMode::Off,
-                "MTP head not found beside model; suffix lookup remains enabled".into(),
-            )
+            // Only what discovery can see: whether suffix/ngram lookup is on is
+            // decided by `--no-speculation`, which took the branch above.
+            let reason = "no MTP head or int8 artifact installed beside the model";
+            (MtpMode::Off(Some(reason.into())), reason.into())
         };
         let cache = std::env::var_os("HOME")
             .map(PathBuf::from)
