@@ -55,10 +55,16 @@ REPO = Path(__file__).resolve().parents[1]
 BINARY = REPO / "target" / "release" / "local-ai"
 MODEL = REPO / "models" / "bonsai2-27b-ptq1" / "Ternary-Bonsai-2-27B-PTQ1_0.gguf"
 
-# Reported, not enforced: a constant co-tenant is absorbed by interleaving and the
-# best-case estimator. Build tools are the hard gate, because they arrive and
-# leave mid-run. See `require_idle`.
-MAX_LOAD = 4.0
+# Build tools are the hard gate, because they arrive and leave mid-run; see
+# `require_idle`. Load average cannot do that job: it cannot tell a constant
+# co-tenant from a varying one, and on this machine the floor is constant --
+# `AMPDevicesAgent` alone sits at 100% -- while the reported number still
+# moves by about two as *my own* tooling does work. So load is bounded by
+# something derived from the machine rather than a chosen constant, and only
+# warns until there are more runnable tasks than cores.
+CPU_COUNT = os.cpu_count() or 1
+ADVISORY_LOAD = CPU_COUNT * 0.75
+HARD_LOAD = float(CPU_COUNT)
 
 DEFAULT_PROMPT = (
     "List the planets of the solar system in order, one per line, with a one "
@@ -159,11 +165,21 @@ def require_idle() -> None:
             + ". Decode here is memory-bandwidth-bound, so that competes for the "
             "same resource. Wait for it to finish."
         )
-    if load > MAX_LOAD:
+    if load > HARD_LOAD:
         raise Busy(
-            f"load average {load:.2f} exceeds {MAX_LOAD:.2f}. Past this the machine "
-            "is busy enough that an interleaved best-case sample may still be "
-            "paying for a co-tenant that is not there for every round."
+            f"load average {load:.2f} exceeds {HARD_LOAD:.2f}, the core count. More "
+            "tasks are runnable than there are cores, so a best-case sample can "
+            "still be paying for a co-tenant that is not there for every round. "
+            f"Pass --allow-busy to measure anyway; the interleaving and estimator "
+            f"then carry the comparison. Above {ADVISORY_LOAD:.2f} is already "
+            "suspect; above the core count the contention is not noise."
+        )
+    if load > ADVISORY_LOAD:
+        print(
+            f"warning: load average {load:.2f} is above {ADVISORY_LOAD:.2f}. Constant "
+            "co-tenants are absorbed by the interleaving and the best-case "
+            "estimator, so this is a heads-up rather than a refusal.",
+            file=sys.stderr,
         )
 
 
@@ -230,7 +246,10 @@ def depth_sweep() -> list[Config]:
     """Every depth the engine accepts, plus a no-speculation reference."""
     return [
         Config("no-speculation", ("--no-speculation",)),
-        *[Config(f"depth {depth}", (f"--mtp-depth={depth}",)) for depth in (1, 2, 3, 4)],
+        # Space-separated, not `--mtp-depth=N`: every value-taking flag in this
+        # CLI takes its value as a separate argument. `--export` is the only
+        # exception, because its own value grammar contains `=`.
+        *[Config(f"depth {depth}", ("--mtp-depth", str(depth))) for depth in (1, 2, 3, 4)],
     ]
 
 
@@ -281,7 +300,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     load, competing = machine_state()
-    print(f"load average {load:.2f} (limit {MAX_LOAD:.2f})", file=sys.stderr)
+    print(
+        f"load average {load:.2f} of {HARD_LOAD:.2f} cores"
+        + (f" (advisory floor {ADVISORY_LOAD:.2f})" if load > ADVISORY_LOAD else ""),
+        file=sys.stderr,
+    )
     if competing:
         print(f"competing builds: {', '.join(sorted(set(competing)))}", file=sys.stderr)
     if args.check_only:
