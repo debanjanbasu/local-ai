@@ -4,7 +4,9 @@ use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
 
 use futures_core::Stream;
 use tokio::sync::mpsc as async_mpsc;
@@ -544,6 +546,60 @@ impl EventStream {
         CancelHandle {
             cancel: self.cancel.clone(),
         }
+    }
+
+    /// Wait for the next event, giving up after `timeout`.
+    ///
+    /// `Ok(Some(event))` is an event, `Ok(None)` is end-of-stream, and
+    /// `Err(RecvTimeoutError::Timeout)` is a deadline that passed while the
+    /// generation was still open. `Err(RecvTimeoutError::Disconnected)` is
+    /// never produced: a closed channel is reported as `Ok(None)`.
+    ///
+    /// The three states cannot be folded into one, because end-of-stream and a
+    /// silent-but-running generation both arrive as `None` from
+    /// [`Iterator::next`], and a consumer that must give up on a wedged reader
+    /// needs to tell them apart. A caller tracking that with a side flag has to
+    /// remember to clear it; [`RecvTimeoutError`] is std's own name for the
+    /// same distinction, so the whole answer stays in the return type.
+    ///
+    /// Unlike [`Iterator::next`] this is safe to call from inside a runtime
+    /// task: it parks the calling thread instead of panicking, and reports
+    /// `Timeout` once the deadline passes. It holds `&mut self`, so it cannot
+    /// race a concurrent [`Stream`](futures_core::Stream) poll on the same
+    /// stream.
+    pub fn next_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Event>, std::sync::mpsc::RecvTimeoutError> {
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let started = Instant::now();
+        loop {
+            match self.receiver.poll_recv(&mut context) {
+                Poll::Ready(Some(event)) => return Ok(Some(event)),
+                Poll::Ready(None) => return Ok(None),
+                Poll::Pending => {}
+            }
+            let waited = started.elapsed();
+            if waited >= timeout {
+                return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+            }
+            std::thread::park_timeout(timeout.saturating_sub(waited));
+        }
+    }
+}
+
+/// Unparks the thread that is waiting in [`EventStream::next_timeout`].
+///
+/// The receiver is woken from whatever thread produces the next event, so the
+/// wait ends at that moment instead of at the next poll. Sleeping for a fixed
+/// slice and retrying instead would put that slice in front of every slow
+/// generation step.
+struct ThreadWaker(std::thread::Thread);
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
     }
 }
 

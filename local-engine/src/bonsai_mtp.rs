@@ -13,7 +13,7 @@
 //! head keeps its own F16 KV cache indexed by absolute token position.
 //!
 //! The quantized form is also a distributable artifact: the same bytes the
-//! loader builds for itself are written by `local-ai bonsai --export-mtp-head`,
+//! loader builds for itself are written by `local-ai bonsai --export mtp-head=DIR`,
 //! and a head file records its section names, section sizes and payload digest,
 //! so an install can ship the artifact and validate it without the 849 MB source.
 

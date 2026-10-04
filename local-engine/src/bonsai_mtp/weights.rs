@@ -217,7 +217,7 @@ pub(super) fn spec() -> Vec<Section> {
 
 /// Quantize the BF16 head at `source` into artifact-order sections.
 ///
-/// `Weights::load` and `local-ai bonsai --export-mtp-head` both call this, which
+/// `Weights::load` and `local-ai bonsai --export mtp-head=DIR` both call this, which
 /// is what makes a shipped artifact byte-identical to what the loader would have
 /// built for itself: same split, same per-row quantization, same section order.
 pub(super) fn transform_sections(source: &Path) -> crate::Result<Vec<Vec<u8>>> {
@@ -277,7 +277,7 @@ fn read_artifact(path: &Path, spec: &[Section]) -> crate::Result<Option<CacheMap
     read_head(path, spec).map(Some).map_err(|reason| {
         crate::Error::InvalidFormat(format!(
             "MTP int8 head artifact {} is unusable: {reason}; re-export it with \
-             `local-ai bonsai --export-mtp-head <dir>` or remove it to quantize from a \
+             `local-ai bonsai --export mtp-head=<dir>` or remove it to quantize from a \
              BF16 source",
             path.display()
         ))

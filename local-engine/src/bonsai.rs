@@ -2,7 +2,7 @@
 //!
 //! The native Metal backend runs the checkpoint straight from this file:
 //! `metal_tensor` wraps 16-KiB-aligned windows of the immutable mapping as
-//! shared Metal buffers without copying. `--export-index` describes the same
+//! shared Metal buffers without copying. `--export index` describes the same
 //! checked tensor layout, Hadamard signs and tokenizer for the F64 reference.
 //! The complete file is virtually mapped for
 //! checked metadata and CPU views; this does not make it resident.
@@ -37,7 +37,7 @@ use self::hadamard::parse_hadamard;
 use self::metal_tensor::metal_window;
 
 /// The pinned checkpoint the runtime runs directly; also the source
-/// `--export-index`/`--tokenize` read.
+/// `--export index`/`--tokenize` read.
 ///
 /// Shipped builds keep this repository-relative so a relocated install
 /// resolves `./models` beside itself; `resources::discover_model` treats it as

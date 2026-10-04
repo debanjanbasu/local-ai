@@ -1,7 +1,7 @@
 //! Shipping the int8 head, so an install can run speculation from an artifact
 //! instead of an 849 MB BF16 source.
 //!
-//! `local-ai bonsai --export-mtp-head <dir>` writes `mtp-head-int8-v2.bin` beside
+//! `local-ai bonsai --export mtp-head=<dir>` writes `mtp-head-int8-v2.bin` beside
 //! nothing else: no GPU, no 5.9 GB target checkpoint, and no second copy of the
 //! transform. The same file can hold its sections verbatim or behind one zstd
 //! frame; which one it holds is in the file's own magic, so the loader reads

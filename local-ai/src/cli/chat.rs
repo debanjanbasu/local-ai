@@ -10,6 +10,7 @@ use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
 use crate::resources::{PREFILL_CHUNK, Resources};
 
+#[derive(Debug)]
 struct Args {
     model: Option<PathBuf>,
     max_tokens: Option<usize>,
@@ -24,8 +25,7 @@ fn usage() {
     eprintln!();
     eprintln!("  --model PATH      Override automatic pinned-model discovery");
     eprintln!("  --max-tokens N    Maximum generated tokens (default: 8192)");
-    eprintln!("  --thinking        Enable xhigh thinking (default)");
-    eprintln!("  --no-thinking     Disable thinking");
+    eprintln!("  --no-thinking     Skip the checkpoint's xhigh reasoning (default: on)");
     eprintln!("  --greedy          Disable sampling");
     eprintln!("  --raw             Skip the chat template");
 }
@@ -33,7 +33,7 @@ fn usage() {
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut model = None;
     let mut max_tokens = None;
-    let mut thinking_override = None;
+    let mut no_thinking = false;
     let mut raw = false;
     let mut greedy = false;
     let mut prompt = Vec::new();
@@ -56,8 +56,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--raw" => raw = true,
             "--greedy" => greedy = true,
-            "--thinking" => thinking_override = Some(true),
-            "--no-thinking" => thinking_override = Some(false),
+            "--no-thinking" => no_thinking = true,
             "--help" | "-h" => return Err(String::new()),
             "--" => {
                 prompt.extend_from_slice(&args[index + 1..]);
@@ -71,14 +70,10 @@ fn parse(args: &[String]) -> Result<Args, String> {
     if prompt.is_empty() {
         return Err("prompt is required".into());
     }
-    if raw && thinking_override == Some(true) {
-        return Err("--thinking requires the chat template, not --raw".into());
-    }
-    let thinking = !raw && thinking_override.unwrap_or(true);
     Ok(Args {
         model,
         max_tokens,
-        thinking,
+        thinking: !raw && !no_thinking,
         raw,
         greedy,
         prompt: prompt.join(" "),
@@ -169,7 +164,6 @@ mod tests {
         for invalid in [
             vec!["--prefill-chunk", "0", "hi"],
             vec!["--context", "4096", "hi"],
-            vec!["--raw", "--thinking", "hi"],
             vec!["--kv-cache", "q8", "hi"],
             vec!["--image", "cat.png", "hi"],
         ] {
@@ -181,5 +175,14 @@ mod tests {
             parse(&args(&["--", "--literal"])).expect("literal").prompt,
             "--literal"
         );
+    }
+
+    #[test]
+    fn thinking_is_not_a_flag_because_it_sets_the_default() {
+        assert_eq!(
+            parse(&args(&["--thinking", "hi"])).expect_err("rejected"),
+            "unknown option: --thinking"
+        );
+        assert!(parse(&args(&["--raw", "--no-thinking", "hi"])).is_ok());
     }
 }

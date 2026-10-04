@@ -82,7 +82,7 @@ impl Codec {
 }
 
 /// The distributable int8 head, installed beside the pinned BF16 source and
-/// written by `local-ai bonsai --export-mtp-head`.
+/// written by `local-ai bonsai --export mtp-head=DIR`.
 ///
 /// Its version is [`CACHE_VERSION`], so a future format is a different file
 /// rather than a misparse of this one. It deliberately does *not* start with

@@ -21,7 +21,7 @@ pub struct BonsaiTokenizer {
 }
 
 /// Everything the tokenizer needs from the checkpoint, in the shape
-/// `--export-index` emits under `tokenizer` (`schema_version` 1). Field names
+/// `--export index` emits under `tokenizer` (`schema_version` 1). Field names
 /// mirror the GGUF `tokenizer.ggml.*` / `tokenizer.chat_template` keys so the
 /// object is a plain copy of the checkpoint metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,10 +530,10 @@ mod tests {
         }
     }
 
-    /// The `tokenizer` object from `--export-index` must build a tokenizer
+    /// The `tokenizer` object from `--export index` must build a tokenizer
     /// identical to the GGUF-embedded one.
     #[test]
-    #[ignore = "set BONSAI_INDEX to an absolute path to the JSON written by `bonsai --export-index > index.json`; requires --test-threads=1 (parallel runs spuriously purge volatile prompt-cache state)"]
+    #[ignore = "set BONSAI_INDEX to an absolute path to the JSON written by `bonsai --export index > index.json`; requires --test-threads=1 (parallel runs spuriously purge volatile prompt-cache state)"]
     fn exported_tokenizer_object_reproduces_prism_token_ids() {
         let path = std::env::var("BONSAI_INDEX").expect("BONSAI_INDEX is required");
         let index: serde_json::Value =
