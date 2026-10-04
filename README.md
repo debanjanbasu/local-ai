@@ -120,6 +120,26 @@ still yields a 61,538-token context rather than a hard-coded limit. The M2 also
 selects Metal 4 tensor kernels for full-attention prefill
 (`attention_kernel: tensor_f32`), not the `simd_f32` fallback.
 
+### Speculation, decomposed
+
+`--no-speculation` is one flag over two independent mechanisms: the MTP head,
+a learned draft that speculates ahead, and n-gram suffix lookup
+(`ngram_policy`, `min_match: 24`), an exact-match reuse of a previously-seen
+24-token suffix that proposes its known continuation. Both are honestly called
+speculation and the flag disables both, so the 2.0x above is not in dispute;
+what an A/B against that flag cannot show is how the gain divides between them.
+Measured today on this M2, greedy, median of three repetitions per arm, every
+arm producing byte-identical output: on varied prose and on ordinary repetition
+the n-gram path never fired at all, and the gains there — **1.26x** (1.22x on an
+independent second run) and **1.62x** — are MTP alone. The larger figure appears
+only where n-gram lookup engages, which on a verbatim repetition workload it did
+at 260 of 261 proposals accepted for 0.1 ms of total lookup time; both
+mechanisms were live in that run, so these figures bound the head's contribution
+rather than dividing the gain between the two. Verification, not drafting, is
+89.0% of decode time, and a batched verify token costs **0.65x** what a standalone
+decode token costs — which is also why a published CUDA measurement of the same
+PTQ1 format gained only 1.6%.
+
 See [docs/BONSAI.md](docs/BONSAI.md) for the technical reference.
 
 ## Model install
