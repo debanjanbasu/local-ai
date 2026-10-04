@@ -113,9 +113,11 @@ fn usage() {
     eprintln!("                         of anonymous RAM at load, so the stored form is");
     eprintln!("                         what discovery prefers.");
     eprintln!("  --no-speculation   A/B baseline: disable MTP and suffix lookup");
-    eprintln!("  --mtp-depth N      Drafts per speculative round (1-{MAX_MTP_DEPTH}, default:");
-    eprintln!("                     {DEFAULT_MTP_DEPTH}); measures what the confidence gate");
-    eprintln!("                     leaves unused, not a tuned default");
+    eprintln!(
+        "  --mtp-depth N      Drafts per speculative round (1-{MAX_MTP_DEPTH}, \
+         default: {DEFAULT_MTP_DEPTH}); measures what the confidence gate leaves \
+         unused, not a tuned default"
+    );
 }
 
 #[allow(clippy::too_many_lines)]

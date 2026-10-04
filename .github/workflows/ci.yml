@@ -54,6 +54,13 @@
 # components, and rustup on a GitHub runner honours that file automatically.
 # The absence is deliberate; adding a setup step would only risk overriding
 # the pin. (`rust-src` matters: `.cargo/config.toml` sets `build-std`.)
+#
+# Actions are pinned to commit SHAs with the release tag as a trailing comment.
+# `v4` and `v5` are mutable tags that upstream moves on every release, so a tag
+# is not a fixed action -- it is a promise about whatever ships next. Each SHA
+# below is the commit its own tag resolved to, verified against that tag's
+# release (`gh api repos/OWNER/REPO/git/ref/tags/TAG`). Bump the SHA and the
+# comment together; never widen one back to a bare tag.
 name: CI
 
 on:
@@ -86,20 +93,20 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install uv (for `uvx ruff`)
         # GitHub's macOS runners do not ship `uvx`, and `tools/` is Python this
         # repo actively maintains -- 22 unit tests, one of which reads Rust
         # source to keep a Rust constant and a Python constant in sync. So the
         # Python gates are load-bearing, not an afterthought.
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
 
       # `Cargo.lock` is committed and every gate below passes `--locked`, which
       # makes it the exact and correct invalidation input: any dependency
       # change busts the key, and a pure source change keeps a warm cache.
       - name: Cache cargo and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry

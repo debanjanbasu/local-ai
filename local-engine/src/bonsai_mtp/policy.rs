@@ -2,19 +2,19 @@ use std::path::{Path, PathBuf};
 
 use super::cache::MTP_HEAD_ARTIFACT;
 
-/// Native drafts per round. Each verify row costs 30–45 % of a single-row
-/// pass (the PTQ1 decode is shared; the extra row adds one FMA per weight),
-/// so a second draft pays off when the head's chained second token is
-/// accepted often enough. Measured on the M4 Pro with lossless F16 caches
-/// (greedy, tokens identical at every depth): unconditional depth 2 beat
-/// depth 1 by 1–9 % on three parity cases and lost 11 % on the fourth
-/// (second-draft acceptance 26 %); with the margin gate below it is ahead
-/// of depth 1 on the three short cases and within noise on the 12K one.
-/// Once the int8 head made drafting 20–30 % cheaper, gated depth 3 beat
-/// depth 2 on arithmetic, code, explanation and essay prompts (+1–3 %,
-/// lower GPU time per token, identical tokens).
-// The doc above is one measurement log, not separate findings.
-#[allow(clippy::too_long_first_doc_paragraph)]
+/// Native drafts per round, each verify row costing 30–45 % of a single-row
+/// pass: the PTQ1 decode is shared, and the extra row adds one FMA per weight.
+///
+/// A draft earns its cost when the head's chained next token is accepted often
+/// enough. Measured on the M4 Pro with lossless F16 caches (greedy, tokens
+/// identical at every depth): unconditional depth 2 beat depth 1 by 1–9 % on
+/// three parity cases and lost 11 % on the fourth (second-draft acceptance
+/// 26 %); with the margin gate below it is ahead of depth 1 on the three short
+/// cases and within noise on the 12K one.
+///
+/// Once the int8 head made drafting 20–30 % cheaper, gated depth 3 beat depth 2
+/// on arithmetic, code, explanation and essay prompts (+1–3 %, lower GPU time
+/// per token, identical tokens). That is the measurement behind the 3 here.
 pub const DEFAULT_MTP_DEPTH: usize = 3;
 pub const MAX_MTP_DEPTH: usize = 4;
 /// The head drafts a further token only while its current proposal leads
@@ -113,8 +113,17 @@ pub const DEFAULT_MTP_ENABLED: bool = true;
 pub const MTP_OFF_REASON: &str = "speculation disabled by request (--no-speculation)";
 
 /// Why `Auto` leaves speculation disabled when the build default is off.
-pub const MTP_DEFAULT_OFF_REASON: &str =
-    "speculation is off by build default (DEFAULT_MTP_ENABLED); pass --mtp to enable";
+///
+/// No flag re-enables it. `--no-speculation` is the only one that reaches the
+/// policy at all, and it asks for `Off`, which reports [`MTP_OFF_REASON`]
+/// instead; the CLI rejects `--mtp` as an unknown option, so naming that would
+/// name a flag no user can pass. [`DEFAULT_MTP_ENABLED`] is a compile-time
+/// constant, so turning it back on means a build that sets it true, or naming
+/// the head directly with [`MtpMode::Head`], which skips this policy.
+///
+/// Only a build configured off reaches this text: `Auto` follows
+/// [`DEFAULT_MTP_ENABLED`], and shipped builds set it true.
+pub const MTP_DEFAULT_OFF_REASON: &str = "speculation is off by build default (DEFAULT_MTP_ENABLED); no flag re-enables it, so this needs a build with DEFAULT_MTP_ENABLED = true";
 
 /// How a caller wants speculation.
 ///
