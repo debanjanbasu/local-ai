@@ -19,7 +19,12 @@ target/release/local-ai serve
 target/release/local-ai chat 'What is 17 * 23?'
 ```
 
-The server exposes an OpenAI-compatible API at `127.0.0.1:8080`.
+The server exposes an OpenAI-compatible API at `127.0.0.1:8080`. A client that
+stops reading its socket without closing it is invisible to TCP, so `serve`
+takes `--stall-timeout SECONDS` (default 30, accepted 10 to 3600) to bound how
+long a generation may go undelivered before it is cancelled and the engine
+released; the budgets, measurements and limits are in
+[docs/BONSAI.md](docs/BONSAI.md#server-api).
 
 ## Library use
 
@@ -189,9 +194,9 @@ licenses. The head tool also supports `--install ARCHIVE` and optional
 ### MTP head artifact
 
 The BF16 head is quantized to symmetric int8 at load time and cached, which
-makes it a runtime cost rather than a shipping format. `--export-mtp-head` runs
-that same transform offline and writes the result as a file an install can ship,
-so speculation no longer requires the 849 MB source at runtime.
+makes it a runtime cost rather than a shipping format. `--export mtp-head=DIR`
+runs that same transform offline and writes the result as a file an install can
+ship, so speculation no longer requires the 849 MB source at runtime.
 
 Prebuilt copies are published for both encodings:
 
@@ -213,14 +218,15 @@ To build it yourself instead:
 ```bash
 target/release/local-ai bonsai \
   --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export-mtp-head models/bonsai2-27b-mtp
+  --export mtp-head=models/bonsai2-27b-mtp
 ```
 
 It writes `models/bonsai2-27b-mtp/mtp-head-int8-v2.bin`. No engine is started
 and no checkpoint is opened: the command locates the installed model directory
-only to find the head beside it, then transforms the head file alone. It is
-rejected in combination with `--json`, `--tokenize`, `--export-index`, or the
-other export flag.
+only to find the head beside it, then transforms the head file alone. `--export`
+takes one kind and accepts only `--model`, so it is rejected alongside any
+prompt, `--prompt-file`, `--json`, `--tokenize`, or sampling flag. The two head
+kinds are `--export mtp-head=DIR` and `--export mtp-head-zstd=DIR`.
 
 The artifact is **the bytes the loader already computes**, not a second
 quantization, so there is no quality trade-off to weigh. It is the transform a
@@ -231,8 +237,8 @@ an install ship the artifact and trust it.
 
 | Form | Bytes | Saving against the 849 MB source |
 | --- | ---: | ---: |
-| `--export-mtp-head`, `"compression":"stored"` | 425,263,104 | 49.9% |
-| `--export-mtp-head-zstd`, `"compression":"zstd"` | 355,837,652 | 58.1% |
+| `--export mtp-head=DIR`, `"compression":"stored"` | 425,263,104 | 49.9% |
+| `--export mtp-head-zstd=DIR`, `"compression":"zstd"` | 355,837,652 | 58.1% |
 
 Both forms report the same identity, which is what makes them interchangeable:
 
@@ -247,9 +253,10 @@ layout. The filename is identical for both forms: the file's own magic records
 which encoding its sections are in, so the loader reads either without being
 told which to expect.
 
-`--export-mtp-head-zstd` writes the same file with its section region behind one
-zstd frame, at **level 19**. Level 19 is a measurement, not a default: on this
-payload level 22 measures 358,063,503 bytes and `--long=27` measures 355,688,546,
+`--export mtp-head-zstd=DIR` writes the same file with its section region behind
+one zstd frame, at **level 19**. Level 19 is a measurement, not a default: on
+this payload level 22 measures 358,063,503 bytes and `--long=27` measures
+355,688,546,
 both worse than level 19's 355,361,865. Widening the window does not help this
 data.
 
@@ -309,7 +316,7 @@ so the head is pinned even though its default now resolves:
 mkdir -p cache
 ./target/release/local-ai bonsai \
   --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export-index > cache/bonsai-index.json
+  --export index > cache/bonsai-index.json
 
 BONSAI_GGUF=$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
 BONSAI_MTP_HEAD=$PWD/models/bonsai2-27b-mtp/model_mtp.safetensors \

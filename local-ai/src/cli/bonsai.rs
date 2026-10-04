@@ -13,34 +13,65 @@ use crate::bonsai_ngram::NgramSettings;
 use crate::bonsai_tokenizer::BonsaiTokenizer;
 use crate::resources::{PREFILL_CHUNK, Resources};
 
+/// What `--export` writes instead of generating. The variants are the kinds as
+/// the command line names them, and the directory an export writes belongs to
+/// its kind, so `index` cannot be given one.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportKind {
+    Index,
+    MtpHead { dir: PathBuf, zstd: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum OutputMode {
     Stream,
     Json,
     Tokenize,
-    ExportIndex,
-    ExportMtpHead,
-    ExportMtpHeadZstd,
+    Export(ExportKind),
 }
 
-/// Output modes that decode nothing: they are mutually exclusive, and with a
-/// prompt, and with any sampling flag.
-const fn is_export(output: &OutputMode) -> bool {
-    matches!(
-        output,
-        OutputMode::ExportIndex | OutputMode::ExportMtpHead | OutputMode::ExportMtpHeadZstd
-    )
+/// The kinds `--export` accepts, for every message that has to name them.
+const EXPORT_KINDS: &str = "index, mtp-head=DIR, mtp-head-zstd=DIR";
+
+/// How an [`OutputMode::Export`] is spelled, for its error messages.
+const fn export_flag(kind: &ExportKind) -> &'static str {
+    match kind {
+        ExportKind::Index => "--export index",
+        ExportKind::MtpHead { zstd: false, .. } => "--export mtp-head=DIR",
+        ExportKind::MtpHead { zstd: true, .. } => "--export mtp-head-zstd=DIR",
+    }
 }
 
-/// The flag that selected an [`is_export`] mode, for its error messages.
-const fn export_flag(output: &OutputMode) -> &'static str {
-    match output {
-        OutputMode::ExportMtpHead => "--export-mtp-head",
-        OutputMode::ExportMtpHeadZstd => "--export-mtp-head-zstd",
-        _ => "--export-index",
+/// The `--export` grammar: a kind, with the directory it writes joined by `=`
+/// as `--export mtp-head=DIR`. A directory on a kind that writes no file is
+/// rejected rather than ignored, so `--export index=/tmp/x` cannot quietly do
+/// less than it was asked for.
+fn parse_export(requested: &str) -> Result<ExportKind, String> {
+    let (kind, dir) = requested
+        .split_once('=')
+        .map_or((requested, None), |(kind, dir)| (kind, Some(dir)));
+    match (kind, dir) {
+        ("", _) => Err(format!("--export requires a kind ({EXPORT_KINDS})")),
+        ("index", None) => Ok(ExportKind::Index),
+        ("index", Some(_)) => Err("--export index takes no directory".into()),
+        (kind @ ("mtp-head" | "mtp-head-zstd"), None) => {
+            Err(format!("--export {kind} requires =DIR"))
+        }
+        (kind @ ("mtp-head" | "mtp-head-zstd"), Some("")) => {
+            Err(format!("--export {kind} requires a non-empty =DIR"))
+        }
+        (kind @ ("mtp-head" | "mtp-head-zstd"), Some(dir)) => Ok(ExportKind::MtpHead {
+            dir: PathBuf::from(dir),
+            zstd: kind == "mtp-head-zstd",
+        }),
+        (kind, _) => Err(format!(
+            "unknown --export kind: {kind} (expected {EXPORT_KINDS})"
+        )),
     }
 }
 
 #[allow(clippy::struct_excessive_bools)]
+#[derive(Debug)]
 struct Args {
     model: PathBuf,
     max_tokens: usize,
@@ -48,9 +79,9 @@ struct Args {
     prompt_file: Option<PathBuf>,
     raw: bool,
     thinking: bool,
+    no_thinking: bool,
     greedy: bool,
     output: OutputMode,
-    export_dir: Option<PathBuf>,
     model_explicit: bool,
     no_speculation: bool,
 }
@@ -62,20 +93,23 @@ fn usage() {
     eprintln!("  --max-tokens N     Output cap (default: 8192)");
     eprintln!("  --prompt-file PATH Read a long UTF-8 prompt instead of positional text");
     eprintln!("  --raw              No chat template");
-    eprintln!("  --thinking         Checkpoint's xhigh thinking (default)");
-    eprintln!("  --no-thinking      Skip thinking; lower reasoning quality in our checks");
+    eprintln!("  --no-thinking      Skip the checkpoint's xhigh reasoning (default: on);");
+    eprintln!("                     lower reasoning quality in our checks");
     eprintln!("  --greedy           Disable sampling for reference comparisons");
     eprintln!("  --json             Emit token IDs, stop reason, and measured timings");
     eprintln!("  --tokenize         Emit prompt token IDs without loading the model");
-    eprintln!("  --export-index     Emit the checked GGUF index JSON");
-    eprintln!("  --export-mtp-head DIR");
-    eprintln!("                     Quantize the MTP head to DIR/mtp-head-int8-v2.bin");
-    eprintln!("                     (no engine, no checkpoint: head file only)");
-    eprintln!("  --export-mtp-head-zstd DIR");
-    eprintln!("                     Same artifact, zstd level 19: 16.3% smaller on the");
-    eprintln!("                     wire, byte-identical once inflated. Costs ~425 MB");
-    eprintln!("                     of anonymous RAM at load, so the stored form is");
-    eprintln!("                     what discovery prefers.");
+    eprintln!("  --export KIND      Write an artifact instead of generating; accepts");
+    eprintln!("                     only --model. Kinds:");
+    eprintln!("                       index");
+    eprintln!("                         emit the checked GGUF index JSON on stdout");
+    eprintln!("                       mtp-head=DIR");
+    eprintln!("                         quantize the MTP head to DIR/mtp-head-int8-v2.bin");
+    eprintln!("                         (no engine, no checkpoint: head file only)");
+    eprintln!("                       mtp-head-zstd=DIR");
+    eprintln!("                         same artifact, zstd level 19: 16.3% smaller on the");
+    eprintln!("                         wire, byte-identical once inflated. Costs ~425 MB");
+    eprintln!("                         of anonymous RAM at load, so the stored form is");
+    eprintln!("                         what discovery prefers.");
     eprintln!("  --no-speculation   A/B baseline: disable MTP and suffix lookup");
 }
 
@@ -88,14 +122,13 @@ fn parse(args: &[String]) -> Result<Args, String> {
         prompt_file: None,
         raw: false,
         thinking: true,
+        no_thinking: false,
         greedy: false,
         output: OutputMode::Stream,
-        export_dir: None,
         model_explicit: false,
         no_speculation: false,
     };
     let mut positional = Vec::new();
-    let mut thinking_override = None;
     let mut index = 0;
     while index < args.len() {
         if matches!(
@@ -119,11 +152,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             return Err(format!("unknown option: {}", args[index]));
         }
         match args[index].as_str() {
-            "--model"
-            | "--max-tokens"
-            | "--prompt-file"
-            | "--export-mtp-head"
-            | "--export-mtp-head-zstd" => {
+            "--model" | "--max-tokens" | "--prompt-file" => {
                 let flag = args[index].as_str();
                 index += 1;
                 let value = args
@@ -135,60 +164,55 @@ fn parse(args: &[String]) -> Result<Args, String> {
                         result.model_explicit = true;
                     }
                     "--prompt-file" => result.prompt_file = Some(PathBuf::from(value)),
-                    "--max-tokens" => {
+                    _ => {
                         result.max_tokens = value.parse().map_err(|_| "invalid --max-tokens")?;
                     }
-                    flag @ ("--export-mtp-head" | "--export-mtp-head-zstd") => {
-                        let compressed = flag == "--export-mtp-head-zstd";
-                        if !matches!(result.output, OutputMode::Stream) {
-                            return Err(format!(
-                                "{flag} is incompatible with \
-                                 --json/--tokenize/--export-index/--export-mtp-head/--export-mtp-head-zstd"
-                            ));
-                        }
-                        result.export_dir = Some(PathBuf::from(value));
-                        result.output = if compressed {
-                            OutputMode::ExportMtpHeadZstd
-                        } else {
-                            OutputMode::ExportMtpHead
-                        };
-                    }
-                    _ => unreachable!(),
                 }
             }
             "--raw" => result.raw = true,
             "--no-speculation" => result.no_speculation = true,
-            "--thinking" => thinking_override = Some(true),
-            "--no-thinking" => thinking_override = Some(false),
+            "--no-thinking" => result.no_thinking = true,
             "--greedy" => result.greedy = true,
             "--json" => {
-                if is_export(&result.output) {
-                    return Err(format!(
-                        "--json is incompatible with {}",
-                        export_flag(&result.output)
-                    ));
+                if let OutputMode::Export(kind) = &result.output {
+                    return Err(format!("--json is incompatible with {}", export_flag(kind)));
                 }
                 if !matches!(result.output, OutputMode::Tokenize) {
                     result.output = OutputMode::Json;
                 }
             }
             "--tokenize" => {
-                if is_export(&result.output) {
+                if let OutputMode::Export(kind) = &result.output {
                     return Err(format!(
                         "--tokenize is incompatible with {}",
-                        export_flag(&result.output)
+                        export_flag(kind)
                     ));
                 }
                 result.output = OutputMode::Tokenize;
             }
-            "--export-index" => {
-                if !matches!(result.output, OutputMode::Stream) {
-                    return Err(
-                        "--export-index is incompatible with --json/--tokenize/--export-mtp-head"
-                            .into(),
-                    );
+            flag if flag == "--export" || flag.starts_with("--export=") => {
+                let requested = match flag.strip_prefix("--export=") {
+                    Some(kind) => kind,
+                    None => {
+                        index += 1;
+                        args.get(index).filter(|value| !value.starts_with('-'))
+                    }
+                    .ok_or_else(|| format!("--export requires a kind ({EXPORT_KINDS})"))?,
+                };
+                let kind = parse_export(requested)?;
+                let claimed = match &result.output {
+                    OutputMode::Stream => None,
+                    OutputMode::Json => Some("--json"),
+                    OutputMode::Tokenize => Some("--tokenize"),
+                    OutputMode::Export(previous) => Some(export_flag(previous)),
+                };
+                if let Some(claimed) = claimed {
+                    return Err(format!(
+                        "{} is incompatible with {claimed}",
+                        export_flag(&kind)
+                    ));
                 }
-                result.output = OutputMode::ExportIndex;
+                result.output = OutputMode::Export(kind);
             }
             "--help" | "-h" => return Err(String::new()),
             "--" => {
@@ -200,28 +224,51 @@ fn parse(args: &[String]) -> Result<Args, String> {
         }
         index += 1;
     }
-    if result.raw && thinking_override == Some(true) {
-        return Err("--thinking requires the chat template, not --raw".into());
-    }
-    result.thinking = !result.raw && thinking_override.unwrap_or(true);
-    if is_export(&result.output) {
+    result.thinking = !result.raw && !result.no_thinking;
+    if let OutputMode::Export(kind) = &result.output {
         if !positional.is_empty()
             || result.prompt_file.is_some()
             || result.raw
-            || thinking_override.is_some()
+            || result.no_thinking
             || result.greedy
             || result.max_tokens != crate::DEFAULT_MAX_OUTPUT_TOKENS
         {
-            return Err(format!(
-                "{} accepts only --model",
-                export_flag(&result.output)
-            ));
+            return Err(format!("{} accepts only --model", export_flag(kind)));
         }
     } else if positional.is_empty() == result.prompt_file.is_none() {
         return Err("supply a prompt or --prompt-file, not both".into());
     }
     result.prompt = positional.join(" ");
     Ok(result)
+}
+
+/// Writes the artifact an [`ExportKind`] names and returns. Neither kind opens
+/// the engine: `index` checks the GGUF, and the head kinds transform the head
+/// file alone.
+fn export(resources: &Resources, kind: &ExportKind) -> crate::Result<()> {
+    match kind {
+        ExportKind::Index => {
+            let package = BonsaiPackage::open(&resources.model)?;
+            validate_profile(&package)?;
+            println!("{}", package.export_index(&resources.model)?);
+        }
+        ExportKind::MtpHead { dir, zstd } => {
+            let source = resources.mtp_source.as_deref().ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "no BF16 MTP head found beside {}; exporting quantizes it",
+                    resources.model.display()
+                ))
+            })?;
+            // No engine and no checkpoint: this transforms the head file alone.
+            let artifact = if *zstd {
+                local_engine::export_head_zstd(source, dir)?
+            } else {
+                local_engine::export_head(source, dir)?
+            };
+            println!("{}", json!(artifact));
+        }
+    }
+    Ok(())
 }
 
 /// Speculation head and depth for the JSON record, when enabled.
@@ -238,36 +285,8 @@ fn run(args: &Args) -> crate::Result<()> {
         args.model_explicit.then_some(args.model.as_path()),
         !args.no_speculation,
     )?;
-    if matches!(args.output, OutputMode::ExportIndex) {
-        let package = BonsaiPackage::open(&resources.model)?;
-        validate_profile(&package)?;
-        println!("{}", package.export_index(&resources.model)?);
-        return Ok(());
-    }
-    if matches!(
-        args.output,
-        OutputMode::ExportMtpHead | OutputMode::ExportMtpHeadZstd
-    ) {
-        let directory = args.export_dir.as_deref().ok_or_else(|| {
-            crate::Error::InvalidArgument(format!(
-                "{} requires a directory",
-                export_flag(&args.output)
-            ))
-        })?;
-        let source = resources.mtp_source.as_deref().ok_or_else(|| {
-            crate::Error::InvalidArgument(format!(
-                "no BF16 MTP head found beside {}; exporting quantizes it",
-                resources.model.display()
-            ))
-        })?;
-        // No engine and no checkpoint: this transforms the head file alone.
-        let artifact = if matches!(args.output, OutputMode::ExportMtpHeadZstd) {
-            local_engine::export_head_zstd(source, directory)?
-        } else {
-            local_engine::export_head(source, directory)?
-        };
-        println!("{}", json!(artifact));
-        return Ok(());
+    if let OutputMode::Export(kind) = &args.output {
+        return export(&resources, kind);
     }
     let text = args
         .prompt_file
@@ -426,5 +445,155 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+
+    #[test]
+    fn export_kinds_select_their_mode() {
+        for (command, kind) in [
+            ("--export index", ExportKind::Index),
+            ("--export=index", ExportKind::Index),
+            (
+                "--export mtp-head=/tmp/head",
+                ExportKind::MtpHead {
+                    dir: PathBuf::from("/tmp/head"),
+                    zstd: false,
+                },
+            ),
+            (
+                "--export mtp-head-zstd=/tmp/head",
+                ExportKind::MtpHead {
+                    dir: PathBuf::from("/tmp/head"),
+                    zstd: true,
+                },
+            ),
+            (
+                "--export=mtp-head-zstd=/tmp/head",
+                ExportKind::MtpHead {
+                    dir: PathBuf::from("/tmp/head"),
+                    zstd: true,
+                },
+            ),
+        ] {
+            let parsed = parse(&args(&command.split(' ').collect::<Vec<_>>())).expect(command);
+            assert_eq!(parsed.output, OutputMode::Export(kind), "{command}");
+        }
+        let with_model =
+            parse(&args(&["--export", "index", "--model", "/tmp/model.gguf"])).expect("model");
+        assert_eq!(with_model.output, OutputMode::Export(ExportKind::Index));
+        assert!(with_model.model_explicit);
+    }
+
+    #[test]
+    fn export_grammar_errors() {
+        for (input, expected) in [
+            (
+                vec!["--export", "index=/tmp/head"],
+                "--export index takes no directory",
+            ),
+            (
+                vec!["--export", "mtp-head"],
+                "--export mtp-head requires =DIR",
+            ),
+            (
+                vec!["--export", "mtp-head="],
+                "--export mtp-head requires a non-empty =DIR",
+            ),
+            (
+                vec!["--export", "mtp-head-zstd"],
+                "--export mtp-head-zstd requires =DIR",
+            ),
+            (
+                vec!["--export", "foo"],
+                "unknown --export kind: foo (expected index, mtp-head=DIR, mtp-head-zstd=DIR)",
+            ),
+            (
+                vec!["--export=foo"],
+                "unknown --export kind: foo (expected index, mtp-head=DIR, mtp-head-zstd=DIR)",
+            ),
+            (
+                vec!["--export="],
+                "--export requires a kind (index, mtp-head=DIR, mtp-head-zstd=DIR)",
+            ),
+            (
+                vec!["--export"],
+                "--export requires a kind (index, mtp-head=DIR, mtp-head-zstd=DIR)",
+            ),
+            (
+                vec!["--export", "--json"],
+                "--export requires a kind (index, mtp-head=DIR, mtp-head-zstd=DIR)",
+            ),
+        ] {
+            let error = parse(&args(&input)).expect_err(&format!("{input:?}"));
+            assert_eq!(error, expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn export_refuses_anything_that_decodes() {
+        for (extra, expected) in [
+            (vec!["hello"], "--export index accepts only --model"),
+            (
+                vec!["--prompt-file", "/tmp/prompt.txt"],
+                "--export index accepts only --model",
+            ),
+            (
+                vec!["--max-tokens", "16"],
+                "--export index accepts only --model",
+            ),
+            (vec!["--greedy"], "--export index accepts only --model"),
+            (vec!["--raw"], "--export index accepts only --model"),
+            (vec!["--no-thinking"], "--export index accepts only --model"),
+            (vec!["--json"], "--json is incompatible with --export index"),
+            (
+                vec!["--tokenize"],
+                "--tokenize is incompatible with --export index",
+            ),
+        ] {
+            let mut input = vec!["--export", "index"];
+            input.extend(extra.iter().copied());
+            let error = parse(&args(&input)).expect_err(&format!("{extra:?}"));
+            assert_eq!(error, expected, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn export_is_incompatible_with_the_other_output_modes() {
+        for (input, expected) in [
+            (
+                vec!["--json", "--export", "index"],
+                "--export index is incompatible with --json",
+            ),
+            (
+                vec!["--tokenize", "--export", "index"],
+                "--export index is incompatible with --tokenize",
+            ),
+            (
+                vec!["--export", "mtp-head=/tmp/head", "--export", "index"],
+                "--export index is incompatible with --export mtp-head=DIR",
+            ),
+        ] {
+            let error = parse(&args(&input)).expect_err(&format!("{input:?}"));
+            assert_eq!(error, expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn thinking_is_not_a_flag_because_it_already_is_the_default() {
+        assert_eq!(
+            parse(&args(&["--thinking", "hello"])).expect_err("rejected"),
+            "unknown option: --thinking"
+        );
+        let raw = parse(&args(&["--raw", "--no-thinking", "hello"])).expect("raw");
+        assert!(!raw.thinking);
     }
 }

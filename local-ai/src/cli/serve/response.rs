@@ -1,4 +1,6 @@
 use std::io::Cursor;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -54,15 +56,78 @@ const RETRY_AFTER_SECONDS: u32 = 1;
 const JSON_ENCODE_FAILED: &[u8] =
     b"{\"error\":{\"message\":\"JSON encoding failed\",\"type\":\"server_error\"}}";
 
+/// How long the collector may wait for the next event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EventWait {
+    /// No deadline at all, used for the first event.
+    Unbounded,
+    /// The stall budget, used once the engine has shown it is producing.
+    Bounded(Duration),
+}
+
+/// The wait to give the next event of a non-streaming collection.
+///
+/// The first event is deliberately unbounded, and the stall budget starts only
+/// once it has arrived. Nothing is emitted during prefill, `PREFILL_CHUNK` is
+/// 128 and this M2 prefills at 3.6-4.2 tok/s, so one prefill chunk is about
+/// 35 s of complete silence, and a prompt over 128 tokens is ordinary. A stall
+/// means the engine was producing and the client stopped consuming, which is
+/// only knowable after the first event; a slow first token is the model
+/// working. Putting a deadline on the first wait would cancel long prefills
+/// that were never stalled, so `Unbounded` is a separate outcome here rather
+/// than a large timeout that would quietly become one.
+pub(super) const fn event_wait(first_seen: bool, stall: Duration) -> EventWait {
+    if first_seen {
+        EventWait::Bounded(stall)
+    } else {
+        EventWait::Unbounded
+    }
+}
+
+/// Collect a whole response, bounding the wait for each event after the first.
+///
+/// This path cannot see a client disconnect: the body is buffered here and
+/// written once at the end, so the engine is never backpressured and it keeps
+/// generating for a socket nobody is reading. What it can bound is a
+/// generation that has stopped producing, which is the same engine-side
+/// silence the streaming path treats as a stall.
 pub(super) fn collect_response(
-    events: EventStream,
+    mut events: EventStream,
     chat: bool,
     model: &str,
+    stall: Duration,
 ) -> Result<Value, String> {
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut stats = None;
-    for event in events {
+    let mut first_seen = false;
+    loop {
+        let event = match event_wait(first_seen, stall) {
+            EventWait::Unbounded => events.next(),
+            EventWait::Bounded(budget) => match events.next_timeout(budget) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => {
+                    // Dropping `events` cancels too, but setting the handle
+                    // first stops the engine without waiting for the unwind.
+                    events.cancel_handle().cancel();
+                    eprintln!(
+                        "dropping request: no event for {}s after the first token, so the \
+                         generation is cancelled and the queue slot released",
+                        budget.as_secs()
+                    );
+                    return Err(format!(
+                        "generation stalled: no event for {}s after the first token, so it \
+                         was cancelled",
+                        budget.as_secs()
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => None,
+            },
+        };
+        let Some(event) = event else {
+            break;
+        };
+        first_seen = true;
         match event {
             Event::Content(piece) => content.push_str(&piece),
             Event::Reasoning(piece) => reasoning.push_str(&piece),

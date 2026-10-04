@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -43,12 +44,15 @@ use self::sse::start_stream;
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
+#[derive(Debug)]
 struct Args {
     model: Option<PathBuf>,
     host: IpAddr,
     port: u16,
     thinking: bool,
     api_key: Option<String>,
+    /// How long a client may stop consuming before its generation is dropped.
+    stall: Duration,
 }
 
 #[derive(Clone)]
@@ -59,6 +63,8 @@ struct AppState {
     api_key: Option<Arc<str>>,
     alt_svc: Option<Arc<str>>,
     depth: QueueDepth,
+    /// How long a client may stop consuming before its generation is dropped.
+    stall: Duration,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -201,7 +207,15 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     };
     let admitted = state.depth.admit();
     if prepared.stream {
-        match start_stream(events, chat, Arc::clone(&state.model), admitted).await {
+        match start_stream(
+            events,
+            chat,
+            Arc::clone(&state.model),
+            admitted,
+            state.stall,
+        )
+        .await
+        {
             Ok(events) => {
                 let mut response = Response::new(Body::from_stream(ReceiverStream::new(events)));
                 response.headers_mut().insert(
@@ -221,7 +235,10 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         }
     } else {
         let model = Arc::clone(&state.model);
-        match tokio::task::spawn_blocking(move || collect_response(events, chat, &model)).await {
+        let stall = state.stall;
+        match tokio::task::spawn_blocking(move || collect_response(events, chat, &model, stall))
+            .await
+        {
             Ok(Ok(value)) => json_response(StatusCode::OK, value, &state, &parts.headers).await,
             Ok(Err(error)) => {
                 error_response(error_status_message(&error), &error, &state, &parts.headers).await
@@ -254,6 +271,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
             .as_ref()
             .map(|_| Arc::from(format!("h3=\":{}\"; ma=86400", args.port))),
         depth: QueueDepth::default(),
+        stall: args.stall,
     };
     let address = SocketAddr::new(args.host, args.port);
     let h3_task = if let Some((cert, key)) = resources.tls {

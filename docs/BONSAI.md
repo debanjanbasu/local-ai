@@ -14,7 +14,7 @@ embedding, norms, and other tensors remain in their checkpoint types. The GGUF
 is memory-mapped and exposed to Metal without copying the complete file.
 
 The runtime checks the architecture, tensor names, shapes, types, byte ranges,
-alignment, file size, and SHA256 before inference. `bonsai --export-index`
+alignment, file size, and SHA256 before inference. `bonsai --export index`
 emits the validated metadata and tokenizer index as JSON.
 
 ### MTP head
@@ -32,23 +32,23 @@ rebuilt rather than reused.
 #### The int8 head artifact
 
 That cache was a runtime cost rather than a shipping format, so the same
-transform is also available offline. `local-ai bonsai --export-mtp-head DIR`
-writes `DIR/mtp-head-int8-v2.bin`, and `--export-mtp-head-zstd DIR` writes the
+transform is also available offline. `local-ai bonsai --export mtp-head=DIR`
+writes `DIR/mtp-head-int8-v2.bin`, and `--export mtp-head-zstd=DIR` writes the
 same filename with its section region behind one zstd frame. The export starts
 no engine and opens no checkpoint: it locates the installed model directory only
 to find the head beside it, then transforms the head file alone, so it needs no
 GPU, no second copy of the transform, and no memory for the target. The model
 path must still be discoverable, since that directory is what says where the
-head is. It is rejected alongside `--json`, `--tokenize`, `--export-index`, or
-the other export flag.
+head is. `--export` accepts only `--model`: it is rejected alongside any prompt,
+`--prompt-file`, `--json`, `--tokenize`, or sampling flag.
 
 ```bash
 target/release/local-ai bonsai \
   --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export-mtp-head models/bonsai2-27b-mtp
+  --export mtp-head=models/bonsai2-27b-mtp
 target/release/local-ai bonsai \
   --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export-mtp-head-zstd models/bonsai2-27b-mtp
+  --export mtp-head-zstd=models/bonsai2-27b-mtp
 ```
 
 Discovery finds `models/bonsai2-27b-mtp/mtp-head-int8-v2.bin` beside the pinned
@@ -64,8 +64,8 @@ trade-off between the two forms: they hash the same.
 
 | Form | Bytes on disk | `compression` | Install saving |
 | --- | ---: | --- | ---: |
-| `--export-mtp-head` | 425,263,104 | `stored` | 49.9% |
-| `--export-mtp-head-zstd` | 355,837,652 | `zstd` | 58.1% |
+| `--export mtp-head=DIR` | 425,263,104 | `stored` | 49.9% |
+| `--export mtp-head-zstd=DIR` | 355,837,652 | `zstd` | 58.1% |
 
 Both forms save against the 849,400,392-byte BF16 source; the compressed form is
 a further 16.325% below the stored one.
@@ -119,8 +119,7 @@ is the best ratio on JSON bodies. Widening the window does not help here.
 local-ai chat [options] <prompt>
   --model PATH       override model discovery
   --max-tokens N     output cap (default 8192)
-  --thinking         xhigh reasoning (default)
-  --no-thinking      disable reasoning
+  --no-thinking      skip the checkpoint's xhigh reasoning (default on)
   --greedy           disable sampling
   --raw              skip the chat template
 
@@ -130,34 +129,36 @@ local-ai serve [options]
   --port N           TCP and UDP port (default 8080)
   --api-key KEY      require Bearer authentication
   --no-thinking      disable reasoning
+  --stall-timeout N  drop a generation whose client stopped reading; seconds,
+                     default 30, accepted 10 to 3600
 
 local-ai bonsai [options] <prompt>
   --model PATH       override model discovery
   --max-tokens N     output cap (default 8192)
   --prompt-file PATH read a UTF-8 prompt instead of positional text
   --raw              skip the chat template
-  --thinking         xhigh reasoning (default)
-  --no-thinking      disable reasoning
+  --no-thinking      skip the checkpoint's xhigh reasoning (default on)
   --greedy           disable sampling
   --json             return token IDs and measured timings
   --tokenize         emit prompt token IDs without loading weights
-  --export-index     emit checked GGUF index JSON; accepts only --model
-  --export-mtp-head DIR
-                     write the int8 MTP head artifact, sections stored
-  --export-mtp-head-zstd DIR
-                     same artifact behind one zstd frame; ~425 MB resident RAM
+  --export KIND      write an artifact instead of generating; accepts only
+                     --model. Kinds: index, mtp-head=DIR, mtp-head-zstd=DIR
   --no-speculation   disable both MTP and suffix lookup for comparison
 ```
 
 `chat` and `bonsai` stream text to stdout. Startup policy JSON goes to stderr.
-Raw mode cannot be combined with reasoning mode. Use `--` before prompt text
-that starts with a hyphen.
+`--no-thinking` skips the checkpoint's xhigh reasoning, which is on by default;
+there is no flag to turn it back on, since it is already on. `--raw` drops the
+chat template that reasoning is asked inside. Use `--` before prompt text that
+starts with a hyphen.
 
-The three export flags are mutually exclusive, decode nothing, and take no
-prompt. `--export-mtp-head` and `--export-mtp-head-zstd` need only the BF16 head
-beside the checkpoint: neither starts an engine nor opens the GGUF, and each
-prints the artifact record as JSON. Both write `DIR/mtp-head-int8-v2.bin` and
-overwrite whatever was there.
+`--export` takes one kind, so passing it twice is an error rather than a choice
+between two exports. Every kind decodes nothing and takes no prompt. `index`
+writes no file and therefore takes no directory; `mtp-head=DIR` and
+`mtp-head-zstd=DIR` need only the BF16 head beside the checkpoint, since neither
+starts an engine nor opens the GGUF, and each prints the artifact record as JSON.
+Both head kinds write `DIR/mtp-head-int8-v2.bin` and overwrite whatever was
+there.
 
 ## Server API
 
@@ -189,7 +190,48 @@ dictionary was measured for this path and rejected; see
 The engine processes one generation at a time through an eight-slot queue.
 Submission to a full queue fails immediately. Dropping an `EventStream`, using
 its cancellation handle, or disconnecting a streaming client cooperatively
-cancels queued or running generation.
+cancels queued or running generation. A reset and a graceful close are both
+detected and release the engine promptly — a graceful close was caught after
+only 3,544 bytes — so `--stall-timeout` covers the one case neither of them
+reports: a client that stops reading while holding the socket open.
+
+`--stall-timeout` bounds how long a response may go without the server being
+able to hand it a frame. A client can stop reading its socket without closing
+it — a stalled network, a dead consumer, a client that wandered off — and
+neither TCP nor axum signals that. Left alone, the send path blocks, the engine
+worker blocks inside its emit callback upstream of every cancellation
+checkpoint, and the single-flight engine holds its queue slot indefinitely, so
+nothing else can be served. When the budget is exceeded the server logs, cancels
+that generation, releases the queue slot, and drops the request, leaving the
+engine free for the next client. The default is 30 seconds; a value outside
+10 to 3600 inclusive, or one that is not a whole number of seconds, is refused
+at startup.
+
+One flag governs two different clocks. On a streaming response it is a
+consumer-liveness budget, and a small value is safe there because the server
+only produces a frame when the engine emits one. On a non-streaming response the
+same number is a producer-liveness budget instead, and the engine's own gaps
+between events are not small, so the floor comes from a measurement rather than
+from taste; see [Tried and rejected](#tried-and-rejected).
+
+The budget starts only after the first event arrives, so it does not bound
+time-to-first-token. Nothing is emitted during prefill, the prefill chunk is 128
+tokens, and this class of machine prefills at roughly 3.6-4.2 tok/s, so one
+chunk is about 35 seconds of silence that is entirely healthy. A budget that
+included prefill would abandon ordinary long prompts.
+
+Two limits are worth stating plainly. On streaming, the clock starts late by
+construction: a client must first fill the socket buffers before the server feels
+backpressure. Measured on an M2, the server absorbed 564,550 bytes (551.3 KiB)
+before the stall began, and SSE frames average 194.9 bytes, so roughly 2,900
+tokens are generated first. Reclaim time is therefore time to fill the socket
+buffers plus the budget, not the budget counted from the request. The buffer
+ceiling is autotuned rather than fixed, and 4 MiB is the observed autotune
+maximum on that machine. Second, a non-streaming client that vanishes cannot be
+detected: the body does not exist until generation finishes, so there is no
+disconnect signal to observe, and the budget is producer-liveness only. One such
+client was measured burning 706 seconds of engine time before the request
+completed.
 
 ## Resource policy
 
@@ -339,6 +381,13 @@ is the main limit.
 - Compressing the 5,946,648,928-byte PTQ1 GGUF: the measured ceiling is 1.074x
   and the best measured result 1.29%, so the checkpoint is not a compression
   target. Only the int8 head is, which is why it ships in two encodings.
+- A rounder `--stall-timeout` floor: the same number bounds a consumer-liveness
+  budget on a streaming response and a producer-liveness budget on a
+  non-streaming one, and the latter is set by the engine's own inter-event gaps.
+  A speculative round measured 3.076 s, p95 0.728 s, on a six-token prompt on an
+  M2, so a budget below that abandons healthy non-streaming requests. The floor
+  is 10 rather than a rounder number because it sits an order of magnitude above
+  the worst gap actually observed.
 
 ## Verification
 
@@ -357,7 +406,7 @@ Create the checked index used by tokenizer tests:
 ```bash
 target/release/local-ai bonsai \
   --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export-index > cache/bonsai-index.json
+  --export index > cache/bonsai-index.json
 ```
 
 Ignored real-model tests use absolute paths supplied by these variables:
