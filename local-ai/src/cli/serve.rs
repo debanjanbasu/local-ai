@@ -1,0 +1,315 @@
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode, header};
+use axum::response::Response;
+use axum::{Router, routing::any};
+use http_body_util::BodyExt;
+use serde_json::json;
+use tokio_stream::wrappers::ReceiverStream;
+
+use local_engine::{Engine, EngineHandle};
+
+use crate::resources::Resources;
+
+mod http3;
+mod options;
+mod request;
+mod response;
+mod sse;
+
+#[cfg(test)]
+use self::request::message_text;
+#[cfg(test)]
+use self::response::wants_zstd;
+#[cfg(test)]
+use axum::http::HeaderMap;
+#[cfg(test)]
+use local_engine::Event;
+
+use self::http3::serve_h3;
+use self::options::{parse, usage};
+use self::request::{GenerationRequest, prepare_generation};
+use self::response::{
+    add_alt_svc, collect_response, error_response, error_status, error_status_message,
+    json_response, queue_full_response,
+};
+use self::sse::start_stream;
+
+const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+
+struct Args {
+    model: Option<PathBuf>,
+    host: IpAddr,
+    port: u16,
+    thinking: bool,
+    api_key: Option<String>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    engine: EngineHandle,
+    model: Arc<str>,
+    thinking: bool,
+    api_key: Option<Arc<str>>,
+    alt_svc: Option<Arc<str>>,
+    depth: QueueDepth,
+}
+
+/// Requests the engine has accepted and not finished yet: the queue depth as
+/// this server sees it.
+///
+/// It cannot be read off the engine, because `try_send` reports only that the
+/// queue was full, and it is only ever read to explain a rejection, so it is
+/// tracked here. Every job reaching the queue comes through this module, so it
+/// counts queued and running requests together.
+#[derive(Clone, Default)]
+struct QueueDepth(Arc<AtomicUsize>);
+
+impl QueueDepth {
+    fn load(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Take a queue slot. The returned guard releases it on drop, so an early
+    /// return, a failed generation and a disconnected client all release it.
+    fn admit(&self) -> Admitted {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Admitted(Arc::clone(&self.0))
+    }
+}
+
+struct Admitted(Arc<AtomicUsize>);
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn route(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    if let Some(expected) = &state.api_key {
+        let valid = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|value| value == expected.as_ref());
+        if !valid {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid API key",
+                &state,
+                &parts.headers,
+            )
+            .await;
+        }
+    }
+    if parts.method == Method::GET && parts.uri.path() == "/health" {
+        return json_response(
+            StatusCode::OK,
+            json!({"status":"ok"}),
+            &state,
+            &parts.headers,
+        )
+        .await;
+    }
+    if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
+        return json_response(
+            StatusCode::OK,
+            json!({"object":"list","data":[{"id":state.model.as_ref(),"object":"model","owned_by":"local"}]}),
+            &state,
+            &parts.headers,
+        )
+        .await;
+    }
+    let chat = match (parts.method, parts.uri.path()) {
+        (Method::POST, "/v1/chat/completions") => true,
+        (Method::POST, "/v1/completions") => false,
+        _ => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "route not found",
+                &state,
+                &parts.headers,
+            )
+            .await;
+        }
+    };
+    let body = match body.collect().await {
+        Ok(value) => {
+            let value = value.to_bytes();
+            if value.len() <= MAX_REQUEST_BYTES {
+                value.to_vec()
+            } else {
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "HTTP request is too large",
+                    &state,
+                    &parts.headers,
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid HTTP body: {error}"),
+                &state,
+                &parts.headers,
+            )
+            .await;
+        }
+    };
+    let prepared = match prepare_generation(&body, chat, state.thinking) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return error_response(
+                error_status(&error),
+                &error.to_string(),
+                &state,
+                &parts.headers,
+            )
+            .await;
+        }
+    };
+    let events = match prepared.request {
+        GenerationRequest::Chat(request) => state.engine.chat(request),
+        GenerationRequest::Completion(request) => state.engine.complete(request),
+    };
+    let events = match events {
+        Ok(events) => events,
+        Err(error) => {
+            if matches!(error, crate::Error::QueueFull) {
+                return queue_full_response(&state, &parts.headers).await;
+            }
+            return error_response(
+                error_status(&error),
+                &error.to_string(),
+                &state,
+                &parts.headers,
+            )
+            .await;
+        }
+    };
+    let admitted = state.depth.admit();
+    if prepared.stream {
+        match start_stream(events, chat, Arc::clone(&state.model), admitted).await {
+            Ok(events) => {
+                let mut response = Response::new(Body::from_stream(ReceiverStream::new(events)));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/event-stream"),
+                );
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("no-cache"),
+                );
+                add_alt_svc(&mut response, &state);
+                response
+            }
+            Err(error) => {
+                error_response(error_status_message(&error), &error, &state, &parts.headers).await
+            }
+        }
+    } else {
+        let model = Arc::clone(&state.model);
+        match tokio::task::spawn_blocking(move || collect_response(events, chat, &model)).await {
+            Ok(Ok(value)) => json_response(StatusCode::OK, value, &state, &parts.headers).await,
+            Ok(Err(error)) => {
+                error_response(error_status_message(&error), &error, &state, &parts.headers).await
+            }
+            Err(error) => {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("generation task failed: {error}"),
+                    &state,
+                    &parts.headers,
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn run_async(args: Args) -> crate::Result<()> {
+    let resources = Resources::discover(args.model.as_deref(), true)?;
+    let model: Arc<str> = resources.model.to_string_lossy().into_owned().into();
+    let engine = Engine::open_model(&resources.model)?;
+    eprintln!("{}", engine.info().json);
+    let state = AppState {
+        engine: engine.into_handle(),
+        model,
+        thinking: args.thinking,
+        api_key: args.api_key.map(Into::into),
+        alt_svc: resources
+            .tls
+            .as_ref()
+            .map(|_| Arc::from(format!("h3=\":{}\"; ma=86400", args.port))),
+        depth: QueueDepth::default(),
+    };
+    let address = SocketAddr::new(args.host, args.port);
+    let h3_task = if let Some((cert, key)) = resources.tls {
+        Some(tokio::spawn(serve_h3(address, state.clone(), cert, key)))
+    } else {
+        None
+    };
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    eprintln!("Bonsai server listening on http://{address}");
+    let app = Router::new().fallback(any(route)).with_state(state);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown())
+        .await
+        .map_err(crate::Error::Io)?;
+    if let Some(task) = h3_task {
+        task.abort();
+    }
+    Ok(())
+}
+
+async fn shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+pub fn main_with_args(args: &[String]) -> ExitCode {
+    match parse(args) {
+        Ok(args) => match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => match runtime.block_on(run_async(args)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(error) => {
+                eprintln!("error: could not start Tokio runtime: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            if !error.is_empty() {
+                eprintln!("error: {error}");
+            }
+            usage();
+            if error.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests;

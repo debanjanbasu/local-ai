@@ -1,0 +1,7 @@
+[unstable]
+build-std = ["std", "panic_abort", "core", "alloc"]
+
+# M1 is the baseline so release binaries run on every Apple Silicon Mac; the
+# engine is GPU-bound, so newer CPU features add nothing measurable.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]

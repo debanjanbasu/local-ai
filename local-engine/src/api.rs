@@ -1,0 +1,652 @@
+//! Stable, synchronous library API.
+
+use std::cell::Cell;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures_core::Stream;
+use tokio::sync::mpsc as async_mpsc;
+
+use crate::bonsai_model::{BonsaiEngine, BonsaiInfo, CancelToken, PromptCacheSource, StopReason};
+use crate::bonsai_native::KvOptions;
+use crate::bonsai_ngram::NgramSettings;
+use crate::bonsai_tokenizer::{BonsaiTokenizer, ChatMessage as TokenizerMessage};
+use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
+use crate::runtime::EVENT_BUFFER;
+use crate::{GenerateParams, GenerationStats};
+
+const THINK_END: &str = "</think>";
+
+/// A role/content pair used by the checkpoint chat template.
+#[derive(Clone, Debug)]
+pub struct ChatMessage {
+    /// OpenAI-compatible role (`system`, `user`, or `assistant`).
+    pub role: String,
+    /// Visible message content.
+    pub content: String,
+    /// Optional prior assistant reasoning content.
+    pub reasoning_content: Option<String>,
+}
+
+/// Sampling controls for one generation.
+#[derive(Clone, Debug, Default)]
+pub struct Sampling(pub GenerateParams);
+
+/// A templated chat generation request.
+#[derive(Clone, Debug)]
+pub struct ChatRequest {
+    /// Conversation in chronological order.
+    pub messages: Vec<ChatMessage>,
+    /// Maximum number of generated tokens.
+    pub max_tokens: usize,
+    /// Sampling controls.
+    pub sampling: Sampling,
+    /// Whether to ask the model for xhigh reasoning.
+    pub thinking: bool,
+    /// Optional prompt-cache affinity hint.
+    pub session: Option<String>,
+}
+
+/// A raw-text generation request.
+#[derive(Clone, Debug)]
+pub struct CompletionRequest {
+    /// Prompt passed directly to the tokenizer.
+    pub prompt: String,
+    /// Maximum number of generated tokens.
+    pub max_tokens: usize,
+    /// Sampling controls.
+    pub sampling: Sampling,
+    /// Optional prompt-cache affinity hint.
+    pub session: Option<String>,
+}
+
+/// Typed automatic startup decisions.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    /// Selected model path.
+    pub model: std::path::PathBuf,
+    /// Why this model was selected.
+    pub model_reason: String,
+    /// Whether an MTP head was selected.
+    pub speculation: bool,
+    /// Why speculation was enabled or disabled.
+    pub speculation_reason: String,
+    /// Selected disk prompt-cache directory.
+    pub prompt_cache_dir: Option<std::path::PathBuf>,
+    /// Disk prompt-cache budget in bytes.
+    pub prompt_cache_budget: u64,
+}
+
+/// Loaded engine information and startup policy.
+#[derive(Clone, Debug)]
+pub struct EngineInfo {
+    /// Resource-discovery decisions.
+    pub plan: Plan,
+    /// Model and memory decisions.
+    pub model: BonsaiInfo,
+    /// Existing machine-readable startup record.
+    pub json: serde_json::Value,
+}
+
+/// Final generation measurements.
+#[derive(Clone, Debug)]
+pub struct Stats {
+    /// Why generation stopped.
+    pub stop_reason: StopReason,
+    /// Prompt-cache tier used by the request.
+    pub cache_source: PromptCacheSource,
+    /// Token and speculation measurements.
+    pub generation: GenerationStats,
+}
+
+/// Collected response from the convenient synchronous chat API.
+#[derive(Clone, Debug)]
+pub struct ChatOutput {
+    /// Final answer, excluding model reasoning.
+    pub content: String,
+    /// Model reasoning emitted before the closing thinking delimiter.
+    pub reasoning: String,
+    /// Generated token IDs.
+    pub token_ids: Vec<u32>,
+    /// Generation measurements.
+    pub stats: Stats,
+}
+
+/// A generation stream item.
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// Visible assistant text.
+    Content(String),
+    /// Hidden reasoning text when the template exposes it separately.
+    Reasoning(String),
+    /// Generated token IDs, emitted as a batch before [`Event::Finished`].
+    TokenIds(Vec<u32>),
+    /// Successful terminal event.
+    Finished(Box<Stats>),
+    /// Terminal worker error.
+    Error(String),
+}
+
+/// Synchronous Metal inference engine.
+///
+/// It is `Send` but deliberately not `Sync`; use [`EngineHandle`] to share it.
+pub struct Engine {
+    inner: BonsaiEngine,
+    info: EngineInfo,
+    not_sync: std::marker::PhantomData<Cell<()>>,
+}
+
+// SAFETY: Metal command queues and resource objects may be transferred between
+// threads. `Engine` has exclusive ownership of every object and is deliberately
+// `!Sync`, so no command encoder or mutable model state is used concurrently.
+#[allow(unsafe_code)]
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for Engine {}
+
+impl Engine {
+    /// Discover all resources and load the installed pinned model.
+    pub fn open() -> crate::Result<Self> {
+        Self::open_inner(None)
+    }
+
+    /// Load an explicit model while auto-discovering every other resource.
+    pub fn open_model(path: impl AsRef<Path>) -> crate::Result<Self> {
+        Self::open_inner(Some(path.as_ref()))
+    }
+
+    fn open_inner(path: Option<&Path>) -> crate::Result<Self> {
+        let resources = Resources::discover(path, true)?;
+        let mut inner = BonsaiEngine::open_with_options(
+            &resources.model,
+            None,
+            PREFILL_CHUNK,
+            None,
+            &resources.mtp,
+            NgramSettings::default(),
+            KvOptions::default(),
+        )?;
+        inner.configure_prompt_cache(
+            resources.prompt_cache_dir.clone(),
+            resources.disk_budget_bytes,
+            resources.prompt_cache_write_bytes_per_second,
+        )?;
+        let plan = Plan {
+            model: resources.model.clone(),
+            model_reason: resources.model_reason.clone(),
+            speculation: inner.mtp_enabled(),
+            speculation_reason: resources.mtp_reason.clone(),
+            prompt_cache_dir: resources.prompt_cache_dir.clone(),
+            prompt_cache_budget: resources.disk_budget_bytes,
+        };
+        let model = inner.info().clone();
+        let json =
+            serde_json::json!({"experimental_bonsai":{"engine":model,"policy":resources.policy()}});
+        Ok(Self {
+            inner,
+            info: EngineInfo { plan, model, json },
+            not_sync: std::marker::PhantomData,
+        })
+    }
+
+    /// Return model and resource-discovery decisions.
+    pub const fn info(&self) -> &EngineInfo {
+        &self.info
+    }
+
+    /// Tokenize raw text.
+    pub fn tokenize(&self, text: &str) -> crate::Result<Vec<u32>> {
+        self.inner.encode_prompt(text, true, false)
+    }
+
+    /// Decode token IDs, omitting checkpoint special tokens.
+    pub fn detokenize(&self, ids: &[u32]) -> crate::Result<String> {
+        self.inner.decode_tokens(ids)
+    }
+
+    /// Render messages through the checkpoint's chat template.
+    pub fn render_chat(messages: &[ChatMessage], thinking: bool) -> crate::Result<String> {
+        let borrowed = messages
+            .iter()
+            .map(|message| TokenizerMessage {
+                role: &message.role,
+                content: &message.content,
+                reasoning_content: message.reasoning_content.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        BonsaiTokenizer::chat_messages(&borrowed, thinking)
+    }
+
+    /// Chat with one user prompt and collect the final answer and statistics.
+    ///
+    /// ```no_run
+    /// let mut engine = local_engine::Engine::open()?;
+    /// let answer = engine.chat("What is 17 * 23?")?;
+    /// println!("{}", answer.content);
+    /// # Ok::<(), local_engine::Error>(())
+    /// ```
+    pub fn chat(&mut self, prompt: impl Into<String>) -> crate::Result<ChatOutput> {
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: prompt.into(),
+                reasoning_content: None,
+            }],
+            max_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
+            sampling: Sampling::default(),
+            thinking: true,
+            session: None,
+        };
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut token_ids = Vec::new();
+        let stats = self.chat_with(&request, |event| {
+            match event {
+                Event::Content(piece) => content.push_str(&piece),
+                Event::Reasoning(piece) => reasoning.push_str(&piece),
+                Event::TokenIds(ids) => token_ids = ids,
+                Event::Finished(_) | Event::Error(_) => {}
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(ChatOutput {
+            content,
+            reasoning,
+            token_ids,
+            stats,
+        })
+    }
+
+    /// Generate a chat response, stopping when the callback returns `Break`.
+    pub fn chat_with(
+        &mut self,
+        request: &ChatRequest,
+        callback: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> crate::Result<Stats> {
+        let cancel = CancelToken::default();
+        self.chat_with_cancel(request, &cancel, callback)
+    }
+
+    fn chat_with_cancel(
+        &mut self,
+        request: &ChatRequest,
+        cancel: &CancelToken,
+        callback: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> crate::Result<Stats> {
+        let prompt = Self::render_chat(&request.messages, request.thinking)?;
+        self.generate(
+            &prompt,
+            request.max_tokens,
+            &request.sampling,
+            request.session.as_deref(),
+            request.thinking,
+            cancel,
+            callback,
+        )
+    }
+
+    /// Generate a raw completion, stopping when the callback returns `Break`.
+    pub fn complete(
+        &mut self,
+        request: &CompletionRequest,
+        callback: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> crate::Result<Stats> {
+        let cancel = CancelToken::default();
+        self.complete_with_cancel(request, &cancel, callback)
+    }
+
+    fn complete_with_cancel(
+        &mut self,
+        request: &CompletionRequest,
+        cancel: &CancelToken,
+        callback: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> crate::Result<Stats> {
+        self.generate(
+            &request.prompt,
+            request.max_tokens,
+            &request.sampling,
+            request.session.as_deref(),
+            false,
+            cancel,
+            callback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        sampling: &Sampling,
+        session: Option<&str>,
+        thinking: bool,
+        cancel: &CancelToken,
+        mut callback: impl FnMut(Event) -> ControlFlow<()>,
+    ) -> crate::Result<Stats> {
+        let ids = self.inner.encode_prompt(prompt, true, false)?;
+        let mut params = sampling.0.clone();
+        params.max_tokens = max_tokens;
+        let mut splitter = EventSplitter::new(thinking);
+        let output = self.inner.generate_session_cancellable(
+            &ids,
+            &params,
+            session,
+            |piece| splitter.emit(piece, &mut callback).is_continue(),
+            cancel,
+        )?;
+        if splitter.finish(&mut callback).is_break() {
+            return Ok(Stats {
+                stop_reason: StopReason::Cancelled,
+                cache_source: output.cache_source,
+                generation: output.stats,
+            });
+        }
+        if callback(Event::TokenIds(output.token_ids.clone())).is_break() {
+            return Ok(Stats {
+                stop_reason: StopReason::Cancelled,
+                cache_source: output.cache_source,
+                generation: output.stats,
+            });
+        }
+        let stats = Stats {
+            stop_reason: output.stop_reason,
+            cache_source: output.cache_source,
+            generation: output.stats,
+        };
+        let _ = callback(Event::Finished(Box::new(stats.clone())));
+        Ok(stats)
+    }
+
+    /// Generate and collect only visible content.
+    pub fn generate_to_string(&mut self, request: &ChatRequest) -> crate::Result<String> {
+        let mut text = String::new();
+        self.chat_with(request, |event| {
+            if let Event::Content(piece) = event {
+                text.push_str(&piece);
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(text)
+    }
+
+    /// Move this engine to a dedicated worker thread.
+    pub fn into_handle(self) -> EngineHandle {
+        EngineHandle::new(self)
+    }
+}
+
+enum Job {
+    Chat(ChatRequest, async_mpsc::Sender<Event>, CancelToken),
+    Completion(CompletionRequest, async_mpsc::Sender<Event>, CancelToken),
+}
+
+/// Cloneable, thread-safe interface to a dedicated engine worker.
+///
+/// The job queue is bounded. Request methods are plain `&self` calls that work
+/// without an async runtime and hand back a blocking [`EventStream`], which is
+/// also a [`Stream`]; [`EngineHandle::chat_stream`] and
+/// [`EngineHandle::complete_stream`] name that intent at call sites.
+#[derive(Clone)]
+pub struct EngineHandle {
+    sender: async_mpsc::Sender<Job>,
+}
+
+impl EngineHandle {
+    /// Load a model off the runtime and move it to a dedicated worker thread.
+    ///
+    /// [`Engine::open_model`] blocks for the whole mmap plus GPU upload, so it
+    /// runs on the blocking pool and keeps a runtime worker free.
+    pub async fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let path: PathBuf = path.as_ref().to_path_buf();
+        let engine = tokio::task::spawn_blocking(move || Engine::open_model(path))
+            .await
+            .map_err(|error| crate::Error::Generation(error.to_string()))?;
+        Ok(engine?.into_handle())
+    }
+
+    fn new(mut engine: Engine) -> Self {
+        let (sender, mut receiver) = async_mpsc::channel::<Job>(SERVE_QUEUE);
+        std::thread::spawn(move || {
+            while let Some(job) = receiver.blocking_recv() {
+                let (events, cancel, result) = match job {
+                    Job::Chat(request, events, cancel) => {
+                        let result = engine.chat_with_cancel(&request, &cancel, |event| {
+                            send_event(&events, &cancel, event)
+                        });
+                        (events, cancel, result)
+                    }
+                    Job::Completion(request, events, cancel) => {
+                        let result = engine.complete_with_cancel(&request, &cancel, |event| {
+                            send_event(&events, &cancel, event)
+                        });
+                        (events, cancel, result)
+                    }
+                };
+                if let Err(error) = result {
+                    let _ = events.blocking_send(Event::Error(error.to_string()));
+                }
+                cancel.cancel();
+            }
+        });
+        Self { sender }
+    }
+
+    /// Queue a chat request and return a blocking event iterator.
+    ///
+    /// Dropping the iterator cancels queued or running work. Use
+    /// [`EventStream::cancel_handle`] when cancellation must be explicit.
+    ///
+    /// ```no_run
+    /// # use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
+    /// let handle = Engine::open()?.into_handle();
+    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), reasoning_content: None }], max_tokens: 32, sampling: Sampling::default(), thinking: true, session: None };
+    /// for event in handle.chat(request)? {
+    ///     if let Event::Content(text) = event { print!("{text}"); }
+    /// }
+    /// # Ok::<(), local_engine::Error>(())
+    /// ```
+    pub fn chat(&self, request: ChatRequest) -> crate::Result<EventStream> {
+        self.submit(|events, cancel| Job::Chat(request, events, cancel))
+    }
+
+    /// Queue a raw completion and return its event stream and cancellation handle.
+    pub fn complete(&self, request: CompletionRequest) -> crate::Result<EventStream> {
+        self.submit(|events, cancel| Job::Completion(request, events, cancel))
+    }
+
+    /// Queue a chat request for `Stream` consumption.
+    ///
+    /// Thin alias for [`EngineHandle::chat`]; nothing happens before the stream
+    /// exists, so this needs no runtime.
+    pub fn chat_stream(&self, request: ChatRequest) -> crate::Result<EventStream> {
+        self.chat(request)
+    }
+
+    /// Queue a raw completion for `Stream` consumption.
+    ///
+    /// Thin alias for [`EngineHandle::complete`]; nothing happens before the
+    /// stream exists, so this needs no runtime.
+    pub fn complete_stream(&self, request: CompletionRequest) -> crate::Result<EventStream> {
+        self.complete(request)
+    }
+
+    fn submit(
+        &self,
+        job: impl FnOnce(async_mpsc::Sender<Event>, CancelToken) -> Job,
+    ) -> crate::Result<EventStream> {
+        let (sender, receiver) = async_mpsc::channel::<Event>(EVENT_BUFFER);
+        let cancel = CancelToken::new();
+        self.sender
+            .try_send(job(sender, cancel.clone()))
+            .map_err(|error| match error {
+                async_mpsc::error::TrySendError::Full(_) => crate::Error::QueueFull,
+                async_mpsc::error::TrySendError::Closed(_) => {
+                    crate::Error::Generation("engine worker stopped".into())
+                }
+            })?;
+        Ok(EventStream {
+            receiver,
+            cancel,
+            not_sync: std::marker::PhantomData,
+        })
+    }
+}
+
+fn send_event(
+    sender: &async_mpsc::Sender<Event>,
+    cancel: &CancelToken,
+    event: Event,
+) -> ControlFlow<()> {
+    if cancel.is_cancelled() || sender.blocking_send(event).is_err() {
+        ControlFlow::Break(())
+    } else {
+        ControlFlow::Continue(())
+    }
+}
+
+/// Explicit cancellation control for a queued or running request.
+#[derive(Clone)]
+pub struct CancelHandle {
+    cancel: CancelToken,
+}
+
+impl CancelHandle {
+    /// Request cooperative cancellation.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Generation event stream; dropping it cancels the request.
+///
+/// Implements both [`Iterator`] (blocking) and [`Stream`] (async) over one
+/// shared receiver, so a request can be consumed either way. Mixing the two in
+/// a single session interleaves events; use one per request.
+///
+/// [`Iterator::next`] blocks the calling thread and panics inside a runtime
+/// task; [`Stream::poll_next`] is the non-blocking path. Dropping either form
+/// mid-flight cancels the running generation.
+///
+/// Like [`Engine`] it is `Send` but deliberately not `Sync`: the underlying
+/// `tokio` receiver is `Sync`, so the marker keeps the original surface rather
+/// than silently widening it.
+pub struct EventStream {
+    receiver: async_mpsc::Receiver<Event>,
+    cancel: CancelToken,
+    not_sync: std::marker::PhantomData<Cell<()>>,
+}
+
+impl EventStream {
+    /// Obtain an independently owned cancellation control.
+    #[must_use]
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            cancel: self.cancel.clone(),
+        }
+    }
+}
+
+impl Iterator for EventStream {
+    type Item = Event;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver.blocking_recv()
+    }
+}
+
+impl Stream for EventStream {
+    type Item = Event;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().receiver.poll_recv(cx)
+    }
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+struct EventSplitter {
+    reasoning: bool,
+    pending: String,
+    /// The chat template puts `\n\n` after `</think>`; drop it from the answer.
+    answer_started: bool,
+}
+
+impl EventSplitter {
+    const fn new(reasoning: bool) -> Self {
+        Self {
+            reasoning,
+            pending: String::new(),
+            answer_started: !reasoning,
+        }
+    }
+
+    fn content(
+        &mut self,
+        piece: &str,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let text = if self.answer_started {
+            piece
+        } else {
+            piece.trim_start_matches('\n')
+        };
+        if text.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        self.answer_started = true;
+        callback(Event::Content(text.to_owned()))
+    }
+
+    fn emit(
+        &mut self,
+        piece: &str,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        if !self.reasoning {
+            return self.content(piece, callback);
+        }
+        self.pending.push_str(piece);
+        if let Some(boundary) = self.pending.find(THINK_END) {
+            let mut content = self.pending.split_off(boundary);
+            content.drain(..THINK_END.len());
+            let reasoning = std::mem::take(&mut self.pending);
+            self.reasoning = false;
+            if !reasoning.is_empty() && callback(Event::Reasoning(reasoning)).is_break() {
+                return ControlFlow::Break(());
+            }
+            return self.content(&content, callback);
+        }
+        let mut safe = self.pending.len().saturating_sub(THINK_END.len() - 1);
+        while !self.pending.is_char_boundary(safe) {
+            safe = safe.saturating_sub(1);
+        }
+        if safe != 0 {
+            return self.flush_prefix(safe, callback);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn flush_prefix(
+        &mut self,
+        length: usize,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let remainder = self.pending.split_off(length);
+        let text = std::mem::replace(&mut self.pending, remainder);
+        callback(Event::Reasoning(text))
+    }
+
+    fn finish(&mut self, callback: &mut impl FnMut(Event) -> ControlFlow<()>) -> ControlFlow<()> {
+        if self.pending.is_empty() {
+            ControlFlow::Continue(())
+        } else if self.reasoning {
+            callback(Event::Reasoning(std::mem::take(&mut self.pending)))
+        } else {
+            callback(Event::Content(std::mem::take(&mut self.pending)))
+        }
+    }
+}
