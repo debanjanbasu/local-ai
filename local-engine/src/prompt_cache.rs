@@ -174,10 +174,25 @@ pub fn store(
     let short_digest = digest.get(..16).unwrap_or(&digest);
     let path = dir.join(format!("{}-{short_digest}.bpc", snapshot.position));
     let temporary = path.with_extension("tmp");
-    let mut file = File::create(&temporary)?;
+    let committed = write_temporary(&temporary, &header, tokens, snapshot)
+        .and_then(|()| fs::rename(&temporary, &path).map_err(crate::Error::from));
+    if committed.is_err() {
+        // The temporary is invisible to `discover`, so nothing else would reclaim it.
+        let _ = fs::remove_file(&temporary);
+    }
+    committed.map(|()| path)
+}
+
+fn write_temporary(
+    temporary: &Path,
+    header: &[u8],
+    tokens: &[u32],
+    snapshot: &PromptSnapshot,
+) -> crate::Result<()> {
+    let mut file = File::create(temporary)?;
     file.write_all(MAGIC)?;
     file.write_all(&(header.len() as u64).to_le_bytes())?;
-    file.write_all(&header)?;
+    file.write_all(header)?;
     for token in tokens {
         file.write_all(&token.to_le_bytes())?;
     }
@@ -186,8 +201,7 @@ pub fn store(
     file.write_all(&snapshot.target_kv)?;
     file.write_all(&snapshot.mtp_kv)?;
     file.sync_all()?;
-    fs::rename(&temporary, &path)?;
-    Ok(path)
+    Ok(())
 }
 
 pub fn trim(root: &Path, model_key: &str, budget: u64) {
@@ -272,40 +286,4 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disk_snapshot_round_trip_and_corruption_rejection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let snapshot = PromptSnapshot {
-            position: 3,
-            layout: "f16".into(),
-            recurrent: PageBytes::concat([&[1, 2, 3][..]]).expect("bytes"),
-            mtp_prev_hidden: PageBytes::concat([&[4, 5][..]]).expect("bytes"),
-            target_kv: PageBytes::concat([&[6, 7, 8, 9][..]]).expect("bytes"),
-            mtp_kv: PageBytes::concat([&[10, 11][..]]).expect("bytes"),
-        };
-        let path = store(
-            dir.path(),
-            "model",
-            &[12, 34, 56],
-            Some("a"),
-            &snapshot,
-            true,
-        )
-        .expect("store snapshot");
-        let entries = discover(dir.path(), "model");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tokens, [12, 34, 56]);
-        assert!(entries[0].reusable_boundary);
-        let loaded = load(&path, "model").expect("load snapshot");
-        assert_eq!(loaded.position, snapshot.position);
-        assert_eq!(*loaded.target_kv, *snapshot.target_kv);
-        let mut bytes = fs::read(&path).expect("read snapshot");
-        let last = bytes.last_mut().expect("non-empty snapshot");
-        *last ^= 1;
-        fs::write(&path, bytes).expect("corrupt snapshot");
-        assert!(load(&path, "model").is_err());
-    }
-}
+mod tests;

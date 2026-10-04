@@ -156,7 +156,25 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 | "--context"
                 | "--repeat"
         ) {
-            return Err(format!("unknown option: {}", args[index]));
+            // A flag that moved is told where its intent went: the flag that
+            // replaced it, or the default that absorbed it. The rest keep the
+            // bare rejection, because there is nothing better to say.
+            let flag = args[index].as_str();
+            return Err(match flag {
+                "--mtp" => format!(
+                    "unknown option: {flag} (no replacement: MTP is on by default, and \
+                     --no-speculation opts out)"
+                ),
+                "--mtp-head" => format!(
+                    "unknown option: {flag} (no replacement flag: the head is discovered \
+                     beside the model, and --export mtp-head=DIR writes a quantized one)"
+                ),
+                "--no-mtp" => format!(
+                    "unknown option: {flag} (replaced by --no-speculation, which disables \
+                     MTP and suffix lookup)"
+                ),
+                flag => format!("unknown option: {flag}"),
+            });
         }
         match args[index].as_str() {
             "--model" | "--max-tokens" | "--mtp-depth" | "--prompt-file" => {
@@ -669,5 +687,59 @@ mod tests {
         );
         let raw = parse(&args(&["--raw", "--no-thinking", "hello"])).expect("raw");
         assert!(!raw.thinking);
+    }
+
+    #[test]
+    fn a_replaced_mtp_flag_names_the_flag_that_replaced_it() {
+        assert_eq!(
+            parse(&args(&["--no-mtp", "hello"])).expect_err("rejected"),
+            "unknown option: --no-mtp (replaced by --no-speculation, which disables \
+             MTP and suffix lookup)"
+        );
+    }
+
+    #[test]
+    fn a_rejected_mtp_flag_that_a_default_absorbed_says_so() {
+        for (flag, hint) in [
+            (
+                "--mtp",
+                "unknown option: --mtp (no replacement: MTP is on by default, and \
+                 --no-speculation opts out)",
+            ),
+            (
+                "--mtp-head",
+                "unknown option: --mtp-head (no replacement flag: the head is discovered \
+                 beside the model, and --export mtp-head=DIR writes a quantized one)",
+            ),
+        ] {
+            assert_eq!(
+                parse(&args(&[flag, "hello"])).expect_err(flag),
+                hint,
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_flag_with_nothing_to_point_at_keeps_the_bare_message() {
+        for flag in [
+            "--prefill-chunk",
+            "--attention-kernel",
+            "--kv-cache",
+            "--kv-initial",
+            "--ngram",
+            "--no-ngram",
+            "--ngram-max",
+            "--ngram-min-match",
+            "--prompt-cache-checkpoints",
+            "--context",
+            "--repeat",
+        ] {
+            assert_eq!(
+                parse(&args(&[flag, "hello"])).expect_err(flag),
+                format!("unknown option: {flag}"),
+                "{flag}"
+            );
+        }
     }
 }

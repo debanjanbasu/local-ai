@@ -100,6 +100,13 @@ pub fn artifact_beside(head: &Path) -> Option<PathBuf> {
 /// case; only the cost moved. On the M4 Pro the gated depth-3 default
 /// decodes at 20–26 tok/s against 17.5 plain. Speculation is therefore on
 /// by default; `bonsai --no-speculation` opts out for A/B runs.
+///
+/// Only the [`MtpMode::Auto`] arm reads this, and
+/// [`Resources::discover`](crate::resources::Resources::discover) never builds an
+/// `Auto`, so no shipped binary is decided by it: discovery takes an explicit
+/// `speculation` argument and answers with a head or with `Off`. It is the
+/// embedder's constant — what [`MtpMode::default`] follows, and what
+/// [`MtpMode::resolve`] hands [`MtpMode::resolve_with_default`] as `auto_enabled`.
 pub const DEFAULT_MTP_ENABLED: bool = true;
 
 /// The record an `Off` mode falls back to when its constructor recorded none.
@@ -121,8 +128,13 @@ pub const MTP_OFF_REASON: &str = "speculation disabled by request (--no-speculat
 /// constant, so turning it back on means a build that sets it true, or naming
 /// the head directly with [`MtpMode::Head`], which skips this policy.
 ///
-/// Only a build configured off reaches this text: `Auto` follows
-/// [`DEFAULT_MTP_ENABLED`], and shipped builds set it true.
+/// Only the [`MtpMode::Auto`] arm reports this text, and only when
+/// `auto_enabled` is false: so the reachers are an embedder calling
+/// [`MtpMode::resolve_with_default`] with `false`, and [`MtpMode::resolve`] in a
+/// build configured off. The shipping CLI reaches neither, because discovery
+/// hands the engine an explicit [`MtpMode::Head`] or [`MtpMode::Off`]. Reaching
+/// it through `Auto` is doubly guarded anyway: a head or artifact must be
+/// installed, and `auto_enabled` must be false.
 pub const MTP_DEFAULT_OFF_REASON: &str = "speculation is off by build default (DEFAULT_MTP_ENABLED); no flag re-enables it, so this needs a build with DEFAULT_MTP_ENABLED = true";
 
 /// How a caller wants speculation.
@@ -134,7 +146,18 @@ pub const MTP_DEFAULT_OFF_REASON: &str = "speculation is off by build default (D
 /// Drafts never change the emitted tokens because the target verifies every one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MtpMode {
-    Auto { depth: usize },
+    /// Speculate from whichever head is found.
+    ///
+    /// This is the library-facing default — [`MtpMode::default`] returns it — and
+    /// [`Resources::discover`](crate::resources::Resources::discover) never does:
+    /// discovery resolves a head or reports `Off`, so the shipping CLI never
+    /// resolves through this arm. An embedder who wants automatic behaviour
+    /// should call `Resources::discover`; one who already knows the head can pass
+    /// [`MtpMode::Head`] and skip discovery. The variant stays because it is
+    /// public API and the default for a caller that never discovered anything.
+    Auto {
+        depth: usize,
+    },
     Head(MtpSettings),
     Off(Option<String>),
 }
@@ -158,6 +181,12 @@ pub enum MtpResolution {
 
 impl MtpMode {
     /// Decide whether to speculate.
+    ///
+    /// Every engine construction calls this with the mode it was handed, so it
+    /// runs on the CLI as well — but with a mode
+    /// [`Resources::discover`](crate::resources::Resources::discover) built, which
+    /// is never [`MtpMode::Auto`]. The `Auto` arm here is therefore reached by a
+    /// caller that asked for `Auto` or took [`MtpMode::default`].
     pub fn resolve(&self) -> crate::Result<MtpResolution> {
         self.resolve_with_default(Path::new(DEFAULT_BONSAI_MTP_HEAD), DEFAULT_MTP_ENABLED)
     }

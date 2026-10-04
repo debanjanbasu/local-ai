@@ -73,6 +73,9 @@ impl Resources {
             .filter(|path| writable_directory(path).is_ok());
         // The artifact first: it loads without the 849 MB source, and an invalid
         // one is reported by the loader instead of quietly costing throughput.
+        // Every branch below answers with a named head or with `Off`; discovery
+        // never constructs `MtpMode::Auto`, which stays the default for an
+        // embedder that has not called this.
         let (mtp, mtp_reason) = if !speculation {
             let reason = "disabled by --no-speculation";
             (MtpMode::Off(Some(reason.into())), reason.into())
