@@ -111,7 +111,7 @@ The compressed export encodes at **zstd level 19**, which is where this payload'
 ratio turns over: `--long=27` measures 355,688,546 bytes and level 22 measures
 358,063,503, both worse than level 19's 355,361,865. This is a property of the
 payload, not of zstd — the HTTP response path deliberately uses level 22, which
-is the best ratio on JSON bodies. Widening the window does not help here.
+measured best on JSON bodies. Widening the window does not help here.
 
 ## Commands
 
@@ -187,6 +187,33 @@ level 22, chosen for ratio rather than for a cheaper CPU bill. A zstd
 dictionary was measured for this path and rejected; see
 [Tried and rejected](#tried-and-rejected).
 
+That ratio is set by how much of the body is flushed at once rather than by the
+level. A completion response is written in pieces as tokens arrive, and zstd
+cannot compress across a flush boundary, so the same text split into many
+pieces gives each frame less to compress than one buffered write does. Measured
+on an M2 over 1139 tokens of real generated text at level 22, one zstd flush
+per frame, with the 18 bytes of HTTP chunk overhead per frame counted in:
+
+| Body written every | Plain bytes | zstd bytes | zstd ratio |
+| --- | ---: | ---: | ---: |
+| 1 piece | 24,957 | 28,332 | 0.16x |
+| 16 pieces | 5,733 | 4,384 | 1.02x |
+| 64 pieces | 4,761 | 2,743 | 1.62x |
+| the whole body | 4,455 | 1,903 | 2.34x |
+
+A chunked body compresses worse than a single buffered one, and a frame per
+piece makes compression a net loss rather than a saving: 28,332 bytes on the
+wire against 24,957 plain. That is why the flush carries two bounds and not
+one. The body is written when `BODY_FLUSH_BYTES` (8 KiB) has accumulated or
+`BODY_FLUSH_INTERVAL` (1 s) has elapsed, whichever comes first, and at the
+2.6-17 tok/s measured here 8 KiB is about 150 s of output at the slow end, so
+the interval is what binds. The frame count then stays near one per second, and
+a streaming completion body lands between the 16- and 64-piece rows — nearer
+1-1.6x — so there is no single ratio to quote for one and the whole-body 2.34x
+is the ceiling rather than a figure a completion response reaches. Level 22 is
+deliberately unchanged: the ratio is a property of the flush policy, not of
+the level.
+
 The engine processes one generation at a time through an eight-slot queue.
 Submission to a full queue fails immediately. Dropping an `EventStream`, using
 its cancellation handle, or disconnecting a streaming client cooperatively
@@ -207,18 +234,26 @@ engine free for the next client. The default is 30 seconds; a value outside
 10 to 3600 inclusive, or one that is not a whole number of seconds, is refused
 at startup.
 
-One flag governs two different clocks. On a streaming response it is a
-consumer-liveness budget, and a small value is safe there because the server
-only produces a frame when the engine emits one. On a non-streaming response the
-same number is a producer-liveness budget instead, and the engine's own gaps
-between events are not small, so the floor comes from a measurement rather than
-from taste; see [Tried and rejected](#tried-and-rejected).
+One number bounds two clocks, but not to the same depth on the two paths. On a
+streaming response it is a consumer-liveness budget: the server only produces a
+frame when the engine emits one, so frames arrive as fast as the engine makes
+them, and what is left to measure is how long a client goes without taking one.
+On a non-streaming response it bounds that too, because the body is written
+while generation runs, and it bounds the engine's own gaps between events as
+well, since the wait for the next event carries the same budget as the write.
+The producer half is the binding one for a healthy request, so the floor still
+has to clear it, and the engine's inter-event gaps are not small: the floor
+comes from a measurement rather than from taste; see
+[Tried and rejected](#tried-and-rejected).
 
 The budget starts only after the first event arrives, so it does not bound
-time-to-first-token. Nothing is emitted during prefill, the prefill chunk is 128
-tokens, and this class of machine prefills at roughly 3.6-4.2 tok/s, so one
-chunk is about 35 seconds of silence that is entirely healthy. A budget that
-included prefill would abandon ordinary long prompts.
+time-to-first-token. Prefill now reports a boundary at every 128-token chunk and
+the boundary is written to the client, but it deliberately does not start a
+clock. This class of machine prefills at roughly 3.6-4.2 tok/s, so one chunk is
+about 35 seconds of work that is entirely healthy, and a budget armed on a
+boundary would abandon ordinary long prompts. A cold 6,438-token prompt measured
+50 boundaries and 349.9 seconds of prefill at the 10-second floor with no false
+cancellation.
 
 Two limits are worth stating plainly. On streaming, the clock starts late by
 construction: a client must first fill the socket buffers before the server feels
@@ -227,11 +262,17 @@ before the stall began, and SSE frames average 194.9 bytes, so roughly 2,900
 tokens are generated first. Reclaim time is therefore time to fill the socket
 buffers plus the budget, not the budget counted from the request. The buffer
 ceiling is autotuned rather than fixed, and 4 MiB is the observed autotune
-maximum on that machine. Second, a non-streaming client that vanishes cannot be
-detected: the body does not exist until generation finishes, so there is no
-disconnect signal to observe, and the budget is producer-liveness only. One such
-client was measured burning 706 seconds of engine time before the request
-completed.
+maximum on that machine. Second, a non-streaming body is written while
+generation runs, so a vanished client's write can fail and the generation is
+cancelled with it — but only once the socket buffers have filled, and a
+completion body is about 4 KiB at 900 tokens, some 140x under the 551.3 KiB
+measured above. At that size the write does not fail, the disconnect itself is
+not observed, and the generation runs to its end; a failing write needs a body
+past that 551.3 KiB, roughly 125,000 tokens. The budget is not a substitute for
+that detection. What it does now bound on this path is a request going
+undeliverable for longer than the budget, which a body that exists on the wire
+makes observable and a buffered body could not be at all. That buffered body is
+what one measured vanished client cost: 706 seconds of engine time.
 
 ## Resource policy
 
@@ -472,28 +513,30 @@ is the main limit.
 - Compressing the int8 head artifact above zstd level 19: level 22 measures
   358,063,503 bytes and `--long=27` measures 355,688,546, both worse than level
   19's 355,361,865 on the same payload. This is a property of the payload, not
-  of zstd — the HTTP response path uses level 22 because it is the best ratio
-  there — so neither level is presented as universally best.
-- A zstd dictionary on the HTTP response path: a 1 MB dictionary at level 9 would
-  give +5.6% ratio and roughly 14x less time than the level-22 setting, and it
-  was rejected anyway. RFC 8878 section 6 says `application/zstd` payloads
-  should not use a dictionary, section 5 records that the specification does not
-  define dictionary delivery, and section 7.4 confirms no public registry of
-  such dictionaries exists. There is no HTTP mechanism to deliver the dictionary a
-  frame's `Dictionary_ID` points at, so a stock client without it — `curl`,
-  `httpx`, `requests`, `undici` — fails hard with `Dictionary mismatch` and
-  decodes zero bytes. Verified. Dictionaries remain valid where both ends are
-  yours, such as internal IPC or a bundled SDK.
+  of zstd — the HTTP response path uses level 22 because it measured best on
+  JSON bodies — so neither level is presented as universally best.
+- A zstd dictionary on the HTTP response path: a 1 MB dictionary at level 9 was
+  measured at +5.6% ratio and roughly 14x less time than the level-22 setting,
+  on one buffered body, which is not what this path writes any more. A frame per
+  piece measures 0.16x there, a net loss, so that comparison does not carry
+  over. It was rejected anyway. RFC 8878 section 6 says `application/zstd`
+  payloads should not use a dictionary, section 5 records that the specification
+  does not define dictionary delivery, and section 7.4 confirms no public
+  registry of such dictionaries exists. There is no HTTP mechanism to deliver the
+  dictionary a frame's `Dictionary_ID` points at, so a stock client without it —
+  `curl`, `httpx`, `requests`, `undici` — fails hard with `Dictionary mismatch`
+  and decodes zero bytes. Verified. Dictionaries remain valid where both ends
+  are yours, such as internal IPC or a bundled SDK.
 - Compressing the 5,946,648,928-byte PTQ1 GGUF: the measured ceiling is 1.074x
   and the best measured result 1.29%, so the checkpoint is not a compression
   target. Only the int8 head is, which is why it ships in two encodings.
-- A rounder `--stall-timeout` floor: the same number bounds a consumer-liveness
-  budget on a streaming response and a producer-liveness budget on a
-  non-streaming one, and the latter is set by the engine's own inter-event gaps.
-  A speculative round measured 3.076 s, p95 0.728 s, on a six-token prompt on an
-  M2, so a budget below that abandons healthy non-streaming requests. The floor
-  is 10 rather than a rounder number because it sits an order of magnitude above
-  the worst gap actually observed.
+- A rounder `--stall-timeout` floor: on a streaming response the number bounds
+  only how long a client goes without taking a frame; on a non-streaming one it
+  bounds that and the engine's own inter-event gaps, the producer half being the
+  binding one. A speculative round measured 3.076 s, p95 0.728 s, on a six-token
+  prompt on an M2, so a budget below that abandons healthy non-streaming
+  requests. The floor is 10 rather than a rounder number because it sits an
+  order of magnitude above the worst gap actually observed.
 
 ## Verification
 
