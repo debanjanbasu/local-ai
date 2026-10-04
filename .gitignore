@@ -1,0 +1,31 @@
+# Build artifacts
+*.air
+*.metallib
+/target/
+/cache/
+
+# Models
+/models
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python virtual environment
+.venv/
+
+# Editor files
+*.swp
+*.swo
+*~
+*.bak
+
+# Python build artifacts
+*.so
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# graphify knowledge graph (generated, rebuilt on commit via git hook)
+graphify-out/

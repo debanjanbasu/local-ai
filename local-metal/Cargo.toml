@@ -1,0 +1,22 @@
+[package]
+name = "local-metal"
+version = "0.2.0"
+description = "Metal kernels and runtime for Bonsai 2 27B inference on Apple Silicon"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+half.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+block2 = "0.6.2"
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLBuffer", "MTLAllocation", "MTLResource", "MTLLibrary", "MTLComputePipeline", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLCommandEncoder", "MTLTypes"] }
+objc2-foundation = "0.3"
+dispatch2 = "0.3"
