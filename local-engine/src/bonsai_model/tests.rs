@@ -53,7 +53,7 @@ fn bonsai_ngram_repetitive_greedy_matches_plain_tokens() {
             Some(512),
             DEFAULT_PREFILL_CHUNK,
             None,
-            &MtpMode::Off,
+            &MtpMode::Off(None),
             ngram,
             KvOptions::default(),
         )
@@ -182,7 +182,7 @@ fn interleaved_and_restarted_session_snapshots_match_cold_tokens() {
             Some(512),
             DEFAULT_PREFILL_CHUNK,
             None,
-            &MtpMode::Off,
+            &MtpMode::Off(None),
             NgramSettings::default(),
             KvOptions::default(),
         )
@@ -256,7 +256,7 @@ fn shared_system_prefix_reuses_across_sessions_and_restart() {
             Some(1024),
             DEFAULT_PREFILL_CHUNK,
             None,
-            &MtpMode::Off,
+            &MtpMode::Off(None),
             NgramSettings::default(),
             KvOptions::default(),
         )
@@ -330,7 +330,7 @@ fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
             Some(512),
             DEFAULT_PREFILL_CHUNK,
             None,
-            &MtpMode::Off,
+            &MtpMode::Off(None),
             NgramSettings::default(),
             KvOptions::default(),
         )
@@ -393,7 +393,7 @@ fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
             Some(1024),
             DEFAULT_PREFILL_CHUNK,
             None,
-            &MtpMode::Off,
+            &MtpMode::Off(None),
             NgramSettings {
                 enabled: false,
                 ..NgramSettings::default()

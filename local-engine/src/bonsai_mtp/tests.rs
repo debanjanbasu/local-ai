@@ -481,7 +481,7 @@ fn auto_speculates_only_with_an_installed_head() {
         }
     );
     assert!(matches!(
-        MtpMode::Off
+        MtpMode::Off(None)
             .resolve_with_default(&installed, true)
             .expect("off"),
         MtpResolution::Disabled(reason) if reason == MTP_OFF_REASON
@@ -546,8 +546,44 @@ fn explicit_head_overrides_the_default() {
     assert!(absent.resolve_with_default(&default_head, true).is_err());
     // Off never errors and ignores every head.
     assert_eq!(
-        MtpMode::Off
+        MtpMode::Off(None)
             .resolve_with_default(&default_head, true)
+            .expect("off"),
+        MtpResolution::Disabled(MTP_OFF_REASON.into())
+    );
+}
+
+/// `Off` carries the reason its own constructor recorded, so the record is
+/// carried rather than re-derived.
+///
+/// A discoverer that finds no head builds `Off` exactly as an explicit opt-out
+/// does; a mode with no payload makes the two indistinguishable, and every
+/// report then names an opt-out the user never asked for.
+#[test]
+fn off_reports_the_reason_it_carried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let installed = dir.path().join("model_mtp.safetensors");
+    std::fs::write(&installed, b"stub").expect("write head");
+    let absent = "no MTP head or int8 artifact installed beside the model";
+
+    // A discoverer that found nothing beside the model says so, verbatim.
+    assert_eq!(
+        MtpMode::Off(Some(absent.into()))
+            .resolve_with_default(&installed, true)
+            .expect("off"),
+        MtpResolution::Disabled(absent.into())
+    );
+    // ... which is not the request's opt-out text, whatever head is installed.
+    assert_ne!(
+        MtpMode::Off(Some(absent.into()))
+            .resolve_with_default(&installed, true)
+            .expect("off"),
+        MtpResolution::Disabled(MTP_OFF_REASON.into())
+    );
+    // An `Off` that recorded nothing still falls back to the generic text.
+    assert_eq!(
+        MtpMode::Off(None)
+            .resolve_with_default(&installed, true)
             .expect("off"),
         MtpResolution::Disabled(MTP_OFF_REASON.into())
     );

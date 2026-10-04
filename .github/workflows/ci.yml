@@ -1,0 +1,129 @@
+# CI for local-ai.
+#
+# This workflow runs exactly the five commands in README.md's "Verification"
+# block, in the same order, so CI cannot drift from the documented procedure.
+# If you change one of them, change the README in the same commit.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS CI DELIBERATELY DOES NOT RUN
+# ---------------------------------------------------------------------------
+# It does not run the 15 `#[ignore]`d real-model integration tests. Those are
+# opt-in, environment-gated tests documented separately in
+# docs/BONSAI.md#verification, and they are skipped by `cargo test --workspace`
+# below -- so nothing in this file exercises them.
+#
+# They cannot run here, and that is not a runner-size problem to be tuned away:
+#
+#   * They require real artifacts that do not exist on a fresh checkout: a
+#     5.9 GB GGUF checkpoint, an ~8 MB tokenizer index JSON, and an MTP head
+#     file. Three of them `expect` BONSAI_GGUF / BONSAI_INDEX outright with no
+#     fallback, so they fail rather than skip when the vars are unset.
+#   * They pass only with `--test-threads=1`. Cargo's default thread count
+#     makes them fail spuriously: each test maps and uploads the full
+#     checkpoint, and concurrent unified-memory and GPU contention purges
+#     volatile prompt-cache state, so cache-source assertions fail on correct
+#     code.
+#   * Serial execution is necessary but still not sufficient on a 16 GB
+#     machine -- cumulative memory pressure across a whole run forced two
+#     assertions to be relaxed. GitHub-hosted runners are shared, virtualised
+#     and have no such memory guarantee, so these tests would be flaky at
+#     best and wrong at worst.
+#
+# Consequence, stated plainly: a green run here does NOT mean the full test
+# suite passed. It means the documented fast verification block passed. Do not
+# read a green check as coverage of the real-model path.
+# ---------------------------------------------------------------------------
+#
+# Runner: `macos-14`, deliberately NOT `macos-latest`. Do not "simplify" this.
+# Two independent reasons, either one fatal on its own:
+#
+#   1. `local-metal/build.rs` shells out to `xcrun metal` / `xcrun metallib`
+#      to compile `shaders/*.metal` into a `.metallib`. That toolchain only
+#      exists on macOS with Xcode installed. There is no Linux path -- this
+#      project cannot build off macOS at all, so a Linux or Windows runner is
+#      not a slower alternative, it is a broken one.
+#   2. The target is Apple Silicon. The workspace enables bytemuck's
+#      `aarch64_simd` feature and `.cargo/config.toml` pins
+#      `-C target-cpu=apple-m1` for `aarch64-apple-darwin`. An x86_64 runner
+#      is the wrong architecture and would not exercise the same code paths,
+#      so a "passing" run would mean very little.
+#
+# Toolchain: there is intentionally NO `dtolnay/rust-toolchain` or
+# `actions-rust-lang/setup-rust-toolchain` step. `rust-toolchain.toml` pins
+# `channel = "nightly"` plus the `clippy`, `rustfmt` and `rust-src`
+# components, and rustup on a GitHub runner honours that file automatically.
+# The absence is deliberate; adding a setup step would only risk overriding
+# the pin. (`rust-src` matters: `.cargo/config.toml` sets `build-std`.)
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep `cargo`'s own output readable in the log without changing any gate.
+  CARGO_TERM_COLOR: always
+  # Transient network flakes on registry fetches should fail the run loudly
+  # once, not spuriously. This does not weaken any gate.
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  verify:
+    name: Verification block
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install uv (for `uvx ruff`)
+        # GitHub's macOS runners do not ship `uvx`, and `tools/` is Python this
+        # repo actively maintains -- 22 unit tests, one of which reads Rust
+        # source to keep a Rust constant and a Python constant in sync. So the
+        # Python gates are load-bearing, not an afterthought.
+        uses: astral-sh/setup-uv@v5
+
+      # `Cargo.lock` is committed and every gate below passes `--locked`, which
+      # makes it the exact and correct invalidation input: any dependency
+      # change busts the key, and a pure source change keeps a warm cache.
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ./target
+          key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-arm64-cargo-
+
+      # Gates 1-3, verbatim from README.md "Verification".
+      - name: Gate 1/5 -- cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Gate 2/5 -- cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Gate 3/5 -- cargo test
+        run: cargo test --workspace --locked --release
+
+      # Gates 4-5, verbatim from README.md "Verification". `tools/` is the
+      # documented scope and it is also complete: every tracked .py file in the
+      # repo lives under tools/.
+      - name: Gate 4/5 -- ruff
+        run: uvx ruff check tools/
+
+      - name: Gate 5/5 -- python unittest
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
