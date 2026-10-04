@@ -15,7 +15,8 @@ pub const SERVE_QUEUE: usize = 8;
 /// A disk snapshot stores the full prompt state, so its size scales with the
 /// selected context rather than staying small: at a 45k-token context one
 /// snapshot is roughly 1.7 GB. A 32 GiB ceiling therefore held under twenty
-/// sessions, which evicted checkpoints long before the disk ran short.
+/// sessions, which evicted checkpoints long before the disk ran short, so the
+/// ceiling was raised to 512 GiB, which holds about 290.
 ///
 /// The free-space fraction in `Resources::discover` is the real governor; this
 /// ceiling only stops a pathological report from authorising an unbounded
@@ -42,7 +43,22 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// [`Self::discover`] at the built-in draft depth, which is what every
+    /// caller that is not measuring speculation wants.
     pub fn discover(model_override: Option<&Path>, speculation: bool) -> crate::Result<Self> {
+        Self::discover_with_depth(model_override, speculation, DEFAULT_MTP_DEPTH)
+    }
+
+    /// [`Self::discover`] with an explicit MTP draft depth, for measuring what
+    /// the shipped depth leaves on the table.
+    ///
+    /// [`MtpSettings::new`] owns the accepted range, so a depth outside it is
+    /// rejected here rather than quietly decoding at some other depth.
+    pub fn discover_with_depth(
+        model_override: Option<&Path>,
+        speculation: bool,
+        mtp_depth: usize,
+    ) -> crate::Result<Self> {
         let (model, model_reason) = discover_model(model_override)?;
         let mtp_root = model.parent().and_then(Path::parent);
         let source = mtp_root.map(|root| root.join(MTP_RELATIVE));
@@ -67,7 +83,7 @@ impl Resources {
         {
             (
                 MtpMode::Head(
-                    MtpSettings::new(path, DEFAULT_MTP_DEPTH)?.with_head_cache(mtp_cache.clone()),
+                    MtpSettings::new(path, mtp_depth)?.with_head_cache(mtp_cache.clone()),
                 ),
                 reason,
             )
@@ -98,7 +114,10 @@ impl Resources {
                         (
                             Some(path),
                             budget,
-                            format!("min(32 GiB, 25% of {free} free bytes)"),
+                            format!(
+                                "min({} GiB, 25% of {free} free bytes)",
+                                DISK_CACHE_CAP_BYTES / (1024 * 1024 * 1024)
+                            ),
                             rate,
                         )
                     }

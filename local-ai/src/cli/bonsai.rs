@@ -12,6 +12,7 @@ use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
 use crate::bonsai_tokenizer::BonsaiTokenizer;
 use crate::resources::{PREFILL_CHUNK, Resources};
+use crate::{DEFAULT_MTP_DEPTH, MAX_MTP_DEPTH};
 
 /// What `--export` writes instead of generating. The variants are the kinds as
 /// the command line names them, and the directory an export writes belongs to
@@ -84,6 +85,7 @@ struct Args {
     output: OutputMode,
     model_explicit: bool,
     no_speculation: bool,
+    mtp_depth: usize,
 }
 
 fn usage() {
@@ -111,6 +113,9 @@ fn usage() {
     eprintln!("                         of anonymous RAM at load, so the stored form is");
     eprintln!("                         what discovery prefers.");
     eprintln!("  --no-speculation   A/B baseline: disable MTP and suffix lookup");
+    eprintln!("  --mtp-depth N      Drafts per speculative round (1-{MAX_MTP_DEPTH}, default:");
+    eprintln!("                     {DEFAULT_MTP_DEPTH}); measures what the confidence gate");
+    eprintln!("                     leaves unused, not a tuned default");
 }
 
 #[allow(clippy::too_many_lines)]
@@ -127,6 +132,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         output: OutputMode::Stream,
         model_explicit: false,
         no_speculation: false,
+        mtp_depth: DEFAULT_MTP_DEPTH,
     };
     let mut positional = Vec::new();
     let mut index = 0;
@@ -139,7 +145,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 | "--kv-initial"
                 | "--mtp"
                 | "--mtp-head"
-                | "--mtp-depth"
                 | "--no-mtp"
                 | "--ngram"
                 | "--no-ngram"
@@ -152,7 +157,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             return Err(format!("unknown option: {}", args[index]));
         }
         match args[index].as_str() {
-            "--model" | "--max-tokens" | "--prompt-file" => {
+            "--model" | "--max-tokens" | "--mtp-depth" | "--prompt-file" => {
                 let flag = args[index].as_str();
                 index += 1;
                 let value = args
@@ -164,6 +169,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                         result.model_explicit = true;
                     }
                     "--prompt-file" => result.prompt_file = Some(PathBuf::from(value)),
+                    "--mtp-depth" => result.mtp_depth = parse_mtp_depth(value)?,
                     _ => {
                         result.max_tokens = value.parse().map_err(|_| "invalid --max-tokens")?;
                     }
@@ -232,6 +238,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             || result.no_thinking
             || result.greedy
             || result.max_tokens != crate::DEFAULT_MAX_OUTPUT_TOKENS
+            || result.mtp_depth != DEFAULT_MTP_DEPTH
         {
             return Err(format!("{} accepts only --model", export_flag(kind)));
         }
@@ -240,6 +247,24 @@ fn parse(args: &[String]) -> Result<Args, String> {
     }
     result.prompt = positional.join(" ");
     Ok(result)
+}
+
+/// Parse a `--mtp-depth` value as a draft depth inside the engine's range.
+///
+/// The range is the engine's, not a second copy of it: a depth the MTP
+/// settings would refuse is refused at the flag too, so an unusable depth is
+/// named by the person who passed it instead of decoding at a depth nobody
+/// asked for.
+fn parse_mtp_depth(value: &str) -> Result<usize, String> {
+    let depth: usize = value
+        .parse()
+        .map_err(|_| format!("invalid --mtp-depth: {value:?} is not a whole number"))?;
+    if !(1..=MAX_MTP_DEPTH).contains(&depth) {
+        return Err(format!(
+            "--mtp-depth must be between 1 and {MAX_MTP_DEPTH}, not {depth}"
+        ));
+    }
+    Ok(depth)
 }
 
 /// Writes the artifact an [`ExportKind`] names and returns. Neither kind opens
@@ -281,9 +306,10 @@ fn mtp_summary(engine: &BonsaiEngine) -> Option<(serde_json::Value, serde_json::
 
 #[allow(clippy::too_many_lines)]
 fn run(args: &Args) -> crate::Result<()> {
-    let resources = Resources::discover(
+    let resources = Resources::discover_with_depth(
         args.model_explicit.then_some(args.model.as_path()),
         !args.no_speculation,
+        args.mtp_depth,
     )?;
     if let OutputMode::Export(kind) = &args.output {
         return export(&resources, kind);
@@ -585,6 +611,52 @@ mod tests {
             let error = parse(&args(&input)).expect_err(&format!("{input:?}"));
             assert_eq!(error, expected, "{input:?}");
         }
+    }
+
+    #[test]
+    fn mtp_depth_defaults_to_the_shipped_depth() {
+        assert_eq!(
+            parse(&args(&["hello"])).expect("unset").mtp_depth,
+            DEFAULT_MTP_DEPTH
+        );
+    }
+
+    #[test]
+    fn mtp_depth_accepts_every_depth_the_engine_accepts() {
+        for depth in 1..=MAX_MTP_DEPTH {
+            let flag = depth.to_string();
+            let parsed = parse(&args(&["--mtp-depth", &flag, "hello"])).expect(&flag);
+            assert_eq!(parsed.mtp_depth, depth, "{flag}");
+        }
+    }
+
+    #[test]
+    fn mtp_depth_rejects_a_non_integer() {
+        for value in ["2.5", "-1", "three", ""] {
+            let error = parse(&args(&["--mtp-depth", value, "hello"])).expect_err(value);
+            assert_eq!(
+                error,
+                format!("invalid --mtp-depth: {value:?} is not a whole number")
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_depth_rejects_zero_and_anything_above_the_maximum() {
+        for depth in [0, MAX_MTP_DEPTH + 1, 99] {
+            let flag = depth.to_string();
+            let error = parse(&args(&["--mtp-depth", &flag, "hello"])).expect_err(&flag);
+            assert_eq!(
+                error,
+                format!("--mtp-depth must be between 1 and {MAX_MTP_DEPTH}, not {depth}")
+            );
+        }
+    }
+
+    #[test]
+    fn export_refuses_a_depth_it_cannot_honour() {
+        let error = parse(&args(&["--export", "index", "--mtp-depth", "2"])).expect_err("depth");
+        assert_eq!(error, "--export index accepts only --model");
     }
 
     #[test]
