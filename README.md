@@ -96,7 +96,7 @@ bandwidth:
 | --- | ---: |
 | Decode, speculation on | 5.2 tok/s |
 | Decode, `bonsai --no-speculation` | 2.55 tok/s |
-| Speculation gain | 2.0x |
+| Speculation gain | 1.15x–1.96x |
 | Model load | 0.45 s |
 | Peak RSS | 361 MB |
 | Peak memory footprint | 0.96 GB |
@@ -104,6 +104,22 @@ bandwidth:
 | Automatically selected context | 61,538 tokens |
 | MTP head load, cold from the BF16 source | 5.94 s |
 | MTP head load, warm int8 artifact | 3.18 s |
+
+**Read the two decode rates as one session, not as constants.** Both come from
+the same machine with `--no-thinking --greedy`, but they are not comparable to
+each other as published: the speculation run used a planets prompt and the
+baseline a counting prompt, so the original single "2.0x" was a ratio across two
+different workloads. Re-measured on one prompt with
+[`tools/benchmark.py`](tools/benchmark.py), which refuses to compare
+configurations that emit different text, the gain is **1.15x on varied prose**
+and **1.62x on repetitive text**, where the n-gram suffix lookup contributes as
+well as the MTP head. `docs/BONSAI.md` decomposes the two mechanisms.
+
+Absolute rates are the least portable number here: they move with prompt length
+because prefill amortizes differently (a 160-token generation runs well above
+the rate a 1024-token one does on identical hardware), and two measurements of
+the same configuration on this box have differed by 1.6x when the machine was
+busy. Measure the ratio, not the rate.
 
 The lower tok/s is hardware, not a defect. Decode is memory-bandwidth-bound:
 PTQ1 decode moves about 5.65 GB of weights per token, and

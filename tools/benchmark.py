@@ -254,11 +254,36 @@ def depth_sweep() -> list[Config]:
 
 
 def parse_configs(groups: list[str]) -> list[Config]:
-    """Build configurations from quoted flag groups on the command line."""
-    if not groups:
+    """Build configurations from quoted flag groups on the command line.
+
+    A bare ``--`` separates one configuration from the next, so a comparison
+    reads as two groups either side of it::
+
+        tools/benchmark.py -- '--no-thinking' -- '--no-speculation'
+
+    An empty group is rejected rather than silently measured as the default:
+    a configuration that is not the one you asked for produces numbers that
+    look real and answer a different question, which is the failure this whole
+    tool exists to prevent.
+    """
+    if not groups or groups == ["--"]:
         return [Config("default")]
-    return [Config(" ".join(shlex.split(group)) or "default", tuple(shlex.split(group)))
-            for group in groups]
+
+    configs: list[Config] = []
+    current: list[str] = []
+    for group in [*groups, "--"]:
+        if group != "--":
+            current.append(group)
+            continue
+        if not current:
+            raise RuntimeError(
+                "empty configuration: `--` must separate two flag groups, "
+                "not stand alone"
+            )
+        flags = tuple(shlex.split(" ".join(current)))
+        configs.append(Config(" ".join(flags), flags))
+        current = []
+    return configs
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -292,7 +317,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "configs",
         nargs="*",
-        help="quoted flag groups to compare, one per configuration",
+        help="quoted flag groups to compare, one per configuration, separated by `--`",
     )
     return parser.parse_args(argv)
 
