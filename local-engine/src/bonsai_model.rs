@@ -23,7 +23,7 @@ use crate::bonsai_ngram::{LookupPolicy, NgramSettings, SuffixStore, fill_verify_
 use crate::bonsai_tokenizer::BonsaiTokenizer;
 use crate::prompt_cache::{self, DiskEntry};
 use crate::sampler::{Sampler, SamplingParams, SamplingResult};
-use crate::{GenerateParams, GenerationStats, MtpStats, NgramStats};
+use crate::{GenerateParams, GenerationStats, MtpStats, NgramStats, PrefillProgress};
 
 mod cache_policy;
 mod checkpoints;

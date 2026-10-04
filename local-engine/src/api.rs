@@ -1,6 +1,7 @@
 //! Stable, synchronous library API.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -16,7 +17,7 @@ use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
 use crate::bonsai_tokenizer::{BonsaiTokenizer, ChatMessage as TokenizerMessage};
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
-use crate::runtime::EVENT_BUFFER;
+use crate::runtime::{EVENT_BUFFER, PrefillProgress};
 use crate::{GenerateParams, GenerationStats};
 
 const THINK_END: &str = "</think>";
@@ -129,6 +130,33 @@ pub enum Event {
     Finished(Box<Stats>),
     /// Terminal worker error.
     Error(String),
+}
+
+/// A next-item wait that a prefill boundary can interrupt instead of an
+/// [`Event`].
+///
+/// Prefill emits no events at all, so a consumer watching only for generated text
+/// cannot tell a working engine from an abandoned socket until the first token,
+/// and a prompt longer than one `PREFILL_CHUNK` is silent for whole chunks of it.
+/// A boundary carries that liveness on a second variant rather than a variant of
+/// [`Event`], so `Event` keeps the shape every consumer already matches on.
+#[derive(Clone, Debug)]
+pub enum Signal {
+    /// A generation event, byte-for-byte what [`EventStream::next`] returns.
+    Event(Event),
+    /// A prefill chunk is about to be submitted.
+    Progress(PrefillProgress),
+}
+
+/// What the engine worker puts on one request's channel.
+///
+/// Progress rides the same channel as the events rather than a second one, so a
+/// single wait can return whichever arrives first. That is what lets a parked
+/// consumer be woken by a boundary instead of polling a second channel for it.
+#[derive(Clone, Debug)]
+enum Delivered {
+    Event(Event),
+    Progress(PrefillProgress),
 }
 
 /// Synchronous Metal inference engine.
@@ -267,13 +295,15 @@ impl Engine {
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
         let cancel = CancelToken::default();
-        self.chat_with_cancel(request, &cancel, callback)
+        let mut progress = ignore_progress;
+        self.chat_with_cancel(request, &cancel, &mut progress, callback)
     }
 
     fn chat_with_cancel(
         &mut self,
         request: &ChatRequest,
         cancel: &CancelToken,
+        progress: &mut dyn FnMut(PrefillProgress),
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
         let prompt = Self::render_chat(&request.messages, request.thinking)?;
@@ -284,6 +314,7 @@ impl Engine {
             request.session.as_deref(),
             request.thinking,
             cancel,
+            progress,
             callback,
         )
     }
@@ -295,13 +326,15 @@ impl Engine {
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
         let cancel = CancelToken::default();
-        self.complete_with_cancel(request, &cancel, callback)
+        let mut progress = ignore_progress;
+        self.complete_with_cancel(request, &cancel, &mut progress, callback)
     }
 
     fn complete_with_cancel(
         &mut self,
         request: &CompletionRequest,
         cancel: &CancelToken,
+        progress: &mut dyn FnMut(PrefillProgress),
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
         self.generate(
@@ -311,6 +344,7 @@ impl Engine {
             request.session.as_deref(),
             false,
             cancel,
+            progress,
             callback,
         )
     }
@@ -324,18 +358,20 @@ impl Engine {
         session: Option<&str>,
         thinking: bool,
         cancel: &CancelToken,
+        progress: &mut dyn FnMut(PrefillProgress),
         mut callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
         let ids = self.inner.encode_prompt(prompt, true, false)?;
         let mut params = sampling.0.clone();
         params.max_tokens = max_tokens;
         let mut splitter = EventSplitter::new(thinking);
-        let output = self.inner.generate_session_cancellable(
+        let output = self.inner.generate_session_progress(
             &ids,
             &params,
             session,
             |piece| splitter.emit(piece, &mut callback).is_continue(),
             cancel,
+            progress,
         )?;
         if splitter.finish(&mut callback).is_break() {
             return Ok(Stats {
@@ -379,9 +415,20 @@ impl Engine {
 }
 
 enum Job {
-    Chat(ChatRequest, async_mpsc::Sender<Event>, CancelToken),
-    Completion(CompletionRequest, async_mpsc::Sender<Event>, CancelToken),
+    Chat(ChatRequest, async_mpsc::Sender<Delivered>, CancelToken),
+    Completion(
+        CompletionRequest,
+        async_mpsc::Sender<Delivered>,
+        CancelToken,
+    ),
 }
+
+/// A progress reporter that records nothing.
+///
+/// The synchronous public API has no channel to report a boundary on, and the
+/// prefill loop cannot skip the report: it shares the cancel poll, which is the
+/// only place a cancelled prefill is noticed.
+const fn ignore_progress(_: PrefillProgress) {}
 
 /// Cloneable, thread-safe interface to a dedicated engine worker.
 ///
@@ -413,20 +460,28 @@ impl EngineHandle {
             while let Some(job) = receiver.blocking_recv() {
                 let (events, cancel, result) = match job {
                     Job::Chat(request, events, cancel) => {
-                        let result = engine.chat_with_cancel(&request, &cancel, |event| {
-                            send_event(&events, &cancel, event)
-                        });
+                        // Scoped so the reporter's borrow of `events` ends before
+                        // the sender is moved out with the result.
+                        let result = {
+                            let mut progress = reporter(&events);
+                            engine.chat_with_cancel(&request, &cancel, &mut progress, |event| {
+                                send_event(&events, &cancel, event)
+                            })
+                        };
                         (events, cancel, result)
                     }
                     Job::Completion(request, events, cancel) => {
-                        let result = engine.complete_with_cancel(&request, &cancel, |event| {
-                            send_event(&events, &cancel, event)
-                        });
+                        let result = {
+                            let mut progress = reporter(&events);
+                            engine.complete_with_cancel(&request, &cancel, &mut progress, |event| {
+                                send_event(&events, &cancel, event)
+                            })
+                        };
                         (events, cancel, result)
                     }
                 };
                 if let Err(error) = result {
-                    let _ = events.blocking_send(Event::Error(error.to_string()));
+                    let _ = events.blocking_send(Delivered::Event(Event::Error(error.to_string())));
                 }
                 cancel.cancel();
             }
@@ -475,9 +530,9 @@ impl EngineHandle {
 
     fn submit(
         &self,
-        job: impl FnOnce(async_mpsc::Sender<Event>, CancelToken) -> Job,
+        job: impl FnOnce(async_mpsc::Sender<Delivered>, CancelToken) -> Job,
     ) -> crate::Result<EventStream> {
-        let (sender, receiver) = async_mpsc::channel::<Event>(EVENT_BUFFER);
+        let (sender, receiver) = async_mpsc::channel::<Delivered>(EVENT_BUFFER);
         let cancel = CancelToken::new();
         self.sender
             .try_send(job(sender, cancel.clone()))
@@ -489,18 +544,33 @@ impl EngineHandle {
             })?;
         Ok(EventStream {
             receiver,
+            progress: VecDeque::new(),
             cancel,
             not_sync: std::marker::PhantomData,
         })
     }
 }
 
+/// Forward prefill boundaries onto a request's channel.
+///
+/// The report never blocks and never cancels. A blocking send would put a slow
+/// consumer on the prefill critical path of a single-flight engine, and a full
+/// channel can only mean that the consumer is behind on events: a dropped
+/// boundary costs one heartbeat, because the next chunk reports again. The client
+/// going away is detected by the event send failing or the stream being dropped,
+/// both of which do cancel.
+fn reporter(sender: &async_mpsc::Sender<Delivered>) -> impl FnMut(PrefillProgress) {
+    move |progress| {
+        let _ = sender.try_send(Delivered::Progress(progress));
+    }
+}
+
 fn send_event(
-    sender: &async_mpsc::Sender<Event>,
+    sender: &async_mpsc::Sender<Delivered>,
     cancel: &CancelToken,
     event: Event,
 ) -> ControlFlow<()> {
-    if cancel.is_cancelled() || sender.blocking_send(event).is_err() {
+    if cancel.is_cancelled() || sender.blocking_send(Delivered::Event(event)).is_err() {
         ControlFlow::Break(())
     } else {
         ControlFlow::Continue(())
@@ -534,7 +604,16 @@ impl CancelHandle {
 /// `tokio` receiver is `Sync`, so the marker keeps the original surface rather
 /// than silently widening it.
 pub struct EventStream {
-    receiver: async_mpsc::Receiver<Event>,
+    receiver: async_mpsc::Receiver<Delivered>,
+    /// Boundaries this stream has taken and not yet handed to a caller that
+    /// asked for them, in arrival order.
+    ///
+    /// A caller that only wants [`Event`]s drops them here instead of the
+    /// channel, so they cost one entry per prefill chunk of a request that can
+    /// never exceed the context. At `PREFILL_CHUNK` of 128 and the smallest
+    /// useful context of 32,768 tokens that is 256 entries, well under 10 KiB,
+    /// and it lasts only as long as the stream.
+    progress: VecDeque<PrefillProgress>,
     cancel: CancelToken,
     not_sync: std::marker::PhantomData<Cell<()>>,
 }
@@ -567,24 +646,113 @@ impl EventStream {
     /// `Timeout` once the deadline passes. It holds `&mut self`, so it cannot
     /// race a concurrent [`Stream`](futures_core::Stream) poll on the same
     /// stream.
+    ///
+    /// A prefill boundary does not end this wait and does not consume the
+    /// deadline: it is kept for [`Self::next_signal`] instead, and it also
+    /// releases the wait early. The deadline therefore still measures silence
+    /// from generated text, which is the only clock a caller of this method can
+    /// interpret. Use [`Self::next_signal`] to see prefill at all.
     pub fn next_timeout(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Event>, std::sync::mpsc::RecvTimeoutError> {
+        // Written on top of the one parking loop rather than beside it. Two
+        // loops that both park on this channel and both have to cope with a
+        // boundary are two chances to get the wakeup wrong, and there is only one
+        // that has to be right.
+        //
+        // A boundary is kept for `next_signal` rather than returned, so the
+        // deadline keeps measuring silence from generated text alone. It is also
+        // why this cannot read the stash back out: doing so would return the
+        // boundary it just put there, forever.
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            match self.wait(deadline)? {
+                Some(Signal::Event(event)) => return Ok(Some(event)),
+                Some(Signal::Progress(progress)) => self.progress.push_back(progress),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Wait for the next event *or* prefill boundary, giving up after `timeout`.
+    ///
+    /// Same three outcomes as [`Self::next_timeout`], with [`Signal`] in place of
+    /// [`Event`]. Prefill is silent per token, so a caller that has to notice a
+    /// client that stopped reading during it needs the boundary to end the wait;
+    /// a caller that does not should use [`Self::next_timeout`], which hides
+    /// boundaries, keeps the deadline measuring generated text alone, and is
+    /// written on top of this.
+    ///
+    /// Boundaries this stream took for [`Self::next_timeout`] come back first, in
+    /// the order they arrived, so a request consumed both ways still sees all of
+    /// them and sees them once.
+    ///
+    /// `timeout` of `None` parks until something arrives. That is the honest
+    /// budget for the first item of a request: `PREFILL_CHUNK` is 128 tokens and
+    /// this M2 prefills at 3.6-4.2 tok/s, so one chunk is about 35 s of work and a
+    /// prompt over 128 tokens is ordinary. It is unbounded here for the same
+    /// reason it is unbounded in [`Self::next_timeout`]: a deadline under one
+    /// chunk would cancel long prompts that were never stalled.
+    ///
+    /// ```no_run
+    /// # use local_engine::{Engine, Signal};
+    /// # use std::time::Duration;
+    /// let handle = Engine::open()?.into_handle();
+    /// let mut events = handle.complete_stream(local_engine::CompletionRequest {
+    ///     prompt: "Hello".into(),
+    ///     max_tokens: 8,
+    ///     sampling: local_engine::Sampling::default(),
+    ///     session: None,
+    /// })?;
+    /// // Prefill has started, and the model has produced no text yet.
+    /// assert!(matches!(
+    ///     events.next_signal(None)?,
+    ///     Some(Signal::Progress(_)) | Some(Signal::Event(_))
+    /// ));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn next_signal(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<Signal>, std::sync::mpsc::RecvTimeoutError> {
+        if let Some(progress) = self.progress.pop_front() {
+            return Ok(Some(Signal::Progress(progress)));
+        }
+        self.wait(timeout.and_then(|timeout| Instant::now().checked_add(timeout)))
+    }
+
+    /// Park until an item arrives or `deadline` passes, `None` meaning forever.
+    ///
+    /// The single place this stream waits. Both waits above are this plus a
+    /// policy: which items count, and what to do with a boundary.
+    fn wait(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Signal>, std::sync::mpsc::RecvTimeoutError> {
         let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
         let mut context = Context::from_waker(&waker);
         let started = Instant::now();
         loop {
             match self.receiver.poll_recv(&mut context) {
-                Poll::Ready(Some(event)) => return Ok(Some(event)),
+                Poll::Ready(Some(Delivered::Event(event))) => {
+                    return Ok(Some(Signal::Event(event)));
+                }
+                Poll::Ready(Some(Delivered::Progress(progress))) => {
+                    return Ok(Some(Signal::Progress(progress)));
+                }
                 Poll::Ready(None) => return Ok(None),
                 Poll::Pending => {}
             }
-            let waited = started.elapsed();
-            if waited >= timeout {
+            let Some(deadline) = deadline else {
+                std::thread::park();
+                continue;
+            };
+            let left = deadline.saturating_duration_since(started);
+            if left.is_zero() {
                 return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
             }
-            std::thread::park_timeout(timeout.saturating_sub(waited));
+            std::thread::park_timeout(left);
         }
     }
 }
@@ -606,7 +774,15 @@ impl Wake for ThreadWaker {
 impl Iterator for EventStream {
     type Item = Event;
     fn next(&mut self) -> Option<Self::Item> {
-        self.receiver.blocking_recv()
+        // A boundary is never an item of this iterator: it is kept for
+        // `next_signal`, so a caller of the iterator sees exactly the events it
+        // saw before a boundary existed.
+        loop {
+            match self.receiver.blocking_recv()? {
+                Delivered::Event(event) => return Some(event),
+                Delivered::Progress(progress) => self.progress.push_back(progress),
+            }
+        }
     }
 }
 
@@ -614,7 +790,19 @@ impl Stream for EventStream {
     type Item = Event;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().receiver.poll_recv(cx)
+        let stream = self.get_mut();
+        loop {
+            match stream.receiver.poll_recv(cx) {
+                Poll::Ready(Some(Delivered::Event(event))) => return Poll::Ready(Some(event)),
+                Poll::Ready(Some(Delivered::Progress(progress))) => {
+                    stream.progress.push_back(progress);
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                // Looping re-polls with the same waker, so a boundary does not
+                // leave the stream parked with nothing registered to wake it.
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -706,3 +894,7 @@ impl EventSplitter {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests;

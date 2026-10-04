@@ -1,5 +1,5 @@
 use super::reuse::ReuseBounds;
-use crate::bonsai_model::{BonsaiEngine, PromptSnapshot};
+use crate::bonsai_model::{BonsaiEngine, PrefillProgress, PromptSnapshot};
 
 impl BonsaiEngine {
     /// Choose the reusable boundary, materialize it, and build the snapshot
@@ -10,6 +10,7 @@ impl BonsaiEngine {
         bounds: &ReuseBounds,
         reused: usize,
         session_id: Option<&str>,
+        progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<(Option<PromptSnapshot>, bool)> {
         let lcp = bounds.lcp;
         let penultimate = bounds.penultimate;
@@ -25,7 +26,7 @@ impl BonsaiEngine {
         let reusable_boundary = divergence.or(system_boundary);
         let mut persisted_reusable_boundary = false;
         if let Some(boundary) = reusable_boundary {
-            self.model.prefill(&prompt[reused..boundary])?;
+            self.model.prefill(&prompt[reused..boundary], progress)?;
             self.save_prompt_checkpoint(&prompt[..boundary], true)?;
             if self.prompt_cache_bytes > 0
                 || (self.prompt_cache_disk_bytes > 0 && self.prompt_cache_dir.is_some())
@@ -43,7 +44,8 @@ impl BonsaiEngine {
         }
         let prefilled = reusable_boundary.unwrap_or(reused);
         if prefilled < penultimate {
-            self.model.prefill(&prompt[prefilled..penultimate])?;
+            self.model
+                .prefill(&prompt[prefilled..penultimate], progress)?;
             if self.max_prompt_checkpoints > 0 {
                 self.cached_tokens.clear();
                 self.cached_tokens.extend_from_slice(&prompt[..penultimate]);

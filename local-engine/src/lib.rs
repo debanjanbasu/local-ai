@@ -25,7 +25,7 @@ mod sampler;
 mod error;
 pub use api::{
     CancelHandle, ChatMessage, ChatOutput, ChatRequest, CompletionRequest, Engine, EngineHandle,
-    EngineInfo, Event, EventStream, Plan, Sampling, Stats,
+    EngineInfo, Event, EventStream, Plan, Sampling, Signal, Stats,
 };
 pub use error::Error;
 
@@ -38,5 +38,5 @@ pub use bonsai_mtp::{
 };
 pub use runtime::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P,
-    EVENT_BUFFER, GenerateParams, GenerationStats, MtpStats, NgramStats,
+    EVENT_BUFFER, GenerateParams, GenerationStats, MtpStats, NgramStats, PrefillProgress,
 };
