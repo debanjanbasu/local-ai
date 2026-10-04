@@ -10,18 +10,12 @@ const MODEL_RELATIVE: &str = "models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_
 const MTP_RELATIVE: &str = "bonsai2-27b-mtp/model_mtp.safetensors";
 pub const PREFILL_CHUNK: usize = 128;
 pub const SERVE_QUEUE: usize = 8;
-/// Ceiling on the prompt-cache disk budget.
-///
-/// A disk snapshot stores the full prompt state, so its size scales with the
-/// selected context rather than staying small: at a 45k-token context one
-/// snapshot is roughly 1.7 GB. A 32 GiB ceiling therefore held under twenty
-/// sessions, which evicted checkpoints long before the disk ran short, so the
-/// ceiling was raised to 512 GiB, which holds about 290.
-///
-/// The free-space fraction in `Resources::discover` is the real governor; this
-/// ceiling only stops a pathological report from authorising an unbounded
-/// budget.
-pub const DISK_CACHE_CAP_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+/// Divisor on free disk in the prompt-cache disk budget, so a fuller disk
+/// shrinks it.
+const FREE_DISK_SHARE: u64 = 8;
+/// Divisor on physical memory in the prompt-cache disk budget, leaving three
+/// quarters of memory to page cache the demand-paged checkpoint.
+const PHYSICAL_MEMORY_SHARE: u64 = 4;
 
 #[derive(Debug)]
 pub struct Resources {
@@ -60,6 +54,10 @@ impl Resources {
         mtp_depth: usize,
     ) -> crate::Result<Self> {
         let (model, model_reason) = discover_model(model_override)?;
+        // One probe, read by both the budget and the reported field: `sysctl`
+        // is spawned once per discovery rather than once per consumer.
+        let memory = physical_memory_bytes();
+        let model_bytes = file_bytes(&model);
         let mtp_root = model.parent().and_then(Path::parent);
         let source = mtp_root.map(|root| root.join(MTP_RELATIVE));
         // The artifact is the head's sibling by construction, so the two can never
@@ -108,18 +106,10 @@ impl Resources {
                 },
                 |path| match writable_directory(&path) {
                     Ok(()) => {
-                        let free = free_disk_bytes(&path).unwrap_or(0);
-                        let budget = DISK_CACHE_CAP_BYTES.min(free / 4);
+                        let (budget, reason) =
+                            disk_cache_budget(model_bytes, free_disk_bytes(&path), memory);
                         let rate = measure_write_rate(&path);
-                        (
-                            Some(path),
-                            budget,
-                            format!(
-                                "min({} GiB, 25% of {free} free bytes)",
-                                DISK_CACHE_CAP_BYTES / (1024 * 1024 * 1024)
-                            ),
-                            rate,
-                        )
+                        (Some(path), budget, reason, rate)
                     }
                     Err(reason) => (None, 0, reason, None),
                 },
@@ -148,7 +138,7 @@ impl Resources {
             prompt_cache_write_bytes_per_second: cache_write_rate,
             tls,
             tls_reason,
-            physical_memory_bytes: physical_memory_bytes(),
+            physical_memory_bytes: memory,
         })
     }
 
@@ -270,6 +260,107 @@ fn command_number(program: &str, args: &[&str]) -> Option<u64> {
         .flatten()
 }
 
+/// The prompt-cache disk budget, and the reason string that reports it.
+///
+/// The budget is the smallest of three terms derived from machine facts: the
+/// checkpoint's own bytes, an eighth of free disk, and a quarter of physical
+/// memory. Measured on this M2 — a 5.95 GB checkpoint, 643.7 GiB free, 16 GiB of
+/// memory — the reason reads `4 GiB = min(model 5 GiB, free disk 642 GiB / 8 =
+/// 80 GiB, physical memory 16 GiB / 4 = 4 GiB), bounded by a quarter of
+/// physical memory`, which holds about 27 snapshots. A fixed 512 GiB ceiling
+/// against a quarter of free disk allowed 161 GiB and about 1,100 instead.
+///
+/// The memory term is the one that protects what the cache exists to serve.
+/// [`crate::bonsai::BonsaiPackage`] maps the checkpoint with
+/// `map_copy_read_only`, so the checkpoint is demand-paged and decode needs its
+/// pages resident: on a 16 GiB part a cache sized only against free disk evicts
+/// exactly those pages. That term is what reserves page cache for the
+/// checkpoint. The in-RAM tier keeps its own independent policy and is untouched
+/// by this bound.
+///
+/// The unit the budget is really counting is the snapshot, not the context.
+/// Measured on this M2 across all 71 real snapshots, spanning six contexts from
+/// 45,720 to 66,810 tokens and 10.56 GiB in total, every `.bpc` file is
+/// ~152 MiB: 151.2-153.4 MiB per context, and no file outside the 100-200 MiB
+/// band. A snapshot's size is therefore close to independent of the context it
+/// holds, which is why no term here reads the context length, and why a budget
+/// in bytes converts to a snapshot count without a guess.
+///
+/// Every term is reported in the reason beside the one that won, so the number
+/// cannot drift from the arithmetic that produced it.
+fn disk_cache_budget(
+    model_bytes: Option<u64>,
+    free_bytes: Option<u64>,
+    memory_bytes: Option<u64>,
+) -> (u64, String) {
+    let model = model_bytes.unwrap_or(u64::MAX);
+    let model_text = readable_bytes(model);
+    let (free, free_text) = bounded_term(free_bytes, FREE_DISK_SHARE);
+    let (memory, memory_text) = bounded_term(memory_bytes, PHYSICAL_MEMORY_SHARE);
+    let budget = model.min(free).min(memory);
+    // `u64::MAX` is the sentinel a failed probe contributes, so a budget sitting
+    // on it means nothing was readable rather than a term having genuinely won.
+    let bound = if budget == u64::MAX {
+        "no machine fact was readable".to_owned()
+    } else if budget == model {
+        format!("the checkpoint it accelerates ({model_text})")
+    } else if budget == free {
+        format!("an eighth of free disk ({free_text})")
+    } else {
+        format!("a quarter of physical memory ({memory_text})")
+    };
+    (
+        budget,
+        format!(
+            "{} = min(model {model_text}, free disk {free_text}, physical memory {memory_text}), \
+             bounded by {bound}",
+            readable_bytes(budget)
+        ),
+    )
+}
+
+/// One divided term of [`disk_cache_budget`], and how it reads in the reason.
+///
+/// A probe that failed contributes [`u64::MAX`] rather than zero. A missing
+/// `sysctl` or `df` must remove a limit, because reading it as "no budget" would
+/// silently turn a failed probe into a disabled cache.
+fn bounded_term(bytes: Option<u64>, share: u64) -> (u64, String) {
+    let Some(known) = bytes else {
+        let text = format!("unbounded (probe failed; would be / {share})");
+        return (u64::MAX, text);
+    };
+    let bounded = known / share;
+    (
+        bounded,
+        format!(
+            "{} / {share} = {}",
+            readable_bytes(known),
+            readable_bytes(bounded)
+        ),
+    )
+}
+
+/// A byte count in gibibytes, falling back to mebibytes below one gibibyte so a
+/// small budget still reads as a number rather than as `0 GiB`.
+fn readable_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes == u64::MAX {
+        // The sentinel an unreadable probe contributes; naming it as a count
+        // would report a budget nobody measured.
+        "unbounded".to_owned()
+    } else if bytes >= GIB {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
+}
+
+/// The size of a file, or `None` when it cannot be measured.
+fn file_bytes(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
 fn physical_memory_bytes() -> Option<u64> {
     command_number("sysctl", &["-n", "hw.memsize"])
 }
@@ -309,4 +400,91 @@ fn measure_write_rate(path: &Path) -> Option<u64> {
         .ok()?
         .checked_mul(1_000_000_000)?
         .checked_div(u64::try_from(elapsed.as_nanos()).ok()?.max(1))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{FREE_DISK_SHARE, PHYSICAL_MEMORY_SHARE, disk_cache_budget, readable_bytes};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// The measured facts of the machine these terms were derived on.
+    const MODEL: u64 = 6 * GIB;
+    const DISK: u64 = 644 * GIB;
+    const MEMORY: u64 = 16 * GIB;
+
+    #[test]
+    fn the_budget_is_the_smallest_of_the_three_machine_terms() {
+        // A small checkpoint bounds the cache below both fractions, and the
+        // reason says so rather than leaving it to be inferred.
+        let (budget, reason) = disk_cache_budget(Some(GIB), Some(DISK), Some(MEMORY));
+        assert_eq!(budget, GIB);
+        assert!(reason.contains("the checkpoint it accelerates"), "{reason}");
+
+        // A fuller disk bounds it even against a large checkpoint and 16 GiB.
+        let (budget, reason) = disk_cache_budget(Some(64 * GIB), Some(8 * GIB), Some(MEMORY));
+        assert_eq!(budget, GIB);
+        assert!(reason.contains("an eighth of free disk"), "{reason}");
+
+        // With disk and memory both plentiful, the memory term is left to bound
+        // it, which is the case this machine is actually in.
+        let (budget, reason) = disk_cache_budget(Some(MODEL), Some(DISK), Some(MEMORY));
+        assert_eq!(budget, MEMORY / PHYSICAL_MEMORY_SHARE);
+        assert!(reason.contains("a quarter of physical memory"), "{reason}");
+    }
+
+    #[test]
+    fn the_reason_reports_every_term_and_the_budget_it_derived() {
+        let (budget, reason) = disk_cache_budget(Some(MODEL), Some(DISK), Some(MEMORY));
+        assert!(reason.starts_with(&readable_bytes(budget)), "{reason}");
+        assert!(reason.contains("model 6 GiB"), "{reason}");
+        assert!(
+            reason.contains(&format!(
+                "free disk {} GiB / {FREE_DISK_SHARE} = {} GiB",
+                DISK / GIB,
+                DISK / FREE_DISK_SHARE / GIB
+            )),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!(
+                "physical memory 16 GiB / {PHYSICAL_MEMORY_SHARE} = 4 GiB"
+            )),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_drops_its_limit_instead_of_zeroing_the_budget() {
+        // Every probe missing leaves the cache unbounded, never disabled.
+        let (budget, reason) = disk_cache_budget(None, None, None);
+        assert_eq!(budget, u64::MAX);
+        assert!(reason.contains("no machine fact was readable"), "{reason}");
+
+        // One probe answering still bounds the budget, and the terms that failed
+        // read as unbounded rather than as a zero that would beat it.
+        let (budget, reason) = disk_cache_budget(None, None, Some(MEMORY));
+        assert_eq!(budget, MEMORY / PHYSICAL_MEMORY_SHARE);
+        assert!(reason.contains("model unbounded"), "{reason}");
+        assert!(
+            reason.contains(&format!(
+                "free disk unbounded (probe failed; would be / {FREE_DISK_SHARE})"
+            )),
+            "{reason}"
+        );
+
+        let (budget, reason) = disk_cache_budget(Some(MODEL), None, None);
+        assert_eq!(budget, MODEL);
+        assert!(reason.contains("bounded by the checkpoint"), "{reason}");
+
+        let (budget, _) = disk_cache_budget(Some(MODEL), Some(DISK), None);
+        assert_eq!(budget, MODEL);
+    }
+
+    #[test]
+    fn a_byte_count_reads_in_gibibytes_and_a_failed_probe_reads_as_unbounded() {
+        assert_eq!(readable_bytes(4 * GIB), "4 GiB");
+        assert_eq!(readable_bytes(152 * 1024 * 1024), "152 MiB");
+        assert_eq!(readable_bytes(u64::MAX), "unbounded");
+    }
 }
