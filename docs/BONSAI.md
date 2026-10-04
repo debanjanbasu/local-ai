@@ -270,6 +270,100 @@ are committed and recurrent state, target K/V, and MTP state are rolled back to
 that exact boundary. Full acceptance needs no restore. This compact rollback
 uses 282 MB for 63 drafts rather than 9.9 GB of per-row full checkpoints.
 
+### What the speculation gain is made of
+
+`--no-speculation` disables two independent mechanisms under one flag: the MTP
+head, which drafts speculatively ahead, and n-gram suffix lookup
+(`ngram_policy`, `min_match: 24`), which proposes the known continuation of a
+previously-seen 24-token suffix. Both are honestly called speculation, the flag
+disables both by design, and the startup policy reports the two separately, so
+an A/B against the flag measures speculation rather than the head alone. What
+that A/B cannot show is how the gain divides between them.
+
+Measured on a 16 GB M2 MacBook Air, greedy decoding, `--max-tokens` 160 to 400,
+three repetitions per arm taking the median. Every arm produced byte-identical
+output, so the comparison is fair.
+
+| Workload | Speculation | `--no-speculation` | Speedup | MTP | n-gram |
+| --- | ---: | ---: | ---: | --- | --- |
+| Varied prose: planets with one-line descriptions | 3.747 tok/s | 2.983 tok/s | 1.26x, and 1.22x on an independent second run | 75 rounds, 84/106 accepted | 0 rounds |
+| Repetitive: counting one to twenty and back | 4.824 tok/s | 2.975 tok/s | 1.62x | 28 rounds, 73 accepted | 0 rounds |
+| Verbatim: the same sentence 20 times | 5.935 tok/s | 3.023 tok/s | 1.96x | 17 rounds, 50/50 accepted | 12 rounds, 260/261 accepted |
+
+The n-gram path never engaged on the first two workloads, so their 1.26x and
+1.62x are the MTP head on its own; run-to-run spread on the first is about 4%,
+which is worth knowing before reading much into a single figure. The 1.96x row
+reproduces the headline gain, and it is the only row where n-gram engaged at
+all: 260 of 261 proposals accepted for 0.1 ms of total lookup time. Both
+mechanisms were live on that row — MTP accepted 50 of 50 there, a higher rate
+than on any other workload — so these counters cannot rank the two against each
+other, and the split is not measured. What is established is narrower and
+still worth stating: the head alone delivers 1.26x on non-repetitive text and
+1.62x on lightly repetitive text, and the larger headline figure coincides with
+the one workload where suffix reuse switched on.
+
+#### Where the decode time goes
+
+From the 160-token varied-prose run, with speculation on:
+
+| Phase | Seconds | Share |
+| --- | ---: | ---: |
+| Verification | 39.211 | 89.0% |
+| Drafting | 3.390 | 7.7% |
+| Commit | 0.549 | 1.2% |
+| Other | 0.896 | 2.0% |
+
+Drafting is the speculative phase and it is cheap; checking the draft is 89.0%
+of decode. That ordering is what makes the unit costs worth recording.
+
+| Quantity | Value |
+| --- | ---: |
+| Plain single-token decode | 0.33563 s |
+| Verify block | 0.52282 s, covering 2.413 tokens |
+| Per batched verify token | 0.21664 s, or 0.6455x a plain decode token |
+| Verify block against one plain decode | 1.5577x, for 2.41x the tokens |
+| Batching gain on the dominant phase | 1.55x |
+| Draft step | 0.04521 s, or 13.5% of a decode step |
+| MTP acceptance | 79.2% (84/106) |
+| Tokens per round achieved | 2.133 |
+| Tokens per round at full depth 3, including the token every round emits anyway | 3.377 |
+| Depth-3 opportunity captured | 63% |
+
+A verify block costs 1.5577x a plain decode and returns 2.41x the tokens, so
+batching is worth 1.55x on the phase that dominates decode. A draft step costs
+13.5% of a decode step, and 2.133 tokens per round against 3.377 at full depth 3
+means the gate already collects 63% of what depth 3 could reach. That is also
+why a cheaper draft has so little left to win on this path.
+
+Throughput then follows from acceptance and depth rather than from a benchmark
+run:
+
+```text
+speedup = tokens_per_round x T / (draft + verify)
+```
+
+Every input to that formula comes from one run of the varied-prose workload, so
+the comparison is like for like: the formula predicts 1.2605x against the
+1.2192x that run measured, 3.4% apart. The model is worth more than the single
+number it produces — a change to acceptance or to draft depth can be priced
+arithmetically instead of benchmarked.
+
+#### Why this engine's speculation pays and a published CUDA result did not
+
+A published community MTP graft of this same 27B ternary trunk, measured on the
+1.75 bpw PTQ1 configuration, reported a 1.6% gain, which is to say nothing, and
+attributed it to verifying a batch of 3 tokens costing about 3x verifying 1.
+That is a per-token ratio near 1.0: no batching gain at all. Here the same ratio
+is 0.6455, a 1.55x gain, because a batched verify shares the weight stream across
+its positions instead of re-reading it per position. Their own note that the
+PTQ1 unpacking was compute-bound is consistent with per-token unpack work
+consuming that share.
+
+This reconciles direction and magnitude between two reported numbers on two
+different runtimes. The batching explanation is inferred, not measured: nothing
+was measured on the other implementation's kernels, so it is the reading that
+makes the two sets of numbers compatible rather than a result.
+
 ## Prompt cache
 
 Prompt reuse is exact-prefix reuse. Each snapshot binds model identity, K/V
@@ -353,6 +447,18 @@ is the main limit.
   perfect-drafter ceiling is 32.8 tok/s and realistic acceptance loses to MTP.
 - Eight-row small-batch verify kernel: faster on 17408×5120 but slower on
   5120×17408; whole-model 8/16/24-row verify went from 256/448/643 ms to 275/489/705 ms.
+- A lower-precision MTP head as a throughput lever: three independent Apple
+  Silicon sources report that keeping the head in BF16 beats a narrower one,
+  since dequant overhead dominates latency-bound draft matmuls. That matches
+  this engine's cost structure, where drafting is 7.7% of decode time, so the
+  ceiling here is arithmetic on that share rather than an experiment: an
+  infinitely fast head matmul caps the whole speculation gain at 8.34%, and
+  halving it buys 4.00%. Separately, the BF16 and int8 paths produce
+  bit-identical GPU weights — the same 425,056,256-byte payload and sha256
+  `a98a24e58fcfb711cd2b466d3a32375e428000b8f2b06b677d5839946b20f93b` — so the
+  int8 artifact is a load-time and footprint result, 5.94 s to 3.18 s and
+  849,400,392 to 355,837,652 bytes, and cannot be a decode-throughput result at
+  all.
 - Residency sets: 17.23/27.50/48.05 tok/s versus 17.17/27.51/47.98; neutral.
 - Untracked hazards: 17.25 versus 17.25 tok/s plain and incorrect speculative tokens.
 - Multi-request batching: 25.5/29.5/31.4 aggregate tok/s at 2/3/4 requests,
