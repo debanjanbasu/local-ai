@@ -36,7 +36,8 @@ pub use self::{
     head::{BonsaiMtp, Shared},
     policy::{
         DEFAULT_BONSAI_MTP_ARTIFACT, DEFAULT_BONSAI_MTP_HEAD, DEFAULT_MTP_DEPTH,
-        DEFAULT_MTP_ENABLED, DRAFT_CHAIN_MIN_MARGIN, MtpMode, MtpResolution, MtpSettings,
+        DEFAULT_MTP_ENABLED, DRAFT_CHAIN_MIN_MARGIN, MAX_MTP_DEPTH, MtpMode, MtpResolution,
+        MtpSettings,
     },
 };
 
@@ -55,7 +56,7 @@ use self::{
         write_zstd_artifact,
     },
     layout::{SAFETENSORS_MAX_HEADER, SafetensorsLayout, TENSORS, open_layout},
-    policy::{MAX_MTP_DEPTH, MTP_DEFAULT_OFF_REASON, MTP_OFF_REASON},
+    policy::{MTP_DEFAULT_OFF_REASON, MTP_OFF_REASON},
     weights::{fold_norm, quantize_rows, spec, split_fc},
 };
 

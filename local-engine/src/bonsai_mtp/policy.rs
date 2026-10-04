@@ -13,6 +13,8 @@ use super::cache::MTP_HEAD_ARTIFACT;
 /// Once the int8 head made drafting 20–30 % cheaper, gated depth 3 beat
 /// depth 2 on arithmetic, code, explanation and essay prompts (+1–3 %,
 /// lower GPU time per token, identical tokens).
+// The doc above is one measurement log, not separate findings.
+#[allow(clippy::too_long_first_doc_paragraph)]
 pub const DEFAULT_MTP_DEPTH: usize = 3;
 pub const MAX_MTP_DEPTH: usize = 4;
 /// The head drafts a further token only while its current proposal leads
