@@ -231,18 +231,23 @@ impl BonsaiOps {
         let bufs = [(q, 0), (k_cache, 0), (v_cache, 0), (fallback, 0), (out, 0)];
         let groups = 24 * tokens.div_ceil(8) as usize;
         let gated = u32::from(gate.is_some());
+        let codes = layout.codes();
         if layout.is_f16() {
+            // `bo_attn_block` reads the format codes at slots 8 and 9 and
+            // dispatches on them: any non-F16 code selects the dequantizing
+            // instantiation, which reads F16 bytes as Q8. The tensor kernel
+            // takes `half*` directly and never dispatches, which is why this
+            // only showed up on the SIMD path.
             self.go(
                 b,
                 13,
                 &bufs,
-                &[position, tokens, gated],
+                &[position, tokens, gated, codes[0], codes[1]],
                 &[],
                 groups,
                 self.attention_kernel.threads(),
             );
         } else {
-            let codes = layout.codes();
             self.go(
                 b,
                 17,
