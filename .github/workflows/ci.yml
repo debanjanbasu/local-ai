@@ -34,25 +34,27 @@
 # read a green check as coverage of the real-model path.
 # ---------------------------------------------------------------------------
 #
-# Runner: `macos-latest`, which is macOS on Apple Silicon. This project targets
-# current macOS on Apple Silicon and nothing older, so testing an older image
-# would verify a configuration nobody ships. Two things the runner must supply,
-# because either one missing makes a "passing" run meaningless:
+# Runner: `macos-latest`, which is macOS on Apple Silicon. Two things the
+# runner must supply, because either one missing makes a "passing" run
+# meaningless:
 #
 #   1. A macOS host with Xcode. `local-metal/build.rs` shells out to `xcrun
 #      metal` / `xcrun metallib` to compile `shaders/*.metal` into a
 #      `.metallib`. That toolchain exists only on macOS with Xcode, so a Linux
 #      or Windows runner is not a slower alternative, it is a broken one.
-#   2. An arm64 host. The workspace enables bytemuck's `aarch64_simd` feature
-#      and `.cargo/config.toml` pins `-C target-cpu=apple-m1` for
-#      `aarch64-apple-darwin`. An x86_64 runner would not exercise the same
-#      code paths.
+#   2. An arm64 host. Intel macOS is not a slower target, it is an unsupported
+#      one: this project has never run on it and never will. The workspace
+#      enables bytemuck's `aarch64_simd` feature and `.cargo/config.toml` pins
+#      `-C target-cpu=apple-m1` for `aarch64-apple-darwin`, so an Intel runner
+#      would not even build the same way.
 #
 # `macos-latest` is a moving target, which is the real cost of not pinning an
 # image: when GitHub moves it, this job silently starts testing a different
-# machine. That is the trade we are making on purpose. If a runner change ever
-# breaks the build, pin the version then -- with a comment saying what broke --
-# rather than pinning preemptively and testing a configuration nobody uses.
+# machine. That is the trade we are making on purpose, and it is the only
+# correct choice here -- there is no older image worth falling back to, because
+# every image before Apple Silicon is a platform this project does not support.
+# If `macos-latest` ever stops resolving to an arm64 macOS runner, the right
+# response is to let this job fail, not to pin its way back to Intel.
 #
 # GPU tests skip rather than fail when the runner exposes no Metal device: each
 # one calls `gpu_or_skip()`, which returns `None` only for a missing device and
