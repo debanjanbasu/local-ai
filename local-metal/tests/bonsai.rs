@@ -151,11 +151,23 @@ fn assert_close(actual: f32, expected: f64, tolerance: f64) {
     );
 }
 
-fn setup() -> (MetalContext, BonsaiKernels) {
-    let context = MetalContext::new().expect("Metal context");
+/// `None` when this machine exposes no Metal device, so GPU tests skip
+/// instead of failing. Any other failure is still a failure: a missing GPU
+/// is an environment, a broken context is a bug.
+fn gpu_or_skip() -> Option<MetalContext> {
+    let context = MetalContext::new();
+    if matches!(context, Err(local_metal::Error::NoMetalDevice)) {
+        eprintln!("skipping GPU test: this machine has no Metal device");
+        return None;
+    }
+    Some(context.expect("Metal context failed for a reason other than a missing device"))
+}
+
+fn setup() -> Option<(MetalContext, BonsaiKernels)> {
+    let context = gpu_or_skip()?;
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     let kernels = BonsaiKernels::new(&context, &shaders).expect("Bonsai kernels");
-    (context, kernels)
+    Some((context, kernels))
 }
 
 fn prefill_kernels(context: &MetalContext) -> Vec<BonsaiKernels> {
@@ -205,7 +217,9 @@ fn row_decoder_preserves_all_ternary_combinations_and_independent_group_scales()
 
 #[test]
 fn cpu_and_gpu_decoders_cover_every_byte_code_at_every_element() {
-    let (context, kernels) = setup();
+    let Some((context, kernels)) = setup() else {
+        return;
+    };
     let mut packed = Vec::new();
     for code in 0..256 {
         let mut block = [0_u8; 28];
@@ -255,7 +269,9 @@ fn cpu_and_gpu_decoders_cover_every_byte_code_at_every_element() {
 
 #[test]
 fn signed_fwht_matches_dense_walsh_reference_and_true_inverse() {
-    let (context, kernels) = setup();
+    let Some((context, kernels)) = setup() else {
+        return;
+    };
     let columns = 2048;
     let tokens = 3;
     let signs = signs(columns);
@@ -352,7 +368,9 @@ fn packed_fixture(rows: usize, columns: usize, salt: u32) -> Vec<u8> {
 
 #[test]
 fn rotated_matvec_matches_unrotated_weights_and_real_projection_widths() {
-    let (context, kernels) = setup();
+    let Some((context, kernels)) = setup() else {
+        return;
+    };
     for (rows, columns) in [(1, 1024), (3, 2048), (7, 5120), (9, 17408)] {
         let packed = packed_fixture(rows, columns, 19);
         let decoded = reference_decode(&packed);
@@ -411,7 +429,9 @@ fn rotated_matvec_matches_unrotated_weights_and_real_projection_widths() {
 
 #[test]
 fn matvec_handles_partial_row_groups_and_partial_four_block_iterations() {
-    let (context, kernels) = setup();
+    let Some((context, kernels)) = setup() else {
+        return;
+    };
     // Widths deliberately not restricted to 1024: the four-block work layout
     // must also handle fewer than four blocks and incomplete final iterations.
     for (rows, columns) in [(1, 128), (2, 256), (5, 384), (6, 640), (17, 896)] {
@@ -451,7 +471,9 @@ fn matvec_handles_partial_row_groups_and_partial_four_block_iterations() {
 
 #[test]
 fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
-    let (context, _) = setup();
+    let Some((context, _)) = setup() else {
+        return;
+    };
     // Tile tails are the subject; small-batch shapes have their own test. Exercise
     // both production prefill implementations directly against the F64 reference.
     let kernels = prefill_kernels(&context);
@@ -539,7 +561,9 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
 
 #[test]
 fn matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range() {
-    let (context, kernels) = setup();
+    let Some((context, kernels)) = setup() else {
+        return;
+    };
     // The tile path is the subject; the small-batch route is checked below.
     let kernels = kernels.with_small_batch_max(1);
     let mut selected = [0_i8; 128];
@@ -625,7 +649,9 @@ fn matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range() {
 
 #[test]
 fn rejects_invalid_geometry_signs_aliasing_and_short_buffers_before_dispatch() {
-    let (context, kernels) = setup();
+    let Some((context, kernels)) = setup() else {
+        return;
+    };
     assert_eq!(PTQ1_BLOCK_ELEMENTS, 128);
     assert_eq!(PTQ1_BLOCK_BYTES, 28);
     assert_eq!(HADAMARD_BLOCK_ELEMENTS, 1024);
@@ -726,7 +752,9 @@ fn kernels_with_small_batch_max(context: &MetalContext, tokens: u32) -> BonsaiKe
 // reference and agree with the prefill tile within its tolerance.
 #[test]
 fn small_batch_matches_tokenwise_matvec_reference_and_tile_for_all_chunks() {
-    let (context, kernels) = setup();
+    let Some((context, kernels)) = setup() else {
+        return;
+    };
     let small = kernels_with_small_batch_max(&context, 64);
     let tile = kernels_with_small_batch_max(&context, 1);
     assert_eq!(tile.small_batch_max(), 1);

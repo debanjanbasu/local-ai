@@ -6,6 +6,18 @@ use local_metal::context::MetalContext;
 use local_metal::sampling::{GpuTopK, MAX_TOP_K, TopKCandidate};
 use local_metal::shaders::ShaderLibrary;
 
+/// `None` when this machine exposes no Metal device, so GPU tests skip
+/// instead of failing. Any other failure is still a failure: a missing GPU
+/// is an environment, a broken context is a bug.
+fn gpu_or_skip() -> Option<MetalContext> {
+    let context = MetalContext::new();
+    if matches!(context, Err(local_metal::Error::NoMetalDevice)) {
+        eprintln!("skipping GPU test: this machine has no Metal device");
+        return None;
+    }
+    Some(context.expect("Metal context failed for a reason other than a missing device"))
+}
+
 fn reference(values: &[f32], k: usize) -> Vec<TopKCandidate> {
     let mut ids: Vec<usize> = (0..values.len()).collect();
     ids.sort_unstable_by(|&a, &b| values[b].total_cmp(&values[a]).then_with(|| a.cmp(&b)));
@@ -41,7 +53,7 @@ fn values(count: usize) -> Vec<f32> {
 
 #[test]
 fn gpu_matches_total_cmp_for_tiny_odd_and_full_vocab() {
-    let context = MetalContext::new().expect("Metal context");
+    let Some(context) = gpu_or_skip() else { return };
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     let topk = GpuTopK::new(&context, &shaders, 248_320).expect("top-k");
     assert_eq!(topk.maximum_supported_k(), MAX_TOP_K);
@@ -69,7 +81,7 @@ fn gpu_matches_total_cmp_for_tiny_odd_and_full_vocab() {
 
 #[test]
 fn preserves_special_bits_and_lowest_id_ties_across_reuse() {
-    let context = MetalContext::new().expect("Metal context");
+    let Some(context) = gpu_or_skip() else { return };
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     let topk = GpuTopK::new(&context, &shaders, 300).expect("top-k");
     let special = [
@@ -103,7 +115,7 @@ fn preserves_special_bits_and_lowest_id_ties_across_reuse() {
 
 #[test]
 fn rejects_invalid_bounds_before_dispatch() {
-    let context = MetalContext::new().expect("Metal context");
+    let Some(context) = gpu_or_skip() else { return };
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     assert!(GpuTopK::new(&context, &shaders, 0).is_err());
     let topk = GpuTopK::new(&context, &shaders, 100).expect("top-k");

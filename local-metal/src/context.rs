@@ -120,15 +120,27 @@ pub type SharedMetalContext = Arc<MetalContext>;
 mod tests {
     use super::*;
 
+    /// `None` when this machine exposes no Metal device, so GPU tests skip
+    /// instead of failing. Any other failure is still a failure: a missing GPU
+    /// is an environment, a broken context is a bug.
+    fn gpu_or_skip() -> Option<MetalContext> {
+        let context = MetalContext::new();
+        if matches!(context, Err(crate::Error::NoMetalDevice)) {
+            eprintln!("skipping GPU test: this machine has no Metal device");
+            return None;
+        }
+        Some(context.expect("Metal context failed for a reason other than a missing device"))
+    }
+
     #[test]
     fn create_context() {
-        let ctx = MetalContext::new().expect("create Metal context");
+        let Some(ctx) = gpu_or_skip() else { return };
         assert_ne!(ctx.device_name(), "");
     }
 
     #[test]
     fn device_name_contains_apple() {
-        let ctx = MetalContext::new().expect("create Metal context");
+        let Some(ctx) = gpu_or_skip() else { return };
         let name = ctx.device_name();
         assert!(
             name.contains("Apple") || name.contains("apple"),
@@ -138,7 +150,7 @@ mod tests {
 
     #[test]
     fn create_command_buffer() {
-        let ctx = MetalContext::new().expect("create Metal context");
+        let Some(ctx) = gpu_or_skip() else { return };
         let _cb = ctx.new_command_buffer().expect("create command buffer");
     }
 }
