@@ -12,6 +12,18 @@ const STATE: usize = 48 * 128 * 128;
 const QKV: usize = 10240;
 const OUTPUT: usize = 6144;
 
+/// `None` when this machine exposes no Metal device, so GPU tests skip
+/// instead of failing. Any other failure is still a failure: a missing GPU
+/// is an environment, a broken context is a bug.
+fn gpu_or_skip() -> Option<MetalContext> {
+    let context = MetalContext::new();
+    if matches!(context, Err(local_metal::Error::NoMetalDevice)) {
+        eprintln!("skipping GPU test: this machine has no Metal device");
+        return None;
+    }
+    Some(context.expect("Metal context failed for a reason other than a missing device"))
+}
+
 struct Kernel {
     rows: usize,
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -107,7 +119,7 @@ fn check(buffer: &MetalBuffer, expected: &[f64]) {
 
 #[test]
 fn tiled_recurrence_matches_f64_for_every_state_row_and_causal_continuation() {
-    let context = MetalContext::new().expect("context");
+    let Some(context) = gpu_or_skip() else { return };
     let kernels = kernels(&context);
     let tokens = 128;
     let (qkv, decay, beta, initial) = inputs(tokens);

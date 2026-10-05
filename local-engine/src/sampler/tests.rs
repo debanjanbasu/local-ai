@@ -1,6 +1,18 @@
 use super::*;
 use local_metal::shaders::ShaderLibrary;
 
+/// `None` when this machine exposes no Metal device, so GPU tests skip
+/// instead of failing. Any other failure is still a failure: a missing GPU
+/// is an environment, a broken context is a bug.
+fn gpu_or_skip() -> Option<MetalContext> {
+    let context = MetalContext::new();
+    if matches!(context, Err(local_metal::Error::NoMetalDevice)) {
+        eprintln!("skipping GPU test: this machine has no Metal device");
+        return None;
+    }
+    Some(context.expect("Metal context failed for a reason other than a missing device"))
+}
+
 fn params() -> SamplingParams {
     SamplingParams {
         temperature: 0.8,
@@ -16,7 +28,9 @@ fn params() -> SamplingParams {
 
 #[test]
 fn seeded_gpu_sampling_preserves_penalties_filters_ties_and_cpu_fallbacks() {
-    let context = MetalContext::new().expect("context");
+    let Some(context) = gpu_or_skip() else {
+        return;
+    };
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     let topk = GpuTopK::new(&context, &shaders, 248_320).expect("top-k");
     for (vocab, k, temperature, top_p, min_p) in [
@@ -62,7 +76,9 @@ fn seeded_gpu_sampling_preserves_penalties_filters_ties_and_cpu_fallbacks() {
 
 #[test]
 fn draft_margin_is_the_penalized_lead_over_the_runner_up_on_gpu_and_cpu() {
-    let context = MetalContext::new().expect("context");
+    let Some(context) = gpu_or_skip() else {
+        return;
+    };
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     let topk = GpuTopK::new(&context, &shaders, 248_320).expect("top-k");
     // 33 selects on the CPU, 248_320 through the GPU top-k.

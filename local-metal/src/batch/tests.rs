@@ -7,9 +7,23 @@ fn drop_probe() -> (Arc<()>, std::sync::Weak<()>) {
     (lease, weak)
 }
 
+/// `None` when this machine exposes no Metal device, so GPU tests skip
+/// instead of failing. Any other failure is still a failure: a missing GPU
+/// is an environment, a broken context is a bug.
+fn gpu_or_skip() -> Option<MetalContext> {
+    let context = MetalContext::new();
+    if matches!(context, Err(crate::Error::NoMetalDevice)) {
+        eprintln!("skipping GPU test: this machine has no Metal device");
+        return None;
+    }
+    Some(context.expect("Metal context failed for a reason other than a missing device"))
+}
+
 #[test]
 fn create_and_commit_empty_batch() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let batch = CommandBatch::new(&ctx).expect("CommandBatch::new");
     assert_eq!(batch.dispatch_count(), 0);
     batch.commit_and_wait().expect("commit_and_wait");
@@ -17,7 +31,9 @@ fn create_and_commit_empty_batch() {
 
 #[test]
 fn dispatch_count_increments() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let mut batch = CommandBatch::new(&ctx).expect("CommandBatch::new");
     batch.record_dispatch();
     batch.record_dispatch();
@@ -27,7 +43,9 @@ fn dispatch_count_increments() {
 
 #[test]
 fn commit_async_returns_command_buffer() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let batch = CommandBatch::new(&ctx).expect("CommandBatch::new");
     let pending = batch.commit_async();
     pending.wait().expect("wait");
@@ -35,7 +53,9 @@ fn commit_async_returns_command_buffer() {
 
 #[test]
 fn submit_buffer_copies_moves_data_between_shared_buffers() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src = crate::buffer::MetalBuffer::from_slice(ctx.device(), &[1_u32, 2, 3, 4]).expect("src");
     let dst = crate::buffer::MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
 
@@ -57,7 +77,9 @@ fn submit_buffer_copies_moves_data_between_shared_buffers() {
 
 #[test]
 fn submit_buffer_copies_iter_moves_data_between_shared_buffers() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src =
         crate::buffer::MetalBuffer::from_slice(ctx.device(), &[1_u32, 2, 3, 4, 5, 6]).expect("src");
     let dst = crate::buffer::MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
@@ -89,7 +111,9 @@ fn submit_buffer_copies_iter_moves_data_between_shared_buffers() {
 
 #[test]
 fn submit_and_renew_can_track_intermediate_copy_work() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src =
         crate::buffer::MetalBuffer::from_slice(ctx.device(), &[10_u32, 20, 30, 40]).expect("src");
     let dst = crate::buffer::MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
@@ -117,7 +141,9 @@ fn submit_and_renew_can_track_intermediate_copy_work() {
 
 #[test]
 fn blit_buffer_copies_moves_data_inside_existing_batch() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src =
         crate::buffer::MetalBuffer::from_slice(ctx.device(), &[7_u32, 8, 9, 10]).expect("src");
     let dst = crate::buffer::MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
@@ -140,7 +166,9 @@ fn blit_buffer_copies_moves_data_inside_existing_batch() {
 
 #[test]
 fn completed_command_releases_lease_while_pending_clone_is_alive() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src = MetalBuffer::from_slice(ctx.device(), &[11_u32, 22, 33, 44, 55]).expect("src");
     let dst = MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
     let (lease, weak) = drop_probe();
@@ -167,7 +195,9 @@ fn completed_command_releases_lease_while_pending_clone_is_alive() {
 
 #[test]
 fn unsubmitted_batch_drop_releases_lease_immediately() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let (lease, weak) = drop_probe();
     let mut batch = CommandBatch::new(&ctx).expect("CommandBatch::new");
     batch.retain_until_completed(lease);
@@ -179,7 +209,9 @@ fn unsubmitted_batch_drop_releases_lease_immediately() {
 
 #[test]
 fn submit_and_renew_keeps_distinct_per_command_leases() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src = MetalBuffer::from_slice(ctx.device(), &[3_u32, 5, 7, 11, 13, 17]).expect("src");
     let dst = MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
     let (first_lease, first_weak) = drop_probe();
@@ -212,7 +244,9 @@ fn submit_and_renew_keeps_distinct_per_command_leases() {
 
 #[test]
 fn dropping_renewed_batch_drains_earlier_copy() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src = MetalBuffer::from_slice(ctx.device(), &[101_u32, 202, 303, 404, 505]).expect("src");
     let dst = MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
     let mut batch = CommandBatch::new(&ctx).expect("CommandBatch::new");
@@ -234,7 +268,9 @@ fn dropping_renewed_batch_drains_earlier_copy() {
 
 #[test]
 fn invalid_blits_restore_encoder_and_allow_valid_work() {
-    let ctx = Arc::new(MetalContext::new().expect("Metal context"));
+    let Some(ctx) = gpu_or_skip().map(Arc::new) else {
+        return;
+    };
     let src = MetalBuffer::from_slice(ctx.device(), &[2_u32, 4, 8, 16, 32, 64]).expect("src");
     let dst = MetalBuffer::empty(ctx.device(), src.length()).expect("dst");
     let mut batch = CommandBatch::new(&ctx).expect("CommandBatch::new");

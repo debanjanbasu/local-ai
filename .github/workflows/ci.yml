@@ -34,19 +34,33 @@
 # read a green check as coverage of the real-model path.
 # ---------------------------------------------------------------------------
 #
-# Runner: `macos-14`, deliberately NOT `macos-latest`. Do not "simplify" this.
-# Two independent reasons, either one fatal on its own:
+# Runner: `macos-latest`, which is macOS on Apple Silicon. This project targets
+# current macOS on Apple Silicon and nothing older, so testing an older image
+# would verify a configuration nobody ships. Two things the runner must supply,
+# because either one missing makes a "passing" run meaningless:
 #
-#   1. `local-metal/build.rs` shells out to `xcrun metal` / `xcrun metallib`
-#      to compile `shaders/*.metal` into a `.metallib`. That toolchain only
-#      exists on macOS with Xcode installed. There is no Linux path -- this
-#      project cannot build off macOS at all, so a Linux or Windows runner is
-#      not a slower alternative, it is a broken one.
-#   2. The target is Apple Silicon. The workspace enables bytemuck's
-#      `aarch64_simd` feature and `.cargo/config.toml` pins
-#      `-C target-cpu=apple-m1` for `aarch64-apple-darwin`. An x86_64 runner
-#      is the wrong architecture and would not exercise the same code paths,
-#      so a "passing" run would mean very little.
+#   1. A macOS host with Xcode. `local-metal/build.rs` shells out to `xcrun
+#      metal` / `xcrun metallib` to compile `shaders/*.metal` into a
+#      `.metallib`. That toolchain exists only on macOS with Xcode, so a Linux
+#      or Windows runner is not a slower alternative, it is a broken one.
+#   2. An arm64 host. The workspace enables bytemuck's `aarch64_simd` feature
+#      and `.cargo/config.toml` pins `-C target-cpu=apple-m1` for
+#      `aarch64-apple-darwin`. An x86_64 runner would not exercise the same
+#      code paths.
+#
+# `macos-latest` is a moving target, which is the real cost of not pinning an
+# image: when GitHub moves it, this job silently starts testing a different
+# machine. That is the trade we are making on purpose. If a runner change ever
+# breaks the build, pin the version then -- with a comment saying what broke --
+# rather than pinning preemptively and testing a configuration nobody uses.
+#
+# GPU tests skip rather than fail when the runner exposes no Metal device: each
+# one calls `gpu_or_skip()`, which returns `None` only for a missing device and
+# still fails on any other context error. So a green run means the 80-odd
+# non-GPU tests passed and the GPU tests either passed or skipped -- it does
+# not mean the Metal paths were exercised. Those are covered by the
+# model-gated suite documented in README.md, which needs a real GPU and the
+# 5.9 GB checkpoint, and which this runner does not run.
 #
 # Toolchain: there is intentionally NO `dtolnay/rust-toolchain` or
 # `actions-rust-lang/setup-rust-toolchain` step. `rust-toolchain.toml` pins
@@ -88,7 +102,7 @@ env:
 jobs:
   verify:
     name: Verification block
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 90
 
     steps:

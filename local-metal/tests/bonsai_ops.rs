@@ -10,16 +10,28 @@ use local_metal::{
     shaders::ShaderLibrary,
 };
 
-fn setup() -> (MetalContext, BonsaiOps) {
-    let context = MetalContext::new().expect("context");
+/// `None` when this machine exposes no Metal device, so GPU tests skip
+/// instead of failing. Any other failure is still a failure: a missing GPU
+/// is an environment, a broken context is a bug.
+fn gpu_or_skip() -> Option<MetalContext> {
+    let context = MetalContext::new();
+    if matches!(context, Err(local_metal::Error::NoMetalDevice)) {
+        eprintln!("skipping GPU test: this machine has no Metal device");
+        return None;
+    }
+    Some(context.expect("Metal context failed for a reason other than a missing device"))
+}
+
+fn setup() -> Option<(MetalContext, BonsaiOps)> {
+    let context = gpu_or_skip()?;
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     let ops = BonsaiOps::new(&context, &shaders).expect("ops");
-    (context, ops)
+    Some((context, ops))
 }
 
 #[test]
 fn bf16_expansion_preserves_values_outside_f16_range() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     // 100000, -2, 0.5, and 65536 as exact BF16 bit patterns, with an offset.
     let weights = MetalBuffer::from_slice(
         ctx.device(),
@@ -49,7 +61,7 @@ fn bf16_expansion_preserves_values_outside_f16_range() {
 
 #[test]
 fn signed_decay_and_tiny_l2_use_pinned_formulas() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let a = MetalBuffer::from_slice(ctx.device(), &[-2.0_f32; 48]).expect("a");
     let alpha = MetalBuffer::from_slice(ctx.device(), &[0.25_f32; 48]).expect("alpha");
     let dt = MetalBuffer::from_slice(ctx.device(), &[-0.5_f32; 48]).expect("dt");
@@ -81,7 +93,7 @@ fn signed_decay_and_tiny_l2_use_pinned_formulas() {
 
 #[test]
 fn validation_happens_before_dispatch_and_workspace_is_linear() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let workspace = AttentionWorkspace::new(&ctx, 129).expect("workspace");
     assert_eq!(workspace.byte_len(), 2 * 24 * 258 * 4);
     let tiny = MetalBuffer::from_slice(ctx.device(), &[0.0_f32; 4]).expect("tiny");
@@ -126,7 +138,7 @@ fn signal(index: usize, salt: usize) -> f32 {
 
 #[test]
 fn rms_all_rows_and_elementwise_tails_match_f64() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let (rows, dimension, stride) = (9, 271, 288);
     let input_data = (0..rows * stride).map(|i| signal(i, 1)).collect::<Vec<_>>();
     let weights_data = (0..dimension + 2).map(|i| signal(i, 9)).collect::<Vec<_>>();
@@ -218,7 +230,7 @@ fn rms_all_rows_and_elementwise_tails_match_f64() {
 
 #[test]
 fn bf16_matvec_checks_every_row_and_partial_simd_width() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let (rows, columns) = (37, 519);
     let mut packed = vec![0xffff_u16; 2];
     packed.extend((0..rows * columns).map(|i| half::bf16::from_f32(signal(i, 2) * 10.0).to_bits()));
@@ -260,7 +272,7 @@ fn bf16_matvec_checks_every_row_and_partial_simd_width() {
 /// only by F32 summation order.
 #[test]
 fn bf16_matmul_tiles_match_f64_on_partial_row_and_token_tiles() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let (rows, columns, tokens) = (37_usize, 320_usize, 41_usize);
     assert!(tokens as u32 >= local_metal::bonsai_ops::BF16_TILE_MIN_TOKENS);
     let mut packed = vec![0xffff_u16; 2];
@@ -316,7 +328,7 @@ fn bf16_matmul_tiles_match_f64_on_partial_row_and_token_tiles() {
 
 #[test]
 fn int8_matvec_and_tiled_matmul_match_f64() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let (rows, columns, tokens) = (37_usize, 320_usize, 41_usize);
     let weights_data = (0..rows * columns)
         .map(|i| i8::from_ne_bytes([u8::try_from((i * 29 + 17) % 255).expect("bounded signal")]))
@@ -371,7 +383,7 @@ fn int8_matvec_and_tiled_matmul_match_f64() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn recurrent_sequence_preserves_all_heads_state_history_and_grouped_output() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let weight_data = (0..10240 * 4)
         .map(|i| signal(i, 3) * 0.31)
         .collect::<Vec<_>>();
@@ -517,7 +529,7 @@ fn normalized_rope(values: &[f32], weights: &[f32], position: u32) -> Vec<f64> {
 
 #[test]
 fn attention_preparation_splits_every_head_and_rotates_only_first64() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let qg_data = (0..12288).map(|i| signal(i, 5)).collect::<Vec<_>>();
     let k_data = (0..1024).map(|i| signal(i, 11)).collect::<Vec<_>>();
     let v_data = (0..1024).map(|i| signal(i, 31)).collect::<Vec<_>>();
@@ -595,7 +607,7 @@ fn attention_preparation_splits_every_head_and_rotates_only_first64() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn kv_preparation_matches_full_preparation_rows_bitwise_and_touches_nothing_else() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let tokens = 3u32;
     let position = 129u32;
     let capacity = position + tokens + 2;
@@ -762,7 +774,7 @@ fn kv_preparation_matches_full_preparation_rows_bitwise_and_touches_nothing_else
 
 #[test]
 fn split_gqa_matches_f64_across_boundaries_and_shorter_workspace_reuse() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let capacity = 4105;
     let workspace = AttentionWorkspace::new(&ctx, capacity).expect("workspace");
     let query_data = (0..6144).map(|i| signal(i, 19) * 1.7).collect::<Vec<_>>();
@@ -890,7 +902,7 @@ fn dequantize_row(format: KvFormat, row: &[u8]) -> Vec<f32> {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_else() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let tokens = 3u32;
     let position = 129u32;
     let capacity = position + tokens + 2;
@@ -1052,7 +1064,7 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
 #[test]
 #[allow(clippy::too_many_lines)]
 fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let capacity = 1100u32;
     let workspace = AttentionWorkspace::new(&ctx, capacity).expect("workspace");
     let query_rows = 9usize;

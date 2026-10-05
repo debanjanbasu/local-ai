@@ -8,11 +8,23 @@ use local_metal::{
     shaders::ShaderLibrary,
 };
 
-fn setup() -> (MetalContext, BonsaiOps) {
-    let context = MetalContext::new().expect("context");
+/// `None` when this machine exposes no Metal device, so GPU tests skip
+/// instead of failing. Any other failure is still a failure: a missing GPU
+/// is an environment, a broken context is a bug.
+fn gpu_or_skip() -> Option<MetalContext> {
+    let context = MetalContext::new();
+    if matches!(context, Err(local_metal::Error::NoMetalDevice)) {
+        eprintln!("skipping GPU test: this machine has no Metal device");
+        return None;
+    }
+    Some(context.expect("Metal context failed for a reason other than a missing device"))
+}
+
+fn setup() -> Option<(MetalContext, BonsaiOps)> {
+    let context = gpu_or_skip()?;
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
     let ops = BonsaiOps::new(&context, &shaders).expect("ops");
-    (context, ops)
+    Some((context, ops))
 }
 
 fn floats(context: &MetalContext, values: &[f32]) -> MetalBuffer {
@@ -44,7 +56,7 @@ fn check(buffer: &MetalBuffer, expected: &[f64], tolerance: f64) {
 
 #[test]
 fn bf16_batch_uses_each_unaligned_row_and_matrix_offset() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let (tokens, rows, columns) = (4, 7, 35);
     let mut packed = vec![0xdead_u16; 3];
     packed.extend((0..rows * columns).map(|i| {
@@ -96,7 +108,7 @@ fn bf16_batch_uses_each_unaligned_row_and_matrix_offset() {
 
 #[test]
 fn decay_rows_vary_by_token_and_head() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let tokens = 5;
     let a_data = (0..48)
         .map(|h| (h as f32).mul_add(0.013, -2.1))
@@ -142,7 +154,7 @@ fn decay_rows_vary_by_token_and_head() {
 
 #[test]
 fn batched_conv_l2_gdn_and_postprocess_match_causal_f64_recurrence() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let tokens = 5;
     let input_data = (0..tokens * 10240)
         .map(|i| signal(i, 17))
@@ -321,7 +333,7 @@ fn normalized_rope(values: &[f32], weights: &[f32], position: u32) -> Vec<f64> {
 
 #[test]
 fn attention_prefill_rows_use_row_offsets_causal_prefixes_and_one_workspace() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let (tokens, position, capacity) = (3, 126_u32, 130_u32);
     let qg_data = (0..tokens * 12288)
         .map(|i| ((i / 12288) as f32).mul_add(0.2, signal(i, 5)))
@@ -509,7 +521,7 @@ fn attention_prefill_rows_use_row_offsets_causal_prefixes_and_one_workspace() {
 
 #[test]
 fn attention_block_rejects_invalid_extents_and_aliases_without_dispatch() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let workspace = AttentionWorkspace::new(&ctx, 129).expect("workspace");
     let q = guarded(&ctx, 128 * 6144);
     let k =
@@ -539,7 +551,7 @@ fn attention_block_rejects_invalid_extents_and_aliases_without_dispatch() {
 
 #[test]
 fn attention_block_handles_all_query_tile_tails_and_ignores_future_cache() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let position = 129_u32;
     let capacity = position as usize + 128;
     let workspace = AttentionWorkspace::new(&ctx, capacity as u32).expect("workspace");
@@ -592,7 +604,7 @@ fn attention_block_handles_all_query_tile_tails_and_ignores_future_cache() {
 
 #[test]
 fn attention_block_does_not_clip_large_finite_logits() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let (position, tokens) = (126_usize, 3_usize);
     let capacity = position + tokens;
     let workspace = AttentionWorkspace::new(&ctx, capacity as u32).expect("workspace");
@@ -642,7 +654,7 @@ fn attention_block_does_not_clip_large_finite_logits() {
 
 #[test]
 fn attention_preserves_f32_queries_and_tiny_probabilities_across_key_and_query_tiles() {
-    let ctx = MetalContext::new().expect("context");
+    let Some(ctx) = gpu_or_skip() else { return };
     let shaders = ShaderLibrary::new(ctx.device()).expect("shaders");
     let portable = BonsaiOps::new_with_attention_kernel(&ctx, &shaders, AttentionKernel::SimdF32)
         .expect("portable ops");
@@ -738,7 +750,9 @@ fn attention_preserves_f32_queries_and_tiny_probabilities_across_key_and_query_t
 #[test]
 #[cfg(any())]
 fn mixed_attention_matches_explicit_query_and_probability_rounding() {
-    let (ctx, selected) = setup();
+    let Some((ctx, selected)) = setup() else {
+        return;
+    };
     if selected.attention_kernel() == AttentionKernel::SimdF32 {
         eprintln!("mixed attention requires Metal 4 tensor support");
         return;
@@ -856,7 +870,7 @@ fn mixed_attention_matches_explicit_query_and_probability_rounding() {
 
 #[test]
 fn recurrence_alias_checks_have_otherwise_valid_buffer_sizes() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let input = guarded(&ctx, 3 * 10240);
     let weights = guarded(&ctx, 4 * 10240);
     let history = guarded(&ctx, 3 * 10240);
@@ -904,7 +918,7 @@ fn recurrence_alias_checks_have_otherwise_valid_buffer_sizes() {
 
 #[test]
 fn batch_validation_rejects_bounds_short_buffers_aliases_and_overflow_before_dispatch() {
-    let (ctx, ops) = setup();
+    let Some((ctx, ops)) = setup() else { return };
     let tiny = floats(&ctx, &[0.0; 8]);
     let workspace = AttentionWorkspace::new(&ctx, 128).expect("workspace");
     let mut batch = CommandBatch::new(&ctx).expect("batch");
