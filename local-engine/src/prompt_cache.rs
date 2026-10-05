@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +12,28 @@ use sha2::{Digest, Sha256};
 use crate::bonsai_native::{PageBytes, PromptSnapshot};
 
 const MAGIC: &[u8; 8] = b"BPCACHE1";
+
+/// How old a `.tmp` must be before `trim` treats it as an orphan instead of a
+/// write still in flight.
+///
+/// Why an age and not a lock: this module has no mutual exclusion today, and
+/// adding one would mean choosing a concurrency model for `store`, `discover`
+/// and `trim` together. An age keeps the guarantee local to the single file
+/// that needs it. Because `store` renames into place, a sweep can only ever
+/// observe a temporary while a write is still running, and `write_temporary`
+/// advances the mtime as it fills the file — so the only window where a live
+/// temporary looks stale is the tail, the final `sync_all`, which does not touch
+/// the mtime. That leaves "fully written, still syncing" as the oldest a
+/// live temporary can look.
+///
+/// Ten minutes clears that tail with room to spare. A snapshot is ~152 MiB: at
+/// the 500 MiB/s this module treats as its SSD-first threshold that is ~0.3 s
+/// to write and roughly the same again to sync, and even a pathological
+/// 10 MiB/s volume needs only ~15 s. Ten minutes is ~20x the slower of those
+/// estimates and ~2000x the faster one, so no plausible `store` is ever a
+/// candidate — while a SIGKILL or power-loss orphan, which will never run again
+/// to clean up after itself, is reclaimed by the next `trim`.
+const ORPHANED_TEMPORARY_AGE: Duration = Duration::from_secs(600);
 
 #[derive(Serialize, Deserialize)]
 struct Header {
@@ -204,7 +227,46 @@ fn write_temporary(
     Ok(())
 }
 
+/// Reclaim temporaries abandoned by a `store` that never reached `fs::rename`.
+///
+/// Nothing else covers this window: `store` removes its own temporary on the
+/// error path, but SIGKILL and power loss run no Rust code at all, and the
+/// temporary is invisible to `discover`, so it is invisible to the budget too.
+///
+/// Only the `.tmp` extension is swept, and only inside this model's directory,
+/// where every `.tmp` was written by `write_temporary` — a committed snapshot
+/// can never be a victim, at any age. A temporary younger than
+/// [`ORPHANED_TEMPORARY_AGE`] belongs to a running `store` and is left alone.
+/// Nothing here feeds the disk budget: `discover` stays the only source of
+/// snapshot sizes, so a live temporary can neither evict nor reorder a real
+/// snapshot.
+fn sweep_abandoned_temporaries(root: &Path, model_key: &str) {
+    let dir = root.join(model_key);
+    let Ok(files) = fs::read_dir(dir) else {
+        return;
+    };
+    let Some(cutoff) = SystemTime::now().checked_sub(ORPHANED_TEMPORARY_AGE) else {
+        return;
+    };
+    for file in files.flatten() {
+        let path = file.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("tmp") {
+            continue;
+        }
+        let abandoned = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if abandoned {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 pub fn trim(root: &Path, model_key: &str, budget: u64) {
+    // Reclaimed before the budget is computed, and independently of it: this
+    // sweep is about files no snapshot ever referenced.
+    sweep_abandoned_temporaries(root, model_key);
     let mut files = discover(root, model_key);
     let mut bytes = files
         .iter()

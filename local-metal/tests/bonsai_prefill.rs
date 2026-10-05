@@ -519,6 +519,245 @@ fn attention_prefill_rows_use_row_offsets_causal_prefixes_and_one_workspace() {
     );
 }
 
+/// One F16 prefill per pinned attention kernel, with the cache preparation and
+/// the attention recorded into the *same* [`CommandBatch`].
+///
+/// `bo_attn_block` reads `k_format`/`v_format` from constant slots 8 and 9, and
+/// `BONSAI_KV_DISPATCH` routes every code other than `BONSAI_KV_F16` to the
+/// dequantizing instantiation, which reinterprets F16 bytes as Q8. `bo_kv_prep`
+/// binds nine buffers and five scalars into the same encoder, so those two slots
+/// already hold *its* last operands: a block dispatch that forgets the codes
+/// inherits that leftover state instead of a clean zero, and every element comes
+/// out wrong. Both halves of the setup are load-bearing — the codes are only
+/// reachable from an encoder that also ran the preparation, so a test that
+/// prepared in one batch and attended in another would never see the stale slot.
+///
+/// `bo_attn_tensor` takes `half*` operands directly, never dispatches, and
+/// [`BonsaiOps::new`] prefers it, so each kernel is pinned explicitly here:
+/// otherwise a developer machine silently exercises only the masked path while
+/// CI, where the tensor pipelines are absent, exercises only the SIMD one.
+#[test]
+fn f16_prefill_matches_f64_when_kv_prep_and_block_attention_share_one_encoder() {
+    let Some(ctx) = gpu_or_skip() else { return };
+    let shaders = ShaderLibrary::new(ctx.device()).expect("shaders");
+    let (tokens, position, capacity) = (4_usize, 125_u32, 129_u32);
+    // A nonzero start is what makes the regression observable: `position` is
+    // what the preparation leaves in the block dispatch's `v_format` slot, and
+    // zero would coincidentally read back as the F16 code.
+    assert_ne!(position, 0);
+    let qg_data = (0..tokens * 12288)
+        .map(|i| ((i / 12288) as f32).mul_add(0.2, signal(i, 71)))
+        .collect::<Vec<_>>();
+    let k_data = (0..tokens * 1024)
+        .map(|i| signal(i, 73))
+        .collect::<Vec<_>>();
+    let v_data = (0..tokens * 1024)
+        .map(|i| signal(i, 79) * 1.4)
+        .collect::<Vec<_>>();
+    let query_norm_weights = (0..256)
+        .map(|i| signal(i, 83).mul_add(0.2, 0.7))
+        .collect::<Vec<_>>();
+    let key_norm_weights = (0..256)
+        .map(|i| signal(i, 89).mul_add(0.2, 0.8))
+        .collect::<Vec<_>>();
+    let initial_keys = (0..capacity as usize * 1024)
+        .map(|i| half::f16::from_f32(signal(i, 97)))
+        .collect::<Vec<_>>();
+    let initial_values = (0..capacity as usize * 1024)
+        .map(|i| half::f16::from_f32(signal(i, 101)))
+        .collect::<Vec<_>>();
+    let mut expected_keys = initial_keys.clone();
+    let mut expected_values = initial_values.clone();
+    let mut expected_query = Vec::new();
+    let mut expected_gate = Vec::new();
+    for token in 0..tokens {
+        for head in 0..24 {
+            expected_query.extend(normalized_rope(
+                &qg_data[token * 12288 + head * 512..][..256],
+                &query_norm_weights,
+                position + token as u32,
+            ));
+            expected_gate.extend(
+                qg_data[token * 12288 + head * 512 + 256..][..256]
+                    .iter()
+                    .copied()
+                    .map(f64::from),
+            );
+        }
+        for head in 0..4 {
+            let key = normalized_rope(
+                &k_data[token * 1024 + head * 256..][..256],
+                &key_norm_weights,
+                position + token as u32,
+            );
+            for (d, &value) in key.iter().enumerate() {
+                let index = (position as usize + token) * 1024 + head * 256 + d;
+                expected_keys[index] = half::f16::from_f64(value);
+                expected_values[index] = half::f16::from_f32(v_data[token * 1024 + head * 256 + d]);
+            }
+        }
+    }
+    // F64 causal softmax over the F16-rounded cache, before and after the gate.
+    let mut expected_attention = vec![0.0; tokens * 6144];
+    let mut expected_gated = vec![0.0; tokens * 6144];
+    for row in 0..tokens {
+        for head in 0..24 {
+            let prefix = position as usize + row + 1;
+            let mut scores = (0..prefix)
+                .map(|t| {
+                    (0..256)
+                        .map(|d| {
+                            expected_query[row * 6144 + head * 256 + d]
+                                * f64::from(expected_keys[(t * 4 + head / 6) * 256 + d].to_f32())
+                        })
+                        .sum::<f64>()
+                        / 16.0
+                })
+                .collect::<Vec<_>>();
+            let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            for score in &mut scores {
+                *score = (*score - maximum).exp();
+            }
+            let denominator = scores.iter().sum::<f64>();
+            for d in 0..256 {
+                let attended = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &probability)| {
+                        probability
+                            * f64::from(expected_values[(t * 4 + head / 6) * 256 + d].to_f32())
+                    })
+                    .sum::<f64>()
+                    / denominator;
+                let gate = expected_gate[row * 6144 + head * 256 + d];
+                expected_attention[row * 6144 + head * 256 + d] = attended;
+                expected_gated[row * 6144 + head * 256 + d] = attended / (1.0 + (-gate).exp());
+            }
+        }
+    }
+    let workspace = AttentionWorkspace::new(&ctx, capacity).expect("workspace");
+    for kernel in [AttentionKernel::TensorF32, AttentionKernel::SimdF32] {
+        let constructed = BonsaiOps::new_with_attention_kernel(&ctx, &shaders, kernel);
+        let ops = match constructed {
+            Ok(ops) => ops,
+            Err(error) => {
+                // Only the Metal 4 tensor pipelines can be missing; losing the
+                // SIMD kernel would silently drop the dispatching path entirely.
+                assert_eq!(kernel, AttentionKernel::TensorF32, "{error}");
+                eprintln!("skipping unavailable kernel {}: {error}", kernel.name());
+                continue;
+            }
+        };
+        assert_eq!(ops.attention_kernel(), kernel);
+        let qg = floats(&ctx, &qg_data);
+        let k = floats(&ctx, &k_data);
+        let v = floats(&ctx, &v_data);
+        let qw = floats(&ctx, &query_norm_weights);
+        let kw = floats(&ctx, &key_norm_weights);
+        let query = guarded(&ctx, tokens * 6144);
+        let gate = guarded(&ctx, tokens * 6144);
+        let output = guarded(&ctx, tokens * 6144);
+        let ungated_output = guarded(&ctx, tokens * 6144);
+        let kc = MetalBuffer::from_slice(ctx.device(), &initial_keys).expect("kc");
+        let vc = MetalBuffer::from_slice(ctx.device(), &initial_values).expect("vc");
+        let mut batch = CommandBatch::new(&ctx).expect("batch");
+        ops.prepare_attention_rows(
+            &mut batch,
+            &qg,
+            &k,
+            &v,
+            &qw,
+            &kw,
+            &query,
+            &gate,
+            &kc,
+            &vc,
+            position,
+            capacity,
+            1e-6,
+            10_000_000.0,
+            tokens as u32,
+        )
+        .expect("prep");
+        ops.attention_block(
+            &mut batch,
+            &query,
+            &kc,
+            &vc,
+            Some(&gate),
+            &output,
+            position,
+            tokens as u32,
+            &workspace,
+        )
+        .expect("gated attention");
+        ops.attention_block(
+            &mut batch,
+            &query,
+            &kc,
+            &vc,
+            None,
+            &ungated_output,
+            position,
+            tokens as u32,
+            &workspace,
+        )
+        .expect("ungated attention");
+        assert_eq!(
+            batch.dispatch_count(),
+            3,
+            "{}: preparation and attention must share one encoder",
+            kernel.name()
+        );
+        batch.commit_and_wait().expect("completion");
+        check(&query, &expected_query, 3e-5);
+        check(&gate, &expected_gate, 0.0);
+        check(&output, &expected_gated, 3e-5);
+        check(&ungated_output, &expected_attention, 3e-5);
+        // The rows this prefill wrote, and the prefix/suffix it must not touch.
+        let written = position as usize * 1024;
+        let stored_keys = &kc.as_slice::<half::f16>()[written..][..tokens * 1024];
+        let stored_values = &vc.as_slice::<half::f16>()[written..][..tokens * 1024];
+        for (local, &key) in stored_keys.iter().enumerate() {
+            let (token, head, d) = (local / 1024, local % 1024 / 256, local % 256);
+            let wanted = normalized_rope(
+                &k_data[token * 1024 + head * 256..][..256],
+                &key_norm_weights,
+                position + token as u32,
+            )[d];
+            assert!(
+                (f64::from(key.to_f32()) - wanted).abs() < 0.002,
+                "{}: stored key {local} is {} not {wanted}",
+                kernel.name(),
+                key.to_f32()
+            );
+            assert_eq!(
+                stored_values[local],
+                half::f16::from_f32(v_data[local]),
+                "{}: stored value {local}",
+                kernel.name()
+            );
+        }
+        for token in 0..capacity as usize {
+            if (position as usize..position as usize + tokens).contains(&token) {
+                continue;
+            }
+            assert_eq!(
+                &kc.as_slice::<half::f16>()[token * 1024..][..1024],
+                &initial_keys[token * 1024..][..1024],
+                "{}: key row {token} outside the block was rewritten",
+                kernel.name()
+            );
+            assert_eq!(
+                &vc.as_slice::<half::f16>()[token * 1024..][..1024],
+                &initial_values[token * 1024..][..1024],
+                "{}: value row {token} outside the block was rewritten",
+                kernel.name()
+            );
+        }
+    }
+}
+
 #[test]
 fn attention_block_rejects_invalid_extents_and_aliases_without_dispatch() {
     let Some((ctx, ops)) = setup() else { return };
@@ -745,127 +984,6 @@ fn attention_preserves_f32_queries_and_tiny_probabilities_across_key_and_query_t
             check(&out, &expected, 5e-6);
         }
     }
-}
-
-#[test]
-#[cfg(any())]
-fn mixed_attention_matches_explicit_query_and_probability_rounding() {
-    let Some((ctx, selected)) = setup() else {
-        return;
-    };
-    if selected.attention_kernel() == AttentionKernel::SimdF32 {
-        eprintln!("mixed attention requires Metal 4 tensor support");
-        return;
-    }
-    let shaders = ShaderLibrary::new(ctx.device()).expect("shaders");
-    let kernels = [
-        AttentionKernel::TensorF32,
-        AttentionKernel::TensorF16Q,
-        AttentionKernel::TensorF16QP,
-    ];
-    let implementations = kernels.map(|kernel| {
-        BonsaiOps::new_with_attention_kernel(&ctx, &shaders, kernel).expect("explicit kernel")
-    });
-    let mut precision_witnesses = [false; 2];
-    for (position, tokens) in [(0, 1), (55, 17), (63, 2), (65, 8), (127, 9), (257, 128)] {
-        let end = position + tokens;
-        let workspace = AttentionWorkspace::new(&ctx, end as u32).expect("workspace");
-        let mut queries = vec![0.0; tokens * 6144];
-        let mut keys = vec![half::f16::NAN; (end + 64) * 1024];
-        keys[..end * 1024].fill(half::f16::ZERO);
-        let mut values = vec![half::f16::NAN; (end + 64) * 1024];
-        let gates = (0..queries.len())
-            .map(|i| signal(i, 57))
-            .collect::<Vec<_>>();
-        for row in 0..tokens {
-            for head in 0..24 {
-                queries[row * 6144 + head * 256] =
-                    (head as f32).mul_add(0.03113, ((row % 3) as f32).mul_add(0.27, 31.2345));
-            }
-        }
-        for token in 0..end {
-            for head in 0..4 {
-                // The first key is always the maximum, so a single F64 softmax
-                // independently predicts both operand-rounding policies without
-                // copying the GPU's blocked online recurrence into the oracle.
-                keys[token * 1024 + head * 256] = half::f16::from_f32(if token == 0 {
-                    0.0
-                } else {
-                    -0.037 * ((token * 3 + head) % 19 + 1) as f32
-                });
-                for d in 0..256 {
-                    values[token * 1024 + head * 256 + d] =
-                        half::f16::from_f32(signal(token * 1024 + head * 256 + d, 43) * 100.0);
-                }
-            }
-        }
-        let query_buffer = floats(&ctx, &queries);
-        let key_buffer = MetalBuffer::from_slice(ctx.device(), &keys).expect("keys");
-        let value_buffer = MetalBuffer::from_slice(ctx.device(), &values).expect("values");
-        let gate_buffer = floats(&ctx, &gates);
-        let mut previous: Option<Vec<f64>> = None;
-        for (method, ops) in implementations.iter().enumerate() {
-            let mut expected = Vec::with_capacity(queries.len());
-            for row in 0..tokens {
-                for head in 0..24 {
-                    let q = queries[row * 6144 + head * 256];
-                    let q = if method == 0 {
-                        f64::from(q)
-                    } else {
-                        f64::from(half::f16::from_f32(q))
-                    };
-                    let probabilities = (0..=position + row)
-                        .map(|token| {
-                            (q * f64::from(keys[token * 1024 + (head / 6) * 256]) / 16.0).exp()
-                        })
-                        .collect::<Vec<_>>();
-                    let denominator = probabilities.iter().sum::<f64>();
-                    for d in 0..256 {
-                        let numerator = probabilities
-                            .iter()
-                            .enumerate()
-                            .map(|(token, &p)| {
-                                let p = if method == 2 {
-                                    f64::from(half::f16::from_f64(p))
-                                } else {
-                                    p
-                                };
-                                p * f64::from(values[token * 1024 + (head / 6) * 256 + d])
-                            })
-                            .sum::<f64>();
-                        let gate = f64::from(gates[row * 6144 + head * 256 + d]);
-                        expected.push(numerator / denominator / (1.0 + (-gate).exp()));
-                    }
-                }
-            }
-            if let Some(prior) = &previous {
-                precision_witnesses[method - 1] |= prior
-                    .iter()
-                    .zip(&expected)
-                    .any(|(&a, &b)| (a - b).abs() > 2e-5 * (1.0 + a.abs() + b.abs()));
-            }
-            let out = guarded(&ctx, queries.len());
-            let mut batch = CommandBatch::new(&ctx).expect("batch");
-            ops.attention_block(
-                &mut batch,
-                &query_buffer,
-                &key_buffer,
-                &value_buffer,
-                Some(&gate_buffer),
-                &out,
-                position as u32,
-                tokens as u32,
-                &workspace,
-            )
-            .expect("mixed attention");
-            batch.commit_and_wait().expect("completion");
-            check(&out, &expected, 1e-5);
-            previous = Some(expected);
-        }
-    }
-    // These inputs must distinguish no rounding, Q rounding and Q+P rounding:
-    // silently selecting F32 instead of the requested mixed kernel must fail.
-    assert!(precision_witnesses.into_iter().all(|witness| witness));
 }
 
 #[test]
