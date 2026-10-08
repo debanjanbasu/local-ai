@@ -50,10 +50,10 @@ impl BonsaiOps {
     /// Attend one query row, reusing a single linear-size workspace for all rows.
     /// The caller supplies that row's causal prefix, not the full token block.
     ///
-    /// F16 caches on a tensor build use `bo_attn_split_tensor` (the six GQA
-    /// heads as one Q tile per 256-token split); quantized caches and the
-    /// SIMD build use `bo_attn_split` with `SPLIT_HEADS` heads per SIMD group.
-    /// Both feed the same partial records to `bo_attn_reduce`.
+    /// On a tensor build, F16 caches use `bo_attn_split_tensor` and quantized
+    /// ones `bo_attn_split_tensor_<layout>` (the six GQA heads as one Q tile per
+    /// split); the SIMD build uses `bo_attn_split` with `SPLIT_HEADS` heads per
+    /// SIMD group. All feed the same partial records to `bo_attn_reduce`.
     pub fn attention_row_kv(
         &self,
         layout: KvLayout,
@@ -91,7 +91,12 @@ impl BonsaiOps {
             (v_cache, 0),
             (&workspace.partials, 0),
         ];
-        let splits = if layout == KvLayout::F16
+        let tensor_split = if layout.is_f16() {
+            Some(18)
+        } else {
+            self.quantized_tensor(layout)
+        };
+        let splits = if let Some(pipeline) = tensor_split
             && self.attention_kernel != AttentionKernel::SimdF32
             && prefix >= SPLIT_TENSOR_MIN_PREFIX
         {
@@ -107,7 +112,7 @@ impl BonsaiOps {
             )?;
             self.go(
                 b,
-                18,
+                pipeline,
                 &caches,
                 &[prefix, splits, split_tokens],
                 &[],
@@ -132,17 +137,44 @@ impl BonsaiOps {
             );
             splits
         };
+        // A rotated (quantized) cache produces rotated outputs: reduce ungated,
+        // then rotate back and gate in `bo_attn_unrotate`.
+        let rotated = !layout.is_f16();
         let fallback = gate.unwrap_or(q);
         self.go(
             b,
             11,
             &[(&workspace.partials, 0), (fallback, offset), (out, offset)],
-            &[splits, u32::from(gate.is_some())],
+            &[splits, u32::from(gate.is_some() && !rotated)],
             &[],
             24,
             256,
         );
+        if rotated {
+            self.unrotate(b, out, offset, gate, 1);
+        }
         Ok(())
+    }
+
+    /// Rotate `rows` attention output rows starting at byte `offset` back from
+    /// a quantized cache's Hadamard basis, then apply `gate` if given.
+    fn unrotate(
+        &self,
+        b: &mut CommandBatch,
+        out: &MetalBuffer,
+        offset: usize,
+        gate: Option<&MetalBuffer>,
+        rows: u32,
+    ) {
+        self.go(
+            b,
+            20,
+            &[(out, offset), (gate.unwrap_or(out), offset)],
+            &[u32::from(gate.is_some())],
+            &[],
+            24 * rows as usize,
+            256,
+        );
     }
 
     /// F16-cache form of [`Self::attention_block_kv`].
@@ -175,8 +207,9 @@ impl BonsaiOps {
     /// Causal full-attention prefill for a contiguous query block. Query row
     /// `r` attends through cache position `position + r`, inclusive.
     ///
-    /// F16 caches use the selected attention kernel; quantized caches always
-    /// take the SIMD block kernel, which dequantizes in registers.
+    /// On a tensor build, F16 caches use `bo_attn_tensor` and quantized ones
+    /// `bo_attn_tensor_<layout>`; the SIMD build takes the SIMD block kernel,
+    /// which dequantizes in registers.
     pub fn attention_block_kv(
         &self,
         layout: KvLayout,
@@ -230,7 +263,9 @@ impl BonsaiOps {
         let fallback = gate.unwrap_or(q);
         let bufs = [(q, 0), (k_cache, 0), (v_cache, 0), (fallback, 0), (out, 0)];
         let groups = 24 * tokens.div_ceil(8) as usize;
-        let gated = u32::from(gate.is_some());
+        // Rotated (quantized) caches gate after rotating back; see `unrotate`.
+        let rotated = !layout.is_f16();
+        let gated = u32::from(gate.is_some() && !rotated);
         let codes = layout.codes();
         if layout.is_f16() {
             // `bo_attn_block` reads the format codes at slots 8 and 9 and
@@ -247,6 +282,16 @@ impl BonsaiOps {
                 groups,
                 self.attention_kernel.threads(),
             );
+        } else if let Some(split) = self.quantized_tensor(layout) {
+            self.go(
+                b,
+                split + 1,
+                &bufs,
+                &[position, tokens, gated],
+                &[],
+                groups,
+                self.attention_kernel.threads(),
+            );
         } else {
             self.go(
                 b,
@@ -257,6 +302,9 @@ impl BonsaiOps {
                 groups,
                 256,
             );
+        }
+        if rotated {
+            self.unrotate(b, out, 0, gate, tokens);
         }
         Ok(())
     }

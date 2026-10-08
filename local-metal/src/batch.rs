@@ -9,7 +9,8 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
+    MTLComputeCommandEncoder, MTLDispatchType,
 };
 
 use crate::Error;
@@ -28,6 +29,20 @@ pub struct CommandBatch {
     leases: Option<CompletionLeases>,
     dispatch_count: u32,
     pending: Vec<PendingCommandBuffer>,
+    concurrent: bool,
+    independent: bool,
+}
+
+fn compute_encoder(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    concurrent: bool,
+) -> crate::Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> {
+    if concurrent {
+        cmd_buf.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+    } else {
+        cmd_buf.computeCommandEncoder()
+    }
+    .ok_or_else(|| Error::CommandBuffer("Failed to create compute encoder".to_owned()))
 }
 
 type CompletionLeases = Arc<Mutex<Vec<Arc<dyn Send + Sync>>>>;
@@ -193,10 +208,27 @@ impl CommandBatch {
     /// Returns [`Error::CommandBuffer`] if Metal cannot allocate a command
     /// buffer or compute encoder.
     pub fn new(ctx: &MetalContext) -> crate::Result<Self> {
+        Self::with_dispatch(ctx, false)
+    }
+
+    /// A batch whose compute encoders may overlap dispatches grouped by
+    /// [`Self::independent`]; every other dispatch is followed by a buffer
+    /// barrier, so ungrouped work keeps the serial batch's ordering.
+    ///
+    /// On an M4 Pro, Bonsai verification blocks gain from it (speculative
+    /// decode 24.99 to 25.40 tok/s, identical text); single-token decode, whose
+    /// independent projections are already one dispatch, lost 21.95 to 21.66.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn new_concurrent(ctx: &MetalContext) -> crate::Result<Self> {
+        Self::with_dispatch(ctx, true)
+    }
+
+    fn with_dispatch(ctx: &MetalContext, concurrent: bool) -> crate::Result<Self> {
         let cmd_buf = ctx.new_command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| Error::CommandBuffer("Failed to create compute encoder".to_owned()))?;
+        let encoder = compute_encoder(&cmd_buf, concurrent)?;
         Ok(Self {
             cmd_buf,
             encoder,
@@ -204,6 +236,8 @@ impl CommandBatch {
             leases: None,
             dispatch_count: 0,
             pending: Vec::new(),
+            concurrent,
+            independent: false,
         })
     }
 
@@ -213,9 +247,31 @@ impl CommandBatch {
         &self.encoder
     }
 
-    /// Record that a dispatch was encoded (for diagnostics).
-    pub const fn record_dispatch(&mut self) {
+    /// Record that a dispatch was encoded. On a concurrent encoder, outside
+    /// [`Self::independent`], this also orders it before every later dispatch.
+    pub fn record_dispatch(&mut self) {
         self.dispatch_count += 1;
+        if self.concurrent && !self.independent {
+            self.encoder
+                .memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+    }
+
+    /// Encode dispatches that neither read nor write anything another of them
+    /// writes; on a concurrent encoder they may overlap. Everything encoded
+    /// after this returns is ordered behind all of them.
+    pub fn independent<T, E>(
+        &mut self,
+        encode: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let nested = std::mem::replace(&mut self.independent, true);
+        let result = encode(self);
+        self.independent = nested;
+        if self.concurrent && !nested && self.encoder_open {
+            self.encoder
+                .memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+        result
     }
 
     /// Number of dispatches encoded so far.
@@ -311,10 +367,7 @@ impl CommandBatch {
             }
         }
         encoder.endEncoding();
-        self.encoder = self
-            .cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| Error::CommandBuffer("Failed to create compute encoder".to_owned()))?;
+        self.encoder = compute_encoder(&self.cmd_buf, self.concurrent)?;
         self.encoder_open = true;
         result
     }
@@ -326,9 +379,7 @@ impl CommandBatch {
         // Finish every fallible allocation before committing. An allocation
         // failure must leave the old encoder open and its leases unsubmitted.
         let next = ctx.new_command_buffer()?;
-        let next_encoder = next
-            .computeCommandEncoder()
-            .ok_or_else(|| Error::CommandBuffer("Failed to create compute encoder".to_owned()))?;
+        let next_encoder = compute_encoder(&next, self.concurrent)?;
         self.end_compute_encoding();
         self.cmd_buf.commit();
         // The completion handler, not this now-renewed batch, owns these leases.

@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use super::cache::MTP_HEAD_ARTIFACT;
-
 /// Native drafts per round, each verify row costing 30–45 % of a single-row
 /// pass: the PTQ1 decode is shared, and the extra row adds one FMA per weight.
 ///
@@ -12,9 +10,10 @@ use super::cache::MTP_HEAD_ARTIFACT;
 /// 26 %); with the margin gate below it is ahead of depth 1 on the three short
 /// cases and within noise on the 12K one.
 ///
-/// Once the int8 head made drafting 20–30 % cheaper, gated depth 3 beat depth 2
-/// on arithmetic, code, explanation and essay prompts (+1–3 %, lower GPU time
-/// per token, identical tokens). That is the measurement behind the 3 here.
+/// Once a quantized head made drafting 20–30 % cheaper than the BF16 one, gated
+/// depth 3 beat depth 2 on arithmetic, code, explanation and essay prompts
+/// (+1–3 %, lower GPU time per token, identical tokens). That is the
+/// measurement behind the 3 here.
 pub const DEFAULT_MTP_DEPTH: usize = 3;
 pub const MAX_MTP_DEPTH: usize = 4;
 /// The head drafts a further token only while its current proposal leads
@@ -29,7 +28,6 @@ pub const DRAFT_CHAIN_MIN_MARGIN: f32 = 4.0;
 pub struct MtpSettings {
     pub path: PathBuf,
     pub depth: usize,
-    pub head_cache_dir: Option<PathBuf>,
 }
 
 impl MtpSettings {
@@ -39,21 +37,11 @@ impl MtpSettings {
                 "MTP draft depth must be within 1..={MAX_MTP_DEPTH}"
             )));
         }
-        Ok(Self {
-            path,
-            depth,
-            head_cache_dir: None,
-        })
-    }
-
-    #[must_use]
-    pub fn with_head_cache(mut self, directory: Option<PathBuf>) -> Self {
-        self.head_cache_dir = directory;
-        self
+        Ok(Self { path, depth })
     }
 }
 
-/// Where the pinned community head is installed by default, beside the
+/// Where the shipped ternary head artifact is installed by default, beside the
 /// pinned target checkpoint directory.
 ///
 /// Shipped builds keep this repository-relative, and `MtpMode::resolve` reads
@@ -61,38 +49,14 @@ impl MtpSettings {
 /// beside the running binary. Test fixtures need the opposite:
 /// `cargo test -p local-engine` runs with `local-engine/` as the working
 /// directory, so the same relative string cannot resolve. The test build
-/// therefore anchors the identical file to the workspace root, where nothing
-/// joins it onto a working directory before opening it.
+/// therefore anchors the identical file to the workspace root.
 #[cfg(not(test))]
-pub const DEFAULT_BONSAI_MTP_HEAD: &str = "models/bonsai2-27b-mtp/model_mtp.safetensors";
-#[cfg(test)]
-pub const DEFAULT_BONSAI_MTP_HEAD: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../models/bonsai2-27b-mtp/model_mtp.safetensors"
-);
-
-/// Where the shipped int8 head is installed by default, beside
-/// [`DEFAULT_BONSAI_MTP_HEAD`] and with the same shipped/test anchoring.
-///
-/// Discovery prefers it: it loads without mapping the 849 MB BF16 source, and it
-/// carries its own payload digest, so an install needs only this file.
-#[cfg(not(test))]
-pub const DEFAULT_BONSAI_MTP_ARTIFACT: &str = "models/bonsai2-27b-mtp/mtp-head-int8-v2.bin";
+pub const DEFAULT_BONSAI_MTP_ARTIFACT: &str = "models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin";
 #[cfg(test)]
 pub const DEFAULT_BONSAI_MTP_ARTIFACT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../models/bonsai2-27b-mtp/mtp-head-int8-v2.bin"
+    "/../models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin"
 );
-
-/// [`MTP_HEAD_ARTIFACT`] in the directory holding `head`.
-///
-/// Every head sits in its own directory, so the artifact is a sibling of
-/// whichever head path is in play — the pinned default, or one the caller named.
-#[must_use]
-pub fn artifact_beside(head: &Path) -> Option<PathBuf> {
-    head.parent()
-        .map(|directory| directory.join(MTP_HEAD_ARTIFACT))
-}
 
 /// Whether `MtpMode::Auto` speculates when a head is available.
 ///
@@ -139,9 +103,8 @@ pub const MTP_DEFAULT_OFF_REASON: &str = "speculation is off by build default (D
 
 /// How a caller wants speculation.
 ///
-/// `Auto` follows [`DEFAULT_MTP_ENABLED`] when a head is installed, preferring the
-/// int8 artifact over the BF16 source. `Head` names a head file, which may be
-/// either. `Off` never speculates and carries why, so the caller that built it —
+/// `Auto` follows [`DEFAULT_MTP_ENABLED`] when the head artifact is installed.
+/// `Head` names a head artifact explicitly. `Off` never speculates and carries why, so the caller that built it —
 /// which is the one that knows — is the only one that has to supply a reason.
 /// Drafts never change the emitted tokens because the target verifies every one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +151,7 @@ impl MtpMode {
     /// is never [`MtpMode::Auto`]. The `Auto` arm here is therefore reached by a
     /// caller that asked for `Auto` or took [`MtpMode::default`].
     pub fn resolve(&self) -> crate::Result<MtpResolution> {
-        self.resolve_with_default(Path::new(DEFAULT_BONSAI_MTP_HEAD), DEFAULT_MTP_ENABLED)
+        self.resolve_with_default(Path::new(DEFAULT_BONSAI_MTP_ARTIFACT), DEFAULT_MTP_ENABLED)
     }
 
     /// [`Self::resolve`] with an explicit `Auto` head location and policy.
@@ -213,18 +176,12 @@ impl MtpMode {
                 Ok(MtpResolution::Native(settings.clone()))
             }
             Self::Auto { depth } => {
-                let mut settings = MtpSettings::new(default_head.to_path_buf(), *depth)?;
-                // An int8 artifact beside the default head wins over it: it needs
-                // neither the BF16 source nor any transform to load.
-                match artifact_beside(default_head).filter(|path| path.is_file()) {
-                    Some(artifact) => settings.path = artifact,
-                    None if !default_head.is_file() => {
-                        return Ok(MtpResolution::Disabled(format!(
-                            "no MTP head or int8 artifact installed at {}",
-                            default_head.display()
-                        )));
-                    }
-                    None => {}
+                let settings = MtpSettings::new(default_head.to_path_buf(), *depth)?;
+                if !default_head.is_file() {
+                    return Ok(MtpResolution::Disabled(format!(
+                        "no MTP head artifact installed at {}",
+                        default_head.display()
+                    )));
                 }
                 if auto_enabled {
                     Ok(MtpResolution::Native(settings))

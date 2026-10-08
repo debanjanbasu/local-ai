@@ -1,7 +1,10 @@
 use super::{
     AttentionLayer, BlockOutput, BonsaiModel, BufferCopyRequest, CommandBatch, HadamardDirection,
-    Speculation, VOCAB, WIDTH, decode_embeddings,
+    Selection, Speculation, VOCAB, WIDTH, decode_embeddings,
 };
+
+/// Layers encoded into a block's first command buffer before it is submitted.
+const SUBMIT_AFTER_LAYERS: usize = 1;
 
 impl BonsaiModel {
     pub(super) fn forward(&mut self, token: u32, logits: bool) -> crate::Result<()> {
@@ -57,6 +60,9 @@ impl BonsaiModel {
                 "MTP ingestion needs output-normalized rows".into(),
             ));
         }
+        // Whatever the block writes, the previous selection no longer
+        // describes the logits the caller will read.
+        self.selection = Selection::None;
         let mut ingest = ingest;
         self.reserve_kv(self.position + tokens.len(), ingest.as_deref_mut())?;
         let count = tokens.len() as u32;
@@ -76,7 +82,13 @@ impl BonsaiModel {
             }
             None => None,
         };
-        let mut batch = CommandBatch::new(&self.context)?;
+        // Verification lets the independent projections of each layer overlap
+        // (`CommandBatch::independent`); every other dispatch stays ordered.
+        let mut batch = if verify.is_some() {
+            CommandBatch::new_concurrent(&self.context)?
+        } else {
+            CommandBatch::new(&self.context)?
+        };
         let scratch = &self.scratch;
         self.kernels.transform(
             &mut batch,
@@ -87,7 +99,13 @@ impl BonsaiModel {
             HadamardDirection::Inverse,
         )?;
         let mut recurrent_index = 0;
-        for layer in &self.layers {
+        for (index, layer) in self.layers.iter().enumerate() {
+            if index == SUBMIT_AFTER_LAYERS {
+                // Start the GPU on the first layers while the host encodes the
+                // rest: encoding a whole block took about 1.2 ms of host time
+                // (0.5 ms for one row) during which the GPU sat idle.
+                batch.submit_and_renew(&self.context)?;
+            }
             self.normalize_input(&mut batch, &scratch.hidden, &layer.attention_norm, count)?;
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
@@ -140,19 +158,43 @@ impl BonsaiModel {
             }
             None => {}
         }
+        let produced = match (output, verify) {
+            (BlockOutput::LastLogits, None) => Some((&scratch.logits, 1, Selection::Last)),
+            (_, Some(verifier)) => Some((
+                &verifier.verify_logits,
+                tokens.len(),
+                Selection::Rows(tokens.len()),
+            )),
+            _ => None,
+        };
+        // The argmax rides in the block's command buffer, and its kernel
+        // flags non-finite rows, so the host neither submits a selection per
+        // row nor scans the logits.
+        let selected =
+            produced.filter(|&(_, rows, _)| self.device_greedy && rows <= self.greedy.max_rows());
+        if let Some((logits, rows, _)) = selected {
+            self.greedy.encode(&mut batch, logits, rows)?;
+        }
         if let Some(speculation) = ingest {
             self.encode_head_rows(&mut batch, speculation, tokens.len(), self.position)?;
         }
         self.finish(batch)?;
         self.position += tokens.len();
-        let logits = match (output, verify) {
-            (BlockOutput::LastLogits, None) => scratch.logits.as_slice::<f32>(),
-            (_, Some(verifier)) => {
-                &verifier.verify_logits.as_slice::<f32>()[..tokens.len() * VOCAB]
+        let nonfinite = match (selected, produced) {
+            (Some((_, rows, selection)), _) => {
+                self.selection = selection;
+                self.greedy
+                    .results(rows)
+                    .iter()
+                    .any(|result| result.nonfinite != 0)
             }
-            _ => &[],
+            (None, Some((logits, rows, _))) => logits.as_slice::<f32>()[..rows * VOCAB]
+                .iter()
+                .any(|value| !value.is_finite()),
+            (None, None) => false,
         };
-        if logits.iter().any(|value| !value.is_finite()) {
+        if nonfinite {
+            self.selection = Selection::None;
             return Err(crate::Error::Generation("non-finite Bonsai logits".into()));
         }
         Ok(())
@@ -173,6 +215,7 @@ impl BonsaiModel {
         result
     }
 
+    #[cfg(test)]
     pub(super) fn encode_committed(
         &self,
         speculation: &mut Speculation,
@@ -198,7 +241,7 @@ impl BonsaiModel {
     /// Encode K/V-only head ingestion of `rows` committed tokens starting at
     /// `start` into `batch`: the head's embedding rows must already be staged
     /// and `scratch.normalized` must hold those rows' output-normalized hidden.
-    fn encode_head_rows(
+    pub(super) fn encode_head_rows(
         &self,
         batch: &mut CommandBatch,
         speculation: &Speculation,

@@ -65,7 +65,6 @@ impl BonsaiEngine {
                 "max_draft_rows": speculation.max_draft_rows,
                 "chain_margin": DRAFT_CHAIN_MIN_MARGIN,
                 "head_bytes": speculation.head_bytes,
-                "head_cache": speculation.head_cache,
                 "checkpoint_bytes": speculation.checkpoint_bytes,
             }),
             _ => serde_json::json!({"enabled": false, "reason": disabled}),
@@ -73,7 +72,8 @@ impl BonsaiEngine {
         let layout = model.kv_layout();
         let info = BonsaiInfo {
             precision: format!(
-                "checkpoint_ptq1_state_f32_kv_{}",
+                "checkpoint_ptq1_state_{}_kv_{}",
+                model.state_format().name(),
                 layout.name().replace('/', "_")
             ),
             policy: serde_json::json!({
@@ -107,6 +107,7 @@ impl BonsaiEngine {
             max_prompt_checkpoints: 0,
             session_snapshots: Vec::new(),
             disk_snapshots: Vec::new(),
+            disk_writer: None,
             prompt_cache_bytes: 0,
             prompt_cache_disk_bytes: 0,
             prompt_cache_dir: None,

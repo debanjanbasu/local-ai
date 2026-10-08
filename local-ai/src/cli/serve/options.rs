@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use super::Args;
@@ -31,7 +30,6 @@ const MAX_STALL_SECONDS: i64 = 3600;
 pub(super) fn usage() {
     eprintln!("Usage: local-ai serve [options]");
     eprintln!();
-    eprintln!("  --model PATH       Override automatic pinned-model discovery");
     eprintln!("  --host IP          Bind address (default: 127.0.0.1)");
     eprintln!("  --port N           TCP/UDP port (default: 8080)");
     eprintln!("  --api-key KEY      Require bearer authentication");
@@ -44,7 +42,6 @@ pub(super) fn usage() {
 
 pub(super) fn parse(args: &[String]) -> Result<Args, String> {
     let mut parsed = Args {
-        model: None,
         host: "127.0.0.1".parse().map_err(|_| "invalid default host")?,
         port: 8080,
         thinking: true,
@@ -65,17 +62,13 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         index += 1;
         // Recognise the flag before demanding its value, so an unknown option is
         // reported as unknown rather than as a missing argument.
-        if !matches!(
-            flag,
-            "--model" | "--host" | "--port" | "--api-key" | "--stall-timeout"
-        ) {
+        if !matches!(flag, "--host" | "--port" | "--api-key" | "--stall-timeout") {
             return Err(format!("unknown option: {flag}"));
         }
         let value = args
             .get(index)
             .ok_or_else(|| format!("{flag} requires a value"))?;
         match flag {
-            "--model" => parsed.model = Some(PathBuf::from(value)),
             "--host" => parsed.host = value.parse().map_err(|_| "invalid --host")?,
             "--port" => parsed.port = value.parse().map_err(|_| "invalid --port")?,
             "--api-key" => parsed.api_key = Some(value.clone()),

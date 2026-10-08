@@ -7,17 +7,15 @@
 # ---------------------------------------------------------------------------
 # WHAT THIS CI DELIBERATELY DOES NOT RUN
 # ---------------------------------------------------------------------------
-# It does not run the 15 `#[ignore]`d real-model integration tests. Those are
-# opt-in, environment-gated tests documented separately in
-# docs/BONSAI.md#verification, and they are skipped by `cargo test --workspace`
-# below -- so nothing in this file exercises them.
+# It does not run the `#[ignore]`d real-model integration tests. Those are
+# opt-in tests documented separately in docs/BONSAI.md#verification, and they
+# are skipped by `cargo test --workspace` below -- so nothing in this file
+# exercises them.
 #
 # They cannot run here, and that is not a runner-size problem to be tuned away:
 #
-#   * They require real artifacts that do not exist on a fresh checkout: a
-#     5.9 GB GGUF checkpoint, an ~8 MB tokenizer index JSON, and an MTP head
-#     file. Three of them `expect` BONSAI_GGUF / BONSAI_INDEX outright with no
-#     fallback, so they fail rather than skip when the vars are unset.
+#   * They require real artifacts that do not exist on a fresh checkout: the
+#     5.9 GB GGUF checkpoint and the MTP head under models/.
 #   * They pass only with `--test-threads=1`. Cargo's default thread count
 #     makes them fail spuriously: each test maps and uploads the full
 #     checkpoint, and concurrent unified-memory and GPU contention purges

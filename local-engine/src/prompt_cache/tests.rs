@@ -1,3 +1,4 @@
+use super::writer::{Completion, Submitted};
 use super::*;
 
 fn snapshot_fixture() -> PromptSnapshot {
@@ -289,4 +290,166 @@ fn temporaries_do_not_perturb_the_disk_budget() {
     );
     load(&first, "model").expect("first snapshot intact");
     load(&second, "model").expect("second snapshot intact");
+}
+
+fn job(root: &Path, tokens: &[u32], reusable_boundary: bool, budget: u64) -> StoreJob {
+    StoreJob {
+        root: root.to_owned(),
+        model_key: "model".into(),
+        tokens: tokens.to_vec(),
+        session_id: Some("a".into()),
+        snapshot: snapshot_fixture(),
+        reusable_boundary,
+        budget,
+    }
+}
+
+fn committed(completions: Vec<Completion>) -> Vec<DiskEntry> {
+    completions
+        .into_iter()
+        .map(|completion| completion.stored.expect("background store"))
+        .collect()
+}
+
+#[test]
+fn a_background_snapshot_is_reported_only_once_committed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer = Writer::spawn().expect("writer");
+    // Large enough that the write is still running when the first poll lands.
+    let mut large = job(dir.path(), &[1, 2, 3], true, u64::MAX);
+    large.snapshot.target_kv = PageBytes::zeroed(64 << 20).expect("bytes");
+    assert_eq!(writer.submit(large), Submitted::Queued);
+    let mut reported = Vec::new();
+    while reported.is_empty() {
+        // Whatever the timing, a reported entry is a renamed, loadable file.
+        for entry in committed(writer.take_completed()) {
+            assert_eq!(entry.path.extension().and_then(|e| e.to_str()), Some("bpc"));
+            load(&entry.path, "model").expect("a reported snapshot is complete");
+            reported.push(entry);
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(reported.len(), 1);
+    assert_eq!(reported[0].tokens, [1, 2, 3]);
+    assert!(reported[0].reusable_boundary);
+    assert_eq!(
+        snapshot_paths(dir.path(), "model"),
+        [reported[0].path.clone()]
+    );
+    assert_eq!(
+        names_with_extension(&dir.path().join("model"), ".tmp"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn wait_for_returns_once_the_matching_write_is_committed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer = Writer::spawn().expect("writer");
+    writer.submit(job(dir.path(), &[7, 8, 9], false, u64::MAX));
+    writer.wait_for(|tokens| tokens == [7, 8, 9]);
+    let entries = committed(writer.take_completed());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].tokens, [7, 8, 9]);
+    load(&entries[0].path, "model").expect("committed");
+    // Nothing pending matches, so this returns at once.
+    writer.wait_for(|_| true);
+}
+
+#[test]
+fn dropping_the_writer_finishes_pending_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer = Writer::spawn().expect("writer");
+    let mut submitted = Vec::new();
+    for tokens in [[1, 1], [2, 2], [3, 3]] {
+        submitted.push(writer.submit(job(dir.path(), &tokens, false, u64::MAX)));
+    }
+    drop(writer);
+    // Each `Replaced` is one job that was never written; every other accepted
+    // job is on disk once the writer is gone, whatever the thread's timing.
+    let replaced = submitted
+        .iter()
+        .filter(|&&outcome| outcome == Submitted::Replaced)
+        .count();
+    assert!(!submitted.contains(&Submitted::Dropped));
+    assert_eq!(snapshot_paths(dir.path(), "model").len(), 3 - replaced);
+    assert_eq!(
+        names_with_extension(&dir.path().join("model"), ".tmp"),
+        Vec::<String>::new()
+    );
+    // The newest job is never the one replaced.
+    assert!(
+        discover(dir.path(), "model")
+            .iter()
+            .any(|entry| entry.tokens == [3, 3])
+    );
+}
+
+#[test]
+fn the_queue_holds_one_job_and_never_lets_a_tail_displace_a_boundary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut queued = None;
+    let tokens = |slot: &Option<StoreJob>| slot.as_ref().map(|job| job.tokens.clone());
+    assert_eq!(
+        writer::enqueue(&mut queued, job(dir.path(), &[1], false, 0)),
+        Submitted::Queued
+    );
+    assert_eq!(
+        writer::enqueue(&mut queued, job(dir.path(), &[2], true, 0)),
+        Submitted::Replaced
+    );
+    assert_eq!(tokens(&queued), Some(vec![2]));
+    assert_eq!(
+        writer::enqueue(&mut queued, job(dir.path(), &[3], false, 0)),
+        Submitted::Dropped,
+        "a request tail never displaces a queued shared-prefix boundary"
+    );
+    assert_eq!(tokens(&queued), Some(vec![2]));
+    assert_eq!(
+        writer::enqueue(&mut queued, job(dir.path(), &[4], true, 0)),
+        Submitted::Replaced,
+        "a newer boundary replaces an older one"
+    );
+    assert_eq!(tokens(&queued), Some(vec![4]));
+}
+
+#[test]
+fn the_writer_trims_from_its_index_and_reports_evictions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer = Writer::spawn().expect("writer");
+    let mut stored = Vec::new();
+    let mut evicted = Vec::new();
+    // A zero budget keeps exactly one snapshot, preferring the boundary.
+    for (tokens, boundary) in [([1, 1], true), ([2, 2], false), ([3, 3], false)] {
+        writer.submit(job(dir.path(), &tokens, boundary, 0));
+        writer.flush();
+        for completion in writer.take_completed() {
+            stored.push(completion.stored.expect("store").path);
+            evicted.extend(completion.evicted);
+        }
+    }
+    assert_eq!(stored.len(), 3);
+    assert_eq!(snapshot_paths(dir.path(), "model"), [stored[0].clone()]);
+    evicted.sort();
+    let mut expected = vec![stored[1].clone(), stored[2].clone()];
+    expected.sort();
+    assert_eq!(evicted, expected);
+}
+
+#[test]
+fn a_failed_background_store_is_reported_not_raised() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A file where the cache directory should be: `create_dir_all` fails.
+    let root = dir.path().join("not-a-directory");
+    fs::write(&root, b"").expect("occupy root");
+    let writer = Writer::spawn().expect("writer");
+    writer.submit(job(&root, &[5], true, u64::MAX));
+    writer.flush();
+    let completions = writer.take_completed();
+    assert_eq!(completions.len(), 1);
+    assert!(completions[0].stored.is_err());
+    // The thread survives the failure.
+    writer.submit(job(dir.path(), &[6], true, u64::MAX));
+    writer.flush();
+    assert_eq!(committed(writer.take_completed()).len(), 1);
 }

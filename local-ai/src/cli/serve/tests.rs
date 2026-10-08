@@ -450,9 +450,14 @@ fn a_zstd_body_streams_frames_and_reassembles_to_the_same_document() {
     );
 }
 #[test]
-#[ignore = "requires BONSAI_GGUF; validates server requests before generation"]
+#[ignore = "requires the pinned model; validates server requests before generation"]
 fn serve_real_bonsai_validates_before_streaming_and_preserves_history() {
-    let path = std::env::var("BONSAI_GGUF").expect("BONSAI_GGUF");
+    // `cargo test` runs this from `local-ai/`, where the shipped relative
+    // default does not resolve, so name the same pinned file from the root.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+    );
     let handle = Engine::open_model(path).expect("open engine").into_handle();
     for body in [
         json!({"prompt":"", "stream":true, "max_tokens":0}),

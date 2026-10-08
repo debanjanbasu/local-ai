@@ -153,6 +153,43 @@ impl Sampler {
         Ok((self.result(best.0), best.1 - second.1))
     }
 
+    /// Whether presence or repetition penalties can change a logit. Without
+    /// them a greedy draft is the plain top two of the logits, which the GPU
+    /// can select in place (see [`Self::greedy_from_top_two`]).
+    #[must_use]
+    pub fn applies_penalties(&self) -> bool {
+        !(self.params.presence_penalty == 0.0
+            && (self.params.repetition_penalty - 1.0).abs() <= f32::EPSILON)
+    }
+
+    /// What [`Self::sample_buffer_with_margin`] returns, from an exact top two
+    /// (`f32::total_cmp` order, ties to the lower id) selected elsewhere.
+    /// Only valid for a greedy sampler that [`Self::applies_penalties`] not.
+    #[must_use]
+    pub fn greedy_from_top_two(
+        &self,
+        best_id: u32,
+        best: f32,
+        second: f32,
+    ) -> (SamplingResult, f32) {
+        (self.result(best_id), best - second)
+    }
+
+    /// Whether selection is the plain argmax of the logits (`f32::total_cmp`
+    /// order, ties to the lower id): greedy with no penalty to apply, which
+    /// the GPU can select in place (see [`Self::greedy_result`]).
+    #[must_use]
+    pub fn selects_argmax(&self) -> bool {
+        self.greedy() && !self.applies_penalties()
+    }
+
+    /// What [`Self::sample_buffer`] returns for the argmax `token_id` selected
+    /// elsewhere. Only valid when [`Self::selects_argmax`].
+    #[must_use]
+    pub fn greedy_result(&self, token_id: u32) -> SamplingResult {
+        self.result(token_id)
+    }
+
     const fn greedy(&self) -> bool {
         self.params.temperature <= f32::EPSILON || self.params.top_k == 1
     }
@@ -237,9 +274,7 @@ impl Sampler {
     }
 
     fn apply_penalties(&self, logits: &mut [f32]) {
-        if self.params.presence_penalty == 0.0
-            && (self.params.repetition_penalty - 1.0).abs() <= f32::EPSILON
-        {
+        if !self.applies_penalties() {
             return;
         }
         for &index in &self.seen_tokens {

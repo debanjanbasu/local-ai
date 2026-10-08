@@ -1,8 +1,8 @@
 //! Native Metal execution of the pinned Bonsai 2 27B text graph.
 //!
 //! PTQ1/BF16 matrices stay in their checkpoint representation, bound straight
-//! from the GGUF mapping. Activations and recurrence are F32; full-attention
-//! caches are F16. Requests start from empty state, with no context shifting
+//! from the GGUF mapping. Activations and recurrence arithmetic are F32, the
+//! recurrent state is stored F16; full-attention caches are Q8 by default. Requests start from empty state, with no context shifting
 //! or silent truncation. Optional native MTP speculation verifies every draft
 //! with the target before emitting it. [`crate::bonsai_model::BonsaiEngine`]
 //! drives this model.
@@ -15,11 +15,12 @@ use local_metal::bonsai::{
     decode_ptq1_row,
 };
 use local_metal::bonsai_ops::{
-    AttentionKernel, AttentionWorkspace, Bf16Matrix, BonsaiOps, KvFormat, KvLayout,
-    MAX_PREFILL_TOKENS, RmsNormParams,
+    AttentionKernel, AttentionWorkspace, Bf16Matrix, BonsaiOps, GdnStateFormat, KvLayout,
+    MAX_PREFILL_TOKENS,
 };
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::{DeviceCaps, MetalContext};
+use local_metal::draft::GreedyRows;
 use local_metal::sampling::GpuTopK;
 use local_metal::shaders::ShaderLibrary;
 
@@ -34,6 +35,7 @@ use crate::sampler::{Sampler, SamplingResult, verify_greedy_drafts};
 use crate::{MtpStats, NgramStats, PrefillProgress};
 
 mod block;
+pub mod capture;
 mod checkpoint;
 mod layers;
 mod speculation;
@@ -44,11 +46,18 @@ pub struct SpeculationInfo {
     pub depth: usize,
     pub max_draft_rows: usize,
     pub head_bytes: u64,
-    pub head_cache: &'static str,
     pub checkpoint_bytes: usize,
 }
 
-const GDN_STATE_BYTES: usize = 48 * 128 * 128 * 4;
+/// How every recurrent layer stores its 48 x 128 x 128 state between blocks;
+/// the recurrence itself runs in F32 registers. F16 halves the state's 302 MB
+/// of traffic per decode step and every checkpoint and snapshot of it. Against
+/// F32 state, teacher-forced over 512 greedy tokens after an 8,192-token
+/// prompt: mean next-token KL 7.5e-6 over 64 positions with no growth along the
+/// generation, top-1 512/512 (BF16: 4.7e-5, 511/512). The largest F32 state
+/// value there was 46.2; F16 stores saturate rather than overflow.
+const STATE_FORMAT: GdnStateFormat = GdnStateFormat::F16;
+const GDN_STATE_BYTES: usize = STATE_FORMAT.state_bytes();
 const RECURRENT_LAYERS: usize = LAYERS - LAYERS / FULL_INTERVAL;
 pub const PROMPT_CHECKPOINT_BYTES: usize =
     RECURRENT_LAYERS * (GDN_STATE_BYTES + CONV_STATE_BYTES) + WIDTH * size_of::<f32>();
@@ -237,11 +246,21 @@ const KV_TOKEN_BYTES: usize = local_metal::bonsai_ops::KvFormat::F16.token_bytes
 /// allocation Metal wires eagerly.
 pub const DEFAULT_KV_INITIAL_TOKENS: usize = 1024;
 
+/// The target's K/V cache format unless a caller chooses one.
+///
+/// Q8 against F16 on the real model, teacher-forced over 64 greedy tokens: mean
+/// next-token KL 1.4e-5 at a 4,096-token prompt and 1.4e-5 at 16,384, top-1
+/// agreement 64/64 at both. It halves K/V memory (34 KiB per token against
+/// 64 KiB), and because decode attention is bandwidth-bound its tensor kernel
+/// ties F16's at 1K tokens and leads from 4K (1.25x) to 128K (1.34x) on an M4
+/// Pro.
+pub const DEFAULT_KV_LAYOUT: KvLayout = KvLayout::Q8;
+
 /// How the sixteen full-attention layers store keys and values.
 ///
 /// Attention only ever reads the written prefix, so caches are allocated for
-/// `initial_tokens` and doubled on demand up to the context; resident memory
-/// follows the request length, not `--context`. The head's own single-layer
+/// `initial_tokens` and grown on demand up to the context; resident memory
+/// follows the request length, not the context. The head's own single-layer
 /// cache stays F16 and grows alongside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvOptions {
@@ -252,7 +271,7 @@ pub struct KvOptions {
 impl Default for KvOptions {
     fn default() -> Self {
         Self {
-            layout: KvLayout::F16,
+            layout: DEFAULT_KV_LAYOUT,
             initial_tokens: DEFAULT_KV_INITIAL_TOKENS,
         }
     }
@@ -400,11 +419,15 @@ impl Scratch {
 const RECURRENCE_FACTOR_WIDTH: usize = 10_240;
 const RECURRENCE_SCALAR_WIDTH: usize = 48;
 
-/// Start-of-round state and compact recurrence inputs used to reconstruct an
-/// accepted prefix without retaining a full state checkpoint for every row.
+/// One GDN layer's side of a verify block. The block reads the layer's own
+/// state and history and writes its final ones here, so the layer keeps the
+/// start of the round with no copy: accepting every row swaps the buffers in
+/// ([`BonsaiModel::commit_verified`]), accepting fewer replays the compact
+/// recurrence inputs, which the block wrote here directly, from that start.
 struct RollbackLayer {
     state: MetalBuffer,
     history: MetalBuffer,
+    /// Raw QKV projection rows (before the convolution).
     inputs: MetalBuffer,
     decay: MetalBuffer,
     beta: MetalBuffer,
@@ -414,8 +437,9 @@ struct RollbackLayer {
 /// Independent of the MTP head: the target owns the checkpoints it rolls
 /// back to and the per-row logits it samples, whatever proposed the drafts.
 struct Verifier {
-    /// One snapshot plus `depth` rows of recurrence factors per GDN layer.
+    /// One final state plus `depth + 1` rows of recurrence inputs per GDN layer.
     rollback: Vec<RollbackLayer>,
+    state_format: GdnStateFormat,
     rows: usize,
     max_rows: usize,
     /// Contiguous per-row target logits produced by the block matmul.
@@ -423,22 +447,28 @@ struct Verifier {
 }
 
 impl Verifier {
-    fn new(context: &MetalContext, initial_depth: usize, max_depth: usize) -> crate::Result<Self> {
+    fn new(
+        context: &MetalContext,
+        state_format: GdnStateFormat,
+        initial_depth: usize,
+        max_depth: usize,
+    ) -> crate::Result<Self> {
         let empty = |bytes| MetalBuffer::empty(context.device(), bytes);
         let rows = initial_depth + 1;
         let rollback = (0..LAYERS - LAYERS / FULL_INTERVAL)
             .map(|_| {
                 Ok(RollbackLayer {
-                    state: empty(GDN_STATE_BYTES)?,
+                    state: empty(state_format.state_bytes())?,
                     history: empty(CONV_STATE_BYTES)?,
-                    inputs: empty(initial_depth * RECURRENCE_FACTOR_WIDTH * size_of::<f32>())?,
-                    decay: empty(initial_depth * RECURRENCE_SCALAR_WIDTH * size_of::<f32>())?,
-                    beta: empty(initial_depth * RECURRENCE_SCALAR_WIDTH * size_of::<f32>())?,
+                    inputs: empty(rows * RECURRENCE_FACTOR_WIDTH * size_of::<f32>())?,
+                    decay: empty(rows * RECURRENCE_SCALAR_WIDTH * size_of::<f32>())?,
+                    beta: empty(rows * RECURRENCE_SCALAR_WIDTH * size_of::<f32>())?,
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(Self {
             rollback,
+            state_format,
             rows,
             max_rows: max_depth + 1,
             verify_logits: empty(rows * VOCAB * size_of::<f32>())?,
@@ -455,7 +485,7 @@ impl Verifier {
             ));
         }
         let rows = rows.next_power_of_two().min(self.max_rows);
-        *self = Self::new(context, rows - 1, self.max_rows - 1)?;
+        *self = Self::new(context, self.state_format, rows - 1, self.max_rows - 1)?;
         Ok(())
     }
 
@@ -466,7 +496,7 @@ impl Verifier {
         (LAYERS - LAYERS / FULL_INTERVAL)
             * (GDN_STATE_BYTES
                 + CONV_STATE_BYTES
-                + depth
+                + (depth + 1)
                     * (RECURRENCE_FACTOR_WIDTH + 2 * RECURRENCE_SCALAR_WIDTH)
                     * size_of::<f32>())
     }
@@ -477,14 +507,21 @@ impl Verifier {
 struct Speculation {
     mtp: BonsaiMtp,
     verifier: Verifier,
+    drafter: speculation::Drafter,
 }
 
 impl Speculation {
-    fn new(context: &MetalContext, mtp: BonsaiMtp, verify_depth: usize) -> crate::Result<Self> {
+    fn new(
+        context: &MetalContext,
+        mtp: BonsaiMtp,
+        verify_depth: usize,
+        drafter: speculation::Drafter,
+    ) -> crate::Result<Self> {
         let initial_depth = mtp.depth.min(verify_depth);
         Ok(Self {
-            verifier: Verifier::new(context, initial_depth, verify_depth)?,
+            verifier: Verifier::new(context, STATE_FORMAT, initial_depth, verify_depth)?,
             mtp,
+            drafter,
         })
     }
 
@@ -509,9 +546,21 @@ enum BlockOutput<'a> {
     Hidden,
     /// Logits of the final row in `scratch.logits`.
     LastLogits,
-    /// Logits of every row in `Verifier::verify_logits`, with recurrent
-    /// compact rollback factors for each non-final row. Needs at least two rows.
+    /// Logits of every row in `Verifier::verify_logits`; the recurrent layers
+    /// keep their start state and write the block's final state and replay
+    /// inputs to the verifier. Needs at least two rows, and every caller must
+    /// then [`BonsaiModel::commit_verified`].
     Verify(&'a Verifier),
+}
+
+/// Logits whose argmax [`BonsaiModel::greedy`] holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Selection {
+    None,
+    /// `scratch.logits`.
+    Last,
+    /// The first rows of the last verify block's `verify_logits`.
+    Rows(usize),
 }
 
 /// The loaded native graph plus its per-request state.
@@ -536,6 +585,13 @@ pub struct BonsaiModel {
     kv_allocated: usize,
     speculation: Option<Speculation>,
     ngram_verifier: Option<Verifier>,
+    state_format: GdnStateFormat,
+    /// Argmax of each logit row a block produces, selected in the block's
+    /// own command buffer while [`Self::set_device_greedy`] is on.
+    greedy: GreedyRows,
+    device_greedy: bool,
+    /// Which logits `greedy` currently describes.
+    selection: Selection,
     epsilon: f32,
     rope_base: f32,
     position: usize,
@@ -568,7 +624,7 @@ impl BonsaiModel {
         attention_kernel: Option<AttentionKernel>,
         mtp: Option<&MtpSettings>,
         ngram: NgramSettings,
-        mut kv: KvOptions,
+        kv: KvOptions,
     ) -> crate::Result<Self> {
         validate_profile(&package)?;
         if kv.initial_tokens == 0 {
@@ -604,24 +660,6 @@ impl BonsaiModel {
             kv.layout,
             &caps,
         )?;
-        if capacity == 0 && info.context < 32_768 && kv.layout == KvLayout::F16 {
-            kv.layout = KvLayout {
-                key: KvFormat::Q8,
-                value: KvFormat::Q8,
-            };
-            info = memory_plan(
-                &package,
-                capacity,
-                prefill_chunk,
-                mtp_bytes,
-                mtp.is_some(),
-                kv.layout,
-                &caps,
-            )?;
-            info.context_reason.push_str(
-                "; selected q8 K/V because F16 could not reach the 32,768-token minimum useful coding context",
-            );
-        }
         let capacity = info.context;
         let kv_allocated = kv.initial_tokens.min(capacity);
         let block_rows = prefill_chunk.max(verify_depth + 1);
@@ -691,7 +729,9 @@ impl BonsaiModel {
                     kv_allocated,
                     VOCAB,
                 )?;
-                Speculation::new(&context, head, verify_depth)
+                let drafter =
+                    speculation::Drafter::new(&context, &shaders, &package, settings.depth)?;
+                Speculation::new(&context, head, verify_depth, drafter)
             })
             .transpose()?;
         if let Some(settings) = mtp {
@@ -702,7 +742,7 @@ impl BonsaiModel {
                 + (verify_depth + 1) * VOCAB * size_of::<f32>();
         }
         let ngram_verifier = (speculation.is_none() && verify_depth > 0)
-            .then(|| Verifier::new(&context, verify_depth.min(3), verify_depth))
+            .then(|| Verifier::new(&context, STATE_FORMAT, verify_depth.min(3), verify_depth))
             .transpose()?;
         Ok(Self {
             info,
@@ -724,6 +764,10 @@ impl BonsaiModel {
             kv_allocated,
             speculation,
             ngram_verifier,
+            state_format: STATE_FORMAT,
+            greedy: GreedyRows::new(&context, &shaders, VOCAB, verify_depth + 1)?,
+            device_greedy: false,
+            selection: Selection::None,
             epsilon: package.metadata_f32("qwen35.attention.layer_norm_rms_epsilon")?,
             rope_base: package.metadata_f32("qwen35.rope.freq_base")?,
             position: 0,
@@ -799,6 +843,18 @@ impl BonsaiModel {
 
     /// Copy all non-positional state at the current token boundary.
     pub(crate) fn prompt_checkpoint(&self) -> crate::Result<PromptCheckpoint> {
+        let checkpoint = self.copy_checkpoint()?;
+        checkpoint.make_volatile();
+        Ok(checkpoint)
+    }
+
+    /// [`Self::prompt_checkpoint`] kept non-purgeable, for a boundary a
+    /// [`Self::prompt_snapshot_at`] will read later in the same request.
+    pub(crate) fn pinned_prompt_checkpoint(&self) -> crate::Result<PromptCheckpoint> {
+        self.copy_checkpoint()
+    }
+
+    fn copy_checkpoint(&self) -> crate::Result<PromptCheckpoint> {
         let recurrent = self
             .layers
             .iter()
@@ -808,7 +864,7 @@ impl BonsaiModel {
             })
             .map(|_| {
                 Ok((
-                    MetalBuffer::empty(self.context.device(), GDN_STATE_BYTES)?,
+                    MetalBuffer::empty(self.context.device(), self.state_format.state_bytes())?,
                     MetalBuffer::empty(self.context.device(), CONV_STATE_BYTES)?,
                 ))
             })
@@ -824,7 +880,6 @@ impl BonsaiModel {
             mtp_prev_hidden,
         };
         self.copy_prompt_state(&checkpoint, false)?;
-        checkpoint.make_volatile();
         Ok(checkpoint)
     }
 
@@ -864,48 +919,90 @@ impl BonsaiModel {
 
     /// Copy an exact boundary to CPU memory. Cache tails are deliberately omitted.
     pub(crate) fn prompt_snapshot(&self) -> crate::Result<PromptSnapshot> {
-        let mut recurrent = Vec::new();
-        let mut target_kv = Vec::new();
-        for layer in &self.layers {
-            match &layer.attention {
-                AttentionLayer::Recurrent(layer) => {
-                    recurrent.push(layer.state.as_slice::<u8>());
-                    recurrent.push(layer.history.as_slice::<u8>());
-                }
-                AttentionLayer::Full(layer) => {
-                    target_kv.push(
-                        &layer.key_cache.as_slice::<u8>()
-                            [..self.position * self.kv_layout.key.token_bytes()],
-                    );
-                    target_kv.push(
-                        &layer.value_cache.as_slice::<u8>()
-                            [..self.position * self.kv_layout.value.token_bytes()],
-                    );
-                }
-            }
+        let recurrent = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attention {
+                AttentionLayer::Recurrent(layer) => Some(layer),
+                AttentionLayer::Full(_) => None,
+            })
+            .flat_map(|layer| [layer.state.as_slice::<u8>(), layer.history.as_slice::<u8>()]);
+        let hidden = self
+            .speculation
+            .as_ref()
+            .map(|speculation| speculation.mtp.prev_hidden().as_slice::<u8>());
+        self.snapshot_with(self.position, recurrent, hidden)
+    }
+
+    /// [`Self::prompt_snapshot`] of the earlier boundary `checkpoint` holds:
+    /// its recurrent state and head hidden from the checkpoint, its K/V rows
+    /// from the live caches, which only ever append past it within a request.
+    /// So a request's prompt snapshot need not sit in host memory for its
+    /// whole decode. `None` when the OS purged the checkpoint.
+    pub(crate) fn prompt_snapshot_at(
+        &self,
+        checkpoint: &PromptCheckpoint,
+    ) -> crate::Result<Option<PromptSnapshot>> {
+        let head_matches = checkpoint.mtp_prev_hidden.is_some() == self.speculation.is_some();
+        if checkpoint.position > self.position || !head_matches {
+            return Err(crate::Error::InvalidArgument(
+                "prompt checkpoint is not behind this model's position".into(),
+            ));
         }
-        let (mtp_prev_hidden, mtp_kv) = match &self.speculation {
-            None => (PageBytes::zeroed(0)?, PageBytes::zeroed(0)?),
-            Some(speculation) => {
-                let mtp = &speculation.mtp;
-                let key_bytes =
-                    self.position * local_metal::bonsai_ops::KvFormat::F16.token_bytes();
-                let (keys, values) = mtp.kv_caches();
+        if !checkpoint.make_nonvolatile() {
+            checkpoint.make_volatile();
+            return Ok(None);
+        }
+        let recurrent = checkpoint
+            .recurrent
+            .iter()
+            .flat_map(|(state, history)| [state.as_slice::<u8>(), history.as_slice::<u8>()]);
+        let hidden = checkpoint
+            .mtp_prev_hidden
+            .as_ref()
+            .map(MetalBuffer::as_slice::<u8>);
+        self.snapshot_with(checkpoint.position, recurrent, hidden)
+            .map(Some)
+    }
+
+    fn snapshot_with<'a>(
+        &'a self,
+        position: usize,
+        recurrent: impl IntoIterator<Item = &'a [u8]>,
+        mtp_prev_hidden: Option<&'a [u8]>,
+    ) -> crate::Result<PromptSnapshot> {
+        let target_kv = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attention {
+                AttentionLayer::Full(layer) => Some([
+                    &layer.key_cache.as_slice::<u8>()
+                        [..position * self.kv_layout.key.token_bytes()],
+                    &layer.value_cache.as_slice::<u8>()
+                        [..position * self.kv_layout.value.token_bytes()],
+                ]),
+                AttentionLayer::Recurrent(_) => None,
+            });
+        let (mtp_prev_hidden, mtp_kv) = match (&self.speculation, mtp_prev_hidden) {
+            (Some(speculation), Some(hidden)) => {
+                let key_bytes = position * local_metal::bonsai_ops::KvFormat::F16.token_bytes();
+                let (keys, values) = speculation.mtp.kv_caches();
                 (
-                    PageBytes::concat([mtp.prev_hidden().as_slice::<u8>()])?,
+                    PageBytes::concat([hidden])?,
                     PageBytes::concat([
                         &keys.as_slice::<u8>()[..key_bytes],
                         &values.as_slice::<u8>()[..key_bytes],
                     ])?,
                 )
             }
+            _ => (PageBytes::zeroed(0)?, PageBytes::zeroed(0)?),
         };
         Ok(PromptSnapshot {
-            position: self.position,
+            position,
             layout: self.kv_layout.name(),
             recurrent: PageBytes::concat(recurrent)?,
             mtp_prev_hidden,
-            target_kv: PageBytes::concat(target_kv)?,
+            target_kv: PageBytes::concat(target_kv.flatten())?,
             mtp_kv,
         })
     }
@@ -926,8 +1023,9 @@ impl BonsaiModel {
         for layer in &mut self.layers {
             match &mut layer.attention {
                 AttentionLayer::Recurrent(layer) => {
-                    let (state, rest) =
-                        recurrent.split_at_checked(GDN_STATE_BYTES).ok_or_else(|| {
+                    let (state, rest) = recurrent
+                        .split_at_checked(self.state_format.state_bytes())
+                        .ok_or_else(|| {
                             crate::Error::InvalidFormat("truncated prompt snapshot state".into())
                         })?;
                     let (history, rest) =
@@ -996,11 +1094,18 @@ impl BonsaiModel {
             kernels: &self.kernels,
             ops: &self.ops,
             input_rotation: &self.input_rotation,
+            attention_rotation: &self.attention_rotation,
+            ffn_rotation: &self.ffn_rotation,
             output: &self.output,
             epsilon: self.epsilon,
             rope_base: self.rope_base,
             capacity: self.kv_allocated,
         }
+    }
+
+    /// How the recurrent layers store their state.
+    pub(crate) const fn state_format(&self) -> GdnStateFormat {
+        self.state_format
     }
 
     pub(crate) const fn kv_layout(&self) -> KvLayout {
@@ -1047,7 +1152,6 @@ impl BonsaiModel {
                 depth: speculation.mtp.depth,
                 max_draft_rows: speculation.verifier.max_rows - 1,
                 head_bytes: speculation.mtp.weight_bytes,
-                head_cache: speculation.mtp.head_cache.name(),
                 checkpoint_bytes: Speculation::checkpoint_bytes(speculation.verifier.max_rows - 1),
             })
     }
@@ -1112,9 +1216,44 @@ impl BonsaiModel {
         self.forward(token, true)
     }
 
+    /// Select greedy tokens inside each block's own command buffer from now
+    /// on, for a request whose sampler [`Sampler::selects_argmax`]: the host
+    /// then reads one id per row instead of submitting a selection per row.
+    pub(crate) const fn set_device_greedy(&mut self, enabled: bool) {
+        self.device_greedy = enabled;
+    }
+
     /// Sample from the logits of the newest committed token on the GPU.
     pub(crate) fn sample(&mut self, sampler: &mut Sampler) -> crate::Result<SamplingResult> {
+        if self.selection == Selection::Last && sampler.selects_argmax() {
+            return Ok(sampler.greedy_result(self.greedy.results(1)[0].best_id));
+        }
         sampler.sample_buffer(&mut self.scratch.logits, 0, &self.context, &self.sampling)
+    }
+
+    /// Verify `drafts` against the `rows` logit rows of the verify block just
+    /// run: from the block's own argmax when it selected one, else on the host.
+    fn verify_rows(
+        &self,
+        sampler: &mut Sampler,
+        drafts: &[u32],
+        logits: &mut MetalBuffer,
+    ) -> crate::Result<crate::sampler::Verification> {
+        let rows = drafts.len() + 1;
+        if self.selection == Selection::Rows(rows) && sampler.selects_argmax() {
+            let results = self.greedy.results(rows);
+            return verify_greedy_drafts(sampler, drafts, |row, sampler| {
+                Ok(sampler.greedy_result(results[row].best_id))
+            });
+        }
+        verify_greedy_drafts(sampler, drafts, |row, sampler| {
+            sampler.sample_buffer(
+                logits,
+                row * VOCAB * size_of::<f32>(),
+                &self.context,
+                &self.sampling,
+            )
+        })
     }
 
     /// One speculative round: draft up to `depth` tokens with the head, verify
@@ -1180,26 +1319,30 @@ impl BonsaiModel {
                 })?;
             self.forward_block(&inputs, BlockOutput::Verify(verifier))?;
             let sampling_started = Instant::now();
-            let result = verify_greedy_drafts(sampler, drafts, |row, sampler| {
-                sampler.sample_buffer(
-                    &mut verifier.verify_logits,
-                    row * VOCAB * size_of::<f32>(),
-                    &self.context,
-                    &self.sampling,
-                )
-            })?;
-            if result.accepted + 1 < inputs.len() {
-                self.restore_checkpoint(verifier, result.accepted + 1)?;
-            }
+            let result = self.verify_rows(sampler, drafts, &mut verifier.verify_logits)?;
             (result, sampling_started.elapsed())
         };
         let committed = verified.accepted + 1;
-        if committed < inputs.len() {
-            self.position = start + committed;
-        }
+        // The target's rollback and the head's ingestion share one submission.
+        let mut batch = CommandBatch::new(&self.context)?;
+        let rollback = speculation
+            .as_mut()
+            .map(|value| &mut value.verifier)
+            .or(standalone.as_mut())
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument("n-gram verifier is unavailable".into())
+            })?;
+        self.encode_commit_verified(&mut batch, rollback, inputs.len(), committed)?;
+        self.position = start + committed;
         if let Some(head) = speculation.as_mut() {
-            self.encode_committed(head, &inputs[..committed])?;
+            decode_embeddings(
+                &self.package,
+                &inputs[..committed],
+                head.mtp.embedding_rows(committed)?,
+            )?;
+            self.encode_head_rows(&mut batch, head, committed, start)?;
         }
+        self.finish(batch)?;
         self.speculation = speculation;
         self.ngram_verifier = standalone;
         Ok(SpeculativeBatch {
@@ -1226,37 +1369,6 @@ fn cancelled_speculative_batch() -> SpeculativeBatch {
         ngram: NgramStats::default(),
         sampling: std::time::Duration::ZERO,
     }
-}
-
-/// Select the checkpoints a verify block of `tokens` rows needs (one per
-/// non-final row) and seed each from the layer's current state and history,
-/// so the prefix runs in [`BonsaiModel::recurrent`] start where the full run
-/// starts. Without checkpoints this is a plain decode/prefill block.
-fn seed_rollback(
-    batch: &mut CommandBatch,
-    layer: &RecurrentLayer,
-    rollback: Option<&RollbackLayer>,
-) -> crate::Result<()> {
-    let Some(rollback) = rollback else {
-        return Ok(());
-    };
-    batch.blit_buffer_copies([
-        BufferCopyRequest {
-            source: &layer.state,
-            source_offset: 0,
-            destination: &rollback.state,
-            destination_offset: 0,
-            size: GDN_STATE_BYTES,
-        },
-        BufferCopyRequest {
-            source: &layer.history,
-            source_offset: 0,
-            destination: &rollback.history,
-            destination_offset: 0,
-            size: CONV_STATE_BYTES,
-        },
-    ])?;
-    Ok(())
 }
 
 /// Decode PTQ1 embedding rows for `tokens` into consecutive F32 rows of `out`.
@@ -1367,8 +1479,7 @@ fn memory_plan(
     if estimated_working_set > caps.recommended_working_set {
         return Err(crate::Error::Context(format!(
             "Bonsai with {context}-token {} KV needs an estimated {estimated_working_set} bytes; \
-             {} recommends {}. Context/precision were not reduced; choose a smaller context, a \
-             smaller KV format (q8), or another model",
+             {} recommends {}. Context/precision were not reduced; choose a smaller context or another model",
             kv.name(),
             caps.name,
             caps.recommended_working_set

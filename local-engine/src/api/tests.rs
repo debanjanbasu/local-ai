@@ -11,10 +11,9 @@ use crate::Engine;
 /// because a prompt the cache already holds is prefilled as zero chunks, which
 /// would make this vacuously true.
 #[test]
-#[ignore = "requires BONSAI_GGUF; a real prefill is the only thing that reports"]
+#[ignore = "requires the pinned model; a real prefill is the only thing that reports"]
 fn prefill_reports_every_chunk_before_the_first_event() {
-    let path = std::env::var("BONSAI_GGUF").expect("BONSAI_GGUF");
-    let handle = Engine::open_model(path).expect("open engine").into_handle();
+    let handle = Engine::open().expect("open engine").into_handle();
     let marker = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after the epoch")
@@ -74,10 +73,9 @@ fn prefill_reports_every_chunk_before_the_first_event() {
 /// reads them from the same stream it read its events from, and a boundary dropped
 /// here would silently disable the prefill heartbeat.
 #[test]
-#[ignore = "requires BONSAI_GGUF; a real prefill is what reports"]
+#[ignore = "requires the pinned model; a real prefill is what reports"]
 fn a_prefill_boundary_survives_a_wait_that_only_wanted_events() {
-    let path = std::env::var("BONSAI_GGUF").expect("BONSAI_GGUF");
-    let handle = Engine::open_model(path).expect("open engine").into_handle();
+    let handle = Engine::open().expect("open engine").into_handle();
     let marker = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after the epoch")

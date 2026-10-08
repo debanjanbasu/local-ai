@@ -3,6 +3,7 @@ pub mod bonsai;
 pub mod bonsai_ops;
 pub mod buffer;
 pub mod context;
+pub mod draft;
 pub mod sampling;
 pub mod shaders;
 

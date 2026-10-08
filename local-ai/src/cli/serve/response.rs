@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -102,7 +101,10 @@ pub(super) async fn json_response(
     let zstd = wants_zstd(request_headers);
     let bytes = tokio::task::spawn_blocking(move || {
         let mut bytes = serde_json::to_vec(&value).unwrap_or_else(|_| JSON_ENCODE_FAILED.to_vec());
-        if zstd && let Ok(compressed) = zstd::stream::encode_all(Cursor::new(&bytes), ZSTD_LEVEL) {
+        // `bulk` tells zstd the size up front, so it sizes its tables to the
+        // body: ~1.5 MB of working memory at level 22, where the stream API
+        // without a size allocates and clears ~740 MB per call.
+        if zstd && let Ok(compressed) = zstd::bulk::compress(&bytes, ZSTD_LEVEL) {
             bytes = compressed;
         }
         bytes

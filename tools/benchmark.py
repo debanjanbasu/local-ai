@@ -89,8 +89,6 @@ class Config:
         return [
             str(BINARY),
             "bonsai",
-            "--model",
-            str(MODEL),
             "--greedy",
             "--no-thinking",
             "--json",
@@ -186,8 +184,13 @@ def require_idle() -> None:
 def run_once(config: Config, prompt: str, max_tokens: int) -> Sample:
     """Run one generation and parse the engine's own measurement of it."""
     # The engine reports its own decode timing, so wall time is not needed here.
+    # From the repository root, where the engine discovers the pinned model.
     done = subprocess.run(
-        config.argv(prompt, max_tokens), capture_output=True, text=True, check=False
+        config.argv(prompt, max_tokens),
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
     )
     if done.returncode != 0:
         raise RuntimeError(

@@ -18,9 +18,14 @@ use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, 
 
 use crate::Error;
 use crate::batch::CommandBatch;
+use crate::bonsai_ops::Bf16Matrix;
 use crate::buffer::MetalBuffer;
 use crate::context::MetalContext;
 use crate::shaders::ShaderLibrary;
+
+mod int8;
+
+pub use self::int8::{INT8_CHUNK_TOKENS, INT8_COLUMN_MULTIPLE, INT8_VECTOR_TOKENS, Int8Matrix};
 
 pub const PTQ1_BLOCK_ELEMENTS: usize = 128;
 pub const PTQ1_BLOCK_BYTES: usize = 28;
@@ -74,12 +79,14 @@ pub fn decode_ptq1_row(packed: &[u8], output: &mut [f32]) -> crate::Result<()> {
 /// Checked row-major view into immutable packed weights, including an mmap or pool.
 ///
 /// The buffer and any pool slot must not be modified/reused until GPU completion.
+/// Single-token projections also need a 4-byte-aligned offset (GGUF tensors
+/// are 32-aligned); they reject a 2-byte-aligned view.
 #[derive(Clone, Copy)]
 pub struct Ptq1Matrix<'a> {
-    buffer: &'a MetalBuffer,
-    offset: usize,
-    rows: u32,
-    columns: u32,
+    pub(crate) buffer: &'a MetalBuffer,
+    pub(crate) offset: usize,
+    pub(crate) rows: u32,
+    pub(crate) columns: u32,
 }
 
 impl<'a> Ptq1Matrix<'a> {
@@ -119,6 +126,12 @@ impl<'a> Ptq1Matrix<'a> {
     pub const fn columns(self) -> u32 {
         self.columns
     }
+
+    /// The single-token kernels read each block's code bytes as aligned
+    /// four-byte words.
+    const fn word_aligned(self) -> bool {
+        self.offset.is_multiple_of(4)
+    }
 }
 
 /// Checkpoint-provided signs, one per column, repeated for each activation row.
@@ -126,8 +139,8 @@ impl<'a> Ptq1Matrix<'a> {
 /// Different 1024-wide column blocks can have different signs. No seed, signs, or
 /// missing rotation metadata are guessed. Sign storage is immutable after upload.
 pub struct SignedHadamard {
-    signs: MetalBuffer,
-    columns: u32,
+    pub(crate) signs: MetalBuffer,
+    pub(crate) columns: u32,
 }
 
 impl SignedHadamard {
@@ -191,29 +204,53 @@ pub struct BonsaiKernels {
     forward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     inverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matvec: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    matvec_swiglu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    matvec_concat: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    matvec_concat_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    rms_forward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Tensor-tile variants with 64- and 32-token tiles for verify-sized blocks.
     matmul_short: Option<[Retained<ProtocolObject<dyn MTLComputePipelineState>>; 2]>,
     /// Exact-token kernels for 2..=`SMALL_BATCH_KERNEL_TOKENS` activation rows.
     small_batch: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Simdgroup-matrix kernel for up to `SMALL_BATCH_WIDE_TOKENS` rows.
+    small_batch_wide: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     small_batch_max: u32,
     prefill_kernel: PrefillKernel,
+    int8: int8::Int8Kernels,
 }
 
-/// Largest activation-row count handled by one small-batch dispatch.
+/// Largest activation-row count handled by one scalar small-batch dispatch.
 ///
-/// Measured per-token cost is flat through four rows and steps up at five, so
-/// larger blocks are split into balanced chunks of three or four.
+/// On an M4 Pro (17408x5120 / 5120x17408) the scalar kernel measures 191/194,
+/// 235/237 and 281/286 us at 2/3/4 rows and 337/351 us at five, where the wide
+/// kernel's 340/345 us is no slower; five or more rows use the wide kernel.
+/// With the half-prefix trit decoder: 155/162, 198/200 and 235/244 us against
+/// the wide kernel's 280/286.
 pub const SMALL_BATCH_KERNEL_TOKENS: u32 = 4;
+
+/// Largest activation-row count handled by one wide small-batch dispatch.
+///
+/// The simdgroup-matrix kernel's cost is flat in the row count, 340-348 us on the
+/// two FFN shapes for 5 to 8 rows (280-301 us with half-prefix decoding),
+/// against 452-720 us for the former two scalar dispatches. A 16-row variant
+/// sharing the decoded trits across two token tiles measured 721-735 us, twice
+/// the 8-row cost: the F32 8x8 multiplies themselves, about 270 us per eight
+/// rows, are the limit, not trit decoding.
+pub const SMALL_BATCH_WIDE_TOKENS: u32 = 8;
 
 /// Token blocks up to this size use chunked small-batch dispatches; larger
 /// blocks use the prefill tensor tile (32-, 64- or 128-token tiles).
 ///
-/// Whole-model verify blocks on an M4 Pro at a 1,024-token prefix
-/// (`benchmark_verify_block_rows`): small batch 643 ms at 24 rows and 841 ms at
-/// 32; the 32-token tile is flat at about 650 ms from 9 to 32 rows and the
-/// 64-token tile at about 860 ms from 33 to 64 rows. Small batch wins through 24.
-pub const DEFAULT_SMALL_BATCH_MAX: u32 = 24;
+/// Whole-model verify blocks on an M4 Pro at a 1,024-token prefix, best of
+/// three: small batch 95.6 / 166.1 / 267.6 / 372.2 / 477.6 / 572.1 / 673.6 /
+/// 774.9 / 860.5 ms at 4 / 8 / 16 / 24 / 32 / 40 / 48 / 56 / 60 rows and 878.4 /
+/// 879.2 ms at 63 / 64; the 32-token tile is flat at about 590-660 ms from 2 to
+/// 32 rows and the 64-token tile at about 861-877 ms from 33 to 64. Small batch
+/// wins through 60 rows and ties the tile from 63. (The former scalar-only
+/// small batch measured 108.4 / 257.4 / 452.8 / 648.2 ms at 4 / 8 / 16 / 24
+/// rows and lost to the tile from 32.)
+pub const DEFAULT_SMALL_BATCH_MAX: u32 = 60;
 
 impl BonsaiKernels {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
@@ -247,6 +284,10 @@ impl BonsaiKernels {
             forward: pipeline("bonsai_fwht_forward", 128)?,
             inverse: pipeline("bonsai_fwht_inverse", 128)?,
             matvec: pipeline("bonsai_ptq1_matvec_reuse", 32)?,
+            matvec_swiglu: pipeline("bonsai_ptq1_matvec_swiglu", 32)?,
+            matvec_concat: pipeline("bonsai_ptq1_matvec_concat", 32)?,
+            matvec_concat_bf16: pipeline("bonsai_ptq1_matvec_concat_bf16", 32)?,
+            rms_forward: pipeline("bonsai_rms_fwht_forward", 128)?,
             matmul: pipeline(
                 match prefill_kernel {
                     PrefillKernel::SimdF32 => "bonsai_ptq1_matmul_bytewise_32",
@@ -264,8 +305,10 @@ impl BonsaiKernels {
             small_batch: (2..=SMALL_BATCH_KERNEL_TOKENS)
                 .map(|tokens| pipeline(&format!("bonsai_ptq1_small_batch_{tokens}"), 32))
                 .collect::<crate::Result<_>>()?,
+            small_batch_wide: pipeline("bonsai_ptq1_small_batch_wide", 128)?,
             small_batch_max: DEFAULT_SMALL_BATCH_MAX,
             prefill_kernel,
+            int8: int8::Int8Kernels::new(pipeline)?,
         })
     }
 
@@ -341,13 +384,16 @@ impl BonsaiKernels {
         input: &MetalBuffer,
         output: &MetalBuffer,
     ) -> crate::Result<()> {
-        if input.length() < matrix.columns as usize * size_of::<f32>()
+        if !matrix.word_aligned()
+            || input.length() < matrix.columns as usize * size_of::<f32>()
             || output.length() < matrix.rows as usize * size_of::<f32>()
             || std::ptr::eq(input.raw(), output.raw())
             || std::ptr::eq(matrix.buffer.raw(), output.raw())
         {
             return Err(Error::InvalidArgument(
-                "PTQ1_0 matvec buffers are too short or output aliases an input".into(),
+                "PTQ1_0 matvec matrix is not 4-byte aligned, buffers are too short, or output \
+                 aliases an input"
+                    .into(),
             ));
         }
         let encoder = batch.encoder();
@@ -359,8 +405,247 @@ impl BonsaiKernels {
             set_u32(encoder, &matrix.rows, 3);
             set_u32(encoder, &matrix.columns, 4);
         }
-        // One SIMD group shares activation coefficients across four rows.
-        dispatch(encoder, (matrix.rows as usize).div_ceil(4), 32);
+        // One SIMD group shares activation coefficients across eight rows.
+        dispatch(encoder, (matrix.rows as usize).div_ceil(8), 32);
+        batch.record_dispatch();
+        Ok(())
+    }
+
+    /// Single-token `silu(gate * input) * (up * input)` in one dispatch;
+    /// neither projection is stored. Both matrices must have the same shape.
+    #[allow(unsafe_code)]
+    pub fn matvec_swiglu(
+        &self,
+        batch: &mut CommandBatch,
+        gate: Ptq1Matrix<'_>,
+        up: Ptq1Matrix<'_>,
+        input: &MetalBuffer,
+        output: &MetalBuffer,
+    ) -> crate::Result<()> {
+        if gate.rows != up.rows
+            || !gate.word_aligned()
+            || !up.word_aligned()
+            || gate.columns != up.columns
+            || input.length() < gate.columns as usize * size_of::<f32>()
+            || output.length() < gate.rows as usize * size_of::<f32>()
+            || std::ptr::eq(input.raw(), output.raw())
+            || std::ptr::eq(gate.buffer.raw(), output.raw())
+            || std::ptr::eq(up.buffer.raw(), output.raw())
+        {
+            return Err(Error::InvalidArgument(
+                "PTQ1_0 SwiGLU shapes differ, are misaligned, buffers are too short, or output aliases"
+                    .into(),
+            ));
+        }
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.matvec_swiglu);
+        unsafe {
+            bind(encoder, gate.buffer, gate.offset, 0);
+            bind(encoder, input, 0, 1);
+            bind(encoder, output, 0, 2);
+            set_u32(encoder, &gate.rows, 3);
+            set_u32(encoder, &gate.columns, 4);
+            bind(encoder, up.buffer, up.offset, 5);
+        }
+        // Four rows of each matrix per SIMD group.
+        dispatch(encoder, (gate.rows as usize).div_ceil(4), 32);
+        batch.record_dispatch();
+        Ok(())
+    }
+
+    /// Single-token projections of one input by one to three matrices with the
+    /// same column count, in one dispatch. Outputs must be distinct from the
+    /// input and every weight buffer.
+    pub fn matvec_concat(
+        &self,
+        batch: &mut CommandBatch,
+        projections: &[(Ptq1Matrix<'_>, &MetalBuffer)],
+        input: &MetalBuffer,
+    ) -> crate::Result<()> {
+        self.concat(batch, projections, input, None)
+    }
+
+    /// [`Self::matvec_concat`] plus two same-shape single-token BF16
+    /// projections of `bf16_input`, bitwise as `BonsaiOps::bf16_matvec`
+    /// computes them, in the same dispatch.
+    pub fn matvec_concat_bf16(
+        &self,
+        batch: &mut CommandBatch,
+        projections: &[(Ptq1Matrix<'_>, &MetalBuffer)],
+        input: &MetalBuffer,
+        bf16: [(Bf16Matrix<'_>, &MetalBuffer); 2],
+        bf16_input: &MetalBuffer,
+    ) -> crate::Result<()> {
+        let [(first, _), (second, _)] = bf16;
+        if first.rows == 0
+            || first.columns == 0
+            || (first.rows, first.columns) != (second.rows, second.columns)
+            || bf16_input.length() < first.columns as usize * size_of::<f32>()
+            || bf16.iter().any(|(matrix, output)| {
+                !matrix.offset.is_multiple_of(2)
+                    || (matrix.rows as usize)
+                        .checked_mul(matrix.columns as usize * 2)
+                        .and_then(|bytes| bytes.checked_add(matrix.offset))
+                        .is_none_or(|end| end > matrix.buffer.length())
+                    || output.length() < matrix.rows as usize * size_of::<f32>()
+                    || [input, bf16_input, matrix.buffer]
+                        .iter()
+                        .any(|read| std::ptr::eq(read.raw(), output.raw()))
+                    || projections.iter().any(|(other, packed)| {
+                        std::ptr::eq(other.buffer.raw(), output.raw())
+                            || std::ptr::eq(packed.raw(), output.raw())
+                    })
+            })
+            || std::ptr::eq(bf16[0].1.raw(), bf16[1].1.raw())
+            || projections.iter().any(|(_, packed)| {
+                std::ptr::eq(packed.raw(), bf16_input.raw())
+                    || bf16
+                        .iter()
+                        .any(|(matrix, _)| std::ptr::eq(matrix.buffer.raw(), packed.raw()))
+            })
+        {
+            return Err(Error::InvalidArgument(
+                "BF16 projections in a concatenated matvec are invalid or aliased".into(),
+            ));
+        }
+        self.concat(batch, projections, input, Some((bf16, bf16_input)))
+    }
+
+    #[allow(unsafe_code, clippy::type_complexity)]
+    fn concat(
+        &self,
+        batch: &mut CommandBatch,
+        projections: &[(Ptq1Matrix<'_>, &MetalBuffer)],
+        input: &MetalBuffer,
+        bf16: Option<([(Bf16Matrix<'_>, &MetalBuffer); 2], &MetalBuffer)>,
+    ) -> crate::Result<()> {
+        let Some(&(first, first_output)) = projections.first() else {
+            return Err(Error::InvalidArgument(
+                "PTQ1_0 concatenated matvec needs one to three matrices".into(),
+            ));
+        };
+        if projections.len() > 3
+            || input.length() < first.columns as usize * size_of::<f32>()
+            || projections.iter().any(|(matrix, output)| {
+                matrix.columns != first.columns
+                    || !matrix.word_aligned()
+                    || output.length() < matrix.rows as usize * size_of::<f32>()
+                    || std::ptr::eq(input.raw(), output.raw())
+                    || projections
+                        .iter()
+                        .any(|(other, _)| std::ptr::eq(other.buffer.raw(), output.raw()))
+            })
+        {
+            return Err(Error::InvalidArgument(
+                "PTQ1_0 concatenated matvec shapes differ, are misaligned, buffers are short, or aliased"
+                    .into(),
+            ));
+        }
+        let mut rows = [0_u32; 3];
+        let mut groups = 0;
+        let encoder = batch.encoder();
+        if let Some((matrices, bf16_input)) = bf16 {
+            let shape = [matrices[0].0.rows, matrices[0].0.columns];
+            groups += 2 * shape[0] as usize;
+            encoder.setComputePipelineState(&self.matvec_concat_bf16);
+            unsafe {
+                for (index, (matrix, output)) in matrices.iter().enumerate() {
+                    bind(encoder, matrix.buffer, matrix.offset, 9 + 2 * index);
+                    bind(encoder, output, 0, 10 + 2 * index);
+                }
+                bind(encoder, bf16_input, 0, 13);
+                encoder.setBytes_length_atIndex(
+                    NonNull::new_unchecked(shape.as_ptr().cast_mut().cast::<c_void>()),
+                    size_of_val(&shape),
+                    14,
+                );
+            }
+        } else {
+            encoder.setComputePipelineState(&self.matvec_concat);
+        }
+        unsafe {
+            bind(encoder, input, 0, 1);
+            set_u32(encoder, &first.columns, 4);
+            // Unused segments have zero rows but still bind valid buffers.
+            for (segment, (rows, (weights_index, output_index))) in
+                rows.iter_mut().zip([(0, 2), (5, 6), (7, 8)]).enumerate()
+            {
+                let (matrix, output) = match projections.get(segment) {
+                    Some(&projection) => {
+                        *rows = projection.0.rows;
+                        groups += (projection.0.rows as usize).div_ceil(8);
+                        projection
+                    }
+                    None => (first, first_output),
+                };
+                bind(encoder, matrix.buffer, matrix.offset, weights_index);
+                bind(encoder, output, 0, output_index);
+            }
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(rows.as_ptr().cast_mut().cast::<c_void>()),
+                size_of_val(&rows),
+                3,
+            );
+        }
+        dispatch(encoder, groups, 32);
+        batch.record_dispatch();
+        Ok(())
+    }
+
+    /// RMS-normalize `tokens` rows of `input` (F32 `weights`, same width as the
+    /// rotation) into `normalized`, and write their forward rotation to
+    /// `output`, in one dispatch. Values are bitwise those of an `RMSNorm`
+    /// followed by [`Self::transform`] with [`HadamardDirection::Forward`].
+    #[allow(unsafe_code, clippy::too_many_arguments)]
+    pub fn normalize_transform(
+        &self,
+        batch: &mut CommandBatch,
+        rotation: &SignedHadamard,
+        input: &MetalBuffer,
+        weights: &MetalBuffer,
+        normalized: &MetalBuffer,
+        output: &MetalBuffer,
+        tokens: u32,
+        epsilon: f32,
+    ) -> crate::Result<()> {
+        let elements = rotation
+            .columns
+            .checked_mul(tokens)
+            .filter(|&count| count != 0)
+            .ok_or_else(|| {
+                Error::InvalidArgument("Bonsai activation shape overflow/empty".into())
+            })?;
+        let bytes = elements as usize * size_of::<f32>();
+        if input.length() < bytes
+            || normalized.length() < bytes
+            || output.length() < bytes
+            || weights.length() < rotation.columns as usize * size_of::<f32>()
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+            || [normalized, output].iter().any(|out| {
+                [input, weights]
+                    .iter()
+                    .any(|r| std::ptr::eq(out.raw(), r.raw()))
+            })
+            || std::ptr::eq(normalized.raw(), output.raw())
+        {
+            return Err(Error::InvalidArgument(
+                "Bonsai normalize-rotate buffers are short, aliased, or epsilon invalid".into(),
+            ));
+        }
+        let blocks_per_row = rotation.columns / HADAMARD_BLOCK_ELEMENTS as u32;
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.rms_forward);
+        unsafe {
+            bind(encoder, input, 0, 0);
+            bind(encoder, weights, 0, 1);
+            bind(encoder, normalized, 0, 2);
+            bind(encoder, &rotation.signs, 0, 3);
+            bind(encoder, output, 0, 4);
+            set_u32(encoder, &blocks_per_row, 5);
+            set_f32(encoder, &epsilon, 6);
+        }
+        dispatch(encoder, elements as usize / HADAMARD_BLOCK_ELEMENTS, 128);
         batch.record_dispatch();
         Ok(())
     }
@@ -441,9 +726,12 @@ impl BonsaiKernels {
         Ok(())
     }
 
-    /// Exact-token dispatches of at most `SMALL_BATCH_KERNEL_TOKENS` rows each;
-    /// the caller has validated extents and aliasing. Each dispatch reads the
-    /// packed matrix once, so cost grows with `ceil(tokens / 4)`, not tiles.
+    /// Exact-token dispatches; the caller has validated extents and aliasing.
+    /// Each dispatch reads the packed matrix once. Blocks of up to
+    /// `SMALL_BATCH_KERNEL_TOKENS` rows use one scalar dispatch; larger blocks
+    /// use wide dispatches of at most `SMALL_BATCH_WIDE_TOKENS` rows, plus one
+    /// scalar dispatch for a remainder of one to four rows (a remainder of one
+    /// borrows a row from the last wide chunk, so no dispatch has one row).
     #[allow(unsafe_code)]
     fn small_batch(
         &self,
@@ -454,15 +742,36 @@ impl BonsaiKernels {
         tokens: u32,
     ) {
         debug_assert!(tokens >= 2);
-        // Balanced chunks (5 -> 3 + 2, 9 -> 3 + 3 + 3) keep every dispatch at
-        // two or more rows and never revisit a row.
-        let chunks = tokens.div_ceil(SMALL_BATCH_KERNEL_TOKENS);
+        let tail = match tokens % SMALL_BATCH_WIDE_TOKENS {
+            _ if tokens <= SMALL_BATCH_KERNEL_TOKENS => tokens,
+            1 => 2,
+            remainder @ 2..=SMALL_BATCH_KERNEL_TOKENS => remainder,
+            _ => 0,
+        };
+        let wide = tokens - tail;
+        let chunks = wide.div_ceil(SMALL_BATCH_WIDE_TOKENS);
         let mut start = 0;
         for chunk in 0..chunks {
-            let end = (tokens * (chunk + 1)).div_ceil(chunks);
+            let end = (wide * (chunk + 1)).div_ceil(chunks);
             let count = end - start;
             let encoder = batch.encoder();
-            encoder.setComputePipelineState(&self.small_batch[count as usize - 2]);
+            encoder.setComputePipelineState(&self.small_batch_wide);
+            unsafe {
+                bind(encoder, matrix.buffer, matrix.offset, 0);
+                bind(encoder, input, 0, 1);
+                bind(encoder, output, 0, 2);
+                set_u32(encoder, &matrix.rows, 3);
+                set_u32(encoder, &matrix.columns, 4);
+                set_u32(encoder, &start, 5);
+                set_u32(encoder, &count, 6);
+            }
+            dispatch(encoder, (matrix.rows as usize).div_ceil(8), 128);
+            batch.record_dispatch();
+            start = end;
+        }
+        if tail != 0 {
+            let encoder = batch.encoder();
+            encoder.setComputePipelineState(&self.small_batch[tail as usize - 2]);
             unsafe {
                 bind(encoder, matrix.buffer, matrix.offset, 0);
                 bind(encoder, input, 0, 1);
@@ -473,7 +782,6 @@ impl BonsaiKernels {
             }
             dispatch(encoder, (matrix.rows as usize).div_ceil(4), 32);
             batch.record_dispatch();
-            start = end;
         }
     }
 }
@@ -513,6 +821,21 @@ unsafe fn set_u32(
         encoder.setBytes_length_atIndex(
             NonNull::new_unchecked(std::ptr::from_ref(value).cast_mut().cast::<c_void>()),
             size_of::<u32>(),
+            index,
+        );
+    }
+}
+
+#[allow(unsafe_code, clippy::trivially_copy_pass_by_ref)]
+unsafe fn set_f32(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    value: &f32,
+    index: usize,
+) {
+    unsafe {
+        encoder.setBytes_length_atIndex(
+            NonNull::new_unchecked(std::ptr::from_ref(value).cast_mut().cast::<c_void>()),
+            size_of::<f32>(),
             index,
         );
     }

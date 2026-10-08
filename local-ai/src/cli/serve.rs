@@ -1,5 +1,4 @@
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,7 +45,6 @@ const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug)]
 struct Args {
-    model: Option<PathBuf>,
     host: IpAddr,
     port: u16,
     thinking: bool,
@@ -265,9 +263,11 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 }
 
 async fn run_async(args: Args) -> crate::Result<()> {
-    let resources = Resources::discover(args.model.as_deref(), true)?;
+    // One discovery serves both the engine and the TLS lookup: each one probes
+    // the disk's write rate with a 16 MiB file, so a second is wasted startup.
+    let resources = Resources::discover(None, true)?;
     let model: Arc<str> = resources.model.to_string_lossy().into_owned().into();
-    let engine = Engine::open_model(&resources.model)?;
+    let engine = Engine::from_resources(&resources)?;
     eprintln!("{}", engine.info().json);
     let state = AppState {
         engine: engine.into_handle(),

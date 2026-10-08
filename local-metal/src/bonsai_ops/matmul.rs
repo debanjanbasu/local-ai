@@ -1,7 +1,6 @@
 use super::{
     BF16_TILE_COLUMNS, BF16_TILE_MIN_TOKENS, BF16_TILE_ROWS, BF16_TILE_TOKENS, Bf16Matrix,
-    BonsaiOps, CommandBatch, Int8Matrix, MetalBuffer, arg, matrix_bytes, need, no_alias,
-    sequence_bytes,
+    BonsaiOps, CommandBatch, MetalBuffer, arg, matrix_bytes, need, no_alias, sequence_bytes,
 };
 
 impl BonsaiOps {
@@ -60,48 +59,6 @@ impl BonsaiOps {
             m.rows as usize * tokens as usize,
             32,
         );
-        Ok(())
-    }
-
-    pub fn int8_matmul(
-        &self,
-        b: &mut CommandBatch,
-        m: Int8Matrix<'_>,
-        x: &MetalBuffer,
-        y: &MetalBuffer,
-        tokens: u32,
-    ) -> crate::Result<()> {
-        if m.rows == 0 || m.columns == 0 || tokens == 0 {
-            return Err(arg("invalid int8 matrix"));
-        }
-        need(m.weights, matrix_bytes(m.rows, m.columns, 1)?)?;
-        need(m.scales, m.rows as usize * 4)?;
-        need(x, sequence_bytes(tokens, m.columns)?)?;
-        need(y, sequence_bytes(tokens, m.rows)?)?;
-        no_alias(y, &[m.weights, m.scales, x])?;
-        if tokens >= BF16_TILE_MIN_TOKENS && m.columns.is_multiple_of(BF16_TILE_COLUMNS) {
-            let groups = (m.rows as usize).div_ceil(BF16_TILE_ROWS as usize)
-                * (tokens as usize).div_ceil(BF16_TILE_TOKENS as usize);
-            self.go(
-                b,
-                20,
-                &[(m.weights, 0), (m.scales, 0), (x, 0), (y, 0)],
-                &[m.rows, m.columns, tokens],
-                &[],
-                groups,
-                128,
-            );
-        } else {
-            self.go(
-                b,
-                19,
-                &[(m.weights, 0), (m.scales, 0), (x, 0), (y, 0)],
-                &[m.rows, m.columns],
-                &[],
-                m.rows as usize * tokens as usize,
-                32,
-            );
-        }
         Ok(())
     }
 }

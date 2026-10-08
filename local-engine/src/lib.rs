@@ -32,9 +32,8 @@ pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub use bonsai_mtp::{
-    DEFAULT_BONSAI_MTP_ARTIFACT, DEFAULT_BONSAI_MTP_HEAD, DEFAULT_MTP_DEPTH, DEFAULT_MTP_ENABLED,
-    MAX_MTP_DEPTH, MTP_HEAD_ARTIFACT, MtpHeadArtifact, MtpMode, MtpResolution, MtpSettings,
-    export_head, export_head_zstd,
+    DEFAULT_BONSAI_MTP_ARTIFACT, DEFAULT_MTP_DEPTH, DEFAULT_MTP_ENABLED, MAX_MTP_DEPTH,
+    MTP_HEAD_ARTIFACT, MtpHeadArtifact, MtpMode, MtpResolution, MtpSettings, export_head,
 };
 pub use runtime::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P,

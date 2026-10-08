@@ -11,14 +11,19 @@ use sha2::{Digest, Sha256};
 
 use crate::bonsai_native::{PageBytes, PromptSnapshot};
 
+mod writer;
+
+pub use self::writer::{StoreJob, Writer};
+
 const MAGIC: &[u8; 8] = b"BPCACHE1";
 
 /// How old a `.tmp` must be before `trim` treats it as an orphan instead of a
 /// write still in flight.
 ///
-/// Why an age and not a lock: this module has no mutual exclusion today, and
-/// adding one would mean choosing a concurrency model for `store`, `discover`
-/// and `trim` together. An age keeps the guarantee local to the single file
+/// Why an age and not a lock: one engine's [`Writer`] runs its stores and trims
+/// serially, but nothing excludes another process sharing the directory, and a
+/// lock across processes would mean choosing a concurrency model for `store`,
+/// `discover` and `trim` together. An age keeps the guarantee local to the single file
 /// that needs it. Because `store` renames into place, a sweep can only ever
 /// observe a temporary while a write is still running, and `write_temporary`
 /// advances the mtime as it fills the file — so the only window where a live
@@ -134,7 +139,9 @@ pub fn load(path: &Path, model_key: &str) -> crate::Result<PromptSnapshot> {
         ));
     }
     let mut digest = Sha256::new();
-    hash_exact(&mut file, token_bytes, &mut digest, None)?;
+    let mut stored_tokens = vec![0; token_bytes];
+    file.read_exact(&mut stored_tokens)?;
+    digest.update(&stored_tokens);
     let recurrent = read_hashed(&mut file, header.recurrent, &mut digest)?;
     let mtp_prev_hidden = read_hashed(&mut file, header.mtp_hidden, &mut digest)?;
     let target_kv = read_hashed(&mut file, header.target_kv, &mut digest)?;
@@ -171,10 +178,9 @@ pub fn store(
 ) -> crate::Result<PathBuf> {
     let dir = root.join(model_key);
     fs::create_dir_all(&dir)?;
+    let stored_tokens = token_bytes(tokens);
     let mut digest = Sha256::new();
-    for token in tokens {
-        digest.update(token.to_le_bytes());
-    }
+    digest.update(&stored_tokens);
     digest.update(&snapshot.recurrent);
     digest.update(&snapshot.mtp_prev_hidden);
     digest.update(&snapshot.target_kv);
@@ -197,7 +203,7 @@ pub fn store(
     let short_digest = digest.get(..16).unwrap_or(&digest);
     let path = dir.join(format!("{}-{short_digest}.bpc", snapshot.position));
     let temporary = path.with_extension("tmp");
-    let committed = write_temporary(&temporary, &header, tokens, snapshot)
+    let committed = write_temporary(&temporary, &header, &stored_tokens, snapshot)
         .and_then(|()| fs::rename(&temporary, &path).map_err(crate::Error::from));
     if committed.is_err() {
         // The temporary is invisible to `discover`, so nothing else would reclaim it.
@@ -209,16 +215,16 @@ pub fn store(
 fn write_temporary(
     temporary: &Path,
     header: &[u8],
-    tokens: &[u32],
+    tokens: &[u8],
     snapshot: &PromptSnapshot,
 ) -> crate::Result<()> {
     let mut file = File::create(temporary)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&(header.len() as u64).to_le_bytes())?;
-    file.write_all(header)?;
-    for token in tokens {
-        file.write_all(&token.to_le_bytes())?;
-    }
+    let mut preamble = Vec::with_capacity(MAGIC.len() + 8 + header.len() + tokens.len());
+    preamble.extend_from_slice(MAGIC);
+    preamble.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    preamble.extend_from_slice(header);
+    preamble.extend_from_slice(tokens);
+    file.write_all(&preamble)?;
     file.write_all(&snapshot.recurrent)?;
     file.write_all(&snapshot.mtp_prev_hidden)?;
     file.write_all(&snapshot.target_kv)?;
@@ -263,55 +269,117 @@ fn sweep_abandoned_temporaries(root: &Path, model_key: &str) {
     }
 }
 
+/// Remove snapshots, oldest request tails first, until `budget` holds.
+///
+/// Reads the whole directory with `discover`. The engine trims through the
+/// background [`Writer`], whose [`DiskIndex`] pays that only once per
+/// directory; this standalone form is the reference the tests pin it to.
+#[cfg(test)]
 pub fn trim(root: &Path, model_key: &str, budget: u64) {
     // Reclaimed before the budget is computed, and independently of it: this
     // sweep is about files no snapshot ever referenced.
     sweep_abandoned_temporaries(root, model_key);
-    let mut files = discover(root, model_key);
-    let mut bytes = files
-        .iter()
-        .filter_map(|e| fs::metadata(&e.path).ok())
-        .map(|m| m.len())
-        .sum::<u64>();
-    while bytes > budget && files.len() > 1 {
-        let victim = files
-            .iter()
-            .position(|entry| !entry.reusable_boundary)
-            .unwrap_or(0);
-        let entry = files.remove(victim);
-        if let Ok(metadata) = fs::metadata(&entry.path) {
-            bytes = bytes.saturating_sub(metadata.len());
+    DiskIndex::discover(root, model_key).evict_over(budget);
+}
+
+struct Indexed {
+    path: PathBuf,
+    bytes: u64,
+    reusable_boundary: bool,
+}
+
+/// The committed snapshots of one model directory, oldest first, with the
+/// sizes the budget is computed from.
+///
+/// Seeded by `discover` and then kept current by its owner's own stores and
+/// evictions. Files another process adds are not seen until the next seed;
+/// files deleted behind its back are counted until an eviction reaches them,
+/// which errs toward evicting early, never toward exceeding the budget.
+struct DiskIndex {
+    dir: PathBuf,
+    entries: Vec<Indexed>,
+}
+
+impl DiskIndex {
+    fn discover(root: &Path, model_key: &str) -> Self {
+        let entries = discover(root, model_key)
+            .into_iter()
+            .filter_map(|entry| {
+                let bytes = fs::metadata(&entry.path).ok()?.len();
+                Some(Indexed {
+                    path: entry.path,
+                    bytes,
+                    reusable_boundary: entry.reusable_boundary,
+                })
+            })
+            .collect();
+        Self {
+            dir: root.join(model_key),
+            entries,
         }
-        let _ = fs::remove_file(entry.path);
+    }
+
+    fn is_for(&self, root: &Path, model_key: &str) -> bool {
+        self.dir == root.join(model_key)
+    }
+
+    /// Record a snapshot just committed at `path` as the newest.
+    fn insert(&mut self, path: &Path, reusable_boundary: bool) {
+        // The name is the content digest, so an equal name is the same file
+        // rewritten by `rename`, not a second one.
+        self.entries.retain(|entry| entry.path != path);
+        if let Ok(metadata) = fs::metadata(path) {
+            self.entries.push(Indexed {
+                path: path.to_owned(),
+                bytes: metadata.len(),
+                reusable_boundary,
+            });
+        }
+    }
+
+    /// Delete snapshots until the total fits `budget`, always keeping one.
+    /// Request tails go before shared-prefix boundaries, oldest first.
+    fn evict_over(&mut self, budget: u64) -> Vec<PathBuf> {
+        let mut bytes = self.entries.iter().map(|entry| entry.bytes).sum::<u64>();
+        let mut evicted = Vec::new();
+        while bytes > budget && self.entries.len() > 1 {
+            let victim = self
+                .entries
+                .iter()
+                .position(|entry| !entry.reusable_boundary)
+                .unwrap_or(0);
+            let entry = self.entries.remove(victim);
+            bytes = bytes.saturating_sub(entry.bytes);
+            let _ = fs::remove_file(&entry.path);
+            evicted.push(entry.path);
+        }
+        evicted
     }
 }
+
+/// Bytes read per `read` call when restoring a section.
+///
+/// Reading straight into the destination and hashing each piece while it is
+/// still in cache replaces 16 KiB reads through a scratch buffer, which cost a
+/// syscall and an extra copy per 16 KiB of a ~152 MiB snapshot.
+const READ_CHUNK: usize = 1024 * 1024;
 
 fn read_hashed(file: &mut File, length: usize, digest: &mut Sha256) -> crate::Result<PageBytes> {
     let mut bytes = PageBytes::zeroed(length)?;
-    hash_exact(file, length, digest, Some(&mut bytes))?;
+    for chunk in bytes.chunks_mut(READ_CHUNK) {
+        file.read_exact(chunk)?;
+        digest.update(&*chunk);
+    }
     Ok(bytes)
 }
 
-fn hash_exact(
-    file: &mut File,
-    length: usize,
-    digest: &mut Sha256,
-    mut output: Option<&mut [u8]>,
-) -> crate::Result<()> {
-    let mut remaining = length;
-    let mut offset = 0;
-    let mut scratch = [0_u8; 16 * 1024];
-    while remaining != 0 {
-        let count = remaining.min(scratch.len());
-        file.read_exact(&mut scratch[..count])?;
-        digest.update(&scratch[..count]);
-        if let Some(bytes) = output.as_deref_mut() {
-            bytes[offset..offset + count].copy_from_slice(&scratch[..count]);
-        }
-        remaining -= count;
-        offset += count;
-    }
-    Ok(())
+/// The token section as stored: little-endian `u32`s, one contiguous buffer, so
+/// it is hashed and written in one call each rather than once per token.
+fn token_bytes(tokens: &[u32]) -> Vec<u8> {
+    tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect()
 }
 
 fn read_header(file: &mut File) -> crate::Result<Header> {

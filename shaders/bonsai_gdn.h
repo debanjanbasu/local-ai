@@ -4,8 +4,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Round an F32 register to the state's storage type (nearest even).
+static inline void bonsai_store_state(device float &state, float value) { state = value; }
+// F16 saturates rather than overflowing to infinity.
+static inline void bonsai_store_state(device half &state, float value) {
+    state = half(clamp(value, -65504.0f, 65504.0f));
+}
+static inline void bonsai_store_state(device bfloat &state, float value) { state = bfloat(value); }
+
 // Independent value rows share Q/K and scalar gates within one SIMD. Retain
-// the original per-row FMA and SIMD reduction order, including F32 state.
+// the original per-row FMA and SIMD reduction order; the state is stored in
+// whatever element type the accessors name and computed in F32 registers.
 // A tile never crosses a head: each candidate row count divides 128.
 // Rank-one tensor accessors keep the equations independent of the storage
 // they read. Initial/final state may alias only for in-place use.
@@ -19,7 +28,7 @@ static inline void bonsai_gdn_rows(
     float values[rows][4];
     for (uint r = 0; r < rows; ++r) {
         for (uint i = 0; i < 4; ++i) {
-            values[r][i] = initial_state[(first_row + r) * 128 + lane + i * 32];
+            values[r][i] = float(initial_state[(first_row + r) * 128 + lane + i * 32]);
         }
     }
     for (uint token = 0; token < tokens; ++token) {
@@ -48,7 +57,7 @@ static inline void bonsai_gdn_rows(
     }
     for (uint r = 0; r < rows; ++r) {
         for (uint i = 0; i < 4; ++i) {
-            final_state[(first_row + r) * 128 + lane + i * 32] = values[r][i];
+            bonsai_store_state(final_state[(first_row + r) * 128 + lane + i * 32], values[r][i]);
         }
     }
 }

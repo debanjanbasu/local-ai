@@ -15,7 +15,9 @@ fn main() {
         "bonsai.metal",
         "bonsai_ops.metal",
         "bonsai_small_batch.metal",
+        "bonsai_int8.metal",
         "sampling.metal",
+        "draft.metal",
     ];
 
     let mut air_files = Vec::new();

@@ -46,3 +46,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## MTP head training scripts
+
+`tools/mtp_train/mtp_head.py`, `data.py` and `train.py` are adapted from
+[xkm/qwen3.8-27b-mtp-head-retrained](https://huggingface.co/xkm/qwen3.8-27b-mtp-head-retrained/tree/b0b5836b399d69730373afa6f1346220465394b0)
+(`train/`), revision `b0b5836b399d69730373afa6f1346220465394b0`, licensed under
+the Apache License, Version 2.0
+(<https://www.apache.org/licenses/LICENSE-2.0>). They were modified to read this
+runtime's capture shards and frozen tables and to match its draft chain layout.

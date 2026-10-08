@@ -16,6 +16,7 @@ use crate::{
 mod attention;
 mod conv;
 mod gdn;
+pub use gdn::GdnStateFormat;
 mod kv;
 mod matmul;
 mod norm;
@@ -93,14 +94,6 @@ pub struct RmsNormParams {
 pub struct Bf16Matrix<'a> {
     pub buffer: &'a MetalBuffer,
     pub offset: usize,
-    pub rows: u32,
-    pub columns: u32,
-}
-
-#[derive(Clone, Copy)]
-pub struct Int8Matrix<'a> {
-    pub weights: &'a MetalBuffer,
-    pub scales: &'a MetalBuffer,
     pub rows: u32,
     pub columns: u32,
 }
@@ -208,6 +201,10 @@ impl KvLayout {
         key: KvFormat::F16,
         value: KvFormat::F16,
     };
+    pub const Q8: Self = Self {
+        key: KvFormat::Q8,
+        value: KvFormat::Q8,
+    };
 
     /// Bytes per cached token across both caches.
     #[must_use]
@@ -241,9 +238,16 @@ impl KvLayout {
     }
 }
 
+/// Quantized layouts with tensor attention kernels; each names its
+/// `bo_attn_split_tensor_*` and `bo_attn_tensor_*` instantiations.
+const QUANTIZED_TENSOR_LAYOUTS: [KvLayout; 1] = [KvLayout::Q8];
+
 pub struct BonsaiOps {
     p: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     attention_kernel: AttentionKernel,
+    /// Quantized layout -> index in `p` of its tensor decode-split pipeline;
+    /// its causal prefill pipeline follows at the next index.
+    quantized_tensor: Vec<(KvLayout, usize)>,
 }
 impl BonsaiOps {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
@@ -280,8 +284,8 @@ impl BonsaiOps {
             "bo_gdn_rows_4",
             "bo_kv_prep",
             "bo_bf16_mm",
-            // Quantized caches always take the SIMD block kernel: the mpp
-            // tensor variants read `half` tiles straight from the cache.
+            // Quantized caches without a tensor kernel of their own take the
+            // SIMD block kernel, which dequantizes in registers.
             "bo_attn_block",
             // Decode over an F16 cache on the tensor units (six GQA heads as
             // one Q tile); the SIMD build keeps the split kernel here.
@@ -289,11 +293,38 @@ impl BonsaiOps {
                 AttentionKernel::SimdF32 => "bo_attn_split",
                 AttentionKernel::TensorF32 => "bo_attn_split_tensor",
             },
-            "bo_int8_mv",
-            "bo_int8_mm",
+            "bo_conv_l2_decay",
+            "bo_attn_unrotate",
+            // Reduced-precision recurrent state (see `GdnStateFormat`): the
+            // token-at-a-time and four-row kernels for F16, then BF16.
+            "bo_gdn_f16",
+            "bo_gdn_rows_4_f16",
+            "bo_gdn_bf16",
+            "bo_gdn_rows_4_bf16",
         ];
-        let mut p = Vec::with_capacity(names.len());
-        for name in names {
+        // Quantized layouts with tensor kernels of their own (decode split and
+        // causal prefill), each K/V tile dequantized to half in threadgroup
+        // memory. Their pipelines follow the named ones in `p`.
+        let quantized: &[KvLayout] = if attention_kernel == AttentionKernel::TensorF32 {
+            &QUANTIZED_TENSOR_LAYOUTS
+        } else {
+            &[]
+        };
+        let quantized_names = quantized
+            .iter()
+            .flat_map(|layout| {
+                let suffix = layout.name();
+                [
+                    format!("bo_attn_split_tensor_{suffix}"),
+                    format!("bo_attn_tensor_{suffix}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut p = Vec::with_capacity(names.len() + quantized_names.len());
+        for name in names
+            .into_iter()
+            .chain(quantized_names.iter().map(String::as_str))
+        {
             let f = shaders.get_function(name)?;
             let pipeline = context
                 .device()
@@ -313,15 +344,29 @@ impl BonsaiOps {
             }
             p.push(pipeline);
         }
+        let quantized_tensor = quantized
+            .iter()
+            .enumerate()
+            .map(|(index, &layout)| (layout, names.len() + 2 * index))
+            .collect();
         Ok(Self {
             p,
             attention_kernel,
+            quantized_tensor,
         })
     }
 
     #[must_use]
     pub const fn attention_kernel(&self) -> AttentionKernel {
         self.attention_kernel
+    }
+
+    /// Index of `layout`'s quantized tensor decode-split pipeline, if it has one.
+    fn quantized_tensor(&self, layout: KvLayout) -> Option<usize> {
+        self.quantized_tensor
+            .iter()
+            .find(|(candidate, _)| *candidate == layout)
+            .map(|&(_, index)| index)
     }
 
     #[allow(unsafe_code)]

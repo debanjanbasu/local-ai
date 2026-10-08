@@ -7,6 +7,7 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #endif
 #include "bonsai_projection.h"
+#include "bonsai_mixer.h"
 using namespace metal;
 
 kernel void bonsai_fwht_forward(
@@ -33,11 +34,11 @@ kernel void bonsai_fwht_inverse(
     bonsai_fwht_impl<true>(input, signs, output, blocks_per_row, block, tid, shared);
 }
 
-// Eight lanes per packed block, four blocks in parallel. Collapse each byte's
-// five digit products using y[n] - 3*y[n+1], then reuse those coefficients for
-// four output rows. Adapted from the pinned fork's ptq1_0_dot_reg/mul_mv path.
-// This trades register-local arithmetic for fewer activation and weight loads;
-// it does not materialize a dequantized or differently packed weight cache.
+// Eight output rows per SIMD group share activation coefficients; see
+// bonsai_ptq1_matvec_reuse_impl. Adapted from the pinned fork's
+// ptq1_0_dot_reg/mul_mv path. This trades register-local arithmetic for fewer
+// activation and weight loads; it does not materialize a dequantized or
+// differently packed weight cache.
 kernel void bonsai_ptq1_matvec_reuse(
     device const BonsaiPtq1Block *weights [[buffer(0)]],
     device const float *input [[buffer(1)]],
@@ -47,8 +48,173 @@ kernel void bonsai_ptq1_matvec_reuse(
     uint group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    bonsai_ptq1_matvec_reuse_impl<4>(
-        BonsaiNativePacked{weights}, input, output, rows, columns, group, lane);
+    const uint first_row = group * 8;
+    float sums[8];
+    bonsai_ptq1_matvec_reuse_impl<8>(
+        bonsai_ptq1_rows<8>(weights, first_row, rows, columns / 128), input, columns, lane, sums);
+    #pragma clang loop unroll(full)
+    for (uint row = 0; row < 8; ++row) {
+        if (lane == 0 && first_row + row < rows) output[first_row + row] = sums[row];
+    }
+}
+
+// Gate and up projections of one input with bo_swiglu folded in: each SIMD
+// group reduces four gate rows and the same four up rows, sharing activation
+// coefficients across the eight as the plain matvec does, then writes
+// silu(gate) * up, so neither projection is stored. With the half-prefix
+// decoder four rows of each measured 163.5 us against 170.8 us for two (the
+// floor decoder measured 264.5 against 262.1).
+kernel void bonsai_ptq1_matvec_swiglu(
+    device const BonsaiPtq1Block *gate [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    device const BonsaiPtq1Block *up [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint first_row = group * 4, blocks = columns / 128;
+    const BonsaiPtq1Rows<4> gate_rows = bonsai_ptq1_rows<4>(gate, first_row, rows, blocks);
+    const BonsaiPtq1Rows<4> up_rows = bonsai_ptq1_rows<4>(up, first_row, rows, blocks);
+    BonsaiPtq1Rows<8> both;
+    #pragma clang loop unroll(full)
+    for (uint row = 0; row < 4; ++row) {
+        both.blocks[row] = gate_rows.blocks[row];
+        both.blocks[4 + row] = up_rows.blocks[row];
+    }
+    float sums[8];
+    bonsai_ptq1_matvec_reuse_impl<8>(both, input, columns, lane, sums);
+    #pragma clang loop unroll(full)
+    for (uint row = 0; row < 4; ++row) {
+        if (lane == 0 && first_row + row < rows) {
+            output[first_row + row] = bonsai_silu(sums[row]) * sums[4 + row];
+        }
+    }
+}
+
+// Up to three projections of one input in one dispatch. Each SIMD group still
+// owns eight rows of a single matrix; the segment only selects base pointers.
+static inline void bonsai_ptq1_matvec_concat_impl(
+    device const BonsaiPtq1Block *weights0, device const float *input, device float *output0,
+    constant uint *segment_rows, uint columns,
+    device const BonsaiPtq1Block *weights1, device float *output1,
+    device const BonsaiPtq1Block *weights2, device float *output2,
+    uint group, uint lane
+) {
+    const uint groups0 = (segment_rows[0] + 7) / 8, groups1 = (segment_rows[1] + 7) / 8;
+    device const BonsaiPtq1Block *weights = weights0;
+    device float *output = output0;
+    uint rows = segment_rows[0];
+    if (group >= groups0 + groups1) {
+        group -= groups0 + groups1;
+        weights = weights2;
+        output = output2;
+        rows = segment_rows[2];
+    } else if (group >= groups0) {
+        group -= groups0;
+        weights = weights1;
+        output = output1;
+        rows = segment_rows[1];
+    }
+    const uint first_row = group * 8;
+    float sums[8];
+    bonsai_ptq1_matvec_reuse_impl<8>(
+        bonsai_ptq1_rows<8>(weights, first_row, rows, columns / 128), input, columns, lane, sums);
+    #pragma clang loop unroll(full)
+    for (uint row = 0; row < 8; ++row) {
+        if (lane == 0 && first_row + row < rows) output[first_row + row] = sums[row];
+    }
+}
+
+kernel void bonsai_ptq1_matvec_concat(
+    device const BonsaiPtq1Block *weights0 [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output0 [[buffer(2)]],
+    constant uint *segment_rows [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    device const BonsaiPtq1Block *weights1 [[buffer(5)]],
+    device float *output1 [[buffer(6)]],
+    device const BonsaiPtq1Block *weights2 [[buffer(7)]],
+    device float *output2 [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    bonsai_ptq1_matvec_concat_impl(weights0, input, output0, segment_rows, columns,
+        weights1, output1, weights2, output2, group, lane);
+}
+
+// The concatenated matvec preceded by two BF16 matvecs of a second input, as
+// bo_bf16_mv computes them, one SIMD group per BF16 row. Their groups come
+// first so their latency overlaps the packed rows instead of trailing them.
+kernel void bonsai_ptq1_matvec_concat_bf16(
+    device const BonsaiPtq1Block *weights0 [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output0 [[buffer(2)]],
+    constant uint *segment_rows [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    device const BonsaiPtq1Block *weights1 [[buffer(5)]],
+    device float *output1 [[buffer(6)]],
+    device const BonsaiPtq1Block *weights2 [[buffer(7)]],
+    device float *output2 [[buffer(8)]],
+    device const ushort *bf16_weights0 [[buffer(9)]],
+    device float *bf16_output0 [[buffer(10)]],
+    device const ushort *bf16_weights1 [[buffer(11)]],
+    device float *bf16_output1 [[buffer(12)]],
+    device const float *bf16_input [[buffer(13)]],
+    constant uint *bf16_shape [[buffer(14)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint bf16_rows = bf16_shape[0], bf16_columns = bf16_shape[1];
+    if (group < bf16_rows) {
+        bonsai_bf16_mv_impl(bf16_weights0, bf16_input, bf16_output0, bf16_rows, bf16_columns,
+            group, lane);
+    } else if (group < 2 * bf16_rows) {
+        bonsai_bf16_mv_impl(bf16_weights1, bf16_input, bf16_output1, bf16_rows, bf16_columns,
+            group - bf16_rows, lane);
+    } else {
+        bonsai_ptq1_matvec_concat_impl(weights0, input, output0, segment_rows, columns,
+            weights1, output1, weights2, output2, group - 2 * bf16_rows, lane);
+    }
+}
+
+// bo_rms followed by the forward rotation in one dispatch. Every 1024-wide
+// threadgroup repeats its row's full 128-thread square sum, in bo_rms's order,
+// then normalizes its own block exactly as bo_rms does, stores it (consumers
+// such as the BF16 projections read the unrotated row) and rotates it.
+kernel void bonsai_rms_fwht_forward(
+    device const float *input [[buffer(0)]],
+    device const float *weights [[buffer(1)]],
+    device float *normalized [[buffer(2)]],
+    device const float *signs [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    constant uint &blocks_per_row [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]],
+    uint block [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float partial[4];
+    threadgroup float shared[1024];
+    const uint dimension = blocks_per_row * 1024;
+    const ulong row = block / blocks_per_row;
+    float square_sum = 0.0f;
+    for (uint i = tid; i < dimension; i += 128) {
+        const float value = input[row * dimension + i];
+        square_sum = fma(value, value, square_sum);
+    }
+    const float sum = bonsai_group_sum<128>(square_sum, tid, partial);
+    const float inverse = rsqrt(sum / float(dimension) + epsilon);
+    const ulong base = ulong(block) * 1024;
+    const uint column = (block % blocks_per_row) * 1024;
+    float values[8];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; ++i) {
+        const uint local = i * 128 + tid;
+        values[i] = input[base + local] * inverse * weights[column + local];
+        normalized[base + local] = values[i];
+    }
+    bonsai_fwht_values<false>(values, signs, output, blocks_per_row, block, tid, shared);
 }
 
 // Decode each packed byte once for its four/five trits. A padded column-major
