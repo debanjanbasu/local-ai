@@ -47,10 +47,26 @@ static inline void bonsai_bf16_mv_impl(
     metal::uint columns, metal::uint group, metal::uint lane
 ) {
     const metal::uint row = group % rows, token = group / rows;
+    const metal::ulong weight_row = metal::ulong(row) * columns;
+    const metal::ulong input_row = metal::ulong(token) * columns;
     float sum = 0.0f;
-    for (metal::uint column = lane; column < columns; column += 32) {
-        const float weight = as_type<float>(metal::uint(weights[metal::ulong(row) * columns + column]) << 16);
-        sum = metal::fma(weight, input[metal::ulong(token) * columns + column], sum);
+    metal::uint column = lane;
+    // Issue eight iterations' loads before their fused multiply-adds, which
+    // stay in column order. A 48x5120 row-per-SIMD-group projection was bound
+    // by one load latency per iteration: 45 us each on an M4 Pro.
+    for (; column + 7 * 32 < columns; column += 8 * 32) {
+        float weight[8], value[8];
+        #pragma clang loop unroll(full)
+        for (metal::uint i = 0; i < 8; ++i) {
+            weight[i] = as_type<float>(metal::uint(weights[weight_row + column + i * 32]) << 16);
+            value[i] = input[input_row + column + i * 32];
+        }
+        #pragma clang loop unroll(full)
+        for (metal::uint i = 0; i < 8; ++i) sum = metal::fma(weight[i], value[i], sum);
+    }
+    for (; column < columns; column += 32) {
+        const float weight = as_type<float>(metal::uint(weights[weight_row + column]) << 16);
+        sum = metal::fma(weight, input[input_row + column], sum);
     }
     sum = metal::simd_sum(sum);
     if (lane == 0) output[group] = sum;

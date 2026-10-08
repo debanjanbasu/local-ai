@@ -6,7 +6,7 @@ use std::time::Instant;
 use serde_json::json;
 
 use crate::GenerateParams;
-use crate::bonsai::{BonsaiPackage, DEFAULT_BONSAI_GGUF, validate_profile};
+use crate::bonsai::{BonsaiPackage, validate_profile};
 use crate::bonsai_model::BonsaiEngine;
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
@@ -20,7 +20,7 @@ use crate::{DEFAULT_MTP_DEPTH, MAX_MTP_DEPTH};
 #[derive(Debug, PartialEq, Eq)]
 enum ExportKind {
     Index,
-    MtpHead { dir: PathBuf, zstd: bool },
+    MtpHead { dir: PathBuf },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,14 +32,13 @@ enum OutputMode {
 }
 
 /// The kinds `--export` accepts, for every message that has to name them.
-const EXPORT_KINDS: &str = "index, mtp-head=DIR, mtp-head-zstd=DIR";
+const EXPORT_KINDS: &str = "index, mtp-head=DIR";
 
 /// How an [`OutputMode::Export`] is spelled, for its error messages.
 const fn export_flag(kind: &ExportKind) -> &'static str {
     match kind {
         ExportKind::Index => "--export index",
-        ExportKind::MtpHead { zstd: false, .. } => "--export mtp-head=DIR",
-        ExportKind::MtpHead { zstd: true, .. } => "--export mtp-head-zstd=DIR",
+        ExportKind::MtpHead { .. } => "--export mtp-head=DIR",
     }
 }
 
@@ -55,15 +54,10 @@ fn parse_export(requested: &str) -> Result<ExportKind, String> {
         ("", _) => Err(format!("--export requires a kind ({EXPORT_KINDS})")),
         ("index", None) => Ok(ExportKind::Index),
         ("index", Some(_)) => Err("--export index takes no directory".into()),
-        (kind @ ("mtp-head" | "mtp-head-zstd"), None) => {
-            Err(format!("--export {kind} requires =DIR"))
-        }
-        (kind @ ("mtp-head" | "mtp-head-zstd"), Some("")) => {
-            Err(format!("--export {kind} requires a non-empty =DIR"))
-        }
-        (kind @ ("mtp-head" | "mtp-head-zstd"), Some(dir)) => Ok(ExportKind::MtpHead {
+        ("mtp-head", None) => Err("--export mtp-head requires =DIR".into()),
+        ("mtp-head", Some("")) => Err("--export mtp-head requires a non-empty =DIR".into()),
+        ("mtp-head", Some(dir)) => Ok(ExportKind::MtpHead {
             dir: PathBuf::from(dir),
-            zstd: kind == "mtp-head-zstd",
         }),
         (kind, _) => Err(format!(
             "unknown --export kind: {kind} (expected {EXPORT_KINDS})"
@@ -74,7 +68,6 @@ fn parse_export(requested: &str) -> Result<ExportKind, String> {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct Args {
-    model: PathBuf,
     max_tokens: usize,
     prompt: String,
     prompt_file: Option<PathBuf>,
@@ -83,7 +76,6 @@ struct Args {
     no_thinking: bool,
     greedy: bool,
     output: OutputMode,
-    model_explicit: bool,
     no_speculation: bool,
     mtp_depth: usize,
 }
@@ -91,7 +83,6 @@ struct Args {
 fn usage() {
     eprintln!("Usage: local-ai bonsai [options] <prompt>");
     eprintln!("Bonsai 2 27B text inference: native Metal straight from the GGUF.");
-    eprintln!("  --model PATH       Override automatic pinned-model discovery");
     eprintln!("  --max-tokens N     Output cap (default: 8192)");
     eprintln!("  --prompt-file PATH Read a long UTF-8 prompt instead of positional text");
     eprintln!("  --raw              No chat template");
@@ -100,18 +91,15 @@ fn usage() {
     eprintln!("  --greedy           Disable sampling for reference comparisons");
     eprintln!("  --json             Emit token IDs, stop reason, and measured timings");
     eprintln!("  --tokenize         Emit prompt token IDs without loading the model");
-    eprintln!("  --export KIND      Write an artifact instead of generating; accepts");
-    eprintln!("                     only --model. Kinds:");
+    eprintln!("  --export KIND      Write an artifact instead of generating; takes no");
+    eprintln!("                     other options. Kinds:");
     eprintln!("                       index");
     eprintln!("                         emit the checked GGUF index JSON on stdout");
     eprintln!("                       mtp-head=DIR");
-    eprintln!("                         quantize the MTP head to DIR/mtp-head-int8-v2.bin");
-    eprintln!("                         (no engine, no checkpoint: head file only)");
-    eprintln!("                       mtp-head-zstd=DIR");
-    eprintln!("                         same artifact, zstd level 19: 16.3% smaller on the");
-    eprintln!("                         wire, byte-identical once inflated. Costs ~425 MB");
-    eprintln!("                         of anonymous RAM at load, so the stored form is");
-    eprintln!("                         what discovery prefers.");
+    eprintln!("                         pack a trained ternary head from");
+    eprintln!("                         DIR/model_mtp_ternary.safetensors into");
+    eprintln!("                         DIR/mtp-head-ptq1-v1.bin (no engine, no");
+    eprintln!("                         checkpoint: head file only)");
     eprintln!("  --no-speculation   A/B baseline: disable MTP and suffix lookup");
     eprintln!(
         "  --mtp-depth N      Drafts per speculative round (1-{MAX_MTP_DEPTH}, \
@@ -123,7 +111,6 @@ fn usage() {
 #[allow(clippy::too_many_lines)]
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut result = Args {
-        model: PathBuf::from(DEFAULT_BONSAI_GGUF),
         max_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
         prompt: String::new(),
         prompt_file: None,
@@ -132,62 +119,20 @@ fn parse(args: &[String]) -> Result<Args, String> {
         no_thinking: false,
         greedy: false,
         output: OutputMode::Stream,
-        model_explicit: false,
         no_speculation: false,
         mtp_depth: DEFAULT_MTP_DEPTH,
     };
     let mut positional = Vec::new();
     let mut index = 0;
     while index < args.len() {
-        if matches!(
-            args[index].as_str(),
-            "--prefill-chunk"
-                | "--attention-kernel"
-                | "--kv-cache"
-                | "--kv-initial"
-                | "--mtp"
-                | "--mtp-head"
-                | "--no-mtp"
-                | "--ngram"
-                | "--no-ngram"
-                | "--ngram-max"
-                | "--ngram-min-match"
-                | "--prompt-cache-checkpoints"
-                | "--context"
-                | "--repeat"
-        ) {
-            // A flag that moved is told where its intent went: the flag that
-            // replaced it, or the default that absorbed it. The rest keep the
-            // bare rejection, because there is nothing better to say.
-            let flag = args[index].as_str();
-            return Err(match flag {
-                "--mtp" => format!(
-                    "unknown option: {flag} (no replacement: MTP is on by default, and \
-                     --no-speculation opts out)"
-                ),
-                "--mtp-head" => format!(
-                    "unknown option: {flag} (no replacement flag: the head is discovered \
-                     beside the model, and --export mtp-head=DIR writes a quantized one)"
-                ),
-                "--no-mtp" => format!(
-                    "unknown option: {flag} (replaced by --no-speculation, which disables \
-                     MTP and suffix lookup)"
-                ),
-                flag => format!("unknown option: {flag}"),
-            });
-        }
         match args[index].as_str() {
-            "--model" | "--max-tokens" | "--mtp-depth" | "--prompt-file" => {
+            "--max-tokens" | "--mtp-depth" | "--prompt-file" => {
                 let flag = args[index].as_str();
                 index += 1;
                 let value = args
                     .get(index)
                     .ok_or_else(|| format!("{flag} requires a value"))?;
                 match flag {
-                    "--model" => {
-                        result.model = PathBuf::from(value);
-                        result.model_explicit = true;
-                    }
                     "--prompt-file" => result.prompt_file = Some(PathBuf::from(value)),
                     "--mtp-depth" => result.mtp_depth = parse_mtp_depth(value)?,
                     _ => {
@@ -260,7 +205,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             || result.max_tokens != crate::DEFAULT_MAX_OUTPUT_TOKENS
             || result.mtp_depth != DEFAULT_MTP_DEPTH
         {
-            return Err(format!("{} accepts only --model", export_flag(kind)));
+            return Err(format!("{} takes no other options", export_flag(kind)));
         }
     } else if positional.is_empty() == result.prompt_file.is_none() {
         return Err("supply a prompt or --prompt-file, not both".into());
@@ -288,8 +233,8 @@ fn parse_mtp_depth(value: &str) -> Result<usize, String> {
 }
 
 /// Writes the artifact an [`ExportKind`] names and returns. Neither kind opens
-/// the engine: `index` checks the GGUF, and the head kinds transform the head
-/// file alone.
+/// the engine: `index` checks the GGUF, and `mtp-head` packs the head file
+/// alone.
 fn export(resources: &Resources, kind: &ExportKind) -> crate::Result<()> {
     match kind {
         ExportKind::Index => {
@@ -297,20 +242,9 @@ fn export(resources: &Resources, kind: &ExportKind) -> crate::Result<()> {
             validate_profile(&package)?;
             println!("{}", package.export_index(&resources.model)?);
         }
-        ExportKind::MtpHead { dir, zstd } => {
-            let source = resources.mtp_source.as_deref().ok_or_else(|| {
-                crate::Error::InvalidArgument(format!(
-                    "no BF16 MTP head found beside {}; exporting quantizes it",
-                    resources.model.display()
-                ))
-            })?;
-            // No engine and no checkpoint: this transforms the head file alone.
-            let artifact = if *zstd {
-                local_engine::export_head_zstd(source, dir)?
-            } else {
-                local_engine::export_head(source, dir)?
-            };
-            println!("{}", json!(artifact));
+        ExportKind::MtpHead { dir } => {
+            // No engine and no checkpoint: this packs the head file alone.
+            println!("{}", json!(local_engine::export_head(dir)?));
         }
     }
     Ok(())
@@ -326,11 +260,7 @@ fn mtp_summary(engine: &BonsaiEngine) -> Option<(serde_json::Value, serde_json::
 
 #[allow(clippy::too_many_lines)]
 fn run(args: &Args) -> crate::Result<()> {
-    let resources = Resources::discover_with_depth(
-        args.model_explicit.then_some(args.model.as_path()),
-        !args.no_speculation,
-        args.mtp_depth,
-    )?;
+    let resources = Resources::discover_with_depth(None, !args.no_speculation, args.mtp_depth)?;
     if let OutputMode::Export(kind) = &args.output {
         return export(&resources, kind);
     }
@@ -512,31 +442,18 @@ mod tests {
                 "--export mtp-head=/tmp/head",
                 ExportKind::MtpHead {
                     dir: PathBuf::from("/tmp/head"),
-                    zstd: false,
                 },
             ),
             (
-                "--export mtp-head-zstd=/tmp/head",
+                "--export=mtp-head=/tmp/head",
                 ExportKind::MtpHead {
                     dir: PathBuf::from("/tmp/head"),
-                    zstd: true,
-                },
-            ),
-            (
-                "--export=mtp-head-zstd=/tmp/head",
-                ExportKind::MtpHead {
-                    dir: PathBuf::from("/tmp/head"),
-                    zstd: true,
                 },
             ),
         ] {
             let parsed = parse(&args(&command.split(' ').collect::<Vec<_>>())).expect(command);
             assert_eq!(parsed.output, OutputMode::Export(kind), "{command}");
         }
-        let with_model =
-            parse(&args(&["--export", "index", "--model", "/tmp/model.gguf"])).expect("model");
-        assert_eq!(with_model.output, OutputMode::Export(ExportKind::Index));
-        assert!(with_model.model_explicit);
     }
 
     #[test]
@@ -555,28 +472,32 @@ mod tests {
                 "--export mtp-head requires a non-empty =DIR",
             ),
             (
-                vec!["--export", "mtp-head-zstd"],
-                "--export mtp-head-zstd requires =DIR",
+                vec!["--export", "mtp-head-zstd=/tmp/head"],
+                "unknown --export kind: mtp-head-zstd (expected index, mtp-head=DIR)",
+            ),
+            (
+                vec!["--export", "mtp-head-ternary=/tmp/head"],
+                "unknown --export kind: mtp-head-ternary (expected index, mtp-head=DIR)",
             ),
             (
                 vec!["--export", "foo"],
-                "unknown --export kind: foo (expected index, mtp-head=DIR, mtp-head-zstd=DIR)",
+                "unknown --export kind: foo (expected index, mtp-head=DIR)",
             ),
             (
                 vec!["--export=foo"],
-                "unknown --export kind: foo (expected index, mtp-head=DIR, mtp-head-zstd=DIR)",
+                "unknown --export kind: foo (expected index, mtp-head=DIR)",
             ),
             (
                 vec!["--export="],
-                "--export requires a kind (index, mtp-head=DIR, mtp-head-zstd=DIR)",
+                "--export requires a kind (index, mtp-head=DIR)",
             ),
             (
                 vec!["--export"],
-                "--export requires a kind (index, mtp-head=DIR, mtp-head-zstd=DIR)",
+                "--export requires a kind (index, mtp-head=DIR)",
             ),
             (
                 vec!["--export", "--json"],
-                "--export requires a kind (index, mtp-head=DIR, mtp-head-zstd=DIR)",
+                "--export requires a kind (index, mtp-head=DIR)",
             ),
         ] {
             let error = parse(&args(&input)).expect_err(&format!("{input:?}"));
@@ -587,18 +508,21 @@ mod tests {
     #[test]
     fn export_refuses_anything_that_decodes() {
         for (extra, expected) in [
-            (vec!["hello"], "--export index accepts only --model"),
+            (vec!["hello"], "--export index takes no other options"),
             (
                 vec!["--prompt-file", "/tmp/prompt.txt"],
-                "--export index accepts only --model",
+                "--export index takes no other options",
             ),
             (
                 vec!["--max-tokens", "16"],
-                "--export index accepts only --model",
+                "--export index takes no other options",
             ),
-            (vec!["--greedy"], "--export index accepts only --model"),
-            (vec!["--raw"], "--export index accepts only --model"),
-            (vec!["--no-thinking"], "--export index accepts only --model"),
+            (vec!["--greedy"], "--export index takes no other options"),
+            (vec!["--raw"], "--export index takes no other options"),
+            (
+                vec!["--no-thinking"],
+                "--export index takes no other options",
+            ),
             (vec!["--json"], "--json is incompatible with --export index"),
             (
                 vec!["--tokenize"],
@@ -676,7 +600,7 @@ mod tests {
     #[test]
     fn export_refuses_a_depth_it_cannot_honour() {
         let error = parse(&args(&["--export", "index", "--mtp-depth", "2"])).expect_err("depth");
-        assert_eq!(error, "--export index accepts only --model");
+        assert_eq!(error, "--export index takes no other options");
     }
 
     #[test]
@@ -690,39 +614,14 @@ mod tests {
     }
 
     #[test]
-    fn a_replaced_mtp_flag_names_the_flag_that_replaced_it() {
-        assert_eq!(
-            parse(&args(&["--no-mtp", "hello"])).expect_err("rejected"),
-            "unknown option: --no-mtp (replaced by --no-speculation, which disables \
-             MTP and suffix lookup)"
-        );
-    }
-
-    #[test]
-    fn a_rejected_mtp_flag_that_a_default_absorbed_says_so() {
-        for (flag, hint) in [
-            (
-                "--mtp",
-                "unknown option: --mtp (no replacement: MTP is on by default, and \
-                 --no-speculation opts out)",
-            ),
-            (
-                "--mtp-head",
-                "unknown option: --mtp-head (no replacement flag: the head is discovered \
-                 beside the model, and --export mtp-head=DIR writes a quantized one)",
-            ),
-        ] {
-            assert_eq!(
-                parse(&args(&[flag, "hello"])).expect_err(flag),
-                hint,
-                "{flag}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_rejected_flag_with_nothing_to_point_at_keeps_the_bare_message() {
+    fn retired_and_model_selection_flags_are_unknown_options() {
+        // One pinned model is discovered, never named, and each automatic
+        // policy replaced a tuning flag; all of them are plain unknown options.
         for flag in [
+            "--model",
+            "--mtp",
+            "--mtp-head",
+            "--no-mtp",
             "--prefill-chunk",
             "--attention-kernel",
             "--kv-cache",

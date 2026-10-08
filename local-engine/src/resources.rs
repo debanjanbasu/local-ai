@@ -7,7 +7,8 @@ use crate::bonsai::DEFAULT_BONSAI_GGUF;
 use crate::bonsai_mtp::{DEFAULT_MTP_DEPTH, MTP_HEAD_ARTIFACT, MtpMode, MtpSettings};
 
 const MODEL_RELATIVE: &str = "models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
-const MTP_RELATIVE: &str = "bonsai2-27b-mtp/model_mtp.safetensors";
+/// The MTP head's directory under the models root.
+const MTP_DIRECTORY: &str = "bonsai2-27b-mtp";
 pub const PREFILL_CHUNK: usize = 128;
 pub const SERVE_QUEUE: usize = 8;
 /// Divisor on free disk in the prompt-cache disk budget, so a fuller disk
@@ -23,10 +24,6 @@ pub struct Resources {
     pub model_reason: String,
     pub mtp: MtpMode,
     pub mtp_reason: String,
-    /// The BF16 safetensors head beside the model, if one is installed. Exporting
-    /// an int8 artifact needs it; loading an artifact does not.
-    pub mtp_source: Option<PathBuf>,
-    pub mtp_head_cache_dir: Option<PathBuf>,
     pub prompt_cache_dir: Option<PathBuf>,
     pub disk_budget_bytes: u64,
     pub disk_reason: String,
@@ -58,40 +55,26 @@ impl Resources {
         // is spawned once per discovery rather than once per consumer.
         let memory = physical_memory_bytes();
         let model_bytes = file_bytes(&model);
-        let mtp_root = model.parent().and_then(Path::parent);
-        let source = mtp_root.map(|root| root.join(MTP_RELATIVE));
-        // The artifact is the head's sibling by construction, so the two can never
-        // drift onto different directories.
-        let artifact = source
-            .as_ref()
-            .map(|head| head.with_file_name(MTP_HEAD_ARTIFACT));
-        let mtp_source = source.filter(|path| path.is_file());
-        let mtp_artifact = artifact.filter(|path| path.is_file());
-        let mtp_cache = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join("Library/Caches/local-ai/mtp-head"))
-            .filter(|path| writable_directory(path).is_ok());
-        // The artifact first: it loads without the 849 MB source, and an invalid
-        // one is reported by the loader instead of quietly costing throughput.
-        // Every branch below answers with a named head or with `Off`; discovery
-        // never constructs `MtpMode::Auto`, which stays the default for an
-        // embedder that has not called this.
+        let head = model
+            .parent()
+            .and_then(Path::parent)
+            .map(|root| root.join(MTP_DIRECTORY).join(MTP_HEAD_ARTIFACT))
+            .filter(|path| path.is_file());
+        // The one head is the trained ternary artifact beside the model. An
+        // invalid one is reported by the loader instead of quietly costing
+        // throughput. Every branch below answers with a named head or with
+        // `Off`; discovery never constructs `MtpMode::Auto`, which stays the
+        // default for an embedder that has not called this.
         let (mtp, mtp_reason) = if !speculation {
             let reason = "disabled by --no-speculation";
             (MtpMode::Off(Some(reason.into())), reason.into())
-        } else if let Some((path, reason)) =
-            describe_head(mtp_artifact.as_ref(), mtp_source.as_ref())
-        {
-            (
-                MtpMode::Head(
-                    MtpSettings::new(path, mtp_depth)?.with_head_cache(mtp_cache.clone()),
-                ),
-                reason,
-            )
+        } else if let Some(path) = head {
+            let reason = format!("ternary PTQ1 MTP head artifact {}", path.display());
+            (MtpMode::Head(MtpSettings::new(path, mtp_depth)?), reason)
         } else {
             // Only what discovery can see: whether suffix/ngram lookup is on is
             // decided by `--no-speculation`, which took the branch above.
-            let reason = "no MTP head or int8 artifact installed beside the model";
+            let reason = "no MTP head artifact installed beside the model";
             (MtpMode::Off(Some(reason.into())), reason.into())
         };
         let cache = std::env::var_os("HOME")
@@ -133,8 +116,6 @@ impl Resources {
             model_reason,
             mtp,
             mtp_reason,
-            mtp_source,
-            mtp_head_cache_dir: mtp_cache,
             prompt_cache_dir,
             disk_budget_bytes,
             disk_reason,
@@ -151,8 +132,6 @@ impl Resources {
                 "model": self.model,
                 "model_reason": self.model_reason,
                 "mtp_reason": self.mtp_reason,
-                "mtp_head_source": self.mtp_source,
-                "mtp_head_cache_directory": self.mtp_head_cache_dir,
                 "physical_memory_bytes": self.physical_memory_bytes,
                 "prompt_cache_directory": self.prompt_cache_dir,
                 "prompt_cache_disk_budget_bytes": self.disk_budget_bytes,
@@ -167,47 +146,11 @@ impl Resources {
     }
 }
 
-/// Name the head that will load and say what it is.
-///
-/// Discovery can only see that these paths are files; the loader classifies them
-/// by content, so the reason reports what is installed rather than claiming a
-/// winner it has not checked.
-fn describe_head(
-    artifact: Option<&PathBuf>,
-    source: Option<&PathBuf>,
-) -> Option<(PathBuf, String)> {
-    match (artifact, source) {
-        (Some(artifact), Some(source)) => Some((
-            artifact.clone(),
-            format!(
-                "int8 MTP head artifact {}; {} kept as the rebuild source",
-                artifact.display(),
-                source.display()
-            ),
-        )),
-        (Some(artifact), None) => Some((
-            artifact.clone(),
-            format!(
-                "int8 MTP head artifact {}; no BF16 source installed",
-                artifact.display()
-            ),
-        )),
-        (None, Some(source)) => Some((
-            source.clone(),
-            format!(
-                "BF16 MTP head {}; quantized once and cached",
-                source.display()
-            ),
-        )),
-        (None, None) => None,
-    }
-}
-
 fn discover_model(override_path: Option<&Path>) -> crate::Result<(PathBuf, String)> {
     if let Some(path) = override_path {
         return path
             .is_file()
-            .then(|| (path.to_owned(), "explicit --model override".into()))
+            .then(|| (path.to_owned(), "explicit Engine::open_model path".into()))
             .ok_or_else(|| {
                 crate::Error::InvalidArgument(format!("model not found: {}", path.display()))
             });
@@ -236,7 +179,8 @@ fn discover_model(override_path: Option<&Path>) -> crate::Result<(PathBuf, Strin
         })
         .ok_or_else(|| {
             crate::Error::InvalidArgument(
-                "pinned Bonsai model not found; install it under ./models or pass --model PATH"
+                "pinned Bonsai model not found; install it under ./models, beside the \
+                 executable, or under ~/Library/Caches/local-ai/models"
                     .into(),
             )
         })

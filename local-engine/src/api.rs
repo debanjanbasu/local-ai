@@ -187,7 +187,13 @@ impl Engine {
     }
 
     fn open_inner(path: Option<&Path>) -> crate::Result<Self> {
-        let resources = Resources::discover(path, true)?;
+        Self::from_resources(&Resources::discover(path, true)?)
+    }
+
+    /// Load the model and policy an earlier [`Resources::discover`] chose, for a
+    /// caller that also needs the other discovered resources (TLS, paths) and
+    /// should not pay for discovery twice.
+    pub fn from_resources(resources: &Resources) -> crate::Result<Self> {
         let mut inner = BonsaiEngine::open_with_options(
             &resources.model,
             None,

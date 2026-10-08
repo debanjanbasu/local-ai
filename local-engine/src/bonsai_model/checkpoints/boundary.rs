@@ -1,5 +1,5 @@
 use super::reuse::ReuseBounds;
-use crate::bonsai_model::{BonsaiEngine, PrefillProgress, PromptSnapshot};
+use crate::bonsai_model::{BonsaiEngine, PrefillProgress, PromptCheckpoint};
 
 impl BonsaiEngine {
     /// Choose the reusable boundary, materialize it, and build the snapshot
@@ -11,7 +11,7 @@ impl BonsaiEngine {
         reused: usize,
         session_id: Option<&str>,
         progress: &mut dyn FnMut(PrefillProgress),
-    ) -> crate::Result<(Option<PromptSnapshot>, bool)> {
+    ) -> crate::Result<(Option<PromptCheckpoint>, bool)> {
         let lcp = bounds.lcp;
         let penultimate = bounds.penultimate;
         let minimum = bounds.minimum;
@@ -31,6 +31,8 @@ impl BonsaiEngine {
             if self.prompt_cache_bytes > 0
                 || (self.prompt_cache_disk_bytes > 0 && self.prompt_cache_dir.is_some())
             {
+                // Only the GPU readback is paid here, mid-prefill; the disk
+                // write is queued to the background writer.
                 let snapshot = self.model.prompt_snapshot()?;
                 self.save_session_snapshot(
                     &prompt[..boundary],
@@ -52,10 +54,14 @@ impl BonsaiEngine {
                 self.save_prompt_checkpoint(&prompt[..penultimate], false)?;
             }
         }
+        // Pin the boundary's recurrent state on the GPU and read the snapshot
+        // back when the request ends: its K/V rows stay put in the live caches
+        // meanwhile. Reading it all back now held the whole prefix in host
+        // memory through decode (777 MB after a 16K-token prompt).
         let snapshot = (penultimate > 0
             && (self.prompt_cache_bytes > 0
                 || (self.prompt_cache_disk_bytes > 0 && self.prompt_cache_dir.is_some())))
-        .then(|| self.model.prompt_snapshot())
+        .then(|| self.model.pinned_prompt_checkpoint())
         .transpose()?;
         Ok((snapshot, persisted_reusable_boundary))
     }

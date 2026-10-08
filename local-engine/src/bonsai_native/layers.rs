@@ -1,10 +1,37 @@
 use super::{
-    Bf16Matrix, BonsaiMetalTensor, BonsaiModel, BufferCopyRequest, CommandBatch, FFN,
-    FullAttentionLayer, HadamardDirection, Layer, MetalBuffer, RECURRENCE_FACTOR_WIDTH,
-    RECURRENCE_SCALAR_WIDTH, RecurrentLayer, RmsNormParams, RollbackLayer, WIDTH, seed_rollback,
+    Bf16Matrix, BonsaiMetalTensor, BonsaiModel, CommandBatch, FFN, FullAttentionLayer,
+    HadamardDirection, Layer, MetalBuffer, RecurrentLayer, RollbackLayer, WIDTH,
 };
 
+/// Blocks up to this many rows (decode and speculative verification) take the
+/// fused convolution kernel, whose threadgroups normalize each row's heads in
+/// turn; prefill chunks keep one threadgroup per row and head.
+const SHORT_BLOCK: u32 = 32;
+
+/// A recurrent layer's 48-row BF16 alpha or beta projection. These sensitive
+/// projections read the unrotated input: they are NOT Hadamard-folded.
+const fn decay_projection(weights: &BonsaiMetalTensor) -> Bf16Matrix<'_> {
+    Bf16Matrix {
+        buffer: weights.buffer(),
+        offset: weights.offset(),
+        rows: 48,
+        columns: WIDTH as u32,
+    }
+}
+
+/// Where [`BonsaiModel::recurrent_inputs`] leaves what the recurrence and a
+/// later replay read.
+#[derive(Clone, Copy)]
+struct RecurrentInputs<'a> {
+    raw: &'a MetalBuffer,
+    final_history: &'a MetalBuffer,
+    decay: &'a MetalBuffer,
+    beta: &'a MetalBuffer,
+}
+
 impl BonsaiModel {
+    /// RMS-normalize into `scratch.normalized` and rotate into
+    /// `scratch.rotated_hidden`, in one dispatch.
     pub(super) fn normalize_input(
         &self,
         batch: &mut CommandBatch,
@@ -12,26 +39,15 @@ impl BonsaiModel {
         weights: &MetalBuffer,
         tokens: u32,
     ) -> crate::Result<()> {
-        self.ops.rms_norm(
+        self.kernels.normalize_transform(
             batch,
+            &self.input_rotation,
             input,
             weights,
             &self.scratch.normalized,
-            RmsNormParams {
-                dimension: WIDTH as u32,
-                rows: tokens,
-                stride: WIDTH as u32,
-                epsilon: self.epsilon,
-                weight_offset: 0,
-            },
-        )?;
-        self.kernels.transform(
-            batch,
-            &self.input_rotation,
-            &self.scratch.normalized,
             &self.scratch.rotated_hidden,
             tokens,
-            HadamardDirection::Forward,
+            self.epsilon,
         )?;
         Ok(())
     }
@@ -57,27 +73,39 @@ impl BonsaiModel {
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
         self.normalize_input(batch, &scratch.hidden, &layer.post_attention_norm, tokens)?;
-        self.project(
-            batch,
-            &layer.gate,
-            &scratch.rotated_hidden,
-            &scratch.ffn_gate,
-            tokens,
-        )?;
-        self.project(
-            batch,
-            &layer.up,
-            &scratch.rotated_hidden,
-            &scratch.ffn_up,
-            tokens,
-        )?;
-        self.ops.swiglu(
-            batch,
-            &scratch.ffn_gate,
-            &scratch.ffn_up,
-            &scratch.ffn_product,
-            FFN as u32 * tokens,
-        )?;
+        if tokens == 1 {
+            self.kernels.matvec_swiglu(
+                batch,
+                layer.gate.ptq1_matrix()?,
+                layer.up.ptq1_matrix()?,
+                &scratch.rotated_hidden,
+                &scratch.ffn_product,
+            )?;
+        } else {
+            batch.independent(|batch| {
+                self.project(
+                    batch,
+                    &layer.gate,
+                    &scratch.rotated_hidden,
+                    &scratch.ffn_gate,
+                    tokens,
+                )?;
+                self.project(
+                    batch,
+                    &layer.up,
+                    &scratch.rotated_hidden,
+                    &scratch.ffn_up,
+                    tokens,
+                )
+            })?;
+            self.ops.swiglu(
+                batch,
+                &scratch.ffn_gate,
+                &scratch.ffn_up,
+                &scratch.ffn_product,
+                FFN as u32 * tokens,
+            )?;
+        }
         self.kernels.transform(
             batch,
             &self.ffn_rotation,
@@ -103,8 +131,9 @@ impl BonsaiModel {
         Ok(())
     }
 
-    /// During verification, snapshot the start state and retain only the
-    /// compact inputs needed to replay each non-final recurrence row.
+    /// During verification the layer keeps its start state and history: the
+    /// block writes its final ones, and the compact inputs a partial commit
+    /// replays, straight to `rollback` (see [`BonsaiModel::commit_verified`]).
     pub(super) fn recurrent(
         &self,
         batch: &mut CommandBatch,
@@ -113,91 +142,43 @@ impl BonsaiModel {
         rollback: Option<&RollbackLayer>,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
-        seed_rollback(batch, layer, rollback)?;
-        self.project(
+        let (inputs, decay, beta, final_state, final_history) = rollback.map_or(
+            (
+                &scratch.query_gate,
+                &scratch.decay,
+                &scratch.beta,
+                &layer.state,
+                &layer.history,
+            ),
+            |rollback| {
+                (
+                    &rollback.inputs,
+                    &rollback.decay,
+                    &rollback.beta,
+                    &rollback.state,
+                    &rollback.history,
+                )
+            },
+        );
+        self.recurrent_inputs(
             batch,
-            &layer.qkv,
-            &scratch.rotated_hidden,
-            &scratch.query_gate,
+            layer,
             tokens,
+            RecurrentInputs {
+                raw: inputs,
+                final_history,
+                decay,
+                beta,
+            },
         )?;
-        self.project(
+        self.ops.gdn_sequence_into(
             batch,
-            &layer.gate,
-            &scratch.rotated_hidden,
-            &scratch.gate,
-            tokens,
-        )?;
-        for (weights, output) in [
-            (&layer.alpha, &scratch.alpha),
-            (&layer.beta, &scratch.raw_beta),
-        ] {
-            // These sensitive BF16 projections are NOT Hadamard-folded.
-            self.ops.bf16_matmul(
-                batch,
-                Bf16Matrix {
-                    buffer: weights.buffer(),
-                    offset: weights.offset(),
-                    rows: 48,
-                    columns: WIDTH as u32,
-                },
-                &scratch.normalized,
-                output,
-                tokens,
-            )?;
-        }
-        self.ops.conv_sequence(
-            batch,
-            &scratch.query_gate,
-            &layer.convolution,
-            &layer.history,
+            self.state_format,
             &scratch.convolved,
-            tokens,
-        )?;
-        self.ops
-            .l2_normalize_qk_rows(batch, &scratch.convolved, self.epsilon, tokens)?;
-        self.ops.decay_beta_rows(
-            batch,
-            &layer.decay,
-            &scratch.alpha,
-            &layer.dt,
-            &scratch.raw_beta,
-            &scratch.decay,
-            &scratch.beta,
-            tokens,
-        )?;
-        if let Some(rollback) = rollback {
-            let rows = (tokens as usize).saturating_sub(1);
-            batch.blit_buffer_copies([
-                BufferCopyRequest {
-                    source: &scratch.query_gate,
-                    source_offset: 0,
-                    destination: &rollback.inputs,
-                    destination_offset: 0,
-                    size: rows * RECURRENCE_FACTOR_WIDTH * size_of::<f32>(),
-                },
-                BufferCopyRequest {
-                    source: &scratch.decay,
-                    source_offset: 0,
-                    destination: &rollback.decay,
-                    destination_offset: 0,
-                    size: rows * RECURRENCE_SCALAR_WIDTH * size_of::<f32>(),
-                },
-                BufferCopyRequest {
-                    source: &scratch.beta,
-                    source_offset: 0,
-                    destination: &rollback.beta,
-                    destination_offset: 0,
-                    size: rows * RECURRENCE_SCALAR_WIDTH * size_of::<f32>(),
-                },
-            ])?;
-        }
-        self.ops.gdn_sequence(
-            batch,
-            &scratch.convolved,
-            &scratch.decay,
-            &scratch.beta,
+            decay,
+            beta,
             &layer.state,
+            final_state,
             &scratch.recurrent_output,
             tokens,
         )?;
@@ -213,6 +194,95 @@ impl BonsaiModel {
         self.project_attention(batch, &layer.output, tokens)
     }
 
+    /// The recurrence's per-row inputs: the raw QKV projection into
+    /// `out.raw`, convolved and normalized Q/K/V, the output gate, and
+    /// decay/beta.
+    fn recurrent_inputs(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &RecurrentLayer,
+        tokens: u32,
+        out: RecurrentInputs<'_>,
+    ) -> crate::Result<()> {
+        let scratch = &self.scratch;
+        if tokens == 1 {
+            self.kernels.matvec_concat_bf16(
+                batch,
+                &[
+                    (layer.qkv.ptq1_matrix()?, out.raw),
+                    (layer.gate.ptq1_matrix()?, &scratch.gate),
+                ],
+                &scratch.rotated_hidden,
+                [
+                    (decay_projection(&layer.alpha), &scratch.alpha),
+                    (decay_projection(&layer.beta), &scratch.raw_beta),
+                ],
+                &scratch.normalized,
+            )?;
+        } else {
+            batch.independent(|batch| {
+                self.project(batch, &layer.qkv, &scratch.rotated_hidden, out.raw, tokens)?;
+                self.project(
+                    batch,
+                    &layer.gate,
+                    &scratch.rotated_hidden,
+                    &scratch.gate,
+                    tokens,
+                )?;
+                for (weights, output) in [
+                    (&layer.alpha, &scratch.alpha),
+                    (&layer.beta, &scratch.raw_beta),
+                ] {
+                    self.ops.bf16_matmul(
+                        batch,
+                        decay_projection(weights),
+                        &scratch.normalized,
+                        output,
+                        tokens,
+                    )?;
+                }
+                crate::Result::Ok(())
+            })?;
+        }
+        if tokens <= SHORT_BLOCK {
+            self.ops.conv_l2_decay_into(
+                batch,
+                out.raw,
+                &layer.convolution,
+                [&layer.history, out.final_history],
+                &scratch.convolved,
+                self.epsilon,
+                [&layer.decay, &scratch.alpha, &layer.dt, &scratch.raw_beta],
+                out.decay,
+                out.beta,
+                tokens,
+            )?;
+        } else {
+            self.ops.conv_sequence_into(
+                batch,
+                out.raw,
+                &layer.convolution,
+                &layer.history,
+                out.final_history,
+                &scratch.convolved,
+                tokens,
+            )?;
+            self.ops
+                .l2_normalize_qk_rows(batch, &scratch.convolved, self.epsilon, tokens)?;
+            self.ops.decay_beta_rows(
+                batch,
+                &layer.decay,
+                &scratch.alpha,
+                &layer.dt,
+                &scratch.raw_beta,
+                out.decay,
+                out.beta,
+                tokens,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn full_attention(
         &self,
         batch: &mut CommandBatch,
@@ -220,12 +290,27 @@ impl BonsaiModel {
         tokens: u32,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
-        for (weights, output) in [
+        let projections = [
             (&layer.query_gate, &scratch.query_gate),
             (&layer.key, &scratch.key),
             (&layer.value, &scratch.value),
-        ] {
-            self.project(batch, weights, &scratch.rotated_hidden, output, tokens)?;
+        ];
+        if tokens == 1 {
+            self.kernels.matvec_concat(
+                batch,
+                &projections
+                    .map(|(weights, output)| weights.ptq1_matrix().map(|matrix| (matrix, output)))
+                    .into_iter()
+                    .collect::<crate::Result<Vec<_>>>()?,
+                &scratch.rotated_hidden,
+            )?;
+        } else {
+            batch.independent(|batch| {
+                for (weights, output) in projections {
+                    self.project(batch, weights, &scratch.rotated_hidden, output, tokens)?;
+                }
+                crate::Result::Ok(())
+            })?;
         }
         self.ops.prepare_attention_rows_kv(
             self.kv_layout,

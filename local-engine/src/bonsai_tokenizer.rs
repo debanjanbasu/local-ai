@@ -531,13 +531,16 @@ mod tests {
     }
 
     /// The `tokenizer` object from `--export index` must build a tokenizer
-    /// identical to the GGUF-embedded one.
+    /// identical to the GGUF-embedded one. The index is exported in-process from
+    /// the pinned model, exactly as `bonsai --export index` does.
     #[test]
-    #[ignore = "set BONSAI_INDEX to an absolute path to the JSON written by `bonsai --export index > index.json`; requires --test-threads=1 (parallel runs spuriously purge volatile prompt-cache state)"]
+    #[ignore = "requires the pinned model"]
     fn exported_tokenizer_object_reproduces_prism_token_ids() {
-        let path = std::env::var("BONSAI_INDEX").expect("BONSAI_INDEX is required");
-        let index: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).expect("index bytes")).expect("index");
+        let path = std::path::Path::new(crate::bonsai::DEFAULT_BONSAI_GGUF);
+        let index = BonsaiPackage::open(path)
+            .expect("valid package")
+            .export_index(path)
+            .expect("index");
         let definition: TokenizerDefinition =
             serde_json::from_value(index["tokenizer"].clone()).expect("tokenizer object");
         let tokenizer = BonsaiTokenizer::from_definition(definition).expect("sidecar tokenizer");
@@ -545,9 +548,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "set BONSAI_GGUF to an absolute models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf; requires --test-threads=1 (parallel runs spuriously purge volatile prompt-cache state)"]
+    #[ignore = "requires the pinned model"]
     fn real_gguf_roundtrips_and_renders_prompts() {
-        let path = std::env::var("BONSAI_GGUF").expect("BONSAI_GGUF is required");
+        let path = crate::bonsai::DEFAULT_BONSAI_GGUF;
         let package = BonsaiPackage::open(path).expect("valid package");
         let tokenizer = BonsaiTokenizer::from_package(&package).expect("embedded tokenizer");
         assert_prism_token_ids(&tokenizer);

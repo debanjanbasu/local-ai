@@ -914,7 +914,6 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tokio",
- "zstd",
 ]
 
 [[package]]

@@ -4,7 +4,12 @@ use std::collections::HashMap;
 
 pub const DEFAULT_NGRAM_ENABLED: bool = true;
 pub const DEFAULT_NGRAM_MAX: usize = 63;
-pub const DEFAULT_NGRAM_MIN_MATCH: usize = 24;
+/// The suffix length that must match before lookup drafts instead of MTP.
+/// Measured on the M4 Pro, greedy, byte-identical text: three edit prompts that
+/// echo quoted code decoded at 55.9 tok/s geomean with 12 against 55.1 with 16
+/// and 52.8 with 24; 4 and 8 fired spurious lookups on novel prose, while 12
+/// fired none on four novel prompts.
+pub const DEFAULT_NGRAM_MIN_MATCH: usize = 12;
 /// 63 drafts plus the seed fill one 64-token verify tile; a 65th row would
 /// spill into the 128-token tile and cost half as much again.
 pub const MAX_NGRAM_MAX: usize = 63;

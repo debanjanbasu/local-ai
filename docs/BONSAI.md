@@ -19,112 +19,98 @@ emits the validated metadata and tokenizer index as JSON.
 
 ### MTP head
 
-The optional `model_mtp.safetensors` file is a one-layer multi-token prediction
-head. Its published BF16 file is 849 MB. At first load, dense matrices are
-quantized to symmetric int8 and written to
-`~/Library/Caches/local-ai/mtp-head`; later runs validate and memory-map the
-425 MB cache. A cached load takes 0.38 s.
-
-Norms and other sensitive vectors retain their required precision. The cache
-key binds the source identity and format, so a changed or invalid source is
-rebuilt rather than reused.
-
-#### The int8 head artifact
-
-That cache was a runtime cost rather than a shipping format, so the same
-transform is also available offline. `local-ai bonsai --export mtp-head=DIR`
-writes `DIR/mtp-head-int8-v2.bin`, and `--export mtp-head-zstd=DIR` writes the
-same filename with its section region behind one zstd frame. The export starts
-no engine and opens no checkpoint: it locates the installed model directory only
-to find the head beside it, then transforms the head file alone, so it needs no
-GPU, no second copy of the transform, and no memory for the target. The model
-path must still be discoverable, since that directory is what says where the
-head is. `--export` accepts only `--model`: it is rejected alongside any prompt,
-`--prompt-file`, `--json`, `--tokenize`, or sampling flag.
-
-```bash
-target/release/local-ai bonsai \
-  --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export mtp-head=models/bonsai2-27b-mtp
-target/release/local-ai bonsai \
-  --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export mtp-head-zstd=models/bonsai2-27b-mtp
-```
-
-Discovery finds `models/bonsai2-27b-mtp/mtp-head-int8-v2.bin` beside the pinned
-BF16 head, so the directory written above is already the installed one.
-
-The artifact is not a re-quantization. It is the byte-identical product of the
-same `transform_sections` a cache miss runs, so both forms describe the same 25
-sections with the same names, sizes, and offsets, and inflating one rebuilds the
-other byte for byte. Every later load re-derives the payload digest from the
-file and compares it against the header, which is what lets an install ship the
-artifact and trust it without the 849 MB source. There is therefore no quality
-trade-off between the two forms: they hash the same.
-
-| Form | Bytes on disk | `compression` | Install saving |
-| --- | ---: | --- | ---: |
-| `--export mtp-head=DIR` | 425,263,104 | `stored` | 49.9% |
-| `--export mtp-head-zstd=DIR` | 355,837,652 | `zstd` | 58.1% |
-
-Both forms save against the 849,400,392-byte BF16 source; the compressed form is
-a further 16.325% below the stored one.
-
-Both report `"payload_bytes":425056256` and the same digest:
+The optional MTP head is a one-layer multi-token prediction head (one dense
+Qwen3.5 full-attention decoder layer). The shipped head is **mixed
+precision, trained for it**, the way Bonsai keeps a few tensors above ternary.
+All nine matrices live in the target's Hadamard-rotated basis; `q_proj`,
+`gate_proj`, `up_proj` and `down_proj` are exactly ternary with one F16 scale
+per 128 columns, stored as the target's own `PTQ1_0` blocks and multiplied by
+its kernels, while the sensitive `fc` (both halves), `k_proj`, `v_proj` and
+`o_proj` are per-row int8 (see [Mixed-precision heads](#mixed-precision-heads)).
+The installed file is `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`,
+166,969,344 bytes, mapped into Metal with no copy: 258 MB less resident memory
+than an all-int8 head at the same decode speed. Discovery looks for exactly this file beside the pinned checkpoint
+directory; when it is absent, MTP is off and the policy records why.
 
 ```text
-payload_sha256 = a98a24e58fcfb711cd2b466d3a32375e428000b8f2b06b677d5839946b20f93b
+payload_bytes  = 166799360
+payload_sha256 = fb05507f87f54432c782b0fcb35e5cf1da1b4997610ab35a3d98502e536351cd
 ```
 
-The digest is taken over the 25 logical sections concatenated in artifact order,
-skipping the 16 KiB alignment padding, so it identifies the payload rather than
-one file layout. The installed filename is the same for both forms, because the
-encoding is recorded in the file's own eight-byte magic rather than in its name;
-a compressed head sits at the one installed artifact path and is still read as
-itself. A section-region zstd frame is decoded before any of it is validated, so
-one validator holds both encodings to one standard rather than trusting the
-compressed form separately.
+The digest is taken over the 21 logical sections (nine matrices, each one
+`.ptq1` section or `.int8` plus `.row_scales`, then seven folded F32 norms) concatenated in artifact order, skipping the 16 KiB
+alignment padding, so it identifies the payload rather than one file layout.
+The header page names every section and records its size, because sizes alone
+cannot bind them (`k_proj` and `v_proj` are both `[1024, 5120]`). Every load
+re-derives the digest from the file and compares it with the header. A corrupt,
+truncated, or renamed artifact is always a hard error naming the file and the
+reason; there is deliberately no fallback, because decoding without
+speculation looks like a healthy install rather than a broken one.
 
-The artifact is content-addressed inside the head cache as
-`mtp-head-v2-<sha256>.bin`. Discovery prefers it over the BF16 source, which is
-then used only as a rebuild source and is not `open()`ed at all when an artifact
-is present. Measured on an M2 MacBook Air, a load drops from 5.94 s cold from the
-BF16 source to 3.18 s warm from the artifact. End to end on the same machine
-with `model_mtp.safetensors` absent, the engine loads the artifact and reports
-`mtp.enabled: true` with `head_cache: "hit"`, and answers correctly.
+#### Provenance and export
 
-A corrupt, truncated, or renamed artifact is always a hard error naming the file
-and the reason, even with a valid BF16 source beside it. There is deliberately
-no fallback to the source on this path: a head that cannot be read has no second
-source to rebuild from, and decoding without speculation looks like a healthy
-install rather than a broken one.
+The head was distilled from the community BF16 head
+[`ProCreations/Ternary-Bonsai-2-27B-MTP`](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP)
+(849 MB, `model_mtp.safetensors`), which serves only as the teacher. The
+recipe is ours: `mtp-capture` records the target's hidden states and logits;
+`tools/mtp_train/train_ternary.py` runs TWN g128 QAT in the rotated basis with
+a straight-through estimator and KL to the teacher's draft chains; and
+`tools/mtp_train/convert.py to-ternary` writes `model_mtp_ternary.safetensors`:
+for each of the nine matrices (`mtp.fc.weight.embedding`,
+`mtp.fc.weight.hidden`, then the layer's q/k/v/o and gate/up/down) an I8
+`<name>.codes` `[rows, cols]` in {-1, 0, 1} and an F16 `<name>.scales`
+`[rows, cols/128]`, meaning `y = Σ codes·scale·(R x)` with `R` the target's
+forward signed Hadamard for `cols` (5120, 6144 or 17408), plus the seven BF16
+zero-centered norms. `tools/kaggle_bonsai_mtp_job.py` fetches the pinned teacher
+into `models/bonsai2-27b-mtp-teacher` for training.
 
-**The cost of the compressed form is resident memory.** A stored head is mapped,
-and `from_bytes_no_copy` hands Metal pointers into pages the kernel demand-pages
-and reclaims, so it costs no anonymous RAM. An inflated head must exist in full
-before a single section can be read, so every load through one holds a
-425,263,104-byte anonymous allocation for the life of the process. Peak RSS is
-412 MiB stored against 752 MiB zstd, which is why discovery prefers the stored
-form and the compressed export stays opt-in.
+```bash
+target/release/local-ai bonsai --export mtp-head=DIR
+cp DIR/mtp-head-ptq1-v1.bin models/bonsai2-27b-mtp/
+```
 
-The compressed export encodes at **zstd level 19**, which is where this payload's
-ratio turns over: `--long=27` measures 355,688,546 bytes and level 22 measures
-358,063,503, both worse than level 19's 355,361,865. This is a property of the
-payload, not of zstd — the HTTP response path deliberately uses level 22, which
-measured best on JSON bodies. Widening the window does not help here.
+The export starts no engine and opens no checkpoint. It packs codes and scales
+into `PTQ1_0` blocks bit-identical to Prism's reference encoder, folds the norms
+to `1 + w`, and writes `DIR/mtp-head-ptq1-v1.bin`. `--export` takes no other
+options: it is rejected alongside any prompt, `--prompt-file`, `--json`,
+`--tokenize`, or sampling flag.
+
+#### Mixed-precision heads
+
+Like Bonsai itself, a head may keep a few sensitive matrices at higher
+precision. Any of the nine matrices may instead be given in the source as an I8
+`<name>.int8` `[rows, cols]` in [-127, 127] and an F32 `<name>.row_scales`
+`[rows]`, meaning `y = Σ int8·row_scale·(R x)` in the same rotated basis; the
+export detects the format per matrix (holding both pairs for one matrix is an
+error) and prints the int8 ones as `int8_matrices`. The artifact is the same
+file and container version: a ternary matrix is one `<name>.ptq1` section, an
+int8 one is `<name>.int8` then `<name>.row_scales`, and the section names are
+what the loader reads each matrix's format from. An all-ternary head is
+therefore byte-identical to what earlier builds wrote (the installed head
+re-exports bit for bit); a build without int8 support refuses a mixed head by
+its section count or names.
+
+Int8 matrices multiply the same rotated activations through their own kernels
+(`shaders/bonsai_int8.metal`): one and two activation rows use vector kernels
+reducing four weight rows per SIMD group with 16-byte weight loads (236-248
+GB/s on an M4 Pro, 360 us for 17408x5120 against 134 us in `PTQ1_0`); 3 to 8
+rows use one F32 simdgroup-matrix dispatch whose cost is flat in the row count
+(201-216 GB/s, 414 us for 17408x5120); larger blocks, such as K/V-only
+ingestion of prefill chunks, take even chunks of at most eight rows. Single-row groups are fused per format: the
+`PTQ1_0` members of q/k/v share one concatenated matvec and the int8 members
+another, and gate/up use one fused SwiGLU when both share a format; a mixed
+gate/up pair runs as two projections and the elementwise SwiGLU.
 
 ## Commands
 
 ```text
 local-ai chat [options] <prompt>
-  --model PATH       override model discovery
   --max-tokens N     output cap (default 8192)
   --no-thinking      skip the checkpoint's xhigh reasoning (default on)
   --greedy           disable sampling
   --raw              skip the chat template
 
 local-ai serve [options]
-  --model PATH       override model discovery
   --host IP          bind address (default 127.0.0.1)
   --port N           TCP and UDP port (default 8080)
   --api-key KEY      require Bearer authentication
@@ -133,7 +119,6 @@ local-ai serve [options]
                      default 30, accepted 10 to 3600
 
 local-ai bonsai [options] <prompt>
-  --model PATH       override model discovery
   --max-tokens N     output cap (default 8192)
   --prompt-file PATH read a UTF-8 prompt instead of positional text
   --raw              skip the chat template
@@ -141,10 +126,16 @@ local-ai bonsai [options] <prompt>
   --greedy           disable sampling
   --json             return token IDs and measured timings
   --tokenize         emit prompt token IDs without loading weights
-  --export KIND      write an artifact instead of generating; accepts only
-                     --model. Kinds: index, mtp-head=DIR, mtp-head-zstd=DIR
+  --export KIND      write an artifact instead of generating; takes no other
+                     options. Kinds: index, mtp-head=DIR
   --no-speculation   disable both MTP and suffix lookup for comparison
+  --mtp-depth N      drafts per speculative round, 1 to 4 (default 3)
 ```
+
+There is no model flag. The engine runs one pinned checkpoint and discovers it
+under `./models`, beside the executable, or under
+`~/Library/Caches/local-ai/models`, and nothing at runtime reads an
+environment variable other than `HOME`.
 
 `chat` and `bonsai` stream text to stdout. Startup policy JSON goes to stderr.
 `--no-thinking` skips the checkpoint's xhigh reasoning, which is on by default;
@@ -154,11 +145,10 @@ starts with a hyphen.
 
 `--export` takes one kind, so passing it twice is an error rather than a choice
 between two exports. Every kind decodes nothing and takes no prompt. `index`
-writes no file and therefore takes no directory; `mtp-head=DIR` and
-`mtp-head-zstd=DIR` need only the BF16 head beside the checkpoint, since neither
-starts an engine nor opens the GGUF, and each prints the artifact record as JSON.
-Both head kinds write `DIR/mtp-head-int8-v2.bin` and overwrite whatever was
-there.
+writes no file and therefore takes no directory; `mtp-head=DIR` needs only
+`DIR/model_mtp_ternary.safetensors`, starts no engine, opens no GGUF, writes
+`DIR/mtp-head-ptq1-v1.bin` (overwriting whatever was there), and prints the
+artifact record as JSON.
 
 ## Server API
 
@@ -284,9 +274,9 @@ All choices and reasons are reported in startup JSON.
   fits 90% of Metal's recommended working set.
 - **K/V:** F16 unless it cannot reach a useful 32,768-token context, then Q8.
 - **Prefill:** fixed 128-token chunks with Metal 4 kernels where supported.
-- **Speculation:** suffix lookup is enabled; the discovered MTP head adds
-  gated depth-3 drafting. Discovery prefers the int8 head artifact over the BF16
-  source, so the 849 MB source is optional and used only to rebuild.
+- **Speculation:** suffix lookup is enabled; the ternary MTP head artifact,
+  when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`, adds gated
+  depth-3 drafting. Without it MTP is off and the policy says why.
 - **Prompt cache:** GPU checkpoint count derives from working-set headroom.
   Disk budget is the smaller of 512 GiB and 25% of free space.
 - **Host snapshots:** disabled when the startup write probe measures at least
@@ -305,18 +295,44 @@ known continuation. Draft depth adapts to match length and remaining context.
 When the optional head is installed, it drafts up to three tokens. A gate
 avoids head work where measured acceptance does not repay its cost.
 
-The target verifies a draft as a row block. Recurrent layers save one initial
-state plus compact factors for intermediate rows. On rejection, accepted rows
-are committed and recurrent state, target K/V, and MTP state are rolled back to
-that exact boundary. Full acceptance needs no restore. This compact rollback
-uses 282 MB for 63 drafts rather than 9.9 GB of per-row full checkpoints.
+The target verifies a draft as a row block. Its recurrent layers read their
+state and convolution history but write the block's final ones, and each row's
+compact recurrence inputs, to the verifier, so the layer keeps the round's start
+with no copy. Full acceptance swaps the verifier's buffers in; on rejection the
+accepted rows are replayed from the untouched start, and target K/V and MTP
+state are rolled back to that exact boundary. This uses 208 MB for 63 drafts
+rather than 9.9 GB of per-row full checkpoints, and no state copy at all: the
+former scheme copied all 48 states into a snapshot before every verify block
+and back on every rejection.
+
+With a greedy sampler and no penalty, the verify block (and a plain decode
+step) also selects each row's argmax in its own command buffer, with the same
+`total_cmp` order and ties to the lower id as the GPU top-k, and flags any
+non-finite logit; the host reads one id per row instead of submitting a top-k
+per row and scanning every logit. Other samplers keep the host path.
+
+Drafting stays on the GPU. Each draft step is one submission: the token's
+`token_embd` row is decoded and inverse-rotated on the device
+(`draft_embed_inverse`, reading the GGUF mapping without a copy), the head
+layer runs, and a two-pass top-two (`draft_top2_partial`/`draft_top2_final`,
+`total_cmp` order, ties to the lower id) leaves 16 bytes for the host, which
+applies the EOS check and the margin gate exactly as the host sampler did; the
+next step reads its token from the device buffer. Rollback and the head commit
+share one submission, and a verify block submits after its first layer so the
+GPU starts while the rest encodes. Against the per-step host loop: 3.24 to 3.05
+ms per draft and 27.96 to 28.39 tok/s geomean on six prompts, byte-identical
+tokens. Running all steps in one command buffer and truncating at the gate
+afterwards lost (24.9 to 23.3 tok/s): only 211 of 477 possible steps pass the
+gate, so the ungated steps cost more than the saved round trips. Requests with
+presence or repetition penalties keep the host draft loop, since the device
+top-two applies none.
 
 ### What the speculation gain is made of
 
 `--no-speculation` disables two independent mechanisms under one flag: the MTP
 head, which drafts speculatively ahead, and n-gram suffix lookup
-(`ngram_policy`, `min_match: 24`), which proposes the known continuation of a
-previously-seen 24-token suffix. Both are honestly called speculation, the flag
+(`ngram_policy`, `min_match: 12`), which proposes the known continuation of a
+previously-seen 12-token suffix. Both are honestly called speculation, the flag
 disables both by design, and the startup policy reports the two separately, so
 an A/B against the flag measures speculation rather than the head alone. What
 that A/B cannot show is how the gain divides between them.
@@ -356,6 +372,12 @@ From the 160-token varied-prose run, with speculation on:
 
 Drafting is the speculative phase and it is cheap; checking the draft is 89.0%
 of decode. That ordering is what makes the unit costs worth recording.
+
+These figures were taken with the retired int8 head, whose matrix-vector
+product read four output rows per SIMD group with eight-byte weight loads; that
+took drafting on the planets prompt from 0.588 s to 0.503 s on an M4 Pro,
+leaving it about 8% of decode time. The shipped ternary head runs on the
+target's own PTQ1 kernels.
 
 | Quantity | Value |
 | --- | ---: |
@@ -418,6 +440,27 @@ layout, MTP configuration, tokens, recurrent state, and target and head K/V.
 3. Disk `.bpc` snapshots are versioned and SHA256-checked, written atomically,
    discovered at startup, and trimmed within the automatic disk budget.
 
+Disk snapshots are written by one background thread the engine owns. The
+engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
+and trim run behind the request. A snapshot is indexed for reuse only after
+its rename is reported, so a file still being written is never loaded; a
+request whose best disk match is still in flight waits for that one write.
+At most one job is in flight and one queued: a newer job replaces the queued
+one, except that a request tail never displaces a shared boundary. Dropping
+the engine finishes pending writes. A failed write is a cache miss reported
+on stderr, not a request error. Trim keeps an in-memory index of the
+directory instead of re-reading every snapshot header after each store.
+
+Measured on an M4 Pro (1.7 GB/s write probe, host tier off), six interleaved
+cold runs per arm of `local-ai bonsai --raw --json --greedy --max-tokens 16`,
+medians, ~204 MB snapshots:
+
+| Case | Synchronous write | Background write |
+| --- | ---: | ---: |
+| 696-token prompt, 678-token system boundary: TTFT | 8.611 s | 8.469 s |
+| Same, request time | 9.300 s | 9.153 s |
+| 17-token prompt, tail snapshot: request time | 1.931 s | 1.847 s |
+
 The request tail is checkpointed at the penultimate chat token because the
 next rendered turn diverges at the assistant opener. One reusable boundary is
 also materialized per prefill: a newly observed shared-prefix divergence is
@@ -435,55 +478,264 @@ Measured effects:
 
 ## K/V cache
 
-The target's full-attention layers use F16 keys and values by default. If F16
-cannot provide a 32K context within the working-set policy, both use Q8 blocks
-with an F16 scale per 32 values. Scores and accumulation remain F32. The MTP
-head's one-layer cache always remains F16.
+The target's full-attention layers store keys and values as Q8: int8 values
+with an F16 scale per 32, 8.5 bits per value and 34 KiB per token across the
+sixteen layers, against F16's 64 KiB. There is no other target format and no
+fallback: Q8's 34 KiB per token is what the context policy budgets. Scores and
+accumulation remain F32. The MTP head's one-layer cache always remains F16.
+
+Quantized rows are stored in a rotated basis: each head's 256-value key and
+value row is multiplied by the orthonormal Walsh-Hadamard matrix H/16 before
+quantization, and the query by the same matrix, so every score (Hq)·(Hk) equals
+q·k exactly. Rotation spreads an outlier channel's energy across the whole row,
+which shrinks the per-block scale for everything else in it. Values come back
+through `bo_attn_unrotate`, which rotates each head's output and then applies
+the output gate, since gating does not commute with the rotation. It took Q8's
+error from 1.4e-5 to 8.9e-6 and costs nothing measurable: plain decode at a
+512-token prompt measured 21.9 tok/s with F16 and Q8 alike.
 
 Caches begin at 1,024 tokens, or the selected context when smaller. Capacity
-doubles only when a request reaches it, preserving written rows exactly.
+grows only when a request reaches it, preserving written rows exactly: it
+doubles up to 4,096 tokens, then grows 4,096 tokens at a time, because Metal
+keeps a whole buffer resident once the GPU uses it (see Memory).
 Attention workspaces and speculation buffers grow with actual need rather than
 the maximum context.
 
-F16 is retained whenever it fits: Q8 prefill is about 1.5–1.9 times slower at
-12K–32K and decode is up to 15% slower at 32K.
+Q8 is the default because it is effectively lossless and faster. Against F16 on
+the real model, teacher-forced along 64 greedy tokens after a prompt of this
+repository's own text (`quantized_kv_tracks_f16_next_token_distribution`):
+
+| Layout | KiB/token | Mean next-token KL | Top-1 agreement |
+| --- | ---: | ---: | ---: |
+| Q8, 4,096-token prompt | 34 | 8.9e-6 | 64/64 |
+| Q8 unrotated, 4,096-token prompt | 34 | 1.4e-5 | 64/64 |
+| Q8 unrotated, 16,384-token prompt | 34 | 1.4e-5 | 64/64 |
+
+Decode attention reads the whole cache for every token and is bandwidth-bound,
+so fewer bytes are faster. Each quantized K or V tile is dequantized to half in
+threadgroup memory and fed to the same Metal 4 tensor matmuls the F16 kernel
+uses; the P·V accumulator stays in registers for the whole split and is
+rescaled in place, instead of a per-tile round trip through threadgroup memory.
+One layer on an M4 Pro, GPU time:
+
+| Context | F16 | Q8 |
+| ---: | ---: | ---: |
+| 1K | 33.8 µs | 33.3 µs |
+| 4K | 86.7 µs | 69.6 µs |
+| 16K | 301 µs | 244 µs |
+| 64K | 1,192 µs | 903 µs |
+| 128K | 2,476 µs | 1,844 µs |
+
+Below Q8 the unpacking, not the bytes, sets the pace, which is why smaller
+formats were not worth their accuracy (see Tried and rejected).
+Causal prefill uses a tensor kernel of the same shape. Whole model, plain
+decode without speculation, M4 Pro:
+
+| Prompt | Prefill F16 | Prefill Q8 | Decode F16 | Decode Q8 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 tokens | 88.9 tok/s | 90.7 tok/s | 21.9 tok/s | 21.9 tok/s |
+| 24,576 tokens | 87.7 tok/s | 85.6 tok/s | 18.73 tok/s | 19.34 tok/s |
+
+The decode gap widens with context, since attention's share of each token does.
+Every attention path reads quantized values dequantized and rounded once to
+half, so the paths agree on their operands as F16 caches always have. A
+quantized cache still amplifies kernels' last-bit differences in the K/V rows
+they write (a value near a rounding boundary moves a whole step), which the
+verify-block test bounds separately per format; greedy output with speculation
+remained byte-identical to output without it over 300 tokens on three prompts.
 
 ## Memory
 
 Checkpoint weights remain file-backed and are paged on demand. Startup does
-not touch every weight page. A stored MTP int8 head, whether it is the machine
-cache or the installed artifact, is memory-mapped and demand-paged too; an
-inflated zstd head is the exception, since it must be whole in anonymous memory
-before it can be read. K/V, attention workspaces, verify rows, and other
+not touch every weight page. The 167 MB mixed ternary/int8 MTP head artifact is
+memory-mapped and demand-paged too. K/V, attention workspaces, verify rows, and other
 context-dependent buffers are allocated at their minimum useful size and grow
 lazily.
 
-The resulting short-request peak footprint is about 1.4 GB. After a prompt of
-roughly 8K tokens, idle footprint is about 1.1 GB. These footprint values count
-resident runtime memory; the 5.9 GB mapped checkpoint remains part of virtual
-address space and its resident pages vary with operating-system pressure.
+The resulting short-request peak footprint is 0.8-0.9 GB (`/usr/bin/time -l`,
+a 14-token prompt; 1.18 GB before the changes below). These footprint
+values count resident runtime memory; the 5.9 GB mapped checkpoint and the
+head remain file-backed, outside the footprint, and their resident pages vary
+with operating-system pressure.
+
+Audit of one `bonsai --greedy --json --max-tokens 500` request on a
+15,920-token prompt (MTP and n-gram on, cold prompt cache), `footprint`
+sampled every 2 s, M4 Pro:
+
+| Component | Before | After |
+| --- | ---: | ---: |
+| GDN state, 48 layers (F32 to F16) | 151 MB | 75 MB |
+| Verify rollback, depth 3 / 63 drafts | 163 / 282 MB | 89 / 208 MB |
+| Verify logits, 4 / 64 rows | 4 / 64 MB | unchanged |
+| Target Q8 + head F16 K/V at 16,420 tokens | 1,275 MB (32,768 allocated) | 797 MB (20,480) |
+| Prompt GPU checkpoint, each of up to 4 (purgeable) | 157 MB | 81 MB |
+| Prompt snapshot held in host memory during decode | 777 MB | none |
+| Footprint after load | 491 MB | 416 MB |
+| Footprint during decode | 2,118 MB | 1,254 MB |
+| Peak footprint | 2,769 MB | 2,090 MB |
+
+Three changes made the difference. The recurrent state is stored F16 (see
+Performance). K/V caches stop doubling past 4,096 tokens: a Metal buffer
+becomes resident as a whole once the GPU uses it (each doubling during prefill
+raised the footprint by the full new allocation less the old one), so doubling
+kept up to half of a long request's K/V resident and unused. The prompt's
+cache snapshot was read back to host memory right after prefill and held
+through the whole decode until the request ended; the request now pins an
+81 MB recurrent checkpoint instead and reads the snapshot at the end, from that
+checkpoint and the live K/V prefix, which decode never rewrites. The peak is
+that end-of-request readback (673 MB) on its way to the disk writer.
 
 ## Performance
 
 | Workload | Result |
 | --- | ---: |
-| Plain short-prompt decode | 17.5 tok/s |
+| Plain short-prompt decode | 31.1 tok/s |
+| Six-prompt speculative decode (geomean) | 36.5 tok/s |
 | Arithmetic with speculation | about 27 tok/s |
 | Code copy-edits with speculation | 40–54 tok/s |
 | 4K prefill | about 96 tok/s |
 | 128K prefill | 56 tok/s |
 
 Decode spends 97–98% of wall time on the GPU. PTQ1 decode moves 5.65 GB of
-weights per token at 116–127 GB/s; trit reconstruction, rather than host gaps,
-is the main limit.
+weights per token. The packed projections were ALU-bound, not bandwidth-bound:
+with weights pinned in cache the floor-based matvec took the same 135 us on
+17408x5120 as streaming them, while loads alone took 89 us. Apple GPUs run
+`floor` and integer-to-float conversion at quarter rate, so the kernels now
+derive each base-3 prefix `floor(q * 3^p / 256)` with one half FMA that rounds
+onto [1024, 2048), where halves are integers (the byte enters as the half
+`1024 + q` by OR-ing it into the mantissa; offsets make every byte, including
+the q = 0 tie, round to the floor). The values are the integers the floor gave,
+so decoded trits are unchanged and the small-batch kernels stay bit-identical.
+The single-row matvec also moved to four lanes per block (one uchar4, two
+uchar2 and the scale per row and block, float4/float2 activations) and eight
+rows per SIMD group; fused SwiGLU now reduces four rows of each matrix.
+Kernel GPU time on an M4 Pro, best of two interleaved runs, weights rotating
+through 512 MB:
+
+| Projection | Before | After |
+| --- | ---: | ---: |
+| 17408x5120, 1 row | 135.4 us, 144 GB/s | 89.7 us, 217 GB/s |
+| 5120x17408, 1 row | 140.0 us, 139 GB/s | 93.5 us, 209 GB/s |
+| 12288 / 10240 / 6144 x5120, 1 row | 97.7 / 81.6 / 50.8 us | 65.8 / 54.8 / 35.1 us |
+| 5120x6144, 1 row | 50.7 us | 34.6 us |
+| 248320x5120 output head | 1,895 us, 147 GB/s | 1,245 us, 223 GB/s |
+| Fused gate/up SwiGLU | 267.2 us | 172.3 us |
+| Fused GDN 10240+6144 / attention 12288+1024+1024 | 128.0 / 113.2 us | 86.1 / 75.9 us |
+| 17408x5120, 2 / 3 / 4 rows | 191.9 / 234.8 / 281.8 us | 155.2 / 197.9 / 234.8 us |
+| 17408x5120, 5 / 8 rows (wide) | 341.2 / 343.4 us | 280.4 / 282.2 us |
+| 17408x5120, 64 / 128 rows (tensor tile) | 2,630 / 4,159 us | unchanged |
+
+The int8 matvec on the same machine reaches 234–252 GB/s, and the new
+matvec sits within a few percent of its own load-only time, so little remains
+in the single-row path short of fewer bytes. Matvec sums keep the telescoped
+coefficient form and its rounding (worst error against F64 1.7e-6 to 4.3e-6
+before, 2.3e-6 to 3.7e-6 after on 5,120-17,408-wide rows); exact trits dotted
+with the activations are 18 times more accurate but measured 112 against
+99 us. Six prompts, 300 greedy tokens, best of two interleaved runs of both
+builds: plain decode 22.52 to 31.14 tok/s geomean (1.38x, every prompt
+1.37-1.39x), default speculative decode 30.73 to 36.53 (1.19x); greedy text is
+byte-identical to the previous build on every prompt, with and without
+speculation. Teacher-forced along 128 tokens of this file after a 1,024-token
+prompt, next-token KL of the new build against the old is 7.3e-7 mean and
+6.3e-6 at worst, top-1 128/128 (rotated Q8 K/V against F16 is 8.9e-6).
+Prefill of a 2,484-token prompt runs on the tensor tile and is unchanged
+(97.40 to 97.84 tok/s).
+
+Verification itself got cheaper in two steps, measured on an M4 Pro. The scalar
+small-batch kernel now holds its decoded trits in half registers, exact for
+-1/0/+1 and widened into the same F32 FMAs, so outputs stay bit-identical:
+2/3/4 rows went from 200/256/324 to 191/235/281 us on 17408x5120 and from
+197/259/344 to 194/237/286 us on 5120x17408. Blocks of five or more rows use a
+simdgroup-matrix kernel that covers up to eight rows in one pass for 340-348 us
+whatever the row count, where the former code issued two re-streaming
+dispatches costing 452-720 us; its summation order differs, with gaps of
+1.5e-7 to 2.2e-7 of the largest output. A whole-model verify block at a
+1,024-token prefix went from 108.4 / 257.4 / 452.8 / 648.2 ms to 95.6 / 166.1 /
+267.6 / 372.2 ms at 4 / 8 / 16 / 24 rows, and the small-batch range now reaches
+60 rows (860.5 ms against the 64-token tile's 876.6 ms), so n-gram drafts are
+padded to fill a tile only past 60 rows. Greedy output is
+byte-identical to before and to `--no-speculation`. With `tools/benchmark.py`,
+best of three, the planets prompt went from 23.58 to 24.74 tok/s at
+`--mtp-depth 3` (19.02 to 19.18 without speculation), and a prompt asking for a
+short function three times verbatim from 25.26 to 31.95 tok/s.
+
+Single-token decode encodes 835 dispatches per token, down from 1,364, and
+every fused kernel is bitwise identical to the dispatches it replaces
+(`local-metal/tests/bonsai_fusion.rs`):
+
+- RMSNorm and the input rotation: each 1024-wide rotation threadgroup repeats
+  its row's square sum in the same order. 13.4 to 8.0 us.
+- FFN gate and up: one SIMD group reduces four rows of each (two before the
+  half-prefix decoder), sharing activation coefficients across the eight as
+  the plain matvec does, and writes `silu(gate) * up`. 269.1 to 262.1 us.
+- A recurrent layer's QKV and gate projections and its two 48-row BF16
+  alpha/beta projections: one dispatch, BF16 rows first so their latency
+  overlaps the packed rows. 148.4 to 130.3 us. A full-attention layer's Q, K
+  and V: 120.7 to 111.3 us.
+- Convolution, Q/K L2 normalization and decay/beta: one dispatch for blocks of
+  up to 32 rows.
+
+The BF16 matvec was bound by one load latency per loop iteration, 45 us for
+each 48x5120 alpha or beta projection; it now issues eight iterations' loads
+before their in-order fused multiply-adds, also bitwise identical. Kernel
+times above are best of three over 200 dispatches with weights rotating
+through 600 MB.
+
+Recurrent state is stored F16 and computed in F32 registers, rounded once
+per block. Each decode step read and wrote 302 MB of F32 state, and every
+verify block copied it into a snapshot (and back on rejection). Against F32
+state, teacher-forced along 512 greedy tokens after an 8,192-token prompt
+(`reduced_state_tracks_f32_state_next_token_distribution`): mean next-token KL
+7.5e-6 over 64 positions, with no growth along the generation (quarters
+1.6e-5, 4.9e-6, 6.4e-6, 3.4e-6), top-1 512/512; on a later build of the
+projection kernels 7.1e-6 and 511/512. The largest F32 state value there is
+46.2, far inside F16's range, which saturates rather than overflows. Greedy
+output on the six benchmark prompts is byte-identical with and without
+speculation. Free-running past a 15,920-token prompt it first differed from F32
+state at the 188th of 500 generated tokens (two list items swapped order).
+
+Together with the copy-free verify rollback and the in-block greedy argmax
+(see Lossless speculation), six prompts, greedy, 300 tokens, best of two,
+interleaved, identical tokens in every arm, one build with each change
+switchable: speculative decode 34.68 to 36.56 tok/s geomean (+5.4%); removing
+one change at a time cost 2.4% (rollback copies), 1.6% (host greedy
+selection, 0.68-1.02 ms per round of top-k submissions) and 0.7% (F32 state).
+Plain decode, where only the state width and argmax apply, moved 22.18 to
+22.36 tok/s, within noise.
+
+Verification blocks use a concurrent compute encoder: every dispatch is
+followed by a buffer barrier except within a layer's group of independent
+projections. That measured 24.99 to 25.40 tok/s on speculative decode.
+
+Together, on the default benchmark prompt with identical greedy text: plain
+decode 18.84 to 21.64 tok/s and speculative decode (`--mtp-depth 3`) 23.58 to
+25.44 tok/s, interleaved runs of both builds. Removing one fusion at a time
+cost: RMSNorm with rotation 3.4%, QKV/gate concatenation 4.0%, BF16 folding
+2.3%, SwiGLU 1.3%, convolution 0.8%. The BF16 load change alone took plain
+decode from 19.23 to 20.39 tok/s.
 
 ## Tried and rejected
 
+- BF16 recurrent state: mean KL 4.7e-5 against F32 state (511/512 top-1) in
+  the test above, six times F16's 7.5e-6 for the same bytes.
 - Chunkwise GDN prefill: recurrence is 17.25 ms per 128-row block, only
   1.17–1.29% of block time; perfect removal yields at most 1.013x.
 - F16 prefill activations: only 1.04–1.07x projection speedup before conversion,
   below the 1.15x threshold; tile conversion is 1.9–3.5x slower.
 - Half-precision PTQ1 decode: exact recurrence is 36–51% slower than FP32.
+  (The shipped half decode is different: one rounding FMA per prefix.)
+- Other PTQ1 projection decoders, 17408x5120 single row against the 135 us
+  floor decoder: a threadgroup lookup table of byte to five half trits, 151 us
+  (random threadgroup loads are slower than the arithmetic); the same rounding
+  trick in F32, 119 us, and 149-173 us once its constants came from arrays the
+  compiler did not fold or the qh trit used it too; half prefixes for the one
+  qh trit per lane, 2-3% slower than its floor; 16 rows per SIMD group, 250 us
+  (spills). A load-time repack into 2-bit codes was not pursued: the matvec is
+  now near its load-only time, and 2 bits per weight would move 14% more bytes
+  and hold 1.2 GB more.
+- Small-batch (2-4 row) variants of the new layout: four lanes per block with
+  trits streamed per byte group, 204-349 us against 155-244 us, and float2
+  activation loads in the eight-lane kernel, 160 against 152 us.
 - DSpark: available Bonsai 2 weights have no usable license; the measured
   perfect-drafter ceiling is 32.8 tok/s and realistic acceptance loses to MTP.
 - Eight-row small-batch verify kernel: faster on 17408×5120 but slower on
@@ -502,15 +754,109 @@ is the main limit.
   all.
 - Residency sets: 17.23/27.50/48.05 tok/s versus 17.17/27.51/47.98; neutral.
 - Untracked hazards: 17.25 versus 17.25 tok/s plain and incorrect speculative tokens.
+- Folding the residual addition into the down and attention-output matvec
+  stores: 21.58 tok/s fused versus 21.69 separate, plain decode.
+- Fusing the GDN output normalization with the following rotation: 11.1 to
+  5.4 us in isolation, but 21.58 versus 21.62 tok/s plain and 25.31 versus
+  25.40 speculative with it; neutral.
+- A concurrent encoder for single-token decode: 21.66 versus 21.95 tok/s once
+  its independent projections were single dispatches. Before the BF16 change it
+  measured 20.30 versus 19.33, by hiding the alpha/beta latency.
+- SwiGLU with four rows of each matrix per SIMD group: 264.5 versus 262.1 us
+  for two.
 - Multi-request batching: 25.5/29.5/31.4 aggregate tok/s at 2/3/4 requests,
   versus 31.1/35.4/37.7 for serial requests retaining speculation.
 - Weight prewarm: increases resident footprint without improving steady-state inference.
-- Q4 K/V: quality and kernel cost did not justify a format below the Q8 fallback.
+- Q6 K/V (six-bit codes, F16 scale per 32, 26 KiB per token) as a fallback
+  for machines where Q8 could not reach 32K tokens. Rotated: mean KL 1.3e-4
+  (64/64 top-1), 15 times Q8's; unrotated 2.5e-4. Decode attention measured
+  within 2% of Q8 at every length (1,809 against 1,844 µs at 128K) and prefill
+  attention a few percent slower, so it bought 24% less memory and nothing
+  else. Q8 alone is now budgeted.
+- 4-bit K/V. Measured against F16 like the formats above (4,096-token prompt),
+  unrotated: Q4 mean KL 3.8e-3 (61/64 top-1), FP4 E2M1 3.5e-3 (62/64), Q8 keys
+  with Q4 values 1.6e-3 (62/64), Q8 keys with FP4 values 1.1e-3 (63/64).
+  Hadamard rotation, which cut Q8's error by a third, barely moved them: Q4
+  3.3e-3 (60/64), and FP4 got worse at 4.3e-3, since rotation removes the heavy
+  tails its non-uniform levels are shaped for. Their error is the resolution of
+  15 levels per 32 values, not outliers. That is about 0.3% in perplexity terms,
+  the band the literature calls near-lossless, but 370 times rotated Q8's
+  divergence for 47% less memory. Tensor decode attention was 7% faster than
+  Q8's at 128K for Q4 and slower for FP4, whose level lookup costs more than
+  the bytes it saves; whole-model decode at a 24,576-token prompt measured
+  19.47 tok/s for Q4 against Q8's 19.34, 0.7%.
+- A ternary MTP head. Every head matrix rotated by the target's own signed
+  Hadamard transform for its input width (which leaves w·x unchanged) and then
+  replaced, per 128-value block, by the least-squares ternary vector and F16
+  scale, packed as PTQ1 and run through the target's matvec: 4.5x smaller and
+  drafting 30% cheaper (0.503 s to 0.352 s on the planets prompt), but draft
+  acceptance fell from 79% to 68% (planets) and 95% to 80% (repetitive), so
+  verification rounds rose 19-53% and throughput fell 9-10% (26.53 to 24.14 and
+  39.43 to 35.29 tok/s, byte-identical text). The head was trained in BF16 and
+  never calibrated for ternary; drafting is about 8% of decode time, which caps
+  what any cheaper head can return. Quantization-aware training then closed
+  two thirds of the gap but not all of it: `tools/mtp_train/train_ternary.py`
+  (TWN g128 in the rotated basis, straight-through estimator, KL to the int8
+  head on its own draft chains plus 0.1 of the target labels, 485K captured
+  positions) for 10 epochs on a Kaggle T4x2 (7.6 GPU-hours) gave 27.46 tok/s
+  at 74.3% acceptance against int8's 28.40 at 80.8%, six prompts, byte-identical
+  text (untrained TWN: 25.15 at 67.5%; 4 epochs: 27.27 at 73.4%). The 93 MB
+  head saves 332 MB resident, not decode time.
+- An all-ternary head, superseded by the shipped mixed head. A per-matrix
+  sensitivity study (each group ternarized alone in an otherwise int8 head,
+  held-out KL to the int8 head per MB saved) ranked k/v, fc and o as costly and
+  q, gate/up and down as cheap; heads keeping the costly groups int8 were then
+  trained the same way on Kaggle (3 epochs from the ternary student). Six
+  prompts, greedy, byte-identical text, with the GPU-resident draft loop: all
+  ternary 93 MB 28.57 tok/s at 74.3% acceptance; fc+k+v+o int8 167 MB 29.48 at
+  78.6% (shipped); plus `down` int8 237 MB 29.41 at 78.9%; all int8 425 MB 29.57
+  at 80.4%.
+- Keeping the int8 MTP head (retired). The community BF16 head quantized to
+  symmetric per-row int8 (425,263,104-byte artifact, or 355,837,652 behind zstd
+  level 19 at the cost of a 425 MB anonymous buffer) measured 28.40 tok/s at
+  80.8% acceptance against the trained ternary head's 27.46 at 74.3%. It was
+  removed with its BF16 loader, machine cache and zstd codec; int8 returned
+  only as a per-matrix format inside the mixed head.
+- Swapping in a head trained against the BF16 Qwen3.8-27B target. Same 15-tensor
+  layout, int8 through the same export, greedy, six prompts (prose, explanation,
+  arithmetic, code, essay, thinking), 300 tokens, best of two, byte-identical
+  text in every arm. The community head (distilled from this ternary trunk's
+  hidden states, run as int8 then) measured 28.18 tok/s geomean at 80.9% mean acceptance;
+  `xkm/qwen3.8-27b-mtp-head-retrained` (multi-step, 17.5M positions, +2-5
+  points over stock on BF16) 26.81 at 76.1%; the stock head
+  (`EigenLabs/Qwen3.8-27B-MTP-bf16`) 26.68 at 74.5%. Alignment with the exact
+  target outweighs a stronger general-purpose recipe. Block drafters (DFlash2,
+  DSpark) were not ported: the published Qwen3.8-27B ones read 1.1-2 GB per
+  draft pass, the Bonsai DFlash2 port reports 50% acceptance at three drafts,
+  and the SpecForge-trained Qwen3.8 DFlash measures 1.81 accepted per step.
+- Fine-tuning the community head on this trunk's own outputs (`mtp-capture` +
+  `tools/mtp_train`, xkm's chain-faithful objective, depth 3): 485K captured
+  positions (UltraChat, FineWeb-Edu, code, OpenWebMath), 820 steps. Held-out
+  accuracy per draft step rose from 0.682/0.568/0.514 to 0.721/0.639/0.603,
+  but live acceptance on the six-prompt A/B fell from 80.8% to 78.7% and
+  throughput was flat (28.54 against 28.66 tok/s geomean, byte-identical
+  text): teacher-forced corpus accuracy did not transfer to the model's own
+  generations.
 - Neural Engine: real-size projections execute on GPU and 54 GB FP16 weights do not fit.
 - `float4` verify activation loads: 1–5% slower than scalar gathers.
-- Tensor Q8 attention: 3.6–7.3 times slower decode and twice as slow prefill.
+- Further small-batch variants, M4 Pro, µs on 17408×5120 / 5120×17408. The
+  simdgroup-matrix kernel for 2–4 rows: 340–348 at any row count, slower than
+  the scalar 191–286. A 16-row matrix variant decoding trits once for two token
+  tiles: 721–735, no better than two 8-row passes, because the F32 8×8
+  multiplies alone cost about 270 per eight rows. One to four SIMD groups per
+  threadgroup splitting the blocks: 379/407, 371/383, 367/369, the last kept;
+  two or four independent accumulator chains: within 1%. Prefetching the next
+  block's packed bytes in the scalar kernel: 197/262/321 against 197/256/325 at
+  2/3/4 rows. Half trits with eight rows per SIMD group: 494/515 at four rows,
+  and with two rows 319/351, both worse than four rows' 281/286. The half-trit
+  scalar kernel at five and six rows: 337/351 and 394/409, against the matrix
+  kernel's 340/345.
+- Tensor Q8 attention that round-trips the P·V result through threadgroup
+  memory every tile: 3.6–7.3 times slower decode and twice as slow prefill in a
+  first attempt; with 32- or 16-token dequantized tiles, 75 GB/s at 128K
+  against F16's 200. Keeping the accumulator in registers is what made it pay.
 - Trit lookup tables and 2-bit repacks: none exceed the FP32 digit decoder's 127 GB/s.
-- Compressing the int8 head artifact above zstd level 19: level 22 measures
+- Compressing the retired int8 head artifact above zstd level 19: level 22 measures
   358,063,503 bytes and `--long=27` measures 355,688,546, both worse than level
   19's 355,361,865 on the same payload. This is a property of the payload, not
   of zstd — the HTTP response path uses level 22 because it measured best on
@@ -529,7 +875,8 @@ is the main limit.
   are yours, such as internal IPC or a bundled SDK.
 - Compressing the 5,946,648,928-byte PTQ1 GGUF: the measured ceiling is 1.074x
   and the best measured result 1.29%, so the checkpoint is not a compression
-  target. Only the int8 head is, which is why it ships in two encodings.
+  target. Only the retired int8 head was, which is why it shipped in two
+  encodings.
 - A rounder `--stall-timeout` floor: on a streaming response the number bounds
   only how long a client goes without taking a frame; on a non-streaming one it
   bounds that and the engine's own inter-event gaps, the producer half being the
@@ -550,28 +897,12 @@ uvx ruff check tools/
 python3 -m unittest discover -s tools -p 'test_*.py'
 ```
 
-Create the checked index used by tokenizer tests:
+Ignored real-model tests resolve the pinned model and head from the
+workspace's `models/` directory, so they need no environment variables. Run
+them serially:
 
 ```bash
-target/release/local-ai bonsai \
-  --model "$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
-  --export index > cache/bonsai-index.json
-```
-
-Ignored real-model tests use absolute paths supplied by these variables:
-
-```bash
-BONSAI_GGUF=$PWD/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-BONSAI_MTP_HEAD=$PWD/models/bonsai2-27b-mtp/model_mtp.safetensors \
-BONSAI_INDEX=$PWD/cache/bonsai-index.json \
-  cargo test -p local-engine --lib --release -- \
-  --include-ignored --test-threads 1 bonsai
-```
-
-Run GPU checks serially when including ignored tests:
-
-```bash
-cargo test -p local-metal --release -- --include-ignored --test-threads 1
+cargo test --workspace --release -- --ignored --test-threads 1
 ```
 
 The engine targets text inference on Apple Silicon. Model quality relative to

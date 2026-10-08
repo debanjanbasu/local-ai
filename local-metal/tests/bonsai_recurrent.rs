@@ -30,8 +30,12 @@ struct Kernel {
 }
 
 fn kernels(context: &MetalContext) -> Vec<Kernel> {
+    named_kernels(context, [("bo_gdn", 1), ("bo_gdn_rows_4", 4)])
+}
+
+fn named_kernels(context: &MetalContext, names: [(&str, usize); 2]) -> Vec<Kernel> {
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
-    [("bo_gdn", 1), ("bo_gdn_rows_4", 4)]
+    names
         .into_iter()
         .map(|(name, rows)| {
             let function = shaders.get_function(name).expect("function");
@@ -46,8 +50,20 @@ fn kernels(context: &MetalContext) -> Vec<Kernel> {
         .collect()
 }
 
-#[allow(unsafe_code)]
 fn encode(batch: &mut CommandBatch, kernel: &Kernel, buffers: [&MetalBuffer; 5], tokens: u32) {
+    // In place: the final state overwrites the initial one.
+    let [qkv, decay, beta, state, output] = buffers;
+    encode_into(
+        batch,
+        kernel,
+        [qkv, decay, beta, state, output, state],
+        tokens,
+    );
+}
+
+/// Buffers: QKV, decay, beta, initial state, output, final state.
+#[allow(unsafe_code)]
+fn encode_into(batch: &mut CommandBatch, kernel: &Kernel, buffers: [&MetalBuffer; 6], tokens: u32) {
     let encoder = batch.encoder();
     encoder.setComputePipelineState(&kernel.pipeline);
     // SAFETY: callers allocate the fixed GDN geometry; the owned buffers remain
@@ -59,7 +75,7 @@ fn encode(batch: &mut CommandBatch, kernel: &Kernel, buffers: [&MetalBuffer; 5],
         encoder.setBytes_length_atIndex(
             NonNull::new_unchecked(std::ptr::from_ref(&tokens).cast_mut().cast()),
             size_of::<u32>(),
-            5,
+            6,
         );
     }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -190,6 +206,108 @@ fn tiled_recurrence_matches_f64_for_every_state_row_and_causal_continuation() {
                     .find(|(position, _)| *position == end)
                     .expect("state checkpoint")
                     .1,
+            );
+        }
+    }
+}
+
+/// F64 recurrence over `tokens` rows from `initial`: outputs and final state.
+fn reference(
+    qkv: &[f32],
+    decay: &[f32],
+    beta: &[f32],
+    initial: &[f32],
+    tokens: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut state = initial.iter().copied().map(f64::from).collect::<Vec<_>>();
+    let mut output = vec![0.0; tokens * OUTPUT];
+    for token in 0..tokens {
+        let x = &qkv[token * QKV..][..QKV];
+        for head in 0..48 {
+            let q = &x[(head % 16) * 128..][..128];
+            let k = &x[2048 + (head % 16) * 128..][..128];
+            for d in 0..128 {
+                let row = head * 128 + d;
+                let memory = &mut state[row * 128..][..128];
+                for value in &mut *memory {
+                    *value *= f64::from(decay[token * 48 + head]);
+                }
+                let prediction = memory
+                    .iter()
+                    .zip(k)
+                    .map(|(s, &k)| s * f64::from(k))
+                    .sum::<f64>();
+                let correction =
+                    (f64::from(x[4096 + row]) - prediction) * f64::from(beta[token * 48 + head]);
+                for (s, &k) in memory.iter_mut().zip(k) {
+                    *s = f64::mul_add(f64::from(k), correction, *s);
+                }
+                output[token * OUTPUT + row] = memory
+                    .iter()
+                    .zip(q)
+                    .map(|(s, &q)| s * f64::from(q))
+                    .sum::<f64>()
+                    / 128.0_f64.sqrt();
+            }
+        }
+    }
+    (output, state)
+}
+
+/// F16-stored state: both kernels widen the initial state, run the block in
+/// F32 registers, and round only the final state, written to a separate
+/// buffer so the initial one survives for a verification rollback.
+#[test]
+fn f16_state_rounds_once_per_block_and_leaves_a_separate_initial_state_intact() {
+    let Some(context) = gpu_or_skip() else { return };
+    let kernels = named_kernels(&context, [("bo_gdn_f16", 1), ("bo_gdn_rows_4_f16", 4)]);
+    let tokens = 37;
+    let (qkv, decay, beta, initial) = inputs(tokens);
+    let initial = initial
+        .iter()
+        .map(|&value| half::f16::from_f32(value))
+        .collect::<Vec<_>>();
+    let widened = initial
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let (output_reference, state_reference) = reference(&qkv, &decay, &beta, &widened, tokens);
+    for kernel in &kernels {
+        let start = MetalBuffer::from_slice(context.device(), &initial).expect("initial");
+        let end =
+            MetalBuffer::from_slice(context.device(), &vec![half::f16::NAN; STATE]).expect("final");
+        let x = floats(&context, &qkv);
+        let a = floats(&context, &decay);
+        let b = floats(&context, &beta);
+        let out = floats(&context, &vec![f32::NAN; tokens * OUTPUT + 7]);
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        encode_into(
+            &mut batch,
+            kernel,
+            [&x, &a, &b, &start, &out, &end],
+            tokens as u32,
+        );
+        batch.commit_and_wait().expect("completion");
+        check(&out, &output_reference);
+        assert!(
+            start
+                .as_slice::<half::f16>()
+                .iter()
+                .zip(&initial)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the initial state was modified"
+        );
+        for (i, (actual, &wanted)) in end
+            .as_slice::<half::f16>()
+            .iter()
+            .zip(&state_reference)
+            .enumerate()
+        {
+            // One F16 rounding of an F32 value within 5e-6 of the F64 one.
+            let tolerance = 5e-6f64.mul_add(1.0 + wanted.abs(), wanted.abs() * 2.0_f64.powi(-11));
+            assert!(
+                (f64::from(actual.to_f32()) - wanted).abs() <= tolerance,
+                "state {i}: {actual} != {wanted}"
             );
         }
     }

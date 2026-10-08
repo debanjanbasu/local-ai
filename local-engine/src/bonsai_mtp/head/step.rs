@@ -1,11 +1,95 @@
 use local_metal::batch::{BufferCopyRequest, CommandBatch};
-use local_metal::bonsai::HadamardDirection;
-use local_metal::bonsai_ops::{Int8Matrix, RmsNormParams};
+use local_metal::bonsai::{HadamardDirection, Int8Matrix, Ptq1Matrix};
+use local_metal::bonsai_ops::RmsNormParams;
 use local_metal::buffer::MetalBuffer;
+use local_metal::draft::DraftKernels;
 
 use super::super::weights::MatrixWeight;
-use super::super::{ATTENTION, FFN, KV, QUERY_GATE, WIDTH};
+use super::super::{FFN, WIDTH};
 use super::{BonsaiMtp, Shared};
+
+fn ptq1(packed: &MetalBuffer, rows: u32, columns: u32) -> crate::Result<Ptq1Matrix<'_>> {
+    Ptq1Matrix::new(packed, 0, rows, columns).map_err(crate::Error::Metal)
+}
+
+fn int8<'a>(
+    weights: &'a MetalBuffer,
+    scales: &'a MetalBuffer,
+    rows: u32,
+    columns: u32,
+) -> crate::Result<Int8Matrix<'a>> {
+    Int8Matrix::new(weights, scales, rows, columns).map_err(crate::Error::Metal)
+}
+
+/// Multiply `count` rotated rows of `input` by `matrix`, whichever format it
+/// is stored in, into `output`.
+fn project(
+    batch: &mut CommandBatch,
+    shared: &Shared<'_>,
+    matrix: &MatrixWeight,
+    input: &MetalBuffer,
+    output: &MetalBuffer,
+    count: u32,
+) -> crate::Result<()> {
+    match matrix {
+        MatrixWeight::Ptq1 {
+            packed,
+            rows,
+            columns,
+        } => shared
+            .kernels
+            .matmul(batch, ptq1(packed, *rows, *columns)?, input, output, count)?,
+        MatrixWeight::Int8 {
+            weights,
+            scales,
+            rows,
+            columns,
+        } => shared.kernels.int8_matmul(
+            batch,
+            int8(weights, scales, *rows, *columns)?,
+            input,
+            output,
+            count,
+        )?,
+    }
+    Ok(())
+}
+
+/// Single-row projections of one rotated input by several matrices, as few
+/// dispatches as their formats allow: the `PTQ1_0` ones share one concatenated
+/// matvec, as the target's own single-token projections do, and the int8 ones
+/// another.
+fn project_concat(
+    batch: &mut CommandBatch,
+    shared: &Shared<'_>,
+    projections: &[(&MatrixWeight, &MetalBuffer)],
+    input: &MetalBuffer,
+) -> crate::Result<()> {
+    let mut packed = Vec::with_capacity(projections.len());
+    let mut wide = Vec::with_capacity(projections.len());
+    for &(matrix, output) in projections {
+        match matrix {
+            MatrixWeight::Ptq1 {
+                packed: bytes,
+                rows,
+                columns,
+            } => packed.push((ptq1(bytes, *rows, *columns)?, output)),
+            MatrixWeight::Int8 {
+                weights,
+                scales,
+                rows,
+                columns,
+            } => wide.push((int8(weights, scales, *rows, *columns)?, output)),
+        }
+    }
+    if !packed.is_empty() {
+        shared.kernels.matvec_concat(batch, &packed, input)?;
+    }
+    if !wide.is_empty() {
+        shared.kernels.int8_matvec_concat(batch, &wide, input)?;
+    }
+    Ok(())
+}
 
 impl BonsaiMtp {
     /// Stage the hidden inputs for `rows` committed tokens starting at the
@@ -68,8 +152,67 @@ impl BonsaiMtp {
     /// projected to draft logits; without it, only the K/V cache is needed
     /// (committed rows), so work stops after FC, input norm and K/V, leaving
     /// `predicted` untouched.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// The embedding rows are the host-staged [`Self::embedding_rows`].
     pub fn encode(
+        &self,
+        batch: &mut CommandBatch,
+        shared: &Shared<'_>,
+        hidden_in: &MetalBuffer,
+        position: usize,
+        rows: usize,
+        logits: bool,
+    ) -> crate::Result<()> {
+        shared.kernels.transform(
+            batch,
+            shared.input_rotation,
+            &self.scratch.embedding,
+            &self.scratch.embedded,
+            rows as u32,
+            HadamardDirection::Inverse,
+        )?;
+        self.encode_layer(batch, shared, hidden_in, position, rows, logits)
+    }
+
+    /// One draft row whose token the GPU reads from `tokens[token_index]`
+    /// (written by the previous chained step or by the host): the `PTQ1_0`
+    /// `embeddings` row is decoded and inverse-rotated on the GPU, bit-identical
+    /// to staging it through [`Self::embedding_rows`] and [`Self::encode`],
+    /// and the full layer projects draft logits into [`Self::logits`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_draft(
+        &self,
+        batch: &mut CommandBatch,
+        shared: &Shared<'_>,
+        draft: &DraftKernels,
+        embeddings: Ptq1Matrix<'_>,
+        tokens: &MetalBuffer,
+        token_index: u32,
+        hidden_in: &MetalBuffer,
+        position: usize,
+    ) -> crate::Result<()> {
+        draft.embed_inverse(
+            batch,
+            embeddings,
+            shared.input_rotation,
+            tokens,
+            token_index,
+            &self.scratch.embedded,
+        )?;
+        self.encode_layer(batch, shared, hidden_in, position, 1, true)
+    }
+
+    /// The layer from the inverse-rotated embedding rows in `scratch.embedded`.
+    /// The layer from the inverse-rotated embedding rows in `scratch.embedded`.
+    ///
+    /// Every matrix, `PTQ1_0` or int8, lives in the target's rotated basis, so
+    /// every projection input is forward-rotated once and shared by the
+    /// projections reading it. Rotated rows land in scratch already dead at
+    /// that point of the layer: `rotated` (WIDTH, free until the final
+    /// projection), `query` (ATTENTION, after attention) and `ffn_gate` (FFN,
+    /// after `SwiGLU`).
+    #[allow(clippy::too_many_lines)]
+    fn encode_layer(
         &self,
         batch: &mut CommandBatch,
         shared: &Shared<'_>,
@@ -91,76 +234,62 @@ impl BonsaiMtp {
         let count = rows as u32;
         let scratch = &self.scratch;
         let weights = &self.weights;
-        let norm = |batch: &mut CommandBatch, input: &MetalBuffer, w: &MetalBuffer, output| {
-            shared.ops.rms_norm(
+        // Normalize `input` into `normalized` and its forward rotation into
+        // `scratch.rotated`, which the following projections read, in one
+        // dispatch.
+        let normalize = |batch: &mut CommandBatch,
+                         input: &MetalBuffer,
+                         w: &MetalBuffer,
+                         normalized: &MetalBuffer|
+         -> crate::Result<()> {
+            shared.kernels.normalize_transform(
                 batch,
+                shared.input_rotation,
                 input,
                 w,
-                output,
-                RmsNormParams {
-                    dimension: WIDTH as u32,
-                    rows: count,
-                    stride: WIDTH as u32,
-                    epsilon: shared.epsilon,
-                    weight_offset: 0,
-                },
-            )
+                normalized,
+                &scratch.rotated,
+                count,
+                shared.epsilon,
+            )?;
+            Ok(())
         };
         let dense = |batch: &mut CommandBatch,
                      matrix: &MatrixWeight,
-                     out_rows: usize,
-                     columns: usize,
                      input: &MetalBuffer,
                      output: &MetalBuffer| {
-            shared.ops.int8_matmul(
-                batch,
-                Int8Matrix {
-                    weights: &matrix.weights,
-                    scales: &matrix.scales,
-                    rows: out_rows as u32,
-                    columns: columns as u32,
-                },
-                input,
-                output,
-                count,
-            )
+            project(batch, shared, matrix, input, output, count)
         };
-        shared.kernels.transform(
-            batch,
-            shared.input_rotation,
-            &scratch.embedding,
-            &scratch.embedded,
-            count,
-            HadamardDirection::Inverse,
-        )?;
-        norm(
+        let rotate =
+            |batch: &mut CommandBatch, rotation, input: &MetalBuffer, output: &MetalBuffer| {
+                shared.kernels.transform(
+                    batch,
+                    rotation,
+                    input,
+                    output,
+                    count,
+                    HadamardDirection::Forward,
+                )
+            };
+        normalize(
             batch,
             &scratch.embedded,
             &weights.embedding_norm,
             &scratch.normalized_embedding,
         )?;
-        norm(
+        dense(
+            batch,
+            &weights.fc_embedding,
+            &scratch.rotated,
+            &scratch.hidden,
+        )?;
+        normalize(
             batch,
             hidden_in,
             &weights.hidden_norm,
             &scratch.normalized_hidden,
         )?;
-        dense(
-            batch,
-            &weights.fc_embedding,
-            WIDTH,
-            WIDTH,
-            &scratch.normalized_embedding,
-            &scratch.hidden,
-        )?;
-        dense(
-            batch,
-            &weights.fc_hidden,
-            WIDTH,
-            WIDTH,
-            &scratch.normalized_hidden,
-            &scratch.branch,
-        )?;
+        dense(batch, &weights.fc_hidden, &scratch.rotated, &scratch.branch)?;
         let residual = |batch: &mut CommandBatch| {
             shared.ops.residual_add(
                 batch,
@@ -172,21 +301,31 @@ impl BonsaiMtp {
         };
         residual(batch)?;
 
-        norm(
+        normalize(
             batch,
             &scratch.hidden,
             &weights.input_norm,
             &scratch.normalized,
         )?;
-        for (matrix, output) in [
-            (&weights.key, &scratch.key),
-            (&weights.value, &scratch.value),
-        ] {
-            dense(batch, matrix, KV, WIDTH, &scratch.normalized, output)?;
+        // Committed rows only feed later drafts through attention, so without
+        // logits the query, attention, FFN and final norm outputs are never
+        // read and the query projection is skipped.
+        let query = (&weights.query_gate, &scratch.query_gate);
+        let key = (&weights.key, &scratch.key);
+        let value = (&weights.value, &scratch.value);
+        let projections: &[(&MatrixWeight, &MetalBuffer)] = if logits {
+            &[query, key, value]
+        } else {
+            &[key, value]
+        };
+        if count == 1 {
+            project_concat(batch, shared, projections, &scratch.rotated)?;
+        } else {
+            for &(matrix, output) in projections {
+                dense(batch, matrix, &scratch.rotated, output)?;
+            }
         }
         if !logits {
-            // Committed rows only feed later drafts through attention, so the
-            // query, attention, FFN and final norm outputs are never read.
             shared.ops.prepare_kv_rows(
                 batch,
                 &scratch.key,
@@ -202,14 +341,6 @@ impl BonsaiMtp {
             )?;
             return Ok(());
         }
-        dense(
-            batch,
-            &weights.query_gate,
-            QUERY_GATE,
-            WIDTH,
-            &scratch.normalized,
-            &scratch.query_gate,
-        )?;
         shared.ops.prepare_attention_rows(
             batch,
             &scratch.query_gate,
@@ -251,93 +382,134 @@ impl BonsaiMtp {
                 &scratch.attention,
             )?;
         }
-        dense(
+        rotate(
             batch,
-            &weights.output,
-            WIDTH,
-            ATTENTION,
+            shared.attention_rotation,
             &scratch.attention_output,
-            &scratch.branch,
+            &scratch.query,
         )?;
+        dense(batch, &weights.output, &scratch.query, &scratch.branch)?;
         residual(batch)?;
 
-        norm(
+        normalize(
             batch,
             &scratch.hidden,
             &weights.post_attention_norm,
             &scratch.normalized,
         )?;
-        dense(
+        match (&weights.gate, &weights.up) {
+            // One row in one format: a fused single-token SwiGLU, so neither
+            // projection is stored.
+            (
+                MatrixWeight::Ptq1 {
+                    packed: gate,
+                    rows,
+                    columns,
+                },
+                MatrixWeight::Ptq1 { packed: up, .. },
+            ) if count == 1 => {
+                shared.kernels.matvec_swiglu(
+                    batch,
+                    ptq1(gate, *rows, *columns)?,
+                    ptq1(up, *rows, *columns)?,
+                    &scratch.rotated,
+                    &scratch.ffn_product,
+                )?;
+            }
+            (
+                MatrixWeight::Int8 {
+                    weights: gate,
+                    scales: gate_scales,
+                    rows,
+                    columns,
+                },
+                MatrixWeight::Int8 {
+                    weights: up,
+                    scales: up_scales,
+                    ..
+                },
+            ) if count == 1 => {
+                shared.kernels.int8_matvec_swiglu(
+                    batch,
+                    int8(gate, gate_scales, *rows, *columns)?,
+                    int8(up, up_scales, *rows, *columns)?,
+                    &scratch.rotated,
+                    &scratch.ffn_product,
+                )?;
+            }
+            _ => {
+                dense(batch, &weights.gate, &scratch.rotated, &scratch.ffn_gate)?;
+                dense(batch, &weights.up, &scratch.rotated, &scratch.ffn_up)?;
+                shared.ops.swiglu(
+                    batch,
+                    &scratch.ffn_gate,
+                    &scratch.ffn_up,
+                    &scratch.ffn_product,
+                    FFN as u32 * count,
+                )?;
+            }
+        }
+        rotate(
             batch,
-            &weights.gate,
-            FFN,
-            WIDTH,
-            &scratch.normalized,
+            shared.ffn_rotation,
+            &scratch.ffn_product,
             &scratch.ffn_gate,
         )?;
-        dense(
-            batch,
-            &weights.up,
-            FFN,
-            WIDTH,
-            &scratch.normalized,
-            &scratch.ffn_up,
-        )?;
-        shared.ops.swiglu(
-            batch,
-            &scratch.ffn_gate,
-            &scratch.ffn_up,
-            &scratch.ffn_product,
-            FFN as u32 * count,
-        )?;
-        dense(
-            batch,
-            &weights.down,
-            WIDTH,
-            FFN,
-            &scratch.ffn_product,
-            &scratch.branch,
-        )?;
+        dense(batch, &weights.down, &scratch.ffn_gate, &scratch.branch)?;
         residual(batch)?;
 
-        norm(
-            batch,
-            &scratch.hidden,
-            &weights.final_norm,
-            &scratch.predicted,
-        )?;
-        if logits {
-            // The shared PTQ1 head consumes rotated rows; project only the
-            // newest row, which is the sole draft candidate.
-            let last = if count == 1 {
-                &scratch.predicted
-            } else {
-                let row_bytes = WIDTH * size_of::<f32>();
-                batch.blit_buffer_copies([BufferCopyRequest {
-                    source: &scratch.predicted,
-                    source_offset: (rows - 1) * row_bytes,
-                    destination: &scratch.embedded,
-                    destination_offset: 0,
-                    size: row_bytes,
-                }])?;
-                &scratch.embedded
-            };
+        // The shared PTQ1 head consumes rotated rows; project only the newest
+        // row, which is the sole draft candidate.
+        if count == 1 {
+            // Final norm and rotation in one dispatch.
+            shared.kernels.normalize_transform(
+                batch,
+                shared.input_rotation,
+                &scratch.hidden,
+                &weights.final_norm,
+                &scratch.predicted,
+                &scratch.rotated,
+                1,
+                shared.epsilon,
+            )?;
+        } else {
+            shared.ops.rms_norm(
+                batch,
+                &scratch.hidden,
+                &weights.final_norm,
+                &scratch.predicted,
+                RmsNormParams {
+                    dimension: WIDTH as u32,
+                    rows: count,
+                    stride: WIDTH as u32,
+                    epsilon: shared.epsilon,
+                    weight_offset: 0,
+                },
+            )?;
+            let row_bytes = WIDTH * size_of::<f32>();
+            batch.blit_buffer_copies([BufferCopyRequest {
+                source: &scratch.predicted,
+                source_offset: (rows - 1) * row_bytes,
+                destination: &scratch.embedded,
+                destination_offset: 0,
+                size: row_bytes,
+            }])?;
             shared.kernels.transform(
                 batch,
                 shared.input_rotation,
-                last,
+                &scratch.embedded,
                 &scratch.rotated,
                 1,
                 HadamardDirection::Forward,
             )?;
-            shared.kernels.matmul(
-                batch,
-                shared.output.ptq1_matrix()?,
-                &scratch.rotated,
-                &self.logits,
-                1,
-            )?;
         }
+        shared.kernels.matmul(
+            batch,
+            shared.output.ptq1_matrix()?,
+            &scratch.rotated,
+            &self.logits,
+            1,
+        )?;
         Ok(())
     }
 }

@@ -108,6 +108,7 @@ impl BonsaiEngine {
             },
         );
         sampler.observe(prompt);
+        self.model.set_device_greedy(sampler.selects_argmax());
         let (reused, cache_source, prompt_snapshot, persisted_reusable_boundary) =
             self.prepare_prompt(prompt, session_id, progress)?;
         stats.reused_prompt_tokens = reused;
@@ -226,6 +227,12 @@ impl BonsaiEngine {
                 self.cached_tokens.extend_from_slice(prompt);
                 self.cached_tokens.extend_from_slice(&token_ids);
                 let represented_tokens = self.cached_tokens.clone();
+                // The prompt boundary's snapshot, read back now that decode
+                // no longer needs the bandwidth.
+                let prompt_snapshot = match prompt_snapshot {
+                    Some(checkpoint) => self.model.prompt_snapshot_at(&checkpoint)?,
+                    None => None,
+                };
                 self.save_prompt_checkpoint(&represented_tokens, false)?;
                 if let Some(snapshot) = prompt_snapshot {
                     self.save_session_snapshot(

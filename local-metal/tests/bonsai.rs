@@ -240,13 +240,14 @@ fn cpu_and_gpu_decoders_cover_every_byte_code_at_every_element() {
         expected
     );
 
-    // The scale remains half-aligned but not four-byte aligned. Prefix/suffix
-    // bytes must not be mistaken for a block, and output guards must not change.
-    let mut data = vec![0xcd; 2];
+    // Blocks start at a word-aligned offset but are not 16-byte aligned. Prefix/
+    // suffix bytes must not be mistaken for a block, and output guards must not
+    // change.
+    let mut data = vec![0xcd; 4];
     data.extend_from_slice(&packed);
     data.extend_from_slice(&[0xba; 30]);
     let weights = MetalBuffer::from_slice(context.device(), &data).expect("weights");
-    let matrix = Ptq1Matrix::new(&weights, 2, 256, 128).expect("matrix");
+    let matrix = Ptq1Matrix::new(&weights, 4, 256, 128).expect("matrix");
     let outputs = (0..128).map(|_| guarded(&context, 256)).collect::<Vec<_>>();
     let mut batch = CommandBatch::new(&context).expect("batch");
     for (element, output) in outputs.iter().enumerate() {
@@ -437,11 +438,11 @@ fn matvec_handles_partial_row_groups_and_partial_four_block_iterations() {
     for (rows, columns) in [(1, 128), (2, 256), (5, 384), (6, 640), (17, 896)] {
         let packed = packed_fixture(rows, columns, 127);
         let decoded = reference_decode(&packed);
-        let mut data = vec![0xcd; 6];
+        let mut data = vec![0xcd; 12];
         data.extend_from_slice(&packed);
         data.extend_from_slice(&[0xba; 30]);
         let weights = MetalBuffer::from_slice(context.device(), &data).expect("weights");
-        let matrix = Ptq1Matrix::new(&weights, 6, rows as u32, columns as u32).expect("matrix");
+        let matrix = Ptq1Matrix::new(&weights, 12, rows as u32, columns as u32).expect("matrix");
         let values = activations(columns);
         let mut padded = values.clone();
         padded.extend_from_slice(&[f32::NAN; 512]);
@@ -499,11 +500,15 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
     ] {
         let packed = packed_fixture(rows, columns, 913);
         let decoded = reference_decode(&packed);
-        let mut data = vec![0xcd; 6];
+        // Multi-token paths accept a half-aligned view; one token is a matvec,
+        // which needs a word-aligned one.
+        let offset = if tokens == 1 { 8 } else { 6 };
+        let mut data = vec![0xcd; offset];
         data.extend_from_slice(&packed);
         data.extend_from_slice(&[0xba; 30]);
         let weights = MetalBuffer::from_slice(context.device(), &data).expect("weights");
-        let matrix = Ptq1Matrix::new(&weights, 6, rows as u32, columns as u32).expect("matrix");
+        let matrix =
+            Ptq1Matrix::new(&weights, offset, rows as u32, columns as u32).expect("matrix");
         // Non-dyadic inputs distinguish F32 arithmetic from half-rounded operands.
         let mut values = activations(tokens * columns)
             .into_iter()
@@ -719,6 +724,18 @@ fn rejects_invalid_geometry_signs_aliasing_and_short_buffers_before_dispatch() {
     }
     let alias = input.clone();
     assert!(kernels.matvec(&mut batch, matrix, &input, &alias).is_err());
+    // Half-aligned views are valid, but the single-token kernels read words.
+    assert!(kernels.matvec(&mut batch, matrix, &input, &output).is_err());
+    assert!(
+        kernels
+            .matvec_swiglu(&mut batch, matrix, matrix, &input, &output)
+            .is_err()
+    );
+    assert!(
+        kernels
+            .matvec_concat(&mut batch, &[(matrix, &output)], &input)
+            .is_err()
+    );
     for (source, destination, tokens) in [
         (&input, &output, 0),
         (&input, &output, u32::MAX),
@@ -743,8 +760,9 @@ fn kernels_with_small_batch_max(context: &MetalContext, tokens: u32) -> BonsaiKe
         .with_small_batch_max(tokens)
 }
 
-// Every exact-token kernel, every balanced multi-chunk split, partial row
-// groups, partial four-block iterations and real projection widths. The
+// Every exact-token kernel, the wide kernel alone and with each scalar tail
+// (9 -> 7 + 2, 12 -> 8 + 4, 17 -> 8 + 7 + 2), partial row groups, partial
+// four-block iterations and real projection widths. The
 // small-batch path repeats the decode matvec's arithmetic per token, but the
 // compiler contracts the per-token FMAs differently, so results are not bit
 // identical (first run: 3.7e-7 gap on a 1.4-magnitude row); the gap is bounded
@@ -782,6 +800,10 @@ fn small_batch_matches_tokenwise_matvec_reference_and_tile_for_all_chunks() {
         data.extend_from_slice(&[0xba; 30]);
         let weights = MetalBuffer::from_slice(context.device(), &data).expect("weights");
         let matrix = Ptq1Matrix::new(&weights, 6, rows as u32, columns as u32).expect("matrix");
+        // The matvec reads words, so it gets a word-aligned copy.
+        let aligned = MetalBuffer::from_slice(context.device(), &data[2..]).expect("aligned");
+        let word_matrix =
+            Ptq1Matrix::new(&aligned, 4, rows as u32, columns as u32).expect("word matrix");
         // Token-dependent, non-dyadic values so rows are distinguishable, with
         // outliers wide enough to expose row/offset mixups. F16 operand
         // rounding and beyond-half sums are covered by the tests above; larger
@@ -814,7 +836,7 @@ fn small_batch_matches_tokenwise_matvec_reference_and_tile_for_all_chunks() {
             .expect("tile");
         for (token_input, output) in token_inputs.iter().zip(&matvec_outputs) {
             kernels
-                .matvec(&mut batch, matrix, token_input, output)
+                .matvec(&mut batch, word_matrix, token_input, output)
                 .expect("matvec");
         }
         batch.commit_and_wait().expect("completion");

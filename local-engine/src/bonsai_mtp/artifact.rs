@@ -1,56 +1,48 @@
-//! Shipping the int8 head, so an install can run speculation from an artifact
-//! instead of an 849 MB BF16 source.
+//! Exporting the trained head as the artifact an install ships.
 //!
-//! `local-ai bonsai --export mtp-head=<dir>` writes `mtp-head-int8-v2.bin` beside
-//! nothing else: no GPU, no 5.9 GB target checkpoint, and no second copy of the
-//! transform. The same file can hold its sections verbatim or behind one zstd
-//! frame; which one it holds is in the file's own magic, so the loader reads
-//! either without being told.
+//! `local-ai bonsai --export mtp-head=<dir>` packs
+//! `<dir>/model_mtp_ternary.safetensors` into `<dir>/mtp-head-ptq1-v1.bin`:
+//! no GPU and no target checkpoint needed.
 
 use std::path::{Path, PathBuf};
 
-use super::cache::{Codec, HeadFile, MTP_HEAD_ARTIFACT, write_artifact, write_zstd_artifact};
-use super::weights::{spec, transform_sections};
+use super::format::{HeadFile, MTP_HEAD_ARTIFACT, write_artifact};
+use super::ternary::{MTP_TERNARY_SOURCE, MatrixFormat, head_sections, head_spec};
+use super::weights::MATRIX_SPECS;
 
-/// What one exported int8 head contains.
+/// What one exported head contains.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct MtpHeadArtifact {
     /// The artifact that was written.
     pub path: PathBuf,
-    /// The BF16 safetensors it was quantized from.
+    /// The safetensors it was packed from.
     pub source: PathBuf,
+    /// Matrices stored as per-row int8; every other matrix is `PTQ1_0`.
+    pub int8_matrices: Vec<String>,
     /// Sections in artifact order; the header names every one of them.
     pub sections: usize,
     /// Section bytes with the inter-section padding skipped: what a load hashes
     /// and uploads, and the artifact's content identity.
     pub payload_bytes: u64,
-    /// Bytes on disk, header page and padding included — less than
-    /// [`Self::canonical_bytes`] for a compressed export.
+    /// Bytes on disk, header page and padding included.
     pub file_bytes: u64,
-    /// Bytes the same head occupies with its sections stored verbatim, which is
-    /// what [`Self::file_bytes`] means for the stored export.
-    pub canonical_bytes: u64,
-    /// How the file encodes its sections: `stored` or `zstd`. Recorded here for
-    /// the reader of this report; the file itself says it in its magic.
-    pub compression: &'static str,
     pub payload_sha256: String,
 }
 
 impl MtpHeadArtifact {
     fn exported(
         source: &Path,
+        int8_matrices: Vec<String>,
         sections: usize,
-        codec: Codec,
         head: HeadFile,
     ) -> crate::Result<Self> {
         Ok(Self {
             path: head.path,
             source: source.to_owned(),
+            int8_matrices,
             sections,
             payload_bytes: widen(head.payload_bytes, "MTP head payload exceeds 64 bits")?,
             file_bytes: widen(head.file_bytes, "MTP head file exceeds 64 bits")?,
-            canonical_bytes: widen(head.canonical_bytes, "MTP head image exceeds 64 bits")?,
-            compression: codec.name(),
             payload_sha256: head.payload_sha256,
         })
     }
@@ -60,51 +52,83 @@ fn widen(bytes: usize, message: &'static str) -> crate::Result<u64> {
     u64::try_from(bytes).map_err(|_| crate::Error::InvalidFormat(message.into()))
 }
 
-/// Quantize the BF16 head at `source` into `<directory>/mtp-head-int8-v2.bin`,
-/// with its sections stored verbatim.
+/// Pack the trained head at `<directory>/model_mtp_ternary.safetensors` into
+/// `<directory>/mtp-head-ptq1-v1.bin`, stored verbatim.
 ///
-/// The transform is [`transform_sections`], the one `Weights::load` runs on a
-/// cache miss, so the artifact is byte-identical to the payload the loader would
-/// have built for itself. Every later load re-derives the digest from the file and
-/// compares it with the header, which is what lets an install ship this file and
-/// trust it.
-///
-/// This is the default because a load of the stored form costs no anonymous RAM:
-/// the file is mapped and its sections reach Metal as demand-paged pointers.
-pub fn export_head(source: &Path, directory: &Path) -> crate::Result<MtpHeadArtifact> {
-    let spec = spec();
-    let sections = transform_sections(source)?;
-    let count = sections.len();
-    let head = write_artifact(&directory.join(MTP_HEAD_ARTIFACT), &spec, &sections)?;
-    MtpHeadArtifact::exported(source, count, Codec::Stored, head)
+/// Ternary codes and scales are packed into the target's `PTQ1_0` blocks bit
+/// for bit, int8 matrices and their row scales are stored as given, norms are
+/// folded to `1 + w`, and the file records its section names (which say each
+/// matrix's format) and payload digest, which every load re-derives and checks.
+/// Install it in `models/bonsai2-27b-mtp/`.
+pub fn export_head(directory: &Path) -> crate::Result<MtpHeadArtifact> {
+    let source = directory.join(MTP_TERNARY_SOURCE);
+    let packed = head_sections(&source)?;
+    let spec = head_spec(&packed.formats);
+    let int8_matrices = MATRIX_SPECS
+        .iter()
+        .zip(&packed.formats)
+        .filter(|(_, format)| **format == MatrixFormat::Int8)
+        .map(|(matrix, _)| matrix.section.to_owned())
+        .collect();
+    let count = packed.sections.len();
+    let head = write_artifact(&directory.join(MTP_HEAD_ARTIFACT), &spec, &packed.sections)?;
+    MtpHeadArtifact::exported(&source, int8_matrices, count, head)
 }
 
-/// Quantize the BF16 head at `source` into `<directory>/mtp-head-int8-v2.bin`,
-/// with its section region behind one zstd frame.
-///
-/// Same transform, same spec, same section names and offsets, and the same
-/// `payload_sha256`: inflating the frame rebuilds the file [`export_head`] writes,
-/// byte for byte. The frame is decoded into the image before any of it is
-/// validated, so the two forms are held to one standard rather than trusted
-/// separately.
-///
-/// **The trade, stated plainly.** The stored head is mapped, and
-/// `from_bytes_no_copy` hands Metal pointers into pages the kernel demand-pages and
-/// reclaims — so a load spends no anonymous RAM on it. An inflated head has to
-/// exist in full before a single section can be read, so every load through one
-/// spends ~425 MB of anonymous RAM that stays resident for the life of the process
-/// and cannot be paged out. Measured on the shipped head, reading it that way peaks
-/// at 752 MiB resident against 412 MiB for the mapped file, and the difference is
-/// the inflated image plus the frame's page cache. In exchange the file is 69,425,452
-/// bytes smaller — 425,263,104 -> 355,837,652 on disk, 16.3% — and the transform is
-/// not needed at load time either way. Seventy megabytes of disk is not worth 425 MB
-/// of resident memory on every speculative load, so this stays opt-in: it writes to
-/// the same installed path, overwriting whatever was there, and the loader needs
-/// nothing to be told about it.
-pub fn export_head_zstd(source: &Path, directory: &Path) -> crate::Result<MtpHeadArtifact> {
-    let spec = spec();
-    let sections = transform_sections(source)?;
-    let count = sections.len();
-    let head = write_zstd_artifact(&directory.join(MTP_HEAD_ARTIFACT), &spec, &sections)?;
-    MtpHeadArtifact::exported(source, count, Codec::Zstd, head)
+/// Rewrite the head at `source` into `destination` with the matrices at
+/// `int8` (indices into `MATRIX_SPECS`) requantized per row to int8 from their
+/// dequantized `PTQ1_0` weights (`row_scale = absmax / 127`), every other
+/// section copied. The result is a mixed head whose int8 matrices closely
+/// approximate the ternary ones, for tests comparing the two formats' kernels.
+#[cfg(test)]
+pub fn requantize_head(source: &Path, destination: &Path, int8: &[usize]) -> crate::Result<()> {
+    use super::format::read_head_with;
+    use super::ternary::formats_from_names;
+
+    let bind = |names: &[&str]| formats_from_names(names).map(|formats| head_spec(&formats));
+    let head = read_head_with(source, &bind).map_err(crate::Error::InvalidFormat)?;
+    let mut formats = formats_from_names(
+        &head
+            .spec
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(crate::Error::InvalidFormat)?;
+    let section = |index: usize| {
+        let (offset, length) = head.sections[index];
+        &head.map[offset..offset + length]
+    };
+    let mut sections = Vec::with_capacity(head.spec.len() + int8.len());
+    let mut at = 0;
+    for (index, (matrix, format)) in MATRIX_SPECS.iter().zip(&mut formats).enumerate() {
+        let width = if *format == MatrixFormat::Int8 { 2 } else { 1 };
+        if !int8.contains(&index) || *format == MatrixFormat::Int8 {
+            sections.extend((at..at + width).map(|i| section(i).to_vec()));
+            at += width;
+            continue;
+        }
+        let packed = section(at);
+        at += 1;
+        let row_bytes = matrix.columns / 128 * 28;
+        let mut weights = Vec::with_capacity(matrix.rows * matrix.columns);
+        let mut scales = Vec::with_capacity(matrix.rows * 4);
+        let mut row = vec![0.0_f32; matrix.columns];
+        for packed_row in packed.chunks_exact(row_bytes) {
+            local_metal::bonsai::decode_ptq1_row(packed_row, &mut row)?;
+            let peak = row.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+            let scale = if peak > 0.0 { peak / 127.0 } else { 1.0 };
+            weights.extend(
+                row.iter()
+                    .map(|v| (v / scale).round().clamp(-127.0, 127.0) as i8 as u8),
+            );
+            scales.extend_from_slice(&scale.to_le_bytes());
+        }
+        sections.push(weights);
+        sections.push(scales);
+        *format = MatrixFormat::Int8;
+    }
+    sections.extend((at..head.spec.len()).map(|i| section(i).to_vec()));
+    write_artifact(destination, &head_spec(&formats), &sections)?;
+    Ok(())
 }

@@ -7,7 +7,6 @@ use crate::bonsai::BonsaiMetalTensor;
 use crate::bonsai_native::grow_cache;
 
 use super::MtpSettings;
-use super::cache::HeadCacheStatus;
 use super::weights::Weights;
 use super::{ATTENTION, FFN, KV, KV_TOKEN_BYTES, QUERY_GATE, WIDTH};
 
@@ -19,6 +18,10 @@ pub struct Shared<'a> {
     pub kernels: &'a BonsaiKernels,
     pub ops: &'a BonsaiOps,
     pub input_rotation: &'a SignedHadamard,
+    /// Forward rotations for the 6144- and 17408-wide inputs the head's
+    /// `o_proj` and `down_proj` consume.
+    pub attention_rotation: &'a SignedHadamard,
+    pub ffn_rotation: &'a SignedHadamard,
     pub output: &'a BonsaiMetalTensor,
     pub epsilon: f32,
     pub rope_base: f32,
@@ -89,7 +92,6 @@ pub struct BonsaiMtp {
     /// Draft logits for the newest row, projected through the shared head.
     pub logits: MetalBuffer,
     pub weight_bytes: u64,
-    pub head_cache: HeadCacheStatus,
 }
 
 impl BonsaiMtp {
@@ -113,7 +115,7 @@ impl BonsaiMtp {
                 "MTP initial KV allocation must be within the context".into(),
             ));
         }
-        let (weights, weight_bytes, head_cache) = Weights::load(context.device(), settings)?;
+        let (weights, weight_bytes) = Weights::load(context.device(), settings)?;
         Ok(Self {
             depth: settings.depth,
             weights,
@@ -123,7 +125,6 @@ impl BonsaiMtp {
             prev_hidden: MetalBuffer::empty(context.device(), WIDTH * size_of::<f32>())?,
             logits: MetalBuffer::empty(context.device(), vocab * size_of::<f32>())?,
             weight_bytes,
-            head_cache,
         })
     }
 

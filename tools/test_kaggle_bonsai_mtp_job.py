@@ -19,7 +19,7 @@ TINY_HEAD = b"tiny-mtp-head-bytes"
 SUPPORTS = {name: name.encode() for name in head.PIN["SUPPORT_FILES"]}
 
 ENGINE_SOURCES = Path(__file__).resolve().parents[1] / "local-engine/src"
-MTP_HEAD_SYMBOL = "DEFAULT_BONSAI_MTP_HEAD"
+MTP_HEAD_SYMBOL = "DEFAULT_BONSAI_MTP_ARTIFACT"
 STRING_LITERAL = re.compile(r"#*\"(?P<path>[^\"\n]*)\"#*")
 # `= OTHER_CONST;` delegates the value; follow a couple of hops rather than a whole file.
 MAX_HOPS = 3
@@ -94,7 +94,7 @@ def comparable_directory(literal):
 
 
 def mtp_head_directories(sources):
-    """Every directory the engine's `DEFAULT_BONSAI_MTP_HEAD` bindings resolve to.
+    """Every directory the engine's `DEFAULT_BONSAI_MTP_ARTIFACT` bindings resolve to.
 
     Read off the constant's own initialisers — literals concatenated in binding order, as
     `concat!` does — following `= OTHER_CONST;` delegations. Deliberately never scans a
@@ -178,7 +178,7 @@ class Tests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_pin_matches_upstream_head_and_engine_default(self):
+    def test_pin_matches_upstream_teacher_and_stays_out_of_the_runtime_directory(self):
         self.assertEqual(head.PIN["MODEL_FILE"], "model_mtp.safetensors")
         self.assertEqual(head.PIN["MODEL_SIZE"], 849_400_392)
         self.assertEqual(
@@ -186,16 +186,17 @@ class Tests(unittest.TestCase):
             "7a4a18b2d02116ef184d1b0ee4af46d829825ff2c042f79cf37ef8a03c399218",
         )
         head_path = head.DEFAULT_DESTINATION / head.PIN["MODEL_FILE"]
-        self.assertEqual(head_path, Path("models/bonsai2-27b-mtp/model_mtp.safetensors"))
-        # What this protects: the directory this stager publishes the head into is the
-        # directory the engine looks in at run time. It does NOT protect the exact
-        # spelling of the Rust constant — that text is the engine's business, so the
+        self.assertEqual(
+            head_path, Path("models/bonsai2-27b-mtp-teacher/model_mtp.safetensors")
+        )
+        # What this protects: the BF16 teacher is training input, not a runtime head,
+        # so it must not be published into the directory the engine loads its ternary
+        # artifact from (the no-clobber installer would refuse it there anyway). The
         # check is deliberately location- and formatting-agnostic: locate the constant
         # by SYMBOL anywhere under local-engine/src, then compare the directory it
         # resolves to with DEFAULT_DESTINATION. Reformatting, cfg-splitting, renaming
         # the constant or moving it to another module must never fail a Kaggle staging
-        # run; pointing the engine at a different directory must always fail.
-        # Do not tighten this back into a literal grep of one source file.
+        # run. Do not tighten this into a literal grep of one source file.
         sources = rust_sources()
         holders = sorted(name for name, text in sources.items() if MTP_HEAD_SYMBOL in text)
         self.assertTrue(
@@ -203,12 +204,12 @@ class Tests(unittest.TestCase):
             f"{MTP_HEAD_SYMBOL} is declared nowhere under {ENGINE_SOURCES}",
         )
         declared = mtp_head_directories(sources)
-        self.assertTrue(declared, f"no {MTP_HEAD_SYMBOL} path literal found")
-        self.assertEqual(
+        self.assertEqual(declared, {"models/bonsai2-27b-mtp"})
+        self.assertNotIn(
+            head.DEFAULT_DESTINATION.as_posix(),
             declared,
-            {head.DEFAULT_DESTINATION.as_posix()},
-            msg=f"engine head directories {sorted(declared)} disagree with the "
-            f"staged destination {head.DEFAULT_DESTINATION.as_posix()!r}",
+            msg=f"the teacher destination {head.DEFAULT_DESTINATION.as_posix()!r} is "
+            "the engine's runtime head directory",
         )
 
     def test_binding_is_isolated_from_the_shared_downloader(self):
@@ -257,7 +258,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(manifest["upstream"]["revision"], head.PIN["REVISION"])
         self.assertFalse(manifest["job"]["gpu_required"])
 
-        destination = self.root / "models" / "bonsai2-27b-mtp"
+        destination = self.root / "models" / "bonsai2-27b-mtp-teacher"
         installed = module.install_archive(archive, destination)
         self.assertEqual(installed["upstream"], manifest["upstream"])
         self.assertEqual((destination / "model_mtp.safetensors").read_bytes(), TINY_HEAD)
@@ -296,7 +297,7 @@ class Tests(unittest.TestCase):
             for path in sorted(work.iterdir()):
                 tar.add(path, arcname=path.name)
         with self.assertRaises(ValueError):
-            head.install_head(archive, self.root / "models" / "bonsai2-27b-mtp")
+            head.install_head(archive, self.root / "models" / "bonsai2-27b-mtp-teacher")
 
     def test_staged_job_freezes_head_sources_and_binds_before_download(self):
         staged = head.stage_job("owner/bonsai-mtp-head", self.root / "staged")

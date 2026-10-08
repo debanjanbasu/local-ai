@@ -479,9 +479,9 @@ fn tensor_bytes_are_exact_views_of_the_mapped_payload() {
 }
 
 #[test]
-#[ignore = "requires BONSAI_GGUF"]
+#[ignore = "requires the pinned model"]
 fn real_bonsai_profile_is_pinned() {
-    let path = std::env::var("BONSAI_GGUF").expect("BONSAI_GGUF must name the verified GGUF");
+    let path = crate::bonsai::DEFAULT_BONSAI_GGUF;
     let package = BonsaiPackage::open(path).expect("open real Bonsai");
     assert_eq!(
         (

@@ -2,9 +2,7 @@
 
 use local_metal::{
     batch::CommandBatch,
-    bonsai_ops::{
-        AttentionWorkspace, Bf16Matrix, BonsaiOps, Int8Matrix, KvFormat, KvLayout, RmsNormParams,
-    },
+    bonsai_ops::{AttentionWorkspace, Bf16Matrix, BonsaiOps, KvFormat, KvLayout, RmsNormParams},
     buffer::MetalBuffer,
     context::MetalContext,
     shaders::ShaderLibrary,
@@ -324,60 +322,6 @@ fn bf16_matmul_tiles_match_f64_on_partial_row_and_token_tiles() {
             "row {r}: tiled {tiled} vs matvec {vector}"
         );
     }
-}
-
-#[test]
-fn int8_matvec_and_tiled_matmul_match_f64() {
-    let Some((ctx, ops)) = setup() else { return };
-    let (rows, columns, tokens) = (37_usize, 320_usize, 41_usize);
-    let weights_data = (0..rows * columns)
-        .map(|i| i8::from_ne_bytes([u8::try_from((i * 29 + 17) % 255).expect("bounded signal")]))
-        .collect::<Vec<_>>();
-    let scales_data = (0..rows)
-        .map(|i| (i as f32).mul_add(0.0003, 0.002))
-        .collect::<Vec<_>>();
-    let input_data = (0..tokens * columns)
-        .map(|i| signal(i, 12))
-        .collect::<Vec<_>>();
-    let weights = MetalBuffer::from_slice(ctx.device(), &weights_data).expect("int8 weights");
-    let scales = floats(&ctx, &scales_data);
-    let input = floats(&ctx, &input_data);
-    let output = guarded(&ctx, rows * tokens);
-    let matrix = Int8Matrix {
-        weights: &weights,
-        scales: &scales,
-        rows: rows as u32,
-        columns: columns as u32,
-    };
-    let mut batch = CommandBatch::new(&ctx).expect("batch");
-    ops.int8_matmul(&mut batch, matrix, &input, &output, tokens as u32)
-        .expect("int8 matmul");
-    batch.commit_and_wait().expect("int8 matmul completion");
-    let expected = (0..tokens)
-        .flat_map(|token| {
-            let weights_data = &weights_data;
-            let scales_data = &scales_data;
-            let input_data = &input_data;
-            (0..rows).map(move |row| {
-                (0..columns)
-                    .map(|column| {
-                        f64::from(weights_data[row * columns + column])
-                            * f64::from(scales_data[row])
-                            * f64::from(input_data[token * columns + column])
-                    })
-                    .sum::<f64>()
-            })
-        })
-        .collect::<Vec<_>>();
-    check(&output, &expected, 4e-5);
-
-    let one_input = floats(&ctx, &input_data[..columns]);
-    let one_output = guarded(&ctx, rows);
-    let mut batch = CommandBatch::new(&ctx).expect("batch");
-    ops.int8_matmul(&mut batch, matrix, &one_input, &one_output, 1)
-        .expect("int8 matvec");
-    batch.commit_and_wait().expect("int8 matvec completion");
-    check(&one_output, &expected[..rows], 4e-5);
 }
 
 #[test]
@@ -850,6 +794,30 @@ fn split_gqa_matches_f64_across_boundaries_and_shorter_workspace_reuse() {
     }
 }
 
+/// Orthonormal 256-point Walsh-Hadamard transform of every 256-value row, the
+/// basis quantized caches are stored in (`bonsai_hadamard256`). Symmetric and
+/// self-inverse.
+fn hadamard_rows(values: &[f64]) -> Vec<f64> {
+    let mut out = values.to_vec();
+    for row in out.chunks_mut(256) {
+        let mut distance = 1;
+        while distance < 256 {
+            for i in 0..256 {
+                if i & distance == 0 {
+                    let (a, b) = (row[i], row[i | distance]);
+                    row[i] = a + b;
+                    row[i | distance] = a - b;
+                }
+            }
+            distance <<= 1;
+        }
+        for value in row.iter_mut() {
+            *value /= 16.0;
+        }
+    }
+    out
+}
+
 /// Independent model of the quantized cache row layout (`bonsai_kv_store`):
 /// per KV head, eight 32-value blocks; Q8 keeps one int8 per value then 32 F16
 /// scales after byte 1024.
@@ -937,7 +905,10 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
             })
         })
         .collect::<Vec<_>>();
-    for layout in [KvLayout::parse("q8").expect("q8")] {
+    // Quantized caches store Hadamard-rotated rows.
+    let expected_key = hadamard_rows(&expected_key);
+    let expected_value = hadamard_rows(&v_data.iter().map(|&v| f64::from(v)).collect::<Vec<_>>());
+    for layout in ["q8"].map(|name| KvLayout::parse(name).expect("layout")) {
         let cache = |format: KvFormat| {
             MetalBuffer::from_slice(
                 ctx.device(),
@@ -1000,12 +971,7 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
 
         for (format, cache, expected, label) in [
             (layout.key, &only_k, &expected_key, "key"),
-            (
-                layout.value,
-                &only_v,
-                &v_data.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
-                "value",
-            ),
+            (layout.value, &only_v, &expected_value, "value"),
         ] {
             let bytes = cache.as_slice::<u8>();
             let row_bytes = format.token_bytes();
@@ -1017,7 +983,10 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
                     .all(|&b| b == 0xFF),
                 "{layout:?} {label} guard bytes"
             );
-            let levels = 127.0;
+            // Largest level; every format rounds to within half a scale step.
+            let (levels, half_step) = match format {
+                KvFormat::F16 | KvFormat::Q8 => (127.0, 0.5),
+            };
             for token in 0..tokens as usize {
                 let row = &bytes[(position as usize + token) * row_bytes..][..row_bytes];
                 let decoded = dequantize_row(format, row);
@@ -1037,7 +1006,7 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
                         // Half a step of rounding, plus the F32 prep kernel's own
                         // error (the F16 test allows 0.004) which can shift the
                         // scale by an F16 ulp.
-                        let bound = scale.mul_add(2e-3f64.mul_add(levels, 0.5), 0.004);
+                        let bound = scale.mul_add(2e-3f64.mul_add(levels, half_step), 0.004);
                         assert!(
                             error <= bound,
                             "{layout:?} {label} token {token} element {index}: {} vs {} (bound {bound})",
@@ -1045,16 +1014,6 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
                             wanted[index]
                         );
                     }
-                }
-                // The independently quantized row must agree with the GPU's
-                // except where the F32 rounding boundary differs: for values
-                // the prep kernel stores the input unchanged, so bytes match.
-                if label == "value" {
-                    assert_eq!(
-                        row,
-                        quantize_row(format, &v_data[token * 1024..][..1024]).as_slice(),
-                        "{layout:?} value token {token} bytes"
-                    );
                 }
             }
         }
@@ -1083,7 +1042,7 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
     let query = floats(&ctx, &query_data);
     let gate = floats(&ctx, &gate_data);
     let mut output = guarded(&ctx, 6144 * query_rows);
-    let reference = |row: usize, prefix: usize, k: &[f32], v: &[f32], gated: bool| {
+    let reference_raw = |row: usize, prefix: usize, k: &[f32], v: &[f32], gated: bool| {
         let mut expected = vec![0.0; 6144];
         for head in 0..24 {
             let mut scores = (0..prefix)
@@ -1119,7 +1078,23 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
         }
         expected
     };
-    for layout in [KvLayout::parse("q8").expect("q8"), KvLayout::F16] {
+    // A quantized cache is taken to hold rotated rows: its kernels attend in
+    // that basis and `bo_attn_unrotate` rotates each head's output back before
+    // gating. The F16 path gates directly.
+    let reference_in =
+        |row: usize, prefix: usize, k: &[f32], v: &[f32], gated: bool, rotated: bool| {
+            let mut expected = reference_raw(row, prefix, k, v, false);
+            if rotated {
+                expected = hadamard_rows(&expected);
+            }
+            if gated {
+                for (index, value) in expected.iter_mut().enumerate() {
+                    *value /= 1.0 + (-f64::from(gate_data[row * 6144 + index])).exp();
+                }
+            }
+            expected
+        };
+    for layout in ["q8", "f16"].map(|name| KvLayout::parse(name).expect("layout")) {
         let encode = |format: KvFormat, data: &[f32]| {
             let bytes = data
                 .chunks(1024)
@@ -1144,7 +1119,23 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                 "{layout:?} keys rounded"
             );
         }
+        // Every attention path dequantizes a quantized value and rounds it once
+        // to half (the tensor kernels' operand type, matched by the SIMD
+        // reader). That rounding is the kernels' contract, so the reference
+        // applies it too rather than the bound being loosened.
+        let half_operands = layout != KvLayout::F16;
+        let rounded = |data: &[f32]| {
+            data.iter()
+                .map(|&value| half::f16::from_f32(value).to_f32())
+                .collect::<Vec<_>>()
+        };
+        let (k_half, v_half) = (rounded(&k_seen), rounded(&v_seen));
         for prefix in [1u32, 129, 257, 300, 1100] {
+            let (k_read, v_read) = if half_operands {
+                (&k_half, &v_half)
+            } else {
+                (&k_seen, &v_seen)
+            };
             for gated in [false, true] {
                 let mut batch = CommandBatch::new(&ctx).expect("batch");
                 ops.attention_row_kv(
@@ -1161,7 +1152,14 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                 )
                 .expect("attention row");
                 batch.commit_and_wait().expect("attention completion");
-                let expected = reference(0, prefix as usize, &k_seen, &v_seen, gated);
+                let expected = reference_in(
+                    0,
+                    prefix as usize,
+                    k_read,
+                    v_read,
+                    gated,
+                    layout != KvLayout::F16,
+                );
                 for (index, (&actual, &wanted)) in output.as_slice::<f32>()[..6144]
                     .iter()
                     .zip(&expected)
@@ -1198,7 +1196,14 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
             batch.commit_and_wait().expect("block completion");
             let out = output.as_slice::<f32>();
             for row in 0..rows {
-                let expected = reference(row, position as usize + row + 1, &k_seen, &v_seen, true);
+                let prefix = position as usize + row + 1;
+                let (k_read, v_read) = if half_operands {
+                    (&k_half, &v_half)
+                } else {
+                    (&k_seen, &v_seen)
+                };
+                let expected =
+                    reference_in(row, prefix, k_read, v_read, true, layout != KvLayout::F16);
                 for (index, (&actual, &wanted)) in
                     out[row * 6144..][..6144].iter().zip(&expected).enumerate()
                 {

@@ -86,6 +86,27 @@ const fn stream_head(chat: bool) -> &'static str {
     }
 }
 
+/// Window for the streamed body: 2 MiB.
+///
+/// A streamed body's size is unknown when it opens, so zstd falls back to level
+/// 22's full table sizes (window 2^27, hash 2^25, chain 2^27) and allocates and
+/// clears ~740 MB per response. These are the logs zstd itself picks for level
+/// 22 once it knows the input is at most 2 MiB. Measured with zstd 0.13.3 on a
+/// 1.5 MB text body written in 256-byte flushed pieces: the same 555,029
+/// compressed bytes, 39 MB peak instead of 744 MB, 206 ms instead of 304 ms.
+/// A larger body still compresses correctly; it only loses matches further
+/// back than 2 MiB.
+const STREAM_WINDOW_LOG: u32 = 21;
+
+fn open_encoder() -> std::io::Result<Encoder<'static, Vec<u8>>> {
+    use zstd::stream::raw::CParameter;
+    let mut encoder = Encoder::new(Vec::new(), ZSTD_LEVEL)?;
+    encoder.set_parameter(CParameter::WindowLog(STREAM_WINDOW_LOG))?;
+    encoder.set_parameter(CParameter::HashLog(STREAM_WINDOW_LOG + 1))?;
+    encoder.set_parameter(CParameter::ChainLog(STREAM_WINDOW_LOG + 1))?;
+    Ok(encoder)
+}
+
 /// How body bytes reach the wire.
 enum Codec {
     /// Plain bytes: every client that did not ask for zstd, and the same choice
@@ -125,8 +146,7 @@ impl Body {
     /// request over its transfer encoding.
     pub(super) fn open(chat: bool, model: Arc<str>, zstd: bool) -> (Self, bool) {
         let codec = if zstd {
-            Encoder::new(Vec::new(), ZSTD_LEVEL)
-                .map_or(Codec::Plain, |encoder| Codec::Zstd(Some(Box::new(encoder))))
+            open_encoder().map_or(Codec::Plain, |encoder| Codec::Zstd(Some(Box::new(encoder))))
         } else {
             Codec::Plain
         };

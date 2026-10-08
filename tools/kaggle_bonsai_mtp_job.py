@@ -1,10 +1,12 @@
-"""Stage a private CPU-only Kaggle job for the pinned Bonsai 2 MTP head.
+"""Stage a private CPU-only Kaggle job for the pinned Bonsai 2 MTP teacher head.
 
-The community head (`model_mtp.safetensors`) travels the same bounded,
-digest-checked path as the target checkpoint: this module rebinds the pinned
-identity of `kaggle_bonsai_job` to the head repository and reuses its
-downloader, archive format and no-clobber installer unchanged. Staging never
-submits a job; installation never replaces an existing head directory.
+The community BF16 head (`ProCreations/Ternary-Bonsai-2-27B-MTP`,
+`model_mtp.safetensors`) is the distillation teacher for the ternary head the
+engine ships (`tools/mtp_train/train_ternary.py`); the runtime never reads it.
+It travels the same bounded, digest-checked path as the target checkpoint: this
+module rebinds the pinned identity of `kaggle_bonsai_job` to the head repository
+and reuses its downloader, archive format and no-clobber installer unchanged.
+Staging never submits a job; installation never replaces an existing directory.
 """
 
 from __future__ import annotations
@@ -24,8 +26,10 @@ PIN = {
     # Small text files kept beside the head for attribution and provenance.
     "SUPPORT_FILES": ("README.md", "LICENSE", "NOTICE", "TRAINING.md", "mtp_config.json"),
 }
-# Where the engine's `DEFAULT_BONSAI_MTP_HEAD` expects the head at run time.
-DEFAULT_DESTINATION = Path("models/bonsai2-27b-mtp")
+# Where the teacher is installed for training: beside, never inside, the runtime
+# head directory the engine's `DEFAULT_BONSAI_MTP_ARTIFACT` names, which the
+# no-clobber installer would refuse anyway.
+DEFAULT_DESTINATION = Path("models/bonsai2-27b-mtp-teacher")
 SOURCE_FILES = (
     "kaggle_bonsai_job.py",
     "kaggle_bonsai_mtp_job.py",
@@ -70,7 +74,7 @@ def pinned_downloader(pin: dict | None = None):
 
 
 def install_head(archive: Path, destination: Path = DEFAULT_DESTINATION) -> dict:
-    """Verify a recovered head archive against the pin and publish a new head directory."""
+    """Verify a recovered teacher archive against the pin and publish a new directory."""
     return pinned_downloader().install_archive(Path(archive), Path(destination))
 
 
@@ -100,7 +104,7 @@ tests = frozen("test_kaggle_bonsai_job")
 checks = tests.run_cloud_checks()
 output = module.run_job(archive_name=ARCHIVE_NAME, source_sha256=SOURCE_SHA256,
                         checks_run=checks)
-print("Verified pinned Bonsai MTP head archive:", output.name, module.MODEL_SIZE,
+print("Verified pinned Bonsai MTP teacher head archive:", output.name, module.MODEL_SIZE,
       module.MODEL_SHA256, flush=True)
 """
 
@@ -115,13 +119,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--kernel", help="stage for this new private owner/slug")
-    modes.add_argument("--install", type=Path, help="recovered head archive to install")
+    modes.add_argument("--install", type=Path, help="recovered teacher archive to install")
     parser.add_argument("--output", type=Path, help="staging directory (with --kernel)")
     parser.add_argument(
         "--destination",
         type=Path,
         default=DEFAULT_DESTINATION,
-        help=f"new head directory (with --install; default: {DEFAULT_DESTINATION})",
+        help=f"new teacher directory (with --install; default: {DEFAULT_DESTINATION})",
     )
     args = parser.parse_args()
     if args.kernel:

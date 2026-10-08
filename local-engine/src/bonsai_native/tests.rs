@@ -1,6 +1,10 @@
 use super::*;
 use crate::bonsai::DEFAULT_BONSAI_GGUF;
-use crate::bonsai_tokenizer::BonsaiTokenizer;
+
+/// The head discovery would load: the installed ternary artifact.
+fn pinned_head() -> String {
+    crate::bonsai_mtp::DEFAULT_BONSAI_MTP_ARTIFACT.into()
+}
 
 #[test]
 fn automatic_context_reserves_ten_percent_and_caps_at_training_limit() {
@@ -18,17 +22,18 @@ fn automatic_context_reserves_ten_percent_and_caps_at_training_limit() {
 
 #[test]
 fn speculation_byte_budget_counts_checkpoints_kv_and_logit_rows() {
-    // 48 recurrent layers x (one state+history snapshot + compact rows).
-    assert_eq!(Speculation::checkpoint_bytes(1), 158_877_696);
-    assert_eq!(Speculation::checkpoint_bytes(2), 160_862_208);
+    // 48 recurrent layers x (one F16 final state + F32 history, and the
+    // compact inputs of every row).
+    assert_eq!(Speculation::checkpoint_bytes(1), 85_364_736);
+    assert_eq!(Speculation::checkpoint_bytes(2), 87_349_248);
     assert_eq!(Speculation::checkpoint_bytes(0), 0);
     // Head KV for 8 tokens (2 x 8 x 2048 B) + depth-2 rollback
     // + one contiguous verify-logit block with depth + 1 rows.
     assert_eq!(
         Speculation::extra_bytes(2, 8),
-        32_768 + 160_862_208 + 3 * 248_320 * 4
+        32_768 + 87_349_248 + 3 * 248_320 * 4
     );
-    assert_eq!(Speculation::extra_bytes(2, 8), 163_874_816);
+    assert_eq!(Speculation::extra_bytes(2, 8), 90_361_856);
 }
 
 /// Plain tokenwise decoding: reset, run `prefix` as one block, then feed
@@ -86,9 +91,8 @@ fn compare(actual: &[f32], expected: &[f32]) -> serde_json::Value {
 #[test]
 #[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
 fn kv_growth_reproduces_full_allocation_bitwise_across_prefill_decode_and_speculation() {
-    let path = std::env::var("BONSAI_GGUF").unwrap_or_else(|_| DEFAULT_BONSAI_GGUF.into());
-    let head = std::env::var("BONSAI_MTP_HEAD")
-        .unwrap_or_else(|_| crate::bonsai_mtp::DEFAULT_BONSAI_MTP_HEAD.into());
+    let path = String::from(DEFAULT_BONSAI_GGUF);
+    let head = pinned_head();
     let settings = MtpSettings::new(head.into(), 1).expect("head settings");
     let context = 40;
     let load = |initial_tokens| {
@@ -178,12 +182,25 @@ fn kv_growth_reproduces_full_allocation_bitwise_across_prefill_decode_and_specul
 
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
-#[allow(clippy::too_many_lines)]
 fn verify_block_restores_every_accepted_prefix_like_tokenwise_decoding() {
+    // Both cache formats: the restore copies cache bytes whatever they hold.
+    for layout in [KvLayout::F16, KvLayout::Q8] {
+        verify_block_restores_like_tokenwise_decoding(layout);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_block_restores_like_tokenwise_decoding(layout: KvLayout) {
     // Block-vs-tokenwise F32 kernels differ slightly; a wrong restore
-    // differs by whole units (see the negative control below).
-    const ROW_TOLERANCE: f32 = 1e-2;
-    let path = std::env::var("BONSAI_GGUF").unwrap_or_else(|_| DEFAULT_BONSAI_GGUF.into());
+    // differs by whole units (see the negative control below, which must
+    // exceed ten times the tolerance). A quantized cache amplifies the
+    // kernels' last-bit differences in the K/V rows they write: a value near a
+    // rounding boundary flips a whole Q8 step (about 1% of its block's peak)
+    // where F16 moves one 2^-11 step. Measured on Q8: 0.0105 at worst, against
+    // 1e-4 on F16, with every argmax equal and greedy text identical with and
+    // without speculation.
+    let row_tolerance: f32 = if layout.is_f16() { 1e-2 } else { 3e-2 };
+    let path = String::from(DEFAULT_BONSAI_GGUF);
     let package = BonsaiPackage::open(&path).expect("open Bonsai GGUF");
     let mut model = BonsaiModel::load(
         package,
@@ -196,7 +213,10 @@ fn verify_block_restores_every_accepted_prefix_like_tokenwise_decoding() {
             max_drafts: 64,
             min_match: 8,
         },
-        KvOptions::default(),
+        KvOptions {
+            layout,
+            ..KvOptions::default()
+        },
     )
     .expect("load target");
     let prefix = [5u32, 8, 12];
@@ -223,21 +243,21 @@ fn verify_block_restores_every_accepted_prefix_like_tokenwise_decoding() {
         })
         .collect::<Vec<_>>();
 
-    let run_verify_block = |model: &mut BonsaiModel| -> usize {
+    let run_verify_block = |model: &mut BonsaiModel, verifier: &Verifier| -> usize {
         model.reset();
         model
             .forward_block(&prefix, BlockOutput::None)
             .expect("prefix block");
         let start = model.position;
         model
-            .forward_block(&block, BlockOutput::Verify(&verifier))
+            .forward_block(&block, BlockOutput::Verify(verifier))
             .expect("verify block");
         assert_eq!(model.position, start + block.len());
         start
     };
 
     let mut evidence = serde_json::Map::new();
-    run_verify_block(&mut model);
+    run_verify_block(&mut model, &verifier);
     let row_reports = rows
         .iter()
         .enumerate()
@@ -252,7 +272,7 @@ fn verify_block_restores_every_accepted_prefix_like_tokenwise_decoding() {
     for report in &row_reports {
         assert!(
             report["same_argmax"].as_bool() == Some(true)
-                && report["max_abs"].as_f64().expect("max_abs") < f64::from(ROW_TOLERANCE),
+                && report["max_abs"].as_f64().expect("max_abs") < f64::from(row_tolerance),
             "verify row differs from tokenwise decoding: {report}"
         );
     }
@@ -260,32 +280,33 @@ fn verify_block_restores_every_accepted_prefix_like_tokenwise_decoding() {
 
     let mut rollback_reports = Vec::new();
     for (committed, expected) in accepted_prefixes.into_iter().zip(&continuations) {
-        let start = run_verify_block(&mut model);
-        if committed < block.len() {
-            model
-                .restore_checkpoint(&verifier, committed)
-                .expect("restore checkpoint");
-            model.position = start + committed;
-        }
+        let start = run_verify_block(&mut model, &verifier);
+        model
+            .commit_verified(&mut verifier, block.len(), committed)
+            .expect("commit verified rows");
+        model.position = start + committed;
         model.forward(next, true).expect("decode after rollback");
         let report = compare(model.scratch.logits.as_slice::<f32>(), expected);
         assert!(
             report["same_argmax"].as_bool() == Some(true)
-                && report["max_abs"].as_f64().expect("max_abs") < f64::from(ROW_TOLERANCE),
+                && report["max_abs"].as_f64().expect("max_abs") < f64::from(row_tolerance),
             "decode after committing {committed} rows differs from tokenwise: {report}"
         );
         rollback_reports.push(serde_json::json!({"committed": committed, "report": report}));
     }
     evidence.insert("rollbacks".into(), rollback_reports.into());
 
-    // Negative control: rewind the position but keep the recurrent state
-    // of all three rows. The recurrent layers must make this visible.
-    let start = run_verify_block(&mut model);
+    // Negative control: rewind the position but adopt the recurrent state
+    // of every row. The recurrent layers must make this visible.
+    let start = run_verify_block(&mut model, &verifier);
+    model
+        .commit_verified(&mut verifier, block.len(), block.len())
+        .expect("adopt every row");
     model.position = start + 1;
     model.forward(next, true).expect("decode without restore");
     let control = compare(model.scratch.logits.as_slice::<f32>(), &continuations[0]);
     assert!(
-        control["max_abs"].as_f64().expect("max_abs") > 10.0 * f64::from(ROW_TOLERANCE),
+        control["max_abs"].as_f64().expect("max_abs") > 10.0 * f64::from(row_tolerance),
         "skipping the restore was not observable: {control}"
     );
     evidence.insert("no_restore_control".into(), control);
@@ -294,14 +315,11 @@ fn verify_block_restores_every_accepted_prefix_like_tokenwise_decoding() {
         serde_json::json!({
             "model": path, "context": 96, "prefill_chunk": 8,
             "prefix": prefix, "block": block, "next": next,
-            "row_tolerance": ROW_TOLERANCE,
+            "row_tolerance": row_tolerance,
         }),
     );
     let evidence = serde_json::Value::Object(evidence);
     eprintln!("{evidence:#}");
-    if let Some(output) = std::env::var_os("BONSAI_VERIFY_EVIDENCE") {
-        std::fs::write(output, format!("{evidence:#}\n")).expect("write evidence");
-    }
 }
 
 /// Poison the head's caches and predicted scratch so anything the next
@@ -376,9 +394,8 @@ fn draft_logits(model: &mut BonsaiModel, seed: u32) -> Vec<f32> {
 #[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
 #[allow(clippy::too_many_lines)]
 fn kv_only_ingestion_matches_full_head_cache_and_next_draft() {
-    let path = std::env::var("BONSAI_GGUF").unwrap_or_else(|_| DEFAULT_BONSAI_GGUF.into());
-    let head = std::env::var("BONSAI_MTP_HEAD")
-        .unwrap_or_else(|_| crate::bonsai_mtp::DEFAULT_BONSAI_MTP_HEAD.into());
+    let path = String::from(DEFAULT_BONSAI_GGUF);
+    let head = pinned_head();
     let settings = MtpSettings::new(head.clone().into(), 1).expect("head settings");
     let package = BonsaiPackage::open(&path).expect("open Bonsai GGUF");
     let mut model = BonsaiModel::load(
@@ -545,9 +562,6 @@ fn kv_only_ingestion_matches_full_head_cache_and_next_draft() {
         "ingest_seconds": {"kv_only": kv_only_seconds, "full_head": full_seconds},
     });
     eprintln!("{evidence:#}");
-    if let Some(output) = std::env::var_os("BONSAI_KV_EVIDENCE") {
-        std::fs::write(output, format!("{evidence:#}\n")).expect("write evidence");
-    }
 }
 
 /// Chunked prefill with the head fused into each target batch must leave
@@ -572,9 +586,8 @@ fn chunked_prefill_ingests_output_normalized_rows_for_every_chunk() {
         prev_hidden: Vec<f32>,
         draft: Vec<f32>,
     }
-    let path = std::env::var("BONSAI_GGUF").unwrap_or_else(|_| DEFAULT_BONSAI_GGUF.into());
-    let head = std::env::var("BONSAI_MTP_HEAD")
-        .unwrap_or_else(|_| crate::bonsai_mtp::DEFAULT_BONSAI_MTP_HEAD.into());
+    let path = String::from(DEFAULT_BONSAI_GGUF);
+    let head = pinned_head();
     let settings = MtpSettings::new(head.into(), 1).expect("head settings");
     let package = BonsaiPackage::open(&path).expect("open Bonsai GGUF");
     let mut model = BonsaiModel::load(
@@ -750,54 +763,321 @@ fn chunked_prefill_ingests_output_normalized_rows_for_every_chunk() {
     );
 }
 
-/// Diagnostic, not a check: prefill `BONSAI_KV_DUMP_PROMPT` (chat-wrapped,
-/// thinking on, like the CLI) and write every full-attention layer's F16
-/// K/V prefix to `BONSAI_KV_DUMP_DIR/layer_<index>_{k,v}.f16` so the
-/// cache's real bit-pattern statistics can be measured offline.
+/// Quantized K/V caches must track F16 on the real model.
+///
+/// Greedy F16 continues 4,096 tokens of this repository's own documentation and
+/// source; each quantized layout is then teacher-forced along the same tokens
+/// and its next-token distribution compared with F16's at every step. Measured
+/// when Hadamard-rotated Q8 became the default (M4 Pro): mean KL 8.9e-6, 64/64
+/// top-1. The bounds leave headroom above that and sit below every format that
+/// was measured and rejected (rotated Q6 1.3e-4, Q4 3.3e-3, FP4 4.3e-3; see
+/// docs/BONSAI.md).
 #[test]
-#[ignore = "requires the Bonsai GGUF, a Metal device and BONSAI_KV_DUMP_DIR"]
-fn dump_full_attention_kv_caches() {
-    let Ok(dir) = std::env::var("BONSAI_KV_DUMP_DIR") else {
-        eprintln!("BONSAI_KV_DUMP_DIR unset; nothing dumped");
-        return;
+#[ignore = "requires the pinned model"]
+#[allow(clippy::cast_precision_loss)]
+fn quantized_kv_tracks_f16_next_token_distribution() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = [
+        "docs/BONSAI.md",
+        "README.md",
+        "local-engine/src/bonsai_native.rs",
+    ]
+    .iter()
+    .map(|file| std::fs::read_to_string(format!("{root}/{file}")).expect("corpus"))
+    .collect::<String>();
+    let steps = 64;
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let mut prompt = tokenizer.encode(&text).expect("encode");
+    prompt.truncate(4096);
+    assert_eq!(prompt.len(), 4096, "corpus too short");
+    let load = |layout: KvLayout| {
+        BonsaiModel::load(
+            BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open"),
+            prompt.len() + steps,
+            128,
+            None,
+            None,
+            NgramSettings::default(),
+            KvOptions {
+                layout,
+                initial_tokens: prompt.len() + steps,
+            },
+        )
+        .expect("load")
     };
-    let prompt_path = std::env::var("BONSAI_KV_DUMP_PROMPT").expect("BONSAI_KV_DUMP_PROMPT");
-    let path = std::env::var("BONSAI_GGUF").unwrap_or_else(|_| DEFAULT_BONSAI_GGUF.into());
-    let package = BonsaiPackage::open(&path).expect("open Bonsai GGUF");
-    let tokenizer = BonsaiTokenizer::from_package(&package).expect("tokenizer");
-    let text = std::fs::read_to_string(prompt_path).expect("prompt text");
-    let prompt = tokenizer
-        .encode(&BonsaiTokenizer::chat_prompt(&text, true).expect("chat prompt"))
-        .expect("encode");
-    let capacity = prompt.len().next_multiple_of(128);
+    let logits = |model: &BonsaiModel| model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    let argmax = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .expect("vocab")
+    };
+    let log_softmax = |values: &[f32]| {
+        let peak = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        let log_sum = values
+            .iter()
+            .map(|&v| (f64::from(v) - peak).exp())
+            .sum::<f64>()
+            .ln()
+            + peak;
+        values
+            .iter()
+            .map(|&v| f64::from(v) - log_sum)
+            .collect::<Vec<_>>()
+    };
+
+    let mut model = load(KvLayout::F16);
+    model.prefill(&prompt, &mut |_| {}).expect("prefill");
+    let mut reference = Vec::new();
+    let mut tokens = Vec::new();
+    for _ in 0..steps {
+        let current = logits(&model);
+        tokens.push(argmax(&current));
+        reference.push(log_softmax(&current));
+        model
+            .decode(*tokens.last().expect("token"))
+            .expect("decode");
+    }
+    drop(model);
+    for (layout, mean_bound, agreement_bound) in [(KvLayout::Q8, 1e-4, 63)] {
+        let mut model = load(layout);
+        model.prefill(&prompt, &mut |_| {}).expect("prefill");
+        let (mut kl_sum, mut agree) = (0.0f64, 0);
+        for (step, &token) in tokens.iter().enumerate() {
+            let current = logits(&model);
+            let quantized = log_softmax(&current);
+            kl_sum += reference[step]
+                .iter()
+                .zip(&quantized)
+                .map(|(&p, &q)| p.exp() * (p - q))
+                .sum::<f64>();
+            agree += usize::from(argmax(&current) == token);
+            model.decode(token).expect("decode");
+        }
+        let mean = kl_sum / steps as f64;
+        eprintln!(
+            "{}: mean KL {mean:.3e}, top-1 {agree}/{steps}",
+            layout.name()
+        );
+        assert!(mean < mean_bound, "{} mean KL {mean:.3e}", layout.name());
+        assert!(
+            agree >= agreement_bound,
+            "{} top-1 {agree}/{steps}",
+            layout.name()
+        );
+    }
+}
+
+/// A mixed head drafts like the ternary head it was requantized from.
+///
+/// Matrices of the installed ternary head are rewritten as per-row int8 of
+/// their own dequantized weights (about 0.4 % per-element error), so the two
+/// heads compute nearly the same function through different kernels. Two
+/// layouts cover every dispatch shape the head encodes: int8 q beside ternary
+/// k/v and int8 gate beside ternary up (mixed groups, split dispatches), and
+/// all of q/k/v, gate/up and both FC matrices int8 (the int8 concat and fused
+/// `SwiGLU` kernels). Prefill chunks of 16 put 12, 5 and 15 rows through the
+/// K/V-only path: the exact-row int8 kernels and the tiled one. Draft logits
+/// after the prefills of three prompts must stay close to the ternary head's
+/// and pick the same token; a basis or layout mistake in any int8 path would
+/// scramble them.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
+fn mixed_int8_head_drafts_like_the_ternary_head_it_requantizes() {
+    let path = String::from(DEFAULT_BONSAI_GGUF);
+    let ternary = pinned_head();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layouts: [(&str, &[usize]); 2] = [
+        ("mixed-groups", &[2, 6, 8]),
+        ("int8-groups", &[0, 1, 2, 3, 4, 6, 7]),
+    ];
+    let prompts: [&[u32]; 3] = [
+        &[5, 8, 12, 17, 23, 31, 40, 52, 61, 77, 90, 101],
+        &[1000, 2000, 3000, 4000, 5000],
+        &[
+            42, 4242, 424, 24, 2424, 44, 22, 4, 2, 242, 1, 11, 111, 1111, 11111,
+        ],
+    ];
+    let seed = 7u32;
+    let drafts = |head: &std::path::Path| -> Vec<Vec<f32>> {
+        let settings = MtpSettings::new(head.into(), 1).expect("head settings");
+        let package = BonsaiPackage::open(&path).expect("open Bonsai GGUF");
+        let mut model = BonsaiModel::load(
+            package,
+            64,
+            16,
+            None,
+            Some(&settings),
+            NgramSettings::default(),
+            KvOptions::default(),
+        )
+        .expect("load");
+        prompts
+            .iter()
+            .map(|prompt| {
+                model.reset();
+                model.prefill(prompt, &mut |_| {}).expect("prefill");
+                draft_logits(&mut model, seed)
+            })
+            .collect()
+    };
+    let reference = drafts(std::path::Path::new(&ternary));
+    for (label, int8) in layouts {
+        let head = dir.path().join(format!("{label}.bin"));
+        crate::bonsai_mtp::requantize_head(std::path::Path::new(&ternary), &head, int8)
+            .expect("requantize head");
+        for (prompt, (mixed, ternary)) in drafts(&head).iter().zip(&reference).enumerate() {
+            assert!(
+                mixed.iter().all(|v| v.is_finite()),
+                "{label} prompt {prompt}"
+            );
+            let dot: f64 = mixed
+                .iter()
+                .zip(ternary)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+            let cosine = dot / (norm(mixed) * norm(ternary));
+            let report = compare(mixed, ternary);
+            eprintln!("{label} prompt {prompt}: cosine {cosine:.5} {report}");
+            // Measured: cosine above 0.99999 and the largest logit gap 0.11 %
+            // (mixed groups) to 0.24 % (int8 groups) of the largest logit.
+            assert!(cosine > 0.9999, "{label} prompt {prompt}: cosine {cosine}");
+            assert!(
+                report["scaled"]
+                    .as_f64()
+                    .is_some_and(|scaled| scaled < 0.01),
+                "{label} prompt {prompt}: {report}"
+            );
+            assert_eq!(
+                argmax(mixed),
+                argmax(ternary),
+                "{label} prompt {prompt}: {report}"
+            );
+        }
+    }
+}
+
+/// Reduced-precision recurrent state against F32 state, teacher-forced over a
+/// long generation: an 8,192-token prompt, then 512 greedy F32-state tokens.
+/// The delta rule feeds each rounded state into the next update, so error
+/// could accumulate; KL is reported per quarter of the generation.
+#[test]
+#[ignore = "requires the pinned model"]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn reduced_state_tracks_f32_state_next_token_distribution() {
+    use local_metal::bonsai_ops::GdnStateFormat;
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = [
+        "docs/BONSAI.md",
+        "README.md",
+        "local-engine/src/bonsai_native.rs",
+        "local-engine/src/bonsai_native/tests.rs",
+        "local-engine/src/sampler.rs",
+        "local-engine/src/bonsai_model/generation.rs",
+    ]
+    .iter()
+    .map(|file| std::fs::read_to_string(format!("{root}/{file}")).expect("corpus"))
+    .collect::<String>();
+    let (prompt_tokens, steps, every) = (8192, 512, 8);
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let mut prompt = tokenizer.encode(&text).expect("encode");
+    prompt.truncate(prompt_tokens);
+    assert_eq!(prompt.len(), prompt_tokens, "corpus too short");
     let mut model = BonsaiModel::load(
         package,
-        capacity,
+        prompt.len() + steps,
         128,
         None,
         None,
         NgramSettings::default(),
-        KvOptions::default(),
+        KvOptions {
+            initial_tokens: prompt.len() + steps,
+            ..KvOptions::default()
+        },
     )
     .expect("load");
+    let logits = |model: &BonsaiModel| model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    let log_softmax = |values: &[f32]| {
+        let peak = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        let log_sum = values
+            .iter()
+            .map(|&v| (f64::from(v) - peak).exp())
+            .sum::<f64>()
+            .ln()
+            + peak;
+        values
+            .iter()
+            .map(|&v| f64::from(v) - log_sum)
+            .collect::<Vec<_>>()
+    };
+    model.set_state_format(GdnStateFormat::F32).expect("f32");
     model.prefill(&prompt, &mut |_| {}).expect("prefill");
-    std::fs::create_dir_all(&dir).expect("dump dir");
-    let bytes = prompt.len() * KV_TOKEN_BYTES;
-    let mut dumped = 0usize;
-    for (index, layer) in model.layers.iter().enumerate() {
-        let AttentionLayer::Full(full) = &layer.attention else {
-            continue;
-        };
-        for (name, cache) in [("k", &full.key_cache), ("v", &full.value_cache)] {
-            let file = format!("{dir}/layer_{index:02}_{name}.f16");
-            std::fs::write(&file, &cache.as_slice::<u8>()[..bytes]).expect("write dump");
+    let mut reference = Vec::new();
+    let mut tokens = Vec::new();
+    for step in 0..steps {
+        let current = logits(&model);
+        tokens.push(argmax(&current) as u32);
+        if step % every == 0 {
+            reference.push(log_softmax(&current));
         }
-        dumped += 1;
+        model.decode(tokens[step]).expect("decode");
     }
+    let peak = model
+        .layers
+        .iter()
+        .filter_map(|layer| match &layer.attention {
+            AttentionLayer::Recurrent(recurrent) => Some(recurrent),
+            AttentionLayer::Full(_) => None,
+        })
+        .flat_map(|recurrent| recurrent.state.as_slice::<f32>().iter().map(|v| v.abs()))
+        .fold(0.0f32, f32::max);
     eprintln!(
-        "dumped {dumped} full-attention layers × {} tokens × {} bytes to {dir}",
-        prompt.len(),
-        KV_TOKEN_BYTES
+        "f32 state: largest magnitude {peak} after {} tokens",
+        prompt.len() + steps
     );
-    assert_eq!(dumped, LAYERS / FULL_INTERVAL);
+    let mut report = Vec::new();
+    // BF16 measured 4.7e-5 mean KL and 511/512 here; only F16 is kept.
+    for format in [GdnStateFormat::F16] {
+        model.set_state_format(format).expect("format");
+        model.prefill(&prompt, &mut |_| {}).expect("prefill");
+        let (mut kl, mut agree, mut max_kl) = (Vec::new(), 0, 0.0f64);
+        for (step, &token) in tokens.iter().enumerate() {
+            let current = logits(&model);
+            if step % every == 0 {
+                let candidate = log_softmax(&current);
+                let value = reference[step / every]
+                    .iter()
+                    .zip(&candidate)
+                    .map(|(&p, &q)| p.exp() * (p - q))
+                    .sum::<f64>();
+                max_kl = max_kl.max(value);
+                kl.push(value);
+            }
+            agree += usize::from(argmax(&current) as u32 == token);
+            model.decode(token).expect("decode");
+        }
+        let mean = kl.iter().sum::<f64>() / kl.len() as f64;
+        let quarters = kl
+            .chunks(kl.len() / 4)
+            .map(|chunk| format!("{:.3e}", chunk.iter().sum::<f64>() / chunk.len() as f64))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "{}: mean KL {mean:.3e} over {} positions (quarters {quarters}), max {max_kl:.3e}, top-1 {agree}/{steps}",
+            format.name(),
+            kl.len()
+        );
+        report.push((format, mean, agree));
+    }
+    let (_, f16_mean, f16_agree) = report[0];
+    assert!(f16_mean < 1e-4, "f16 mean KL {f16_mean:.3e}");
+    assert!(
+        f16_agree * 64 >= steps * 63,
+        "f16 top-1 {f16_agree}/{steps}"
+    );
 }

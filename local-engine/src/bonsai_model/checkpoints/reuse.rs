@@ -160,6 +160,7 @@ impl BonsaiEngine {
         bounds: &ReuseBounds,
         session_id: Option<&str>,
     ) -> (usize, PromptCacheSource) {
+        self.await_pending_disk_write(prompt, bounds);
         let disk = self
             .disk_snapshots
             .iter()
@@ -196,5 +197,31 @@ impl BonsaiEngine {
             self.model.reset();
             (0, PromptCacheSource::None)
         }
+    }
+
+    /// Wait for a disk write still in flight when it would beat every
+    /// committed snapshot for this prompt, then index it.
+    ///
+    /// Writes run in the background, so a request that arrives right behind
+    /// the one that queued a snapshot — and misses the GPU and host tiers —
+    /// could otherwise find it absent and prefill from further back. Waiting
+    /// costs at most the rest of that one write; it is never paid when a
+    /// committed snapshot is already as long, nor when no write is pending.
+    fn await_pending_disk_write(&mut self, prompt: &[u32], bounds: &ReuseBounds) {
+        let Some(writer) = &self.disk_writer else {
+            return;
+        };
+        let usable =
+            |tokens: &[u32]| tokens.len() <= bounds.snapshot_reusable && prompt.starts_with(tokens);
+        let committed = self
+            .disk_snapshots
+            .iter()
+            .filter(|snapshot| usable(&snapshot.tokens))
+            .map(|snapshot| snapshot.tokens.len())
+            .max();
+        writer.wait_for(|tokens| {
+            committed.is_none_or(|length| tokens.len() > length) && usable(tokens)
+        });
+        self.collect_disk_writes();
     }
 }

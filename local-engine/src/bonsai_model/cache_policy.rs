@@ -11,12 +11,16 @@ impl BonsaiEngine {
             self.prompt_cache_disk_bytes = u64::MAX;
         }
         // Snapshots carry MTP head state, so runs with and without the head
-        // must not share files.
+        // must not share files. Quantized K/V rows are stored Hadamard-rotated,
+        // and the key says so: snapshots of an unrotated quantized cache, written
+        // before rotation existed, must never be restored into a rotated one.
+        let layout = self.model.kv_layout();
         self.prompt_cache_model_key = format!(
-            "v1-{}-{}-{}-{}",
+            "v1-{}-{}-{}{}-{}",
             self.info.precision.replace('/', "_"),
             self.info.context,
-            self.model.kv_layout().name().replace('/', "_"),
+            layout.name().replace('/', "_"),
+            if layout.is_f16() { "" } else { "-hadamard" },
             if self.model.speculation().is_some() {
                 "mtp"
             } else {

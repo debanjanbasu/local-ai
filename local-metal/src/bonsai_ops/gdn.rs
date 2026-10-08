@@ -1,5 +1,50 @@
 use super::{BonsaiOps, CommandBatch, GDN_HEADS, MetalBuffer, arg, need, no_alias, sequence_bytes};
 
+/// Storage of a 48-head x 128 x 128 recurrent state. The recurrence always
+/// computes in F32 registers; the format only rounds what a block leaves in
+/// memory (once per dispatch, round to nearest even).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GdnStateFormat {
+    #[default]
+    F32,
+    F16,
+    Bf16,
+}
+
+impl GdnStateFormat {
+    #[must_use]
+    pub const fn element_bytes(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+
+    /// Bytes of one layer's state.
+    #[must_use]
+    pub const fn state_bytes(self) -> usize {
+        GDN_HEADS as usize * 128 * 128 * self.element_bytes()
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+        }
+    }
+
+    /// Indexes of the single-row and four-row pipelines in `BonsaiOps::p`.
+    const fn pipelines(self) -> (usize, usize) {
+        match self {
+            Self::F32 => (7, 14),
+            Self::F16 => (21, 22),
+            Self::Bf16 => (23, 24),
+        }
+    }
+}
+
 impl BonsaiOps {
     pub fn decay_beta(
         &self,
@@ -75,20 +120,58 @@ impl BonsaiOps {
         out: &MetalBuffer,
         tokens: u32,
     ) -> crate::Result<()> {
+        self.gdn_sequence_into(
+            b,
+            GdnStateFormat::F32,
+            qkv,
+            decay,
+            beta,
+            state,
+            state,
+            out,
+            tokens,
+        )
+    }
+
+    /// [`Self::gdn_sequence`] reading `state` and writing the block's final
+    /// state to `final_state`, which may be `state` itself (in place) or a
+    /// separate buffer that leaves `state` intact, both in `format`.
+    pub fn gdn_sequence_into(
+        &self,
+        b: &mut CommandBatch,
+        format: GdnStateFormat,
+        qkv: &MetalBuffer,
+        decay: &MetalBuffer,
+        beta: &MetalBuffer,
+        state: &MetalBuffer,
+        final_state: &MetalBuffer,
+        out: &MetalBuffer,
+        tokens: u32,
+    ) -> crate::Result<()> {
         need(qkv, sequence_bytes(tokens, 10240)?)?;
         need(decay, sequence_bytes(tokens, 48)?)?;
         need(beta, sequence_bytes(tokens, 48)?)?;
-        need(state, 48 * 128 * 128 * 4)?;
+        need(state, format.state_bytes())?;
+        need(final_state, format.state_bytes())?;
         need(out, sequence_bytes(tokens, 6144)?)?;
-        no_alias(out, &[qkv, decay, beta, state])?;
+        no_alias(out, &[qkv, decay, beta, state, final_state])?;
         no_alias(state, &[qkv, decay, beta])?;
+        no_alias(final_state, &[qkv, decay, beta])?;
         // Four value rows share Q/K loads during prefill. Single-token decode
         // remains on the original kernel: the wider variant's gain was noisy.
-        let (pipeline, rows) = if tokens > 1 { (14, 4) } else { (7, 1) };
+        let (single, wide) = format.pipelines();
+        let (pipeline, rows) = if tokens > 1 { (wide, 4) } else { (single, 1) };
         self.go(
             b,
             pipeline,
-            &[(qkv, 0), (decay, 0), (beta, 0), (state, 0), (out, 0)],
+            &[
+                (qkv, 0),
+                (decay, 0),
+                (beta, 0),
+                (state, 0),
+                (out, 0),
+                (final_state, 0),
+            ],
             &[tokens],
             &[],
             48 * 128 / rows,

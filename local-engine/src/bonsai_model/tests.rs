@@ -38,8 +38,7 @@ fn draft_depth_is_bounded_by_request_then_context() {
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn bonsai_ngram_repetitive_greedy_matches_plain_tokens() {
-    let path =
-        std::env::var("BONSAI_GGUF").unwrap_or_else(|_| crate::bonsai::DEFAULT_BONSAI_GGUF.into());
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let prompt =
         "Repeat this sequence exactly twice: alpha beta gamma delta alpha beta gamma delta";
     let params = GenerateParams {
@@ -89,8 +88,7 @@ fn bonsai_ngram_repetitive_greedy_matches_plain_tokens() {
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn prompt_checkpoints_match_cold_greedy_for_extension_and_mid_prompt_edit() {
-    let path =
-        std::env::var("BONSAI_GGUF").unwrap_or_else(|_| crate::bonsai::DEFAULT_BONSAI_GGUF.into());
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let params = GenerateParams {
         temperature: 0.0,
         max_tokens: 8,
@@ -169,8 +167,7 @@ fn prompt_checkpoints_match_cold_greedy_for_extension_and_mid_prompt_edit() {
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn interleaved_and_restarted_session_snapshots_match_cold_tokens() {
-    let path =
-        std::env::var("BONSAI_GGUF").unwrap_or_else(|_| crate::bonsai::DEFAULT_BONSAI_GGUF.into());
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let params = GenerateParams {
         temperature: 0.0,
         max_tokens: 4,
@@ -243,8 +240,7 @@ fn interleaved_and_restarted_session_snapshots_match_cold_tokens() {
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn shared_system_prefix_reuses_across_sessions_and_restart() {
-    let path =
-        std::env::var("BONSAI_GGUF").unwrap_or_else(|_| crate::bonsai::DEFAULT_BONSAI_GGUF.into());
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let params = GenerateParams {
         temperature: 0.0,
         max_tokens: 4,
@@ -322,8 +318,7 @@ fn shared_system_prefix_reuses_across_sessions_and_restart() {
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
-    let path =
-        std::env::var("BONSAI_GGUF").unwrap_or_else(|_| crate::bonsai::DEFAULT_BONSAI_GGUF.into());
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let open = || {
         BonsaiEngine::open_with_options(
             Path::new(&path),
@@ -385,8 +380,7 @@ fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
-    let path =
-        std::env::var("BONSAI_GGUF").unwrap_or_else(|_| crate::bonsai::DEFAULT_BONSAI_GGUF.into());
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let open = || {
         BonsaiEngine::open_with_options(
             Path::new(&path),

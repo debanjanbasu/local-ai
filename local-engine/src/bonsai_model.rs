@@ -139,7 +139,12 @@ pub struct BonsaiEngine {
     prompt_checkpoints: Vec<CachedCheckpoint>,
     max_prompt_checkpoints: usize,
     session_snapshots: Vec<SessionSnapshot>,
+    /// Committed disk snapshots. The writer reports each one only after its
+    /// rename, so nothing here can still be in flight.
     disk_snapshots: Vec<DiskEntry>,
+    /// Persists disk snapshots off the request path; spawned on first use.
+    /// Dropping it finishes pending writes, so it flushes with the engine.
+    disk_writer: Option<prompt_cache::Writer>,
     prompt_cache_bytes: usize,
     prompt_cache_disk_bytes: u64,
     prompt_cache_dir: Option<PathBuf>,

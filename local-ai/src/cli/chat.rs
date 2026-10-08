@@ -1,5 +1,4 @@
 use std::io::Write as _;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde_json::json;
@@ -12,7 +11,6 @@ use crate::resources::{PREFILL_CHUNK, Resources};
 
 #[derive(Debug)]
 struct Args {
-    model: Option<PathBuf>,
     max_tokens: Option<usize>,
     thinking: bool,
     raw: bool,
@@ -23,7 +21,6 @@ struct Args {
 fn usage() {
     eprintln!("Usage: local-ai chat [options] <prompt>");
     eprintln!();
-    eprintln!("  --model PATH      Override automatic pinned-model discovery");
     eprintln!("  --max-tokens N    Maximum generated tokens (default: 8192)");
     eprintln!("  --no-thinking     Skip the checkpoint's xhigh reasoning (default: on)");
     eprintln!("  --greedy          Disable sampling");
@@ -31,7 +28,6 @@ fn usage() {
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
-    let mut model = None;
     let mut max_tokens = None;
     let mut no_thinking = false;
     let mut raw = false;
@@ -40,19 +36,10 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--model" | "--max-tokens" => {
-                let flag = args[index].as_str();
+            "--max-tokens" => {
                 index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| format!("{flag} requires a value"))?;
-                match flag {
-                    "--model" => model = Some(PathBuf::from(value)),
-                    "--max-tokens" => {
-                        max_tokens = Some(value.parse().map_err(|_| "invalid --max-tokens")?);
-                    }
-                    _ => return Err(format!("unknown option: {flag}")),
-                }
+                let value = args.get(index).ok_or("--max-tokens requires a value")?;
+                max_tokens = Some(value.parse().map_err(|_| "invalid --max-tokens")?);
             }
             "--raw" => raw = true,
             "--greedy" => greedy = true,
@@ -71,7 +58,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
         return Err("prompt is required".into());
     }
     Ok(Args {
-        model,
         max_tokens,
         thinking: !raw && !no_thinking,
         raw,
@@ -81,7 +67,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 fn run(args: &Args) -> crate::Result<()> {
-    let resources = Resources::discover(args.model.as_deref(), true)?;
+    let resources = Resources::discover(None, true)?;
     let mut engine = BonsaiEngine::open_with_options(
         &resources.model,
         None,
@@ -155,7 +141,6 @@ mod tests {
     #[test]
     fn defaults_to_bonsai_and_parses_options() {
         let args = parse(&args(&["--no-thinking", "hi"])).expect("options");
-        assert_eq!(args.model, None);
         assert!(!args.thinking);
     }
 
