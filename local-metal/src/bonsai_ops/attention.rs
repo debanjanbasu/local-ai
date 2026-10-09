@@ -1,8 +1,8 @@
 use super::{
     AttentionKernel, AttentionWorkspace, BonsaiOps, CommandBatch, KV_HEADS, KvLayout,
     MAX_PREFILL_TOKENS, MetalBuffer, Q_HEADS, ROW_BLOCK_MIN_PREFIX, ROW_BLOCK_TOKENS, SPLIT,
-    SPLIT_HEADS, SPLIT_TENSOR_LONG, SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX,
-    SPLIT_TENSOR_SHORT, arg, need, no_alias, sequence_bytes,
+    SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_SHORT, arg,
+    need, no_alias, sequence_bytes, tensor_split_tokens,
 };
 
 impl BonsaiOps {
@@ -101,7 +101,7 @@ impl BonsaiOps {
             && prefix >= SPLIT_TENSOR_MIN_PREFIX
         {
             let split_tokens = if prefix >= SPLIT_TENSOR_LONG_MIN_PREFIX {
-                SPLIT_TENSOR_LONG
+                tensor_split_tokens(prefix)
             } else {
                 SPLIT_TENSOR_SHORT
             };

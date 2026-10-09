@@ -3,8 +3,12 @@ use super::{
     Selection, Speculation, VOCAB, WIDTH, decode_embeddings,
 };
 
-/// Layers encoded into a block's first command buffer before it is submitted.
-const SUBMIT_AFTER_LAYERS: usize = 1;
+/// Submit the command buffer encoded so far before encoding these layers.
+/// The input rotation goes alone so the GPU's start-up latency (about 0.1 ms)
+/// overlaps encoding the first layer; layers 1-3 keep the GPU busy while the
+/// host encodes the rest, which took 0.25-0.7 ms for one row and left the GPU
+/// idle 0.05-0.35 ms per token when the first buffer held only layer 0.
+const SUBMIT_BEFORE_LAYERS: [usize; 3] = [0, 1, 4];
 
 impl BonsaiModel {
     pub(super) fn forward(&mut self, token: u32, logits: bool) -> crate::Result<()> {
@@ -100,13 +104,26 @@ impl BonsaiModel {
         )?;
         let mut recurrent_index = 0;
         for (index, layer) in self.layers.iter().enumerate() {
-            if index == SUBMIT_AFTER_LAYERS {
+            if SUBMIT_BEFORE_LAYERS.contains(&index) {
                 // Start the GPU on the first layers while the host encodes the
                 // rest: encoding a whole block took about 1.2 ms of host time
                 // (0.5 ms for one row) during which the GPU sat idle.
                 batch.submit_and_renew(&self.context)?;
             }
-            self.normalize_input(&mut batch, &scratch.hidden, &layer.attention_norm, count)?;
+            // The residual stream alternates between `hidden` (layer input)
+            // and `hidden_alt` (after attention), so every residual add rides
+            // in the next normalization's dispatch.
+            if index == 0 {
+                self.normalize_input(&mut batch, &scratch.hidden, &layer.attention_norm, count)?;
+            } else {
+                self.residual_normalize(
+                    &mut batch,
+                    &scratch.hidden_alt,
+                    &scratch.hidden,
+                    &layer.attention_norm,
+                    count,
+                )?;
+            }
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
                     let rollback = verify.map(|verifier| &verifier.rollback[recurrent_index]);
@@ -115,19 +132,33 @@ impl BonsaiModel {
                 }
                 AttentionLayer::Full(full) => self.full_attention(&mut batch, full, count)?,
             }
+            self.residual_normalize(
+                &mut batch,
+                &scratch.hidden,
+                &scratch.hidden_alt,
+                &layer.post_attention_norm,
+                count,
+            )?;
+            self.feed_forward_branch(&mut batch, layer, count)?;
+        }
+        if matches!(output, BlockOutput::None) {
             self.ops.residual_add(
                 &mut batch,
                 &scratch.branch,
-                &scratch.hidden,
+                &scratch.hidden_alt,
                 &scratch.hidden,
                 WIDTH as u32 * count,
             )?;
-            self.feed_forward(&mut batch, layer, count)?;
-        }
-        if !matches!(output, BlockOutput::None) {
+        } else {
             // Every row is output-normalized: `scratch.normalized` then holds
             // the hidden rows the MTP head consumes for these committed tokens.
-            self.normalize_input(&mut batch, &scratch.hidden, &self.output_norm, count)?;
+            self.residual_normalize(
+                &mut batch,
+                &scratch.hidden_alt,
+                &scratch.hidden,
+                &self.output_norm,
+                count,
+            )?;
         }
         match verify {
             None if matches!(output, BlockOutput::LastLogits) => {

@@ -33,6 +33,18 @@ def read_shard(path):
     return tokens, top_ids, top_logits, hidden
 
 
+def window_starts(count, window):
+    """Starts of full windows tiling a document, plus one final window aligned
+    to its end (overlapping the previous one) so no tail positions are dropped;
+    short documents give one window from 0."""
+    if count <= window:
+        return [0]
+    starts = list(range(0, count - window + 1, window))
+    if starts[-1] + window < count:
+        starts.append(count - window)
+    return starts
+
+
 class DocBatcher:
     """Yields fixed-length contiguous windows from shards, batched.
 
@@ -60,26 +72,43 @@ class DocBatcher:
         order = list(paths)
         if shuffle:
             self.rng.shuffle(order)
-        buffer = []
+        # Short windows (documents shorter than `window`) are pooled and batched
+        # with others of similar length: a batch is cut to its shortest window.
+        buffer, short = [], []
+
+        def short_batches(flush):
+            short.sort(key=lambda item: -item[0].shape[0])
+            while len(short) >= (self.batch if flush else 4 * self.batch):
+                batch = short[: self.batch]
+                del short[: self.batch]
+                yield self._collate(batch)
+
         for path in order:
             tokens, top_ids, top_logits, hidden = read_shard(path)
             count = len(tokens)
-            starts = list(range(0, max(count - self.window, 1), self.window))
+            starts = window_starts(count, self.window)
             if shuffle:
                 self.rng.shuffle(starts)
             for start in starts:
                 end = min(start + self.window, count)
                 if end - start < 64:
                     continue
-                buffer.append(
-                    (tokens[start:end], top_ids[start:end], top_logits[start:end],
-                     hidden[start:end], start)
-                )
+                item = (tokens[start:end], top_ids[start:end], top_logits[start:end],
+                        hidden[start:end], start)
+                if end - start < self.window:
+                    short.append(item)
+                    if len(short) >= 8 * self.batch:
+                        yield from short_batches(False)
+                    continue
+                buffer.append(item)
                 if len(buffer) == self.batch:
                     yield self._collate(buffer)
                     buffer = []
         if buffer:
             yield self._collate(buffer)
+        yield from short_batches(True)
+        if short:
+            yield self._collate(short)
 
     def _collate(self, items):
         window = min(x[0].shape[0] for x in items)

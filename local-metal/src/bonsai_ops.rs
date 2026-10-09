@@ -32,11 +32,24 @@ pub const MAX_PREFILL_TOKENS: u32 = 128;
 const SPLIT: u32 = 128;
 /// Tokens per threadgroup of `bo_attn_split_tensor` (a multiple of its
 /// 64-key tile). Short prefixes use the small split so the four KV heads
-/// still yield enough threadgroups to fill the GPU; long prefixes use the
-/// large one.
+/// still yield enough threadgroups to fill the GPU; from
+/// `SPLIT_TENSOR_LONG_MIN_PREFIX` on, see [`tensor_split_tokens`].
 const SPLIT_TENSOR_SHORT: u32 = 64;
-const SPLIT_TENSOR_LONG: u32 = 256;
 const SPLIT_TENSOR_LONG_MIN_PREFIX: u32 = 4096;
+
+/// Split size of the tensor decode kernels for a `prefix` of at least
+/// `SPLIT_TENSOR_LONG_MIN_PREFIX` tokens: the largest power of two not above
+/// `prefix / 64`, clamped to 256..=1024, so 64-128 splits per KV head up to
+/// 64K tokens. Every split costs a Q load and a partial record that
+/// `bo_attn_reduce` walks serially, which a fixed 256-token split paid 512
+/// times per head at 128K. One layer of Q8 decode attention on an M4 Pro,
+/// fixed 256 against this rule: 1,798 against 1,588 us at 128K, 450 against
+/// 443 at 32K; larger splits lost below 32K, where too few threadgroups remain
+/// (1,024 tokens: 192 against 73 us at 4K).
+fn tensor_split_tokens(prefix: u32) -> u32 {
+    let target = (prefix / 64).max(1);
+    (1 << target.ilog2()).clamp(256, 1024)
+}
 /// Below this prefix the SIMD split kernel is used even on tensor builds: a
 /// handful of tensor threadgroups walking one tile each has worse latency
 /// than 24+ SIMD groups, which showed as a 5 % short-prompt MTP decode loss.
@@ -295,6 +308,10 @@ impl BonsaiOps {
             "bo_gdn_rows_4_f16",
             "bo_gdn_bf16",
             "bo_gdn_rows_4_bf16",
+            // Fused decode chains: GDN output norm, gate and rotation; and
+            // residual add, RMSNorm and rotation.
+            "bo_gdn_post_fwht",
+            "bo_add_rms_fwht",
         ];
         // Quantized layouts with tensor kernels of their own (decode split and
         // causal prefill), each K/V tile dequantized to half in threadgroup
@@ -454,5 +471,30 @@ unsafe fn scalar<T>(e: &ProtocolObject<dyn MTLComputeCommandEncoder>, v: &T, i: 
             size_of::<T>(),
             i,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SPLIT, SPLIT_TENSOR_LONG_MIN_PREFIX, tensor_split_tokens};
+
+    #[test]
+    fn long_tensor_splits_grow_with_the_prefix_in_whole_tiles() {
+        for (prefix, split) in [
+            (SPLIT_TENSOR_LONG_MIN_PREFIX, 256),
+            (32_767, 256),
+            (32_768, 512),
+            (65_536, 1024),
+            (262_144, 1024),
+        ] {
+            assert_eq!(tensor_split_tokens(prefix), split, "{prefix}");
+        }
+        // Splits are whole 64-key tiles and never outnumber the 128-token
+        // SIMD splits `AttentionWorkspace` sizes its partial records for.
+        for prefix in (SPLIT_TENSOR_LONG_MIN_PREFIX..=262_144).step_by(997) {
+            let split = tensor_split_tokens(prefix);
+            assert_eq!(split % 64, 0);
+            assert!(prefix.div_ceil(split) <= prefix.div_ceil(SPLIT));
+        }
     }
 }

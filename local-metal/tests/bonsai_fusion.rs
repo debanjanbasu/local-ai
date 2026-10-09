@@ -277,6 +277,86 @@ fn fused_normalization_and_rotation_match_separate_dispatches_bitwise() {
 }
 
 #[test]
+fn fused_residual_and_gdn_output_chains_match_separate_dispatches_bitwise() {
+    let Some((context, kernels, ops)) = setup() else {
+        return;
+    };
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for tokens in [1_u32, 3] {
+        let t = tokens as usize;
+        // Residual add + RMSNorm + rotation over five 1024-wide blocks per row.
+        let rotation = rng.signs(&context, 5120);
+        let hidden = rng.floats(&context, 5120 * t);
+        let branch = rng.floats(&context, 5120 * t);
+        let norm = rng.floats(&context, 5120);
+        let rows: Vec<_> = (0..6).map(|_| rng.floats(&context, 5120 * t)).collect();
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        ops.residual_add(&mut batch, &branch, &hidden, &rows[0], 5120 * tokens)
+            .expect("add");
+        kernels
+            .normalize_transform(
+                &mut batch, &rotation, &rows[0], &norm, &rows[1], &rows[2], tokens, 1e-6,
+            )
+            .expect("rms rotate");
+        ops.residual_normalize_transform(
+            &mut batch,
+            &rotation,
+            &hidden,
+            &branch,
+            &norm,
+            [&rows[3], &rows[4], &rows[5]],
+            tokens,
+            1e-6,
+        )
+        .expect("fused residual");
+        assert!(
+            ops.residual_normalize_transform(
+                &mut batch,
+                &rotation,
+                &hidden,
+                &branch,
+                &norm,
+                [&hidden, &rows[4], &rows[5]],
+                tokens,
+                1e-6,
+            )
+            .is_err(),
+            "the sum may not overwrite rows other threadgroups still read"
+        );
+        batch.commit_and_wait().expect("run");
+        assert_bits("sum", &rows[3], &rows[0], 5120 * t);
+        assert_bits("normalized", &rows[4], &rows[1], 5120 * t);
+        assert_bits("rotated", &rows[5], &rows[2], 5120 * t);
+
+        // GDN output norm + gate + grouped-head reorder + rotation.
+        let rotation = rng.signs(&context, 6144);
+        let recurrent = rng.floats(&context, 6144 * t);
+        let gate = rng.floats(&context, 6144 * t);
+        let norm = rng.floats(&context, 128);
+        let rows: Vec<_> = (0..3).map(|_| rng.floats(&context, 6144 * t)).collect();
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        ops.gdn_postprocess_rows(&mut batch, &recurrent, &gate, &norm, &rows[0], 1e-6, tokens)
+            .expect("post");
+        kernels
+            .transform(
+                &mut batch,
+                &rotation,
+                &rows[0],
+                &rows[1],
+                tokens,
+                HadamardDirection::Forward,
+            )
+            .expect("rotate");
+        ops.gdn_postprocess_transform(
+            &mut batch, &recurrent, &gate, &norm, &rotation, &rows[2], 1e-6, tokens,
+        )
+        .expect("fused post");
+        batch.commit_and_wait().expect("run");
+        assert_bits("rotated GDN output", &rows[2], &rows[1], 6144 * t);
+    }
+}
+
+#[test]
 fn concurrent_batch_orders_everything_outside_independent_groups() {
     let Some((context, kernels, ops)) = setup() else {
         return;

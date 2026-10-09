@@ -1081,3 +1081,105 @@ fn reduced_state_tracks_f32_state_next_token_distribution() {
         "f16 top-1 {f16_agree}/{steps}"
     );
 }
+
+/// Prefill chunks on the large-batch PTQ1 kernel (64-token by 64-row tiles,
+/// half trit * scale operands, F32 activations and accumulation) against the
+/// small-batch kernels they replace, teacher-forced over 64 greedy tokens
+/// after 1,024- and 8,192-token prompts of this repository's text. Only the
+/// summation order differs, so the bounds are the prefill acceptance bar:
+/// mean next-token KL at most 1e-5 and at least 63/64 top-1.
+#[test]
+#[ignore = "requires the pinned model"]
+#[allow(clippy::cast_precision_loss)]
+fn large_batch_prefill_tracks_small_batch_next_token_distribution() {
+    use local_metal::bonsai::DEFAULT_LARGE_BATCH_MIN;
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = [
+        "docs/BONSAI.md",
+        "README.md",
+        "local-engine/src/bonsai_native.rs",
+        "local-engine/src/bonsai_native/tests.rs",
+        "local-engine/src/sampler.rs",
+        "local-engine/src/bonsai_model/generation.rs",
+    ]
+    .iter()
+    .map(|file| std::fs::read_to_string(format!("{root}/{file}")).expect("corpus"))
+    .collect::<String>();
+    let steps = 64;
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let corpus = tokenizer.encode(&text).expect("encode");
+    let mut model = BonsaiModel::load(
+        package,
+        8192 + steps,
+        128,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions {
+            initial_tokens: 8192 + steps,
+            ..KvOptions::default()
+        },
+    )
+    .expect("load");
+    let context = MetalContext::new().expect("context");
+    let shaders = ShaderLibrary::new(context.device()).expect("shaders");
+    let kernels = |large_batch_min: u32| {
+        BonsaiKernels::new(&context, &shaders)
+            .expect("kernels")
+            .with_large_batch_min(large_batch_min)
+    };
+    let logits = |model: &BonsaiModel| model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    let log_softmax = |values: &[f32]| {
+        let peak = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        let log_sum = values
+            .iter()
+            .map(|&v| (f64::from(v) - peak).exp())
+            .sum::<f64>()
+            .ln()
+            + peak;
+        values
+            .iter()
+            .map(|&v| f64::from(v) - log_sum)
+            .collect::<Vec<_>>()
+    };
+    for prompt_tokens in [1024, 8192] {
+        let prompt = &corpus[..prompt_tokens];
+        model.kernels = kernels(u32::MAX);
+        model.reset();
+        model.prefill(prompt, &mut |_| {}).expect("prefill");
+        let mut reference = Vec::new();
+        let mut tokens = Vec::new();
+        for _ in 0..steps {
+            let current = logits(&model);
+            tokens.push(argmax(&current) as u32);
+            reference.push(log_softmax(&current));
+            model
+                .decode(*tokens.last().expect("token"))
+                .expect("decode");
+        }
+        model.kernels = kernels(DEFAULT_LARGE_BATCH_MIN);
+        model.reset();
+        model.prefill(prompt, &mut |_| {}).expect("prefill");
+        let (mut kl_sum, mut max_kl, mut agree) = (0.0f64, 0.0f64, 0);
+        for (step, &token) in tokens.iter().enumerate() {
+            let current = logits(&model);
+            let candidate = log_softmax(&current);
+            let value = reference[step]
+                .iter()
+                .zip(&candidate)
+                .map(|(&p, &q)| p.exp() * (p - q))
+                .sum::<f64>();
+            kl_sum += value;
+            max_kl = max_kl.max(value);
+            agree += usize::from(argmax(&current) as u32 == token);
+            model.decode(token).expect("decode");
+        }
+        let mean = kl_sum / steps as f64;
+        eprintln!(
+            "{prompt_tokens}-token prompt: mean KL {mean:.3e}, max {max_kl:.3e}, top-1 {agree}/{steps}"
+        );
+        assert!(mean <= 1e-5, "{prompt_tokens}: mean KL {mean:.3e}");
+        assert!(agree >= 63, "{prompt_tokens}: top-1 {agree}/{steps}");
+    }
+}
