@@ -189,7 +189,10 @@ says why.
 
 The head is published as a release asset,
 [`mtp-head-mixed-v1`](https://github.com/debanjanbasu/local-ai/releases/tag/mtp-head-mixed-v1)
-(with its model card, license, notice and checksums). From the repository root:
+(with its model card, license, notice and checksums), mirrored on Hugging Face
+as
+[`debanjanbasu/Ternary-Bonsai-2-27B-MTP-mixed`](https://huggingface.co/debanjanbasu/Ternary-Bonsai-2-27B-MTP-mixed).
+From the repository root:
 
 ```bash
 python3 tools/fetch_mtp_head.py
