@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::hash::{BuildHasher, Hasher, RandomState};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -7,6 +10,7 @@ use serde_json::{Value, json};
 
 use local_engine::bonsai_native::MAX_BATCH_SEQUENCES;
 use local_engine::resources::SERVE_QUEUE;
+use local_engine::{Stats, ToolCall};
 
 use super::AppState;
 
@@ -210,6 +214,110 @@ pub(super) const fn finish_reason(reason: crate::bonsai_model::StopReason) -> &'
         crate::bonsai_model::StopReason::TokenLimit => "length",
         crate::bonsai_model::StopReason::Cancelled => "cancelled",
     }
+}
+
+/// Chat finish reason, which reports `tool_calls` when the model ended its turn
+/// on one or more complete calls.
+///
+/// A token limit still wins: a call that was emitted before the budget ran out
+/// is complete, but the turn was cut short and the client has to know.
+pub(super) const fn chat_finish_reason(
+    reason: crate::bonsai_model::StopReason,
+    called: bool,
+) -> &'static str {
+    match reason {
+        crate::bonsai_model::StopReason::Eos if called => "tool_calls",
+        other => finish_reason(other),
+    }
+}
+
+/// Seconds since the Unix epoch, for the `created` members.
+pub(super) fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// A fresh opaque identifier: `prefix` followed by 32 hex digits.
+///
+/// Unique within the process by a counter and across restarts by the clock and
+/// `RandomState`'s per-process keys. It names a response, never a secret.
+pub(super) fn new_id(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+    );
+    let high = hasher.finish();
+    hasher.write_u64(high);
+    let low = hasher.finish();
+    format!("{prefix}{high:016x}{low:016x}")
+}
+
+/// Which API a generation answers, with what its documents need to echo.
+#[derive(Clone)]
+pub(super) enum Protocol {
+    /// `POST /v1/completions`.
+    Completion,
+    /// `POST /v1/chat/completions`.
+    Chat {
+        /// `stream_options.include_usage`: a final chunk with `usage`.
+        include_usage: bool,
+    },
+    /// `POST /v1/responses`.
+    Responses(Arc<super::responses::Echo>),
+}
+
+/// Everything a response document is labelled with, fixed when the request is
+/// accepted so every frame of one response carries the same identity.
+#[derive(Clone)]
+pub(super) struct Reply {
+    pub(super) protocol: Protocol,
+    pub(super) id: String,
+    pub(super) created: u64,
+    pub(super) model: Arc<str>,
+}
+
+impl Reply {
+    pub(super) fn new(protocol: Protocol, model: Arc<str>) -> Self {
+        let prefix = match &protocol {
+            Protocol::Completion => "cmpl-",
+            Protocol::Chat { .. } => "chatcmpl-",
+            Protocol::Responses(_) => "resp_",
+        };
+        Self {
+            protocol,
+            id: new_id(prefix),
+            created: unix_now(),
+            model,
+        }
+    }
+
+    pub(super) const fn chat(&self) -> bool {
+        matches!(self.protocol, Protocol::Chat { .. })
+    }
+}
+
+/// Chat and completion `usage`, with the engine's prompt-cache reuse.
+pub(super) fn usage_json(stats: &Stats) -> Value {
+    let generation = &stats.generation;
+    json!({"prompt_tokens":generation.prompt_tokens,"prompt_tokens_details":{"cached_tokens":generation.reused_prompt_tokens,"cache_source":stats.cache_source},"completion_tokens":generation.generated_tokens,"completion_tokens_details":{"reasoning_tokens":stats.reasoning_tokens},"total_tokens":generation.prompt_tokens+generation.generated_tokens})
+}
+
+/// A tool call in the Chat Completions wire shape, at its position in the turn.
+///
+/// `arguments` is a JSON *string* on the wire. The engine hands over a parsed,
+/// validated value, so this re-encodes it; the text is canonical JSON rather
+/// than the model's exact spelling, which is the same document.
+pub(super) fn chat_tool_call(index: usize, call: &ToolCall) -> Value {
+    json!({"index":index,"id":call.id,"type":"function","function":{"name":call.name,"arguments":arguments_text(call)}})
+}
+
+pub(super) fn arguments_text(call: &ToolCall) -> String {
+    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_owned())
 }
 
 pub(super) const fn error_status(error: &crate::Error) -> StatusCode {

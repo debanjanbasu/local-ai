@@ -161,7 +161,23 @@ fn expected(chat: bool, content: &str, reasoning: &str) -> Value {
     } else {
         json!({"index":0,"text":content,"finish_reason":"stop"})
     };
-    json!({"choices":[choice],"id":"local","model":"local","object":if chat {"chat.completion"} else {"text_completion"},"speculation":{"batched_tokens":0,"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
+    json!({"choices":[choice],"created":0,"id":"local","model":"local","object":if chat {"chat.completion"} else {"text_completion"},"speculation":{"batched_tokens":0,"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
+}
+
+/// A response identity fixed for comparison against `expected`.
+fn reply(chat: bool) -> Reply {
+    Reply {
+        protocol: if chat {
+            Protocol::Chat {
+                include_usage: false,
+            }
+        } else {
+            Protocol::Completion
+        },
+        id: "local".into(),
+        created: 0,
+        model: "local".into(),
+    }
 }
 
 /// A finished request whose only measurement is a prompt length.
@@ -169,6 +185,7 @@ fn stats() -> Stats {
     Stats {
         stop_reason: StopReason::Eos,
         cache_source: PromptCacheSource::None,
+        reasoning_tokens: 0,
         generation: GenerationStats {
             prompt_tokens: 7,
             ..GenerationStats::default()
@@ -178,7 +195,7 @@ fn stats() -> Stats {
 
 /// Fold signals through a body exactly as the pump does, and collect the frames.
 fn frames(signals: Vec<Signal>, chat: bool, zstd: bool) -> Vec<Vec<u8>> {
-    let (mut body, compressed) = Body::open(chat, "local".into(), zstd);
+    let (mut body, compressed) = Body::open(reply(chat), zstd);
     // The response may only claim a transfer encoding that is really in use.
     assert_eq!(
         compressed, zstd,
@@ -201,7 +218,7 @@ fn frames(signals: Vec<Signal>, chat: bool, zstd: bool) -> Vec<Vec<u8>> {
 }
 #[test]
 fn only_finished_closes_the_document() {
-    let (mut body, _) = Body::open(true, "local".into(), false);
+    let (mut body, _) = Body::open(reply(true), false);
     // Token IDs are a streaming frame, not a member of this document, and
     // reasoning is held back because this body's order puts it after the answer.
     assert_eq!(
@@ -357,7 +374,7 @@ fn the_interval_writes_a_frame_that_fills_no_byte_bound() {
     // is 150 s at the 2.6 tok/s measured here. This is the bound that makes the
     // write fail while the abandoned generation can still be dropped.
     let piece = "y".repeat(16);
-    let (mut body, _) = Body::open(true, "local".into(), false);
+    let (mut body, _) = Body::open(reply(true), false);
     let mut written = Vec::new();
     // The head the pump writes before it waits for anything.
     written.extend(body.take(false).map(|frame| frame.to_vec()));

@@ -5,10 +5,46 @@
 //! mtp-capture signs DIR
 //! mtp-capture capture --out DIR [options] CORPUS.jsonl...
 //! mtp-capture parity  --out DIR [--doc N] [--positions P,..] [--depth D] CORPUS.jsonl...
+//! mtp-capture features --out DIR [--max-tokens N] [--rows N] ROWS.jsonl
 //! ```
 //!
 //! Paths resolve like `local-ai bonsai`: the target is discovered from the
 //! working directory, and `parity` loads the head discovery finds beside it.
+//!
+//! # `features`: frozen-target hidden features at selected positions
+//!
+//! Input: one JSON object per line (blank lines and unknown fields rejected):
+//!
+//! ```text
+//! {"id": "<string>", "text": "<raw text>", "positions": [<int>, ...], "metadata": <any JSON, optional>}
+//! ```
+//!
+//! `text` is tokenized with the target's own Bonsai tokenizer, as-is: no chat
+//! template, no BOS/EOS added (special-token text inside `text` still maps to
+//! its special id). `positions` are zero-based indices into those token ids,
+//! strictly increasing, each below the token count; the last token
+//! (`len - 1`) is allowed. A row needs `2..=--max-tokens` tokens (default
+//! 2048); longer rows are an error, never truncated. `metadata` (e.g.
+//! `{"label": ..., "split": ...}`) is passed through untouched. Ids must be
+//! unique. Every row is validated before the model loads.
+//!
+//! Output in `--out DIR`, which must be absent or empty (no resume):
+//!
+//! - `feature-NNNNNN.bin` for input row `N` (zero-based, six digits, never
+//!   derived from `id`): `positions.len()` consecutive vectors of 5120
+//!   little-endian FP16 values, in `positions` order, no header. Vector `i` is
+//!   the target's output-normalized final hidden (`output_norm` applied,
+//!   unrotated Qwen basis) of the row whose input is token `positions[i]` —
+//!   the hidden that produces the logits predicting token `positions[i] + 1`.
+//!   File size is exactly `positions.len() * 5120 * 2` bytes.
+//! - `features.jsonl`, one line per captured row, in input order:
+//!   `{"id", "token_ids", "positions", "width": 5120, "feature_file":
+//!   "feature-NNNNNN.bin", "metadata": <input metadata or null>}`.
+//!
+//! Each binary is written to `feature-NNNNNN.bin.partial`, checked for
+//! size, and renamed; its manifest line is appended only afterwards. On
+//! failure the run stops: manifest lines name only complete files, and a
+//! leftover `.partial` is never listed.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +71,12 @@ const USAGE: &str = "usage:
       one shard-NNNNNN.bin per document; existing shards are kept (resume)
   mtp-capture parity --out DIR [--doc N] [--positions P,..] [--depth D] CORPUS.jsonl...
       capture one document and record the runtime head's draft chains
+  mtp-capture features --out DIR [--max-tokens N] [--rows N] ROWS.jsonl
+      output-normalized hidden (5120 × LE fp16) at selected token positions;
+      rows {id, text, positions:[int], metadata?}, raw text, no template.
+      DIR must be absent or empty; writes feature-NNNNNN.bin per input row and
+      features.jsonl {id, token_ids, positions, width, feature_file, metadata}.
+      Rows over --max-tokens (default 2048) are errors, never truncated.
 
 Corpus lines are JSON objects with `messages` (chat template, no thinking)
 or `text` (raw). Files are read round-robin, one document from each in turn.";
@@ -316,6 +358,249 @@ fn parity(options: &Options) -> local_engine::Result<()> {
     Ok(())
 }
 
+/// Hidden width of every feature vector.
+const FEATURE_WIDTH: usize = local_engine::bonsai::WIDTH;
+const FEATURE_MANIFEST: &str = "features.jsonl";
+
+struct FeatureOptions {
+    out: PathBuf,
+    input: PathBuf,
+    max_tokens: usize,
+    rows: usize,
+}
+
+fn parse_features(args: &[String]) -> Result<FeatureOptions, String> {
+    let (mut out, mut inputs) = (None, Vec::new());
+    let (mut max_tokens, mut rows) = (2048, DEFAULT_ROWS);
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let mut value = || {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| format!("{arg} needs a value"))
+        };
+        let number = |text: String| {
+            text.parse::<usize>()
+                .map_err(|_| format!("{arg}: {text:?} is not a whole number"))
+        };
+        match arg.as_str() {
+            "--out" => out = Some(PathBuf::from(value()?)),
+            "--max-tokens" => max_tokens = number(value()?)?,
+            "--rows" => rows = number(value()?)?,
+            flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
+            path => inputs.push(PathBuf::from(path)),
+        }
+    }
+    let out = out.ok_or("--out is required")?;
+    let [input] = <[PathBuf; 1]>::try_from(inputs)
+        .map_err(|_| "features takes exactly one ROWS.jsonl".to_owned())?;
+    if max_tokens < 2 {
+        return Err("--max-tokens must be at least 2".into());
+    }
+    Ok(FeatureOptions {
+        out,
+        input,
+        max_tokens,
+        rows,
+    })
+}
+
+/// One `features` input line.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeatureRow {
+    id: String,
+    text: String,
+    positions: Vec<usize>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+/// A validated, tokenized input row.
+struct FeatureJob {
+    row: FeatureRow,
+    tokens: Vec<u32>,
+}
+
+/// Check one row's positions against its tokens, before any model work.
+fn check_positions(tokens: usize, positions: &[usize], max_tokens: usize) -> Result<(), String> {
+    if tokens < 2 {
+        return Err(format!("text has {tokens} tokens, need at least 2"));
+    }
+    if tokens > max_tokens {
+        return Err(format!(
+            "text has {tokens} tokens, over --max-tokens {max_tokens} (not truncated)"
+        ));
+    }
+    if positions.is_empty() {
+        return Err("positions is empty".into());
+    }
+    if let Some(&[before, after]) = positions
+        .array_windows::<2>()
+        .find(|[before, after]| before >= after)
+    {
+        return Err(format!(
+            "positions must be strictly increasing: {before} then {after}"
+        ));
+    }
+    let last = positions[positions.len() - 1];
+    if last >= tokens {
+        return Err(format!(
+            "position {last} is past the final token index {}",
+            tokens - 1
+        ));
+    }
+    Ok(())
+}
+
+/// Parse, tokenize and validate every input row.
+fn feature_jobs(
+    input: &Path,
+    tokenizer: &BonsaiTokenizer,
+    max_tokens: usize,
+) -> Result<Vec<FeatureJob>, String> {
+    let file = std::fs::File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let mut ids = std::collections::HashSet::new();
+    let mut jobs = Vec::new();
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let at = format!("{}:{}", input.display(), index + 1);
+        let line = line.map_err(|e| format!("{at}: {e}"))?;
+        let row: FeatureRow =
+            serde_json::from_str(&line).map_err(|e| format!("{at}: invalid row: {e}"))?;
+        if !ids.insert(row.id.clone()) {
+            return Err(format!("{at}: duplicate id {:?}", row.id));
+        }
+        let tokens = tokenizer
+            .encode(&row.text)
+            .map_err(|e| format!("{at}: {e}"))?;
+        check_positions(tokens.len(), &row.positions, max_tokens)
+            .map_err(|e| format!("{at} (id {:?}): {e}", row.id))?;
+        jobs.push(FeatureJob { row, tokens });
+    }
+    if jobs.is_empty() {
+        return Err(format!("{}: no rows", input.display()));
+    }
+    Ok(jobs)
+}
+
+/// Create `out`, or accept it only if it exists and is empty: an earlier
+/// run's files are never resumed, overwritten or mixed in.
+fn prepare_feature_dir(out: &Path) -> Result<(), String> {
+    if out.exists() {
+        let mut entries = std::fs::read_dir(out).map_err(|e| format!("{}: {e}", out.display()))?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "{} is not empty; features needs a fresh output directory",
+                out.display()
+            ));
+        }
+        Ok(())
+    } else {
+        std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))
+    }
+}
+
+fn feature_file_name(index: usize) -> String {
+    format!("feature-{index:06}.bin")
+}
+
+/// Capture one row into `dir/name` through a `.partial` file, checking its
+/// size before the rename.
+fn write_feature_file(
+    capture: &mut MtpCapture,
+    job: &FeatureJob,
+    dir: &Path,
+    name: &str,
+) -> local_engine::Result<()> {
+    let path = dir.join(name);
+    let partial = dir.join(format!("{name}.partial"));
+    let result = (|| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        let mut out = std::io::BufWriter::new(file);
+        capture.write_features(&job.tokens, &job.row.positions, &mut out)?;
+        let file = out
+            .into_inner()
+            .map_err(|error| local_engine::Error::Io(error.into_error()))?;
+        file.sync_all()?;
+        let expected = (job.row.positions.len() * FEATURE_WIDTH * 2) as u64;
+        let actual = file.metadata()?.len();
+        if actual != expected {
+            return Err(local_engine::Error::InvalidFormat(format!(
+                "{name}: wrote {actual} bytes, expected {expected}"
+            )));
+        }
+        if path.exists() {
+            return Err(local_engine::Error::InvalidArgument(format!(
+                "{name} already exists"
+            )));
+        }
+        std::fs::rename(&partial, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
+fn features(options: &FeatureOptions) -> Result<(), String> {
+    let resources = Resources::discover(None, false).map_err(|e| e.to_string())?;
+    let tokenizer = BonsaiPackage::open(&resources.model)
+        .and_then(|package| BonsaiTokenizer::from_package(&package))
+        .map_err(|e| e.to_string())?;
+    let jobs = feature_jobs(&options.input, &tokenizer, options.max_tokens)?;
+    prepare_feature_dir(&options.out)?;
+    let manifest_path = options.out.join(FEATURE_MANIFEST);
+    let mut manifest = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let started = Instant::now();
+    let mut capture = MtpCapture::open(&resources.model, None, options.rows, options.max_tokens)
+        .map_err(|e| e.to_string())?;
+    eprintln!("loaded target in {:.1}s", started.elapsed().as_secs_f64());
+    let started = Instant::now();
+    let mut vectors = 0;
+    for (index, job) in jobs.iter().enumerate() {
+        let name = feature_file_name(index);
+        write_feature_file(&mut capture, job, &options.out, &name)
+            .map_err(|e| format!("row {index} (id {:?}): {e}", job.row.id))?;
+        let line = serde_json::json!({
+            "id": job.row.id,
+            "token_ids": job.tokens,
+            "positions": job.row.positions,
+            "width": FEATURE_WIDTH,
+            "feature_file": name,
+            "metadata": job.row.metadata,
+        });
+        writeln!(manifest, "{line}")
+            .and_then(|()| manifest.flush())
+            .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        vectors += job.row.positions.len();
+        eprintln!(
+            "row {}/{} ({} tokens, {} positions)",
+            index + 1,
+            jobs.len(),
+            job.tokens.len(),
+            job.row.positions.len()
+        );
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "rows": jobs.len(),
+            "vectors": vectors,
+            "manifest": manifest_path.display().to_string(),
+            "seconds": started.elapsed().as_secs_f64(),
+        })
+    );
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let Some((command, rest)) = args.split_first() else {
         return Err(USAGE.into());
@@ -340,6 +625,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "capture" => capture(&parse(rest)?),
         "parity" => parity(&parse(rest)?),
+        "features" => return features(&parse_features(rest)?),
         _ => return Err(USAGE.into()),
     };
     result.map_err(|error| error.to_string())
@@ -353,5 +639,59 @@ fn main() -> ExitCode {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FeatureRow, check_positions, feature_file_name, parse_features};
+
+    #[test]
+    fn feature_positions_allow_final_token_and_reject_bad_lists() {
+        assert!(check_positions(4, &[0, 3], 8).is_ok());
+        assert!(check_positions(4, &[3], 4).is_ok());
+        assert!(check_positions(4, &[4], 8).is_err());
+        assert!(check_positions(4, &[2, 2], 8).is_err());
+        assert!(check_positions(4, &[2, 1], 8).is_err());
+        assert!(check_positions(4, &[], 8).is_err());
+        assert!(check_positions(1, &[0], 8).is_err());
+        assert!(check_positions(9, &[0], 8).is_err());
+    }
+
+    #[test]
+    fn feature_rows_are_strict_and_keep_metadata_opaque() -> serde_json::Result<()> {
+        let row: FeatureRow = serde_json::from_str(
+            r#"{"id":"a/../b","text":"hi there","positions":[0,1],"metadata":{"label":1,"split":"dev"}}"#,
+        )?;
+        assert_eq!(row.positions, vec![0, 1]);
+        assert_eq!(
+            row.metadata,
+            Some(serde_json::json!({"label":1,"split":"dev"}))
+        );
+        let row: FeatureRow = serde_json::from_str(r#"{"id":"x","text":"t","positions":[1]}"#)?;
+        assert_eq!(row.metadata, None);
+        for bad in [
+            r#"{"id":"x","text":"t","positions":[-1]}"#,
+            r#"{"id":"x","text":"t","positions":[1.5]}"#,
+            r#"{"id":"x","text":"t","positions":[1],"label":0}"#,
+            r#"{"id":1,"text":"t","positions":[1]}"#,
+            r#"{"text":"t","positions":[1]}"#,
+            "",
+        ] {
+            assert!(serde_json::from_str::<FeatureRow>(bad).is_err(), "{bad}");
+        }
+        assert_eq!(feature_file_name(7), "feature-000007.bin");
+        Ok(())
+    }
+
+    #[test]
+    fn feature_options_need_out_and_one_input() {
+        let args = |list: &[&str]| list.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+        let options = parse_features(&args(&["--out", "d", "--max-tokens", "64", "r.jsonl"]));
+        assert!(options.is_ok_and(|o| o.max_tokens == 64 && o.input.as_os_str() == "r.jsonl"));
+        assert!(parse_features(&args(&["r.jsonl"])).is_err());
+        assert!(parse_features(&args(&["--out", "d"])).is_err());
+        assert!(parse_features(&args(&["--out", "d", "a", "b"])).is_err());
+        assert!(parse_features(&args(&["--out", "d", "--resume", "a"])).is_err());
     }
 }

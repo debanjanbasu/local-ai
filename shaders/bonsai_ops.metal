@@ -584,23 +584,57 @@ kernel void bo_attn_split(
         query, key, value, partials, prefix, splits, group, lane);
 }
 
+// Share split metadata and read numerator values ahead, retaining the original
+// FMA order. Quantized caches rotate back before gating in this same dispatch.
 kernel void bo_attn_reduce(
     device const float *partials [[buffer(0)]], device const float *gate [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &splits [[buffer(3)]],
-    constant uint &gated [[buffer(4)]], uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]
+    constant uint &gated [[buffer(4)]], constant uint &rotated [[buffer(5)]],
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]]
 ) {
-    float maximum = -INFINITY;
-    for (uint i = 0; i < splits; ++i) maximum = max(maximum, partials[(ulong(head) * splits + i) * 258]);
+    threadgroup float scratch[256], scales[256], weights[256], maxima[8];
+    device const float *base = partials + ulong(head) * splits * 258;
+    float local = -INFINITY;
+    for (uint i = tid; i < splits; i += 256) local = max(local, base[ulong(i) * 258]);
+    local = simd_max(local);
+    if (lane == 0) maxima[simd] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maximum = maxima[0];
+    for (uint s = 1; s < 8; ++s) maximum = max(maximum, maxima[s]);
     float denominator = 0.0f, numerator = 0.0f;
-    for (uint i = 0; i < splits; ++i) {
-        device const float *part = partials + (ulong(head) * splits + i) * 258;
-        const float scale = exp(part[0] - maximum);
-        denominator = fma(part[1], scale, denominator);
-        numerator = fma(part[2 + tid], scale, numerator);
+    for (uint chunk = 0; chunk < splits; chunk += 256) {
+        const uint count = min(256u, splits - chunk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < count) {
+            device const float *part = base + ulong(chunk + tid) * 258;
+            scales[tid] = exp(part[0] - maximum);
+            weights[tid] = part[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const float *column = base + ulong(chunk) * 258 + 2 + tid;
+        uint j = 0;
+        for (; j + 8 <= count; j += 8) {
+            float v[8];
+            for (uint k = 0; k < 8; ++k) v[k] = column[ulong(j + k) * 258];
+            for (uint k = 0; k < 8; ++k) {
+                denominator = fma(weights[j + k], scales[j + k], denominator);
+                numerator = fma(v[k], scales[j + k], numerator);
+            }
+        }
+        for (; j < count; ++j) {
+            denominator = fma(weights[j], scales[j], denominator);
+            numerator = fma(column[ulong(j) * 258], scales[j], numerator);
+        }
     }
     const uint index = head * 256 + tid;
-    output[index] = (numerator / denominator) * (gated ? bonsai_sigmoid(gate[index]) : 1.0f);
+    // Separate expressions preserve the F16 path's fast-math contraction.
+    if (rotated) {
+        const float value = bonsai_hadamard256(numerator / denominator, tid, scratch);
+        output[index] = value * (gated ? bonsai_sigmoid(gate[index]) : 1.0f);
+    } else {
+        output[index] = (numerator / denominator) * (gated ? bonsai_sigmoid(gate[index]) : 1.0f);
+    }
 }
 
 // Eight causal queries share a threadgroup. Each SIMD owns one query, keeping
@@ -1142,5 +1176,282 @@ kernel void NAME(                                                               
     BONSAI_ATTN_SPLIT_TENSOR_QUANTIZED(bo_attn_split_tensor_##SUFFIX, FORMAT, FORMAT) \
     BONSAI_ATTN_TENSOR_QUANTIZED(bo_attn_tensor_##SUFFIX, FORMAT, FORMAT)
 BONSAI_ATTN_QUANTIZED(q8, 1)
+
+// Pack token/head pairs by KV head. Four verify tokens fill three 8-query
+// tiles rather than four 6-query tiles, and all tiles share each K/V load.
+kernel void bo_attn_gather_rows(
+    device const float *query [[buffer(0)]], device float *packed [[buffer(1)]],
+    constant uint &tokens [[buffer(2)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    const uint token = group / 24, head = group % 24, kv_head = head / 6;
+    packed[(ulong(kv_head) * 6 * tokens + token * 6 + head % 6) * 256 + tid] =
+        query[ulong(group) * 256 + tid];
+}
+
+// Online softmax over one 32-key tile of packed score rows, eight rows per
+// pass (row r is token r / 6, which sees keys before first_prefix + r / 6).
+template <uint TOKENS>
+static inline void bonsai_attn_rows_softmax(
+    threadgroup float *scores, threadgroup float *correction, threadgroup float *maximum,
+    threadgroup float *denominator, uint first_prefix, uint begin, uint start, uint count,
+    uint row, uint lane
+) {
+    constexpr uint nq = 8, nk = 32, nt = (6 * TOKENS + 7) / 8;
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < nt; ++j) {
+        const uint live = min(8u, 6 * TOKENS - 8 * j);
+        const uint prefix = first_prefix + (8 * j + row) / 6;
+        const bool active = row < live && begin < prefix;
+        const uint limit = prefix > start ? min(count, prefix - start) : 0;
+        threadgroup float *s = scores + j * nq * nk;
+        float peak = -INFINITY;
+        for (uint column = lane; column < nk; column += 16) {
+            const uint i = row * nk + column;
+            const float score = active && column < limit ? s[i] * (1.0f / 16.0f) : -INFINITY;
+            s[i] = score;
+            peak = max(peak, score);
+        }
+        for (ushort mask = 8; mask != 0; mask >>= 1) peak = max(peak, simd_shuffle_xor(peak, mask));
+        const uint slot = j * nq + row;
+        const float next_maximum = active ? max(maximum[slot], peak) : 0.0f;
+        const float old_scale = active ? exp(maximum[slot] - next_maximum) : 0.0f;
+        float sum = 0.0f;
+        for (uint column = lane; column < nk; column += 16) {
+            const uint i = row * nk + column;
+            const float weight = exp(s[i] - next_maximum);
+            s[i] = weight;
+            sum += weight;
+        }
+        for (ushort mask = 8; mask != 0; mask >>= 1) sum += simd_shuffle_xor(sum, mask);
+        if (lane == 0) {
+            correction[slot] = old_scale;
+            maximum[slot] = next_maximum;
+            denominator[slot] = fma(denominator[slot], old_scale, sum);
+        }
+    }
+}
+
+template <uint TOKENS>
+static inline void bonsai_attn_split_rows_q8_impl(
+    device float *query, device const uchar *key, device const uchar *value,
+    device float *partials, uint first_prefix, uint splits, uint split_tokens,
+    uint group, uint tid, threadgroup half *tile, threadgroup float *scores,
+    threadgroup float *correction, threadgroup float *maximum, threadgroup float *denominator
+) {
+    constexpr int nq = 8, nk = 32, dimension = 256;
+    constexpr uint nt = (6 * TOKENS + 7) / 8;
+    const uint kv_head = group % 4, split = group / 4;
+    const uint begin = split * split_tokens;
+    const uint end = min(begin + split_tokens, first_prefix + TOKENS - 1);
+    const uint row = tid / 16, lane = tid % 16;
+    if (tid < nq * nt) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
+    auto live = [](uint j) { return min(8u, 6 * TOKENS - 8 * j); };
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(nq, nk, dimension, false, true, false),
+        execution_simdgroups<4>> qk;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(nq, dimension, static_cast<int>(dynamic_extent),
+            false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> pv;
+    auto v_shape = tensor(tile, dextents<int32_t, 2>(dimension, nk), array<int, 2>({1, dimension}));
+    auto p_shape = tensor(scores, dextents<int32_t, 2>(nk, nq), array<int, 2>({1, nk}));
+    using Acc = decltype(pv.template get_destination_cooperative_tensor<
+        decltype(p_shape), decltype(v_shape), float>());
+    auto make_acc = [&](uint j) {
+        auto shape = tensor(scores + j * nq * nk, dextents<int32_t, 2>(nk, live(j)),
+            array<int, 2>({1, nk}));
+        auto acc = pv.template get_destination_cooperative_tensor<
+            decltype(shape), decltype(v_shape), float>();
+        #pragma clang loop unroll(full)
+        for (ushort i = 0; i < acc.get_capacity(); ++i) {
+            if (acc.is_valid_element(i)) acc[i] = 0.0f;
+        }
+        return acc;
+    };
+    Acc acc0 = make_acc(0), acc1 = make_acc(1), acc2 = make_acc(nt > 2 ? 2 : 0);
+
+    for (uint start = begin; start < end; start += nk) {
+        const uint count = min(uint(nk), end - start);
+        bonsai_kv_tile<nk>(key, start, count, kv_head, tile, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto k = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < nt; ++j) {
+            auto q = tensor(query + (ulong(kv_head) * 6 * TOKENS + 8 * j) * dimension,
+                dextents<int32_t, 2>(dimension, live(j)), array<int, 2>({1, dimension}));
+            auto products = qk.template get_destination_cooperative_tensor<decltype(q), decltype(k), float>();
+            qk.run(q, k, products);
+            products.store(tensor(scores + j * nq * nk, dextents<int32_t, 2>(nk, nq)));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bonsai_attn_rows_softmax<TOKENS>(scores, correction, maximum, denominator,
+            first_prefix, begin, start, count, row, lane);
+        bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto v = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
+        auto step = [&](thread Acc &acc, uint j) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                if (acc.is_valid_element(i)) {
+                    acc[i] *= correction[j * nq + acc.get_multidimensional_index(i)[1]];
+                }
+            }
+            auto probabilities = tensor(scores + j * nq * nk,
+                dextents<int32_t, 2>(count, live(j)), array<int, 2>({1, nk}));
+            pv.run(probabilities, v, acc);
+        };
+        step(acc0, 0);
+        step(acc1, 1);
+        if (nt > 2) step(acc2, 2);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Reduce every query row together. An earlier token can have an empty
+    // last split; its (-inf, 0, zeros) record contributes exactly nothing.
+    auto record = [&](uint j, uint r) -> device float * {
+        const uint token = (8 * j + r) / 6, head = (8 * j + r) % 6;
+        return partials + (ulong(token * 24 + kv_head * 6 + head) * splits + split) * 258;
+    };
+    auto emit = [&](thread Acc &acc, uint j) {
+        #pragma clang loop unroll(full)
+        for (ushort i = 0; i < acc.get_capacity(); ++i) {
+            if (acc.is_valid_element(i)) {
+                const auto index = acc.get_multidimensional_index(i);
+                const uint r = index[1];
+                if (r < live(j)) {
+                    const bool active = begin < first_prefix + (8 * j + r) / 6;
+                    record(j, r)[2 + index[0]] = active ? acc[i] : 0.0f;
+                }
+            }
+        }
+    };
+    emit(acc0, 0);
+    emit(acc1, 1);
+    if (nt > 2) emit(acc2, 2);
+    if (lane == 0) {
+        for (uint j = 0; j < nt; ++j) {
+            if (row < live(j)) {
+                const bool active = begin < first_prefix + (8 * j + row) / 6;
+                device float *out = record(j, row);
+                out[0] = active ? maximum[j * nq + row] : -INFINITY;
+                out[1] = active ? denominator[j * nq + row] : 0.0f;
+            }
+        }
+    }
+}
+
+
+// Two or three rows (12 or 18 packed query rows) run one 16- or 24-row
+// matmul per K or V tile instead of one per eight rows, so each SIMD group
+// reads its slice of the dequantized tile once for all of them. Partials are
+// bitwise those of the per-tile form; split kernel time drops 3-11% at
+// 1K-262K tokens. Four rows keep the per-tile form: the joint form was 3-9%
+// faster from 2K to 32K tokens but 1-3% slower at 128K-262K.
+template <uint TOKENS>
+static inline void bonsai_attn_split_rows_q8_joint_impl(
+    device float *query, device const uchar *key, device const uchar *value,
+    device float *partials, uint first_prefix, uint splits, uint split_tokens,
+    uint group, uint tid, threadgroup half *tile, threadgroup float *scores,
+    threadgroup float *correction, threadgroup float *maximum, threadgroup float *denominator
+) {
+    constexpr int nq = 8, nk = 32, dimension = 256;
+    constexpr uint nt = (6 * TOKENS + 7) / 8;
+    constexpr int m = int(nq * nt), live_rows = int(6 * TOKENS);
+    const uint kv_head = group % 4, split = group / 4;
+    const uint begin = split * split_tokens;
+    const uint end = min(begin + split_tokens, first_prefix + TOKENS - 1);
+    const uint row = tid / 16, lane = tid % 16;
+    if (tid < nq * nt) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
+
+    auto q = tensor(query + ulong(kv_head) * 6 * TOKENS * dimension,
+        dextents<int32_t, 2>(dimension, live_rows), array<int, 2>({1, dimension}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(m, nk, dimension, false, true, false),
+        execution_simdgroups<4>> qk;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(m, dimension, static_cast<int>(dynamic_extent),
+            false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> pv;
+    auto p_shape = tensor(scores, dextents<int32_t, 2>(nk, live_rows), array<int, 2>({1, nk}));
+    auto v_shape = tensor(tile, dextents<int32_t, 2>(dimension, nk), array<int, 2>({1, dimension}));
+    auto acc = pv.template get_destination_cooperative_tensor<
+        decltype(p_shape), decltype(v_shape), float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+
+    for (uint start = begin; start < end; start += nk) {
+        const uint count = min(uint(nk), end - start);
+        bonsai_kv_tile<nk>(key, start, count, kv_head, tile, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto k = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
+        auto products = qk.template get_destination_cooperative_tensor<decltype(q), decltype(k), float>();
+        qk.run(q, k, products);
+        products.store(tensor(scores, dextents<int32_t, 2>(nk, m)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        bonsai_attn_rows_softmax<TOKENS>(scores, correction, maximum, denominator,
+            first_prefix, begin, start, count, row, lane);
+        bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto v = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
+        #pragma clang loop unroll(full)
+        for (ushort i = 0; i < acc.get_capacity(); ++i) {
+            if (acc.is_valid_element(i)) acc[i] *= correction[acc.get_multidimensional_index(i)[1]];
+        }
+        auto probabilities = tensor(scores, dextents<int32_t, 2>(count, live_rows), array<int, 2>({1, nk}));
+        pv.run(probabilities, v, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    auto record = [&](uint r) -> device float * {
+        return partials + (ulong((r / 6) * 24 + kv_head * 6 + r % 6) * splits + split) * 258;
+    };
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto index = acc.get_multidimensional_index(i);
+            const uint r = index[1];
+            if (r < uint(live_rows)) {
+                record(r)[2 + index[0]] = begin < first_prefix + r / 6 ? acc[i] : 0.0f;
+            }
+        }
+    }
+    if (lane == 0) {
+        for (uint r = row; r < uint(live_rows); r += nq) {
+            const bool active = begin < first_prefix + r / 6;
+            device float *out = record(r);
+            out[0] = active ? maximum[r] : -INFINITY;
+            out[1] = active ? denominator[r] : 0.0f;
+        }
+    }
+}
+
+#define BONSAI_ATTN_SPLIT_ROWS_Q8(TOKENS)                                            \
+kernel void bo_attn_split_tensor_rows_q8_##TOKENS(                                   \
+    device float *query [[buffer(0)]], device const uchar *key [[buffer(1)]],         \
+    device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],    \
+    constant uint &first_prefix [[buffer(4)]], constant uint &splits [[buffer(5)]],   \
+    constant uint &split_tokens [[buffer(6)]],                                      \
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]] \
+) {                                                                                \
+    constexpr uint nt = (6 * TOKENS + 7) / 8;                                       \
+    threadgroup half tile[32 * 256];                                                \
+    threadgroup float scores[nt * 8 * 32], correction[nt * 8], maximum[nt * 8],       \
+        denominator[nt * 8];                                                       \
+    if (TOKENS == 4) {                                                               \
+        bonsai_attn_split_rows_q8_impl<TOKENS>(query, key, value, partials,          \
+            first_prefix, splits, split_tokens, group, tid, tile, scores, correction, \
+            maximum, denominator);                                                   \
+    } else {                                                                         \
+        bonsai_attn_split_rows_q8_joint_impl<TOKENS>(query, key, value, partials,    \
+            first_prefix, splits, split_tokens, group, tid, tile, scores, correction, \
+            maximum, denominator);                                                   \
+    }                                                                                \
+}
+BONSAI_ATTN_SPLIT_ROWS_Q8(2)
+BONSAI_ATTN_SPLIT_ROWS_Q8(3)
+BONSAI_ATTN_SPLIT_ROWS_Q8(4)
 
 #endif

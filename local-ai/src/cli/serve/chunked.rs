@@ -1,5 +1,4 @@
 use std::io::Write as _;
-use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -8,10 +7,14 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use zstd::stream::write::Encoder;
 
-use local_engine::{Event, EventStream, Signal, Stats};
+use local_engine::{Event, EventStream, Signal, Stats, ToolCall};
 
 use super::Admitted;
-use super::response::{EventWait, ZSTD_LEVEL, event_wait, finish_reason};
+use super::response::{
+    EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, event_wait,
+    finish_reason, usage_json,
+};
+use super::responses::ResponsesState;
 use super::sse::{FrameOutcome, send_frame};
 
 /// Body bytes written per frame when the generation is outrunning the clock.
@@ -78,12 +81,37 @@ const fn members(chat: bool) -> &'static [&'static str] {
 /// write something before there is any text to write, and the only JSON bytes
 /// legal between a `:` and the value that follows it are whitespace: a space
 /// written once the quotes are open would silently become part of the answer.
-const fn stream_head(chat: bool) -> &'static str {
-    if chat {
-        "{\"choices\":[{\"index\":0,\"message\":{\"reasoning_content\":"
-    } else {
-        "{\"choices\":[{\"index\":0,\"text\":"
+///
+/// A Responses document opens with a single space instead: its members are not
+/// streamed (see [`Document::Responses`]), and whitespace before a JSON value is
+/// as legal as whitespace inside one.
+const fn stream_head(document: &Document) -> &'static str {
+    match document {
+        Document::Chat { .. } => "{\"choices\":[{\"index\":0,\"message\":{\"reasoning_content\":",
+        Document::Completion => "{\"choices\":[{\"index\":0,\"text\":",
+        Document::Responses(_) => " ",
     }
+}
+
+/// What a non-streaming body is building.
+enum Document {
+    Completion,
+    /// A chat completion. Tool calls are complete objects that only exist once
+    /// the engine has validated them, so they are kept here and written in the
+    /// tail, after the streamed strings, like every other end-dependent member.
+    Chat {
+        calls: Vec<ToolCall>,
+    },
+    /// A Response object.
+    ///
+    /// Its `output` is an array of items whose number, order and kinds are only
+    /// known at the end, and every one carries a status that is too, so it is
+    /// assembled by the same state machine the streaming path uses and written
+    /// whole when the generation finishes. Until then the body carries only
+    /// whitespace — at every prefill boundary and at least once per
+    /// [`BODY_FLUSH_INTERVAL`] of decode — which keeps the first byte on the wire
+    /// during prefill and lets a client that has gone away fail a write.
+    Responses(Box<ResponsesState>),
 }
 
 /// Window for the streamed body: 2 MiB.
@@ -122,8 +150,8 @@ enum Codec {
 
 /// A non-streaming response body, written as the generation produces it.
 pub(super) struct Body {
-    chat: bool,
-    model: Arc<str>,
+    reply: Reply,
+    document: Document,
     /// How many of [`members`] have been declared. The head declares the first,
     /// so this starts at one.
     declared: usize,
@@ -144,23 +172,33 @@ impl Body {
     /// response only claims `Content-Encoding: zstd` when it is true. An encoder
     /// this build cannot open falls back to plain bytes rather than failing a
     /// request over its transfer encoding.
-    pub(super) fn open(chat: bool, model: Arc<str>, zstd: bool) -> (Self, bool) {
+    pub(super) fn open(reply: Reply, zstd: bool) -> (Self, bool) {
         let codec = if zstd {
             open_encoder().map_or(Codec::Plain, |encoder| Codec::Zstd(Some(Box::new(encoder))))
         } else {
             Codec::Plain
         };
         let compressed = matches!(codec, Codec::Zstd(_));
+        let document = match &reply.protocol {
+            Protocol::Completion => Document::Completion,
+            Protocol::Chat { .. } => Document::Chat { calls: Vec::new() },
+            Protocol::Responses(echo) => Document::Responses(Box::new(ResponsesState::new(
+                &reply,
+                std::sync::Arc::clone(echo),
+                false,
+            ))),
+        };
         let mut body = Self {
-            chat,
-            model,
+            reply,
+            document,
             declared: 1,
             open: false,
             pending: Vec::new(),
             last_flush: Instant::now(),
             codec,
         };
-        body.pending.extend_from_slice(stream_head(chat).as_bytes());
+        body.pending
+            .extend_from_slice(stream_head(&body.document).as_bytes());
         (body, compressed)
     }
 
@@ -209,11 +247,12 @@ impl Body {
     /// Close the member the head left open and name the next, until every
     /// streamed member has been declared.
     fn declare_rest(&mut self) {
-        while self.declared < members(self.chat).len() {
+        let members = members(self.reply.chat());
+        while self.declared < members.len() {
             self.close_value();
             self.pending.push(b',');
             self.pending
-                .extend_from_slice(json_string(members(self.chat)[self.declared]).as_bytes());
+                .extend_from_slice(json_string(members[self.declared]).as_bytes());
             self.pending.push(b':');
             self.declared += 1;
         }
@@ -234,9 +273,19 @@ impl Body {
         // Nothing streamed at all is still a complete document: every member the
         // head declared and every one after it is closed as the empty string.
         self.declare_rest();
-        self.close_value();
-        self.pending
-            .extend_from_slice(&stream_tail(self.chat, &self.model, stats));
+        let calls = match &mut self.document {
+            Document::Chat { calls } => std::mem::take(calls),
+            Document::Completion | Document::Responses(_) => Vec::new(),
+        };
+        if !self.open && !calls.is_empty() {
+            // A turn that only called tools has no answer, which OpenAI spells
+            // `"content": null` rather than an empty string.
+            self.pending.extend_from_slice(b"null");
+        } else {
+            self.close_value();
+        }
+        let tail = stream_tail(&self.reply, &calls, stats);
+        self.pending.extend_from_slice(&tail);
     }
 
     /// Whether enough has accumulated, or enough time has passed, to write.
@@ -309,6 +358,9 @@ pub(super) enum Flow {
 
 /// Fold one signal into the body and say what to write.
 pub(super) fn absorb(body: &mut Body, signal: Signal) -> Flow {
+    if matches!(body.document, Document::Responses(_)) {
+        return absorb_response(body, signal);
+    }
     match signal {
         // A boundary exists to be written, so it always is: reporting it and not
         // flushing it would leave prefill as silent as it was.
@@ -329,6 +381,13 @@ pub(super) fn absorb(body: &mut Body, signal: Signal) -> Flow {
         }
         // Token IDs are not part of this document.
         Signal::Event(Event::TokenIds(_)) => Flow::Keep,
+        Signal::Event(Event::ToolCall(call)) => {
+            // A raw completion renders no tools, so only a chat can see one.
+            if let Document::Chat { calls } = &mut body.document {
+                calls.push(call);
+            }
+            Flow::Keep
+        }
         Signal::Event(Event::Finished(stats)) => {
             body.finish(&stats);
             Flow::Last
@@ -351,15 +410,69 @@ fn due(body: &Body) -> Flow {
     if body.due() { Flow::Flush } else { Flow::Keep }
 }
 
+/// [`absorb`] for a Response, which is written whole at the end.
+fn absorb_response(body: &mut Body, signal: Signal) -> Flow {
+    let Document::Responses(state) = &mut body.document else {
+        return Flow::Stop;
+    };
+    let event = match signal {
+        Signal::Progress(_) => {
+            body.heartbeat();
+            return Flow::Flush;
+        }
+        Signal::Event(event) => event,
+    };
+    if let Event::Error(error) = &event {
+        // Only whitespace has been written, and whitespace alone is not a JSON
+        // document, so stopping here is the same honest truncation the chat body
+        // makes: the client cannot mistake it for a short answer.
+        eprintln!("truncating response: the engine failed after the body had started: {error}");
+        return Flow::Stop;
+    }
+    if let Some(response) = state.event(event) {
+        body.pending.extend_from_slice(&encode(&response));
+        return Flow::Last;
+    }
+    // Decode emits no prefill boundaries, so the interval is what keeps writing
+    // something for the disconnect check to fail on.
+    if body.last_flush.elapsed() >= BODY_FLUSH_INTERVAL {
+        body.heartbeat();
+        Flow::Flush
+    } else {
+        Flow::Keep
+    }
+}
+
 /// The bytes that close a streamed choice and the document behind it.
 ///
 /// Every member here is end-dependent, which is the other half of why the
 /// streamed strings come first: `role` and `finish_reason` are not known until
 /// the generation has stopped.
-fn stream_tail(chat: bool, model: &str, stats: &Stats) -> Vec<u8> {
+fn stream_tail(reply: &Reply, calls: &[ToolCall], stats: &Stats) -> Vec<u8> {
     let mut tail = Vec::new();
-    let stop = json_string(finish_reason(stats.stop_reason));
+    let chat = reply.chat();
+    let stop = json_string(if chat {
+        chat_finish_reason(stats.stop_reason, !calls.is_empty())
+    } else {
+        finish_reason(stats.stop_reason)
+    });
     if chat {
+        if !calls.is_empty() {
+            let calls: Vec<Value> = calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    let mut call = chat_tool_call(index, call);
+                    // `index` belongs to stream deltas; a message lists calls in order.
+                    if let Value::Object(map) = &mut call {
+                        map.remove("index");
+                    }
+                    call
+                })
+                .collect();
+            tail.extend_from_slice(b",\"tool_calls\":");
+            tail.extend_from_slice(&encode(&Value::Array(calls)));
+        }
         // `message` is still open, and this brace is what ends it.
         tail.extend_from_slice(b",\"role\":\"assistant\"}");
     }
@@ -368,7 +481,7 @@ fn stream_tail(chat: bool, model: &str, stats: &Stats) -> Vec<u8> {
     // The same two bytes close the choice and the array in either shape, which
     // is what `stream_head` opened; the brace at the end closes the document.
     tail.extend_from_slice(b"}]");
-    for (key, value) in trailer(chat, model, stats) {
+    for (key, value) in trailer(reply, stats) {
         tail.push(b',');
         tail.extend_from_slice(json_string(key).as_bytes());
         tail.push(b':');
@@ -383,13 +496,14 @@ fn stream_tail(chat: bool, model: &str, stats: &Stats) -> Vec<u8> {
 /// Written out member by member rather than taken from a serialized map because
 /// the streamed body has to carry the members after `choices` by hand, and a map
 /// serialized whole would put `choices` back at the front.
-fn trailer(chat: bool, model: &str, stats: &Stats) -> Vec<(&'static str, Value)> {
+fn trailer(reply: &Reply, stats: &Stats) -> Vec<(&'static str, Value)> {
     vec![
-        ("id", json!("local")),
-        ("model", json!(model)),
+        ("created", json!(reply.created)),
+        ("id", json!(reply.id)),
+        ("model", json!(reply.model.as_ref())),
         (
             "object",
-            json!(if chat {
+            json!(if reply.chat() {
                 "chat.completion"
             } else {
                 "text_completion"
@@ -399,11 +513,6 @@ fn trailer(chat: bool, model: &str, stats: &Stats) -> Vec<(&'static str, Value)>
         ("timings", timings_json(stats)),
         ("usage", usage_json(stats)),
     ]
-}
-
-fn usage_json(stats: &Stats) -> Value {
-    let generation = &stats.generation;
-    json!({"prompt_tokens":generation.prompt_tokens,"prompt_tokens_details":{"cached_tokens":generation.reused_prompt_tokens,"cache_source":stats.cache_source},"completion_tokens":generation.generated_tokens,"total_tokens":generation.prompt_tokens+generation.generated_tokens})
 }
 
 fn timings_json(stats: &Stats) -> Value {
@@ -454,8 +563,7 @@ fn json_interior(value: &str) -> Vec<u8> {
 /// wire while the prompt is still being consumed.
 pub(super) async fn start_chunked(
     mut events: EventStream,
-    chat: bool,
-    model: Arc<str>,
+    reply: Reply,
     admitted: Admitted,
     stall: Duration,
     zstd: bool,
@@ -474,7 +582,7 @@ pub(super) async fn start_chunked(
     if let Signal::Event(Event::Error(error)) = &first {
         return Err(error.clone());
     }
-    let (body, compressed) = Body::open(chat, model, zstd);
+    let (body, compressed) = Body::open(reply, zstd);
     // Capacity 1 is deliberate backpressure, not a buffer, for the same reason
     // as the streaming path: a slow reader stops this pump, and this pump is what
     // holds the engine.

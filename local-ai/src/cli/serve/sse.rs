@@ -1,15 +1,18 @@
-use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use local_engine::{Event, EventStream};
 
-use super::{Admitted, response::finish_reason};
+use super::Admitted;
+use super::response::{
+    Protocol, Reply, chat_finish_reason, chat_tool_call, finish_reason, usage_json,
+};
+use super::responses::{ResponsesState, sse_frame};
 
 /// Retry interval for a frame the client has not taken yet.
 ///
@@ -24,8 +27,7 @@ const STALL_RETRY: Duration = Duration::from_millis(2);
 /// a 200 whose first frame is an error.
 pub(super) async fn start_stream(
     mut events: EventStream,
-    chat: bool,
-    model: Arc<str>,
+    reply: Reply,
     admitted: Admitted,
     stall: Duration,
 ) -> Result<mpsc::Receiver<Result<Bytes, std::io::Error>>, String> {
@@ -52,8 +54,9 @@ pub(super) async fn start_stream(
     let (sender, receiver) = mpsc::channel(1);
     // Detached, because this function returns the receiver and the pump owns
     // the only `EventStream`; the receiver is what ends the pump.
+    let frames = Frames::new(reply);
     tokio::task::spawn_blocking(move || {
-        pump(first, events, chat, model, sender, admitted, stall);
+        pump(first, events, frames, sender, admitted, stall);
     });
     Ok(receiver)
 }
@@ -74,25 +77,23 @@ pub(super) async fn start_stream(
 ///
 /// `_admission` is a drop guard held for the pump's lifetime, so the queue slot
 /// is released exactly when this function returns, on every path out of it.
-// `model`, `sender` and `stall` are owned because the detached task has to keep
-// all three alive for the whole pump; none is consumed by the body.
+// `sender` is owned because the detached task has to keep it alive for the
+// whole pump; it is not consumed by the body.
 #[allow(clippy::needless_pass_by_value)]
 fn pump(
     first: Option<Event>,
     events: EventStream,
-    chat: bool,
-    model: Arc<str>,
+    mut frames: Frames,
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
     _admission: Admitted,
     stall: Duration,
 ) {
-    if let Some(event) = first
-        && !deliver(&sender, &model, chat, event, stall)
-    {
+    if !deliver(&sender, frames.start(), stall) {
         return;
     }
-    for event in events {
-        if !deliver(&sender, &model, chat, event, stall) {
+    for event in first.into_iter().chain(events) {
+        let (out, terminal) = frames.event(event);
+        if !deliver(&sender, out, stall) || terminal {
             return;
         }
     }
@@ -107,23 +108,24 @@ fn pump(
 /// so it says the same thing for a 10-token and a 4000-token generation.
 fn deliver(
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
-    model: &str,
-    chat: bool,
-    event: Event,
+    frames: Vec<String>,
     stall: Duration,
 ) -> bool {
-    match send_stream_event(sender, model, chat, event, stall) {
-        FrameOutcome::Sent => true,
-        FrameOutcome::Closed => false,
-        FrameOutcome::Stalled => {
-            eprintln!(
-                "dropping stream: the client stopped accepting frames for {}s, so the \
-                 generation is cancelled and the queue slot released",
-                stall.as_secs()
-            );
-            false
+    for frame in frames {
+        match send_frame(sender, Bytes::from(frame), stall) {
+            FrameOutcome::Sent => {}
+            FrameOutcome::Closed => return false,
+            FrameOutcome::Stalled => {
+                eprintln!(
+                    "dropping stream: the client stopped accepting frames for {}s, so the \
+                     generation is cancelled and the queue slot released",
+                    stall.as_secs()
+                );
+                return false;
+            }
         }
     }
+    true
 }
 
 /// What became of a frame offered to the client.
@@ -172,28 +174,131 @@ pub(super) fn send_frame(
     }
 }
 
-fn send_stream_event(
-    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
-    model: &str,
-    chat: bool,
-    event: Event,
-    stall: Duration,
-) -> FrameOutcome {
-    let object = if chat {
-        "chat.completion.chunk"
-    } else {
-        "text_completion"
-    };
-    let data = match event {
-        Event::Content(piece) if chat => json!({"id":"local","object":object,"model":model,"choices":[{"index":0,"delta":{"content":piece},"finish_reason":null}]}).to_string(),
-        Event::Reasoning(piece) if chat => json!({"id":"local","object":object,"model":model,"choices":[{"index":0,"delta":{"reasoning_content":piece},"finish_reason":null}]}).to_string(),
-        Event::Content(piece) | Event::Reasoning(piece) => json!({"id":"local","object":object,"model":model,"choices":[{"index":0,"text":piece,"finish_reason":null}]}).to_string(),
-        Event::Finished(stats) => {
-            let choice = if chat { json!({"index":0,"delta":{},"finish_reason":finish_reason(stats.stop_reason)}) } else { json!({"index":0,"text":"","finish_reason":finish_reason(stats.stop_reason)}) };
-            format!("{}\n\ndata: [DONE]", json!({"id":"local","object":object,"model":model,"choices":[choice]}))
+/// Turns engine events into the SSE frames of one API's streaming format.
+///
+/// Stateful because Chat and Responses frames are: Chat numbers tool calls and
+/// announces the role once, and a Responses stream is a lifecycle of numbered
+/// item events rather than one frame per token.
+pub(super) enum Frames {
+    Completion(Reply),
+    Chat {
+        reply: Reply,
+        include_usage: bool,
+        /// Whether a chunk has carried `role` yet; `OpenAI` sends it once, first.
+        announced: bool,
+        /// Complete calls sent so far, which is also the next call's `index`.
+        calls: usize,
+    },
+    Responses(Box<ResponsesState>),
+}
+
+impl Frames {
+    pub(super) fn new(reply: Reply) -> Self {
+        match reply.protocol.clone() {
+            Protocol::Completion => Self::Completion(reply),
+            Protocol::Chat { include_usage } => Self::Chat {
+                reply,
+                include_usage,
+                announced: false,
+                calls: 0,
+            },
+            Protocol::Responses(echo) => {
+                Self::Responses(Box::new(ResponsesState::new(&reply, echo, true)))
+            }
         }
-        Event::Error(error) => json!({"error":{"message":error,"type":"server_error"}}).to_string(),
-        Event::TokenIds(_) => return FrameOutcome::Sent,
+    }
+
+    /// Frames sent before the first engine event: the Responses `created` and
+    /// `in_progress` pair, and nothing for the older APIs.
+    pub(super) fn start(&mut self) -> Vec<String> {
+        match self {
+            Self::Responses(state) => {
+                state.start();
+                state.take_events().iter().map(sse_frame).collect()
+            }
+            Self::Completion(_) | Self::Chat { .. } => Vec::new(),
+        }
+    }
+
+    /// The frames for one event, and whether it ended the stream.
+    pub(super) fn event(&mut self, event: Event) -> (Vec<String>, bool) {
+        let terminal = matches!(event, Event::Finished(_) | Event::Error(_));
+        let frames = match self {
+            Self::Completion(reply) => completion_frames(reply, event),
+            Self::Chat {
+                reply,
+                include_usage,
+                announced,
+                calls,
+            } => chat_frames(reply, *include_usage, announced, calls, event),
+            Self::Responses(state) => {
+                state.event(event);
+                state.take_events().iter().map(sse_frame).collect()
+            }
+        };
+        (frames, terminal)
+    }
+}
+
+fn data(value: &Value) -> String {
+    format!("data: {value}\n\n")
+}
+
+fn error_frame(error: &str) -> String {
+    data(&json!({"error":{"message":error,"type":"server_error"}}))
+}
+
+fn completion_frames(reply: &Reply, event: Event) -> Vec<String> {
+    let chunk = |text: &str, finish: Option<&str>| json!({"id":reply.id,"object":"text_completion","created":reply.created,"model":reply.model.as_ref(),"choices":[{"index":0,"text":text,"finish_reason":finish}]});
+    match event {
+        Event::Content(piece) | Event::Reasoning(piece) => vec![data(&chunk(&piece, None))],
+        Event::Finished(stats) => vec![
+            data(&chunk("", Some(finish_reason(stats.stop_reason)))),
+            "data: [DONE]\n\n".to_owned(),
+        ],
+        Event::Error(error) => vec![error_frame(&error)],
+        // A raw completion renders no tools, so the engine cannot report a call.
+        Event::TokenIds(_) | Event::ToolCall(_) => Vec::new(),
+    }
+}
+
+fn chat_frames(
+    reply: &Reply,
+    include_usage: bool,
+    announced: &mut bool,
+    calls: &mut usize,
+    event: Event,
+) -> Vec<String> {
+    let chunk = |delta: Value, finish: Option<&str>| json!({"id":reply.id,"object":"chat.completion.chunk","created":reply.created,"model":reply.model.as_ref(),"choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+    let mut delta = match event {
+        Event::Content(piece) => json!({"content":piece}),
+        Event::Reasoning(piece) => json!({"reasoning_content":piece}),
+        // The engine reports a call only once it is complete and validated, so
+        // the whole call — ID, name and every argument — goes out in one delta.
+        // That is buffering in the engine, not incremental argument streaming,
+        // and clients that concatenate `arguments` fragments read it unchanged.
+        Event::ToolCall(call) => {
+            let index = *calls;
+            *calls += 1;
+            json!({"tool_calls":[chat_tool_call(index, &call)]})
+        }
+        Event::Finished(stats) => {
+            let finish = chat_finish_reason(stats.stop_reason, *calls > 0);
+            let mut frames = vec![data(&chunk(json!({}), Some(finish)))];
+            if include_usage {
+                frames.push(data(&json!({"id":reply.id,"object":"chat.completion.chunk","created":reply.created,"model":reply.model.as_ref(),"choices":[],"usage":usage_json(&stats)})));
+            }
+            frames.push("data: [DONE]\n\n".to_owned());
+            return frames;
+        }
+        Event::Error(error) => return vec![error_frame(&error)],
+        Event::TokenIds(_) => return Vec::new(),
     };
-    send_frame(sender, Bytes::from(format!("data: {data}\n\n")), stall)
+    if !*announced {
+        *announced = true;
+        if let Value::Object(map) = &mut delta {
+            map.insert("role".into(), json!("assistant"));
+        }
+    }
+    vec![data(&chunk(delta, None))]
 }

@@ -1,8 +1,8 @@
 use super::{
     AttentionKernel, AttentionWorkspace, BonsaiOps, CommandBatch, KV_HEADS, KvLayout,
     MAX_PREFILL_TOKENS, MetalBuffer, Q_HEADS, ROW_BLOCK_MIN_PREFIX, ROW_BLOCK_TOKENS, SPLIT,
-    SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_SHORT, arg,
-    need, no_alias, sequence_bytes, tensor_split_tokens,
+    SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_ROWS,
+    SPLIT_TENSOR_SHORT, arg, need, no_alias, sequence_bytes, tensor_split_tokens,
 };
 
 impl BonsaiOps {
@@ -137,22 +137,80 @@ impl BonsaiOps {
             );
             splits
         };
-        // A rotated (quantized) cache produces rotated outputs: reduce ungated,
-        // then rotate back and gate in `bo_attn_unrotate`.
+        // Quantized outputs rotate back inside the reduction before gating.
         let rotated = !layout.is_f16();
         let fallback = gate.unwrap_or(q);
         self.go(
             b,
             11,
             &[(&workspace.partials, 0), (fallback, offset), (out, offset)],
-            &[splits, u32::from(gate.is_some() && !rotated)],
+            &[splits, u32::from(gate.is_some()), u32::from(rotated)],
             &[],
             24,
             256,
         );
-        if rotated {
-            self.unrotate(b, out, offset, gate, 1);
-        }
+        Ok(())
+    }
+
+    /// Pack two to four Q8 query rows so their GQA tiles share each KV load.
+    /// The caller validates buffers and keeps every row on the same split size.
+    fn attention_rows_q8(
+        &self,
+        b: &mut CommandBatch,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        gate: Option<&MetalBuffer>,
+        out: &MetalBuffer,
+        first_prefix: u32,
+        rows: u32,
+        row: u32,
+        split_tokens: u32,
+        pipeline: usize,
+        workspace: &AttentionWorkspace,
+    ) -> crate::Result<()> {
+        let offset = row as usize * 6144 * 4;
+        let splits = (first_prefix + rows - 1).div_ceil(split_tokens);
+        need(
+            &workspace.partials,
+            (rows * Q_HEADS * splits * 258) as usize * 4,
+        )?;
+        self.go(
+            b,
+            pipeline,
+            &[(q, offset), (&workspace.gathered, 0)],
+            &[rows],
+            &[],
+            (rows * Q_HEADS) as usize,
+            256,
+        );
+        self.go(
+            b,
+            pipeline + rows as usize - 1,
+            &[
+                (&workspace.gathered, 0),
+                (k_cache, 0),
+                (v_cache, 0),
+                (&workspace.partials, 0),
+            ],
+            &[first_prefix, splits, split_tokens],
+            &[],
+            (KV_HEADS * splits) as usize,
+            128,
+        );
+        self.go(
+            b,
+            11,
+            &[
+                (&workspace.partials, 0),
+                (gate.unwrap_or(q), offset),
+                (out, offset),
+            ],
+            &[splits, u32::from(gate.is_some()), 1],
+            &[],
+            (rows * Q_HEADS) as usize,
+            256,
+        );
         Ok(())
     }
 
@@ -210,6 +268,7 @@ impl BonsaiOps {
     /// On a tensor build, F16 caches use `bo_attn_tensor` and quantized ones
     /// `bo_attn_tensor_<layout>`; the SIMD build takes the SIMD block kernel,
     /// which dequantizes in registers.
+    #[allow(clippy::too_many_lines)]
     pub fn attention_block_kv(
         &self,
         layout: KvLayout,
@@ -240,11 +299,46 @@ impl BonsaiOps {
         }
         no_alias(out, &[q, k_cache, v_cache, &workspace.partials])?;
         if tokens <= ROW_BLOCK_TOKENS && end > ROW_BLOCK_MIN_PREFIX {
-            // Speculative verification or a prompt's short tail chunk deep
-            // into the context: the split kernel spreads each row over
-            // 128-token splits instead of a mostly idle eight-row tile
-            // (measured 17.0 -> 19.6 MTP decode tok/s at 12K tokens, F16).
-            for row in 0..tokens {
+            let mut row = 0;
+            while row < tokens {
+                let first_prefix = position + row + 1;
+                let remaining = tokens - row;
+                // Avoid leaving one row after a four-row group.
+                let rows = if remaining == 5 {
+                    3
+                } else {
+                    remaining.min(SPLIT_TENSOR_ROWS)
+                };
+                let split_size = |prefix| {
+                    if prefix >= SPLIT_TENSOR_LONG_MIN_PREFIX {
+                        tensor_split_tokens(prefix)
+                    } else {
+                        SPLIT_TENSOR_SHORT
+                    }
+                };
+                if let Some(pipeline) = self.tensor_rows
+                    && layout == KvLayout::Q8
+                    && rows >= 2
+                    && first_prefix >= SPLIT_TENSOR_MIN_PREFIX
+                    && split_size(first_prefix) == split_size(first_prefix + rows - 1)
+                {
+                    self.attention_rows_q8(
+                        b,
+                        q,
+                        k_cache,
+                        v_cache,
+                        gate,
+                        out,
+                        first_prefix,
+                        rows,
+                        row,
+                        split_size(first_prefix),
+                        pipeline,
+                        workspace,
+                    )?;
+                    row += rows;
+                    continue;
+                }
                 self.attention_row_kv(
                     layout,
                     b,
@@ -257,6 +351,7 @@ impl BonsaiOps {
                     workspace,
                     row,
                 )?;
+                row += 1;
             }
             return Ok(());
         }

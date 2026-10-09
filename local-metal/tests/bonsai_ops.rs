@@ -93,7 +93,7 @@ fn signed_decay_and_tiny_l2_use_pinned_formulas() {
 fn validation_happens_before_dispatch_and_workspace_is_linear() {
     let Some((ctx, ops)) = setup() else { return };
     let workspace = AttentionWorkspace::new(&ctx, 129).expect("workspace");
-    assert_eq!(workspace.byte_len(), 2 * 24 * 258 * 4);
+    assert_eq!(workspace.byte_len(), 2 * 24 * 258 * 4 + 4 * 6144 * 4);
     let tiny = MetalBuffer::from_slice(ctx.device(), &[0.0_f32; 4]).expect("tiny");
     let mut batch = CommandBatch::new(&ctx).expect("batch");
     assert!(ops.sigmoid_mul(&mut batch, &tiny, &tiny, &tiny, 5).is_err());
@@ -1070,7 +1070,15 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
         .map(|i| signal(i, 11) * 2.0)
         .collect::<Vec<_>>();
     let values = (0..capacity as usize * 1024)
-        .map(|i| signal(i, 7) + (i / 1024) as f32 / 3000.0)
+        .map(|i| {
+            if i / 1024 == 1088 {
+                // Only the last two rows of the block at 1086 may see this
+                // conspicuous token; a shared full-block mask must fail.
+                4.0 + (i % 17) as f32 / 8.0
+            } else {
+                signal(i, 7) + (i / 1024) as f32 / 3000.0
+            }
+        })
         .collect::<Vec<_>>();
     let query = floats(&ctx, &query_data);
     let gate = floats(&ctx, &gate_data);
@@ -1208,12 +1216,20 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                 }
             }
         }
-        // A nine-row block whose rows straddle the 256-key tile boundary and
-        // a two-row verification-sized block at a short prefix (block
-        // kernels), then the same two rows past the 1,024-token routing
-        // threshold, which every layout attends row by row through the
-        // split kernel.
-        for (position, rows) in [(250u32, query_rows), (255, 2), (1023, 2)] {
+        // Prefill and short verification blocks, including the tensor routing
+        // threshold, an empty final split for earlier rows, chunk offsets,
+        // and the 64-to-256-token split-size boundary.
+        for (position, rows, gated) in [
+            (250u32, query_rows, true),
+            (255, 2, true),
+            (1023, 2, true),
+            (1022, 3, false),
+            (1086, 4, true),
+            (4093, 5, true),
+            (1100, 6, false),
+            (1100, 7, true),
+            (1100, 8, true),
+        ] {
             output.as_mut_slice::<f32>().fill(f32::NAN);
             let mut batch = CommandBatch::new(&ctx).expect("batch");
             ops.attention_block_kv(
@@ -1222,7 +1238,7 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                 &query,
                 &k_cache,
                 &v_cache,
-                Some(&gate),
+                gated.then_some(&gate),
                 &output,
                 position,
                 rows as u32,
@@ -1239,7 +1255,7 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                     (&k_seen, &v_seen)
                 };
                 let expected =
-                    reference_in(row, prefix, k_read, v_read, true, layout != KvLayout::F16);
+                    reference_in(row, prefix, k_read, v_read, gated, layout != KvLayout::F16);
                 for (index, (&actual, &wanted)) in
                     out[row * 6144..][..6144].iter().zip(&expected).enumerate()
                 {
@@ -1309,4 +1325,36 @@ fn q8_attention_reduces_every_split_at_the_training_context_limit() {
         check(&output, &hadamard_rows(&expected), 2e-5);
         values.as_mut_slice::<u8>()[offset..offset + ordinary.len()].copy_from_slice(&ordinary);
     }
+    // Joint verification at the context limit must keep the final token
+    // invisible to the first three query rows.
+    let query = floats(&ctx, &vec![0.0; 4 * 6144]);
+    let output = guarded(&ctx, 4 * 6144);
+    let offset = (capacity as usize - 1) * layout.value.token_bytes();
+    values.as_mut_slice::<u8>()[offset..offset + last.len()].copy_from_slice(&last);
+    let mut batch = CommandBatch::new(&ctx).expect("batch");
+    ops.attention_block_kv(
+        layout,
+        &mut batch,
+        &query,
+        &keys,
+        &values,
+        None,
+        &output,
+        capacity - 4,
+        4,
+        &workspace,
+    )
+    .expect("joint attention");
+    batch.commit_and_wait().expect("joint completion");
+    let expected = (0..4 * 6144)
+        .map(|i| {
+            let index = (i % 6144 / 256 / 6) * 256 + i % 256;
+            if i / 6144 == 3 {
+                f64::mul_add(base[index], f64::from(capacity - 1), tip[index]) / f64::from(capacity)
+            } else {
+                base[index]
+            }
+        })
+        .collect::<Vec<_>>();
+    check(&output, &hadamard_rows(&expected), 2e-5);
 }

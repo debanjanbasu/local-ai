@@ -57,12 +57,11 @@ const SPLIT_TENSOR_MIN_PREFIX: u32 = 1024;
 /// Query heads served by one SIMD group of `bo_attn_split`; must match the
 /// shader's `BONSAI_SPLIT_HEADS` and divide the six heads per KV head.
 const SPLIT_HEADS: u32 = 2;
-/// Blocks of at most this many rows whose causal prefix ends past
-/// `ROW_BLOCK_MIN_PREFIX` attend row by row through the split kernel (one
-/// dispatch pair per row) rather than the block kernels, which would leave
-/// most of their eight-row tiles idle while walking a long prefix.
+/// Short blocks use split attention rather than walking a long prefix with
+/// mostly idle prefill tiles. Tensor Q8 packs up to four rows per split pass.
 const ROW_BLOCK_TOKENS: u32 = 8;
 const ROW_BLOCK_MIN_PREFIX: u32 = 1024;
+const SPLIT_TENSOR_ROWS: u32 = 4;
 
 /// Full-attention prefill operands; all variants keep F32 softmax statistics,
 /// accumulation and output, F16 KV storage, and the same F32 decode path.
@@ -107,6 +106,7 @@ pub struct Bf16Matrix<'a> {
 
 pub struct AttentionWorkspace {
     partials: MetalBuffer,
+    gathered: MetalBuffer,
     max_context: u32,
     bytes: usize,
 }
@@ -124,15 +124,30 @@ impl AttentionWorkspace {
         } else {
             0
         };
-        let splits = max_context.div_ceil(SPLIT).max(tensor_short) as usize;
-        let bytes = splits
+        // Long tensor prefixes need at most 128 splits before the split size
+        // reaches its 1,024-token cap. Reserve four rows without multiplying
+        // the much larger full-context SIMD workspace by four as well.
+        let tensor_long = if max_context >= SPLIT_TENSOR_LONG_MIN_PREFIX {
+            max_context
+                .div_ceil(256)
+                .min(128)
+                .max(max_context.div_ceil(1024))
+        } else {
+            0
+        };
+        let splits = max_context
+            .div_ceil(SPLIT)
+            .max(SPLIT_TENSOR_ROWS * tensor_short.max(tensor_long)) as usize;
+        let partial_bytes = splits
             .checked_mul(Q_HEADS as usize)
             .and_then(|n| n.checked_mul(258 * 4))
             .ok_or_else(|| arg("workspace size overflow"))?;
+        let gather_bytes = (SPLIT_TENSOR_ROWS * Q_HEADS * HEAD_DIM) as usize * 4;
         Ok(Self {
-            partials: MetalBuffer::empty(context.device(), bytes)?,
+            partials: MetalBuffer::empty(context.device(), partial_bytes)?,
+            gathered: MetalBuffer::empty(context.device(), gather_bytes)?,
             max_context,
-            bytes,
+            bytes: partial_bytes + gather_bytes,
         })
     }
     #[must_use]
@@ -255,6 +270,8 @@ pub struct BonsaiOps {
     /// Quantized layout -> index in `p` of its tensor decode-split pipeline;
     /// its causal prefill pipeline follows at the next index.
     quantized_tensor: Vec<(KvLayout, usize)>,
+    /// Gather followed by the two-, three- and four-row Q8 split pipelines.
+    tensor_rows: Option<usize>,
 }
 impl BonsaiOps {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
@@ -331,10 +348,21 @@ impl BonsaiOps {
                 ]
             })
             .collect::<Vec<_>>();
-        let mut p = Vec::with_capacity(names.len() + quantized_names.len());
+        let row_names: &[&str] = if attention_kernel == AttentionKernel::TensorF32 {
+            &[
+                "bo_attn_gather_rows",
+                "bo_attn_split_tensor_rows_q8_2",
+                "bo_attn_split_tensor_rows_q8_3",
+                "bo_attn_split_tensor_rows_q8_4",
+            ]
+        } else {
+            &[]
+        };
+        let mut p = Vec::with_capacity(names.len() + quantized_names.len() + row_names.len());
         for name in names
             .into_iter()
             .chain(quantized_names.iter().map(String::as_str))
+            .chain(row_names.iter().copied())
         {
             let f = shaders.get_function(name)?;
             let pipeline = context
@@ -360,10 +388,12 @@ impl BonsaiOps {
             .enumerate()
             .map(|(index, &layout)| (layout, names.len() + 2 * index))
             .collect();
+        let tensor_rows = (!row_names.is_empty()).then_some(names.len() + quantized_names.len());
         Ok(Self {
             p,
             attention_kernel,
             quantized_tensor,
+            tensor_rows,
         })
     }
 

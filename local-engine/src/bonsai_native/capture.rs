@@ -24,6 +24,10 @@
 //! token at `p`, the target's top-k logits of row `p` (its argmax is the verify
 //! accept criterion for the draft this row makes), and the normalized hidden of
 //! row `p - 1` — zero for `p = 0`, exactly as `BonsaiMtp::reset` leaves it.
+//!
+//! [`MtpCapture::capture_features`] reads the same normalized hidden for
+//! frozen-target probes, but unshifted: row `p` itself at explicitly selected
+//! positions, the final token included.
 
 use std::io::Write;
 use std::path::Path;
@@ -157,6 +161,65 @@ impl MtpCapture {
         Ok(())
     }
 
+    /// Run `tokens` through the target from an empty cache and return the
+    /// output-normalized, unrotated (Qwen-basis) hidden of each requested row:
+    /// `positions.len() × WIDTH` `f32`s, position-major.
+    ///
+    /// Row `p` is the hidden *after* the token at zero-based index `p` — the
+    /// one whose logits predict token `p + 1` — read from `scratch.normalized`
+    /// on the same verify blocks [`Self::capture_document`] runs. Unlike a
+    /// shard record (which holds row `p - 1`), there is no shift and no dummy
+    /// token: `tokens.len() - 1` selects the final token's own hidden.
+    ///
+    /// `tokens` must hold `2..=context` valid ids (the verify path rejects a
+    /// single-row block); `positions` must be non-empty, strictly increasing
+    /// and below `tokens.len()`. Nothing is truncated.
+    pub fn capture_features(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+    ) -> crate::Result<Vec<f32>> {
+        validate_feature_request(tokens, positions, self.context())?;
+        self.model.reset();
+        let mut features = Vec::with_capacity(positions.len() * WIDTH);
+        let mut next = 0;
+        let mut start = 0;
+        for take in block_sizes(tokens.len(), self.rows) {
+            if next == positions.len() {
+                // Causal: later blocks cannot change rows already read.
+                break;
+            }
+            let block = &tokens[start..start + take];
+            self.model
+                .forward_block(block, BlockOutput::Verify(&self.verifier))?;
+            self.model.commit_verified(&mut self.verifier, take, take)?;
+            let normalized = &self.model.scratch.normalized.as_slice::<f32>()[..take * WIDTH];
+            next = select_rows(normalized, start, positions, next, &mut features);
+            start += take;
+        }
+        if next != positions.len() || features.len() != positions.len() * WIDTH {
+            return Err(crate::Error::Generation(
+                "feature capture did not reach every requested position".into(),
+            ));
+        }
+        Ok(features)
+    }
+
+    /// [`Self::capture_features`], written to `out` as consecutive
+    /// little-endian FP16 vectors of `WIDTH` values, one per position in
+    /// order. Nothing is written unless every row was captured and is finite
+    /// in FP16.
+    pub fn write_features(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        out: &mut impl Write,
+    ) -> crate::Result<()> {
+        let features = self.capture_features(tokens, positions)?;
+        out.write_all(&features_f16_bytes(&features)?)?;
+        Ok(())
+    }
+
     /// Draft `depth` tokens with the runtime head after committing
     /// `tokens[..position]`, exactly as a speculative round does: step 0 fuses
     /// `tokens[position]` with the committed hidden, every deeper step fuses the
@@ -239,6 +302,91 @@ fn block_sizes(count: usize, rows: usize) -> Vec<usize> {
         remaining -= take;
     }
     sizes
+}
+
+/// Check a [`MtpCapture::capture_features`] request before any GPU work.
+fn validate_feature_request(
+    tokens: &[u32],
+    positions: &[usize],
+    context: usize,
+) -> crate::Result<()> {
+    if tokens.len() < 2 {
+        return Err(crate::Error::InvalidArgument(
+            "feature capture needs at least 2 tokens".into(),
+        ));
+    }
+    if tokens.len() > context {
+        return Err(crate::Error::ContextOverflow(format!(
+            "feature capture has {} tokens, context is {context}",
+            tokens.len()
+        )));
+    }
+    if let Some(index) = tokens.iter().position(|&token| token as usize >= VOCAB) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "token {} at index {index} is outside the {VOCAB}-entry vocabulary",
+            tokens[index]
+        )));
+    }
+    if positions.is_empty() {
+        return Err(crate::Error::InvalidArgument(
+            "feature capture needs at least one position".into(),
+        ));
+    }
+    if let Some(&[before, after]) = positions
+        .array_windows::<2>()
+        .find(|[before, after]| before >= after)
+    {
+        return Err(crate::Error::InvalidArgument(format!(
+            "feature positions must be strictly increasing: {before} then {after}"
+        )));
+    }
+    let last = positions[positions.len() - 1];
+    if last >= tokens.len() {
+        return Err(crate::Error::InvalidArgument(format!(
+            "feature position {last} is past the final token index {}",
+            tokens.len() - 1
+        )));
+    }
+    Ok(())
+}
+
+/// Append to `out` the rows of one block — `normalized` holds the block's
+/// rows, the first at absolute position `start` — for `positions[next..]`
+/// that fall inside it, returning the index of the first position past it.
+/// `positions` is strictly increasing and `positions[next] >= start`.
+fn select_rows(
+    normalized: &[f32],
+    start: usize,
+    positions: &[usize],
+    mut next: usize,
+    out: &mut Vec<f32>,
+) -> usize {
+    let end = start + normalized.len() / WIDTH;
+    while let Some(&position) = positions.get(next) {
+        if position >= end {
+            break;
+        }
+        let row = position - start;
+        out.extend_from_slice(&normalized[row * WIDTH..(row + 1) * WIDTH]);
+        next += 1;
+    }
+    next
+}
+
+/// Little-endian FP16 bytes of `values`, rejecting any value FP16 cannot
+/// hold finitely rather than writing `inf`/`NaN` features.
+fn features_f16_bytes(values: &[f32]) -> crate::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+    for (index, &value) in values.iter().enumerate() {
+        let half = half::f16::from_f32(value);
+        if !half.is_finite() {
+            return Err(crate::Error::Generation(format!(
+                "feature value {value} at element {index} is not finite in FP16"
+            )));
+        }
+        bytes.extend_from_slice(&half.to_le_bytes());
+    }
+    Ok(bytes)
 }
 
 /// Highest `k` entries of one row, best first; ties keep the lower id, as the
@@ -495,7 +643,108 @@ fn write_rotated_table(
 
 #[cfg(test)]
 mod tests {
-    use super::{block_sizes, inverse_rotate, sign_codes, top_k_row};
+    use super::{
+        VOCAB, WIDTH, block_sizes, features_f16_bytes, inverse_rotate, select_rows, sign_codes,
+        top_k_row, validate_feature_request,
+    };
+
+    #[test]
+    #[ignore = "requires the pinned model; selected features must match MTP capture row p+1"]
+    fn selected_features_match_model_capture_including_final_token() -> crate::Result<()> {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+        ));
+        let mut capture = super::MtpCapture::open(path, None, 4, 64)?;
+        let tokens = [7, 1503, 4095, 83, 700, 38, 127, 512];
+        let positions = [0, 3, 4, 7];
+        let features = capture.capture_features(&tokens, &positions)?;
+        let mut extended = tokens.to_vec();
+        extended.push(19);
+        let mut shard = Vec::new();
+        capture.capture_document(&extended, 1, &mut shard)?;
+        let record_bytes = 12 + WIDTH * 2;
+        for (row, &position) in positions.iter().enumerate() {
+            // MTP record p+1 stores hidden p; unlike selected capture its final
+            // hidden needs an appended token. Appending also changes the last
+            // block's size, so allow its existing FP16 state rounding error.
+            let offset = 16 + (position + 1) * record_bytes + 12;
+            let expected: Vec<f32> = shard[offset..offset + WIDTH * 2]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| half::f16::from_le_bytes([pair[0], pair[1]]).to_f32())
+                .collect();
+            let actual = &features[row * WIDTH..(row + 1) * WIDTH];
+            let squared_error: f64 = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                .sum();
+            let energy: f64 = expected.iter().map(|&v| f64::from(v).powi(2)).sum();
+            assert!(energy > 0.0);
+            let relative_rms = (squared_error / energy).sqrt();
+            assert!(
+                relative_rms < 0.003,
+                "position {position}: relative RMS {relative_rms}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Feature selection over the real block split reads row `p` itself — not
+    /// `p - 1` as shard records do — including the first and final tokens and
+    /// rows on either side of a block boundary.
+    #[test]
+    fn feature_rows_are_selected_without_shift() {
+        let rows = 4;
+        for count in [2, 3, 5, 9, 10] {
+            // Every value of row `p` is `p`, so a shifted read is visible.
+            let all: Vec<f32> = (0..count)
+                .flat_map(|p| std::iter::repeat_n(p as f32, WIDTH))
+                .collect();
+            let positions: Vec<usize> = (0..count)
+                .filter(|p| p % 2 == 0 || p + 1 == count)
+                .collect();
+            assert_eq!(positions.last(), Some(&(count - 1)));
+            let (mut out, mut next, mut start) = (Vec::new(), 0, 0);
+            for take in block_sizes(count, rows) {
+                let block = &all[start * WIDTH..(start + take) * WIDTH];
+                next = select_rows(block, start, &positions, next, &mut out);
+                start += take;
+            }
+            assert_eq!(next, positions.len());
+            let want: Vec<f32> = positions
+                .iter()
+                .flat_map(|&p| std::iter::repeat_n(p as f32, WIDTH))
+                .collect();
+            assert!(out == want, "count {count}: rows read shifted");
+        }
+    }
+
+    #[test]
+    fn feature_requests_are_validated() {
+        let tokens = [1, 2, 3, 4];
+        assert!(validate_feature_request(&tokens, &[0, 3], 4).is_ok());
+        assert!(validate_feature_request(&tokens, &[3], 4).is_ok());
+        assert!(validate_feature_request(&tokens, &[], 4).is_err());
+        assert!(validate_feature_request(&tokens, &[2, 1], 4).is_err());
+        assert!(validate_feature_request(&tokens, &[1, 1], 4).is_err());
+        assert!(validate_feature_request(&tokens, &[4], 4).is_err());
+        assert!(validate_feature_request(&tokens, &[0], 3).is_err());
+        assert!(validate_feature_request(&[1], &[0], 4).is_err());
+        assert!(validate_feature_request(&[1, VOCAB as u32], &[0], 4).is_err());
+    }
+
+    #[test]
+    fn feature_bytes_are_little_endian_f16_and_finite() {
+        assert_eq!(
+            features_f16_bytes(&[1.0, -2.0]).ok(),
+            Some(vec![0x00, 0x3C, 0x00, 0xC0])
+        );
+        assert!(features_f16_bytes(&[1.0e6]).is_err());
+        assert!(features_f16_bytes(&[f32::NAN]).is_err());
+    }
 
     /// The butterflies are the natural (Sylvester) order Walsh-Hadamard
     /// transform, H[i][j] = (-1)^popcount(i & j), scaled by 1/32 — the matrix

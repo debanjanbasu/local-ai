@@ -136,3 +136,153 @@ fn a_prefill_boundary_survives_a_wait_that_only_wanted_events() {
         "a multi-chunk prefill left {kept} boundaries for `next_signal`"
     );
 }
+
+fn weather_tools() -> std::sync::Arc<crate::tools::ToolSet> {
+    let tool = crate::ToolDefinition {
+        name: "get_weather".into(),
+        description: None,
+        parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
+    };
+    std::sync::Arc::new(crate::tools::ToolSet::new(&[tool]).expect("tools"))
+}
+
+const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+
+fn split(
+    thinking: bool,
+    tools: Option<std::sync::Arc<crate::tools::ToolSet>>,
+    pieces: &[&str],
+) -> (Vec<Event>, Option<String>) {
+    let mut splitter = super::EventSplitter::new(thinking, tools);
+    let mut events = Vec::new();
+    let mut sink = |event| {
+        events.push(event);
+        std::ops::ControlFlow::Continue(())
+    };
+    for piece in pieces {
+        if splitter.emit(piece, &mut sink).is_break() {
+            break;
+        }
+    }
+    if !splitter.failed() {
+        let _ = splitter.finish(&mut sink);
+    }
+    (events, splitter.take_failure())
+}
+
+#[test]
+fn tool_calls_are_parsed_only_in_the_answer_of_a_request_with_tools() {
+    let thought = format!("plan {CALL}</think>\n\nOK\n\n{CALL}");
+    let (events, failure) = split(true, Some(weather_tools()), &[&thought]);
+    assert_eq!(failure, None);
+    assert!(matches!(&events[0], Event::Reasoning(text) if text.contains("<tool_call>")));
+    assert!(matches!(&events[1], Event::Content(text) if text == "OK"));
+    assert!(
+        matches!(&events[2], Event::ToolCall(call) if call.arguments == serde_json::json!({"city":"Paris"}))
+    );
+    assert_eq!(events.len(), 3);
+
+    let (events, failure) = split(false, None, &[CALL]);
+    assert_eq!(failure, None);
+    assert!(matches!(events.as_slice(), [Event::Content(text)] if text == CALL));
+}
+
+fn delivery(
+    tools: Option<std::sync::Arc<crate::tools::ToolSet>>,
+) -> (
+    super::Delivery,
+    tokio::sync::mpsc::Receiver<super::Delivered>,
+) {
+    let (events, receiver) = tokio::sync::mpsc::channel(16);
+    let delivery = super::Delivery {
+        events,
+        cancel: crate::bonsai_model::CancelToken::new(),
+        splitter: super::EventSplitter::new(false, tools),
+        outbox: std::collections::VecDeque::new(),
+    };
+    (delivery, receiver)
+}
+
+fn generation() -> crate::bonsai_model::BonsaiGeneration {
+    crate::bonsai_model::BonsaiGeneration {
+        text: String::new(),
+        token_ids: vec![1],
+        stop_reason: crate::bonsai_model::StopReason::Eos,
+        stats: crate::GenerationStats::default(),
+        cache_source: crate::bonsai_model::PromptCacheSource::None,
+    }
+}
+
+fn outbox_events(delivery: &super::Delivery) -> Vec<Event> {
+    delivery
+        .outbox
+        .iter()
+        .filter_map(|item| match item {
+            super::Delivered::Event(event) => Some(event.clone()),
+            super::Delivered::Progress(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_worker_streams_a_valid_call_and_then_finishes() {
+    let (mut delivery, _receiver) = delivery(Some(weather_tools()));
+    assert!(delivery.emit("Checking.\n\n"));
+    assert!(delivery.emit(CALL));
+    delivery.complete(Ok(generation()));
+    let events = outbox_events(&delivery);
+    assert!(matches!(&events[0], Event::Content(text) if text == "Checking."));
+    assert!(matches!(&events[1], Event::ToolCall(call) if call.name == "get_weather"));
+    assert!(matches!(events.last(), Some(Event::Finished(_))));
+}
+
+#[test]
+fn usage_counts_reasoning_tokens_including_the_delimiter_not_text_chunks() {
+    for (thinking, text, tokens, count) in [
+        (
+            true,
+            "why</think>\n\nanswer",
+            vec![7, 11, 248_069, 13, 17],
+            3,
+        ),
+        (true, "unfinished thought", vec![7, 11], 2),
+        (false, "literal </think>", vec![7, 248_069, 13], 0),
+        (true, "", vec![], 0),
+    ] {
+        let (mut delivery, _receiver) = delivery(None);
+        delivery.splitter = super::EventSplitter::new(thinking, None);
+        assert!(delivery.emit(text));
+        let mut output = generation();
+        output.token_ids = tokens;
+        delivery.complete(Ok(output));
+        let events = outbox_events(&delivery);
+        let Some(Event::Finished(stats)) = events.last() else {
+            panic!("missing terminal usage: {events:?}");
+        };
+        assert_eq!(stats.reasoning_tokens, count);
+    }
+}
+
+#[test]
+fn the_worker_reports_invalid_and_truncated_calls_without_finishing() {
+    let invalid = CALL.replace("city", "town");
+    let truncated = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar";
+    for (output, stops) in [(invalid.as_str(), true), (truncated, false)] {
+        let (mut delivery, _receiver) = delivery(Some(weather_tools()));
+        assert!(delivery.emit("Checking. "));
+        assert_eq!(delivery.emit(output), !stops);
+        delivery.complete(Ok(generation()));
+        let events = outbox_events(&delivery);
+        assert!(
+            matches!(events.last(), Some(Event::Error(error)) if error.starts_with("invalid tool call")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                Event::ToolCall(_) | Event::Finished(_) | Event::TokenIds(_)
+            )),
+            "{events:?}"
+        );
+    }
+}

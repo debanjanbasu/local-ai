@@ -40,12 +40,13 @@ use std::ops::ControlFlow;
 let mut engine = Engine::open()?;
 let request = ChatRequest {
     messages: vec![ChatMessage {
-        role: "user".into(), content: "Hello".into(), reasoning_content: None,
+        role: "user".into(), content: "Hello".into(), ..ChatMessage::default()
     }],
     max_tokens: 128,
     sampling: Sampling::default(),
     thinking: true,
     session: None,
+    tools: vec![],
 };
 engine.chat_with(&request, |event| {
     if let Event::Content(text) = event { print!("{text}"); }
