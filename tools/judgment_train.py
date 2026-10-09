@@ -1,9 +1,9 @@
 """EXPERIMENTAL head-only judgment pointer training and evaluation (not production).
 
 Research tool for the frozen Bonsai PTQ1 trunk: it never touches the trunk, never
-transplants LoRA weights and never claims accuracy for real Bonsai data (no such
-dataset exists yet; that remains the blocker). It reads features captured by the
-native worker and trains only the pointer head:
+transplants LoRA weights and does not establish production quality. See the
+local-engine README for the small Kev pilot and its limitations. It reads
+features captured by the native worker and trains only the pointer head:
 
     q = Q h_decide + b_q        Q: [HEAD_DIM, width], b_q: [HEAD_DIM]
     k_i = K h_option_i + b_k    K: [HEAD_DIM, width], b_k: [HEAD_DIM]

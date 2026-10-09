@@ -175,6 +175,30 @@ impl BonsaiTokenizer {
             .map_err(|error| crate::Error::Tokenizer(error.to_string()))
     }
 
+    /// Encode `text` once (exactly as [`Self::encode`]) and resolve each UTF-8
+    /// byte endpoint in `byte_ends` (exclusive, strictly increasing) to the
+    /// index of the token that ends exactly there.
+    ///
+    /// An endpoint is rejected, never rounded, when it is zero, past the text,
+    /// inside a UTF-8 character, or inside a token (a merge spans it). When
+    /// byte-level BPE splits one character into several tokens, they share the
+    /// character's span, and the endpoint after the character resolves to the
+    /// last of them.
+    #[doc(hidden)]
+    pub fn encode_with_token_ends(
+        &self,
+        text: &str,
+        byte_ends: &[usize],
+    ) -> crate::Result<(Vec<u32>, Vec<usize>)> {
+        let encoding = self
+            .inner
+            .encode(text, false)
+            .map_err(|error| crate::Error::Tokenizer(error.to_string()))?;
+        let ends = token_end_indices(text, encoding.get_offsets(), byte_ends)
+            .map_err(crate::Error::InvalidArgument)?;
+        Ok((encoding.get_ids().to_vec(), ends))
+    }
+
     #[doc(hidden)]
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> crate::Result<String> {
         self.inner
@@ -258,6 +282,61 @@ fn nonempty<'a>(text: &'a str, field: &str) -> crate::Result<&'a str> {
     } else {
         Ok(text)
     }
+}
+
+/// Map exclusive UTF-8 byte endpoints to ending token indices, given each
+/// token's `[start, end)` byte span in `text` from a single encode.
+fn token_end_indices(
+    text: &str,
+    offsets: &[(usize, usize)],
+    byte_ends: &[usize],
+) -> Result<Vec<usize>, String> {
+    if let Some(&[before, after]) = byte_ends
+        .array_windows::<2>()
+        .find(|[before, after]| before >= after)
+    {
+        return Err(format!(
+            "token_end_offsets must be strictly increasing: {before} then {after}"
+        ));
+    }
+    // Spans of a split character coincide, so neighbours may overlap, but
+    // starts and ends never move backwards.
+    let ordered = offsets.iter().all(|&(start, end)| start <= end)
+        && offsets
+            .array_windows::<2>()
+            .all(|[a, b]| a.0 <= b.0 && a.1 <= b.1);
+    if !ordered || offsets.last().is_some_and(|&(_, end)| end > text.len()) {
+        return Err("tokenizer returned non-monotonic byte offsets".into());
+    }
+    byte_ends
+        .iter()
+        .map(|&byte| {
+            if byte == 0 || byte > text.len() {
+                return Err(format!(
+                    "byte offset {byte} is outside 1..={} (text bytes)",
+                    text.len()
+                ));
+            }
+            if !text.is_char_boundary(byte) {
+                return Err(format!("byte offset {byte} is inside a UTF-8 character"));
+            }
+            // Tokens wholly before the endpoint; the last of them must end on
+            // it and the next must not start before it.
+            let count = offsets.partition_point(|&(_, end)| end <= byte);
+            let next = offsets.get(count);
+            match (
+                count.checked_sub(1).map(|index| (index, offsets[index])),
+                next,
+            ) {
+                (_, Some(&(start, end))) if start < byte => Err(format!(
+                    "byte offset {byte} is inside token {count} (bytes {start}..{end}); \
+                     it is not a token boundary"
+                )),
+                (Some((index, (_, end))), _) if end == byte => Ok(index),
+                _ => Err(format!("byte offset {byte} does not end a token")),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn answer_start(ids: &[u32], thinking: bool) -> Option<usize> {
@@ -374,6 +453,72 @@ mod tests {
         assert_eq!(answer_start(&[], true), None);
     }
 
+    /// The real pre-tokenizer/byte-level pipeline over a tiny vocabulary: the
+    /// 256 byte symbols, merges `a b` and `ab c`, and one special token.
+    fn tiny_tokenizer() -> BonsaiTokenizer {
+        let mut symbols: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+            .into_iter()
+            .collect();
+        symbols.sort_unstable();
+        let mut vocab: Vec<String> = symbols.iter().map(char::to_string).collect();
+        vocab.extend(["ab".into(), "abc".into(), "<|x|>".into()]);
+        let special = vocab.len() - 1;
+        let map = vocab
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), serde_json::Value::from(id)))
+            .collect();
+        let added = vec![serde_json::json!({
+            "id": special, "content": "<|x|>", "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": false, "special": true
+        })];
+        let definition = super::tokenizer_json(map, added, vec!["a b".into(), "ab c".into()]);
+        let bytes = serde_json::to_vec(&definition).expect("json");
+        BonsaiTokenizer {
+            inner: tokenizers::Tokenizer::from_bytes(&bytes).expect("tiny tokenizer"),
+            eos_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn byte_endpoints_resolve_to_exact_ending_tokens_in_one_encode() {
+        let tokenizer = tiny_tokenizer();
+        // Bytes: "abc"=0..3, "\n"=3..4, "é"=4..6, "😀"=6..10, "<|x|>"=10..15, "c"=15..16.
+        let text = "abc\né😀<|x|>c";
+        let ids = tokenizer.encode(text).expect("encode");
+        // abc, \n, é (2 byte tokens), 😀 (4 byte tokens), <|x|>, c.
+        assert_eq!(ids.len(), 10);
+        let (same, ends) = tokenizer
+            .encode_with_token_ends(text, &[3, 4, 6, 10, 15, 16])
+            .expect("boundaries");
+        assert_eq!(same, ids);
+        // A split character's endpoint is its last byte token.
+        assert_eq!(ends, vec![0, 1, 3, 7, 8, 9]);
+        assert_eq!(ids[8] as usize, 256 + 2);
+
+        for (bad, why) in [
+            (&[2][..], "inside token"),    // "ab|c" is merged into one token
+            (&[5][..], "UTF-8 character"), // inside é
+            (&[8][..], "UTF-8 character"), // inside 😀
+            (&[12][..], "inside token"),   // inside the special token
+            (&[0][..], "outside"),         // no token ends at 0
+            (&[17][..], "outside"),        // past the text
+            (&[4, 3][..], "strictly increasing"),
+            (&[4, 4][..], "strictly increasing"),
+        ] {
+            let error = tokenizer
+                .encode_with_token_ends(text, bad)
+                .expect_err("rejected")
+                .to_string();
+            assert!(error.contains(why), "{bad:?}: {error}");
+        }
+        assert!(tokenizer.encode_with_token_ends("", &[1]).is_err());
+        assert_eq!(
+            tokenizer.encode_with_token_ends(text, &[]).expect("none").1,
+            Vec::<usize>::new()
+        );
+    }
+
     #[test]
     fn rejects_bad_family_and_bad_merges() {
         assert!(require("llama", "gpt2", "model").is_err());
@@ -482,7 +627,21 @@ mod tests {
             let ids = tokenizer.encode(text).expect("encode");
             assert_eq!(&ids, expected, "{text:?}");
             assert_eq!(tokenizer.decode(&ids, false).expect("decode"), *text);
+            let (same, ends) = tokenizer
+                .encode_with_token_ends(text, &[text.len()])
+                .expect("final boundary");
+            assert_eq!((same, ends), (ids.clone(), vec![ids.len() - 1]), "{text:?}");
         }
+        // "plain" + " ASCII" are two tokens; the space starts the second.
+        let (_, ends) = tokenizer
+            .encode_with_token_ends("plain ASCII", &[5, 11])
+            .expect("word boundary");
+        assert_eq!(ends, vec![0, 1]);
+        assert!(
+            tokenizer
+                .encode_with_token_ends("plain ASCII", &[6])
+                .is_err()
+        );
     }
 
     /// The `tokenizer` object from `--export index` must build a tokenizer

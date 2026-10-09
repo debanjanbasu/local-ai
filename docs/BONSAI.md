@@ -1686,6 +1686,13 @@ tests do not establish reliable repository reasoning at that length. A short
 prompt with the same formula and arguments returned the correct `38, 17`;
 that control does not isolate the cause of the long-context failure.
 
+Repeating the same 1,800-module fixture with the checkpoint's default `xhigh`
+reasoning returned the correct `38,17`: 69,137 input tokens, 208 output tokens
+(202 reasoning), 807.4 seconds on AC without sleep. Both runs were greedy;
+the reasoning run allowed 1,024 output tokens instead of 32 and included the
+template's reasoning instruction. It is a passing paired probe, not evidence
+of reliable coding at 262,144 tokens or a causal isolation of every difference.
+
 Real-model Chat and Responses each completed a three-turn read/edit/result/final
 loop whose edit passed two executed assertions. Seven unmodified live response
 objects and 57 Responses SSE events, including reasoning and function calls,

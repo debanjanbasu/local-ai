@@ -141,47 +141,88 @@ generation and does not train classification, tool use or confidence calibration
 ### Experimental judgment-head preparation
 
 `mtp-capture features` captures selected output-normalized hidden states without
-changing the frozen model. Positions are zero-based token indices, including the
-final token; this is not the previous-token layout of MTP training shards.
-Input JSONL rows contain `id`, raw `text`, sorted `positions`, and optional
-`metadata`. Output `features.jsonl` records tokens, positions and the matching
+changing the frozen model. Input JSONL rows contain a non-empty `id`, raw
+`text` (no chat template), optional `metadata`, and exactly one of:
+
+- `positions`: sorted zero-based token indices (the final token is allowed);
+  this is not the previous-token layout of MTP training shards;
+- `token_end_offsets`: sorted exclusive UTF-8 byte endpoints into `text`. One
+  native Bonsai encode of the whole text resolves each endpoint to the token
+  ending exactly there. Endpoints at zero, past the text, inside a UTF-8
+  character or inside a merged token are rejected, never rounded.
+
+Output `features.jsonl` records tokens, resolved positions and the matching
 little-endian FP16 binary file. Existing output is never overwritten.
+`--validate-only` tokenizes and checks every row and prints row, vector, token
+and per-split counts; it does not open the Metal engine and writes nothing.
+
+Capture uses the hidden-output path, omitting vocabulary projection and verify
+rollback work. An M4 Pro A/B/B/A run on 16 real rows (60-token blocks) took
+34.860/33.472/33.467/34.859 seconds for verify/hidden/hidden/verify, with identical
+exported FP16 bytes: about 4% less capture time, not a general decode speedup.
+
+The Kev pilot pipeline is:
 
 ```sh
+# 1. Fetch the pinned public files yourself (nothing is uploaded):
+#    https://raw.githubusercontent.com/jaredpalmer/kev/5e42a7a03f28134853dd3ff77461457e921e5ec1/evals/devtools-v1/{manifest,train,development,test}.json[l]
+python3 tools/judgment_prepare.py --kev-dir KEV --out PREP --pilot-rows 32
 cargo build -p local-ai --release --bin mtp-capture
-target/release/mtp-capture features --out FEATURES --max-tokens 2048 ROWS.jsonl
+target/release/mtp-capture features --validate-only PREP/rows.jsonl
+target/release/mtp-capture features --out FEATURES --max-tokens 2048 PREP/rows.jsonl
 python3 tools/judgment_train.py validate FEATURES
 python3 tools/kaggle_judgment_job.py --kernel OWNER/judgment-head \
   --dataset OWNER/FEATURES_DATASET --output STAGING
 ```
 
-The last command only stages a private offline Kaggle job; it does not upload
-data or submit training. Capture is local inference, not local training.
-Training requires a licensed, labeled dataset with independent `train`,
-`validation`, `calibration`, and `test` splits in `metadata.split` and an integer
-`metadata.target`. Option positions precede the final decision position.
-The trainer selects weights on validation, fits temperature only on calibration,
+`tools/judgment_prepare.py` reads Kev's pinned
+[`devtools-v1` manifest](https://github.com/jaredpalmer/kev/blob/5e42a7a03f28134853dd3ff77461457e921e5ec1/evals/devtools-v1/manifest.json)
+(its sha256 is pinned in the script) and checks each partition's sha256, size,
+record and per-source counts and every record's schema. It converts only the
+audited coding questions with native labels, without LLM relabeling:
+`CodeReviewer` `needs_comment` (human label) and `CommitPackFT` `message_match`
+(label by construction). The later
+[Kev-27B label audit](https://github.com/jaredpalmer/kev/blob/main/docs/model-cards/kev-27b.md)
+excludes `FlakeFlagger` and commit-change-type because the supplied state does
+not determine their labels; Aegis is outside the coding focus; `When2Call` and
+prompt-injection are evaluation-only. Each excluded row is counted by reason in
+`PREP/report.json`; unsupported schemas and malformed records are errors.
+
+Kev development becomes `validation` and Kev test stays the locked `test`;
+`calibration` is whole `group_id` groups carved from Kev train in a seeded hash
+order. Record, group, state-text (exact and normalized) and rendered-text overlap
+across splits is an error, as are too few groups or a single label class in any
+split and task. Kev's `CodeReviewer` ids repeat, so `row_sha256` identifies
+records. Each prompt is `State:`, the state, `Question:` with Kev's instruction,
+`Options:` lines `A) Yes` / `B) No` in a per-row deterministic order, and a final
+`Decision:` cue. Option endpoints include each line's newline; `metadata.target`
+indexes the gold option, and `metadata` also keeps the option mapping, native
+label, Kev id, `group_id` and row hash. The report records hashes, attribution,
+source and per-repository licences, counts and caveats. `--pilot-rows N` keeps
+whole groups up to N rows per split and task and reports the rest; a pilot only
+exercises the pipeline and says nothing about quality.
+
+The Kaggle command only stages a private offline job; it does not upload data
+or submit training. Capture is local inference, not local training. The
+trainer selects weights on validation, fits temperature only on calibration,
 and reports held-out accuracy, NLL, Brier score and calibration error. Export is
 an experimental F32 pointer head, not a `LoRA` or an installed runtime artifact.
 
-No production judgment head is supplied. Frozen Bonsai features may not match
-Kev's adapter-trained representations; real held-out and out-of-domain results,
-refusal/confidence semantics, and a native loader remain prerequisites for
-Decisions. The existing MTP rollout data has no judgment labels and is not
-silently reused for this task.
+A private offline CPU Kaggle pilot completed on 252 captured rows (64 train,
+64 validation, 60 calibration, 64 test). Validation selected epoch 1 of 20;
+validation accuracy was 48.44%. Calibrated test accuracy was 40/64 (62.5%), NLL
+0.605155, Brier 0.426804 and ECE 0.106413, with temperature 14.01774. Reading the
+exported head without `PyTorch` reproduced these metrics within 0.00001.
+`CodeReviewer` scored 19/32 versus a train-majority baseline of 16/32;
+`CommitPackFT` scored 21/32 versus 17/32. The code-review test has only four
+groups, and there is no zero-shot Bonsai comparison. These observed pilot test
+rows are no longer an untouched evaluation set for future model selection.
 
-For a public pilot, Kev's pinned
-[`devtools-v1` manifest](https://github.com/jaredpalmer/kev/blob/5e42a7a03f28134853dd3ff77461457e921e5ec1/evals/devtools-v1/manifest.json)
-records file hashes, source revisions, attribution and per-source licenses.
-Preserve those notices and source-level `group_id` boundaries, carve calibration
-groups from training, use development only for checkpoint selection, and keep
-test locked. Its When2Call and prompt-injection sources are evaluation-only.
-Do not use every label indiscriminately: the later
-[Kev-27B label audit](https://github.com/jaredpalmer/kev/blob/main/docs/model-cards/kev-27b.md)
-excludes FlakeFlagger and commit-change-type questions because the supplied state
-does not determine their labels. A converter must also bind option/decision
-positions to Bonsai's exact tokenizer; it is not yet provided. These are proposed
-inputs, not evidence that training has run or that the head generalizes.
+No production judgment head is supplied. Frozen Bonsai features may not match
+Kev's adapter-trained representations; Kev's labels are balanced by sampling,
+not natural rates. Larger held-out and out-of-domain results, refusal/confidence
+semantics, and a native loader remain prerequisites for Decisions. The existing
+MTP rollout data has no judgment labels and is not silently reused for this task.
 
 Acceptance should exercise native calls as well as HTTP: a complete read/edit/
 tool-result turn, malformed and interrupted arguments that cannot execute,

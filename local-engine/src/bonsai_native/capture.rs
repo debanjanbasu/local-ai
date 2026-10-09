@@ -64,6 +64,9 @@ pub struct MtpCapture {
 }
 
 impl MtpCapture {
+    /// Maximum capture-block width accepted by [`Self::open`].
+    pub const MAX_ROWS: usize = MAX_PREFILL_TOKENS as usize;
+
     /// Load the target for capture blocks of up to `rows` tokens and documents of
     /// up to `context` tokens. A `head` is only needed for [`Self::draft_chain`].
     pub fn open(
@@ -72,7 +75,7 @@ impl MtpCapture {
         rows: usize,
         context: usize,
     ) -> crate::Result<Self> {
-        if !(3..=MAX_PREFILL_TOKENS as usize).contains(&rows) {
+        if !(3..=Self::MAX_ROWS).contains(&rows) {
             return Err(crate::Error::InvalidArgument(format!(
                 "capture rows must be within 3..={MAX_PREFILL_TOKENS}"
             )));
@@ -167,13 +170,13 @@ impl MtpCapture {
     ///
     /// Row `p` is the hidden *after* the token at zero-based index `p` — the
     /// one whose logits predict token `p + 1` — read from `scratch.normalized`
-    /// on the same verify blocks [`Self::capture_document`] runs. Unlike a
-    /// shard record (which holds row `p - 1`), there is no shift and no dummy
+    /// on committed hidden-only blocks, without vocabulary projection or
+    /// verification rollback. Unlike a shard record (which holds row `p - 1`),
+    /// there is no shift and no dummy
     /// token: `tokens.len() - 1` selects the final token's own hidden.
     ///
-    /// `tokens` must hold `2..=context` valid ids (the verify path rejects a
-    /// single-row block); `positions` must be non-empty, strictly increasing
-    /// and below `tokens.len()`. Nothing is truncated.
+    /// `tokens` must hold `2..=context` valid ids; `positions` must be non-empty,
+    /// strictly increasing and below `tokens.len()`. Nothing is truncated.
     pub fn capture_features(
         &mut self,
         tokens: &[u32],
@@ -190,9 +193,7 @@ impl MtpCapture {
                 break;
             }
             let block = &tokens[start..start + take];
-            self.model
-                .forward_block(block, BlockOutput::Verify(&self.verifier))?;
-            self.model.commit_verified(&mut self.verifier, take, take)?;
+            self.model.forward_block(block, BlockOutput::Hidden)?;
             let normalized = &self.model.scratch.normalized.as_slice::<f32>()[..take * WIDTH];
             next = select_rows(normalized, start, positions, next, &mut features);
             start += take;
