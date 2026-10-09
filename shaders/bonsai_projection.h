@@ -171,15 +171,31 @@ static inline half bonsai_ptq1_prefix(half code, metal::uint p) {
     return metal::fma(code, powers[p - 1], shifts[p - 1]) - offsets[p - 1];
 }
 
-// The five trits of a qs byte, -1/0/+1 in digit order, exactly:
-// digit n = prefix(n + 1) - 3 * prefix(n), with prefix(0) = 0.
+// The same prefix minus k_p = (3^p - 1) / 2 = 1, 4, 13, 40, 121: the
+// balanced-ternary value of the first p trits, an integer in [-121, 121] and
+// exact in half. Folding k_p into the offset keeps one FMA and one subtraction.
+static inline half bonsai_ptq1_balanced_prefix(half code, metal::uint p) {
+    const half powers[5] = {
+        3.0h / 256.0h, 9.0h / 256.0h, 27.0h / 256.0h, 81.0h / 256.0h, 243.0h / 256.0h};
+    const half shifts[5] = {1013.5h, 1001.5h, 929.5h, 821.5h, 173.5h};
+    const half offsets[5] = {1027.0h, 1042.0h, 1051.0h, 1186.0h, 1267.0h};
+    return metal::fma(code, powers[p - 1], shifts[p - 1]) - offsets[p - 1];
+}
+
+// The five trits of a qs byte, -1/0/+1 in digit order, exactly. With
+// balanced prefixes B_p = prefix(p) - k_p and k_{p+1} = 3 k_p + 1, trit n =
+// prefix(n + 1) - 3 prefix(n) - 1 = B_{n+1} - 3 B_n, and B_1 is trit 0: one
+// FMA per trit after the first instead of a subtraction and an FMA. The
+// trits are the same values; on M4 Pro the scalar small-batch kernel went
+// from 156.4 / 193.9 / 230.8 to 144.7 / 187.0 / 227.8 us at 2 / 3 / 4 rows
+// (17408x5120) with bit-identical outputs.
 static inline void bonsai_ptq1_trits(half code, thread half *trits) {
     half previous = 0.0h;
     #pragma clang loop unroll(full)
     for (metal::uint n = 0; n < 5; ++n) {
-        const half prefix = bonsai_ptq1_prefix(code, n + 1);
-        trits[n] = metal::fma(-3.0h, previous, prefix - 1.0h);
-        previous = prefix;
+        const half balanced = bonsai_ptq1_balanced_prefix(code, n + 1);
+        trits[n] = n == 0 ? balanced : metal::fma(-3.0h, previous, balanced);
+        previous = balanced;
     }
 }
 

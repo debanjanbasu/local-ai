@@ -12,8 +12,8 @@ pub const DEFAULT_MIN_P: f32 = 0.0;
 ///
 /// Capacity 1 bought no useful backpressure, because the engine's own decode
 /// pace is the rate limiter; it only cost cross-client isolation. A real buffer
-/// stops one slow consumer from stalling the engine worker, which is
-/// single-flight and serves every queued request. Events are single-token text
+/// stops one slow consumer from stalling the engine worker, which serves every
+/// running and queued request. Events are single-token text
 /// pieces, or one `Vec<u32>` for the whole generation, so 64 stays well under
 /// one megabyte even in the worst case.
 pub const EVENT_BUFFER: usize = 64;
@@ -101,6 +101,8 @@ pub struct GenerationStats {
     pub gpu: Duration,
     pub mtp: MtpStats,
     pub ngram: NgramStats,
+    /// Tokens decoded in a batched step beside other requests.
+    pub batched_tokens: usize,
     /// Time from request start to the first sampled token, even without visible text.
     pub first_token: Option<Duration>,
     pub elapsed: Duration,

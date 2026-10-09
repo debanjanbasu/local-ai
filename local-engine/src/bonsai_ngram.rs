@@ -8,7 +8,11 @@ pub const DEFAULT_NGRAM_MAX: usize = 63;
 /// Measured on the M4 Pro, greedy, byte-identical text: three edit prompts that
 /// echo quoted code decoded at 55.9 tok/s geomean with 12 against 55.1 with 16
 /// and 52.8 with 24; 4 and 8 fired spurious lookups on novel prose, while 12
-/// fired none on four novel prompts.
+/// fired none on four novel prompts. Re-measured on the current kernels with
+/// two rename-an-identifier edits of ~50 quoted lines (600 tokens): 8, 10, 12
+/// and 16 gave 60.3, 58.9, 60.1 and 58.5 tok/s geomean against 47.5 without
+/// lookup. 8 tied 12 only because the two edits disagreed by ±10 %, so 12
+/// stays.
 pub const DEFAULT_NGRAM_MIN_MATCH: usize = 12;
 /// 63 drafts plus the seed fill one 64-token verify tile; a 65th row would
 /// spill into the 128-token tile and cost half as much again.

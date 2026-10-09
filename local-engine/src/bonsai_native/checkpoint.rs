@@ -8,7 +8,7 @@ use super::{
 /// doubling left up to half of a long request's K/V resident and unused: 478 MB
 /// at 16.4K tokens (32,768 allocated, 20,480 now). A step's prefix copy costs
 /// about 5 ms at 16K tokens and 40 ms at 128K, once per 4,096 tokens.
-const KV_GROWTH_STEP: usize = 4096;
+pub(super) const KV_GROWTH_STEP: usize = 4096;
 
 impl BonsaiModel {
     pub(super) fn copy_prompt_state(

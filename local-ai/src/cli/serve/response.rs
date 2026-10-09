@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use serde_json::{Value, json};
 
+use local_engine::bonsai_native::MAX_BATCH_SEQUENCES;
 use local_engine::resources::SERVE_QUEUE;
 
 use super::AppState;
@@ -160,23 +161,20 @@ pub(super) async fn error_response(
 
 /// Rejection for a full engine queue.
 ///
-/// This adds information, not throughput. The engine is single-flight by
-/// design: one command queue, one position cursor, and `&mut self` held for a
-/// whole generation. Measured on this M2, aggregate throughput is 6.12 tok/s
-/// at one client and 4.69 tok/s at three, so a second client costs 0.77x
-/// instead of adding capacity. What a rejected client lacks is a schedule, so
+/// Up to `MAX_BATCH_SEQUENCES` requests decode together, one batched pass per
+/// token for all of them, and `SERVE_QUEUE` more wait behind them; this is the
+/// answer once both are full. What a rejected client lacks is a schedule, so
 /// this response carries the queue depth, the capacity that depth is measured
 /// against, and a `Retry-After` to retry on.
 ///
-/// The depth is the occupancy at the instant of rejection, which is the number
-/// of requests ahead of the rejected one. An admitted client still waits
-/// invisibly: the engine drains in arrival order, so a client's position is
-/// its admission order, and nothing here shortens that wait.
+/// The depth is the occupancy at the instant of rejection: requests running
+/// and waiting. Waiting requests are admitted in arrival order as running ones
+/// finish.
 pub(super) async fn queue_full_response(state: &AppState, headers: &HeaderMap) -> Response {
     let depth = state.depth.load();
     let message = format!(
-        "engine queue is full: {depth} of {SERVE_QUEUE} slots in use; this server runs one \
-         generation at a time, so adding clients does not add throughput. Retry after \
+        "engine queue is full: {depth} requests running or waiting; up to \
+         {MAX_BATCH_SEQUENCES} decode together and {SERVE_QUEUE} more may wait. Retry after \
          {RETRY_AFTER_SECONDS}s with your own backoff."
     );
     let mut response = json_response(

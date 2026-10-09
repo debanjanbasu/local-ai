@@ -23,8 +23,8 @@ const DEFAULT_STALL_SECONDS: u64 = 30;
 /// worst gap actually observed rather than at a round number.
 const MIN_STALL_SECONDS: i64 = 10;
 
-/// Above this a single wedged client can hold the single-flight engine, and the
-/// one queue slot it admits, for an hour.
+/// Above this a single wedged client can hold a batch slot, its sequence state
+/// and its undelivered output, for an hour.
 const MAX_STALL_SECONDS: i64 = 3600;
 
 pub(super) fn usage() {
@@ -84,8 +84,8 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
 ///
 /// The range is checked here rather than at the point of use because both ends
 /// are only discoverable by letting the server run: zero abandons every slow
-/// generation, and an unbounded value leaves one wedged client owning the
-/// single-flight engine for as long as it cares to hold the socket open.
+/// generation, and an unbounded value leaves one wedged client owning a batch
+/// slot for as long as it cares to hold the socket open.
 fn stall_timeout(value: &str) -> Result<Duration, String> {
     let seconds: i64 = value.parse().map_err(|_| {
         format!("invalid --stall-timeout: {value:?} is not a whole number of seconds")

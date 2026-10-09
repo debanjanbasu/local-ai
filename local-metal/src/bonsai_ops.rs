@@ -20,6 +20,7 @@ pub use gdn::GdnStateFormat;
 mod kv;
 mod matmul;
 mod norm;
+mod rows;
 
 pub const MODEL_WIDTH: u32 = 5120;
 pub const Q_HEADS: u32 = 24;

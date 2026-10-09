@@ -161,7 +161,7 @@ fn expected(chat: bool, content: &str, reasoning: &str) -> Value {
     } else {
         json!({"index":0,"text":content,"finish_reason":"stop"})
     };
-    json!({"choices":[choice],"id":"local","model":"local","object":if chat {"chat.completion"} else {"text_completion"},"speculation":{"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
+    json!({"choices":[choice],"id":"local","model":"local","object":if chat {"chat.completion"} else {"text_completion"},"speculation":{"batched_tokens":0,"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
 }
 
 /// A finished request whose only measurement is a prompt length.
