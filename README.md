@@ -74,14 +74,18 @@ Startup prints every decision and reason under `experimental_bonsai`.
 | Speculation | Lossless suffix lookup; gated depth-3 MTP when the ternary head artifact is installed |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Disk | `min(512 GiB, 25% of free space)` under `~/Library/Caches/local-ai/prompt-cache` |
-| Server | Eight-request queue; HTTP/3 when its certificate and key are discovered |
+| Server | Up to eight requests decoded together in one batched pass per token, eight more queued; HTTP/3 when its certificate and key are discovered |
 
 ## Performance
 
-- Decode: 31.1 tok/s plain and 35.8 tok/s geomean with speculation (32–41
-  across prose, explanation, arithmetic, code and essay prompts), with
-  byte-identical greedy text; code copy-edits measured 40–54 tok/s before the
-  current PTQ1 kernels.
+- Decode: 31.2 tok/s plain and 38.6 tok/s geomean with the default gated
+  depth-3 speculation (35–43 across prose, explanation, arithmetic, code,
+  essay and thinking prompts), with byte-identical greedy text; code
+  copy-edits reach 54–66 tok/s with suffix lookup.
+- Server: concurrent requests decode in one batched pass per token; 300-token
+  chat requests reach 36.8, 48.5 and 67.8 tok/s aggregate at 2, 4 and 8
+  streams against 32.7 for one, with worst TTFT 0.4 s at 4 streams instead of
+  25.5 s queued.
 - Prefill: about 96 tok/s at 4K tokens and 56 tok/s at 128K.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s.

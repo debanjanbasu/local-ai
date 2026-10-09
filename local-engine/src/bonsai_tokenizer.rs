@@ -194,15 +194,24 @@ impl BonsaiTokenizer {
         self.decode(&ids[start..], true).map(Some)
     }
 
-    pub(crate) fn stream_decoder(&self) -> impl FnMut(u32) -> crate::Result<Option<String>> + '_ {
-        // Keep the closing thought marker visible instead of joining reasoning
-        // and the final answer into an indistinguishable string.
-        let mut decoder = self.inner.decode_stream(false);
-        move |id| {
-            decoder
-                .step(id)
-                .map_err(|error| crate::Error::Tokenizer(error.to_string()))
-        }
+    /// Decode one more token incrementally over state the caller owns, so a
+    /// generation can outlive a borrow of the tokenizer. The closing thought
+    /// marker stays visible instead of joining reasoning and the final answer
+    /// into an indistinguishable string.
+    pub(crate) fn stream_step(
+        &self,
+        state: &mut StreamDecodeState,
+        id: u32,
+    ) -> crate::Result<Option<String>> {
+        tokenizers::step_decode_stream(
+            &*self.inner,
+            vec![id],
+            false,
+            &mut state.ids,
+            &mut state.prefix,
+            &mut state.prefix_index,
+        )
+        .map_err(|error| crate::Error::Tokenizer(error.to_string()))
     }
 
     pub(crate) fn vocab_size(&self) -> usize {
@@ -386,6 +395,15 @@ fn require(actual: &str, expected: &str, field: &str) -> crate::Result<()> {
 
 fn invalid<T>(message: impl Into<String>) -> crate::Result<T> {
     Err(crate::Error::InvalidFormat(message.into()))
+}
+
+/// Incremental detokenizer state for [`BonsaiTokenizer::stream_step`]: the
+/// same three fields `tokenizers`' own `DecodeStream` keeps.
+#[derive(Default)]
+pub(crate) struct StreamDecodeState {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
 }
 
 #[cfg(test)]

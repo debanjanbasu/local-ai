@@ -16,10 +16,12 @@ use local_metal::bonsai_ops::AttentionKernel;
 use crate::bonsai::{BonsaiPackage, VOCAB};
 use crate::bonsai_mtp::{DRAFT_CHAIN_MIN_MARGIN, MtpMode, MtpResolution};
 use crate::bonsai_native::{
-    BonsaiModel, HostPromptSnapshot, KvOptions, PROMPT_CHECKPOINT_BYTES, PromptCheckpoint,
-    PromptSnapshot,
+    BatchRow, BonsaiModel, HeadLag, HostPromptSnapshot, KvOptions, PROMPT_CHECKPOINT_BYTES,
+    PromptCheckpoint, PromptSnapshot, SequenceState,
 };
-use crate::bonsai_ngram::{LookupPolicy, NgramSettings, SuffixStore, fill_verify_tile};
+use crate::bonsai_ngram::{
+    LookupPolicy, NgramSettings, SuffixSession, SuffixStore, fill_verify_tile,
+};
 use crate::bonsai_tokenizer::BonsaiTokenizer;
 use crate::prompt_cache::{self, DiskEntry};
 use crate::sampler::{Sampler, SamplingParams, SamplingResult};
@@ -29,9 +31,11 @@ mod cache_policy;
 mod checkpoints;
 mod construction;
 mod generation;
+mod scheduler;
 
 pub use self::cache_policy::{DEFAULT_PROMPT_CACHE_CHECKPOINTS, MAX_PROMPT_CACHE_CHECKPOINTS};
 pub use self::generation::draft_depth;
+pub use self::scheduler::Finished;
 
 use self::checkpoints::{CachedCheckpoint, SessionSnapshot};
 
@@ -149,6 +153,15 @@ pub struct BonsaiEngine {
     prompt_cache_disk_bytes: u64,
     prompt_cache_dir: Option<PathBuf>,
     prompt_cache_model_key: String,
+    /// Generations between admission and their last token.
+    active: Vec<generation::ActiveGeneration>,
+    /// The generation whose buffers are resident in the model, if any.
+    resident: Option<u64>,
+    /// Free parked buffer sets.
+    pool: Vec<SequenceState>,
+    /// The buffer set `cached_tokens` and `prompt_checkpoints` describe.
+    cache_state: u64,
+    next_generation: u64,
 }
 
 impl BonsaiEngine {

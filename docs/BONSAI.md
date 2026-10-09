@@ -204,8 +204,9 @@ is the ceiling rather than a figure a completion response reaches. Level 22 is
 deliberately unchanged: the ratio is a property of the flush policy, not of
 the level.
 
-The engine processes one generation at a time through an eight-slot queue.
-Submission to a full queue fails immediately. Dropping an `EventStream`, using
+The engine decodes up to eight requests together (see
+[Concurrent requests](#concurrent-requests)) and queues eight more behind them;
+submission to a full queue fails immediately. Dropping an `EventStream`, using
 its cancellation handle, or disconnecting a streaming client cooperatively
 cancels queued or running generation. A reset and a graceful close are both
 detected and release the engine promptly — a graceful close was caught after
@@ -217,8 +218,10 @@ able to hand it a frame. A client can stop reading its socket without closing
 it — a stalled network, a dead consumer, a client that wandered off — and
 neither TCP nor axum signals that. Left alone, the send path blocks, the engine
 worker blocks inside its emit callback upstream of every cancellation
-checkpoint, and the single-flight engine holds its queue slot indefinitely, so
-nothing else can be served. When the budget is exceeded the server logs, cancels
+checkpoint, and the generation holds its queue slot indefinitely. (Beside other
+requests the worker no longer waits on a slow reader at all: events queue per
+request and reach the channel without blocking, so only the stalled request
+is held.) When the budget is exceeded the server logs, cancels
 that generation, releases the queue slot, and drops the request, leaving the
 engine free for the next client. The default is 30 seconds; a value outside
 10 to 3600 inclusive, or one that is not a whole number of seconds, is refused
@@ -264,6 +267,73 @@ undeliverable for longer than the budget, which a body that exists on the wire
 makes observable and a buffered body could not be at all. That buffered body is
 what one measured vanished client cost: 706 seconds of engine time.
 
+### Concurrent requests
+
+Decode is bound by trit-decode ALU work per weight byte, so one projection
+pass over several activation rows costs little more than over one. With two or
+more requests running, each engine step decodes one token for every request in
+a single pass: every projection (QKV, gates, FFN, output head) reads its
+weights once for all rows, through the same multi-row kernels speculative
+verification uses. Only what reads a request's own state runs per row, against
+that request's buffers: the convolution and gated-delta recurrence of the 48
+recurrent layers and the K/V append and attention of the 16 full-attention
+layers. Each request owns its recurrent state, convolution history, K/V caches,
+position and MTP-head caches; one set is resident in the model and the others
+are parked, and a swap exchanges buffer handles, never bytes. Requests join
+between steps (a new request's prefill runs as a pass of its own, then it joins
+the next step) and leave when they finish or are cancelled.
+
+A request alone runs exactly the single-sequence rounds it always ran, with
+speculation; its text and speed are unchanged. In a batch, speculation is off:
+measured on HEAD's kernels a verify block costs 50 ms at 2 rows, 73 at 4,
+113 at 8 and 265 at 20, so a batched verify of four requests' seeds plus
+three drafts each (about 20 rows for about 16 committed tokens, plus four
+sequential 12 ms draft chains) comes to about 51 tok/s, no better than the
+52 tok/s of plain batched decode at four. The MTP head of a batched request is fed the rows it missed (their
+tokens and output-normalized hidden, kept per request) in one block when the
+request next runs alone, so a request outliving its batch speculates again
+from exact head state. Taking speculative rounds in turn instead of batching measured
+32.7 tok/s aggregate at two streams against 36.8 batched, so batching starts at
+two.
+
+Greedy output per request matches a request run alone up to the engine's own
+near-ties. Rows of one batch are independent of each other (a sequence's logits
+are bitwise equal whether two, three or four sequences share the step), and
+against single-row decode, teacher-forced over 16 steps of four sequences, mean
+next-token KL is 4.5e-7 to 5.1e-7 (worst 2.8e-6) with top-1 agreement on every
+step. Over eight 300-token chat prompts, every 2-, 4- and 8-stream output was
+byte-identical to that prompt run alone except one prompt in the 2- and
+4-stream runs, which differs at character 624 ("of entries" against "of all
+entries"); the single-request engine splits there too, the same text with and
+without `--no-speculation`, and the batched output equals the non-speculative
+one exactly.
+
+Measured on an M4 Pro, chat requests with distinct prompts arriving together,
+greedy, 300 output tokens each, thinking off, against the previous build
+(which ran them one at a time):
+
+| Streams | Aggregate tok/s | Per-request tok/s | Worst TTFT | Previous: aggregate, worst TTFT | Footprint |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32.7 | 32.7 | 0.10 s | 32.7, 0.09 s | 0.60 GB |
+| 2 | 36.8 | 18.4 | 0.18 s | 30.9, 9.2 s | 0.81 GB |
+| 4 | 48.5 | 12.1 | 0.39 s | 34.7, 25.5 s | 1.21 GB |
+| 8 | 67.8 | 8.6 | 2.9 s | 33.3, 62.6 s | 2.00 GB |
+
+The engine-only step time is 32 ms for one sequence and 52, 64, 77, 90, 92, 94
+and 97 ms for two to eight (82 tok/s at eight); the server figures above add
+prefill, sampling and event delivery. The worst TTFT at eight streams is the
+eight prefills running one after another before the first batched step.
+
+Each extra stream costs its own state: 81 MB of F16 recurrent state and
+convolution history, 34 KiB of Q8 K/V per token (initially 1,024 tokens,
+36 MB) plus 4 KiB of head K/V per token, and 20 KiB per batched token of
+hidden rows owed to its MTP head. The measured footprint grew by about 200 MB
+per stream at these lengths. Admission shares the context the memory policy
+sized for one sequence: a request joins only while the running requests'
+prompt-plus-`max_tokens` reservations, plus each extra sequence's fixed state
+expressed in K/V tokens (about 2,340), fit in it; otherwise it waits for a
+running request to finish. At most eight decode together.
+
 ## Resource policy
 
 All choices and reasons are reported in startup JSON.
@@ -287,13 +357,48 @@ All choices and reasons are reported in startup JSON.
 
 ## Lossless speculation
 
-Speculation changes scheduling, not sampling results. Drafts are checked by
-the target model, and only target-approved tokens are committed.
+Speculation changes scheduling, not the model: drafts are checked by the
+target model, and only target-approved tokens are committed. It is lossless up
+to floating-point rounding, as in other engines: a verify block runs the
+target over several rows with multi-row kernels whose summation order differs
+from single-row decode (logit differences around 1e-6 relative), so a greedy
+near-tie can resolve differently with and without speculation. Measured: the
+default settings matched `--no-speculation` token for token on the six
+benchmark prompts; one server prompt split at character 624 ("of entries"
+against "of all entries"), deterministically, the same way on every run.
 
 The suffix store finds a matching generated-token suffix and proposes the
 known continuation. Draft depth adapts to match length and remaining context.
 When the optional head is installed, it drafts up to three tokens. A gate
 avoids head work where measured acceptance does not repay its cost.
+
+Both were re-swept on the current kernels (M4 Pro, six prompts including one
+thinking, 300 greedy tokens, best of two, interleaved), drafting while the
+head's top logit leads the runner-up by at least the margin:
+
+| Depth | Margin 0 | 2 | 3 | 4 | 5 | 6 | 8 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 37.2 | | | | | | |
+| 2 | 36.4 | 38.0 | 38.0 | 38.1 | 38.0 | 38.1 | 37.6 |
+| 3 | 33.5 | 37.8 | 38.1 | **38.6** | 38.4 | 38.3 | 37.5 |
+| 4 | 30.6 | 37.6 | 38.2 | 38.4 | 38.3 | 38.3 | 37.6 |
+
+tok/s geomean against 31.2 without speculation (depth 1 has no chained draft
+for the margin to gate). Depth 3 at margin 4 (79%
+acceptance, 1.57 drafts per round) stays the default; the optimum is flat
+across depths 2-4 and margins 3-6, and stricter margins for later drafts (3/5,
+4/6 at depth 3; 2/4/6, 3/4/6, 4/5/6 at depth 4) measured 38.1-38.5. The default
+emitted the `--no-speculation` tokens on all six prompts. Some non-default
+settings did not, each on one prompt: depth 2 or 4 ungated and depth 4 at
+margin 2 or 4 resolved a near-tie the other way (for example `So,\n` against
+`So, the` at token 178 of the arithmetic prompt), so verify blocks of different
+row counts are not bit-identical to single-row decode in every case.
+
+Suffix lookup's 12-token anchor was re-checked the same way on two edits that
+rename an identifier in about 50 quoted lines of Rust (600 tokens): anchors of
+8, 10, 12 and 16 gave 60.3, 58.9, 60.1 and 58.5 tok/s geomean against 47.5 with
+lookup off, and none fired on two novel prompts. 8 tied 12 only as the two
+edits disagreed by about 10% each way, so 12 stays.
 
 The target verifies a draft as a row block. Its recurrent layers read their
 state and convolution history but write the block's final ones, and each row's
@@ -641,6 +746,31 @@ prompt, next-token KL of the new build against the old is 7.3e-7 mean and
 Prefill of a 2,484-token prompt runs on the tensor tile and is unchanged
 (97.40 to 97.84 tok/s).
 
+Two- to four-row projections (speculative verify blocks, short prefill
+chunks, batched decode) then got cheaper with bit-identical outputs. Trits
+come from balanced prefixes, prefix(p) - (3^p - 1) / 2, whose offsets fold
+into the rounding FMA's subtraction, so trit n is one FMA of two of them
+with no separate "- 1". Two-row blocks also hold both input rows in
+registers and decode each weight row just before use (bonsai_small_batch.h
+explains why three and four rows keep the other loop order). Kernel GPU
+time on an M4 Pro from `local-metal/tests/bonsai_throughput.rs`, µs, before
+and after (interleaved A/B runs of both kernel sets agree within 1%):
+
+| Projection | 2 rows | 3 rows | 4 rows |
+| --- | ---: | ---: | ---: |
+| 17408x5120 | 156.3 → 139.7 | 193.3 → 187.1 | 231.7 → 228.3 |
+| 5120x17408 | 158.1 → 143.0 | 196.5 → 188.6 | 238.1 → 233.6 |
+| 12288x5120 | 111.5 → 100.4 | 138.6 → 135.5 | 165.2 → 163.5 |
+| 10240x5120 | 94.1 → 85.5 | 118.2 → 113.1 | 139.3 → 137.1 |
+
+Single rows and the five- to eight-row matrix kernel are unchanged. Outputs
+of 1 to 24 rows on four shapes, with 2- and 4-byte-aligned matrices, are
+bitwise those of the previous kernels, so greedy text and logits are too.
+Five prompts, 300 greedy tokens, best of two interleaved runs of both
+builds: default speculative decode 36.05 to 38.06 tok/s geomean (+5.6%,
+every prompt +3.2% to +6.9%), plain decode 31.34 against 31.25 (unchanged
+kernels); text byte-identical across builds and modes.
+
 Verification itself got cheaper in two steps, measured on an M4 Pro. The scalar
 small-batch kernel now holds its decoded trits in half registers, exact for
 -1/0/+1 and widened into the same F32 FMAs, so outputs stay bit-identical:
@@ -851,6 +981,30 @@ decode from 19.23 to 20.39 tok/s.
   and with two rows 319/351, both worse than four rows' 281/286. The half-trit
   scalar kernel at five and six rows: 337/351 and 394/409, against the matrix
   kernel's 340/345.
+- Small-batch layouts after the half-prefix decoder, M4 Pro, µs on 17408×5120
+  at 2/3/4 rows against 156/194/231 for the kernel they would replace. The
+  matvec's layout (four lanes per block, float4/float2 inputs, balanced trits
+  decoded per digit level) with 2/4/8 rows per SIMD group: 187–267 / 209–466 /
+  342–696. One byte of five trits per phase for 4–16 rows with the scale folded
+  into exact half factors (trit × d): 158–529 / 204–657 / 269–1036. Every input
+  row in registers with rows decoded one at a time, shipped for two rows: 236 /
+  360 at three and four. Each falls off a register cliff once a lane holds
+  much more than about 60 live values, and nothing that stayed under it cut
+  the per-row cost. The kernels issue close to one instruction per lane-cycle
+  (the matrix kernel's 276 at eight rows is what one lane-cycle per 8×8×8
+  multiply-add plus its decode predicts), so 2–4 rows pay the exact decode,
+  about three half operations per weight, plus one F32 FMA and a share of an
+  input load per weight and row; 1.3–1.6 times the one-row time is out of
+  reach while trits stay exact. The telescoped decode the matvec uses (two
+  operations per weight) is not an option: it loses about 73 on the lone-trit
+  row that `matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range`
+  bounds at 4.
+  Half-prefix qh trits from per-lane constants: 1–3% slower at four rows, and
+  272 to 295 at five in the matrix kernel together with balanced prefixes.
+  float2 inputs in the eight-lane kernel: 240 against 234 at four rows. Half
+  simdgroup matrices: one 8×8 half multiply costs what an F32 one does (272
+  against 272 at five rows, inputs rounded to half), and exact inputs split
+  into high and low halves need two, 499.
 - Tensor Q8 attention that round-trips the P·V result through threadgroup
   memory every tile: 3.6–7.3 times slower decode and twice as slow prefill in a
   first attempt; with 32- or 16-token dequantized tiles, 75 GB/s at 128K

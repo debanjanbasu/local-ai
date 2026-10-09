@@ -265,6 +265,43 @@ fn cpu_and_gpu_decoders_cover_every_byte_code_at_every_element() {
             assert_close(actual, expected[row * 128 + element], 0.0);
         }
     }
+    // The small-batch decoders too: consecutive basis rows as one block of
+    // each exact-token kernel and of the wide kernel.
+    for tokens in [2_usize, 3, 4, 5, 8] {
+        let starts = (0..128 - tokens)
+            .step_by(tokens)
+            .chain([128 - tokens])
+            .collect::<Vec<_>>();
+        let outputs = starts
+            .iter()
+            .map(|_| guarded(&context, tokens * 256))
+            .collect::<Vec<_>>();
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        for (&start, output) in starts.iter().zip(&outputs) {
+            let mut basis = vec![0.0_f32; tokens * 128];
+            for token in 0..tokens {
+                basis[token * 128 + start + token] = 1.0;
+            }
+            let input = MetalBuffer::from_slice(context.device(), &basis).expect("basis");
+            kernels
+                .matmul(&mut batch, matrix, &input, output, tokens as u32)
+                .expect("small batch");
+        }
+        batch.commit_and_wait().expect("GPU completion");
+        for (&start, output) in starts.iter().zip(&outputs) {
+            assert_guards(output, tokens * 256);
+            let values = output.as_slice::<f32>();
+            for token in 0..tokens {
+                for row in 0..256 {
+                    assert_close(
+                        values[token * 256 + row],
+                        expected[row * 128 + start + token],
+                        0.0,
+                    );
+                }
+            }
+        }
+    }
     assert_eq!(weights.as_slice::<u8>(), data);
 }
 

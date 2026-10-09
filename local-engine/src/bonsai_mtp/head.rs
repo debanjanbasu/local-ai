@@ -206,3 +206,61 @@ impl BonsaiMtp {
         Ok(&mut self.scratch.embedding.as_mut_slice::<f32>()[..rows * WIDTH])
     }
 }
+
+/// One sequence's head state, parked while another sequence's is resident.
+pub struct HeadSequence {
+    key_cache: MetalBuffer,
+    value_cache: MetalBuffer,
+    prev_hidden: MetalBuffer,
+}
+
+impl HeadSequence {
+    /// Empty caches for `tokens` positions and a zero hidden handoff.
+    pub fn new(context: &MetalContext, tokens: usize) -> crate::Result<Self> {
+        let state = Self {
+            key_cache: MetalBuffer::empty(context.device(), tokens * KV_TOKEN_BYTES)?,
+            value_cache: MetalBuffer::empty(context.device(), tokens * KV_TOKEN_BYTES)?,
+            prev_hidden: MetalBuffer::empty(context.device(), WIDTH * size_of::<f32>())?,
+        };
+        state.prev_hidden.clear();
+        Ok(state)
+    }
+
+    /// Bytes this parked state holds.
+    pub fn bytes(&self) -> usize {
+        self.key_cache.length() + self.value_cache.length() + self.prev_hidden.length()
+    }
+
+    /// Grow a parked state's caches as [`BonsaiMtp::grow_caches`] does.
+    pub fn grow(
+        &mut self,
+        context: &MetalContext,
+        used: usize,
+        capacity: usize,
+    ) -> crate::Result<()> {
+        let used = used * KV_TOKEN_BYTES;
+        let bytes = capacity * KV_TOKEN_BYTES;
+        self.key_cache = grow_cache(context, &self.key_cache, used, bytes)?;
+        self.value_cache = grow_cache(context, &self.value_cache, used, bytes)?;
+        Ok(())
+    }
+}
+
+impl BonsaiMtp {
+    /// Exchange the resident sequence state with `parked` (no copies), and
+    /// make the attention workspace cover `capacity` tokens.
+    pub fn swap_sequence(
+        &mut self,
+        context: &MetalContext,
+        parked: &mut HeadSequence,
+        capacity: usize,
+    ) -> crate::Result<()> {
+        std::mem::swap(&mut self.key_cache, &mut parked.key_cache);
+        std::mem::swap(&mut self.value_cache, &mut parked.value_cache);
+        std::mem::swap(&mut self.prev_hidden, &mut parked.prev_hidden);
+        if self.scratch.attention.max_context() < capacity as u32 {
+            self.scratch.attention = AttentionWorkspace::new(context, capacity as u32)?;
+        }
+        Ok(())
+    }
+}

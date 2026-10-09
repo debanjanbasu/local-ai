@@ -34,11 +34,14 @@ use crate::bonsai_ngram::NgramSettings;
 use crate::sampler::{Sampler, SamplingResult, verify_greedy_drafts};
 use crate::{MtpStats, NgramStats, PrefillProgress};
 
+mod batch;
 mod block;
 pub mod capture;
 mod checkpoint;
 mod layers;
 mod speculation;
+
+pub use self::batch::{BatchRow, HeadLag, MAX_BATCH_SEQUENCES, SequenceState};
 
 /// What a loaded head costs, for the policy record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,6 +616,12 @@ pub struct BonsaiModel {
     /// the last [`Self::take_gpu_time`], from Metal's own timestamps: what the
     /// GPU was busy for, excluding CPU encoding and inter-buffer gaps.
     gpu_time: std::cell::Cell<std::time::Duration>,
+    /// Tokens a fresh sequence's K/V caches start with.
+    kv_initial: usize,
+    /// Identity of the resident sequence buffers (see [`SequenceState`]).
+    state_id: u64,
+    /// Logits and greedy selection of batched decode, made on first use.
+    batch: Option<batch::BatchScratch>,
 }
 
 impl BonsaiModel {
@@ -775,6 +784,9 @@ impl BonsaiModel {
             cancel_observed: false,
             prefill_chunks: 0,
             gpu_time: std::cell::Cell::new(std::time::Duration::ZERO),
+            kv_initial: kv_allocated,
+            state_id: 0,
+            batch: None,
             context,
             package,
         })

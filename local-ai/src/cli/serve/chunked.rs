@@ -413,7 +413,7 @@ fn timings_json(stats: &Stats) -> Value {
 
 fn speculation_json(stats: &Stats) -> Value {
     let generation = &stats.generation;
-    json!({"mtp":{"rounds":generation.mtp.rounds,"proposed_tokens":generation.mtp.proposed_tokens,"accepted_tokens":generation.mtp.accepted_tokens},"lookup":{"rounds":generation.ngram.rounds,"proposed_tokens":generation.ngram.proposed_tokens,"accepted_tokens":generation.ngram.accepted_tokens,"cpu_seconds":generation.ngram.lookup.as_secs_f64()}})
+    json!({"batched_tokens":generation.batched_tokens,"mtp":{"rounds":generation.mtp.rounds,"proposed_tokens":generation.mtp.proposed_tokens,"accepted_tokens":generation.mtp.accepted_tokens},"lookup":{"rounds":generation.ngram.rounds,"proposed_tokens":generation.ngram.proposed_tokens,"accepted_tokens":generation.ngram.accepted_tokens,"cpu_seconds":generation.ngram.lookup.as_secs_f64()}})
 }
 
 /// Serialize a value that cannot fail to serialize.

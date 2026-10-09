@@ -10,7 +10,7 @@ const SHORT_BLOCK: u32 = 32;
 
 /// A recurrent layer's 48-row BF16 alpha or beta projection. These sensitive
 /// projections read the unrotated input: they are NOT Hadamard-folded.
-const fn decay_projection(weights: &BonsaiMetalTensor) -> Bf16Matrix<'_> {
+pub(super) const fn decay_projection(weights: &BonsaiMetalTensor) -> Bf16Matrix<'_> {
     Bf16Matrix {
         buffer: weights.buffer(),
         offset: weights.offset(),
@@ -360,7 +360,7 @@ impl BonsaiModel {
         self.project_attention(batch, &layer.output, tokens)
     }
 
-    fn project_attention(
+    pub(super) fn project_attention(
         &self,
         batch: &mut CommandBatch,
         output: &BonsaiMetalTensor,

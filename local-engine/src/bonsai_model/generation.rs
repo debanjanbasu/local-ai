@@ -1,8 +1,66 @@
+use std::collections::VecDeque;
+
 use super::{
     BonsaiEngine, BonsaiGeneration, BonsaiModel, CancelToken, GenerateParams, GenerationStats,
-    Instant, LookupPolicy, MtpStats, PrefillProgress, PromptCacheSource, Sampler, SamplingParams,
-    SamplingResult, StopReason, VOCAB, fill_verify_tile,
+    HeadLag, Instant, LookupPolicy, MtpStats, PrefillProgress, PromptCacheSource, PromptCheckpoint,
+    Sampler, SamplingParams, SamplingResult, SequenceState, StopReason, SuffixSession, VOCAB,
+    fill_verify_tile,
 };
+use crate::bonsai_tokenizer::{BonsaiTokenizer, StreamDecodeState};
+
+/// One request between its prefill and its last token.
+///
+/// Everything a generation needs between rounds lives here rather than on a
+/// call stack, so the engine can advance several of them in turn or together
+/// ([`BonsaiEngine::step`]). A request alone runs exactly the rounds it ran
+/// before batching existed.
+pub(super) struct ActiveGeneration {
+    pub(super) id: u64,
+    prompt: Vec<u32>,
+    params: GenerateParams,
+    session_id: Option<String>,
+    pub(super) cancel: CancelToken,
+    started: Instant,
+    pub(super) stats: GenerationStats,
+    token_ids: Vec<u32>,
+    stop_reason: StopReason,
+    /// No further round will run: the generation only awaits [`BonsaiEngine::finish_generation`].
+    pub(super) done: bool,
+    pub(super) sampler: Sampler,
+    decoder: StreamDecodeState,
+    suffixes: SuffixSession,
+    lookup_policy: LookupPolicy,
+    pub(super) pending: VecDeque<SamplingResult>,
+    cache_source: PromptCacheSource,
+    prompt_snapshot: Option<PromptCheckpoint>,
+    persisted_reusable_boundary: bool,
+    /// The last emitted token, which the next round decodes.
+    pub(super) seed: Option<u32>,
+    /// This sequence's buffers while another sequence's are resident.
+    pub(super) state: Option<SequenceState>,
+    /// Rows the MTP head missed while this sequence decoded in a batch.
+    pub(super) lag: HeadLag,
+}
+
+impl ActiveGeneration {
+    /// Stop before the next round, as a cancelled request does.
+    pub(super) fn mark_cancelled(&mut self) {
+        if self.done {
+            return;
+        }
+        self.stop_reason = StopReason::Cancelled;
+        self.stats.sampled_tokens += self.pending.len();
+        self.pending.clear();
+        self.seed = None;
+        self.done = true;
+    }
+
+    /// The most tokens this generation's sequence can come to hold.
+    pub(super) const fn reserved_tokens(&self) -> usize {
+        self.prompt.len() + self.params.max_tokens
+    }
+}
+
 impl BonsaiEngine {
     pub fn generate(
         &mut self,
@@ -63,7 +121,9 @@ impl BonsaiEngine {
     /// Reporting costs one call per chunk on the prefill critical path of a
     /// single-flight engine, so the reporter must not block; it is called before
     /// any GPU work for that chunk, never after.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// The request runs alone: it must not be called while [`Self::admit`]ted
+    /// generations are still active.
     pub fn generate_session_progress(
         &mut self,
         prompt: &[u32],
@@ -73,27 +133,48 @@ impl BonsaiEngine {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<BonsaiGeneration> {
+        if self.active_generations() != 0 {
+            return Err(crate::Error::InvalidArgument(
+                "a single generation cannot run beside admitted ones".into(),
+            ));
+        }
+        let id = self.admit(
+            prompt,
+            params,
+            session_id,
+            cancel.clone(),
+            progress,
+            &mut emit,
+        )?;
+        loop {
+            for (finished, result) in self.step(&mut |_, piece| emit(piece)) {
+                if finished == id {
+                    return result;
+                }
+            }
+        }
+    }
+
+    /// Validate, prefill and take the first sample for a request whose
+    /// sequence is resident in the model.
+    pub(super) fn begin_generation(
+        &mut self,
+        id: u64,
+        prompt: &[u32],
+        params: &GenerateParams,
+        session_id: Option<&str>,
+        cancel: CancelToken,
+        progress: &mut dyn FnMut(PrefillProgress),
+    ) -> crate::Result<ActiveGeneration> {
         // Installed before anything can prefill, so the model always polls the
         // token belonging to the request in flight.
         self.model.set_cancel(cancel.clone());
         self.validate_generation(prompt, params)?;
         let started = Instant::now();
-        let mut stats = GenerationStats {
+        let stats = GenerationStats {
             prompt_tokens: prompt.len(),
             ..GenerationStats::default()
         };
-        let mut token_ids = Vec::new();
-        let mut stop_reason = StopReason::TokenLimit;
-        if params.max_tokens == 0 {
-            return Ok(BonsaiGeneration {
-                text: String::new(),
-                token_ids,
-                stop_reason,
-                stats,
-                cache_source: PromptCacheSource::None,
-            });
-        }
-        self.model.take_gpu_time();
         let mut sampler = Sampler::new(
             VOCAB,
             SamplingParams {
@@ -107,115 +188,219 @@ impl BonsaiEngine {
                 seed: params.seed,
             },
         );
+        let mut generation = ActiveGeneration {
+            id,
+            prompt: prompt.to_vec(),
+            params: params.clone(),
+            session_id: session_id.map(str::to_owned),
+            cancel,
+            started,
+            stats,
+            token_ids: Vec::new(),
+            stop_reason: StopReason::TokenLimit,
+            done: false,
+            sampler: sampler.clone(),
+            decoder: StreamDecodeState::default(),
+            suffixes: self.suffix_store.session(&[], self.ngram.min_match),
+            lookup_policy: LookupPolicy::new(self.ngram.max_drafts),
+            pending: VecDeque::new(),
+            cache_source: PromptCacheSource::None,
+            prompt_snapshot: None,
+            persisted_reusable_boundary: false,
+            seed: None,
+            state: None,
+            lag: HeadLag::default(),
+        };
+        if params.max_tokens == 0 {
+            generation.done = true;
+            return Ok(generation);
+        }
+        self.model.take_gpu_time();
         sampler.observe(prompt);
         self.model.set_device_greedy(sampler.selects_argmax());
         let (reused, cache_source, prompt_snapshot, persisted_reusable_boundary) =
             self.prepare_prompt(prompt, session_id, progress)?;
-        stats.reused_prompt_tokens = reused;
-        stats.prefill = started.elapsed();
-        let mut decoder = self.tokenizer.stream_decoder();
-        let mut suffixes = self.suffix_store.session(prompt, self.ngram.min_match);
-        let mut lookup_policy = LookupPolicy::new(self.ngram.max_drafts);
-        let mut pending = std::collections::VecDeque::new();
+        generation.stats.reused_prompt_tokens = reused;
+        generation.stats.prefill = started.elapsed();
+        generation.cache_source = cache_source;
+        generation.prompt_snapshot = prompt_snapshot;
+        generation.persisted_reusable_boundary = persisted_reusable_boundary;
+        generation.suffixes = self.suffix_store.session(prompt, self.ngram.min_match);
         if self.model.take_cancel_observed() {
             // Prefill stopped between chunks, so `scratch.logits` still holds an
             // older row: there is nothing new to sample. Fall through to the
             // shared tail, which clears the prompt cache for a cancelled stop.
-            stop_reason = StopReason::Cancelled;
+            generation.stop_reason = StopReason::Cancelled;
+            generation.done = true;
         } else {
-            pending.push_back(sample_current(&mut self.model, &mut sampler, &mut stats)?);
+            let sample = sample_current(&mut self.model, &mut sampler, &mut generation.stats)?;
+            generation.pending.push_back(sample);
         }
-        while let Some(sample) = pending.pop_front() {
+        generation.sampler = sampler;
+        generation.stats.gpu += self.model.take_gpu_time();
+        Ok(generation)
+    }
+
+    /// Emit every pending sample, stopping the generation at EOS, at its token
+    /// limit, or when `emit` refuses a piece. Leaves `seed` set when another
+    /// round is due.
+    pub(super) fn drain_generation(
+        tokenizer: &BonsaiTokenizer,
+        generation: &mut ActiveGeneration,
+        emit: &mut dyn FnMut(&str) -> bool,
+    ) -> crate::Result<()> {
+        generation.seed = None;
+        while let Some(sample) = generation.pending.pop_front() {
+            let stats = &mut generation.stats;
             stats.sampled_tokens += 1;
-            stats.first_token.get_or_insert_with(|| started.elapsed());
+            stats
+                .first_token
+                .get_or_insert_with(|| generation.started.elapsed());
             if sample.is_eos {
-                stop_reason = StopReason::Eos;
+                generation.stop_reason = StopReason::Eos;
+                generation.done = true;
                 break;
             }
-            token_ids.push(sample.token_id);
-            suffixes.append(sample.token_id);
-            sampler.observe(&[sample.token_id]);
-            if let Some(piece) = decoder(sample.token_id)?
+            generation.token_ids.push(sample.token_id);
+            generation.suffixes.append(sample.token_id);
+            generation.sampler.observe(&[sample.token_id]);
+            if let Some(piece) = tokenizer.stream_step(&mut generation.decoder, sample.token_id)?
                 && !emit(&piece)
             {
-                stop_reason = StopReason::Cancelled;
-                stats.sampled_tokens += pending.len();
+                generation.stop_reason = StopReason::Cancelled;
+                generation.stats.sampled_tokens += generation.pending.len();
+                generation.done = true;
                 break;
             }
-            if stats.sampled_tokens >= params.max_tokens {
+            if generation.stats.sampled_tokens >= generation.params.max_tokens {
+                generation.done = true;
                 break;
             }
-            if !pending.is_empty() {
-                continue;
-            }
-            let remaining = params.max_tokens - stats.sampled_tokens;
-            let lookup_started = Instant::now();
-            let draft = self
-                .ngram
-                .enabled
-                .then(|| suffixes.find(self.ngram.max_drafts))
-                .flatten();
-            stats.ngram.lookup += lookup_started.elapsed();
-            let drafts = draft.map_or_else(Vec::new, |mut draft| {
-                let adaptive = lookup_policy.depth(draft.match_len, self.ngram.max_drafts);
-                let depth = draft_depth(
-                    adaptive,
-                    remaining,
-                    self.info.context,
-                    prompt.len() + stats.sampled_tokens - 1,
-                );
-                let filled = fill_verify_tile(depth, draft.tokens.len());
-                let limit = draft_depth(
-                    filled,
-                    remaining,
-                    self.info.context,
-                    prompt.len() + stats.sampled_tokens - 1,
-                );
-                draft.tokens.truncate(limit);
-                draft.tokens
-            });
-            if !drafts.is_empty() {
-                let batch = self
-                    .model
-                    .ngram_step(sample.token_id, &drafts, &mut sampler)?;
-                stats.sampling += batch.sampling;
-                stats.ngram.rounds += batch.ngram.rounds;
-                stats.ngram.proposed_tokens += batch.ngram.proposed_tokens;
-                stats.ngram.accepted_tokens += batch.ngram.accepted_tokens;
-                lookup_policy.observe(
-                    batch.ngram.accepted_tokens,
-                    batch.ngram.proposed_tokens,
-                    self.ngram.max_drafts,
-                );
-                pending.extend(batch.samples);
-            } else if self.model.speculation().is_some() {
-                let batch =
-                    self.model
-                        .speculative_step(sample.token_id, &mut sampler, remaining)?;
-                stats.sampling += batch.sampling;
-                accumulate_mtp(&mut stats.mtp, &batch.stats);
-                pending.extend(batch.samples);
-            } else {
-                self.model.decode(sample.token_id)?;
-            }
-            if self.model.take_cancel_observed() {
-                // The round below was not submitted, so `pending` stayed empty:
-                // do not refill it from logits that were never recomputed.
-                stop_reason = StopReason::Cancelled;
-                stats.sampled_tokens += pending.len();
-                pending.clear();
-                break;
-            }
-            if pending.is_empty() {
-                pending.push_back(sample_current(&mut self.model, &mut sampler, &mut stats)?);
+            if generation.pending.is_empty() {
+                generation.seed = Some(sample.token_id);
             }
         }
-        stats.generated_tokens = token_ids.len();
-        drop(decoder);
-        if stop_reason == StopReason::Cancelled {
-            self.cached_tokens.clear();
-            self.prompt_checkpoints.clear();
+        if generation.done {
+            generation.pending.clear();
+            generation.seed = None;
+        } else if generation.seed.is_none() {
+            // Every round leaves a sample or stops the generation; a running
+            // generation with neither could never advance.
+            return Err(crate::Error::Generation(
+                "generation has no sample to continue from".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// One single-sequence round for the resident `generation`: n-gram
+    /// verification, an MTP speculative round, or a plain decode step,
+    /// exactly as an unbatched request runs it.
+    pub(super) fn solo_round(&mut self, generation: &mut ActiveGeneration) -> crate::Result<()> {
+        let Some(seed) = generation.seed.take() else {
+            return Ok(());
+        };
+        self.model.set_cancel(generation.cancel.clone());
+        self.model
+            .set_device_greedy(generation.sampler.selects_argmax());
+        let head = self.model.speculation().is_some() && generation.lag.usable();
+        if head && !generation.lag.is_empty() {
+            self.model.catch_up_head(&mut generation.lag)?;
+        }
+        let stats = &mut generation.stats;
+        let remaining = generation.params.max_tokens - stats.sampled_tokens;
+        let lookup_started = Instant::now();
+        let draft = self
+            .ngram
+            .enabled
+            .then(|| generation.suffixes.find(self.ngram.max_drafts))
+            .flatten();
+        stats.ngram.lookup += lookup_started.elapsed();
+        let position = generation.prompt.len() + stats.sampled_tokens - 1;
+        let drafts = draft.map_or_else(Vec::new, |mut draft| {
+            let adaptive = generation
+                .lookup_policy
+                .depth(draft.match_len, self.ngram.max_drafts);
+            let depth = draft_depth(adaptive, remaining, self.info.context, position);
+            let filled = fill_verify_tile(depth, draft.tokens.len());
+            let limit = draft_depth(filled, remaining, self.info.context, position);
+            draft.tokens.truncate(limit);
+            draft.tokens
+        });
+        let pending = &mut generation.pending;
+        if !drafts.is_empty() {
+            let batch = self
+                .model
+                .ngram_step(seed, &drafts, &mut generation.sampler)?;
+            stats.sampling += batch.sampling;
+            stats.ngram.rounds += batch.ngram.rounds;
+            stats.ngram.proposed_tokens += batch.ngram.proposed_tokens;
+            stats.ngram.accepted_tokens += batch.ngram.accepted_tokens;
+            generation.lookup_policy.observe(
+                batch.ngram.accepted_tokens,
+                batch.ngram.proposed_tokens,
+                self.ngram.max_drafts,
+            );
+            pending.extend(batch.samples);
+        } else if head {
+            let batch = self
+                .model
+                .speculative_step(seed, &mut generation.sampler, remaining)?;
+            stats.sampling += batch.sampling;
+            accumulate_mtp(&mut stats.mtp, &batch.stats);
+            pending.extend(batch.samples);
         } else {
+            self.model.decode(seed)?;
+        }
+        if self.model.take_cancel_observed() {
+            // The round below was not submitted, so `pending` stayed empty:
+            // do not refill it from logits that were never recomputed.
+            generation.stop_reason = StopReason::Cancelled;
+            stats.sampled_tokens += pending.len();
+            pending.clear();
+            generation.done = true;
+        } else if pending.is_empty() {
+            pending.push_back(sample_current(
+                &mut self.model,
+                &mut generation.sampler,
+                stats,
+            )?);
+        }
+        stats.gpu += self.model.take_gpu_time();
+        Ok(())
+    }
+
+    /// Close the resident `generation`: catch its state up to everything it
+    /// emitted and record it in the prompt cache, or clear the cache after a
+    /// cancellation.
+    pub(super) fn finish_generation(
+        &mut self,
+        mut generation: ActiveGeneration,
+    ) -> crate::Result<BonsaiGeneration> {
+        let mut stats = std::mem::take(&mut generation.stats);
+        stats.generated_tokens = generation.token_ids.len();
+        let prompt = &generation.prompt;
+        let token_ids = std::mem::take(&mut generation.token_ids);
+        let session_id = generation.session_id.as_deref();
+        if generation.params.max_tokens == 0 {
+            return Ok(BonsaiGeneration {
+                text: String::new(),
+                token_ids,
+                stop_reason: generation.stop_reason,
+                stats,
+                cache_source: PromptCacheSource::None,
+            });
+        }
+        if generation.stop_reason == StopReason::Cancelled {
+            self.clear_gpu_cache();
+        } else {
+            if self.model.speculation().is_some()
+                && generation.lag.usable()
+                && !generation.lag.is_empty()
+            {
+                self.model.catch_up_head(&mut generation.lag)?;
+            }
+            self.claim_gpu_cache();
             let represented = prompt.len() + token_ids.len();
             if self.model.position() + 1 == represented
                 && let Some(&last) = token_ids.last()
@@ -229,7 +414,7 @@ impl BonsaiEngine {
                 let represented_tokens = self.cached_tokens.clone();
                 // The prompt boundary's snapshot, read back now that decode
                 // no longer needs the bandwidth.
-                let prompt_snapshot = match prompt_snapshot {
+                let prompt_snapshot = match generation.prompt_snapshot.take() {
                     Some(checkpoint) => self.model.prompt_snapshot_at(&checkpoint)?,
                     None => None,
                 };
@@ -239,7 +424,7 @@ impl BonsaiEngine {
                         &prompt[..prompt.len() - 1],
                         session_id,
                         Some(snapshot),
-                        !persisted_reusable_boundary,
+                        !generation.persisted_reusable_boundary,
                         false,
                     )?;
                 }
@@ -247,22 +432,23 @@ impl BonsaiEngine {
                 // rarely a later prefix: keep it in (volatile) host memory only.
                 self.save_session_snapshot(&represented_tokens, session_id, None, false, false)?;
             } else {
-                self.cached_tokens.clear();
-                self.prompt_checkpoints.clear();
+                self.clear_gpu_cache();
             }
         }
-        stats.elapsed = started.elapsed();
-        stats.gpu = self.model.take_gpu_time();
-        self.suffix_store.remember(suffixes.history().to_vec());
+        stats.elapsed = generation.started.elapsed();
+        stats.gpu += self.model.take_gpu_time();
+        self.suffix_store
+            .remember(generation.suffixes.history().to_vec());
         Ok(BonsaiGeneration {
             text: self.tokenizer.decode(&token_ids, false)?,
             token_ids,
-            stop_reason,
+            stop_reason: generation.stop_reason,
             stats,
-            cache_source,
+            cache_source: generation.cache_source,
         })
     }
 }
+
 /// Sample from the logits the backend produced for its newest committed token.
 fn sample_current(
     model: &mut BonsaiModel,

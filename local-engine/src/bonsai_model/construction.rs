@@ -112,6 +112,11 @@ impl BonsaiEngine {
             prompt_cache_disk_bytes: 0,
             prompt_cache_dir: None,
             prompt_cache_model_key: String::new(),
+            active: Vec::new(),
+            resident: None,
+            pool: Vec::new(),
+            cache_state: 0,
+            next_generation: 0,
         })
     }
 }

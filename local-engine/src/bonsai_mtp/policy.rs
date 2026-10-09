@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 /// depth 3 beat depth 2 on arithmetic, code, explanation and essay prompts
 /// (+1–3 %, lower GPU time per token, identical tokens). That is the
 /// measurement behind the 3 here.
+///
+/// Re-swept after the faster single-row and 2–4-row PTQ1 kernels and the
+/// mixed ternary/int8 head (M4 Pro, six prompts including one thinking, 300
+/// greedy tokens, best of two, interleaved), depth × margin {0..8}: gated
+/// depth 3 still led at 38.6 tok/s geomean, against 38.4 for depth 4, 38.1
+/// for depth 2, 37.2 for depth 1 and 31.2 plain. Depths 2–4 at margins 3–6 all
+/// sit within 2 % of it, so the optimum is flat rather than moved.
 pub const DEFAULT_MTP_DEPTH: usize = 3;
 pub const MAX_MTP_DEPTH: usize = 4;
 /// The head drafts a further token only while its current proposal leads
@@ -22,6 +29,16 @@ pub const MAX_MTP_DEPTH: usize = 4;
 /// tracks the head's confidence in that token: below a lead of 1 the second
 /// draft was accepted in 10–35 % of rounds, above 4 in 71–97 %. Rounds the
 /// gate shortens show up as `proposed_tokens < rounds * depth`.
+///
+/// In the same sweep, at depth 3: margin 0 (ungated) 33.5 tok/s at 55 %
+/// acceptance, 2 37.8 at 73 %, 3 38.1, 4 38.6 at 79 %, 5 38.4, 6 38.3, 8 37.5
+/// at 81 %; depths 2 and 4 peak in the same 4–6 band. A stricter margin for
+/// later drafts (3 then 5, 4 then 6, or 2/4/6 and 3/4/6 at depth 4) never beat
+/// a flat 4 (38.1–38.5 against 38.6), so one margin serves every step. The
+/// default matched `--no-speculation` token for token on all six prompts;
+/// some non-default settings (depth 2 or 4 ungated, depth 4 at margin 2 or 4)
+/// did not, each on one prompt, apparently a near-tie that a different verify
+/// row count resolves the other way.
 pub const DRAFT_CHAIN_MIN_MARGIN: f32 = 4.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

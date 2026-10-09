@@ -115,7 +115,16 @@ fn ptq1_projection_throughput() {
             })
             .collect()
     };
+    // Optional `PTQ1_BENCH_SHAPES=17408x5120,5120x17408` restricts the shapes.
+    let shape_filter = std::env::var("PTQ1_BENCH_SHAPES").ok();
     for (rows, columns) in shapes {
+        if let Some(filter) = &shape_filter
+            && !filter
+                .split(',')
+                .any(|shape| shape == format!("{rows}x{columns}"))
+        {
+            continue;
+        }
         let weights = buffers(rows, columns, rows ^ columns);
         let bytes = (rows * columns / 128 * PTQ1_BLOCK_BYTES) as f64;
         for &tokens in &token_counts {
