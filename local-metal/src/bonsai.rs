@@ -208,6 +208,7 @@ pub struct BonsaiKernels {
     matvec_concat: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matvec_concat_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     rms_forward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    swiglu_forward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Tensor-tile variants with 64- and 32-token tiles for verify-sized blocks.
     matmul_short: Option<[Retained<ProtocolObject<dyn MTLComputePipelineState>>; 2]>,
@@ -314,6 +315,7 @@ impl BonsaiKernels {
             matvec_concat: pipeline("bonsai_ptq1_matvec_concat", 32)?,
             matvec_concat_bf16: pipeline("bonsai_ptq1_matvec_concat_bf16", 32)?,
             rms_forward: pipeline("bonsai_rms_fwht_forward", 128)?,
+            swiglu_forward: pipeline("bonsai_swiglu_fwht_forward", 128)?,
             matmul: pipeline(
                 match prefill_kernel {
                     PrefillKernel::SimdF32 => "bonsai_ptq1_matmul_bytewise_32",
@@ -412,6 +414,50 @@ impl BonsaiKernels {
             bind(encoder, &rotation.signs, 0, 1);
             bind(encoder, output, 0, 2);
             set_u32(encoder, &blocks_per_row, 3);
+        }
+        dispatch(encoder, elements as usize / HADAMARD_BLOCK_ELEMENTS, 128);
+        batch.record_dispatch();
+        Ok(())
+    }
+
+    /// `silu(gate) * up` over `tokens` contiguous rows as wide as the rotation,
+    /// rotated forward into `output`, in one dispatch; the product is never
+    /// stored. Values are bitwise those of `BonsaiOps::swiglu` followed by
+    /// [`Self::transform`] with [`HadamardDirection::Forward`]. The output may
+    /// alias `gate` or `up` (in place), as each threadgroup reads its block
+    /// before writing it.
+    #[allow(unsafe_code)]
+    pub fn swiglu_transform(
+        &self,
+        batch: &mut CommandBatch,
+        rotation: &SignedHadamard,
+        gate: &MetalBuffer,
+        up: &MetalBuffer,
+        output: &MetalBuffer,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        let elements = rotation
+            .columns
+            .checked_mul(tokens)
+            .filter(|&count| count != 0)
+            .ok_or_else(|| {
+                Error::InvalidArgument("Bonsai activation shape overflow/empty".into())
+            })?;
+        let bytes = elements as usize * size_of::<f32>();
+        if gate.length() < bytes || up.length() < bytes || output.length() < bytes {
+            return Err(Error::InvalidArgument(
+                "Bonsai SwiGLU-rotate buffers are too short".into(),
+            ));
+        }
+        let blocks_per_row = rotation.columns / HADAMARD_BLOCK_ELEMENTS as u32;
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.swiglu_forward);
+        unsafe {
+            bind(encoder, gate, 0, 0);
+            bind(encoder, up, 0, 1);
+            bind(encoder, &rotation.signs, 0, 2);
+            bind(encoder, output, 0, 3);
+            set_u32(encoder, &blocks_per_row, 4);
         }
         dispatch(encoder, elements as usize / HADAMARD_BLOCK_ELEMENTS, 128);
         batch.record_dispatch();

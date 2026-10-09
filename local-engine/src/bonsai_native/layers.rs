@@ -1,5 +1,5 @@
 use super::{
-    Bf16Matrix, BonsaiMetalTensor, BonsaiModel, CommandBatch, FFN, FullAttentionLayer,
+    Bf16Matrix, BonsaiMetalTensor, BonsaiModel, CommandBatch, FullAttentionLayer,
     HadamardDirection, Layer, MetalBuffer, RecurrentLayer, RollbackLayer, WIDTH,
 };
 
@@ -127,6 +127,14 @@ impl BonsaiModel {
                 &scratch.rotated_hidden,
                 &scratch.ffn_product,
             )?;
+            self.kernels.transform(
+                batch,
+                &self.ffn_rotation,
+                &scratch.ffn_product,
+                &scratch.rotated_ffn,
+                tokens,
+                HadamardDirection::Forward,
+            )?;
         } else {
             batch.independent(|batch| {
                 self.project(
@@ -144,22 +152,18 @@ impl BonsaiModel {
                     tokens,
                 )
             })?;
-            self.ops.swiglu(
+            // SwiGLU and the forward rotation in one dispatch, bitwise as the
+            // separate ones; rotated_ffn shares ffn_gate's buffer, which the
+            // fused kernel permits (each block is read before it is written).
+            self.kernels.swiglu_transform(
                 batch,
+                &self.ffn_rotation,
                 &scratch.ffn_gate,
                 &scratch.ffn_up,
-                &scratch.ffn_product,
-                FFN as u32 * tokens,
+                &scratch.rotated_ffn,
+                tokens,
             )?;
         }
-        self.kernels.transform(
-            batch,
-            &self.ffn_rotation,
-            &scratch.ffn_product,
-            &scratch.rotated_ffn,
-            tokens,
-            HadamardDirection::Forward,
-        )?;
         self.project(
             batch,
             &layer.down,

@@ -34,6 +34,33 @@ kernel void bonsai_fwht_inverse(
     bonsai_fwht_impl<true>(input, signs, output, blocks_per_row, block, tid, shared);
 }
 
+// bo_swiglu followed by the forward rotation in one dispatch, for multi-row
+// FFN blocks whose gate and up projections are stored. Each thread forms its
+// eight elements exactly as bo_swiglu does, in F32 registers, and rotates them
+// as bonsai_fwht_forward would after reloading the stored product, so the
+// product is neither written nor reread. Every element is read before the
+// rotation's first barrier and only its own block is written, so the output
+// may alias gate or up.
+kernel void bonsai_swiglu_fwht_forward(
+    device const float *gate [[buffer(0)]],
+    device const float *up [[buffer(1)]],
+    device const float *signs [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &blocks_per_row [[buffer(4)]],
+    uint block [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float shared[1024];
+    const ulong base = ulong(block) * 1024;
+    float values[8];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; ++i) {
+        const ulong index = base + i * 128 + tid;
+        values[i] = bonsai_silu(gate[index]) * up[index];
+    }
+    bonsai_fwht_values<false>(values, signs, output, blocks_per_row, block, tid, shared);
+}
+
 // Eight output rows per SIMD group share activation coefficients; see
 // bonsai_ptq1_matvec_reuse_impl. Adapted from the pinned fork's
 // ptq1_0_dot_reg/mul_mv path. This trades register-local arithmetic for fewer
