@@ -185,9 +185,20 @@ The GGUF is required. The [ternary MTP head](#mtp-head-artifact) is not:
 without it speculation falls back to suffix lookup alone and the startup policy
 says why.
 
-`--include` is required on both commands. Without it `hf download` fetches the
-whole repository: the GGUF repository holds 68.5 GB across five checkpoints and
-the MTP repository 9.7 GB across 86 files, most of it unusable here. One
+The head is published as a release asset,
+[`mtp-head-mixed-v1`](https://github.com/debanjanbasu/local-ai/releases/tag/mtp-head-mixed-v1)
+(with its model card, license, notice and checksums). From the repository root:
+
+```bash
+python3 tools/fetch_mtp_head.py
+```
+
+It streams the pinned asset into `models/bonsai2-27b-mtp/`, checks its size and
+SHA256, and never replaces an existing file.
+
+`--include` is required. Without it `hf download` fetches the
+whole repository: it holds 68.5 GB across five checkpoints, most of it
+unusable here. One
 measured attempt transferred 21 GB+ before being stopped. Only the files listed
 above are ever opened, and the rest are not merely unused:
 
