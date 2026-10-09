@@ -476,6 +476,7 @@ fn stream_tail(reply: &Reply, calls: &[ToolCall], stats: &Stats) -> Vec<u8> {
         // `message` is still open, and this brace is what ends it.
         tail.extend_from_slice(b",\"role\":\"assistant\"}");
     }
+    tail.extend_from_slice(b",\"logprobs\":null");
     tail.extend_from_slice(b",\"finish_reason\":");
     tail.extend_from_slice(stop.as_bytes());
     // The same two bytes close the choice and the array in either shape, which

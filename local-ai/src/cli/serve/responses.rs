@@ -253,7 +253,10 @@ fn reasoning_effort(reasoning: Option<&Reasoning>) -> crate::Result<Option<&str>
             "no summarizer runs; the model's reasoning is returned verbatim as reasoning_text",
         ));
     }
-    if !matches!(reasoning.context.as_deref(), None | Some("auto")) {
+    if !matches!(
+        reasoning.context.as_deref(),
+        None | Some("auto" | "all_turns")
+    ) {
         return Err(unsupported(
             "reasoning.context",
             "earlier reasoning is rendered exactly as it is sent in input",
@@ -865,9 +868,10 @@ impl ResponsesState {
             "output":output,
             "parallel_tool_calls":true,
             "previous_response_id":null,
-            "reasoning":{"effort":echo.effort,"summary":null},
+            "reasoning":{"effort":echo.effort,"summary":null,"context":"all_turns"},
             "store":false,
             "background":false,
+            "access_programs":null,
             "service_tier":"default",
             "temperature":echo.temperature,
             "text":{"format":{"type":"text"}},

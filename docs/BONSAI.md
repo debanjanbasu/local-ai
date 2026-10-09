@@ -192,6 +192,8 @@ Reasoning controls are `reasoning_effort` (Chat) and `reasoning.effort`
 `xhigh`. Usage counts reasoning tokens from generated IDs through the first
 `</think>` token, inclusive; a response truncated before that token counts all
 generated tokens as reasoning. Prior reasoning is retained in replayed history.
+Responses accepts `reasoning.context: "all_turns"` (also the effective mode
+reported for the default `auto`); `current_turn` filtering is not implemented.
 Responses reports measured prefix reuse as `input_tokens_details.cached_tokens`.
 `cache_write_tokens` is zero: local cache creation has no separately accounted
 or charged cache-write tier.
@@ -203,6 +205,35 @@ tools, encrypted reasoning, reasoning summaries, images and audio are rejected.
 structured tool events, not a guarantee against tool-like literal text.
 Decisions requires a separately trained and evaluated judgment head; the MTP
 head and next-token softmax are not calibrated decision probabilities.
+
+The compatibility target is the public OpenAI contract, not a particular
+harness. The current schema audit is pinned to
+[`openai-openapi` at e95c0fe](https://github.com/openai/openai-openapi/tree/e95c0fe615f45a19e8878af923a729948445a6bd)
+(OpenAPI 3.1, 230 paths). SDKs, Codex and Oh My Pi are independent clients of
+the same HTTP adapters; native Rust callers use the engine's request/event
+types directly. No client-name branches belong in model execution.
+
+Missing endpoint families are not all model limitations: response storage,
+conversations, input-token counting, compaction, files and batches need server
+implementations; constrained outputs need a decoding constraint implementation;
+media, embedding and moderation capabilities need suitable models or heads.
+Hosted tools and administrative APIs also need their own services. None is
+implemented by merely accepting its request fields.
+
+[Codex at 4aa94dc](https://github.com/openai/codex/tree/4aa94dce270de668eff6e2fa8585c82385e84455)
+uses stateless Responses but requests `reasoning.encrypted_content`, and sends
+`client_metadata` (an extension absent from the pinned public spec). These are
+still blockers, so this server is **not yet a drop-in Codex provider**. Optional
+fields in an output schema do not justify silently ignoring requested encryption
+or labeling raw reasoning as a summary. The Oh My Pi example in the engine
+README configures that client to use only implemented capabilities.
+
+Legacy Completions now rejects unsupported `stop`, `n`, `logprobs`, `logit_bias`,
+`best_of`, `echo`, `suffix` and streaming usage options rather than silently
+ignoring them. Chat also rejects `store:true` and non-default `verbosity`.
+Error envelopes include nullable `code` and `param`; choices include nullable
+`logprobs`; Responses includes nullable `access_programs`. The model's `created`
+timestamp is its registration time at server startup, not its training date.
 
 With `stream: true`, Chat/completions are `text/event-stream` chunks terminated by
 `data: [DONE]`. Chat separates `reasoning_content` from visible `content`.
@@ -1263,6 +1294,16 @@ every fused kernel is bitwise identical to the dispatches it replaces
 - Convolution, Q/K L2 normalization and decay/beta: one dispatch for blocks of
   up to 32 rows.
 
+Multi-row FFNs also fuse SwiGLU with the forward Hadamard rotation, removing
+one dispatch per layer and the intermediate product write/read; single-row
+decode is unchanged. Separate-output and in-place kernels match bitwise for
+2, 4, 8 and 64 rows. On the M4 Pro, best warm stage times were 9.6 to 5.9 us
+at 2 rows, 63.9 to 37.6 us at 64 rows, and 179.5 to 87.5 us at 128 rows.
+A real-model 16-row feature capture in separate/fused/fused/separate order
+took 33.438/33.379/33.361/33.506 seconds, with every captured FP16 feature
+byte identical. The mean whole-capture difference is only 0.3%; these stage
+timings do not establish a broad decode speedup or bandwidth saturation.
+
 The BF16 matvec was bound by one load latency per loop iteration, 45 us for
 each 48x5120 alpha or beta projection; it now issues eight iterations' loads
 before their in-order fused multiply-adds, also bitwise identical. Kernel
@@ -1698,3 +1739,9 @@ loop whose edit passed two executed assertions. Seven unmodified live response
 objects and 57 Responses SSE events, including reasoning and function calls,
 validated against OpenAI Python SDK 3.27.0. These checks cover the supported
 text/function subset, not full platform compatibility or coding benchmarks.
+
+A separate live audit validated 25 unmodified JSON objects and SSE events
+against the pinned public OpenAPI schemas: Models, buffered and streaming
+Chat/Completions/Responses, and rejected requests. Negative controls removing
+required `created` and `param` fields failed validation as expected. This is
+schema coverage of those sampled exchanges, not proof of full API conformance.

@@ -56,7 +56,7 @@ pub(super) const ZSTD_LEVEL: i32 = 22;
 const RETRY_AFTER_SECONDS: u32 = 1;
 
 const JSON_ENCODE_FAILED: &[u8] =
-    b"{\"error\":{\"message\":\"JSON encoding failed\",\"type\":\"server_error\"}}";
+    b"{\"error\":{\"message\":\"JSON encoding failed\",\"type\":\"server_error\",\"code\":null,\"param\":null}}";
 
 /// How long the collector may wait for the next item of a response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +156,7 @@ pub(super) async fn error_response(
     };
     json_response(
         status,
-        json!({"error":{"message":message,"type":kind}}),
+        json!({"error":{"message":message,"type":kind,"code":null,"param":null}}),
         state,
         headers,
     )
@@ -186,6 +186,8 @@ pub(super) async fn queue_full_response(state: &AppState, headers: &HeaderMap) -
         json!({"error":{
             "message":message,
             "type":"server_error",
+            "code":null,
+            "param":null,
             "queue_depth":depth,
             "queue_capacity":SERVE_QUEUE,
             "retry_after_seconds":RETRY_AFTER_SECONDS,

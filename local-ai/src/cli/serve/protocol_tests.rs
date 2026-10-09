@@ -187,6 +187,8 @@ fn chat_rejects_options_it_cannot_honour() {
         (json!({"functions":[{"name":"f"}]}), "functions"),
         (json!({"parallel_tool_calls":false}), "parallel_tool_calls"),
         (json!({"service_tier":"flex"}), "service_tier"),
+        (json!({"store":true}), "store"),
+        (json!({"verbosity":"high"}), "verbosity"),
         (
             json!({"tools":[{"type":"function","function":{"name":"f","strict":true}}]}),
             "strict",
@@ -219,10 +221,34 @@ fn chat_history_errors_are_reported_before_generation() {
 }
 
 #[test]
-fn raw_completions_keep_their_lenient_parsing() {
-    // Options a chat request is refused for were always ignored here, and the
-    // raw API keeps that contract.
-    let body = json!({"prompt":"hi","stop":["x"],"n":2,"max_tokens":3,"stream":true});
+fn raw_completions_reject_options_they_cannot_honour() {
+    for (extra, needle) in [
+        (json!({"stop":["x"]}), "stop"),
+        (json!({"n":2}), "n is not supported"),
+        (json!({"logprobs":0}), "logprobs is not supported"),
+        (json!({"logprobs":5}), "logprobs is not supported"),
+        (json!({"logprobs":false}), "logprobs must be"),
+        (json!({"logit_bias":{"1":2}}), "logit_bias"),
+        (json!({"best_of":2}), "best_of"),
+        (json!({"echo":true}), "echo"),
+        (json!({"suffix":"tail"}), "suffix"),
+        (
+            json!({"stream_options":{"include_usage":true}}),
+            "include_usage",
+        ),
+    ] {
+        let mut body = json!({"prompt":"hi"});
+        body.as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        let error = prepare_generation(body.to_string().as_bytes(), false, true)
+            .err()
+            .expect("unsupported option")
+            .to_string();
+        assert!(error.contains(needle), "{body}: {error}");
+    }
+    let body = json!({"prompt":"hi","stop":null,"n":1,"best_of":1,"echo":false,
+        "suffix":null,"logprobs":null,"max_tokens":3,"stream":true});
     let prepared = prepare_generation(body.to_string().as_bytes(), false, true).expect("valid");
     assert!(prepared.stream);
     assert!(!prepared.include_usage);
@@ -335,10 +361,20 @@ fn completion_stream_is_unchanged_apart_from_its_identity() {
     let chunk = parse_data(&out[0]);
     assert_eq!(chunk["object"], "text_completion");
     assert_eq!(chunk["choices"][0]["text"], "hi");
+    assert_eq!(chunk["choices"][0].get("logprobs"), Some(&Value::Null));
     let (out, terminal) = frames.event(Event::Finished(stats(StopReason::Eos)));
     assert!(terminal);
     assert_eq!(parse_data(&out[0])["choices"][0]["finish_reason"], "stop");
     assert_eq!(out[1], "data: [DONE]\n\n");
+    let mut failed = Frames::new(Reply::new(Protocol::Completion, "m".into()));
+    let (out, terminal) = failed.event(Event::Error("failed".into()));
+    assert!(terminal);
+    assert_eq!(
+        parse_data(&out[0])["error"],
+        json!({
+            "message":"failed","type":"server_error","code":null,"param":null
+        })
+    );
 }
 
 /// Fold signals through a buffered body as the pump does and return the bytes.
@@ -378,6 +414,7 @@ fn chat_body_lists_calls_with_null_content_and_tool_calls_finish() {
     let document: Value = serde_json::from_slice(&body).expect("valid JSON");
     let choice = &document["choices"][0];
     assert_eq!(choice["finish_reason"], "tool_calls");
+    assert_eq!(choice.get("logprobs"), Some(&Value::Null));
     assert_eq!(choice["message"]["content"], Value::Null);
     assert_eq!(choice["message"]["reasoning_content"], "why");
     assert_eq!(
@@ -428,7 +465,7 @@ fn responses_parse_instructions_history_and_tools() {
         "tools":[{"type":"function","name":"weather","description":"Look up","parameters":{"type":"object"},"strict":false}],
         "tool_choice":"auto",
         "max_output_tokens":64,
-        "reasoning":{"effort":"none"},
+        "reasoning":{"effort":"none","context":"all_turns"},
         "store":false,
         "prompt_cache_key":"k",
         "metadata":{"a":"b"},
@@ -635,6 +672,10 @@ fn responses_stream_follows_the_documented_lifecycle() {
     );
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["sequence_number"], index, "{event}");
+        if let Some(response) = event.get("response") {
+            assert_eq!(response.get("access_programs"), Some(&Value::Null));
+            assert_eq!(response["reasoning"]["context"], "all_turns");
+        }
     }
     assert_eq!(events[0]["response"]["status"], "in_progress");
     assert_eq!(events[0]["response"]["output"], json!([]));
@@ -794,6 +835,134 @@ fn responses_body_failure_is_not_a_json_document() {
     assert!(serde_json::from_slice::<Value>(&body).is_err());
 }
 
+/// A request Oh My Pi's `openai-responses` provider sends with the custom
+/// provider in `local-engine/README.md`. Recorded from `omp` 18.8.6 against a
+/// stand-in endpoint, with `instructions` and the tool description shortened.
+/// With those flags it sends no `include`, `reasoning.summary` or `strict`;
+/// `--thinking off` sends `effort: "none"` and every other level `xhigh`.
+fn omp_turn(effort: &str, input: &Value) -> Value {
+    json!({
+        "model":"ternary-bonsai-2-27b",
+        "input":input,
+        "instructions":"You are omp's trusted coding agent.",
+        "tools":[{"type":"function","name":"read","description":"Read a file.","parameters":{
+            "type":"object",
+            "properties":{
+                "i":{"type":"string","description":"concise intent"},
+                "path":{"type":"string","description":"Local path, internal URI, or URL; selectors inline."}
+            },
+            "required":["path","i"],
+            "additionalProperties":false
+        }}],
+        "stream":true,
+        "prompt_cache_key":"01a122e6-26a1-7649-85a2-6679d989b419",
+        "store":false,
+        "max_output_tokens":8192,
+        "reasoning":{"effort":effort}
+    })
+}
+
+/// Oh My Pi resends earlier output items stripped of IDs and output-only
+/// statuses; reasoning keeps only its summary and content.
+fn omp_replay(item: &Value) -> Value {
+    let mut item = item.as_object().cloned().unwrap_or_default();
+    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+        item.retain(|key, _| matches!(key.as_str(), "type" | "summary" | "content"));
+    } else {
+        item.remove("id");
+        item.remove("status");
+    }
+    Value::Object(item)
+}
+
+#[test]
+fn responses_accept_an_oh_my_pi_read_and_tool_result_turn() {
+    let prompt = json!({"role":"user","content":[
+        {"type":"input_text","text":"<system-reminder>\nToday: 2026-10-10.\n</system-reminder>"},
+        {"type":"input_text","text":"Read main.rs and tell me what it prints."}
+    ]});
+    let first = omp_turn("xhigh", &json!([prompt]));
+    let prepared = prepare_responses(first.to_string().as_bytes(), true).expect("first turn");
+    assert!(prepared.stream);
+    assert!(prepared.request.thinking);
+    assert_eq!(
+        prepared.request.session.as_deref(),
+        Some("01a122e6-26a1-7649-85a2-6679d989b419")
+    );
+    assert_eq!(prepared.request.tools[0].name, "read");
+
+    // The server's own answer to that turn, as Oh My Pi replays it.
+    let read = call(
+        "call_1",
+        "read",
+        json!({"i":"see what it prints","path":"main.rs"}),
+    );
+    let reply = responses_reply(&first);
+    let Protocol::Responses(echo) = &reply.protocol else {
+        unreachable!("responses reply")
+    };
+    let mut state = ResponsesState::new(&reply, Arc::clone(echo), false);
+    let mut response = Value::Null;
+    for event in [
+        Event::Reasoning("Read the file first.".into()),
+        Event::ToolCall(read.clone()),
+        Event::Finished(stats(StopReason::Eos)),
+    ] {
+        if let Some(done) = state.event(event) {
+            response = done;
+        }
+    }
+    let mut input = vec![prompt];
+    input.extend(
+        response["output"]
+            .as_array()
+            .expect("output")
+            .iter()
+            .map(omp_replay),
+    );
+    assert_eq!(
+        input[2],
+        json!({"type":"function_call","call_id":"call_1","name":"read",
+            "arguments":"{\"i\":\"see what it prints\",\"path\":\"main.rs\"}"})
+    );
+    input.push(json!({"type":"function_call_output","call_id":"call_1",
+        "output":"fn main() {\n    println!(\"hello\");\n}"}));
+
+    // The user turned thinking off before the tool result went back.
+    let second = omp_turn("none", &Value::Array(input));
+    let request = prepare_responses(second.to_string().as_bytes(), true)
+        .expect("tool-result turn")
+        .request;
+    assert!(!request.thinking);
+    let roles: Vec<&str> = request.messages.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool"]);
+    assert!(
+        request.messages[1]
+            .content
+            .ends_with("tell me what it prints.")
+    );
+    let turn = &request.messages[2];
+    assert_eq!(
+        turn.reasoning_content.as_deref(),
+        Some("Read the file first.")
+    );
+    assert_eq!(turn.tool_calls, vec![read]);
+    let result = &request.messages[3];
+    assert_eq!(result.tool_call_id.as_deref(), Some("call_1"));
+    assert!(result.content.contains("println!(\"hello\")"));
+
+    // Without those flags Oh My Pi asks for semantics this server lacks, and
+    // the request fails instead of being answered as if they were honoured.
+    let mut encrypted = first.clone();
+    encrypted["include"] = json!(["reasoning.encrypted_content"]);
+    let mut summary = first;
+    summary["reasoning"]["summary"] = json!("auto");
+    for (body, needle) in [(encrypted, "include"), (summary, "reasoning.summary")] {
+        let error = responses_error(&body);
+        assert!(error.contains(needle), "{error:?}");
+    }
+}
+
 #[test]
 fn route_preparation_maps_each_api_to_its_protocol() {
     let (stream, request, protocol) = prepare(
@@ -848,8 +1017,9 @@ fn reply_ids_are_prefixed_and_unique() {
 
 #[test]
 fn models_report_the_admitted_context() {
-    let models = models_json("bonsai", 32768);
+    let models = models_json("bonsai", 32768, 1234);
     assert_eq!(models["data"][0]["id"], "bonsai");
+    assert_eq!(models["data"][0]["created"], 1234);
     assert_eq!(models["data"][0]["context_length"], 32768);
     assert_eq!(models["data"][0]["max_model_len"], 32768);
 }

@@ -30,13 +30,19 @@ struct GenerateRequest {
     tool_choice: Option<Value>,
     parallel_tool_calls: Option<bool>,
     reasoning_effort: Option<String>,
-    // Chat options this server cannot honour. They are named so a request that
+    // Options this server cannot honour. They are named so a request that
     // sets one fails instead of being answered as if it had not.
     n: Option<u64>,
     stop: Option<Value>,
-    logprobs: Option<bool>,
+    /// Boolean for Chat, an integer for legacy Completions.
+    logprobs: Option<Value>,
     top_logprobs: Option<u64>,
     logit_bias: Option<Value>,
+    best_of: Option<u64>,
+    echo: Option<bool>,
+    suffix: Option<String>,
+    store: Option<bool>,
+    verbosity: Option<String>,
     response_format: Option<Value>,
     audio: Option<Value>,
     modalities: Option<Vec<String>>,
@@ -73,8 +79,8 @@ impl GenerateRequest {
         }
     }
 
-    /// Fail on any Chat option whose effect this server cannot produce.
-    fn reject_unsupported_chat(&self) -> crate::Result<()> {
+    /// Fail on any named option whose effect this server cannot produce.
+    fn reject_unsupported(&self, chat: bool) -> crate::Result<()> {
         let unsupported = |name: &str, why: &str| {
             Err(crate::Error::InvalidArgument(format!(
                 "{name} is not supported: {why}"
@@ -86,11 +92,41 @@ impl GenerateRequest {
         if self.stop.as_ref().is_some_and(|stop| !is_empty(stop)) {
             return unsupported("stop", "stop sequences are not implemented");
         }
-        if self.logprobs == Some(true) || self.top_logprobs.is_some_and(|n| n > 0) {
+        let logprobs = match self.logprobs.as_ref() {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(enabled)) if chat => *enabled,
+            Some(Value::Number(count)) if !chat && count.as_u64().is_some() => true,
+            _ => {
+                return Err(crate::Error::InvalidArgument(
+                    "logprobs must be a boolean for Chat or a non-negative integer for Completions"
+                        .into(),
+                ));
+            }
+        };
+        if logprobs || self.top_logprobs.is_some_and(|n| n > 0) {
             return unsupported("logprobs", "token log-probabilities are not reported");
         }
         if self.logit_bias.as_ref().is_some_and(|bias| !is_empty(bias)) {
             return unsupported("logit_bias", "the sampler has no per-token bias");
+        }
+        if self.best_of.is_some_and(|count| count != 1) {
+            return unsupported("best_of", "this server generates exactly one candidate");
+        }
+        if self.echo == Some(true) {
+            return unsupported("echo", "prompt echo is not implemented");
+        }
+        if self
+            .suffix
+            .as_ref()
+            .is_some_and(|suffix| !suffix.is_empty())
+        {
+            return unsupported("suffix", "fill-in-the-middle generation is not implemented");
+        }
+        if self.store == Some(true) {
+            return unsupported("store", "this server stores no completions");
+        }
+        if !matches!(self.verbosity.as_deref(), None | Some("medium")) {
+            return unsupported("verbosity", "only the default, medium, is produced");
         }
         if let Some(format) = &self.response_format
             && !format.is_null()
@@ -235,8 +271,13 @@ pub(super) fn prepare_generation(
         .as_ref()
         .and_then(|options| options.include_usage)
         .unwrap_or(false);
+    request.reject_unsupported(chat)?;
+    if !chat && include_usage {
+        return Err(crate::Error::InvalidArgument(
+            "stream_options.include_usage is not supported for legacy Completions".into(),
+        ));
+    }
     let generation = if chat {
-        request.reject_unsupported_chat()?;
         let messages = request
             .messages
             .as_deref()

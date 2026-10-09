@@ -130,6 +130,85 @@ out of the engine; in particular, a retry must not repeat a partially successful
 batch's side effects. Do not change the pinned checkpoint template merely to
 match another Qwen model's conventions.
 
+### Oh My Pi custom provider
+
+Oh My Pi can drive `local-ai serve` through its `openai-responses` provider.
+Add this to `~/.omp/agent/models.yml`:
+
+```yaml
+providers:
+  local-ai:
+    baseUrl: http://127.0.0.1:8080/v1
+    auth: none # with serve --api-key, use apiKey: LOCAL_AI_API_KEY (an env var name)
+    api: openai-responses
+    compat:
+      supportsStrictMode: false
+      supportsReasoningSummary: false
+      includeEncryptedReasoning: false
+      reasoningDisableMode: none-effort
+      supportsForcedToolChoice: false
+      reasoningEffortMap: {minimal: xhigh, low: xhigh, medium: xhigh, high: xhigh, max: xhigh}
+    models:
+      - id: ternary-bonsai-2-27b # not checked by the server
+        name: Ternary Bonsai 2 27B (local-ai)
+        reasoning: true
+        thinking: {mode: effort, efforts: [xhigh], defaultLevel: xhigh, requiresEffort: false}
+        input: [text]
+        contextWindow: 65536 # use context_length from GET /v1/models
+        maxTokens: 8192
+        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
+```
+
+The flags replace Oh My Pi defaults for an unrecognized host that this server
+refuses or would misread. The keys come from the
+[`models.yml` schema](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/packages/coding-agent/src/config/models-config-schema-bundle.ts#L40-L88)
+and, for `includeEncryptedReasoning` and `reasoningDisableMode`, the runtime
+[compatibility axes](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/packages/catalog/src/compat/axes.ts#L131-L161),
+which `models.yml` accepts without a warning
+([docs](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/docs/models.md#unknown-compatibility-keys)).
+The [Responses defaults](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/packages/catalog/src/compat/resolve.ts#L697-L848),
+[request builder](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/packages/ai/src/providers/openai-responses.ts#L1600-L1702),
+[reasoning policy](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/packages/ai/src/providers/openai-shared.ts#L970-L1084),
+[reasoning fields](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/packages/ai/src/providers/openai-shared.ts#L4019-L4096)
+and [effort resolution](https://github.com/can1357/oh-my-pi/blob/703a261df9533e74f16aa8d38e64eb41977ccf89/packages/ai/src/stream.ts#L1707-L1737)
+show what each flag changes:
+
+- `includeEncryptedReasoning: false` stops `include: ["reasoning.encrypted_content"]`,
+  sent on every reasoning request by default.
+- `supportsReasoningSummary: false` stops `reasoning.summary: "auto"`.
+- `reasoningDisableMode: none-effort` makes `--thinking off` send
+  `reasoning.effort: "none"`. The default sends the lowest listed effort,
+  `xhigh`, so turning thinking off would silently keep it on.
+- `efforts: [xhigh]` and `reasoningEffortMap` reflect the checkpoint's only
+  reasoning mode: every level other than off becomes `xhigh`, and a fixed
+  internal effort maps to it instead of failing as unsupported.
+  `requiresEffort: false` declares that off is accepted, so it is never
+  clamped up to `xhigh`; auto-detection gave the same result in the check below.
+- `supportsStrictMode: false` keeps `strict` out of tool definitions. It is
+  already off for hosts other than `OpenAI` and a few known providers; set it
+  explicitly because `strict: true` is refused.
+- `supportsForcedToolChoice: false` turns Oh My Pi's forced tool choices into
+  `auto`, so the model may answer without calling the tool. Without it those
+  requests fail.
+
+Oh My Pi already sends `store: false`, resends earlier turns in `input`, puts
+the system prompt in `instructions`, and leaves out the `developer` role and
+`stream_options` for non-OpenAI hosts. With `input: [text]`, images in tool
+results become text placeholders. Presence or repetition penalties configured
+in Oh My Pi are unknown fields to this Responses endpoint and fail the request.
+For a server started with `--no-thinking`, set `reasoning: false` and remove
+`thinking`; Oh My Pi then sends no reasoning field.
+
+This configuration was checked by reading Oh My Pi at
+[`703a261`](https://github.com/can1357/oh-my-pi/tree/703a261df9533e74f16aa8d38e64eb41977ccf89)
+and by running `omp` 18.8.6 against a recording stand-in for `/v1/responses`,
+not against the model. With the flags, a read, tool-result and reply turn at
+`--thinking high` and `off` sent `reasoning.effort` `xhigh` and `none` and no
+`include`, summary or `strict`. Without the flags, both levels sent `include`
+and `xhigh`, and `high` also sent `summary: "auto"`. The recorded turn is the
+`responses_accept_an_oh_my_pi_read_and_tool_result_turn` test in
+`local-ai/src/cli/serve/protocol_tests.rs`.
+
 `OpenAI`'s [Decisions API](https://developers.openai.com/api/docs/guides/decisions)
 uses `input` and named question/answer arrays. At the pinned revision, Oh My Pi's
 [`openrouter-decisions` adapter](https://github.com/can1357/oh-my-pi/blob/dde3fc44ed16d3bbec292893c7a902e92d6ce00e/packages/ai/src/judgment/typesafe.ts)

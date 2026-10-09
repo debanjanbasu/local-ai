@@ -357,6 +357,74 @@ fn fused_residual_and_gdn_output_chains_match_separate_dispatches_bitwise() {
 }
 
 #[test]
+fn fused_swiglu_and_rotation_match_separate_dispatches_bitwise() {
+    let Some((context, kernels, ops)) = setup() else {
+        return;
+    };
+    let mut rng = Rng(0x6a09_e667_f3bc_c908);
+    // Three 1024-wide blocks per row, each with its own signs.
+    let columns = 3072_usize;
+    let rotation = rng.signs(&context, columns);
+    for tokens in [2_u32, 4, 8, 64] {
+        let count = columns * tokens as usize;
+        // Asymmetric operands: gate spans the sigmoid's curved and saturating
+        // ranges with a positive bias; up has its own scale and offset.
+        let gate_values: Vec<f32> = (0..count).map(|_| rng.unit().mul_add(9.0, 1.5)).collect();
+        let up_values: Vec<f32> = (0..count)
+            .map(|_| rng.unit().mul_add(2.5, -0.375))
+            .collect();
+        let gate = MetalBuffer::from_slice(context.device(), &gate_values).expect("gate");
+        let up = MetalBuffer::from_slice(context.device(), &up_values).expect("up");
+        // The engine rotates in place over the gate buffer.
+        let in_place = copy(&context, &gate);
+        let rows: Vec<_> = (0..3).map(|_| rng.floats(&context, count)).collect();
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        ops.swiglu(&mut batch, &gate, &up, &rows[0], count as u32)
+            .expect("swiglu");
+        kernels
+            .transform(
+                &mut batch,
+                &rotation,
+                &rows[0],
+                &rows[1],
+                tokens,
+                HadamardDirection::Forward,
+            )
+            .expect("rotate");
+        kernels
+            .swiglu_transform(&mut batch, &rotation, &gate, &up, &rows[2], tokens)
+            .expect("fused swiglu rotate");
+        kernels
+            .swiglu_transform(&mut batch, &rotation, &in_place, &up, &in_place, tokens)
+            .expect("in-place fused swiglu rotate");
+        batch.commit_and_wait().expect("run");
+        assert_bits("rotated SwiGLU", &rows[2], &rows[1], count);
+        assert_bits("in-place rotated SwiGLU", &in_place, &rows[1], count);
+        assert!(
+            rows[1].as_slice::<f32>()[..count]
+                .iter()
+                .any(|&value| value != 0.0),
+            "the reference must be nontrivial"
+        );
+    }
+
+    // Short buffers and empty shapes encode nothing.
+    let short = rng.floats(&context, columns);
+    let mut batch = CommandBatch::new(&context).expect("batch");
+    assert!(
+        kernels
+            .swiglu_transform(&mut batch, &rotation, &short, &short, &short, 2)
+            .is_err()
+    );
+    assert!(
+        kernels
+            .swiglu_transform(&mut batch, &rotation, &short, &short, &short, 0)
+            .is_err()
+    );
+    assert_eq!(batch.dispatch_count(), 0);
+}
+
+#[test]
 fn concurrent_batch_orders_everything_outside_independent_groups() {
     let Some((context, kernels, ops)) = setup() else {
         return;

@@ -157,9 +157,9 @@ const STREAM_HEAD_CHAT: &str = "{\"choices\":[{\"index\":0,\"message\":{\"reason
 /// numbers here are all zero.
 fn expected(chat: bool, content: &str, reasoning: &str) -> Value {
     let choice = if chat {
-        json!({"index":0,"message":{"content":content,"reasoning_content":reasoning,"role":"assistant"},"finish_reason":"stop"})
+        json!({"index":0,"message":{"content":content,"reasoning_content":reasoning,"role":"assistant"},"logprobs":null,"finish_reason":"stop"})
     } else {
-        json!({"index":0,"text":content,"finish_reason":"stop"})
+        json!({"index":0,"text":content,"logprobs":null,"finish_reason":"stop"})
     };
     json!({"choices":[choice],"created":0,"id":"local","model":"local","object":if chat {"chat.completion"} else {"text_completion"},"speculation":{"batched_tokens":0,"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
 }

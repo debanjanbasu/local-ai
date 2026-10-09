@@ -245,11 +245,11 @@ fn data(value: &Value) -> String {
 }
 
 fn error_frame(error: &str) -> String {
-    data(&json!({"error":{"message":error,"type":"server_error"}}))
+    data(&json!({"error":{"message":error,"type":"server_error","code":null,"param":null}}))
 }
 
 fn completion_frames(reply: &Reply, event: Event) -> Vec<String> {
-    let chunk = |text: &str, finish: Option<&str>| json!({"id":reply.id,"object":"text_completion","created":reply.created,"model":reply.model.as_ref(),"choices":[{"index":0,"text":text,"finish_reason":finish}]});
+    let chunk = |text: &str, finish: Option<&str>| json!({"id":reply.id,"object":"text_completion","created":reply.created,"model":reply.model.as_ref(),"choices":[{"index":0,"text":text,"logprobs":null,"finish_reason":finish}]});
     match event {
         Event::Content(piece) | Event::Reasoning(piece) => vec![data(&chunk(&piece, None))],
         Event::Finished(stats) => vec![

@@ -59,6 +59,8 @@ struct Args {
 struct AppState {
     engine: EngineHandle,
     model: Arc<str>,
+    /// Registration time of the loaded model resource, stable for this server.
+    created: u64,
     /// Tokens one request may hold, prompt and output together, as the engine
     /// admitted them at load (`BonsaiInfo::context`). Requests over it fail
     /// with a context-overflow error rather than being truncated.
@@ -134,7 +136,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
         return json_response(
             StatusCode::OK,
-            models_json(&state.model, state.context),
+            models_json(&state.model, state.context, state.created),
             &state,
             &parts.headers,
         )
@@ -306,8 +308,8 @@ fn prepare(
 /// `max_model_len` (vLLM's) are both the per-request admission limit from
 /// `BonsaiInfo::context`, prompt plus output, not the checkpoint's training
 /// length: it is what a request can actually use on this machine.
-fn models_json(model: &str, context: usize) -> serde_json::Value {
-    json!({"object":"list","data":[{"id":model,"object":"model","owned_by":"local","context_length":context,"max_model_len":context}]})
+fn models_json(model: &str, context: usize, created: u64) -> serde_json::Value {
+    json!({"object":"list","data":[{"id":model,"object":"model","created":created,"owned_by":"local","context_length":context,"max_model_len":context}]})
 }
 
 async fn run_async(args: Args) -> crate::Result<()> {
@@ -321,6 +323,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let state = AppState {
         engine: engine.into_handle(),
         model,
+        created: response::unix_now(),
         context,
         thinking: args.thinking,
         api_key: args.api_key.map(Into::into),
