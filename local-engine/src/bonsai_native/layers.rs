@@ -229,18 +229,15 @@ impl BonsaiModel {
                     &scratch.gate,
                     tokens,
                 )?;
-                for (weights, output) in [
-                    (&layer.alpha, &scratch.alpha),
-                    (&layer.beta, &scratch.raw_beta),
-                ] {
-                    self.ops.bf16_matmul(
-                        batch,
-                        decay_projection(weights),
-                        &scratch.normalized,
-                        output,
-                        tokens,
-                    )?;
-                }
+                self.ops.bf16_matmul_pair(
+                    batch,
+                    [
+                        (decay_projection(&layer.alpha), &scratch.alpha),
+                        (decay_projection(&layer.beta), &scratch.raw_beta),
+                    ],
+                    &scratch.normalized,
+                    tokens,
+                )?;
                 crate::Result::Ok(())
             })?;
         }

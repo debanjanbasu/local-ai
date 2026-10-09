@@ -74,7 +74,7 @@ Startup prints every decision and reason under `experimental_bonsai`.
 | Speculation | Lossless suffix lookup; gated depth-3 MTP when the ternary head artifact is installed |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Disk | `min(512 GiB, 25% of free space)` under `~/Library/Caches/local-ai/prompt-cache` |
-| Server | Up to eight requests decoded together in one batched pass per token, eight more queued; HTTP/3 when its certificate and key are discovered |
+| Server | Up to eight requests decoded together in one batched pass per step, verifying lookup drafts where a cost model finds them worth their rows; long prompts prefill 32 tokens per step beside them; eight more queued; HTTP/3 when its certificate and key are discovered |
 
 ## Performance
 
@@ -82,10 +82,13 @@ Startup prints every decision and reason under `experimental_bonsai`.
   depth-3 speculation (35–43 across prose, explanation, arithmetic, code,
   essay and thinking prompts), with byte-identical greedy text; code
   copy-edits reach 54–66 tok/s with suffix lookup.
-- Server: concurrent requests decode in one batched pass per token; 300-token
-  chat requests reach 36.8, 48.5 and 67.8 tok/s aggregate at 2, 4 and 8
-  streams against 32.7 for one, with worst TTFT 0.4 s at 4 streams instead of
-  25.5 s queued.
+- Server: concurrent requests decode in one batched pass per step; 300-token
+  chat requests reach 39.2, 47.2 and 74.5 tok/s aggregate at 2, 4 and 8
+  streams against 33.9 for one. A 9.2K-token prompt arriving beside four
+  streams no longer stalls them for its 88 s prefill: they keep a token every
+  0.39 s (p50; 0.41 s p99) and its first token comes at 111 s. Copy-edit
+  requests verify suffix-lookup drafts inside the batch: 37.3 against 31.7
+  tok/s aggregate at four streams, byte-identical to each request alone.
 - Prefill: about 96 tok/s at 4K tokens and 56 tok/s at 128K.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s.

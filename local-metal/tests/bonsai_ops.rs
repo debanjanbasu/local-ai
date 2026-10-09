@@ -263,64 +263,97 @@ fn bf16_matvec_checks_every_row_and_partial_simd_width() {
     check(&output, &expected, 3e-5);
 }
 
-/// The token-tiled BF16 GEMM must agree with the F64 product on partial row
-/// and token tiles (37 rows, 41 tokens against 32-wide tiles), an offset
-/// matrix, and a column count that is a multiple of 64 but not 128, and must
-/// leave the guard tail untouched. Its rows differ from the per-token matvec
-/// only by F32 summation order.
+/// Multi-row BF16 projections (verify, batched decode and prefill blocks)
+/// must agree with the F64 product and be bitwise the single-row matvec of
+/// each row, for one matrix and for the alpha/beta pair, on partial row
+/// groups (1 to 41 rows against four per SIMD group), an offset matrix, a
+/// column count with a partial 256-column step, and must leave the guard
+/// tails untouched.
 #[test]
-fn bf16_matmul_tiles_match_f64_on_partial_row_and_token_tiles() {
+fn bf16_matmul_rows_match_f64_and_are_bitwise_the_matvec() {
     let Some((ctx, ops)) = setup() else { return };
-    let (rows, columns, tokens) = (37_usize, 320_usize, 41_usize);
-    assert!(tokens as u32 >= local_metal::bonsai_ops::BF16_TILE_MIN_TOKENS);
-    let mut packed = vec![0xffff_u16; 2];
-    packed.extend((0..rows * columns).map(|i| half::bf16::from_f32(signal(i, 3) * 10.0).to_bits()));
-    let input_data = (0..tokens * columns)
-        .map(|i| signal(i, 7))
+    let (rows, columns) = (37_usize, 320_usize);
+    let matrix_data = |salt: usize| {
+        let mut packed = vec![0xffff_u16; 2];
+        packed.extend(
+            (0..rows * columns).map(|i| half::bf16::from_f32(signal(i, salt) * 10.0).to_bits()),
+        );
+        packed
+    };
+    let packed = [matrix_data(3), matrix_data(5)];
+    let weights = packed
+        .iter()
+        .map(|data| MetalBuffer::from_slice(ctx.device(), data).expect("BF16 weights"))
         .collect::<Vec<_>>();
-    let weights = MetalBuffer::from_slice(ctx.device(), &packed).expect("BF16 weights");
-    let input = floats(&ctx, &input_data);
-    let output = guarded(&ctx, rows * tokens);
-    let matrix = Bf16Matrix {
-        buffer: &weights,
+    let matrix = |index: usize| Bf16Matrix {
+        buffer: &weights[index],
         offset: 4,
         rows: rows as u32,
         columns: columns as u32,
     };
-    let mut batch = CommandBatch::new(&ctx).expect("batch");
-    ops.bf16_matmul(&mut batch, matrix, &input, &output, tokens as u32)
-        .expect("BF16 matmul");
-    batch.commit_and_wait().expect("matmul completion");
-    let (packed, input_data) = (&packed, &input_data);
-    let expected = (0..tokens)
-        .flat_map(|t| {
-            (0..rows).map(move |r| {
-                (0..columns)
-                    .map(|c| {
-                        f64::from(f32::from_bits(u32::from(packed[2 + r * columns + c]) << 16))
-                            * f64::from(input_data[t * columns + c])
+    for tokens in [1_usize, 2, 3, 4, 5, 8, 41] {
+        let input_data = (0..tokens * columns)
+            .map(|i| signal(i, 7 + tokens))
+            .collect::<Vec<_>>();
+        let input = floats(&ctx, &input_data);
+        let single = guarded(&ctx, rows * tokens);
+        let pair = [guarded(&ctx, rows * tokens), guarded(&ctx, rows * tokens)];
+        let mut rows_by_matvec = [guarded(&ctx, rows * tokens), guarded(&ctx, rows * tokens)];
+        let mut batch = CommandBatch::new(&ctx).expect("batch");
+        ops.bf16_matmul(&mut batch, matrix(0), &input, &single, tokens as u32)
+            .expect("BF16 matmul");
+        ops.bf16_matmul_pair(
+            &mut batch,
+            [(matrix(0), &pair[0]), (matrix(1), &pair[1])],
+            &input,
+            tokens as u32,
+        )
+        .expect("BF16 pair");
+        batch.commit_and_wait().expect("matmul completion");
+        for (index, by_matvec) in rows_by_matvec.iter_mut().enumerate() {
+            for token in 0..tokens {
+                let row_input = floats(&ctx, &input_data[token * columns..(token + 1) * columns]);
+                let row_output = guarded(&ctx, rows);
+                let mut batch = CommandBatch::new(&ctx).expect("batch");
+                ops.bf16_matvec(&mut batch, matrix(index), &row_input, &row_output)
+                    .expect("BF16 matvec");
+                batch.commit_and_wait().expect("matvec completion");
+                by_matvec.as_mut_slice::<f32>()[token * rows..(token + 1) * rows]
+                    .copy_from_slice(&row_output.as_slice::<f32>()[..rows]);
+            }
+        }
+        for (index, packed) in packed.iter().enumerate() {
+            let expected = (0..tokens)
+                .flat_map(|t| {
+                    let input_data = &input_data;
+                    (0..rows).map(move |r| {
+                        (0..columns)
+                            .map(|c| {
+                                f64::from(f32::from_bits(
+                                    u32::from(packed[2 + r * columns + c]) << 16,
+                                )) * f64::from(input_data[t * columns + c])
+                            })
+                            .sum::<f64>()
                     })
-                    .sum::<f64>()
-            })
-        })
-        .collect::<Vec<_>>();
-    check(&output, &expected, 3e-5);
-
-    let single = guarded(&ctx, rows);
-    let last_token = floats(&ctx, &input_data[(tokens - 1) * columns..]);
-    let mut batch = CommandBatch::new(&ctx).expect("batch");
-    ops.bf16_matvec(&mut batch, matrix, &last_token, &single)
-        .expect("BF16 matvec");
-    batch.commit_and_wait().expect("matvec completion");
-    for (r, (&tiled, &vector)) in output.as_slice::<f32>()[(tokens - 1) * rows..tokens * rows]
-        .iter()
-        .zip(single.as_slice::<f32>())
-        .enumerate()
-    {
-        assert!(
-            (f64::from(tiled) - f64::from(vector)).abs() <= 3e-5 * (1.0 + f64::from(vector).abs()),
-            "row {r}: tiled {tiled} vs matvec {vector}"
-        );
+                })
+                .collect::<Vec<_>>();
+            check(&pair[index], &expected, 3e-5);
+            let bits = |buffer: &MetalBuffer| {
+                buffer.as_slice::<f32>()[..rows * tokens]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                bits(&pair[index]),
+                bits(&rows_by_matvec[index]),
+                "{tokens} rows"
+            );
+            if index == 0 {
+                check(&single, &expected, 3e-5);
+                assert_eq!(bits(&single), bits(&rows_by_matvec[0]), "{tokens} rows");
+            }
+        }
     }
 }
 

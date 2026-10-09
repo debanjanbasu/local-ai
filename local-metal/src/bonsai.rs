@@ -233,7 +233,8 @@ pub const SMALL_BATCH_KERNEL_TOKENS: u32 = 4;
 /// Largest activation-row count handled by one wide small-batch dispatch.
 ///
 /// The simdgroup-matrix kernel's cost is flat in the row count, 340-348 us on the
-/// two FFN shapes for 5 to 8 rows (280-301 us with half-prefix decoding),
+/// two FFN shapes for 5 to 8 rows (280-301 us with half-prefix decoding,
+/// 233-281 us with eight-byte activation loads),
 /// against 452-720 us for the former two scalar dispatches. A 16-row variant
 /// sharing the decoded trits across two token tiles measured 721-735 us, twice
 /// the 8-row cost: the F32 8x8 multiplies themselves, about 270 us per eight
@@ -243,15 +244,15 @@ pub const SMALL_BATCH_WIDE_TOKENS: u32 = 8;
 /// Token blocks up to this size use chunked small-batch dispatches; larger
 /// blocks use the prefill tensor tile (32-, 64- or 128-token tiles).
 ///
-/// Whole-model verify blocks on an M4 Pro at a 1,024-token prefix, best of
-/// three: small batch 95.6 / 166.1 / 267.6 / 372.2 / 477.6 / 572.1 / 673.6 /
-/// 774.9 / 860.5 ms at 4 / 8 / 16 / 24 / 32 / 40 / 48 / 56 / 60 rows and 878.4 /
-/// 879.2 ms at 63 / 64; the 32-token tile is flat at about 590-660 ms from 2 to
-/// 32 rows and the 64-token tile at about 861-877 ms from 33 to 64. Small batch
-/// wins through 60 rows and ties the tile from 63. (The former scalar-only
-/// small batch measured 108.4 / 257.4 / 452.8 / 648.2 ms at 4 / 8 / 16 / 24
-/// rows and lost to the tile from 32.)
-pub const DEFAULT_SMALL_BATCH_MAX: u32 = 60;
+/// Whole-model blocks on an M4 Pro at a 1,024-token prefix, best of five,
+/// with eight-byte activation loads in the wide kernel: small batch 520 / 588 /
+/// 594 / 634 ms at 56 / 60 / 64 / 65 verify rows against 776 / 1,224 ms on the
+/// 64- and 128-token tiles at 64 / 65, and 866 / 1,155 ms at 96 / 128 rows
+/// without logits against the 128-token tile's 1,221. Every verify block and
+/// prefill chunk (at most 128 rows) therefore stays on the small-batch
+/// kernels. (Before those loads the range ended at 60 rows: 860.5 ms against
+/// the 64-token tile's 876.6.)
+pub const DEFAULT_SMALL_BATCH_MAX: u32 = 128;
 
 impl BonsaiKernels {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {

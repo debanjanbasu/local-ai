@@ -72,6 +72,58 @@ static inline void bonsai_bf16_mv_impl(
     if (lane == 0) output[group] = sum;
 }
 
+// `bonsai_bf16_mv_impl` for up to `group_tokens` activation rows per SIMD
+// group: each weight is loaded once and multiplied into one F32 chain per
+// row, every chain in the column order of `bonsai_bf16_mv_impl`, so each
+// output is bitwise that kernel's whatever the row count. `token_group`
+// selects rows [token_group * group_tokens, ...) of `tokens`; rows past the
+// end read a real row and are not stored.
+template<metal::uint group_tokens, typename Weights, typename Input, typename Output>
+static inline void bonsai_bf16_mv_tokens_impl(
+    Weights weights, Input input, Output output, metal::uint rows, metal::uint columns,
+    metal::uint tokens, metal::uint row, metal::uint token_group, metal::uint lane
+) {
+    const metal::uint first_token = token_group * group_tokens;
+    const metal::ulong weight_row = metal::ulong(row) * columns;
+    metal::ulong input_row[group_tokens];
+    float sum[group_tokens];
+    #pragma clang loop unroll(full)
+    for (metal::uint t = 0; t < group_tokens; ++t) {
+        input_row[t] = metal::ulong(metal::min(first_token + t, tokens - 1)) * columns;
+        sum[t] = 0.0f;
+    }
+    metal::uint column = lane;
+    for (; column + 7 * 32 < columns; column += 8 * 32) {
+        float weight[8];
+        #pragma clang loop unroll(full)
+        for (metal::uint i = 0; i < 8; ++i) {
+            weight[i] = as_type<float>(metal::uint(weights[weight_row + column + i * 32]) << 16);
+        }
+        #pragma clang loop unroll(full)
+        for (metal::uint t = 0; t < group_tokens; ++t) {
+            float value[8];
+            #pragma clang loop unroll(full)
+            for (metal::uint i = 0; i < 8; ++i) value[i] = input[input_row[t] + column + i * 32];
+            #pragma clang loop unroll(full)
+            for (metal::uint i = 0; i < 8; ++i) sum[t] = metal::fma(weight[i], value[i], sum[t]);
+        }
+    }
+    for (; column < columns; column += 32) {
+        const float weight = as_type<float>(metal::uint(weights[weight_row + column]) << 16);
+        #pragma clang loop unroll(full)
+        for (metal::uint t = 0; t < group_tokens; ++t) {
+            sum[t] = metal::fma(weight, input[input_row[t] + column], sum[t]);
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (metal::uint t = 0; t < group_tokens; ++t) {
+        const float total = metal::simd_sum(sum[t]);
+        if (lane == 0 && first_token + t < tokens) {
+            output[metal::ulong(first_token + t) * rows + row] = total;
+        }
+    }
+}
+
 template<typename Input, typename Weights, typename History, typename Output,
          typename FinalHistory>
 static inline void bonsai_conv_impl(

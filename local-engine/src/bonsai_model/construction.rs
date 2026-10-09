@@ -117,6 +117,8 @@ impl BonsaiEngine {
             pool: Vec::new(),
             cache_state: 0,
             next_generation: 0,
+            #[cfg(test)]
+            force_batched_drafts: false,
         })
     }
 }

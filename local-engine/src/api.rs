@@ -675,12 +675,21 @@ impl Worker {
             }
             self.admit_waiting();
             if !self.running.is_empty() {
-                let running = &mut self.running;
-                let finished = self.engine.inner.step(&mut |id, piece| {
-                    running
-                        .get_mut(&id)
-                        .is_some_and(|delivery| delivery.emit(piece))
-                });
+                // `step` calls one of the two at a time, never both at once.
+                let running = std::cell::RefCell::new(&mut self.running);
+                let finished = self.engine.inner.step(
+                    &mut |id, piece| {
+                        running
+                            .borrow_mut()
+                            .get_mut(&id)
+                            .is_some_and(|delivery| delivery.emit(piece))
+                    },
+                    &mut |id, progress| {
+                        if let Some(delivery) = running.borrow().get(&id) {
+                            reporter(&delivery.events)(progress);
+                        }
+                    },
+                );
                 for (id, result) in finished {
                     if let Some(mut delivery) = self.running.remove(&id) {
                         delivery.complete(result);
@@ -723,16 +732,12 @@ impl Worker {
                 splitter: EventSplitter::new(prepared.thinking),
                 outbox: VecDeque::new(),
             };
-            let progress_events = delivery.events.clone();
-            let mut progress = reporter(&progress_events);
             let cancel = delivery.cancel.clone();
             let admitted = self.engine.inner.admit(
                 &prepared.ids,
                 &prepared.params,
                 prepared.session.as_deref(),
                 cancel,
-                &mut progress,
-                &mut |piece| delivery.emit(piece),
             );
             match admitted {
                 Ok(id) => {
@@ -743,8 +748,6 @@ impl Worker {
                     self.draining.push(delivery);
                 }
             }
-            // Deliver the first token now rather than after the next round.
-            self.flush();
         }
     }
 
@@ -842,9 +845,10 @@ pub struct EventStream {
     ///
     /// A caller that only wants [`Event`]s drops them here instead of the
     /// channel, so they cost one entry per prefill chunk of a request that can
-    /// never exceed the context. At `PREFILL_CHUNK` of 128 and the smallest
-    /// useful context of 32,768 tokens that is 256 entries, well under 10 KiB,
-    /// and it lasts only as long as the stream.
+    /// never exceed the context. A prompt prefilling beside decoding requests
+    /// reports every 48 tokens, so the smallest useful context of 32,768
+    /// tokens is at most 683 entries, about 11 KiB, and it lasts only as long
+    /// as the stream.
     progress: VecDeque<PrefillProgress>,
     cancel: CancelToken,
     not_sync: std::marker::PhantomData<Cell<()>>,

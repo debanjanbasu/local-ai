@@ -51,69 +51,27 @@ kernel void bo_bf16_mv(
     bonsai_bf16_mv_impl(weights, input, output, rows, columns, group, lane);
 }
 
-// Token-tiled BF16 GEMM for multi-row head blocks: each threadgroup (four
-// SIMD groups) owns 32 output rows and 32 tokens, streams the BF16 rows
-// through threadgroup memory once per 64-column chunk and accumulates with
-// F32 simdgroup matrices. `bo_bf16_mv` re-reads the whole matrix per token;
-// here it is read once per 32 tokens. Output layout matches `bo_bf16_mv`
-// (`[tokens, rows]`). Columns must be a multiple of 64; rows and tokens may be
-// partial tiles.
-kernel void bo_bf16_mm(
-    device const ushort *weights [[buffer(0)]], device const float *input [[buffer(1)]],
-    device float *output [[buffer(2)]], constant uint &rows [[buffer(3)]],
-    constant uint &columns [[buffer(4)]], constant uint &tokens [[buffer(5)]],
-    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
+// One or two BF16 matrices of equal shape (a recurrent layer's alpha and
+// beta) over a block of rows, four rows per SIMD group, each output bitwise
+// `bo_bf16_mv`'s. Groups interleave the matrices, then run over matrix rows,
+// then groups of four rows: dispatch matrices * rows * ceil(tokens / 4)
+// groups of 32. Two 48x5120 matrices on an M4 Pro: 11.5 us for 2 to 8 rows,
+// 18 at 16, 27 at 32, 50 at 64 and 96 at 128, against 26 / 66 / 119 / 222 /
+// 437 us for `bo_bf16_mv` per row and 1.18-1.37 ms for the token-tiled
+// GEMM this replaced (two threadgroups per 48-row matrix). Eight rows per
+// SIMD group measured 15-60 us.
+kernel void bo_bf16_mv_tokens(
+    device const ushort *weights0 [[buffer(0)]], device const ushort *weights1 [[buffer(1)]],
+    device const float *input [[buffer(2)]], device float *output0 [[buffer(3)]],
+    device float *output1 [[buffer(4)]], constant uint &rows [[buffer(5)]],
+    constant uint &columns [[buffer(6)]], constant uint &tokens [[buffer(7)]],
+    constant uint &matrices [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
 ) {
-    constexpr uint tile_rows = 32, tile_tokens = 32, tile_columns = 64;
-    threadgroup float activations[tile_tokens * tile_columns];
-    threadgroup float decoded[tile_columns * 33];
-    threadgroup float results[tile_tokens * tile_rows];
-    const uint row_tiles = (rows + tile_rows - 1) / tile_rows;
-    const uint first_row = (group % row_tiles) * tile_rows;
-    const uint first_token = (group / row_tiles) * tile_tokens;
-    simdgroup_matrix<float, 8, 8> sums[tile_tokens / 8];
-    #pragma clang loop unroll(full)
-    for (uint t = 0; t < tile_tokens / 8; ++t) {
-        sums[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    }
-    for (uint chunk = 0; chunk < columns / tile_columns; ++chunk) {
-        const uint column_start = chunk * tile_columns;
-        for (uint i = tid; i < tile_tokens * tile_columns; i += 128) {
-            const uint token = first_token + i / tile_columns, column = i % tile_columns;
-            activations[i] = token < tokens
-                ? input[ulong(token) * columns + column_start + column] : 0.0f;
-        }
-        for (uint i = tid; i < tile_rows * tile_columns; i += 128) {
-            const uint local_row = i / tile_columns, column = i % tile_columns;
-            const uint row = first_row + local_row;
-            const float value = row < rows
-                ? as_type<float>(uint(weights[ulong(row) * columns + column_start + column]) << 16)
-                : 0.0f;
-            decoded[column * 33 + local_row] = value;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint column = 0; column < tile_columns; column += 8) {
-            simdgroup_matrix<float, 8, 8> b;
-            simdgroup_load(b, decoded + column * 33 + simd_group * 8, 33);
-            #pragma clang loop unroll(full)
-            for (uint t = 0; t < tile_tokens / 8; ++t) {
-                simdgroup_matrix<float, 8, 8> a;
-                simdgroup_load(a, activations + t * 8 * tile_columns + column, tile_columns);
-                simdgroup_multiply_accumulate(sums[t], a, b, sums[t]);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    #pragma clang loop unroll(full)
-    for (uint t = 0; t < tile_tokens / 8; ++t) {
-        simdgroup_store(sums[t], results + t * 8 * tile_rows + simd_group * 8, tile_rows);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < tile_tokens * tile_rows; i += 128) {
-        const uint token = first_token + i / tile_rows, row = first_row + i % tile_rows;
-        if (token < tokens && row < rows) output[ulong(token) * rows + row] = results[i];
-    }
+    const uint matrix = group % matrices, rest = group / matrices;
+    bonsai_bf16_mv_tokens_impl<4>(
+        matrix == 0 ? weights0 : weights1, input, matrix == 0 ? output0 : output1, rows,
+        columns, tokens, rest % rows, rest / rows, lane);
 }
 
 // `final_history` may alias `history` (in place) or name a separate buffer,

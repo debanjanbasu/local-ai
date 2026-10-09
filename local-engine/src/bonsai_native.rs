@@ -1192,7 +1192,23 @@ impl BonsaiModel {
         prompt: &[u32],
         progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<()> {
-        let end = self.position + prompt.len();
+        self.prefill_segment(prompt, true, progress)
+    }
+
+    /// [`Self::prefill`] over one segment of a longer prompt: with `logits`
+    /// false the last block leaves no logits, only the head caught up, so a
+    /// prompt prefilled in segments costs what it costs in one call.
+    pub(crate) fn prefill_segment(
+        &mut self,
+        prompt: &[u32],
+        logits: bool,
+        progress: &mut dyn FnMut(PrefillProgress),
+    ) -> crate::Result<()> {
+        let end = if logits {
+            self.position + prompt.len()
+        } else {
+            usize::MAX
+        };
         for block in prompt.chunks(self.info.prefill_chunk_size) {
             if self.stop_for_cancel() {
                 return Ok(());

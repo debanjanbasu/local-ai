@@ -39,8 +39,8 @@ impl Drafter {
 
 /// One draft step's proposal and the head's logit lead for it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Draft {
-    token: u32,
+pub(super) struct Draft {
+    pub(super) token: u32,
     margin: f32,
 }
 
@@ -172,7 +172,7 @@ impl BonsaiModel {
     /// the exact top two over its logits all run on the GPU. The host reads
     /// only the top two, which equals [`Self::draft_on_host`]'s selection
     /// whenever the sampler applies no penalties.
-    fn draft_on_device(
+    pub(super) fn draft_on_device(
         &self,
         speculation: &mut Speculation,
         sampler: &Sampler,
@@ -237,7 +237,7 @@ impl BonsaiModel {
     /// The host-selected draft chain [`Self::draft_on_device`] reproduces:
     /// host embedding decode, then the sampler's own penalized greedy
     /// selection after every step. Required whenever penalties apply.
-    fn draft_on_host(
+    pub(super) fn draft_on_host(
         &self,
         speculation: &mut Speculation,
         sampler: &mut Sampler,

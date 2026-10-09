@@ -240,9 +240,10 @@ comes from a measurement rather than from taste; see
 [Tried and rejected](#tried-and-rejected).
 
 The budget starts only after the first event arrives, so it does not bound
-time-to-first-token. Prefill now reports a boundary at every 128-token chunk and
-the boundary is written to the client, but it deliberately does not start a
-clock. This class of machine prefills at roughly 3.6-4.2 tok/s, so one chunk is
+time-to-first-token. Prefill now reports a boundary at every 128-token block (or
+every 48-token chunk while other requests decode; see
+[Concurrent requests](#concurrent-requests)) and the boundary is written to the
+client, but it deliberately does not start a clock. This class of machine prefills at roughly 3.6-4.2 tok/s, so one chunk is
 about 35 seconds of work that is entirely healthy, and a budget armed on a
 boundary would abandon ordinary long prompts. A cold 6,438-token prompt measured
 50 boundaries and 349.9 seconds of prefill at the 10-second floor with no false
@@ -271,68 +272,152 @@ what one measured vanished client cost: 706 seconds of engine time.
 
 Decode is bound by trit-decode ALU work per weight byte, so one projection
 pass over several activation rows costs little more than over one. With two or
-more requests running, each engine step decodes one token for every request in
-a single pass: every projection (QKV, gates, FFN, output head) reads its
-weights once for all rows, through the same multi-row kernels speculative
-verification uses. Only what reads a request's own state runs per row, against
-that request's buffers: the convolution and gated-delta recurrence of the 48
+more requests running, each engine step decodes every request in a single
+pass: every projection (QKV, gates, FFN, output head) reads its weights once
+for all rows, through the same multi-row kernels speculative verification
+uses. Only what reads a request's own state runs per request, against that
+request's buffers: the convolution and gated-delta recurrence of the 48
 recurrent layers and the K/V append and attention of the 16 full-attention
 layers. Each request owns its recurrent state, convolution history, K/V caches,
 position and MTP-head caches; one set is resident in the model and the others
 are parked, and a swap exchanges buffer handles, never bytes. Requests join
-between steps (a new request's prefill runs as a pass of its own, then it joins
-the next step) and leave when they finish or are cancelled.
+between steps and leave when they finish or are cancelled.
 
 A request alone runs exactly the single-sequence rounds it always ran, with
-speculation; its text and speed are unchanged. In a batch, speculation is off:
-measured on HEAD's kernels a verify block costs 50 ms at 2 rows, 73 at 4,
-113 at 8 and 265 at 20, so a batched verify of four requests' seeds plus
-three drafts each (about 20 rows for about 16 committed tokens, plus four
-sequential 12 ms draft chains) comes to about 51 tok/s, no better than the
-52 tok/s of plain batched decode at four. The MTP head of a batched request is fed the rows it missed (their
-tokens and output-normalized hidden, kept per request) in one block when the
-request next runs alone, so a request outliving its batch speculates again
-from exact head state. Taking speculative rounds in turn instead of batching measured
-32.7 tok/s aggregate at two streams against 36.8 batched, so batching starts at
-two.
+speculation; its text and speed are unchanged. Taking speculative rounds in
+turn instead of batching measured 32.7 tok/s aggregate at two streams against
+36.8 batched, so batching starts at two.
+
+#### Prompts prefill in chunks between steps
+
+Admission only restores a request's reusable prompt prefix. Its prefill then
+runs inside the engine's steps: after each step's decode round, the prompt
+with the fewest tokens left prefills. A prompt of at most 128 tokens to
+prefill (one block; a typical chat turn) goes whole; a longer one prefills 32
+tokens per step while others decode, so a long prompt delays the running
+requests' next token by one chunk instead of its whole prefill. With nothing
+decoding, a step prefills up to 512 tokens, which only bounds how long a newly
+arrived request waits to be admitted. Prompt-cache milestones (the reusable
+boundary checkpoint and snapshot, the penultimate-token checkpoint and pinned
+snapshot, the final checkpoint) are handled when the sequence reaches each one,
+whichever chunk that is; the GPU tier is claimed for the prefilling sequence's
+buffer set at each, so a checkpoint never describes another request's state.
+A cancellation between two chunks ends the request with no tokens and clears
+the prompt cache, as a cancelled single-pass prefill did.
+
+The chunk size trades the running requests' inter-token gap against the
+prompt's own time to first token. A prefill block costs about 9.2 ms a row at
+every size from 8 to 128 rows (75, 146, 289, 441, 589 and 1,181 ms at 8, 16,
+32, 48, 64 and 128 rows), so chunking costs no prefill efficiency; only the
+decode steps in between lengthen the prompt's prefill. (Before the 5- to
+128-row kernel work in [Performance](#performance), the tensor tile made 48
+rows cost 538 ms against 826 for 64 and 1,271 for 128, and 48 was the chunk.)
+Four 600-token streams with a 9.2K-token prompt arriving 4 s in, M4 Pro,
+greedy, cold prompt cache:
+
+| Build | Long prompt TTFT | Streams' ITL p50 / p99 during its prefill | Streams' tok/s during it |
+| --- | ---: | ---: | ---: |
+| Prefill as one pass | 88.5 s | 88.5 s stall | 0.09 |
+| Chunk 48 | 103.6 s | 0.54 / 0.59 s | 7.3 |
+| **Chunk 32** | 111.4 s | 0.39 / 0.41 s | 10.3 |
+| Chunk 16 | 136.3 s | 0.24 / 0.29 s | 16.2 |
+| Earlier kernels, one pass | 96.9 s | 97 s stall | 0.04 |
+| Earlier kernels, chunk 48 | 123.0 s | 0.64 / 0.68 s | 6.2 |
+| Earlier kernels, chunk 128 | 103.3 s | 1.43 / 1.51 s | 2.9 |
+
+#### Speculation in a batch
+
+A batched step verifies drafts too. Each sequence contributes its seed row
+and any drafts as consecutive rows of one stacked block, so a pass of four
+sequences with three drafts each is one 16-row pass. A sequence's verify rows
+run its convolution and recurrence with the multi-row kernels at a row offset
+(the same pipelines bound with byte offsets, so its rows compute what a block
+of only those rows computes), reading its state and history and writing the
+block's final ones to shared spares that nobody reads; the K/V rows are
+appended at its position and attended with the block attention kernel at the
+same offset. Every row is projected to logits and selected on the GPU; each
+sequence then verifies its drafts exactly as a single sequence does, and one
+submission replays every verifying sequence's kept rows from the start of the
+round (its raw QKV rows, decay and beta were kept per layer), as a partial
+commit always has, 2.5-12.7 ms for 2 to 8 sequences. Positions advance by the
+kept rows, and the kept rows' hidden reaches the MTP head through the same
+per-request lag a batched plain step uses.
+
+Drafts come from each sequence's suffix lookup, or from its own MTP head: the
+scheduler makes the sequence resident (a handle swap), feeds the head the rows
+it missed, and drafts the depth-3 chain its solo round would. Whether a
+sequence's drafts are worth their rows is decided per step by a cost model:
+measured pass time by stacked rows (32, 48, 64, 75, 78, 80, 82 and 84 ms for 1
+to 8 rows, 154 at 16, 303 at 32, 602 at 64; about 75 ms per eight rows past
+eight), plus 1.5 ms of commit per verifying sequence and 15 ms per head
+draft chain, against the tokens the drafts are expected to add (a geometric
+chain from each sequence's running acceptance estimate). Candidates are added
+in order of expected tokens per row while each raises expected tokens per
+second. Rows five to eight cost little more than four, so confident lookup
+drafts ride almost free beside two to seven sequences; head drafts rarely pay,
+because a chain costs 15 ms of sequential drafting per sequence: at two
+streams with p = 0.65, three head drafts each come to 42.1 tok/s against
+41.5 plain, and at four, 43 against 53 (only one sequence's chain in the free
+rows pays, 54.5 against 52.9). On the earlier kernels (8 rows 92 ms, 16 rows
+172, 32 rows 337) head drafts never paid; lookup drafts did.
+
+On copy-edit prompts (rename a variable in a 17-line function, edit a 30-line
+config; about 300 prompt tokens, 400-token limit) arriving together, aggregate
+throughput including prefill rose from 31.7 to 37.3 tok/s at four streams and
+from 28.5 to 34.0 at two, against the same kernels without batched
+speculation or chunked prefill; prose streams, where lookups seldom fire, are
+unchanged.
 
 Greedy output per request matches a request run alone up to the engine's own
-near-ties. Rows of one batch are independent of each other (a sequence's logits
-are bitwise equal whether two, three or four sequences share the step), and
-against single-row decode, teacher-forced over 16 steps of four sequences, mean
+near-ties. Rows of one batch are independent of each other, and against
+single-row decode, teacher-forced over 16 steps of four sequences, mean
 next-token KL is 4.5e-7 to 5.1e-7 (worst 2.8e-6) with top-1 agreement on every
-step. Over eight 300-token chat prompts, every 2-, 4- and 8-stream output was
-byte-identical to that prompt run alone except one prompt in the 2- and
-4-stream runs, which differs at character 624 ("of entries" against "of all
-entries"); the single-request engine splits there too, the same text with and
-without `--no-speculation`, and the batched output equals the non-speculative
-one exactly.
+step. A batched verify of three sequences (four, one and three rows) tracks
+each sequence's own verify block at KL at most 2.1e-7 with every argmax equal,
+and after a partial, a plain and a full commit the next step tracks each
+sequence decoded alone from the same kept rows. Over eight 300-token chat
+prompts (four prose, four copy-edits), every 2-, 4- and 8-stream output was
+byte-identical to that prompt run alone, on both kernel generations; the
+previous build split one 8-stream output at a near-tie (character 1,206).
 
 Measured on an M4 Pro, chat requests with distinct prompts arriving together,
-greedy, 300 output tokens each, thinking off, against the previous build
-(which ran them one at a time):
+greedy, 300 output tokens each, thinking off, cold prompt cache, after two
+warm-up requests, streamed over HTTP (TTFT includes this harness's 0.4-0.5 s
+for a lone request); the previous build is `18c274d`, measured the same way:
 
-| Streams | Aggregate tok/s | Per-request tok/s | Worst TTFT | Previous: aggregate, worst TTFT | Footprint |
+| Streams | Aggregate tok/s | TTFT mean / worst | ITL p50 / p99 / max | Footprint | Previous: aggregate, TTFT mean / worst, ITL max |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 32.7 | 32.7 | 0.10 s | 32.7, 0.09 s | 0.60 GB |
-| 2 | 36.8 | 18.4 | 0.18 s | 30.9, 9.2 s | 0.81 GB |
-| 4 | 48.5 | 12.1 | 0.39 s | 34.7, 25.5 s | 1.21 GB |
-| 8 | 67.8 | 8.6 | 2.9 s | 33.3, 62.6 s | 2.00 GB |
+| 1 | 33.9 | 0.40 / 0.40 s | 41 / 80 / 89 ms | 0.88 GB | 34.4, 0.50 / 0.50 s, 114 ms |
+| 2 | 39.2 | 0.65 / 0.89 s | 49 / 64 / 485 ms | 0.85 GB | 39.0, 0.74 / 0.99 s, 542 ms |
+| 4 | 47.2 | 1.16 / 1.90 s | 79 / 128 / 500 ms | 1.38 GB | 46.9, 1.25 / 2.00 s, 1,583 ms |
+| 8 | 74.5 | 2.27 / 4.10 s | 93 / 490 / 544 ms | 2.16 GB | 69.0, 2.28 / 4.04 s, 3,648 ms |
 
-The engine-only step time is 32 ms for one sequence and 52, 64, 77, 90, 92, 94
-and 97 ms for two to eight (82 tok/s at eight); the server figures above add
-prefill, sampling and event delivery. The worst TTFT at eight streams is the
-eight prefills running one after another before the first batched step.
+The engine-only step time is 33 ms for one sequence and 49, 64, 78, 80, 82, 85
+and 89 ms for two to eight (89 tok/s at eight); the server figures above add
+prefill, sampling and event delivery. Most of the aggregate gain at eight
+streams is the new kernels; on them alone, prompts admitted as one pass each
+measured 32.8, 37.8, 45.9 and 75.0 tok/s with TTFT mean 0.41, 0.62, 1.02 and
+1.85 s (worst 0.41, 0.83, 1.64 and 3.34 s). Requests arriving together now
+start decoding one by one as each prompt is prefilled, with a decode step
+between prefills: the first requests stream while the later prompts prefill
+(the ITL p99 is those prefills, against a 3.0-3.6 s stall before), and the
+mean TTFT of eight simultaneous short prompts is about 0.4 s later than
+admitting them back to back on the same kernels.
 
 Each extra stream costs its own state: 81 MB of F16 recurrent state and
 convolution history, 34 KiB of Q8 K/V per token (initially 1,024 tokens,
 36 MB) plus 4 KiB of head K/V per token, and 20 KiB per batched token of
-hidden rows owed to its MTP head. The measured footprint grew by about 200 MB
-per stream at these lengths. Admission shares the context the memory policy
-sized for one sequence: a request joins only while the running requests'
+hidden rows owed to its MTP head. A verifying step keeps each recurrent
+layer's raw QKV rows, decay and beta for its rows (about 2 MB per stacked row,
+allocated on first use at the next power of two of the rows, up to 126 MB at
+64 rows) plus one spare state, and batched logits grow to the stacked rows
+(1 MB each). The measured footprint grew by about 200 MB per stream at these
+lengths. Admission shares the context the memory policy sized for one
+sequence: a request joins only while the running requests'
 prompt-plus-`max_tokens` reservations, plus each extra sequence's fixed state
 expressed in K/V tokens (about 2,340), fit in it; otherwise it waits for a
-running request to finish. At most eight decode together.
+running request to finish. At most eight decode together, in at most 64
+stacked rows.
 
 ## Resource policy
 
@@ -343,7 +428,8 @@ All choices and reasons are reported in startup JSON.
 - **Context:** largest value up to 262,144 tokens whose fully grown model state
   fits 90% of Metal's recommended working set.
 - **K/V:** F16 unless it cannot reach a useful 32,768-token context, then Q8.
-- **Prefill:** fixed 128-token chunks with Metal 4 kernels where supported.
+- **Prefill:** fixed 128-token chunks with Metal 4 kernels where supported;
+  beside decoding requests, a long prompt prefills 48 tokens per step.
 - **Speculation:** suffix lookup is enabled; the ternary MTP head artifact,
   when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`, adds gated
   depth-3 drafting. Without it MTP is off and the policy says why.
@@ -789,6 +875,54 @@ best of three, the planets prompt went from 23.58 to 24.74 tok/s at
 `--mtp-depth 3` (19.02 to 19.18 without speculation), and a prompt asking for a
 short function three times verbatim from 25.26 to 31.95 tok/s.
 
+Blocks of 5 to 128 rows then got cheaper in three steps. The 48x5120 BF16
+alpha/beta projections switched at eight rows to a token-tiled GEMM that gave
+each matrix two threadgroups: 0.6 ms per dispatch whatever the row count, 56
+ms of an eight-row verify block once concurrency stopped hiding it. They now
+run one dispatch per layer for both matrices, four rows per SIMD group sharing
+each weight load, every row bitwise the single-row matvec's: 11.5 us for 2 to
+8 rows and 50 us at 64, against 1.18-1.37 ms tiled and 26-222 us per row. The
+wide PTQ1 kernel loads each lane's two activations as one `float2` and no
+longer zeroes rows past the block (row m of X reaches only row m of the
+product), bit-identical: 275 to 237 us on 17408x5120 and 293 to 281 us on
+5120x17408 at eight rows. That made eight-row passes cheaper than the tensor
+tile up to 128 rows, so every verify block and prefill chunk now runs on the
+small-batch kernels. Whole-model block at a 1,024-token prefix (Q8 K/V, device
+argmax), best of five, ms:
+
+| Rows | 2 | 4 | 5 | 8 | 12 | 16 | 20 | 32 | 48 | 64 | 65 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before | 48.2 | 73.8 | 85.6 | 115.8 | 183.0 | 199.5 | 266.3 | 369.7 | 526.1 | 786.3 | ≥1,224 |
+| After | 45.5 | 72.2 | 73.7 | 79.6 | 145.4 | 150.8 | 218.0 | 298.1 | 445.2 | 593.5 | 631.8 |
+
+A 128-row block without logits went from 1,221 to 1,155 ms. Profiled with
+each dispatch alone, PTQ1 projections are now 83-90% of a 5- to 65-row block
+(the output head 4-5%, attention 1.5-5.6%, recurrence 1.3-1.7%, alpha/beta
+0.5-0.8%); an eight-row block costs 10% more than a four-row one and the
+block cost is close to ceil(rows / 8) times 74 ms. The wide kernel is near
+its limit: eight rows of 17408x5120 in 237 us is 3.0 T multiply-adds per
+second plus the trit decode. Prefill and verify bits change
+(alpha/beta order now the matvec's, projections of 61-128 rows no longer on
+the tile). Teacher-forced along 128 tokens of this file after a 1,024-token
+prompt, next-token KL against the old build is 5.1e-6 (decode after
+prefill), 5.9e-6 (8-row verify blocks) and 5.7e-6 (20-row), top-1 128/128;
+against a reference that runs the prompt one token at a time, the new build's
+KL is 1.37e-5 / 1.31e-5 / 1.35e-5 where the old build's was 1.52e-5 / 1.50e-5
+/ 1.50e-5, so both sit at the block-versus-token gap and the new one is
+slightly closer. Five prompts, 300
+greedy tokens, best of two interleaved runs of both builds: default
+speculative decode 37.80 to 37.99 tok/s geomean (+0.5%; its verify blocks
+are two to four rows), plain decode 31.00 against 31.01. Two copy-edit
+prompts (about 50 lines of this repository's Rust, rename one identifier,
+600 tokens), where n-gram lookup verifies long drafts: 72.8 to 90.5 and 74.0
+to 89.8 tok/s (+24%, +21%). A 2,613-token prompt prefills at 106.9 against
+96.8 tok/s. Run cold (no prompt cache), greedy text is byte-identical across
+builds and with and without speculation on six of the seven; on the train
+arithmetic prompt the new build without speculation words one line
+differently at character 544 ("So, the time is:" for "So,"), the same
+answer, where the old build in both modes and the new one with speculation
+agree.
+
 Single-token decode encodes 835 dispatches per token, down from 1,364, and
 every fused kernel is bitwise identical to the dispatches it replaces
 (`local-metal/tests/bonsai_fusion.rs`):
@@ -1005,6 +1139,38 @@ decode from 19.23 to 20.39 tok/s.
   simdgroup matrices: one 8×8 half multiply costs what an F32 one does (272
   against 272 at five rows, inputs rounded to half), and exact inputs split
   into high and low halves need two, 499.
+- Wide-kernel layouts after the `float2` activation loads, M4 Pro, µs on
+  17408×5120 / 5120×17408 against 237 / 281 at eight rows. Decoding the W
+  tile once for two, three or four eight-row token tiles (bit-identical to
+  separate passes): 16 rows 558 / 563 and 32 rows 1,178 / 1,225, against two
+  and four passes' 474 / 562 and 948 / 1,124; the multiply-accumulates, not
+  the decode, set the cost. Two or four eight-row tiles per threadgroup,
+  with the four SIMD groups' block split kept (8 or 16 SIMD groups) or
+  traded for the rows (one or two per tile), all bit-identical: 239-251 /
+  266-281 at eight rows; the 266, one SIMD group per tile walking every
+  block, costs 262 at five rows against 236. 5120×17408 is the one shape
+  whose cost grows from five rows (236) to eight (281).
+- BF16 alpha/beta with eight rows per SIMD group: 14-60 µs for both matrices
+  at 2-64 rows, against four rows' 11.3-50.
+- Converting the 96 BF16 alpha/beta matrices to int8 at load to drop the BF16
+  kernels (absmax/127 scales; kernels bitwise across block sizes and fused into
+  the decode concat). Teacher-forced against BF16 over 640 greedy steps after a
+  2,048-token prompt: one scale per row 1.46e-5 mean KL, per 128 columns
+  9.5e-6, per 32 columns 7.5e-6, each 638/640 top-1 and 64/64 over the last 64,
+  KL falling rather than growing along the generation (per-128-step windows
+  2.0e-5 to 9.1e-6 per row; 9.9e-6 to 4.4e-6 per 32). Greedy output matched on
+  11 of the 12 runs (six prompts, plain and speculative) for every variant;
+  all three changed the train prompt's plain decode at token 178, a 0.005-logit
+  tie (18.241 against 18.236) that BF16's own speculative path resolves the
+  same way the int8 variants do. Rejected on that byte-identity bar (per row
+  also on the 1e-5 mean-KL bar), and the gain is small: plain decode
+  30.6-30.9 tok/s for all four, the fused decode concat 91-100 µs against
+  BF16's 98, the pair alone 8.6-10.3 µs against 10.9-11.7 at 1-8 rows but
+  89-95 µs against 50 at 64, and 23.6 MB of codes (plus 0.8 or 3.1 MB of
+  scales) in place of 47 MB.
+- `--mtp-depth 4` once five-row verify blocks cost 73.7 against four rows'
+  72.2 ms: 36.4 against 36.2-36.5 tok/s on the planets prompt and 87.1
+  against 89.5 on a copy-edit prompt.
 - Tensor Q8 attention that round-trips the P·V result through threadgroup
   memory every tile: 3.6–7.3 times slower decode and twice as slow prefill in a
   first attempt; with 32- or 16-token dequantized tiles, 75 GB/s at 128K
