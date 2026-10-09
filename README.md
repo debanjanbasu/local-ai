@@ -82,13 +82,15 @@ Startup prints every decision and reason under `experimental_bonsai`.
   depth-3 speculation (35–43 across prose, explanation, arithmetic, code,
   essay and thinking prompts), with byte-identical greedy text; code
   copy-edits reach 54–66 tok/s with suffix lookup.
-- Server: concurrent requests decode in one batched pass per step; 300-token
-  chat requests reach 39.2, 47.2 and 74.5 tok/s aggregate at 2, 4 and 8
-  streams against 33.9 for one. A 9.2K-token prompt arriving beside four
-  streams no longer stalls them for its 88 s prefill: they keep a token every
-  0.39 s (p50; 0.41 s p99) and its first token comes at 111 s. Copy-edit
-  requests verify suffix-lookup drafts inside the batch: 37.3 against 31.7
-  tok/s aggregate at four streams, byte-identical to each request alone.
+- Server: concurrent requests decode in one batched pass per step, their MTP
+  heads drafting together in one head pass per depth; 300-token chat
+  requests reach about 39, 56 and 74 tok/s aggregate at 2, 4 and 8 streams
+  against 33 for one. A 9.2K-token prompt arriving beside four streams
+  prefills inside their passes: they keep a token every 0.32 s (p50; 0.36 s
+  p99) and its first token comes at 106 s. Copy-edit requests verify
+  suffix-lookup drafts inside the batch: 37.9 against 34.9 tok/s aggregate
+  at four streams for the previous build, byte-identical to each request
+  alone.
 - Prefill: about 96 tok/s at 4K tokens and 56 tok/s at 128K.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s.

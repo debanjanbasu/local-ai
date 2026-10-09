@@ -241,7 +241,7 @@ comes from a measurement rather than from taste; see
 
 The budget starts only after the first event arrives, so it does not bound
 time-to-first-token. Prefill now reports a boundary at every 128-token block (or
-every 48-token chunk while other requests decode; see
+every chunk of 24 to 32 tokens while other requests decode; see
 [Concurrent requests](#concurrent-requests)) and the boundary is written to the
 client, but it deliberately does not start a clock. This class of machine prefills at roughly 3.6-4.2 tok/s, so one chunk is
 about 35 seconds of work that is entirely healthy, and a budget armed on a
@@ -288,38 +288,73 @@ speculation; its text and speed are unchanged. Taking speculative rounds in
 turn instead of batching measured 32.7 tok/s aggregate at two streams against
 36.8 batched, so batching starts at two.
 
-#### Prompts prefill in chunks between steps
+#### Prompts prefill inside the decode steps
 
 Admission only restores a request's reusable prompt prefix. Its prefill then
-runs inside the engine's steps: after each step's decode round, the prompt
-with the fewest tokens left prefills. A prompt of at most 128 tokens to
-prefill (one block; a typical chat turn) goes whole; a longer one prefills 32
-tokens per step while others decode, so a long prompt delays the running
-requests' next token by one chunk instead of its whole prefill. With nothing
-decoding, a step prefills up to 512 tokens, which only bounds how long a newly
-arrived request waits to be admitted. Prompt-cache milestones (the reusable
-boundary checkpoint and snapshot, the penultimate-token checkpoint and pinned
-snapshot, the final checkpoint) are handled when the sequence reaches each one,
-whichever chunk that is; the GPU tier is claimed for the prefilling sequence's
-buffer set at each, so a checkpoint never describes another request's state.
-A cancellation between two chunks ends the request with no tokens and clears
-the prompt cache, as a cancelled single-pass prefill did.
+runs inside the engine's steps, one prompt per step: the one with the fewest
+tokens left. A prompt of at most 128 tokens to prefill (one block; a typical
+chat turn) goes whole, in a pass of its own after the step's decode round. A
+longer one, beside two or more decoding requests, prefills inside their
+batched pass: its chunk's rows are stacked after theirs, run every layer with
+them, advance its own recurrent state, convolution history and K/V caches in
+place as a prefill block does (the same row-offset kernels a verify block
+uses, here reading and writing the sequence's own buffers), and are not
+projected to logits; its MTP head ingests them, K/V rows and committed
+hidden, in the same submission, as a prefill block's head ingestion does. The
+chunk fills the pass's rows to a multiple of eight from at least 24 prompt
+tokens (28 beside four streams, 24 beside eight), since a pass costs about
+the same for every row count of an eight-row group. A chunk stops short of
+each prompt-cache milestone (the reusable boundary checkpoint and snapshot,
+the penultimate-token checkpoint and pinned snapshot) and of the prompt's
+last token. Those, and every chunk beside a single request taking its solo
+rounds, prefill 32 tokens in a pass of their own after the step's decode
+round, which handles the milestone (the GPU tier is claimed for the
+prefilling sequence's buffer set, so a checkpoint never describes another
+request's state) and takes the first sample. With nothing decoding, a step
+prefills up to 512 tokens, which only bounds how long a newly arrived request
+waits to be admitted. A cancellation between two chunks ends the request with
+no tokens and clears the prompt cache, as a cancelled single-pass prefill did.
 
 The chunk size trades the running requests' inter-token gap against the
 prompt's own time to first token. A prefill block costs about 9.2 ms a row at
 every size from 8 to 128 rows (75, 146, 289, 441, 589 and 1,181 ms at 8, 16,
 32, 48, 64 and 128 rows), so chunking costs no prefill efficiency; only the
-decode steps in between lengthen the prompt's prefill. (Before the 5- to
-128-row kernel work in [Performance](#performance), the tensor tile made 48
-rows cost 538 ms against 826 for 64 and 1,271 for 128, and 48 was the chunk.)
-Four 600-token streams with a 9.2K-token prompt arriving 4 s in, M4 Pro,
-greedy, cold prompt cache:
+decode rows in between lengthen the prompt's prefill. Folding the chunk into
+the decode pass removes most of what those rows cost, because a pass of 24
+rows or more costs about 9.4 ms a row however many of them are decoding
+(M4 Pro, `prefill_fold_timings`):
+
+| Decoding rows + chunk | One pass | Decode pass, then the chunk alone |
+| --- | ---: | ---: |
+| 2 + 38 | 369 ms | 422 ms |
+| 4 + 36 | 377 ms | 449 ms |
+| 4 + 28 | 301 ms | 370 ms |
+| 4 + 20 | 237 ms | 318 ms |
+| 8 + 32 | 387 ms | 395 ms |
+| 8 + 24 | 314 ms | 325 ms |
+
+Four streams' rows ride almost free (72 ms of 449 saved at a 36-token
+chunk); eight streams' rows fill a group of their own, so folding saves
+little there. Of the two chunks that fill a group beside four streams, 36
+and 28 tokens prefill at the same rate (95.5 and 93 tokens/s), and 28 keeps
+the streams' tokens coming 77 ms sooner, so the chunk fills the nearest group
+from 24. Four 600-token streams with a 9.2K-token prompt arriving 4 s in, M4
+Pro, greedy, cold prompt cache, MTP head loaded:
+
+| Build | Long prompt TTFT | Streams' ITL p50 / p99 during its prefill | Streams' tok/s during it | Aggregate tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Chunk 32 as its own pass (`f088159`) | 115.2 s | 0.40 / 0.44 s | 10.0 | 17.0 |
+| Folded, 36-token chunk (40 rows) | 105.0 s | 0.41 / 0.46 s | 9.8 | 18.0 |
+| **Folded, 28-token chunk (32 rows)** | 105.8 s | 0.32 / 0.36 s | 12.5 | 19.0 |
+
+Earlier measurements of the separate chunk, on the same scenario without
+the folded pass:
 
 | Build | Long prompt TTFT | Streams' ITL p50 / p99 during its prefill | Streams' tok/s during it |
 | --- | ---: | ---: | ---: |
 | Prefill as one pass | 88.5 s | 88.5 s stall | 0.09 |
 | Chunk 48 | 103.6 s | 0.54 / 0.59 s | 7.3 |
-| **Chunk 32** | 111.4 s | 0.39 / 0.41 s | 10.3 |
+| Chunk 32 | 111.4 s | 0.39 / 0.41 s | 10.3 |
 | Chunk 16 | 136.3 s | 0.24 / 0.29 s | 16.2 |
 | Earlier kernels, one pass | 96.9 s | 97 s stall | 0.04 |
 | Earlier kernels, chunk 48 | 123.0 s | 0.64 / 0.68 s | 6.2 |
@@ -343,30 +378,80 @@ commit always has, 2.5-12.7 ms for 2 to 8 sequences. Positions advance by the
 kept rows, and the kept rows' hidden reaches the MTP head through the same
 per-request lag a batched plain step uses.
 
-Drafts come from each sequence's suffix lookup, or from its own MTP head: the
-scheduler makes the sequence resident (a handle swap), feeds the head the rows
-it missed, and drafts the depth-3 chain its solo round would. Whether a
-sequence's drafts are worth their rows is decided per step by a cost model:
-measured pass time by stacked rows (32, 48, 64, 75, 78, 80, 82 and 84 ms for 1
-to 8 rows, 154 at 16, 303 at 32, 602 at 64; about 75 ms per eight rows past
-eight), plus 1.5 ms of commit per verifying sequence and 15 ms per head
-draft chain, against the tokens the drafts are expected to add (a geometric
-chain from each sequence's running acceptance estimate). Candidates are added
-in order of expected tokens per row while each raises expected tokens per
-second. Rows five to eight cost little more than four, so confident lookup
-drafts ride almost free beside two to seven sequences; head drafts rarely pay,
-because a chain costs 15 ms of sequential drafting per sequence: at two
-streams with p = 0.65, three head drafts each come to 42.1 tok/s against
-41.5 plain, and at four, 43 against 53 (only one sequence's chain in the free
-rows pays, 54.5 against 52.9). On the earlier kernels (8 rows 92 ms, 16 rows
-172, 32 rows 337) head drafts never paid; lookup drafts did.
+Drafts come from each sequence's suffix lookup, or from its own MTP head.
+Head drafts are made for every drafting sequence together. Each sequence's
+head caches and committed hidden stay where they are (the resident
+sequence's in the model's head, the others' in their parked buffer sets), and
+a draft round runs one stacked head pass per draft depth, one row per
+drafting sequence: the head's matrices read their weights once for all the
+rows, and each row's K/V append and attention run at its row offset against
+its own sequence's head caches (the target's row-offset wrappers on F16
+caches). Each row's next-token embedding gather and its exact top two run on
+the GPU (`draft_embed_inverse_rows`, `draft_top2_rows_*`), each writing its
+chain's next token where that chain's next row reads it; the host reads the
+top twos after each depth and applies each chain's EOS and margin gate, and
+rows whose chain stopped leave the next pass. The first pass also feeds each
+head the rows it missed in batched steps, as K/V-only rows beside the
+drafting rows (a lag too long for one pass is fed first, in K/V-only passes),
+so no sequence is swapped in to draft. A pass costs about 2.1 ms plus 0.5 ms
+per drafting sequence (2.5 ms for one, 4.4 for three, 6.1 for eight, against
+3.0, 8.9 and 23.5 ms for the same chains drafted one sequence at a time,
+`batched_head_draft_timings`), so a full depth-3 round for four sequences
+costs about 12 ms where it cost 60. Each chain is the one the sequence's solo
+round would draft: over 24 chains of three sequences owing their heads 0 to
+20 rows, one of them resident, every chain matched the solo catch-up and
+draft token for token.
+
+Whether a sequence's drafts are worth their rows is decided per step by a cost
+model: measured pass time by stacked rows (32, 48, 64, 75, 78, 80, 82 and 84
+ms for 1 to 8 rows, 154 at 16, 303 at 32, 602 at 64; about 75 ms per eight
+rows past eight), plus 1.5 ms of commit per verifying sequence and, for head
+drafts, 0.5 ms per draft and 2.1 ms for every depth the deepest head chain
+reaches, against the tokens the drafts are expected to add (a geometric chain
+from each sequence's running acceptance estimate). Pass time is not linear in
+rows, so one sequence's drafts may pay only beside another's (at two streams
+the third and fourth rows cost 16 and 11 ms, the fifth to eighth 2 to 3 ms):
+candidates are added in order of expected tokens per row, each at its best
+depth whether or not it pays yet, the best prefix is kept, and then each
+choice is revised given the others. A chain is one to three drafts, so one
+rejection moves an estimate far; a head that did not draft in a step moves
+its estimate an eighth of the way back to the 0.6 prior, so a run of
+rejections does not stop it drafting for good. Beside a prompt chunk folded
+into the pass, the decoding rows and drafts are charged only what they add to
+the chunk's own pass, where every row costs its full 9.4 ms; drafts seldom
+pay there.
+
+Rows five to eight cost little more than four, so confident lookup drafts
+ride almost free beside two to seven sequences, and so do head drafts now
+that a round costs one head pass per depth for all of them. Prose requests
+arriving together, 160 greedy tokens each, decode-only throughput in the
+engine, two runs (`batched_prose_throughput`; head drafts were accepted
+71-75% of the time when forced every step):
+
+| Streams | No head drafts | Cost model | Head drafts every step |
+| ---: | ---: | ---: | ---: |
+| 2 | 39.0, 40.2 tok/s | 42.1, 42.1 tok/s | 44.2, 46.5 tok/s |
+| 4 | 48.6, 50.3 tok/s | 60.8, 61.9 tok/s | 60.5, 62.2 tok/s |
+| 8 | 81.4, 85.0 tok/s | 82.6, 84.7 tok/s | 67.9, 68.9 tok/s |
+
+At eight streams the seeds fill an eight-row group and any draft starts
+another, so the model drafts only as streams finish. At two, drafting every
+step does better than the model: one rejected chain drops a stream below the
+acceptance at which two streams' drafts pay together, until its estimate
+recovers; over HTTP, where prefill and the first stream's solo rounds count
+too, neither gain at two streams stands out of the runs' spread (see below).
+Before batched drafting, head drafts cost 15 ms of sequential drafting per
+chain and rarely paid (at four streams, one chain in
+the free rows: 54.5 against 52.9 tok/s); on the earlier kernels (8 rows 92
+ms, 16 rows 172, 32 rows 337) they never did.
 
 On copy-edit prompts (rename a variable in a 17-line function, edit a 30-line
 config; about 300 prompt tokens, 400-token limit) arriving together, aggregate
 throughput including prefill rose from 31.7 to 37.3 tok/s at four streams and
 from 28.5 to 34.0 at two, against the same kernels without batched
-speculation or chunked prefill; prose streams, where lookups seldom fire, are
-unchanged.
+speculation or chunked prefill. With batched head drafting and folded prefill
+it measured 34.2, 34.7, 37.9 and 41.7 tok/s at one, two, four and eight
+streams, against 32.8, 32.9, 34.9 and 38.0 for `f088159`.
 
 Greedy output per request matches a request run alone up to the engine's own
 near-ties. Rows of one batch are independent of each other, and against
@@ -379,30 +464,56 @@ sequence decoded alone from the same kept rows. Over eight 300-token chat
 prompts (four prose, four copy-edits), every 2-, 4- and 8-stream output was
 byte-identical to that prompt run alone, on both kernel generations; the
 previous build split one 8-stream output at a near-tie (character 1,206).
+With batched head drafting and folded prefill the eight prompts, run alone
+and in groups of two, four and eight arriving together (so every group size
+covers prose and copy-edits), were again byte-identical to each prompt run
+alone, and the prompts run alone to `f088159`. A prompt chunk prefilled
+inside a batched pass leaves its sequence where prefill blocks leave it: the
+next token's logits are bitwise those of the reference (KL 0), with the
+sequence parked or resident, and its head drafts the same chain; the
+decoding rows beside the chunk track the same step without it. A long prompt
+prefilled beside two decoding requests with the head loaded generated its
+own tokens, and its head then proposed and had accepted exactly as many
+drafts (6 and 5 in 4 rounds) as after prefilling alone.
 
-Measured on an M4 Pro, chat requests with distinct prompts arriving together,
-greedy, 300 output tokens each, thinking off, cold prompt cache, after two
-warm-up requests, streamed over HTTP (TTFT includes this harness's 0.4-0.5 s
-for a lone request); the previous build is `18c274d`, measured the same way:
+Measured on an M4 Pro, chat requests with distinct prose prompts arriving
+together, greedy, 300 output tokens each, thinking off, cold prompt cache,
+after two warm-up requests, streamed over HTTP (TTFT includes this harness's
+0.4-0.5 s for a lone request); the previous build is `f088159`, measured the
+same way, interleaved; aggregate throughput is two runs each:
 
-| Streams | Aggregate tok/s | TTFT mean / worst | ITL p50 / p99 / max | Footprint | Previous: aggregate, TTFT mean / worst, ITL max |
+| Streams | Aggregate tok/s | TTFT mean / worst | ITL p50 / p99 / max | Footprint | Previous: aggregate tok/s, ITL p50 / p99 |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 33.9 | 0.40 / 0.40 s | 41 / 80 / 89 ms | 0.88 GB | 34.4, 0.50 / 0.50 s, 114 ms |
-| 2 | 39.2 | 0.65 / 0.89 s | 49 / 64 / 485 ms | 0.85 GB | 39.0, 0.74 / 0.99 s, 542 ms |
-| 4 | 47.2 | 1.16 / 1.90 s | 79 / 128 / 500 ms | 1.38 GB | 46.9, 1.25 / 2.00 s, 1,583 ms |
-| 8 | 74.5 | 2.27 / 4.10 s | 93 / 490 / 544 ms | 2.16 GB | 69.0, 2.28 / 4.04 s, 3,648 ms |
+| 1 | 33.4, 33.0 | 0.41 / 0.41 s | 45 / 82 / 87 ms | 0.78 GB | 32.5, 33.7; 46 / 80 ms |
+| 2 | 37.1, 40.4 | 0.69 / 0.95 s | 53 / 101 / 529 ms | 0.85 GB | 37.7, 39.2; 50 / 67 ms |
+| 4 | 56.4, 56.2 | 1.18 / 1.93 s | 85 / 141 / 503 ms | 1.40 GB | 45.8, 47.4; 81 / 134 ms |
+| 8 | 73.5, 75.2 | 2.15 / 3.88 s | 93 / 486 / 497 ms | 2.18 GB | 73.1, 74.8; 95 / 503 ms |
+
+The gain is batched head drafting at four streams (+21%; the same build
+without head drafts in a batch measured 46.9 and 47.0, and with head drafts
+forced every step 54.2). At two streams it is within the runs' spread on the
+server (forced drafts: 38.4), and at eight the cost model rightly drafts only
+as streams finish (forced drafts: 54.7). The earlier build, `18c274d`,
+measured 34.4, 39.0, 46.9 and 69.0 tok/s at one, two, four and eight
+streams.
 
 The engine-only step time is 33 ms for one sequence and 49, 64, 78, 80, 82, 85
 and 89 ms for two to eight (89 tok/s at eight); the server figures above add
-prefill, sampling and event delivery. Most of the aggregate gain at eight
-streams is the new kernels; on them alone, prompts admitted as one pass each
-measured 32.8, 37.8, 45.9 and 75.0 tok/s with TTFT mean 0.41, 0.62, 1.02 and
-1.85 s (worst 0.41, 0.83, 1.64 and 3.34 s). Requests arriving together now
-start decoding one by one as each prompt is prefilled, with a decode step
-between prefills: the first requests stream while the later prompts prefill
-(the ITL p99 is those prefills, against a 3.0-3.6 s stall before), and the
-mean TTFT of eight simultaneous short prompts is about 0.4 s later than
-admitting them back to back on the same kernels.
+prefill, sampling and event delivery. Against `18c274d`, most of the gain at
+eight streams was the 5- to 128-row kernels; on them alone, prompts admitted
+as one pass each measured 32.8, 37.8, 45.9 and 75.0 tok/s with TTFT mean 0.41,
+0.62, 1.02 and 1.85 s (worst 0.41, 0.83, 1.64 and 3.34 s). Requests arriving
+together now start decoding one by one as each prompt is prefilled, with a
+decode step between prefills: the first requests stream while the later
+prompts prefill (the ITL p99 is those prefills, against a 3.0-3.6 s stall
+before), and the mean TTFT of eight simultaneous short prompts is about 0.4 s
+later than admitting them back to back on the same kernels.
+
+Batched head drafting keeps one row of draft logits per sequence (8 MB at
+eight) and its own small token and top-two buffers; a prompt chunk folded
+into a pass adds its rows to the pass's activations but no logits rows.
+During the long-prompt scenario above the footprint peaked at 1.91 GB
+against 2.30 GB for `f088159`.
 
 Each extra stream costs its own state: 81 MB of F16 recurrent state and
 convolution history, 34 KiB of Q8 K/V per token (initially 1,024 tokens,
@@ -429,7 +540,9 @@ All choices and reasons are reported in startup JSON.
   fits 90% of Metal's recommended working set.
 - **K/V:** F16 unless it cannot reach a useful 32,768-token context, then Q8.
 - **Prefill:** fixed 128-token chunks with Metal 4 kernels where supported;
-  beside decoding requests, a long prompt prefills 48 tokens per step.
+  beside two or more decoding requests, a long prompt prefills 24 to 31
+  tokens per step inside their batched pass, and 32 per step in a pass of its
+  own beside one.
 - **Speculation:** suffix lookup is enabled; the ternary MTP head artifact,
   when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`, adds gated
   depth-3 drafting. Without it MTP is off and the policy says why.

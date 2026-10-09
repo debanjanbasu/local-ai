@@ -8,11 +8,11 @@ use super::super::weights::MatrixWeight;
 use super::super::{FFN, WIDTH};
 use super::{BonsaiMtp, Shared};
 
-fn ptq1(packed: &MetalBuffer, rows: u32, columns: u32) -> crate::Result<Ptq1Matrix<'_>> {
+pub(super) fn ptq1(packed: &MetalBuffer, rows: u32, columns: u32) -> crate::Result<Ptq1Matrix<'_>> {
     Ptq1Matrix::new(packed, 0, rows, columns).map_err(crate::Error::Metal)
 }
 
-fn int8<'a>(
+pub(super) fn int8<'a>(
     weights: &'a MetalBuffer,
     scales: &'a MetalBuffer,
     rows: u32,
@@ -23,7 +23,7 @@ fn int8<'a>(
 
 /// Multiply `count` rotated rows of `input` by `matrix`, whichever format it
 /// is stored in, into `output`.
-fn project(
+pub(super) fn project(
     batch: &mut CommandBatch,
     shared: &Shared<'_>,
     matrix: &MatrixWeight,

@@ -475,3 +475,478 @@ fn batched_verify_timings() {
     }
     println!("{}", serde_json::json!({"batched_verify": lines}));
 }
+
+fn load_with_head(context: usize, block_rows: usize) -> BonsaiModel {
+    let settings = crate::bonsai_mtp::MtpSettings::new(
+        crate::bonsai_mtp::DEFAULT_BONSAI_MTP_ARTIFACT.into(),
+        crate::bonsai_mtp::DEFAULT_MTP_DEPTH,
+    )
+    .expect("head settings");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open Bonsai GGUF");
+    BonsaiModel::load(
+        package,
+        context,
+        block_rows,
+        None,
+        Some(&settings),
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load")
+}
+
+fn greedy_sampler() -> Sampler {
+    Sampler::new(
+        VOCAB,
+        crate::sampler::SamplingParams {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            eos_tokens: Vec::new(),
+            seed: 0,
+        },
+    )
+}
+
+/// Natural text, so the head's chains run deep: each sequence's prompt,
+/// then the continuation its batched steps are teacher-forced through.
+fn natural_texts(model: &BonsaiModel) -> Vec<Vec<u32>> {
+    let tokenizer =
+        crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&model.package).expect("tokenizer");
+    [
+        "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog again, and then the dog wakes up and chases the fox across the field until both of them are tired.",
+        "One, two, three, four, five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty, twenty-one, twenty-two.",
+        "def add(a, b):\n    return a + b\n\n\ndef subtract(a, b):\n    return a - b\n\n\ndef multiply(a, b):\n    return a * b\n\n\ndef divide(a, b):\n    return a / b\n",
+        "Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday. January, February, March, April, May, June, July, August, September, October, November, December.",
+    ]
+    .iter()
+    .map(|text| tokenizer.encode(text).expect("encode"))
+    .collect()
+}
+
+/// Parked sequences prefilled (head included) with the first eight tokens
+/// of their texts, then advanced `steps` teacher-forced batched steps
+/// through the text that leave their heads behind by those rows, with each
+/// sequence's next seed.
+fn lagged(
+    model: &mut BonsaiModel,
+    count: usize,
+    steps: usize,
+) -> Vec<(SequenceState, HeadLag, u32)> {
+    const PROMPT: usize = 8;
+    let texts = natural_texts(model);
+    let text = |index: usize| &texts[index % texts.len()];
+    let mut sequences = (0..count)
+        .map(|index| {
+            let mut state = model.new_sequence().expect("sequence");
+            model.swap_sequence(&mut state).expect("swap in");
+            model
+                .prefill_segment(&text(index)[..PROMPT], true, &mut |_| {})
+                .expect("prefill");
+            model.swap_sequence(&mut state).expect("swap out");
+            (state, HeadLag::default(), 0)
+        })
+        .collect::<Vec<_>>();
+    for step in 0..steps {
+        let mut rows = sequences
+            .iter_mut()
+            .enumerate()
+            .map(|(index, (state, lag, _))| BatchRow {
+                token: text(index)[PROMPT + step],
+                drafts: Vec::new(),
+                state: Some(state),
+                lag: Some(lag),
+            })
+            .collect::<Vec<_>>();
+        model.decode_batch(&mut rows).expect("batched step");
+    }
+    for (index, sequence) in sequences.iter_mut().enumerate() {
+        sequence.2 = text(index)[PROMPT + steps];
+    }
+    sequences
+}
+
+/// Drafts of several sequences made together, each head fed the rows it
+/// missed in the same passes (a lag too long for one pass first, alone), are
+/// each sequence's own chain: what its solo catch-up and draft propose from
+/// the same state.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
+fn batched_head_drafts_match_each_alone() {
+    // Sixteen-row passes: three sequences owing nine rows each feed part of
+    // their lags ahead of the drafting pass.
+    let mut model = load_with_head(4096, 16);
+    let sampler = greedy_sampler();
+    let count = 3;
+    let mut compared = 0;
+    let mut matching = 0;
+    for steps in [0usize, 1, 9, 20] {
+        let mut together = lagged(&mut model, count, steps);
+        let mut alone = lagged(&mut model, count, steps);
+        // The first sequence drafts resident, the others parked.
+        model.swap_sequence(&mut together[0].0).expect("swap in");
+        let mut entries = together
+            .iter_mut()
+            .enumerate()
+            .map(|(index, (state, lag, seed))| HeadDraft {
+                seed: *seed,
+                depth: 3,
+                state: (index > 0).then_some(state),
+                lag,
+                sampler: &sampler,
+            })
+            .collect::<Vec<_>>();
+        let batched = model.draft_heads(&mut entries).expect("batched drafts");
+        drop(entries);
+        model.swap_sequence(&mut together[0].0).expect("swap out");
+        assert!(together.iter().all(|(_, lag, _)| lag.is_empty()));
+        for (index, (state, lag, seed)) in alone.iter_mut().enumerate() {
+            model.swap_sequence(state).expect("swap in");
+            let solo = model
+                .draft_resident(lag, *seed, &sampler, 4)
+                .expect("solo drafts");
+            model.swap_sequence(state).expect("swap out");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "lag": steps, "sequence": index,
+                    "solo": solo, "batched": batched[index],
+                })
+            );
+            assert!(!batched[index].is_empty(), "no drafts at lag {steps}");
+            assert_eq!(
+                batched[index][0], solo[0],
+                "first draft differs at lag {steps}, sequence {index}"
+            );
+            compared += 1;
+            matching += usize::from(batched[index] == solo);
+        }
+        // The heads were fed exactly: a second round from the next seeds
+        // (no lag now) drafts as the solo heads do.
+        let texts = natural_texts(&model);
+        let next = (0..count)
+            .map(|index| texts[index][9 + steps])
+            .collect::<Vec<_>>();
+        let mut entries = together
+            .iter_mut()
+            .zip(next.iter().copied())
+            .map(|((state, lag, _), seed)| HeadDraft {
+                seed,
+                depth: 3,
+                state: Some(state),
+                lag,
+                sampler: &sampler,
+            })
+            .collect::<Vec<_>>();
+        // Drafting writes no committed state: position stays, so the same
+        // positions are drafted again from the same committed hidden.
+        let again = model.draft_heads(&mut entries).expect("second round");
+        drop(entries);
+        for (index, ((state, lag, _), seed)) in alone.iter_mut().zip(next).enumerate() {
+            model.swap_sequence(state).expect("swap in");
+            let solo = model
+                .draft_resident(lag, seed, &sampler, 4)
+                .expect("solo drafts");
+            model.swap_sequence(state).expect("swap out");
+            assert_eq!(again[index][0], solo[0], "second round, sequence {index}");
+            compared += 1;
+            matching += usize::from(again[index] == solo);
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({"chains": compared, "identical": matching})
+    );
+    assert!(
+        matching * 10 >= compared * 8,
+        "{matching} of {compared} chains identical"
+    );
+}
+
+/// Time of one batched MTP draft round at 1..=8 sequences, each owing its
+/// head one row (a sequence that drafted last step) or eight, against each
+/// sequence drafting alone in turn (the cost model of batched head drafts).
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device; prints timings"]
+fn batched_head_draft_timings() {
+    let mut model = load_with_head(4096, 128);
+    let sampler = greedy_sampler();
+    let mut lines = Vec::new();
+    for lag in [1usize, 8] {
+        for count in [1usize, 2, 3, 4, 6, 8] {
+            let mut sequences = lagged(&mut model, count, 0);
+            let repeats = 8;
+            let mut batched = 0.0;
+            let mut alone = 0.0;
+            let mut steps = 0usize;
+            let mut chain = 0usize;
+            for repeat in 0..repeats + 2 {
+                for step in 0..lag {
+                    let mut rows = sequences
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(index, (state, lag, _))| BatchRow {
+                            token: 1000 + (index * 31 + repeat * 7 + step) as u32,
+                            drafts: Vec::new(),
+                            state: Some(state),
+                            lag: Some(lag),
+                        })
+                        .collect::<Vec<_>>();
+                    model.decode_batch(&mut rows).expect("batched step");
+                }
+                let alone_round = repeat % 2 == 1;
+                let started = Instant::now();
+                let drafted = if alone_round {
+                    sequences
+                        .iter_mut()
+                        .map(|(state, lag, _)| {
+                            model.swap_sequence(state).expect("swap in");
+                            let drafts = model
+                                .draft_resident(lag, 13, &sampler, 4)
+                                .expect("solo drafts");
+                            model.swap_sequence(state).expect("swap out");
+                            drafts
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    let mut entries = sequences
+                        .iter_mut()
+                        .map(|(state, lag, _)| HeadDraft {
+                            seed: 13,
+                            depth: 3,
+                            state: Some(state),
+                            lag,
+                            sampler: &sampler,
+                        })
+                        .collect::<Vec<_>>();
+                    model.draft_heads(&mut entries).expect("batched drafts")
+                };
+                let elapsed = started.elapsed().as_secs_f64();
+                if repeat >= 2 {
+                    if alone_round {
+                        alone += elapsed;
+                    } else {
+                        batched += elapsed;
+                        steps += drafted.iter().map(Vec::len).max().unwrap_or(0);
+                        chain += drafted.iter().map(Vec::len).sum::<usize>();
+                    }
+                }
+            }
+            let rounds = (repeats / 2) as f64;
+            lines.push(serde_json::json!({
+                "sequences": count, "lag": lag,
+                "batched_ms": batched / rounds * 1e3,
+                "alone_ms": alone / rounds * 1e3,
+                "depth_passes": steps as f64 / rounds,
+                "drafts_per_sequence": chain as f64 / rounds / count as f64,
+            }));
+        }
+    }
+    println!("{}", serde_json::json!({"head_drafts": lines}));
+}
+
+/// A prompt chunk prefilled inside a batched pass, after two decoding
+/// sequences' rows, leaves its sequence (target and MTP head) where prefill
+/// blocks leave it: the next token's logits track the reference and the head
+/// drafts the same chain. The decoding rows beside it track the same step
+/// without the chunk.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
+#[allow(clippy::too_many_lines)]
+fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
+    let mut model = load_with_head(4096, 64);
+    let sampler = greedy_sampler();
+    let text = natural_texts(&model).swap_remove(0);
+    let prefix = &text[..8];
+    let chunk = text[8..38].to_vec();
+    let next = text[38];
+    // Reference: prefill blocks, the head ingesting them as prefill does.
+    let mut reference = model.new_sequence().expect("sequence");
+    model.swap_sequence(&mut reference).expect("swap in");
+    model
+        .prefill_segment(prefix, false, &mut |_| {})
+        .expect("prefix");
+    model
+        .prefill_segment(&chunk, false, &mut |_| {})
+        .expect("chunk");
+    let reference_drafts = model
+        .draft_resident(&mut HeadLag::default(), next, &sampler, 4)
+        .expect("reference drafts");
+    model.decode(next).expect("decode");
+    let reference_logits = model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    model.swap_sequence(&mut reference).expect("swap out");
+    // The same chunk inside a batched pass.
+    let mut decoding = lagged(&mut model, 2, 0);
+    let mut alone = lagged(&mut model, 2, 0);
+    let mut folded = model.new_sequence().expect("sequence");
+    model.swap_sequence(&mut folded).expect("swap in");
+    model
+        .prefill_segment(prefix, false, &mut |_| {})
+        .expect("prefix");
+    model.swap_sequence(&mut folded).expect("swap out");
+    for resident in [false, true] {
+        if resident {
+            // Again from the start, the prefilling sequence resident.
+            folded = model.new_sequence().expect("sequence");
+            model.swap_sequence(&mut folded).expect("swap in");
+            model
+                .prefill_segment(prefix, false, &mut |_| {})
+                .expect("prefix");
+            decoding = lagged(&mut model, 2, 0);
+            alone = lagged(&mut model, 2, 0);
+        }
+        let mut rows = decoding
+            .iter_mut()
+            .enumerate()
+            .map(|(index, (state, lag, _))| BatchRow {
+                token: forced(index, 0),
+                drafts: Vec::new(),
+                state: Some(state),
+                lag: Some(lag),
+            })
+            .collect::<Vec<_>>();
+        model
+            .decode_batch_prefilling(
+                &mut rows,
+                Some(PrefillRows {
+                    tokens: &chunk,
+                    state: (!resident).then_some(&mut folded),
+                }),
+            )
+            .expect("batched pass with a prompt chunk");
+        drop(rows);
+        let output = model.batch.as_ref().expect("batch scratch");
+        assert_eq!(output.rows, 2, "only the decoding rows have logits");
+        let with_chunk = output.logits.as_slice::<f32>()[..2 * VOCAB].to_vec();
+        let mut rows = alone
+            .iter_mut()
+            .enumerate()
+            .map(|(index, (state, lag, _))| BatchRow {
+                token: forced(index, 0),
+                drafts: Vec::new(),
+                state: Some(state),
+                lag: Some(lag),
+            })
+            .collect::<Vec<_>>();
+        model.decode_batch(&mut rows).expect("batched pass alone");
+        drop(rows);
+        let output = model.batch.as_ref().expect("batch scratch");
+        let without = output.logits.as_slice::<f32>()[..2 * VOCAB].to_vec();
+        for row in 0..2 {
+            let range = row * VOCAB..(row + 1) * VOCAB;
+            let divergence = kl(&without[range.clone()], &with_chunk[range.clone()]);
+            assert!(divergence < 1e-4, "decoding row {row}: KL {divergence}");
+            assert_eq!(argmax(&without[range.clone()]), argmax(&with_chunk[range]));
+        }
+        if !resident {
+            model.swap_sequence(&mut folded).expect("swap in");
+        }
+        assert_eq!(model.position, prefix.len() + chunk.len());
+        let drafts = model
+            .draft_resident(&mut HeadLag::default(), next, &sampler, 4)
+            .expect("drafts");
+        model.decode(next).expect("decode");
+        let logits = model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+        model.swap_sequence(&mut folded).expect("swap out");
+        let divergence = kl(&reference_logits, &logits);
+        println!(
+            "{}",
+            serde_json::json!({
+                "resident": resident, "next_token_kl": divergence,
+                "reference_drafts": reference_drafts, "drafts": drafts,
+            })
+        );
+        assert!(divergence < 1e-4, "next-token KL {divergence}");
+        assert_eq!(argmax(&reference_logits), argmax(&logits));
+        assert_eq!(drafts.first(), reference_drafts.first());
+    }
+}
+
+/// Time of a batched step of `sequences` decoding rows with a prompt chunk
+/// folded into its pass, against the same step followed by the chunk as its
+/// own prefill block (the cost model of prefilling beside decoding).
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device; prints timings"]
+fn prefill_fold_timings() {
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open Bonsai GGUF");
+    let mut model = BonsaiModel::load(
+        package,
+        8192,
+        128,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    let mut lines = Vec::new();
+    for (sequences, chunk) in [
+        (2usize, 38usize),
+        (4, 36),
+        (4, 28),
+        (4, 20),
+        (8, 32),
+        (8, 24),
+    ] {
+        let mut states = prefilled(&mut model, sequences.min(4));
+        while states.len() < sequences {
+            states.push(model.new_sequence().expect("sequence"));
+        }
+        let mut prompt = model.new_sequence().expect("sequence");
+        let tokens = (0..chunk).map(|row| 1000 + row as u32).collect::<Vec<_>>();
+        let repeats = 6u32;
+        let mut folded = 0.0;
+        let mut separate = 0.0;
+        for repeat in 0..repeats + 2 {
+            for fold in [true, false] {
+                let mut rows = states
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(index, state)| BatchRow {
+                        token: 1000 + index as u32 * 31 + repeat,
+                        drafts: Vec::new(),
+                        state: Some(state),
+                        lag: None,
+                    })
+                    .collect::<Vec<_>>();
+                let started = Instant::now();
+                if fold {
+                    model
+                        .decode_batch_prefilling(
+                            &mut rows,
+                            Some(PrefillRows {
+                                tokens: &tokens,
+                                state: Some(&mut prompt),
+                            }),
+                        )
+                        .expect("folded pass");
+                } else {
+                    model.decode_batch(&mut rows).expect("batched pass");
+                    drop(rows);
+                    model.swap_sequence(&mut prompt).expect("swap in");
+                    model
+                        .forward_block(&tokens, BlockOutput::None)
+                        .expect("prefill block");
+                    model.swap_sequence(&mut prompt).expect("swap out");
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                if repeat >= 2 {
+                    if fold {
+                        folded += elapsed;
+                    } else {
+                        separate += elapsed;
+                    }
+                }
+            }
+        }
+        lines.push(serde_json::json!({
+            "sequences": sequences, "chunk": chunk,
+            "folded_ms": folded / f64::from(repeats) * 1e3,
+            "separate_ms": separate / f64::from(repeats) * 1e3,
+        }));
+    }
+    println!("{}", serde_json::json!({"prefill_fold": lines}));
+}

@@ -513,6 +513,59 @@ impl BonsaiOps {
         Ok(())
     }
 
+    /// [`Self::prepare_kv_rows_kv`] over rows `row..row + tokens`: only the
+    /// K/V rows, appended at `position` of one sequence's caches, for rows
+    /// whose attention output nobody reads (an MTP head catching up).
+    pub fn prepare_kv_rows_kv_at(
+        &self,
+        layout: KvLayout,
+        b: &mut CommandBatch,
+        projections: [&MetalBuffer; 2],
+        k_norm: &MetalBuffer,
+        caches: [&MetalBuffer; 2],
+        extent: [u32; 2],
+        constants: [f32; 2],
+        row: u32,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        let [k, v] = projections;
+        let [k_cache, v_cache] = caches;
+        let [position, capacity] = extent;
+        let [epsilon, rope_base] = constants;
+        if tokens == 0
+            || capacity == 0
+            || capacity > 262_144
+            || position
+                .checked_add(tokens)
+                .is_none_or(|end| end > capacity)
+            || epsilon <= 0.0
+            || !epsilon.is_finite()
+            || rope_base <= 0.0
+            || !rope_base.is_finite()
+        {
+            return Err(arg("invalid KV prep parameters"));
+        }
+        let (kv, kv_end) = rows_extent(row, tokens, 1024)?;
+        need(k, kv_end)?;
+        need(v, kv_end)?;
+        need(k_norm, 256 * 4)?;
+        need(k_cache, capacity as usize * layout.key.token_bytes())?;
+        need(v_cache, capacity as usize * layout.value.token_bytes())?;
+        no_alias(k_cache, &[k, v, k_norm, v_cache])?;
+        no_alias(v_cache, &[k, v, k_norm])?;
+        let codes = layout.codes();
+        self.go(
+            b,
+            15,
+            &[(k, kv), (v, kv), (k_norm, 0), (k_cache, 0), (v_cache, 0)],
+            &[position, codes[0], codes[1]],
+            &[epsilon, rope_base],
+            4 * tokens as usize,
+            256,
+        );
+        Ok(())
+    }
+
     /// [`Self::attention_block_kv`] for query rows `row..row + tokens` of a
     /// stacked block: row `row + r` attends through cache position
     /// `position + r`, inclusive, choosing the kernel exactly as the block

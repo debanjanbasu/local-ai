@@ -12,7 +12,7 @@ use crate::bonsai_tokenizer::{BonsaiTokenizer, StreamDecodeState};
 /// only after a long exact match.
 const INITIAL_NGRAM_ACCEPTANCE: f64 = 0.8;
 /// Acceptance assumed for a sequence's first head drafts.
-const INITIAL_MTP_ACCEPTANCE: f64 = 0.6;
+pub(super) const INITIAL_MTP_ACCEPTANCE: f64 = 0.6;
 
 /// One request between its prefill and its last token.
 ///
@@ -49,7 +49,7 @@ pub(super) struct ActiveGeneration {
     /// The prompt's remaining prefill, until its first sample is taken.
     pub(super) prefill: Option<PromptPrefill>,
     /// Prefill chunks reported to the caller.
-    prefill_chunks: usize,
+    pub(super) prefill_chunks: usize,
     /// Running estimates of the chance a lookup or head draft is accepted,
     /// for the batched-speculation cost model.
     pub(super) ngram_acceptance: f64,

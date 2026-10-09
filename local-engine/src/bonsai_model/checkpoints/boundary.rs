@@ -30,6 +30,36 @@ impl PromptPrefill {
     pub(in crate::bonsai_model) const fn remaining(&self, prompt_len: usize) -> usize {
         prompt_len.saturating_sub(self.done)
     }
+
+    /// Prompt tokens the sequence may prefill from where it is without
+    /// reaching a prompt-cache milestone or the prompt's last token, so
+    /// without anything but its own rows to compute: zero at a milestone.
+    pub(in crate::bonsai_model) fn plain_run(&self, prompt_len: usize) -> usize {
+        if self.boundary == Some(self.done)
+            || (self.done == self.penultimate && !self.penultimate_reached)
+        {
+            return 0;
+        }
+        let target = match self.boundary {
+            Some(boundary) if boundary > self.done => boundary,
+            _ if self.done < self.penultimate => self.penultimate,
+            _ => prompt_len,
+        };
+        target
+            .min(prompt_len.saturating_sub(1))
+            .saturating_sub(self.done)
+    }
+
+    /// Prompt tokens prefilled from `done` on: the next `rows` of
+    /// [`Self::plain_run`].
+    pub(in crate::bonsai_model) const fn advance(&mut self, rows: usize) {
+        self.done += rows;
+    }
+
+    /// Prompt tokens the sequence holds.
+    pub(in crate::bonsai_model) const fn done(&self) -> usize {
+        self.done
+    }
 }
 
 impl BonsaiEngine {
