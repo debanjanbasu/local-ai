@@ -485,3 +485,150 @@ fn joining_and_leaving_during_batched_verify() {
     }
     assert!(observed.outcomes[&ids[2]].stats.batched_tokens > 0);
 }
+
+/// A long prompt arriving beside two decoding requests with the MTP head
+/// loaded prefills in chunks inside their batched passes, its head ingesting
+/// the chunks in the same passes: all three produce their tokens alone, and
+/// the long request's head, once it decodes, drafts as well as it does after
+/// prefilling alone.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
+fn prefill_in_batched_passes_with_speculation_matches_alone() {
+    let mut engine = open(&MtpMode::default());
+    let long = long_prompt(&engine);
+    let reference = alone(&mut engine, 48);
+    let long_alone = engine
+        .generate(&long, &params(96), |_| true)
+        .expect("long alone");
+    let first = admit(&mut engine, 0, 48, CancelToken::new());
+    let second = admit(&mut engine, 1, 48, CancelToken::new());
+    let mut long_id = None;
+    let observed = observe(&mut engine, |engine, observed| {
+        if long_id.is_none() && observed.steps.len() == 3 {
+            long_id = Some(admit_ids(engine, &long, 96, CancelToken::new()));
+        }
+    });
+    let long_id = long_id.expect("long admitted");
+    let interleaved = observed
+        .steps
+        .iter()
+        .filter(|(emitted, prefilled)| {
+            prefilled.contains(&long_id)
+                && emitted.contains_key(&first)
+                && emitted.contains_key(&second)
+        })
+        .count();
+    assert!(
+        interleaved >= 4,
+        "only {interleaved} steps interleaved prefill and decode"
+    );
+    assert_same("first", &observed.outcomes[&first].token_ids, &reference[0]);
+    assert_same(
+        "second",
+        &observed.outcomes[&second].token_ids,
+        &reference[1],
+    );
+    let long_batched = &observed.outcomes[&long_id];
+    assert_same("long", &long_batched.token_ids, &long_alone.token_ids);
+    let (batched, solo) = (&long_batched.stats.mtp, &long_alone.stats.mtp);
+    println!(
+        "{}",
+        serde_json::json!({
+            "batched": [batched.rounds, batched.proposed_tokens, batched.accepted_tokens],
+            "alone": [solo.rounds, solo.proposed_tokens, solo.accepted_tokens],
+        })
+    );
+    assert!(
+        batched.accepted_tokens * 10 >= solo.accepted_tokens * 8,
+        "head accepted {} drafts after batched prefill, {} alone",
+        batched.accepted_tokens,
+        solo.accepted_tokens
+    );
+}
+
+/// Aggregate decode throughput of 2, 4 and 8 prose requests arriving
+/// together, with batched MTP drafting chosen by the cost model, forced at
+/// full depth every step, and without a head: the cost model's evidence.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device; prints timings"]
+fn batched_prose_throughput() {
+    const TOPICS: [&str; 8] = [
+        "how a hash map handles collisions",
+        "the history of the printing press",
+        "how vaccines train the immune system",
+        "the physics of a rainbow",
+        "how a compiler optimizes loops",
+        "why the sky is blue",
+        "how plate tectonics shapes continents",
+        "the life cycle of a star",
+    ];
+    let max_tokens = 160;
+    let mut lines = Vec::new();
+    for mode in ["off", "cost_model", "forced"] {
+        let mut engine = open(&if mode == "off" {
+            MtpMode::Off(None)
+        } else {
+            MtpMode::default()
+        });
+        engine.force_batched_drafts = mode == "forced";
+        for streams in [2usize, 4, 8] {
+            let prompts = TOPICS[..streams]
+                .iter()
+                .map(|topic| {
+                    engine
+                        .encode_prompt(
+                            &format!(
+                                "Write a detailed explanation of {topic}, in several paragraphs."
+                            ),
+                            false,
+                            false,
+                        )
+                        .expect("prompt")
+                })
+                .collect::<Vec<_>>();
+            let ids = prompts
+                .iter()
+                .map(|ids| admit_ids(&mut engine, ids, max_tokens, CancelToken::new()))
+                .collect::<Vec<_>>();
+            // Time decode only: from the step after the last prefill.
+            let mut started = None;
+            let mut tokens = 0;
+            let mut outcomes = HashMap::new();
+            while engine.active_generations() > 0 {
+                let decoding = engine
+                    .active
+                    .iter()
+                    .all(|generation| generation.prefill.is_none());
+                if decoding && started.is_none() {
+                    started = Some(std::time::Instant::now());
+                }
+                let finished = engine.step(
+                    &mut |_, _| {
+                        if started.is_some() {
+                            tokens += 1;
+                        }
+                        true
+                    },
+                    &mut |_, _| {},
+                );
+                for (id, result) in finished {
+                    outcomes.insert(id, result.expect("generation"));
+                }
+            }
+            let elapsed = started.expect("decoded").elapsed().as_secs_f64();
+            let (mut rounds, mut proposed, mut accepted) = (0, 0, 0);
+            for id in &ids {
+                let mtp = &outcomes[id].stats.mtp;
+                rounds += mtp.rounds;
+                proposed += mtp.proposed_tokens;
+                accepted += mtp.accepted_tokens;
+            }
+            lines.push(serde_json::json!({
+                "mode": mode, "streams": streams,
+                "decode_tok_s": f64::from(tokens) / elapsed,
+                "mtp_rounds": rounds, "proposed": proposed, "accepted": accepted,
+            }));
+        }
+    }
+    println!("{}", serde_json::json!({"prose_throughput": lines}));
+}

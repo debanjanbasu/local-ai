@@ -41,7 +41,9 @@ mod checkpoint;
 mod layers;
 mod speculation;
 
-pub use self::batch::{BatchRow, HeadLag, MAX_BATCH_SEQUENCES, SequenceState};
+pub use self::batch::{
+    BatchRow, HeadDraft, HeadLag, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState,
+};
 
 /// What a loaded head costs, for the policy record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

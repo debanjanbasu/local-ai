@@ -39,7 +39,7 @@ pub use self::artifact::requantize_head;
 pub use self::{
     artifact::{MtpHeadArtifact, export_head},
     format::MTP_HEAD_ARTIFACT,
-    head::{BonsaiMtp, HeadSequence, Shared},
+    head::{BonsaiMtp, HeadSequence, HeadSpan, HeadState, Shared},
     policy::{
         DEFAULT_BONSAI_MTP_ARTIFACT, DEFAULT_MTP_DEPTH, DEFAULT_MTP_ENABLED,
         DRAFT_CHAIN_MIN_MARGIN, MAX_MTP_DEPTH, MtpMode, MtpResolution, MtpSettings,

@@ -277,3 +277,85 @@ kernel void greedy_rows_final(
     nonfinite = greedy_group_or(nonfinite, shared_flags, lane, simd);
     if (tid == 0) results[row] = GreedyRowResult{pair.best_id, pair.best, nonfinite, 0};
 }
+
+// Several sequences drafting together: one row per sequence per draft step.
+// Row y reads its token from `tokens[slots[y]]` and writes its selection back
+// into its own slots, so each sequence's chain stays in its own token run.
+// Every row computes exactly what the one-row kernels above compute for it.
+
+// Grid (blocks_per_row, rows), 128 threads: `draft_embed_inverse` per row,
+// row y landing at row y of `output`.
+kernel void draft_embed_inverse_rows(
+    device const BonsaiPtq1Block *table [[buffer(0)]],
+    device const uint *tokens [[buffer(1)]],
+    device const float *signs [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint *slots [[buffer(4)]],
+    constant uint &rows [[buffer(5)]],
+    constant uint &blocks_per_row [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float shared[1024];
+    const uint token = tokens[slots[group.y]];
+    const bool valid = token < rows;
+    const ulong first = ulong(valid ? token : 0) * blocks_per_row * 8 + ulong(group.x) * 8;
+    float values[8];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; ++i) {
+        values[i] = valid ? draft_ptq1_element(table[first + i], tid) : 0.0f;
+    }
+    bonsai_fwht_values<true>(
+        values, signs, output, blocks_per_row, group.y * blocks_per_row + group.x, tid, shared);
+}
+
+// Stage 1 of a per-row top two: group (x, y) reduces 1024 logits of row y.
+kernel void draft_top2_rows_partial(
+    device const float *logits [[buffer(0)]],
+    device DraftPair *partial [[buffer(1)]],
+    constant uint &vocab [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 groups [[threadgroups_per_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup DraftPair shared[8];
+    device const float *row = logits + ulong(group.y) * vocab;
+    DraftPair pair = draft_empty();
+    const uint base = group.x * DRAFT_GROUP_ELEMENTS;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < DRAFT_GROUP_ELEMENTS / 256; ++i) {
+        const uint id = base + i * 256 + tid;
+        if (id < vocab) draft_insert(pair, row[id], id);
+    }
+    pair = draft_group_reduce(pair, shared, tid, lane, simd);
+    if (tid == 0) partial[group.y * groups.x + group.x] = pair;
+}
+
+// Stage 2: group y merges row y's partials, writes the winner to
+// `tokens[token_slots[y]]` and the pair to `results[result_slots[y]]`.
+kernel void draft_top2_rows_final(
+    device const DraftPair *partial [[buffer(0)]],
+    device uint *tokens [[buffer(1)]],
+    device DraftTopTwo *results [[buffer(2)]],
+    constant uint &groups [[buffer(3)]],
+    constant uint *token_slots [[buffer(4)]],
+    constant uint *result_slots [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup DraftPair shared[8];
+    DraftPair pair = draft_empty();
+    for (uint index = tid; index < groups; index += 256) {
+        pair = draft_merge(pair, partial[row * groups + index]);
+    }
+    pair = draft_group_reduce(pair, shared, tid, lane, simd);
+    if (tid == 0) {
+        tokens[token_slots[row]] = pair.best_id;
+        results[result_slots[row]] =
+            DraftTopTwo{pair.best_id, pair.best, pair.second_id, pair.second};
+    }
+}

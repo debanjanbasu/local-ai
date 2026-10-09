@@ -5,14 +5,16 @@
 //! A generation alone runs the single-sequence round it always ran (n-gram
 //! verification, an MTP speculative round, or one decode step), so a lone
 //! request behaves exactly as before. Two or more advance together in a
-//! single batched pass ([`BonsaiModel::decode_batch`]): every projection reads
-//! its weights once for all of them, and a sequence whose drafts the cost
-//! model in [`policy`] finds worth their rows verifies them in the same pass.
+//! single batched pass ([`BonsaiModel::decode_batch_prefilling`]): every
+//! projection reads its weights once for all of them, and a sequence whose
+//! drafts the cost model in [`policy`] finds worth their rows verifies them
+//! in the same pass, its head drafts made for all of them together
+//! ([`BonsaiModel::draft_heads`]).
 //!
-//! A request's prompt prefills in bounded chunks after each step's decode
-//! round, so a long prompt delays the running requests' next token by one
-//! chunk rather than by its whole prefill. Requests join and leave between
-//! steps.
+//! A request's prompt prefills in bounded chunks, inside a batched step's
+//! pass or after a step's decode round, so a long prompt delays the running
+//! requests' next token by one chunk rather than by its whole prefill.
+//! Requests join and leave between steps.
 //!
 //! Each generation owns a full set of sequence buffers. One set is resident
 //! in the model; the others are parked, and a swap exchanges handles only.
@@ -24,18 +26,31 @@ use super::{
     BatchRow, BonsaiEngine, BonsaiGeneration, CancelToken, GenerateParams, PrefillProgress,
     draft_depth,
 };
-use crate::bonsai_native::{MAX_BATCH_SEQUENCES, SequenceState};
+use crate::bonsai_native::{HeadDraft, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState};
 
 mod policy;
 
-/// Prompt tokens of a long prompt one step prefills while other generations
-/// decode: their next token waits for this chunk. A prefill block costs about
+/// Prompt tokens of a long prompt one step prefills in a pass of its own
+/// while other generations decode (a lone stream taking solo rounds, or a
+/// chunk reaching a prompt-cache milestone; a batched step prefills inside
+/// its decode pass instead, see [`PREFILL_FOLD_MIN`]): their next token waits
+/// for this chunk. A prefill block costs about
 /// 9.2 ms a row from 8 to 128 rows on the M4 Pro, so the chunk trades the
 /// others' inter-token gap against the prompt's own time to first token, not
 /// prefill efficiency: beside four streams and a 9.2K-token prompt, chunks of
 /// 16, 32 and 48 kept their tokens coming every 0.24, 0.39 and 0.54 s (p50)
 /// and delayed the prompt's first token to 136, 112 and 104 s.
 const PREFILL_CHUNK_DECODING: usize = 32;
+
+/// Fewest prompt tokens a batched step prefills inside its decode pass; the
+/// chunk then grows until the pass's rows fill their eight-row group, which
+/// costs about what the group's first row does. A pass costs about 9.4 ms a
+/// row from 24 rows on (M4 Pro, `prefill_fold_timings`), so beside four
+/// streams a 28-token chunk takes 300 ms where a 36-token one takes 377 ms
+/// for the same prompt tokens per second: the smaller one keeps the others'
+/// tokens coming sooner. Against the step and a separate 32-token prefill
+/// pass (about 400 ms beside four streams), both are faster.
+const PREFILL_FOLD_MIN: usize = 24;
 
 /// A prompt with at most this many tokens to prefill prefills whole in one
 /// step while other generations decode: one prefill block, so a typical chat
@@ -62,6 +77,16 @@ const BATCH_THRESHOLD: usize = 2;
 /// Move an acceptance estimate a quarter of the way toward a new observation.
 fn blend(estimate: f64, observed: f64) -> f64 {
     0.75f64.mul_add(estimate, 0.25 * observed)
+}
+
+/// Move a head's acceptance estimate an eighth of the way back toward the
+/// prior after a step it did not draft in. A chain is one to three drafts,
+/// so one rejection moves the estimate a long way, and an estimate below
+/// what drafting needs would otherwise never be observed again: two prose
+/// streams whose heads were accepted 75% of the time drafted in 21 of their
+/// rounds and gained nothing, against 10% with drafts every step.
+fn recover(estimate: f64) -> f64 {
+    estimate + (super::generation::INITIAL_MTP_ACCEPTANCE - estimate) / 8.0
 }
 
 /// A finished generation and its outcome.
@@ -142,11 +167,13 @@ impl BonsaiEngine {
     /// Advance every active generation by one round and return those that
     /// finished, each with its outcome.
     ///
-    /// Generations past their prompt decode one round (batched, or alone);
-    /// then the prompt with the fewest tokens left prefills: whole if it had
-    /// at most [`PREFILL_WHOLE_DECODING`] tokens to prefill, else one
-    /// [`PREFILL_CHUNK_DECODING`]-token chunk, while others decode, and up to
-    /// [`PREFILL_CHUNK_ALONE`] tokens while none do. `emit`
+    /// Generations past their prompt decode one round (batched, or alone),
+    /// and the prompt with the fewest tokens left prefills: inside a batched
+    /// round's pass when it is long (see [`Self::fold_candidate`]), else after
+    /// the round, whole if it had at most [`PREFILL_WHOLE_DECODING`] tokens
+    /// to prefill, else one [`PREFILL_CHUNK_DECODING`]-token chunk, while
+    /// others decode, and up to [`PREFILL_CHUNK_ALONE`] tokens while none do.
+    /// `emit`
     /// receives each generation's text with its id, `progress` each prefill
     /// chunk boundary.
     pub fn step(
@@ -166,14 +193,14 @@ impl BonsaiEngine {
             .filter(|generation| generation.decoding())
             .count();
         let outcome = match running {
-            0 => Ok(()),
-            1 => self.step_alone(),
+            0 => Ok(false),
+            1 => self.step_alone().map(|()| false),
             _ if self.model.speculation().is_some() && running < BATCH_THRESHOLD => {
-                self.step_in_turn()
+                self.step_in_turn().map(|()| false)
             }
-            _ => self.step_batched(),
+            _ => self.step_batched(progress),
         };
-        if let Err(error) = outcome {
+        if let Err(error) = &outcome {
             // A failed pass leaves every participant's state undefined.
             let message = error.to_string();
             for generation in std::mem::take(&mut self.active) {
@@ -189,7 +216,8 @@ impl BonsaiEngine {
             self.clear_gpu_cache();
             return finished;
         }
-        if let Some((id, error)) = self.step_prefill(running, progress) {
+        let folded = outcome.unwrap_or(false);
+        if !folded && let Some((id, error)) = self.step_prefill(running, progress) {
             finished.push((id, Err(error)));
         }
         let mut index = 0;
@@ -308,9 +336,15 @@ impl BonsaiEngine {
 
     /// One batched pass over every running generation: its seed and, where
     /// the cost model in [`policy`] finds them worth their rows, drafts from
-    /// n-gram lookup or its MTP head, verified in the same pass.
+    /// n-gram lookup or its MTP head, verified in the same pass; and, when a
+    /// long prompt is prefilling, its next chunk (see [`Self::fold_candidate`]).
+    /// Returns whether it prefilled a chunk, which is then the step's
+    /// prefill.
     #[allow(clippy::too_many_lines)]
-    fn step_batched(&mut self) -> crate::Result<()> {
+    fn step_batched(
+        &mut self,
+        progress: &mut dyn FnMut(u64, PrefillProgress),
+    ) -> crate::Result<bool> {
         let greedy = self
             .active
             .iter()
@@ -324,8 +358,10 @@ impl BonsaiEngine {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if participants.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
+        let fold = self.fold_candidate(participants.len());
+        let fold_rows = fold.map_or(0, |(_, rows)| rows);
         // What each sequence could draft, and which drafts the step verifies.
         let mut lookups = vec![None; participants.len()];
         let mut candidates = vec![None; participants.len()];
@@ -351,6 +387,7 @@ impl BonsaiEngine {
                         depth: draft.tokens.len(),
                         acceptance: generation.ngram_acceptance,
                         draft_ms: policy::COMMIT_MS,
+                        head: false,
                     });
                     lookups[slot] = Some(draft.tokens);
                     continue;
@@ -363,15 +400,21 @@ impl BonsaiEngine {
                 candidates[slot] = (depth > 0).then_some(policy::Candidate {
                     depth,
                     acceptance: generation.mtp_acceptance,
-                    draft_ms: policy::MTP_DRAFT_MS + policy::COMMIT_MS,
+                    draft_ms: policy::COMMIT_MS,
+                    head: true,
                 });
             }
         }
-        let chosen = self.choose_drafts(&candidates);
+        let chosen = self.choose_drafts(participants.len() + fold_rows, &candidates);
         let mut drafts = vec![Vec::new(); participants.len()];
         let mut from_head = vec![false; participants.len()];
+        let mut heads = Vec::new();
         for (slot, &depth) in chosen.iter().enumerate() {
             if depth == 0 {
+                if candidates[slot].is_some_and(|candidate| candidate.head) {
+                    let generation = &mut self.active[participants[slot]];
+                    generation.mtp_acceptance = recover(generation.mtp_acceptance);
+                }
                 continue;
             }
             if let Some(mut tokens) = lookups[slot].take() {
@@ -379,32 +422,41 @@ impl BonsaiEngine {
                 drafts[slot] = tokens;
                 continue;
             }
-            // Head drafting reads the resident sequence's head: bring the
-            // sequence in (a handle swap) and draft as its solo round does.
-            let index = participants[slot];
-            self.make_resident(index)?;
-            let generation = &mut self.active[index];
-            let remaining = generation.params.max_tokens - generation.stats.sampled_tokens;
-            let seed = generation.seed.unwrap_or_default();
-            self.model.set_cancel(generation.cancel.clone());
-            let started = std::time::Instant::now();
-            let mut tokens = self.model.draft_resident(
-                &mut generation.lag,
-                seed,
-                &generation.sampler,
-                remaining.min(depth + 1),
-            )?;
-            tokens.truncate(depth);
-            generation.stats.mtp.drafting += started.elapsed();
-            from_head[slot] = !tokens.is_empty();
-            drafts[slot] = tokens;
+            heads.push((slot, depth));
+        }
+        if !heads.is_empty() {
+            self.draft_from_heads(&participants, &heads, &mut drafts)?;
+            for &(slot, _) in &heads {
+                from_head[slot] = !drafts[slot].is_empty();
+            }
         }
         self.model.set_device_greedy(greedy);
         let resident = self.resident;
         let mut rows = Vec::with_capacity(participants.len());
         let mut samplers = Vec::with_capacity(participants.len());
         let mut drafts = drafts.into_iter();
+        let mut prefill = None;
         for (index, generation) in self.active.iter_mut().enumerate() {
+            if let Some((fold, count)) = fold
+                && fold == index
+            {
+                let done = generation
+                    .prefill
+                    .as_ref()
+                    .map_or(0, super::checkpoints::PromptPrefill::done);
+                let state = if resident == Some(generation.id) {
+                    None
+                } else {
+                    Some(generation.state.as_mut().ok_or_else(|| {
+                        crate::Error::InvalidArgument("parked generation has no state".into())
+                    })?)
+                };
+                prefill = Some(PrefillRows {
+                    tokens: &generation.prompt[done..done + count],
+                    state,
+                });
+                continue;
+            }
             if !participants.contains(&index) {
                 continue;
             }
@@ -427,7 +479,7 @@ impl BonsaiEngine {
             samplers.push(&mut generation.sampler);
         }
         self.model.take_gpu_time();
-        self.model.decode_batch(&mut rows)?;
+        self.model.decode_batch_prefilling(&mut rows, prefill)?;
         let started = std::time::Instant::now();
         let mut committed = vec![1; rows.len()];
         let mut outcomes = Vec::with_capacity(rows.len());
@@ -479,22 +531,158 @@ impl BonsaiEngine {
             }
             generation.pending.extend(verification.samples);
         }
+        let Some((index, count)) = fold else {
+            return Ok(false);
+        };
+        let generation = &mut self.active[index];
+        let id = generation.id;
+        if let Some(plan) = generation.prefill.as_mut() {
+            let tokens = plan.done();
+            plan.advance(count);
+            generation.prefill_chunks += 1;
+            progress(
+                id,
+                PrefillProgress {
+                    tokens,
+                    chunks: generation.prefill_chunks,
+                },
+            );
+        }
+        Ok(true)
+    }
+
+    /// The prompt whose next chunk this batched step prefills inside its
+    /// pass, and the chunk: the prompt [`Self::step_prefill`] would take,
+    /// when it is a long one and its next rows reach no prompt-cache
+    /// milestone. The chunk fills the pass to a multiple of eight rows, from
+    /// [`PREFILL_FOLD_MIN`] to seven more.
+    fn fold_candidate(&self, seeds: usize) -> Option<(usize, usize)> {
+        let (index, _) = self
+            .active
+            .iter()
+            .enumerate()
+            .filter(|(_, generation)| !generation.done)
+            .filter_map(|(index, generation)| Some((index, generation.prefill_remaining()?)))
+            .min_by_key(|&(_, remaining)| remaining)?;
+        let generation = &self.active[index];
+        if generation.prefill_total() <= PREFILL_WHOLE_DECODING || generation.cancel.is_cancelled()
+        {
+            return None;
+        }
+        let run = generation
+            .prefill
+            .as_ref()?
+            .plain_run(generation.prompt.len());
+        let chunk = (seeds + PREFILL_FOLD_MIN).next_multiple_of(8) - seeds;
+        let limit = self
+            .model
+            .max_batch_rows()
+            .min(self.model.max_prefill_fold())
+            .saturating_sub(seeds);
+        let rows = chunk.min(run).min(limit);
+        (rows > 0).then_some((index, rows))
+    }
+
+    /// Head drafts of `depth` for each `(slot, depth)` of `heads`, slots
+    /// indexing `participants`: every sequence's chain drafted together, in
+    /// one head pass per depth. A sampler with penalties drafts on the host,
+    /// alone, as its solo round would.
+    fn draft_from_heads(
+        &mut self,
+        participants: &[usize],
+        heads: &[(usize, usize)],
+        drafts: &mut [Vec<u32>],
+    ) -> crate::Result<()> {
+        let (alone, together): (Vec<_>, Vec<_>) = heads.iter().partition(|&&(slot, _)| {
+            self.active[participants[slot]]
+                .sampler
+                .greedy_draft()
+                .applies_penalties()
+        });
+        for (slot, depth) in alone {
+            // Host drafting reads the resident sequence's head: bring the
+            // sequence in (a handle swap) and draft as its solo round does.
+            let index = participants[slot];
+            self.make_resident(index)?;
+            let generation = &mut self.active[index];
+            let remaining = generation.params.max_tokens - generation.stats.sampled_tokens;
+            let seed = generation.seed.unwrap_or_default();
+            self.model.set_cancel(generation.cancel.clone());
+            let started = std::time::Instant::now();
+            let mut tokens = self.model.draft_resident(
+                &mut generation.lag,
+                seed,
+                &generation.sampler,
+                remaining.min(depth + 1),
+            )?;
+            tokens.truncate(depth);
+            generation.stats.mtp.drafting += started.elapsed();
+            drafts[slot] = tokens;
+        }
+        if together.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let resident = self.resident;
+        let mut slots = Vec::with_capacity(together.len());
+        let mut entries = Vec::with_capacity(together.len());
+        for (index, generation) in self.active.iter_mut().enumerate() {
+            let Some(slot) = participants.iter().position(|&entry| entry == index) else {
+                continue;
+            };
+            let Some(&(_, depth)) = together.iter().find(|&&(entry, _)| entry == slot) else {
+                continue;
+            };
+            let state = if resident == Some(generation.id) {
+                None
+            } else {
+                Some(generation.state.as_mut().ok_or_else(|| {
+                    crate::Error::InvalidArgument("parked generation has no state".into())
+                })?)
+            };
+            slots.push(index);
+            entries.push(HeadDraft {
+                seed: generation.seed.ok_or_else(|| {
+                    crate::Error::InvalidArgument("batched generation has no seed".into())
+                })?,
+                depth,
+                state,
+                lag: &mut generation.lag,
+                sampler: &generation.sampler,
+            });
+        }
+        let chains = self.model.draft_heads(&mut entries)?;
+        drop(entries);
+        let share = started.elapsed() / slots.len() as u32;
+        for (index, chain) in slots.into_iter().zip(chains) {
+            self.active[index].stats.mtp.drafting += share;
+            if let Some(slot) = participants.iter().position(|&entry| entry == index) {
+                drafts[slot] = chain;
+            }
+        }
         Ok(())
     }
 
     /// Drafts each batched sequence verifies, by the cost model.
+    /// `rows` counts the step's rows before drafts: one per sequence and any
+    /// prompt chunk prefilled in the same pass.
     #[cfg(not(test))]
-    fn choose_drafts(&self, candidates: &[Option<policy::Candidate>]) -> Vec<usize> {
-        policy::choose(candidates.len(), candidates, self.model.max_batch_rows())
+    fn choose_drafts(&self, rows: usize, candidates: &[Option<policy::Candidate>]) -> Vec<usize> {
+        policy::choose(
+            candidates.len(),
+            rows,
+            candidates,
+            self.model.max_batch_rows(),
+        )
     }
 
     #[cfg(test)]
-    fn choose_drafts(&self, candidates: &[Option<policy::Candidate>]) -> Vec<usize> {
+    fn choose_drafts(&self, rows: usize, candidates: &[Option<policy::Candidate>]) -> Vec<usize> {
         let max_rows = self.model.max_batch_rows();
         if !self.force_batched_drafts {
-            return policy::choose(candidates.len(), candidates, max_rows);
+            return policy::choose(candidates.len(), rows, candidates, max_rows);
         }
-        let mut rows = candidates.len();
+        let mut rows = rows;
         candidates
             .iter()
             .map(|candidate| {

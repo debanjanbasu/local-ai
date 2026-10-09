@@ -21,6 +21,10 @@ use crate::buffer::MetalBuffer;
 use crate::context::MetalContext;
 use crate::shaders::ShaderLibrary;
 
+mod rows;
+
+pub use rows::DraftRows;
+
 /// Logits each first-stage threadgroup reduces.
 const GROUP_ELEMENTS: usize = 1024;
 /// Bytes of one partial top-two (two ids, two logits).

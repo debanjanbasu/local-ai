@@ -10,7 +10,10 @@ use super::MtpSettings;
 use super::weights::Weights;
 use super::{ATTENTION, FFN, KV, KV_TOKEN_BYTES, QUERY_GATE, WIDTH};
 
+mod rows;
 mod step;
+
+pub use rows::{HeadSpan, HeadState};
 
 /// Target-owned resources the head shares: kernels, rotations, and the PTQ1
 /// output matrix. Borrowed per call so the model keeps single ownership.

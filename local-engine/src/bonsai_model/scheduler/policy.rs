@@ -30,8 +30,17 @@ const PASS_MS: [(usize, f64); 14] = [
 /// Replaying one verifying sequence's kept rows after the pass.
 pub(super) const COMMIT_MS: f64 = 1.5;
 
-/// Time to catch a sequence's MTP head up and draft one chain with it.
-pub(super) const MTP_DRAFT_MS: f64 = 15.0;
+/// A batched MTP draft round (`batched_head_draft_timings`, M4 Pro) runs one
+/// stacked head pass per draft depth for every drafting sequence together:
+/// a pass costs about 2.1 ms plus 0.5 ms per drafting sequence (2.5 ms for
+/// one sequence, 6.1 ms for eight, against 3.0 and 23.5 ms drafting each
+/// alone in turn). The fixed part is paid once per depth the deepest chosen
+/// chain reaches; the per-sequence part goes into each candidate's
+/// `draft_ms`.
+pub(super) const HEAD_PASS_MS: f64 = 2.1;
+
+/// What one sequence adds to each head pass of a batched draft round.
+pub(super) const HEAD_ROW_MS: f64 = 0.5;
 
 /// Milliseconds of one batched pass over `rows` stacked rows.
 pub(super) fn pass_ms(rows: usize) -> f64 {
@@ -62,6 +71,10 @@ pub(super) struct Candidate {
     pub(super) acceptance: f64,
     /// Time to produce the drafts, paid only if they are used.
     pub(super) draft_ms: f64,
+    /// Drafted by the sequence's MTP head: each draft also costs
+    /// [`HEAD_ROW_MS`], and the step pays [`HEAD_PASS_MS`] for every depth
+    /// of its deepest head chain, shared by every head-drafting sequence.
+    pub(super) head: bool,
 }
 
 /// Expected accepted drafts of a chain of `depth` drafts.
@@ -75,18 +88,56 @@ fn expected(acceptance: f64, depth: usize) -> f64 {
     total
 }
 
+/// Expected tokens per millisecond of a step that verifies `plan[i]` drafts
+/// of candidate `i`, or `None` past `max_rows` stacked rows.
+fn rate(
+    sequences: usize,
+    rows: usize,
+    candidates: &[Option<Candidate>],
+    plan: &[usize],
+    max_rows: usize,
+) -> Option<f64> {
+    let rows_before = rows;
+    let mut tokens = sequences as f64;
+    let mut rows = rows.max(sequences);
+    let mut time = 0.0;
+    let mut head_depth = 0;
+    for (candidate, &depth) in candidates.iter().zip(plan) {
+        let Some(candidate) = candidate.filter(|_| depth > 0) else {
+            continue;
+        };
+        tokens += expected(candidate.acceptance, depth);
+        rows += depth;
+        time += candidate.draft_ms;
+        if candidate.head {
+            time = (depth as f64).mul_add(HEAD_ROW_MS, time);
+            head_depth = head_depth.max(depth);
+        }
+    }
+    // A prompt chunk in the pass would have cost its own pass: the decoding
+    // rows and drafts are charged only what they add to it.
+    let chunk = rows_before.saturating_sub(sequences);
+    let prefill = if chunk > 0 { pass_ms(chunk) } else { 0.0 };
+    (rows <= max_rows)
+        .then(|| tokens / (head_depth as f64).mul_add(HEAD_PASS_MS, pass_ms(rows) - prefill + time))
+}
+
 /// Drafts to verify per sequence (0 for none) for a step of `sequences`
-/// sequences, each contributing one row plus its chosen drafts, within
-/// `max_rows` stacked rows.
+/// sequences, each contributing one row plus its chosen drafts, beside
+/// `rows - sequences` rows of a prompt chunk, within `max_rows` stacked rows.
+///
+/// Pass time is not linear in rows (rows five to eight cost little more
+/// than four, the ninth starts another group), so a draft that does not pay
+/// alone may pay beside another's. Candidates are added in order of expected
+/// tokens per row, each at its best depth whether or not it pays yet, and
+/// the best prefix kept; then each choice is revised given the others.
 pub(super) fn choose(
     sequences: usize,
+    rows: usize,
     candidates: &[Option<Candidate>],
     max_rows: usize,
 ) -> Vec<usize> {
-    let mut chosen = vec![0; candidates.len()];
-    let mut tokens = sequences as f64;
-    let mut rows = sequences;
-    let mut extra = 0.0;
+    let rate = |plan: &[usize]| rate(sequences, rows, candidates, plan, max_rows);
     let mut order = candidates
         .iter()
         .enumerate()
@@ -99,25 +150,36 @@ pub(super) fn choose(
         let b = expected(b.acceptance, b.depth) / b.depth as f64;
         b.total_cmp(&a)
     });
-    for (index, candidate) in order {
-        let rate = tokens / (pass_ms(rows) + extra);
+    // The depth of `index` that maximizes the rate, from `least`.
+    let best_depth = |plan: &mut Vec<usize>, index: usize, depth: usize, least: usize| {
         let mut best = None;
-        for depth in 1..=candidate.depth.min(max_rows.saturating_sub(rows)) {
-            let gain = expected(candidate.acceptance, depth);
-            let time = pass_ms(rows + depth) + extra + candidate.draft_ms;
-            let candidate_rate = (tokens + gain) / time;
-            if candidate_rate > best.map_or(rate, |(_, best_rate, _)| best_rate) {
-                best = Some((depth, candidate_rate, gain));
+        for candidate in least..=depth {
+            plan[index] = candidate;
+            if let Some(value) = rate(plan)
+                && best.is_none_or(|(_, best_value)| value > best_value)
+            {
+                best = Some((candidate, value));
             }
         }
-        if let Some((depth, _, gain)) = best {
-            chosen[index] = depth;
-            tokens += gain;
-            rows += depth;
-            extra += candidate.draft_ms;
+        plan[index] = best.map_or(0, |(candidate, _)| candidate);
+        best.map(|(_, value)| value)
+    };
+    let mut plan = vec![0; candidates.len()];
+    let mut best = (rate(&plan).unwrap_or(0.0), plan.clone());
+    for &(index, candidate) in &order {
+        if let Some(value) = best_depth(&mut plan, index, candidate.depth, 1)
+            && value > best.0
+        {
+            best = (value, plan.clone());
         }
     }
-    chosen
+    let mut plan = best.1;
+    for _ in 0..2 {
+        for &(index, candidate) in &order {
+            best_depth(&mut plan, index, candidate.depth, 0);
+        }
+    }
+    plan
 }
 
 #[cfg(test)]
@@ -139,16 +201,42 @@ mod tests {
             depth: 3,
             acceptance: 0.9,
             draft_ms: 0.0,
+            head: false,
         };
-        let chosen = choose(5, &[Some(confident), None, None, None, None], 64);
+        let chosen = choose(5, 5, &[Some(confident), None, None, None, None], 64);
         assert_eq!(chosen[0], 3);
         // A drafted chain that is rarely accepted is not worth its rows.
         let doubtful = Candidate {
             depth: 3,
             acceptance: 0.1,
-            draft_ms: 15.0,
+            draft_ms: COMMIT_MS,
+            head: true,
         };
-        assert_eq!(choose(2, &[Some(doubtful), None], 64), vec![0, 0]);
+        assert_eq!(choose(2, 2, &[Some(doubtful), None], 64), vec![0, 0]);
+    }
+
+    #[test]
+    fn head_drafts_share_their_passes() {
+        // Two prose streams whose heads are accepted 65% of the time: the
+        // head passes are shared, so both chains pay.
+        let head = Candidate {
+            depth: 3,
+            acceptance: 0.65,
+            draft_ms: COMMIT_MS,
+            head: true,
+        };
+        let chosen = choose(2, 2, &[Some(head), Some(head)], 64);
+        assert!(chosen.iter().all(|&depth| depth > 0), "{chosen:?}");
+        // Eight streams fill their eight-row group with seeds: drafts would
+        // double the pass.
+        assert_eq!(choose(8, 8, &[Some(head); 8], 64), vec![0; 8]);
+        // Beside a prompt chunk the pass is long and rows cost their full
+        // price; uncertain drafts are not worth them.
+        let doubtful = Candidate {
+            acceptance: 0.3,
+            ..head
+        };
+        assert_eq!(choose(2, 40, &[Some(doubtful); 2], 64), vec![0, 0]);
     }
 
     #[test]
@@ -157,8 +245,9 @@ mod tests {
             depth: 40,
             acceptance: 0.99,
             draft_ms: 0.0,
+            head: false,
         };
-        let chosen = choose(4, &[Some(long), Some(long), None, None], 64);
+        let chosen = choose(4, 4, &[Some(long), Some(long), None, None], 64);
         assert!(4 + chosen.iter().sum::<usize>() <= 64);
     }
 }
