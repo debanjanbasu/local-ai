@@ -50,13 +50,6 @@ const SPLIT_HEADS: u32 = 2;
 /// most of their eight-row tiles idle while walking a long prefix.
 const ROW_BLOCK_TOKENS: u32 = 8;
 const ROW_BLOCK_MIN_PREFIX: u32 = 1024;
-/// `bo_bf16_mm` tile geometry; must match the shader constants.
-const BF16_TILE_ROWS: u32 = 32;
-const BF16_TILE_TOKENS: u32 = 32;
-const BF16_TILE_COLUMNS: u32 = 64;
-/// Blocks with fewer tokens (decode, draft and verify rows) keep the per-token
-/// matvec; from here the tiled GEMM reads the matrix at most once per 32 rows.
-pub const BF16_TILE_MIN_TOKENS: u32 = 8;
 
 /// Full-attention prefill operands; all variants keep F32 softmax statistics,
 /// accumulation and output, F16 KV storage, and the same F32 decode path.
@@ -284,7 +277,7 @@ impl BonsaiOps {
             },
             "bo_gdn_rows_4",
             "bo_kv_prep",
-            "bo_bf16_mm",
+            "bo_bf16_mv_tokens",
             // Quantized caches without a tensor kernel of their own take the
             // SIMD block kernel, which dequantizes in registers.
             "bo_attn_block",

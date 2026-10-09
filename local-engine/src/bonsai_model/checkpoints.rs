@@ -1,6 +1,6 @@
 use super::{
-    BonsaiEngine, HostPromptSnapshot, PrefillProgress, PromptCacheSource, PromptCheckpoint,
-    PromptSnapshot, prompt_cache,
+    BonsaiEngine, HostPromptSnapshot, PromptCacheSource, PromptCheckpoint, PromptSnapshot,
+    prompt_cache,
 };
 const MAX_HOST_PROMPT_SNAPSHOTS: usize = 16;
 pub(super) struct SessionSnapshot {
@@ -19,6 +19,7 @@ pub(super) struct CachedCheckpoint {
 mod boundary;
 mod reuse;
 
+pub(super) use self::boundary::PromptPrefill;
 use self::reuse::ReuseBounds;
 
 impl BonsaiEngine {
@@ -48,27 +49,17 @@ impl BonsaiEngine {
         Ok(())
     }
 
-    pub(super) fn prepare_prompt(
+    /// Restore the longest reusable prefix of `prompt` into the resident
+    /// sequence and plan the prefill of the rest.
+    pub(super) fn begin_prompt(
         &mut self,
         prompt: &[u32],
         session_id: Option<&str>,
-        progress: &mut dyn FnMut(PrefillProgress),
-    ) -> crate::Result<(usize, PromptCacheSource, Option<PromptCheckpoint>, bool)> {
+    ) -> crate::Result<(PromptPrefill, PromptCacheSource)> {
         self.collect_disk_writes();
         let bounds: ReuseBounds = self.reuse_bounds(prompt);
         let (reused, source) = self.restore_reusable_prefix(prompt, &bounds, session_id)?;
-        let (snapshot, persisted_reusable_boundary) =
-            self.materialize_boundary(prompt, &bounds, reused, session_id, progress)?;
-        self.model
-            .prefill(&prompt[bounds.penultimate..], progress)?;
-        self.cached_tokens.clear();
-        self.cached_tokens.extend_from_slice(prompt);
-        self.prompt_checkpoints.retain(|checkpoint| {
-            checkpoint.tokens.len() <= prompt.len()
-                && checkpoint.tokens.as_slice() == &prompt[..checkpoint.tokens.len()]
-        });
-        self.save_prompt_checkpoint(prompt, false)?;
-        Ok((reused, source, snapshot, persisted_reusable_boundary))
+        Ok((self.plan_prefill(prompt, &bounds, reused), source))
     }
 
     /// `persist` also writes the snapshot to the disk tier; only boundaries a

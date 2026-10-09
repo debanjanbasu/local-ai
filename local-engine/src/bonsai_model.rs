@@ -37,7 +37,7 @@ pub use self::cache_policy::{DEFAULT_PROMPT_CACHE_CHECKPOINTS, MAX_PROMPT_CACHE_
 pub use self::generation::draft_depth;
 pub use self::scheduler::Finished;
 
-use self::checkpoints::{CachedCheckpoint, SessionSnapshot};
+use self::checkpoints::{CachedCheckpoint, PromptPrefill, SessionSnapshot};
 
 /// Shared cancellation flag for one in-flight generation.
 ///
@@ -162,6 +162,10 @@ pub struct BonsaiEngine {
     /// The buffer set `cached_tokens` and `prompt_checkpoints` describe.
     cache_state: u64,
     next_generation: u64,
+    /// Verify every available draft in batched steps, whatever the cost
+    /// model says, so tests exercise batched speculation.
+    #[cfg(test)]
+    force_batched_drafts: bool,
 }
 
 impl BonsaiEngine {

@@ -102,23 +102,34 @@ impl HeadLag {
         !self.abandoned
     }
 
-    /// Reserve room for one more row, returning its byte offset.
-    fn reserve_row(&mut self, context: &local_metal::context::MetalContext) -> Option<usize> {
+    /// Reserve room for `count` more rows, returning the first one's byte
+    /// offset.
+    fn reserve_rows(
+        &mut self,
+        context: &local_metal::context::MetalContext,
+        count: usize,
+    ) -> Option<usize> {
         if self.abandoned {
             return None;
         }
-        if self.tokens.len() >= MAX_HEAD_LAG {
+        if self.tokens.len() + count > MAX_HEAD_LAG {
             self.abandoned = true;
             self.tokens = Vec::new();
             self.hidden = None;
             return None;
         }
         let row_bytes = WIDTH * size_of::<f32>();
-        let needed = (self.tokens.len() + 1) * row_bytes;
+        let needed = (self.tokens.len() + count) * row_bytes;
         let capacity = self.hidden.as_ref().map_or(0, MetalBuffer::length);
         if needed > capacity {
-            let rows = (self.tokens.len() + 1).next_power_of_two().max(64);
-            let grown = MetalBuffer::empty(context.device(), rows * row_bytes).ok()?;
+            let rows = (self.tokens.len() + count).next_power_of_two().max(64);
+            let Ok(grown) = MetalBuffer::empty(context.device(), rows * row_bytes) else {
+                // Rows that cannot be kept cannot be replayed later either.
+                self.abandoned = true;
+                self.tokens = Vec::new();
+                self.hidden = None;
+                return None;
+            };
             if let Some(old) = &self.hidden {
                 // Host-visible and idle: every batch that wrote it has finished.
                 grown.copy_from_bytes(&old.as_slice::<u8>()[..self.tokens.len() * row_bytes], 0);
@@ -129,48 +140,129 @@ impl HeadLag {
     }
 }
 
-/// One sequence's row in a batched step.
+/// One sequence's rows in a batched step.
 pub struct BatchRow<'a> {
     /// The token to decode at the sequence's position.
     pub token: u32,
+    /// Draft tokens verified after `token` in the same pass. A sequence with
+    /// drafts advances only when [`BonsaiModel::commit_batch`] settles how
+    /// many of its rows to keep.
+    pub drafts: Vec<u32>,
     /// `None` for the resident sequence.
     pub state: Option<&'a mut SequenceState>,
     /// Where the head's missed rows go, for a speculating model.
     pub lag: Option<&'a mut HeadLag>,
 }
 
-/// Output buffers of a batched step, made on first use.
+impl BatchRow<'_> {
+    /// Rows this sequence contributes to the pass.
+    const fn rows(&self) -> usize {
+        1 + self.drafts.len()
+    }
+}
+
+/// Output buffers of a batched step, made on first use and grown with the
+/// rows a step stacks.
 pub(super) struct BatchScratch {
     logits: MetalBuffer,
     greedy: GreedyRows,
+    /// Rows `logits` and `greedy` hold.
+    capacity: usize,
     /// Rows the last batched step produced, and whether `greedy` selected them.
     rows: usize,
     selected: bool,
+    /// First row of each sequence in the last batched step.
+    starts: Vec<usize>,
+    /// What a verifying step keeps for [`BonsaiModel::commit_batch`].
+    verify: Option<BatchVerify>,
 }
 
 impl BatchScratch {
-    pub(super) fn new(
-        context: &local_metal::context::MetalContext,
-        shaders: &ShaderLibrary,
-    ) -> crate::Result<Self> {
+    fn new(context: &local_metal::context::MetalContext, rows: usize) -> crate::Result<Self> {
+        let shaders = ShaderLibrary::new(context.device())?;
         Ok(Self {
-            logits: MetalBuffer::empty(
-                context.device(),
-                MAX_BATCH_SEQUENCES * VOCAB * size_of::<f32>(),
-            )?,
-            greedy: GreedyRows::new(context, shaders, VOCAB, MAX_BATCH_SEQUENCES)?,
+            logits: MetalBuffer::empty(context.device(), rows * VOCAB * size_of::<f32>())?,
+            greedy: GreedyRows::new(context, &shaders, VOCAB, rows)?,
+            capacity: rows,
             rows: 0,
             selected: false,
+            starts: Vec::new(),
+            verify: None,
         })
     }
 }
 
-/// Per-row view of the sequence-specific buffers of one layer.
+/// A verifying step's recurrence inputs, kept per recurrent layer for every
+/// row so a sequence's committed rows can be replayed from its start state.
+///
+/// A sequence with drafts reads its state and history and writes the block's
+/// final ones to the shared spares, which nobody reads: its own buffers keep
+/// the start of the round, and the commit replays exactly the rows it keeps
+/// (all of them when every draft is accepted), as a single sequence's partial
+/// commit does.
+struct BatchVerify {
+    layers: Vec<VerifyLayer>,
+    spare_state: MetalBuffer,
+    spare_history: MetalBuffer,
+    rows: usize,
+}
+
+struct VerifyLayer {
+    /// Raw QKV projection rows.
+    inputs: MetalBuffer,
+    decay: MetalBuffer,
+    beta: MetalBuffer,
+}
+
+impl BatchVerify {
+    fn new(
+        context: &local_metal::context::MetalContext,
+        format: local_metal::bonsai_ops::GdnStateFormat,
+        layers: usize,
+        rows: usize,
+    ) -> crate::Result<Self> {
+        let empty = |bytes| MetalBuffer::empty(context.device(), bytes);
+        let floats = |width: usize| empty(rows * width * size_of::<f32>());
+        Ok(Self {
+            layers: (0..layers)
+                .map(|_| {
+                    Ok(VerifyLayer {
+                        inputs: floats(QKV_WIDTH)?,
+                        decay: floats(GDN_HEADS)?,
+                        beta: floats(GDN_HEADS)?,
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?,
+            spare_state: empty(format.state_bytes())?,
+            spare_history: empty(CONV_STATE_BYTES)?,
+            rows,
+        })
+    }
+}
+
+/// Raw QKV projection width of a recurrent layer, and its head count.
+const QKV_WIDTH: usize = 10_240;
+const GDN_HEADS: usize = 48;
+
+/// Most rows one batched step stacks: every sequence's seed and drafts.
+pub const MAX_BATCH_ROWS: usize = 64;
+
+/// Per-sequence view of the sequence-specific buffers of every layer.
 struct RowBuffers<'a> {
     recurrent: Vec<(&'a MetalBuffer, &'a MetalBuffer)>,
     kv: Vec<(&'a MetalBuffer, &'a MetalBuffer)>,
     positions: Vec<usize>,
     capacities: Vec<usize>,
+    /// First row and row count of each sequence in the stacked block.
+    spans: Vec<(usize, usize)>,
+    /// Total stacked rows.
+    rows: usize,
+}
+
+impl RowBuffers<'_> {
+    const fn sequences(&self) -> usize {
+        self.positions.len()
+    }
 }
 
 impl BonsaiModel {
@@ -289,43 +381,53 @@ impl BonsaiModel {
         Ok(())
     }
 
-    /// Decode one token for each row's sequence in a single pass, leaving
-    /// each row's logits for [`Self::sample_batch_row`].
+    /// Decode every row's sequence in a single pass: its token, and after it
+    /// any drafts to verify, leaving each row's logits for
+    /// [`Self::sample_batch_row`] and [`Self::verify_batch_row`].
+    ///
+    /// A sequence without drafts advances by its token. A sequence with
+    /// drafts is left at its position, its recurrent state at the start of
+    /// the round, until [`Self::commit_batch`] keeps the rows it accepted.
     ///
     /// Every row must belong to a different sequence, and at most one row may
     /// be the resident sequence.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn decode_batch(&mut self, rows: &mut [BatchRow<'_>]) -> crate::Result<()> {
         let count = rows.len();
+        let total = rows.iter().map(BatchRow::rows).sum::<usize>();
         if count == 0
             || count > MAX_BATCH_SEQUENCES
-            || count > self.block_rows
+            || total > MAX_BATCH_ROWS
+            || total > self.block_rows
             || rows.iter().filter(|row| row.state.is_none()).count() > 1
-            || rows.iter().any(|row| row.token as usize >= VOCAB)
+            || rows.iter().any(|row| {
+                std::iter::once(row.token)
+                    .chain(row.drafts.iter().copied())
+                    .any(|token| token as usize >= VOCAB)
+            })
         {
             return Err(crate::Error::InvalidArgument(
                 "invalid batched decode rows".into(),
             ));
         }
-        if self.batch.is_none() {
-            let shaders = ShaderLibrary::new(self.context.device())?;
-            self.batch = Some(BatchScratch::new(&self.context, &shaders)?);
-        }
-        // Grow every sequence's caches for its new row, then make the shared
+        let verifying = rows.iter().any(|row| !row.drafts.is_empty());
+        self.reserve_batch(total, verifying)?;
+        // Grow every sequence's caches for its new rows, then make the shared
         // attention workspace cover the longest prefix.
         let mut longest = 0;
         for row in rows.iter_mut() {
             let position = row.state.as_ref().map_or(self.position, |s| s.position);
-            if position >= self.info.context {
+            let end = position + row.rows();
+            if end > self.info.context {
                 return Err(crate::Error::ContextOverflow(
                     "invalid Bonsai token block or position".into(),
                 ));
             }
             match row.state.as_deref_mut() {
-                Some(state) => self.reserve_parked(state, position + 1)?,
-                None => self.reserve_kv(position + 1, None)?,
+                Some(state) => self.reserve_parked(state, end)?,
+                None => self.reserve_kv(end, None)?,
             }
-            longest = longest.max(position + 1);
+            longest = longest.max(end);
         }
         if self.scratch.attention.max_context() < longest as u32 {
             self.scratch.attention = AttentionWorkspace::new(&self.context, longest as u32)?;
@@ -333,21 +435,31 @@ impl BonsaiModel {
         let lag_offsets = rows
             .iter_mut()
             .map(|row| {
+                let count = row.rows();
                 row.lag
                     .as_deref_mut()
-                    .and_then(|lag| lag.reserve_row(&self.context))
+                    .and_then(|lag| lag.reserve_rows(&self.context, count))
             })
             .collect::<Vec<_>>();
         self.selection = Selection::None;
-        let tokens = rows.iter().map(|row| row.token).collect::<Vec<_>>();
+        let tokens = rows
+            .iter()
+            .flat_map(|row| std::iter::once(row.token).chain(row.drafts.iter().copied()))
+            .collect::<Vec<_>>();
         decode_embeddings(
             &self.package,
             &tokens,
             self.scratch.embedding.as_mut_slice::<f32>(),
         )?;
         let buffers = self.row_buffers(rows);
-        let rows_u32 = count as u32;
+        let rows_u32 = total as u32;
         let scratch = &self.scratch;
+        let Some(output) = self.batch.as_ref() else {
+            return Err(crate::Error::InvalidArgument(
+                "batch scratch missing".into(),
+            ));
+        };
+        let verify = output.verify.as_ref().filter(|_| verifying);
         let mut batch = CommandBatch::new_concurrent(&self.context)?;
         self.kernels.transform(
             &mut batch,
@@ -366,7 +478,8 @@ impl BonsaiModel {
             self.normalize_input(&mut batch, &scratch.hidden, &layer.attention_norm, rows_u32)?;
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
-                    self.recurrent_rows(&mut batch, recurrent, &buffers, recurrent_index)?;
+                    let keep = verify.map(|verify| (verify, &verify.layers[recurrent_index]));
+                    self.recurrent_rows(&mut batch, recurrent, &buffers, recurrent_index, keep)?;
                     recurrent_index += 1;
                 }
                 AttentionLayer::Full(full) => {
@@ -384,11 +497,6 @@ impl BonsaiModel {
             self.feed_forward(&mut batch, layer, rows_u32)?;
         }
         self.normalize_input(&mut batch, &scratch.hidden, &self.output_norm, rows_u32)?;
-        let Some(output) = self.batch.as_ref() else {
-            return Err(crate::Error::InvalidArgument(
-                "batch scratch missing".into(),
-            ));
-        };
         self.project(
             &mut batch,
             &self.output,
@@ -398,30 +506,34 @@ impl BonsaiModel {
         )?;
         let selected = self.device_greedy;
         if selected {
-            output.greedy.encode(&mut batch, &output.logits, count)?;
+            output.greedy.encode(&mut batch, &output.logits, total)?;
         }
         let row_bytes = WIDTH * size_of::<f32>();
         let copies = rows
             .iter()
             .zip(&lag_offsets)
-            .enumerate()
-            .filter_map(|(row, (entry, offset))| {
+            .zip(&buffers.spans)
+            .filter_map(|((entry, offset), &(start, length))| {
                 let lag = entry.lag.as_deref()?;
                 Some(BufferCopyRequest {
                     source: &scratch.normalized,
-                    source_offset: row * row_bytes,
+                    source_offset: start * row_bytes,
                     destination: lag.hidden.as_ref()?,
                     destination_offset: (*offset)?,
-                    size: row_bytes,
+                    size: length * row_bytes,
                 })
             })
             .collect::<Vec<_>>();
         if !copies.is_empty() {
             batch.blit_buffer_copies(copies)?;
         }
+        let spans = buffers.spans.clone();
         drop(buffers);
         self.finish(batch)?;
         for (row, offset) in rows.iter_mut().zip(lag_offsets) {
+            if !row.drafts.is_empty() {
+                continue;
+            }
             match row.state.as_deref_mut() {
                 Some(state) => state.position += 1,
                 None => self.position += 1,
@@ -434,16 +546,17 @@ impl BonsaiModel {
             .batch
             .as_mut()
             .ok_or_else(|| crate::Error::InvalidArgument("batch scratch missing".into()))?;
-        output.rows = count;
+        output.rows = total;
         output.selected = selected;
+        output.starts = spans.iter().map(|&(start, _)| start).collect();
         let nonfinite = if selected {
             output
                 .greedy
-                .results(count)
+                .results(total)
                 .iter()
                 .any(|result| result.nonfinite != 0)
         } else {
-            output.logits.as_slice::<f32>()[..count * VOCAB]
+            output.logits.as_slice::<f32>()[..total * VOCAB]
                 .iter()
                 .any(|value| !value.is_finite())
         };
@@ -453,7 +566,53 @@ impl BonsaiModel {
         Ok(())
     }
 
-    /// Sample row `row` of the last [`Self::decode_batch`].
+    /// Most rows one [`Self::decode_batch`] may stack.
+    pub(crate) fn max_batch_rows(&self) -> usize {
+        MAX_BATCH_ROWS.min(self.block_rows)
+    }
+
+    /// Make the batch scratch hold `rows` rows, and a verifying step's
+    /// recurrence inputs when `verifying`.
+    fn reserve_batch(&mut self, rows: usize, verifying: bool) -> crate::Result<()> {
+        let capacity = self.batch.as_ref().map_or(0, |output| output.capacity);
+        if capacity < rows {
+            let rows = rows
+                .next_power_of_two()
+                .clamp(MAX_BATCH_SEQUENCES, MAX_BATCH_ROWS);
+            let verify = self.batch.take().and_then(|output| output.verify);
+            let mut output = BatchScratch::new(&self.context, rows)?;
+            output.verify = verify;
+            self.batch = Some(output);
+        }
+        let Some(output) = self.batch.as_mut() else {
+            return Err(crate::Error::InvalidArgument(
+                "batch scratch missing".into(),
+            ));
+        };
+        if verifying
+            && output
+                .verify
+                .as_ref()
+                .is_none_or(|verify| verify.rows < rows)
+        {
+            output.verify = None;
+            let layers = self
+                .layers
+                .iter()
+                .filter(|layer| matches!(layer.attention, AttentionLayer::Recurrent(_)))
+                .count();
+            output.verify = Some(BatchVerify::new(
+                &self.context,
+                self.state_format,
+                layers,
+                rows.next_power_of_two().min(MAX_BATCH_ROWS),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Sample row `row` of the last [`Self::decode_batch`], counting every
+    /// sequence's seed and draft rows.
     pub(crate) fn sample_batch_row(
         &mut self,
         row: usize,
@@ -478,6 +637,207 @@ impl BonsaiModel {
             &self.context,
             &self.sampling,
         )
+    }
+
+    /// First row of sequence `sequence` in the last [`Self::decode_batch`].
+    pub(crate) fn batch_row_start(&self, sequence: usize) -> crate::Result<usize> {
+        self.batch
+            .as_ref()
+            .and_then(|output| output.starts.get(sequence).copied())
+            .ok_or_else(|| crate::Error::InvalidArgument("batched sequence out of range".into()))
+    }
+
+    /// Verify sequence `sequence`'s drafts against its rows of the last
+    /// [`Self::decode_batch`], exactly as a single sequence's verify block is
+    /// verified.
+    pub(crate) fn verify_batch_row(
+        &mut self,
+        sequence: usize,
+        drafts: &[u32],
+        sampler: &mut Sampler,
+    ) -> crate::Result<crate::sampler::Verification> {
+        let start = self.batch_row_start(sequence)?;
+        crate::sampler::verify_greedy_drafts(sampler, drafts, |row, sampler| {
+            self.sample_batch_row(start + row, sampler)
+        })
+    }
+
+    /// Settle the sequences that verified drafts in the last
+    /// [`Self::decode_batch`] (with the same `rows`): each keeps its first
+    /// `committed[index]` rows. Their recurrent state and history replay
+    /// those rows from the start of the round, in one submission for every
+    /// sequence; positions and head lags advance by the kept rows. Entries of
+    /// sequences without drafts are ignored.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn commit_batch(
+        &mut self,
+        rows: &mut [BatchRow<'_>],
+        committed: &[usize],
+    ) -> crate::Result<()> {
+        if committed.len() != rows.len()
+            || rows
+                .iter()
+                .zip(committed)
+                .any(|(row, &kept)| !row.drafts.is_empty() && !(1..=row.rows()).contains(&kept))
+        {
+            return Err(crate::Error::InvalidArgument(
+                "batched commit needs 1..=rows kept rows per verifying sequence".into(),
+            ));
+        }
+        if rows.iter().all(|row| row.drafts.is_empty()) {
+            return Ok(());
+        }
+        let verify = self
+            .batch
+            .as_ref()
+            .and_then(|output| output.verify.as_ref())
+            .ok_or_else(|| crate::Error::InvalidArgument("no verifying batched step".into()))?;
+        let starts = self
+            .batch
+            .as_ref()
+            .map(|output| output.starts.clone())
+            .unwrap_or_default();
+        if starts.len() != rows.len() {
+            return Err(crate::Error::InvalidArgument(
+                "batched commit does not match the last step".into(),
+            ));
+        }
+        let buffers = self.row_buffers(rows);
+        let sequences = buffers.sequences();
+        let scratch = &self.scratch;
+        let mut batch = CommandBatch::new_concurrent(&self.context)?;
+        let recurrent = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attention {
+                AttentionLayer::Recurrent(layer) => Some(layer),
+                AttentionLayer::Full(_) => None,
+            });
+        for (index, (layer, kept)) in recurrent.zip(&verify.layers).enumerate() {
+            let replays = (0..sequences)
+                .filter(|&sequence| !rows[sequence].drafts.is_empty())
+                .map(|sequence| {
+                    let (state, history) = buffers.recurrent[index * sequences + sequence];
+                    (
+                        starts[sequence] as u32,
+                        committed[sequence] as u32,
+                        state,
+                        history,
+                    )
+                })
+                .collect::<Vec<_>>();
+            batch.independent(|batch| {
+                for &(start, length, _, history) in &replays {
+                    self.ops.conv_rows_at(
+                        batch,
+                        &kept.inputs,
+                        &layer.convolution,
+                        history,
+                        &scratch.convolved,
+                        start,
+                        length,
+                    )?;
+                }
+                crate::Result::Ok(())
+            })?;
+            batch.independent(|batch| {
+                for &(start, length, _, _) in &replays {
+                    self.ops.l2_normalize_qk_rows_at(
+                        batch,
+                        &scratch.convolved,
+                        self.epsilon,
+                        start,
+                        length,
+                    )?;
+                }
+                crate::Result::Ok(())
+            })?;
+            batch.independent(|batch| {
+                for &(start, length, state, _) in &replays {
+                    self.ops.gdn_rows_at(
+                        batch,
+                        self.state_format,
+                        [&scratch.convolved, &kept.decay, &kept.beta],
+                        [state, state],
+                        &scratch.recurrent_output,
+                        start,
+                        length,
+                    )?;
+                }
+                crate::Result::Ok(())
+            })?;
+        }
+        drop(buffers);
+        self.finish(batch)?;
+        for (row, &kept) in rows.iter_mut().zip(committed) {
+            if row.drafts.is_empty() {
+                continue;
+            }
+            match row.state.as_deref_mut() {
+                Some(state) => state.position += kept,
+                None => self.position += kept,
+            }
+            if let Some(lag) = row.lag.as_deref_mut()
+                && lag.usable()
+            {
+                lag.tokens.push(row.token);
+                lag.tokens.extend_from_slice(&row.drafts[..kept - 1]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Draft up to the head's depth after `seed` for the resident sequence,
+    /// as its single-sequence speculative round drafts, first feeding its head
+    /// the rows it missed in batched steps. The drafts are verified in a
+    /// batched step; their rows reach the head through `lag` again.
+    pub(crate) fn draft_resident(
+        &mut self,
+        lag: &mut HeadLag,
+        seed: u32,
+        sampler: &Sampler,
+        remaining: usize,
+    ) -> crate::Result<Vec<u32>> {
+        if !lag.usable() {
+            return Ok(Vec::new());
+        }
+        self.catch_up_head(lag)?;
+        let Some(mut speculation) = self.speculation.take() else {
+            return Ok(Vec::new());
+        };
+        let result = (|| {
+            let depth = super::draft_depth(
+                speculation.mtp.depth,
+                remaining,
+                self.info.context,
+                self.position,
+            );
+            if depth == 0 {
+                return Ok(Vec::new());
+            }
+            self.reserve_kv(self.position + depth + 1, Some(&mut speculation))?;
+            let mut draft_sampler = sampler.greedy_draft();
+            let drafts = if draft_sampler.applies_penalties() {
+                self.draft_on_host(
+                    &mut speculation,
+                    &mut draft_sampler,
+                    seed,
+                    depth,
+                    super::DRAFT_CHAIN_MIN_MARGIN,
+                )?
+            } else {
+                self.draft_on_device(
+                    &mut speculation,
+                    &draft_sampler,
+                    seed,
+                    depth,
+                    super::DRAFT_CHAIN_MIN_MARGIN,
+                )?
+            };
+            Ok(drafts.iter().map(|draft| draft.token).collect())
+        })();
+        self.speculation = Some(speculation);
+        result
     }
 
     /// Feed the resident sequence's MTP head the rows it missed while decoding
@@ -533,8 +893,10 @@ impl BonsaiModel {
             kv: Vec::new(),
             positions: Vec::new(),
             capacities: Vec::new(),
+            spans: Vec::new(),
+            rows: 0,
         };
-        // Layer-major: entry `layer * rows + row`.
+        // Layer-major: entry `layer * sequences + sequence`.
         let mut recurrent_index = 0;
         let mut full_index = 0;
         for layer in &self.layers {
@@ -574,28 +936,35 @@ impl BonsaiModel {
                 });
             buffers.positions.push(position);
             buffers.capacities.push(capacity);
+            buffers.spans.push((buffers.rows, row.rows()));
+            buffers.rows += row.rows();
         }
         buffers
     }
 
+    /// One recurrent layer over the stacked rows. A sequence's single row
+    /// updates its state and history in place. A sequence's verify rows read
+    /// them and leave them as they were (the block's final ones go to the
+    /// spares); with `keep` the layer's raw QKV rows, decay and beta are kept
+    /// there for [`Self::commit_batch`] to replay.
+    #[allow(clippy::too_many_lines)]
     fn recurrent_rows(
         &self,
         batch: &mut CommandBatch,
         layer: &RecurrentLayer,
         buffers: &RowBuffers<'_>,
         layer_index: usize,
+        keep: Option<(&BatchVerify, &VerifyLayer)>,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
-        let rows = buffers.positions.len();
-        let count = rows as u32;
+        let sequences = buffers.sequences();
+        let count = buffers.rows as u32;
+        let (raw, decay, beta) = keep.map_or(
+            (&scratch.query_gate, &scratch.decay, &scratch.beta),
+            |(_, kept)| (&kept.inputs, &kept.decay, &kept.beta),
+        );
         batch.independent(|batch| {
-            self.project(
-                batch,
-                &layer.qkv,
-                &scratch.rotated_hidden,
-                &scratch.query_gate,
-                count,
-            )?;
+            self.project(batch, &layer.qkv, &scratch.rotated_hidden, raw, count)?;
             self.project(
                 batch,
                 &layer.gate,
@@ -617,36 +986,76 @@ impl BonsaiModel {
             }
             crate::Result::Ok(())
         })?;
-        let sequence = &buffers.recurrent[layer_index * rows..(layer_index + 1) * rows];
+        let sequence = &buffers.recurrent[layer_index * sequences..(layer_index + 1) * sequences];
+        let inputs = [&layer.decay, &scratch.alpha, &layer.dt, &scratch.raw_beta];
         batch.independent(|batch| {
-            for (row, &(_, history)) in sequence.iter().enumerate() {
-                self.ops.conv_l2_decay_row(
-                    batch,
-                    &scratch.query_gate,
-                    &layer.convolution,
-                    history,
-                    &scratch.convolved,
-                    self.epsilon,
-                    [&layer.decay, &scratch.alpha, &layer.dt, &scratch.raw_beta],
-                    &scratch.decay,
-                    &scratch.beta,
-                    row as u32,
-                )?;
+            for (&(start, length), &(_, history)) in buffers.spans.iter().zip(sequence) {
+                if length == 1 {
+                    self.ops.conv_l2_decay_row(
+                        batch,
+                        raw,
+                        &layer.convolution,
+                        history,
+                        &scratch.convolved,
+                        self.epsilon,
+                        inputs,
+                        decay,
+                        beta,
+                        start as u32,
+                    )?;
+                } else {
+                    let spare = &keep
+                        .ok_or_else(|| {
+                            crate::Error::InvalidArgument("verify rows without spares".into())
+                        })?
+                        .0
+                        .spare_history;
+                    self.ops.conv_l2_decay_rows_at(
+                        batch,
+                        raw,
+                        &layer.convolution,
+                        [history, spare],
+                        &scratch.convolved,
+                        self.epsilon,
+                        inputs,
+                        [decay, beta],
+                        start as u32,
+                        length as u32,
+                    )?;
+                }
             }
             crate::Result::Ok(())
         })?;
         batch.independent(|batch| {
-            for (row, &(state, _)) in sequence.iter().enumerate() {
-                self.ops.gdn_row(
-                    batch,
-                    self.state_format,
-                    &scratch.convolved,
-                    &scratch.decay,
-                    &scratch.beta,
-                    state,
-                    &scratch.recurrent_output,
-                    row as u32,
-                )?;
+            for (&(start, length), &(state, _)) in buffers.spans.iter().zip(sequence) {
+                if length == 1 {
+                    self.ops.gdn_row(
+                        batch,
+                        self.state_format,
+                        &scratch.convolved,
+                        decay,
+                        beta,
+                        state,
+                        &scratch.recurrent_output,
+                        start as u32,
+                    )?;
+                } else {
+                    let spare = &keep
+                        .ok_or_else(|| {
+                            crate::Error::InvalidArgument("verify rows without spares".into())
+                        })?
+                        .0
+                        .spare_state;
+                    self.ops.gdn_rows_at(
+                        batch,
+                        self.state_format,
+                        [&scratch.convolved, decay, beta],
+                        [state, spare],
+                        &scratch.recurrent_output,
+                        start as u32,
+                        length as u32,
+                    )?;
+                }
             }
             crate::Result::Ok(())
         })?;
@@ -670,8 +1079,8 @@ impl BonsaiModel {
         layer_index: usize,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
-        let rows = buffers.positions.len();
-        let count = rows as u32;
+        let sequences = buffers.sequences();
+        let count = buffers.rows as u32;
         batch.independent(|batch| {
             for (weights, output) in [
                 (&layer.query_gate, &scratch.query_gate),
@@ -682,39 +1091,74 @@ impl BonsaiModel {
             }
             crate::Result::Ok(())
         })?;
-        let caches = &buffers.kv[layer_index * rows..(layer_index + 1) * rows];
+        let caches = &buffers.kv[layer_index * sequences..(layer_index + 1) * sequences];
         batch.independent(|batch| {
-            for (row, &(key, value)) in caches.iter().enumerate() {
-                self.ops.prepare_attention_row_kv(
-                    self.kv_layout,
-                    batch,
-                    [&scratch.query_gate, &scratch.key, &scratch.value],
-                    [&layer.query_norm, &layer.key_norm],
-                    [&scratch.query, &scratch.gate],
-                    (key, value).into(),
-                    buffers.positions[row] as u32,
-                    buffers.capacities[row] as u32,
-                    self.epsilon,
-                    self.rope_base,
-                    row as u32,
-                )?;
+            for (sequence, &(key, value)) in caches.iter().enumerate() {
+                let (start, length) = buffers.spans[sequence];
+                let position = buffers.positions[sequence] as u32;
+                let capacity = buffers.capacities[sequence] as u32;
+                if length == 1 {
+                    self.ops.prepare_attention_row_kv(
+                        self.kv_layout,
+                        batch,
+                        [&scratch.query_gate, &scratch.key, &scratch.value],
+                        [&layer.query_norm, &layer.key_norm],
+                        [&scratch.query, &scratch.gate],
+                        (key, value).into(),
+                        position,
+                        capacity,
+                        self.epsilon,
+                        self.rope_base,
+                        start as u32,
+                    )?;
+                } else {
+                    self.ops.prepare_attention_rows_kv_at(
+                        self.kv_layout,
+                        batch,
+                        [&scratch.query_gate, &scratch.key, &scratch.value],
+                        [&layer.query_norm, &layer.key_norm],
+                        [&scratch.query, &scratch.gate],
+                        [key, value],
+                        [position, capacity],
+                        [self.epsilon, self.rope_base],
+                        start as u32,
+                        length as u32,
+                    )?;
+                }
             }
             crate::Result::Ok(())
         })?;
-        // The rows share one attention workspace, so they stay ordered.
-        for (row, &(key, value)) in caches.iter().enumerate() {
-            self.ops.attention_row_kv(
-                self.kv_layout,
-                batch,
-                &scratch.query,
-                key,
-                value,
-                Some(&scratch.gate),
-                &scratch.attention_output,
-                buffers.positions[row] as u32 + 1,
-                &scratch.attention,
-                row as u32,
-            )?;
+        // The sequences share one attention workspace, so they stay ordered.
+        for (sequence, &(key, value)) in caches.iter().enumerate() {
+            let (start, length) = buffers.spans[sequence];
+            let position = buffers.positions[sequence] as u32;
+            if length == 1 {
+                self.ops.attention_row_kv(
+                    self.kv_layout,
+                    batch,
+                    &scratch.query,
+                    key,
+                    value,
+                    Some(&scratch.gate),
+                    &scratch.attention_output,
+                    position + 1,
+                    &scratch.attention,
+                    start as u32,
+                )?;
+            } else {
+                self.ops.attention_block_kv_at(
+                    self.kv_layout,
+                    batch,
+                    &scratch.query,
+                    [key, value],
+                    &scratch.gate,
+                    &scratch.attention_output,
+                    position,
+                    length as u32,
+                    &scratch.attention,
+                    start as u32,
+                )?;
+            }
         }
         self.project_attention(batch, &layer.output, count)
     }

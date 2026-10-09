@@ -110,8 +110,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
     Ok(options)
 }
 
-/// `local_metal::bonsai::DEFAULT_SMALL_BATCH_MAX`: the largest verify block the
-/// per-row logits path runs on its small-batch kernels.
+/// Within `local_metal::bonsai::DEFAULT_SMALL_BATCH_MAX`, so the per-row
+/// logits path runs on the small-batch kernels.
 const DEFAULT_ROWS: usize = 60;
 
 /// One corpus document: where it came from and its rendered text.

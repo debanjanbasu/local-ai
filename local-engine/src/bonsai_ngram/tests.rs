@@ -38,14 +38,15 @@ fn store_is_bounded_and_reused() {
 
 #[test]
 fn drafts_fill_their_verify_tile() {
-    // Small-batch cost grows with rows through DEFAULT_SMALL_BATCH_MAX (60).
+    // Small-batch cost grows with rows through DEFAULT_SMALL_BATCH_MAX (128),
+    // which covers every verify block (at most 64 drafts), so no draft is
+    // padded.
     assert_eq!(fill_verify_tile(10, 40), 10);
     assert_eq!(fill_verify_tile(40, 63), 40);
     assert_eq!(fill_verify_tile(59, 63), 59);
-    // Past it, the 64-token tile is flat, so the draft fills it.
-    assert_eq!(fill_verify_tile(60, 63), 63);
-    assert_eq!(fill_verify_tile(60, 62), 62);
-    assert_eq!(fill_verify_tile(61, 20), 20);
+    assert_eq!(fill_verify_tile(60, 63), 60);
+    assert_eq!(fill_verify_tile(64, 64), 64);
+    assert_eq!(fill_verify_tile(61, 20), 61);
 }
 
 #[test]

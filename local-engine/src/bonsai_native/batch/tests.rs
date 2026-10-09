@@ -63,6 +63,7 @@ fn trajectories(model: &mut BonsaiModel, count: usize, batched: bool) -> Vec<Vec
                 .enumerate()
                 .map(|(index, state)| BatchRow {
                     token: forced(index, step),
+                    drafts: Vec::new(),
                     state: Some(state),
                     lag: None,
                 })
@@ -196,6 +197,7 @@ fn batched_step_timings() {
                 .enumerate()
                 .map(|(index, state)| BatchRow {
                     token: 1000 + (index * 31 + step) as u32,
+                    drafts: Vec::new(),
                     state: Some(state),
                     lag: None,
                 })
@@ -247,4 +249,229 @@ fn batched_step_timings() {
     }
     model.ngram_verifier = Some(verifier);
     println!("{}", serde_json::json!({"batched": lines, "blocks": solo}));
+}
+
+/// Time of one prefill block of `rows` rows (no logits), the cost of one
+/// interleaved prefill chunk beside batched decode.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device; prints timings"]
+fn prefill_block_timings() {
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open Bonsai GGUF");
+    let mut model = BonsaiModel::load(
+        package,
+        8192,
+        128,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    let mut lines = Vec::new();
+    for rows in [8usize, 16, 32, 48, 64, 96, 128] {
+        let tokens = (0..rows).map(|row| 1000 + row as u32).collect::<Vec<_>>();
+        let mut elapsed = 0.0;
+        for repeat in 0..6 {
+            model.reset();
+            model
+                .forward_block(&tokens, BlockOutput::None)
+                .expect("warm block");
+            let started = Instant::now();
+            model
+                .forward_block(&tokens, BlockOutput::None)
+                .expect("block");
+            if repeat >= 1 {
+                elapsed += started.elapsed().as_secs_f64();
+            }
+        }
+        let block = elapsed / 5.0;
+        lines.push(serde_json::json!({
+            "rows": rows, "block_ms": block * 1e3, "tok_s": rows as f64 / block,
+        }));
+    }
+    println!("{}", serde_json::json!({"prefill_blocks": lines}));
+}
+
+/// Seeds and drafts verified for three sequences in one batched pass: one
+/// with four rows, one with a single row, one with three. Each verify row's
+/// logits track the same sequence's own verify block, and after each keeps
+/// the rows a commit names (a partial commit, a plain row and a full
+/// commit), the next batched step tracks each sequence decoded alone from
+/// the same kept rows, so the replayed state and positions are exact.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn batched_verify_tracks_each_sequence_alone() {
+    let mut model = load(1024, true);
+    let drafts: [&[u32]; 3] = [&[264, 5010, 2336], &[], &[11, 13]];
+    let kept = [2usize, 1, 3];
+    let next = [3010u32, 846, 198];
+    // Reference: each sequence alone, verify block then kept rows then one step.
+    let mut verifier = model.ngram_verifier.take().expect("n-gram verifier");
+    let mut reference = Vec::new();
+    let mut states = prefilled(&mut model, 3);
+    for (index, state) in states.iter_mut().enumerate() {
+        model.swap_sequence(state).expect("swap in");
+        let inputs = std::iter::once(forced(index, 0))
+            .chain(drafts[index].iter().copied())
+            .collect::<Vec<_>>();
+        let start = model.position;
+        let mut rows = Vec::new();
+        if inputs.len() > 1 {
+            verifier
+                .reserve(&model.context, inputs.len())
+                .expect("reserve");
+            model
+                .forward_block(&inputs, BlockOutput::Verify(&verifier))
+                .expect("verify block");
+            for row in 0..inputs.len() {
+                rows.push(
+                    verifier.verify_logits.as_slice::<f32>()[row * VOCAB..(row + 1) * VOCAB]
+                        .to_vec(),
+                );
+            }
+            model
+                .commit_verified(&mut verifier, inputs.len(), kept[index])
+                .expect("commit");
+            model.position = start + kept[index];
+        } else {
+            model.decode(inputs[0]).expect("decode");
+            rows.push(model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec());
+        }
+        model.decode(next[index]).expect("next");
+        let after = model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+        model.swap_sequence(state).expect("swap out");
+        reference.push((rows, after));
+    }
+    model.ngram_verifier = Some(verifier);
+    // Batched: the same rows in one pass, the same commits, one plain step.
+    let mut states = prefilled(&mut model, 3);
+    let mut rows = states
+        .iter_mut()
+        .enumerate()
+        .map(|(index, state)| BatchRow {
+            token: forced(index, 0),
+            drafts: drafts[index].to_vec(),
+            state: Some(state),
+            lag: None,
+        })
+        .collect::<Vec<_>>();
+    model.decode_batch(&mut rows).expect("batched verify");
+    let mut worst = 0.0f64;
+    for (index, (expected, _)) in reference.iter().enumerate() {
+        let start = model.batch_row_start(index).expect("start");
+        let output = model.batch.as_ref().expect("batch scratch");
+        for (row, expected) in expected.iter().enumerate() {
+            let actual =
+                &output.logits.as_slice::<f32>()[(start + row) * VOCAB..(start + row + 1) * VOCAB];
+            worst = worst.max(kl(expected, actual));
+            assert_eq!(
+                argmax(expected),
+                argmax(actual),
+                "sequence {index} row {row}"
+            );
+        }
+    }
+    model.commit_batch(&mut rows, &kept).expect("commit");
+    drop(rows);
+    for (index, state) in states.iter().enumerate() {
+        assert_eq!(state.position, PREFIXES[index].len() + kept[index]);
+    }
+    let mut rows = states
+        .iter_mut()
+        .enumerate()
+        .map(|(index, state)| BatchRow {
+            token: next[index],
+            drafts: Vec::new(),
+            state: Some(state),
+            lag: None,
+        })
+        .collect::<Vec<_>>();
+    model.decode_batch(&mut rows).expect("batched step");
+    let output = model.batch.as_ref().expect("batch scratch");
+    for (index, (_, expected)) in reference.iter().enumerate() {
+        let actual = &output.logits.as_slice::<f32>()[index * VOCAB..(index + 1) * VOCAB];
+        worst = worst.max(kl(expected, actual));
+        assert_eq!(
+            argmax(expected),
+            argmax(actual),
+            "sequence {index} after commit"
+        );
+    }
+    println!("{}", serde_json::json!({"batched_verify_max_kl": worst}));
+    assert!(worst < 1e-3, "max KL {worst}");
+}
+
+/// Time of one batched pass that verifies drafts: `sequences` sequences of
+/// `1 + drafts` rows each, then the commit of every row (the cost model of
+/// batched speculation).
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device; prints timings"]
+fn batched_verify_timings() {
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open Bonsai GGUF");
+    let mut model = BonsaiModel::load(
+        package,
+        4096,
+        128,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    let mut lines = Vec::new();
+    for (sequences, drafts) in [
+        (1, 0),
+        (2, 0),
+        (4, 0),
+        (8, 0),
+        (2, 1),
+        (2, 3),
+        (4, 1),
+        (4, 3),
+        (4, 7),
+        (8, 1),
+        (8, 3),
+        (8, 7),
+        (2, 15),
+        (4, 15),
+        (2, 31),
+    ] {
+        let mut states = prefilled(&mut model, sequences.min(4));
+        while states.len() < sequences {
+            states.push(model.new_sequence().expect("sequence"));
+        }
+        let repeats = 6u32;
+        let mut pass = 0.0;
+        let mut commit = 0.0;
+        for repeat in 0..repeats + 2 {
+            let mut rows = states
+                .iter_mut()
+                .enumerate()
+                .map(|(index, state)| BatchRow {
+                    token: 1000 + index as u32 * 31 + repeat,
+                    drafts: (0..drafts).map(|draft| 2000 + draft as u32).collect(),
+                    state: Some(state),
+                    lag: None,
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            model.decode_batch(&mut rows).expect("batched pass");
+            let middle = Instant::now();
+            let kept = rows
+                .iter()
+                .map(|row| row.drafts.len() + 1)
+                .collect::<Vec<_>>();
+            model.commit_batch(&mut rows, &kept).expect("commit");
+            if repeat >= 2 {
+                pass += middle.duration_since(started).as_secs_f64();
+                commit += middle.elapsed().as_secs_f64();
+            }
+        }
+        lines.push(serde_json::json!({
+            "sequences": sequences, "drafts": drafts, "rows": sequences * (drafts + 1),
+            "pass_ms": pass / f64::from(repeats) * 1e3,
+            "commit_ms": commit / f64::from(repeats) * 1e3,
+        }));
+    }
+    println!("{}", serde_json::json!({"batched_verify": lines}));
 }

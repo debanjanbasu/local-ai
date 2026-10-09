@@ -59,6 +59,16 @@ static inline void bonsai_ptq1_values(
     values[15] = float(input[base + block * 128 + 120 + part]);
 }
 
+// Two adjacent activations as F32, one eight-byte load from a device
+// pointer (`index` must be even); other handles widen two elements.
+static inline metal::float2 bonsai_ptq1_pair(device const float *input, metal::ulong index) {
+    return *reinterpret_cast<device const metal::float2 *>(input + index);
+}
+template<typename Input>
+static inline metal::float2 bonsai_ptq1_pair(Input input, metal::ulong index) {
+    return metal::float2(float(input[index]), float(input[index + 1]));
+}
+
 // One threadgroup is one SIMD group of 32 lanes: lane / 8 selects the packed
 // block in flight, lane & 7 its sixteen-element part. Dispatch
 // ceil(rows / rows_per_group) groups; `first_token` selects the activation
@@ -223,13 +233,16 @@ static inline void bonsai_ptq1_small_batch_pair_impl(
 // exact trits (each lane decodes two, rows `fn` and `fn + 1` at element `fm`),
 // so every product is exact before the F32 MMA accumulation; a block's partial
 // sums are scaled once, as in the matvec, then the four SIMD groups' partials
-// are added through threadgroup memory. Token rows past `tokens` contribute
-// zeros and are not stored. Dispatch ceil(rows / 8) groups of 128 threads.
+// are added through threadgroup memory. Token rows past `tokens` repeat the
+// last row and are not stored: row fm of X only reaches row fm of C. Dispatch
+// ceil(rows / 8) groups of 128 threads.
 // The summation order differs from the scalar kernel, so outputs are not bit
 // identical: on random FFN-shaped weights the largest gap measured 1.5e-7 to
 // 2.2e-7 of the largest output magnitude. Half-prefix trit decoding took the
-// FFN shapes from 341-350 to 280-301 us with bit-identical outputs; the F32
-// 8x8 multiplies remain the limit.
+// FFN shapes from 341-350 to 280-301 us with bit-identical outputs, and one
+// eight-byte activation load per tile (instead of two loads and two selects)
+// to 233-237 / 236-281 us on 17408x5120 / 5120x17408, also bit-identical;
+// the F32 8x8 multiplies remain the limit.
 //
 // Inside a block K is permuted: tile j holds elements 8j..8j+7, so the X tile
 // is eight contiguous activations per token and the W tile's element 8j + fm
@@ -262,7 +275,6 @@ static inline void bonsai_ptq1_small_batch_wide_impl(
     const metal::ulong row_base[2] = {
         metal::ulong(metal::min(first_row + fn, rows - 1)) * blocks,
         metal::ulong(metal::min(first_row + fn + 1, rows - 1)) * blocks};
-    const bool live = fm < tokens;
     const metal::ulong input_row =
         metal::ulong(first_token + metal::min(fm, tokens - 1)) * columns + fn;
     const float power = metal::float4(1.0f, 3.0f, 9.0f, 27.0f)[fm >> 1];
@@ -292,10 +304,10 @@ static inline void bonsai_ptq1_small_batch_wide_impl(
         for (metal::uint tile = 0; tile < 16; ++tile) {
             metal::simdgroup_float8x8 x;
             metal::simdgroup_float8x8 w;
-            const float x0 = float(input[base + tile * 8]);
-            const float x1 = float(input[base + tile * 8 + 1]);
-            x.thread_elements()[0] = live ? x0 : 0.0f;
-            x.thread_elements()[1] = live ? x1 : 0.0f;
+            // fn is even and rows are whole blocks, so the pair is aligned.
+            const metal::float2 pair = bonsai_ptq1_pair(input, base + tile * 8);
+            x.thread_elements()[0] = pair.x;
+            x.thread_elements()[1] = pair.y;
             w.thread_elements()[0] = float(trits[0][tile]);
             w.thread_elements()[1] = float(trits[1][tile]);
             if (tile == 0) {
@@ -310,7 +322,7 @@ static inline void bonsai_ptq1_small_batch_wide_impl(
     shared[simd * 64 + lane * 2] = sums[0];
     shared[simd * 64 + lane * 2 + 1] = sums[1];
     metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    if (simd != 0 || !live) return;
+    if (simd != 0 || fm >= tokens) return;
     #pragma clang loop unroll(full)
     for (metal::uint s = 1; s < split; ++s) {
         sums[0] += shared[s * 64 + lane * 2];

@@ -3,10 +3,16 @@ use std::collections::VecDeque;
 use super::{
     BonsaiEngine, BonsaiGeneration, BonsaiModel, CancelToken, GenerateParams, GenerationStats,
     HeadLag, Instant, LookupPolicy, MtpStats, PrefillProgress, PromptCacheSource, PromptCheckpoint,
-    Sampler, SamplingParams, SamplingResult, SequenceState, StopReason, SuffixSession, VOCAB,
-    fill_verify_tile,
+    PromptPrefill, Sampler, SamplingParams, SamplingResult, SequenceState, StopReason,
+    SuffixSession, VOCAB, fill_verify_tile,
 };
 use crate::bonsai_tokenizer::{BonsaiTokenizer, StreamDecodeState};
+
+/// Acceptance assumed for a sequence's first lookup drafts: a lookup fires
+/// only after a long exact match.
+const INITIAL_NGRAM_ACCEPTANCE: f64 = 0.8;
+/// Acceptance assumed for a sequence's first head drafts.
+const INITIAL_MTP_ACCEPTANCE: f64 = 0.6;
 
 /// One request between its prefill and its last token.
 ///
@@ -16,8 +22,8 @@ use crate::bonsai_tokenizer::{BonsaiTokenizer, StreamDecodeState};
 /// before batching existed.
 pub(super) struct ActiveGeneration {
     pub(super) id: u64,
-    prompt: Vec<u32>,
-    params: GenerateParams,
+    pub(super) prompt: Vec<u32>,
+    pub(super) params: GenerateParams,
     session_id: Option<String>,
     pub(super) cancel: CancelToken,
     started: Instant,
@@ -28,8 +34,8 @@ pub(super) struct ActiveGeneration {
     pub(super) done: bool,
     pub(super) sampler: Sampler,
     decoder: StreamDecodeState,
-    suffixes: SuffixSession,
-    lookup_policy: LookupPolicy,
+    pub(super) suffixes: SuffixSession,
+    pub(super) lookup_policy: LookupPolicy,
     pub(super) pending: VecDeque<SamplingResult>,
     cache_source: PromptCacheSource,
     prompt_snapshot: Option<PromptCheckpoint>,
@@ -40,6 +46,14 @@ pub(super) struct ActiveGeneration {
     pub(super) state: Option<SequenceState>,
     /// Rows the MTP head missed while this sequence decoded in a batch.
     pub(super) lag: HeadLag,
+    /// The prompt's remaining prefill, until its first sample is taken.
+    pub(super) prefill: Option<PromptPrefill>,
+    /// Prefill chunks reported to the caller.
+    prefill_chunks: usize,
+    /// Running estimates of the chance a lookup or head draft is accepted,
+    /// for the batched-speculation cost model.
+    pub(super) ngram_acceptance: f64,
+    pub(super) mtp_acceptance: f64,
 }
 
 impl ActiveGeneration {
@@ -53,6 +67,25 @@ impl ActiveGeneration {
         self.pending.clear();
         self.seed = None;
         self.done = true;
+    }
+
+    /// Whether the generation is past its prompt and still running.
+    pub(super) const fn decoding(&self) -> bool {
+        !self.done && self.prefill.is_none()
+    }
+
+    /// Prompt tokens still to prefill, if the prompt is not prefilled yet.
+    pub(super) fn prefill_remaining(&self) -> Option<usize> {
+        self.prefill
+            .as_ref()
+            .map(|plan| plan.remaining(self.prompt.len()))
+    }
+
+    /// Prompt tokens this generation prefills in all, past its restored prefix.
+    pub(super) fn prefill_total(&self) -> usize {
+        self.prefill
+            .as_ref()
+            .map_or(0, |plan| self.prompt.len() - plan.reused)
     }
 
     /// The most tokens this generation's sequence can come to hold.
@@ -138,16 +171,11 @@ impl BonsaiEngine {
                 "a single generation cannot run beside admitted ones".into(),
             ));
         }
-        let id = self.admit(
-            prompt,
-            params,
-            session_id,
-            cancel.clone(),
-            progress,
-            &mut emit,
-        )?;
+        let id = self.admit(prompt, params, session_id, cancel.clone())?;
         loop {
-            for (finished, result) in self.step(&mut |_, piece| emit(piece)) {
+            for (finished, result) in self.step(&mut |_, piece| emit(piece), &mut |_, report| {
+                progress(report);
+            }) {
                 if finished == id {
                     return result;
                 }
@@ -155,8 +183,9 @@ impl BonsaiEngine {
         }
     }
 
-    /// Validate, prefill and take the first sample for a request whose
-    /// sequence is resident in the model.
+    /// Validate a request whose sequence is resident in the model, restore
+    /// its reusable prompt prefix and plan the rest of its prefill, which
+    /// [`Self::prefill_round`] runs.
     pub(super) fn begin_generation(
         &mut self,
         id: u64,
@@ -164,7 +193,6 @@ impl BonsaiEngine {
         params: &GenerateParams,
         session_id: Option<&str>,
         cancel: CancelToken,
-        progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<ActiveGeneration> {
         // Installed before anything can prefill, so the model always polls the
         // token belonging to the request in flight.
@@ -175,7 +203,7 @@ impl BonsaiEngine {
             prompt_tokens: prompt.len(),
             ..GenerationStats::default()
         };
-        let mut sampler = Sampler::new(
+        let sampler = Sampler::new(
             VOCAB,
             SamplingParams {
                 temperature: params.temperature,
@@ -199,7 +227,7 @@ impl BonsaiEngine {
             token_ids: Vec::new(),
             stop_reason: StopReason::TokenLimit,
             done: false,
-            sampler: sampler.clone(),
+            sampler,
             decoder: StreamDecodeState::default(),
             suffixes: self.suffix_store.session(&[], self.ngram.min_match),
             lookup_policy: LookupPolicy::new(self.ngram.max_drafts),
@@ -210,35 +238,85 @@ impl BonsaiEngine {
             seed: None,
             state: None,
             lag: HeadLag::default(),
+            prefill: None,
+            prefill_chunks: 0,
+            ngram_acceptance: INITIAL_NGRAM_ACCEPTANCE,
+            mtp_acceptance: INITIAL_MTP_ACCEPTANCE,
         };
         if params.max_tokens == 0 {
             generation.done = true;
             return Ok(generation);
         }
         self.model.take_gpu_time();
-        sampler.observe(prompt);
-        self.model.set_device_greedy(sampler.selects_argmax());
-        let (reused, cache_source, prompt_snapshot, persisted_reusable_boundary) =
-            self.prepare_prompt(prompt, session_id, progress)?;
-        generation.stats.reused_prompt_tokens = reused;
-        generation.stats.prefill = started.elapsed();
+        generation.sampler.observe(prompt);
+        let (plan, cache_source) = self.begin_prompt(prompt, session_id)?;
+        generation.stats.reused_prompt_tokens = plan.reused;
         generation.cache_source = cache_source;
-        generation.prompt_snapshot = prompt_snapshot;
-        generation.persisted_reusable_boundary = persisted_reusable_boundary;
-        generation.suffixes = self.suffix_store.session(prompt, self.ngram.min_match);
-        if self.model.take_cancel_observed() {
-            // Prefill stopped between chunks, so `scratch.logits` still holds an
-            // older row: there is nothing new to sample. Fall through to the
-            // shared tail, which clears the prompt cache for a cancelled stop.
-            generation.stop_reason = StopReason::Cancelled;
-            generation.done = true;
-        } else {
-            let sample = sample_current(&mut self.model, &mut sampler, &mut generation.stats)?;
-            generation.pending.push_back(sample);
-        }
-        generation.sampler = sampler;
+        generation.prefill = Some(plan);
         generation.stats.gpu += self.model.take_gpu_time();
         Ok(generation)
+    }
+
+    /// Prefill up to `budget` more prompt tokens of the resident `generation`
+    /// and, once its prompt is complete, take its first sample.
+    pub(super) fn prefill_round(
+        &mut self,
+        generation: &mut ActiveGeneration,
+        budget: usize,
+        progress: &mut dyn FnMut(u64, PrefillProgress),
+    ) -> crate::Result<()> {
+        let Some(mut plan) = generation.prefill.take() else {
+            return Ok(());
+        };
+        self.model.take_gpu_time();
+        self.model.set_cancel(generation.cancel.clone());
+        self.model
+            .set_device_greedy(generation.sampler.selects_argmax());
+        let id = generation.id;
+        let chunks = &mut generation.prefill_chunks;
+        let mut report = |report: PrefillProgress| {
+            *chunks += 1;
+            progress(
+                id,
+                PrefillProgress {
+                    tokens: report.tokens,
+                    chunks: *chunks,
+                },
+            );
+        };
+        let complete = self.advance_prompt(
+            &generation.prompt,
+            generation.session_id.as_deref(),
+            &mut plan,
+            budget,
+            &mut report,
+        )?;
+        generation.stats.gpu += self.model.take_gpu_time();
+        if self.model.take_cancel_observed() {
+            // Prefill stopped between chunks, so `scratch.logits` holds no row
+            // of this prompt: there is nothing to sample. The shared tail
+            // clears the prompt cache for a cancelled stop.
+            generation.stop_reason = StopReason::Cancelled;
+            generation.done = true;
+            return Ok(());
+        }
+        if !complete {
+            generation.prefill = Some(plan);
+            return Ok(());
+        }
+        generation.stats.prefill = generation.started.elapsed();
+        generation.prompt_snapshot = plan.snapshot.take();
+        generation.persisted_reusable_boundary = plan.persisted_reusable_boundary;
+        generation.suffixes = self
+            .suffix_store
+            .session(&generation.prompt, self.ngram.min_match);
+        let sample = sample_current(
+            &mut self.model,
+            &mut generation.sampler,
+            &mut generation.stats,
+        )?;
+        generation.pending.push_back(sample);
+        Ok(())
     }
 
     /// Emit every pending sample, stopping the generation at EOS, at its token

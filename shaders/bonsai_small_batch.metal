@@ -28,8 +28,9 @@ BONSAI_SMALL_BATCH_KERNEL(2, bonsai_ptq1_small_batch_pair_impl)
 BONSAI_SMALL_BATCH_KERNEL(3, bonsai_ptq1_small_batch_impl)
 BONSAI_SMALL_BATCH_KERNEL(4, bonsai_ptq1_small_batch_impl)
 
-// 0.28-0.30 ms (0.34 ms with floor decoding) for any 1..8 tokens on both FFN
-// shapes; dispatch ceil(rows / 8) threadgroups of 128 threads.
+// 0.233-0.237 ms on 17408x5120 and 0.236-0.281 ms on 5120x17408 for 5..8
+// tokens (0.28-0.30 ms with two activation loads per tile, 0.34 ms with floor
+// decoding); dispatch ceil(rows / 8) threadgroups of 128 threads.
 kernel void bonsai_ptq1_small_batch_wide(
     device const BonsaiPtq1Block *weights [[buffer(0)]],
     device const float *input [[buffer(1)]],
