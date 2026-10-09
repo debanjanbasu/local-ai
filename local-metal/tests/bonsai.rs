@@ -170,17 +170,37 @@ fn setup() -> Option<(MetalContext, BonsaiKernels)> {
     Some((context, kernels))
 }
 
-fn prefill_kernels(context: &MetalContext) -> Vec<BonsaiKernels> {
+fn prefill_kernels(context: &MetalContext) -> Vec<(&'static str, BonsaiKernels)> {
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
-    [PrefillKernel::SimdF32, PrefillKernel::TensorF32]
-        .into_iter()
-        .filter_map(|kernel| {
-            BonsaiKernels::new_with_prefill_kernel(context, &shaders, kernel)
-                .map(|kernels| kernels.with_small_batch_max(1))
-                .map_err(|error| eprintln!("{} prefill unavailable: {error}", kernel.name()))
-                .ok()
-        })
-        .collect()
+    let mut kernels: Vec<(&'static str, BonsaiKernels)> =
+        [PrefillKernel::SimdF32, PrefillKernel::TensorF32]
+            .into_iter()
+            .filter_map(|kernel| {
+                BonsaiKernels::new_with_prefill_kernel(context, &shaders, kernel)
+                    .map(|kernels| {
+                        let kernels = kernels
+                            .with_small_batch_max(1)
+                            .with_large_batch_min(u32::MAX);
+                        (kernel.name(), kernels)
+                    })
+                    .map_err(|error| eprintln!("{} prefill unavailable: {error}", kernel.name()))
+                    .ok()
+            })
+            .collect();
+    // Every multi-token block on the large-batch kernel, tails included, and
+    // the default routing that sends a short remainder to the small-batch
+    // kernels.
+    kernels.push((
+        "large_batch",
+        BonsaiKernels::new(context, &shaders)
+            .expect("Bonsai kernels")
+            .with_large_batch_min(2),
+    ));
+    kernels.push((
+        "default",
+        BonsaiKernels::new(context, &shaders).expect("Bonsai kernels"),
+    ));
+    kernels
 }
 
 #[test]
@@ -513,7 +533,8 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
         return;
     };
     // Tile tails are the subject; small-batch shapes have their own test. Exercise
-    // both production prefill implementations directly against the F64 reference.
+    // both prefill tiles, the large-batch kernel alone and the default routing
+    // (large-batch tiles plus small-batch remainders) against the F64 reference.
     let kernels = prefill_kernels(&context);
     for (tokens, rows, columns) in [
         (1, 3, 128),
@@ -530,6 +551,9 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
         (63, 7, 128),
         (64, 32, 128),
         (65, 33, 256),
+        (81, 9, 256),
+        (100, 65, 384),
+        (120, 7, 128),
         (127, 3, 5120),
         (128, 5, 1024),
         (129, 65, 256),
@@ -561,7 +585,7 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
             .map(|_| guarded(&context, tokens * rows))
             .collect::<Vec<_>>();
         let mut batch = CommandBatch::new(&context).expect("batch");
-        for (kernels, output) in kernels.iter().zip(&outputs) {
+        for ((_, kernels), output) in kernels.iter().zip(&outputs) {
             kernels
                 .matmul(&mut batch, matrix, &input, output, tokens as u32)
                 .expect("matmul");
@@ -584,9 +608,8 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
                     .sum::<f64>();
                 let tolerance = f64::mul_add(expected.abs(), 2e-5, 3e-4)
                     .max(8.0 * f64::from(f32::EPSILON) * magnitude);
-                for (kernels, output) in kernels.iter().zip(&outputs) {
+                for ((name, _), output) in kernels.iter().zip(&outputs) {
                     let actual = f64::from(output.as_slice::<f32>()[token * rows + row]);
-                    let name = kernels.prefill_kernel().name();
                     assert!(
                         actual.is_finite() && (actual - expected).abs() <= tolerance,
                         "{name}: shape ({tokens}, {rows}, {columns}), token {token}, row {row}: {actual} != {expected}, tolerance {tolerance}",
@@ -607,7 +630,10 @@ fn matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range() {
         return;
     };
     // The tile path is the subject; the small-batch route is checked below.
-    let kernels = kernels.with_small_batch_max(1);
+    let large = kernels_with_small_batch_max(&context, 1).with_large_batch_min(2);
+    let kernels = kernels
+        .with_small_batch_max(1)
+        .with_large_batch_min(u32::MAX);
     let mut selected = [0_i8; 128];
     selected[7] = 1;
     let mut packed = encode_trits(&selected, f16::from_f32(2048.0)).to_vec();
@@ -621,29 +647,33 @@ fn matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range() {
         values[token * 128 + 7] = (token + 1) as f32 * 1.000_3;
     }
     let input = MetalBuffer::from_slice(context.device(), &values).expect("input");
-    let output = guarded(&context, 3 * 2);
-    let mut batch = CommandBatch::new(&context).expect("batch");
-    kernels
-        .matmul(&mut batch, matrix, &input, &output, 3)
-        .expect("matmul");
-    batch.commit_and_wait().expect("completion");
-    for token in 0..3 {
-        let expected = f64::from(values[token * 128 + 7]) * 2048.0;
-        assert_close(
-            output.as_slice::<f32>()[token * 2],
-            expected,
-            2e-6 * expected,
-        );
-        let sum = 2.0
-            * values[token * 128..(token + 1) * 128]
-                .iter()
-                .copied()
-                .map(f64::from)
-                .sum::<f64>();
-        assert!(sum > 65_504.0);
-        assert_close(output.as_slice::<f32>()[token * 2 + 1], sum, 2e-6 * sum);
+    // The tile and the large-batch kernel (half trit * scale operands, F32
+    // activations) must both keep the F32 operand bits.
+    for kernels in [&kernels, &large] {
+        let output = guarded(&context, 3 * 2);
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        kernels
+            .matmul(&mut batch, matrix, &input, &output, 3)
+            .expect("matmul");
+        batch.commit_and_wait().expect("completion");
+        for token in 0..3 {
+            let expected = f64::from(values[token * 128 + 7]) * 2048.0;
+            assert_close(
+                output.as_slice::<f32>()[token * 2],
+                expected,
+                2e-6 * expected,
+            );
+            let sum = 2.0
+                * values[token * 128..(token + 1) * 128]
+                    .iter()
+                    .copied()
+                    .map(f64::from)
+                    .sum::<f64>();
+            assert!(sum > 65_504.0);
+            assert_close(output.as_slice::<f32>()[token * 2 + 1], sum, 2e-6 * sum);
+        }
+        assert_guards(&output, 3 * 2);
     }
-    assert_guards(&output, 3 * 2);
 
     // Small-batch decodes the actual trits before the dot product. The former
     // telescoped factors lost about 72.6 on this lone-trit row; the remaining
@@ -795,6 +825,7 @@ fn kernels_with_small_batch_max(context: &MetalContext, tokens: u32) -> BonsaiKe
     BonsaiKernels::new(context, &shaders)
         .expect("Bonsai kernels")
         .with_small_batch_max(tokens)
+        .with_large_batch_min(u32::MAX)
 }
 
 // Every exact-token kernel, the wide kernel alone and with each scalar tail

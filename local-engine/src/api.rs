@@ -968,7 +968,6 @@ impl EventStream {
     ) -> Result<Option<Signal>, std::sync::mpsc::RecvTimeoutError> {
         let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
         let mut context = Context::from_waker(&waker);
-        let started = Instant::now();
         loop {
             match self.receiver.poll_recv(&mut context) {
                 Poll::Ready(Some(Delivered::Event(event))) => {
@@ -984,7 +983,7 @@ impl EventStream {
                 std::thread::park();
                 continue;
             };
-            let left = deadline.saturating_duration_since(started);
+            let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
             }

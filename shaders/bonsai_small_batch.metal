@@ -48,3 +48,24 @@ kernel void bonsai_ptq1_small_batch_wide(
         BonsaiNativePacked{weights}, input, output, rows, columns, first_token, tokens,
         group, simd, lane, shared);
 }
+
+// 64 tokens by 64 output rows per threadgroup; see
+// bonsai_ptq1_large_batch_impl. Dispatch (ceil(rows / 64), ceil(tokens / 64))
+// groups of 128 threads.
+kernel void bonsai_ptq1_large_batch(
+    device const BonsaiPtq1Block *weights [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    constant uint &tokens [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup half decoded[128 * bonsai_large_tile];
+    bonsai_ptq1_large_batch_impl(
+        BonsaiNativePacked{weights}, input, output, rows, columns, tokens,
+        group, tid, simd, lane, decoded);
+}

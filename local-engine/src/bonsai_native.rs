@@ -353,6 +353,9 @@ struct Layer {
 struct Scratch {
     embedding: MetalBuffer,
     hidden: MetalBuffer,
+    /// The residual stream between a layer's attention and FFN residual
+    /// adds: the fused add-normalize kernels cannot update rows in place.
+    hidden_alt: MetalBuffer,
     normalized: MetalBuffer,
     rotated_hidden: MetalBuffer,
     branch: MetalBuffer,
@@ -395,6 +398,7 @@ impl Scratch {
         Ok(Self {
             embedding: floats(WIDTH)?,
             hidden: floats(WIDTH)?,
+            hidden_alt: floats(WIDTH)?,
             normalized: floats(WIDTH)?,
             rotated_hidden: floats(WIDTH)?,
             branch: floats(WIDTH)?,
@@ -410,7 +414,9 @@ impl Scratch {
             beta: floats(48)?,
             recurrent_output: work_a.clone(),
             attention_output: work_b.clone(),
-            rotated_attention: work_a.clone(),
+            // Not work_a: the fused GDN post-rotation reads recurrent_output
+            // there while writing this.
+            rotated_attention: work_c.clone(),
             ffn_gate: work_a.clone(),
             ffn_up: work_b,
             ffn_product: work_c,

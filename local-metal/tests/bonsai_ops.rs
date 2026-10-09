@@ -1057,7 +1057,7 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
 #[allow(clippy::too_many_lines)]
 fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() {
     let Some((ctx, ops)) = setup() else { return };
-    let capacity = 1100u32;
+    let capacity = 65_537u32;
     let workspace = AttentionWorkspace::new(&ctx, capacity).expect("workspace");
     let query_rows = 9usize;
     let query_data = (0..6144 * query_rows)
@@ -1163,7 +1163,10 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                 .collect::<Vec<_>>()
         };
         let (k_half, v_half) = (rounded(&k_seen), rounded(&v_seen));
-        for prefix in [1u32, 129, 257, 300, 1100] {
+        // 1,100 and 4,400 reach the tensor split kernels on tensor builds,
+        // the latter with 256-token splits. The longer prefixes exercise
+        // 512- and 1,024-token splits, including a one-token final split.
+        for prefix in [1u32, 129, 257, 300, 1100, 4400, 32_769, 65_537] {
             let (k_read, v_read) = if half_operands {
                 (&k_half, &v_half)
             } else {
@@ -1251,5 +1254,59 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                 "{layout:?} block at {position}: tail overwritten"
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "maximum-context attention: allocates about 600 MB, run alone"]
+fn q8_attention_reduces_every_split_at_the_training_context_limit() {
+    let Some((ctx, ops)) = setup() else { return };
+    let capacity = 262_144u32;
+    let layout = KvLayout::parse("q8").expect("layout");
+    let workspace = AttentionWorkspace::new(&ctx, capacity).expect("workspace");
+    let query = floats(&ctx, &vec![0.0; 6144]);
+    let output = guarded(&ctx, 6144);
+    let zero_key = quantize_row(layout.key, &[0.0; 1024]);
+    let keys =
+        MetalBuffer::from_slice(ctx.device(), &zero_key.repeat(capacity as usize)).expect("keys");
+    let ordinary = quantize_row(
+        layout.value,
+        &(0..1024).map(|i| signal(i, 7)).collect::<Vec<_>>(),
+    );
+    // An asymmetric final token makes dropping the last partial split visible
+    // despite averaging over 262K tokens. Head-specific values catch a wrong
+    // head/split ordering. Zero queries give an independent uniform mean.
+    let last = quantize_row(
+        layout.value,
+        &(0..1024)
+            .map(|i| ((i / 256 + 1) as f32).mul_add(2048.0, (i % 17) as f32))
+            .collect::<Vec<_>>(),
+    );
+    let rounded = |row: &[u8]| {
+        dequantize_row(layout.value, row)
+            .into_iter()
+            .map(|v| f64::from(half::f16::from_f32(v).to_f32()))
+            .collect::<Vec<_>>()
+    };
+    let (base, tip) = (rounded(&ordinary), rounded(&last));
+    let mut values =
+        MetalBuffer::from_slice(ctx.device(), &ordinary.repeat(capacity as usize)).expect("values");
+    for prefix in [capacity - 1, capacity] {
+        let offset = (prefix as usize - 1) * layout.value.token_bytes();
+        values.as_mut_slice::<u8>()[offset..offset + last.len()].copy_from_slice(&last);
+        let mut batch = CommandBatch::new(&ctx).expect("batch");
+        ops.attention_row_kv(
+            layout, &mut batch, &query, &keys, &values, None, &output, prefix, &workspace, 0,
+        )
+        .expect("attention");
+        batch.commit_and_wait().expect("completion");
+        let expected = (0..6144)
+            .map(|i| {
+                let index = (i / 256 / 6) * 256 + i % 256;
+                f64::mul_add(base[index], f64::from(prefix - 1), tip[index]) / f64::from(prefix)
+            })
+            .collect::<Vec<_>>();
+        check(&output, &hadamard_rows(&expected), 2e-5);
+        values.as_mut_slice::<u8>()[offset..offset + ordinary.len()].copy_from_slice(&ordinary);
     }
 }

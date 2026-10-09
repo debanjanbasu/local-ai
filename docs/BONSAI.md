@@ -593,6 +593,36 @@ margin 2 or 4 resolved a near-tie the other way (for example `So,\n` against
 `So, the` at token 178 of the arithmetic prompt), so verify blocks of different
 row counts are not bit-identical to single-row decode in every case.
 
+Verifying the head's runner-up as a second branch was measured and rejected.
+The idea: rows five to eight cost little more than four, so a round could
+also verify a forked chain (the seed, the accepted prefix, the head's
+second-best token where the chain is weakest, and its continuation) as a
+virtual sequence from the same committed state, and keep that branch when the
+target picks the runner-up. On the six prompts (721 rounds, 233 rejected
+drafts), the target's token at a rejected position was the head's second
+choice 42.9% of the time (71 of 147 at the first draft; 31-70% per prompt).
+A hit is worth the branch's bonus token plus its accepted continuation, 1.73
+tokens on average gated at margin 4, so verifying every hit's branch at no
+cost would add 0.24 tokens to the 2.24 a round now yields: +10.7% at most.
+Nothing can be verified for free, though. 97% of rejections are of the
+chain's last, low-margin draft, and 59% of rounds are two-row blocks, where
+rows cost about 13 ms each up to four (45.7 / 59.6 / 72.4 ms measured at two
+/ three / four rows); the branch must repeat the seed and accepted prefix,
+since recurrent state cannot fork mid-block, and even at a near-tie (margin
+under 0.5) the runner-up is the target's token in only 22% of rounds.
+Priced on the trace with the measured block costs, branching at the gated
+draft lost 20.6% (no continuation) to 29.3% (two continuation drafts),
+branching only four-row rounds into eight rows lost 0.9%, and every other
+placement lost 13-28%. In batched serving the flat five-to-eight band is
+sometimes left over beside other sequences: with the scheduler's pass
+costs and a margin-conditioned hit estimate choosing branches only when they
+raise expected tokens per second, two sequences gain at most 0.9%, one or
+three sequences 0.1% or less, and four leave no room, before the extra K/V
+ordering and stash copies a shared-prefix branch needs in every attention
+layer (both branches write the same cache slots). n-gram and head
+drafts as two branches would add nothing on these prompts, where suffix
+lookup never fires. No branch path ships.
+
 Suffix lookup's 12-token anchor was re-checked the same way on two edits that
 rename an identifier in about 50 quoted lines of Rust (600 tokens): anchors of
 8, 10, 12 and 16 gave 60.3, 58.9, 60.1 and 58.5 tok/s geomean against 47.5 with
@@ -832,6 +862,29 @@ One layer on an M4 Pro, GPU time:
 
 Below Q8 the unpacking, not the bytes, sets the pace, which is why smaller
 formats were not worth their accuracy (see Tried and rejected).
+
+Each decode split costs a Q load, a 258-float partial record per query head
+and a step of `bo_attn_reduce`'s serial walk, so splits grow with the prefix:
+64 tokens below 4,096, then the largest power of two under prefix/64,
+clamped to 256..1,024 (`tensor_split_tokens`), where a fixed 256 had paid
+512 splits per KV head at 128K. Quantized splits also run KV head fastest:
+a token's four head rows share the cache lines of its 32 scales, which the
+split-major order fetched once per head. Plain decode attention, one layer
+on an M4 Pro, best of five and of two interleaved runs, before and after:
+
+| Context | Q8 | F16 |
+| ---: | ---: | ---: |
+| 8K | 137 → 129 µs | 161 → 159 µs |
+| 16K | 254 → 239 µs | 313 → 310 µs |
+| 32K | 468 → 442 µs | 602 → 586 µs |
+| 64K | 914 → 846 µs | 1,205 → 1,120 µs |
+| 128K | 1,874 → 1,579 µs | 2,497 → 2,243 µs |
+
+Whole model, plain decode after a synthetic prefix (best of three 8-token
+runs, two rounds): 30.1 → 30.0 tok/s at 8K, 25.5 → 25.9 at 32K, and 16.2 →
+17.5 at 128K, where attention was half of a token (16 layers x 1.87 ms of
+62 ms).
+
 Causal prefill uses a tensor kernel of the same shape. Whole model, plain
 decode without speculation, M4 Pro:
 
@@ -897,7 +950,7 @@ that end-of-request readback (673 MB) on its way to the disk writer.
 | Six-prompt speculative decode (geomean) | 36.5 tok/s |
 | Arithmetic with speculation | about 27 tok/s |
 | Code copy-edits with speculation | 40–54 tok/s |
-| 4K prefill | about 96 tok/s |
+| 4K prefill | about 125 tok/s |
 | 128K prefill | 56 tok/s |
 
 Decode spends 97–98% of wall time on the GPU. PTQ1 decode moves 5.65 GB of
@@ -944,6 +997,20 @@ prompt, next-token KL of the new build against the old is 7.3e-7 mean and
 6.3e-6 at worst, top-1 128/128 (rotated Q8 K/V against F16 is 8.9e-6).
 Prefill of a 2,484-token prompt runs on the tensor tile and is unchanged
 (97.40 to 97.84 tok/s).
+
+A fresh bandwidth control on the M4 Pro reads 512 MiB per pass, sixteen
+passes per sample, with a checksum reduction that validates every output.
+After warm-up, five samples at 128/256/512 threads per group reach 259-261
+GB/s median (read bytes only), with AC power and sleep guards. Against that
+streaming-read control, current single-row projections reach 215-225 GB/s
+for the large internal shapes, 237 GB/s for fused gate/up, and 248 GB/s for
+the output head: roughly 82-86%, 91% and 95%. This is a comparison of useful
+packed-weight bytes to streaming reads, not a hardware-counter measurement
+of DRAM utilization. The gap is not automatically recoverable: access
+patterns and arithmetic differ. Three- and four-row verify blocks reuse
+weights and spend more time computing, so their lower weight GB/s does not
+by itself identify a memory bottleneck. Optimize verified tokens per second,
+not bytes moved for their own sake; retain the mixed-precision head.
 
 Two- to four-row projections (speculative verify blocks, short prefill
 chunks, batched decode) then got cheaper with bit-identical outputs. Trits
@@ -1036,6 +1103,60 @@ differently at character 544 ("So, the time is:" for "So,"), the same
 answer, where the old build in both modes and the new one with speculation
 agree.
 
+Blocks of 56 rows or more (every prefill chunk but a short last one) then
+moved to a large-batch kernel. The wide kernel decodes each weight once per
+eight rows and loads an activation tile for every 8x8 multiply. The new one
+gives a threadgroup 64 tokens and 64 output rows: it decodes each packed
+block once into threadgroup memory as trit times scale in half (exact), and
+each of four SIMD groups multiplies a 32-by-32 quarter with sixteen
+accumulators, so each tile load feeds four multiplies. Activations stay F32
+(the F32-by-half multiply keeps the F32 operand, which the 1000.125-input
+test checks) and so does the accumulation; only the summation order changes.
+On this M4 Pro every 8x8 simdgroup multiply peaks near 3.9 T multiply-adds
+per second, whatever its operand types (F32, F16, BF16, half into F32). The
+wide kernel ran at 3.0 T, the large-batch kernel runs at 3.4 T, and with its
+decode skipped after the first block it measured 3.5 T, so the multiplies
+set its cost. Kernel GPU time, µs, small-batch routing against the new
+kernel (same run, weights rotating through 512 MB):
+
+| Projection | 64 rows | 128 rows | 256 rows | 512 rows |
+| --- | ---: | ---: | ---: | ---: |
+| 17408x5120 | 1,916 → 1,705 | 3,842 → 3,348 | 7,977 → 6,555 | 15,704 → 13,015 |
+| 5120x17408 | 2,296 → 1,754 | 4,583 → 3,362 | 8,275 → 6,617 | 16,635 → 13,162 |
+| 12288x5120 | 1,362 → 1,229 | 2,726 → 2,402 | 5,661 → 4,656 | 11,095 → 9,154 |
+| 10240x5120 | 1,134 → 1,001 | 2,277 → 1,956 | 4,686 → 3,853 | 9,225 → 7,781 |
+| 6144x5120 | 710 → 650 | 1,409 → 1,235 | 2,942 → 2,418 | 5,637 → 4,696 |
+| 5120x6144 | 692 → 625 | 1,381 → 1,197 | 2,857 → 2,353 | 5,569 → 4,667 |
+| 1024x5120 | 155 → 197 | 301 → 292 | 677 → 516 | 1,126 → 876 |
+
+A tile that is mostly empty costs what a full one does (17408x5120: 1,698
+at 56 rows; 32 rows would take 1,716 against the wide kernel's 957), so
+blocks below 56 rows stay on the small-batch kernels and so does a remainder
+of fewer than 56 rows past the last whole tile. 1024x5120 has only 16
+threadgroups per 64 tokens and loses at 64 rows; it is the K/V projection of
+the 16 attention layers, about 0.3% of a 64-row block, and kept on the same
+routing. Whole-model blocks (`prefill_block_timings`, no logits, mean of
+five after a warm-up), ms:
+
+| Rows | 32 | 48 | 64 | 96 | 128 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before | 291.7 | 437.5 | 582.0 | 868.0 | 1,153.5 |
+| After | 289.7 | 433.7 | 504.1 | 797.9 | 984.2 |
+
+Cold prefill (prompt cache deleted, `--no-speculation`, this repository's
+text), tok/s, interleaved runs of both builds, best of two: 512 tokens 100.7
+to 116.9, 2,048 tokens 107.5 to 126.3, 4,096 tokens 106.2 to 124.8 (one
+run), 8,192 tokens 104.8 to 123.3, 32,767 tokens 92.1 to 105.9 (one run;
+attention takes a growing share). The 16 greedy tokens after each prompt up
+to 8,192 tokens are the same in both builds. Teacher-forced
+along 64 greedy tokens after 1,024- and 8,192-token prompts
+(`large_batch_prefill_tracks_small_batch_next_token_distribution`), next-token
+KL against the small-batch kernels is 5.5e-6 and 2.1e-6 mean (2.1e-5 and
+1.6e-5 at worst), top-1 64/64 both. Decode and verify blocks below 56 rows
+run the same kernels as before: six prompts, 300 greedy tokens, plain decode
+30.52 against 30.39 tok/s geomean and speculative 38.02 against 38.12, text
+byte-identical in both modes (the six chat prompts are 27-45 tokens).
+
 Single-token decode encodes 835 dispatches per token, down from 1,364, and
 every fused kernel is bitwise identical to the dispatches it replaces
 (`local-metal/tests/bonsai_fusion.rs`):
@@ -1057,6 +1178,60 @@ each 48x5120 alpha or beta projection; it now issues eight iterations' loads
 before their in-order fused multiply-adds, also bitwise identical. Kernel
 times above are best of three over 200 dispatches with weights rotating
 through 600 MB.
+
+A single-row token was then profiled two ways on an M4 Pro (planets prompt,
+96 tokens after 16 of warm-up): the real command buffers with their GPU and
+host timestamps, and every dispatch in a command buffer of its own (a
+one-dispatch buffer costs 2.0 us, subtracted below; the per-kernel sum lands
+within 2.5% of the in-pipeline GPU time). PTQ1 projections took 27.5 ms of
+32.3; most of the rest was latency, not bandwidth. Three changes, all bitwise
+identical (`fused_residual_and_gdn_output_chains_match_separate_dispatches_bitwise`,
+`bonsai_recurrent.rs`; logits and hidden rows of a 300-token prefill and 48
+decode steps match the old encoding bit for bit):
+
+- Every residual add rides in the next RMSNorm + rotation (`bo_add_rms_fwht`).
+  Each threadgroup recomputes its row's sums, so the residual stream alternates
+  between `hidden` and `hidden_alt` instead of updating in place, and each
+  thread loads its whole 5120-wide row before the in-order square-sum chain
+  (the old kernel waited on one load per iteration): 9.1 us for the add and
+  norm pair, 4.1 us fused.
+- A recurrent layer's output norm, gate, head regrouping and rotation are one
+  dispatch (`bo_gdn_post_fwht`, 3.6 to 3.3 us).
+- The single-token recurrence runs four SIMD groups (one value row each) per
+  threadgroup: 6,144 one-SIMD threadgroups took 21.2 us per layer streaming
+  F16 state, 1,536 four-SIMD ones 15.8 us (eight SIMD groups, or two rows per
+  SIMD group, were no better).
+
+The block's first command buffer now holds only the input rotation, and
+layers 1-3 go in a second: when the first held layer 0 alone, encoding the
+other 63 layers (0.25-0.7 ms on a cold core) often outlasted it and the GPU
+waited 0.18 ms per token between the two buffers. Dispatches per token fell
+from 853 to 677. Per token, ms (kernel time without the 2.0 us per buffer):
+
+| | Before | After |
+| --- | ---: | ---: |
+| PTQ1 projections (incl. 1.18 output head) | 27.48 | 27.45 |
+| Residual add + RMSNorm + rotation | 2.13 | 1.18 |
+| GDN recurrence | 1.01 | 0.48 |
+| Full attention + K/V preparation | 1.06 | 1.05 |
+| FFN and attention-output rotations, GDN post | 0.66 | 0.74 |
+| GDN conv / L2 / decay | 0.16 | 0.13 |
+| Input rotation, argmax | 0.03 | 0.03 |
+| GPU busy (sum of command buffers) | 31.77 | 30.83 |
+| GPU idle between a token's buffers | 0.18 | 0.02 |
+| GPU idle between tokens | 0.33 | 0.32 |
+| Wall time per token | 32.28 | 31.17 |
+
+Between tokens the GPU idles 0.32 ms: 0.13-0.15 ms from its last command to
+the host waking, 0.05-0.08 ms of host work (embedding decode and encoding up
+to the first commit) and 0.08-0.14 ms from commit to the GPU starting.
+Spinning on the command buffer's status instead of blocking cut the first to
+0.10 ms and kept the host core fast (0.24 instead of 0.5 ms to encode a
+token), 0.1-0.4 ms per token in all, but burns a core for the whole token, so
+it was not adopted. Six prompts, 300 greedy tokens, best of two interleaved
+runs of both builds: plain decode 30.92 to 32.17 tok/s geomean (+4.0%, every
+prompt +3.5% to +5.2%), default speculative decode 38.42 to 39.10 (+1.8%);
+greedy text is byte-identical across builds in both modes.
 
 Recurrent state is stored F16 and computed in F32 registers, rounded once
 per block. Each decode step read and wrote 302 MB of F32 state, and every
@@ -1162,6 +1337,28 @@ decode from 19.23 to 20.39 tok/s.
   Q8's at 128K for Q4 and slower for FP4, whose level lookup costs more than
   the bytes it saves; whole-model decode at a 24,576-token prompt measured
   19.47 tok/s for Q4 against Q8's 19.34, 0.7%.
+- Asymmetric K/V: Q8 keys with 4- or 3-bit values, the TurboQuant-style
+  shortlist (keys carry the sensitivity, since each key error reaches six
+  query heads). Rotated, against F16 at a 4,096-token prompt of repository
+  text where rotated Q8 measured 1.2e-5 (64/64): Q4 keys with Q8 values 2.5e-3
+  (61/64), Q8 keys with Q4 values 1.1e-3 (62/64). Values were then coded with
+  a 4-bit Lloyd-Max codebook for a unit Gaussian on the Hadamard basis, scaled
+  per 32 by a least-squares gain (two Lloyd steps on write): 9.4e-4 (62/64),
+  only 17% under uniform Q4, and 3-bit 4.6e-3 (62/64); against Q8 the
+  divergences are the same. The 4-bit codebook stays 80 times above the
+  near-1e-5 bar (3-bit 380 times), every miss on a near-tie (top-2 margin
+  under 0.2 nats): values are the cheaper half, not a cheap one. The 4-bit value cache is
+  24% less K/V memory (3.5 against 4.6 GB at 128K tokens, 7.0 against 9.1 GB
+  at 262K) but bought no speed: tensor decode attention at 128K measured
+  6% faster than Q8 for uniform values and 36% slower for codebook ones, whose
+  per-value level lookup costs more than the bytes it saves (3-bit: 66%
+  slower).
+- Software-pipelined Q8 tensor attention: each tile's V codes fetched into
+  registers before its Q·K and the next tile's K codes before its P·V, so
+  device loads overlap the tensor work. Decode attention got slower, 1,912 to
+  2,100 µs per layer at 128K and 136 to 147 µs at 8K, presumably from the
+  registers the in-flight codes hold; prefetching V alone was a wash (1,919
+  against 1,906 µs).
 - A ternary MTP head. Every head matrix rotated by the target's own signed
   Hadamard transform for its input width (which leaves w·x unchanged) and then
   replaced, per 128-value block, by the least-squares ternary vector and F16
@@ -1214,6 +1411,26 @@ decode from 19.23 to 20.39 tok/s.
   throughput was flat (28.54 against 28.66 tok/s geomean, byte-identical
   text): teacher-forced corpus accuracy did not transfer to the model's own
   generations.
+- Further mixed-head fine-tuning on self-generated rollouts: two probes keep
+  `kv,fc,o` int8 and the remaining projections ternary, with target-loss weights
+  0.1 and 0.5, trained for two epochs on 273 captured shards. On the recovered
+  optimized runtime, six prompts, 300-token cap, reversed-order best of two:
+  installed 38.88 tok/s at 79.0% pooled acceptance; probe A 38.67 at 77.6%;
+  probe B 38.82 at 77.8%. A separate single-round coding comparison (two
+  repairs and an 8,134-token repository prompt) measured 41.33 / 40.07 / 40.37
+  tok/s geomean. Every candidate's output token sequence matched the installed
+  head in both comparisons. Neither candidate replaces it. These are speed
+  and agreement checks, not evidence of coding-agent quality: the generated
+  Python repair passed its two supplied assertions, but the Rust repair kept
+  a wrong tie-breaker and failed its supplied ordering test despite passing
+  a superficial output-pattern check.
+- Grouping independent single-row PTQ1 projection SIMD groups into larger
+  threadgroups (2, 4 or 8 groups rather than 1). Arithmetic and outputs were
+  bitwise unchanged on four representative shapes. Reversed-order three-round
+  timings for 17408x5120 were 86.9 us baseline versus 87.9 / 87.5 / 88.7 us;
+  5120x17408 stayed around 89 us. The output head's best four-group result
+  was 1,121 us versus 1,123 us, only 0.2%; the tiny K/V projection saved
+  about 0.3 us. No meaningful general gain, so this change was not adopted.
 - Neural Engine: real-size projections execute on GPU and 54 GB FP16 weights do not fit.
 - `float4` verify activation loads: 1–5% slower than scalar gathers.
 - Further small-batch variants, M4 Pro, µs on 17408×5120 / 5120×17408. The
@@ -1263,6 +1480,28 @@ decode from 19.23 to 20.39 tok/s.
   266-281 at eight rows; the 266, one SIMD group per tile walking every
   block, costs 262 at five rows against 236. 5120×17408 is the one shape
   whose cost grows from five rows (236) to eight (281).
+- Narrower prefill operands (half or BF16 activations, int8 activations
+  against the trits), as a way past the large-batch kernel. They cannot be
+  faster on this GPU. Chains of 8x8 simdgroup multiplies with no loads
+  measured 3.85 T multiply-adds per second in F32, 3.95 T in F16, 3.85 T for BF16 or half
+  into F32, and 3.93 T with F32 and F16 chains in alternate SIMD groups, so
+  the half and F32 pipes do not run matrix work in parallel. Scalar FMAs
+  were 3.48 T (F32), 3.66 T (F16) and 3.93 T mixed. Metal has no integer
+  simdgroup matrix and the M4 Pro has no neural accelerators for
+  `matmul2d` to use, so an int8 path would run on the same units. The
+  large-batch kernel already reaches 3.4 T with exact F32 activations, so
+  even a free lossy operand could gain at most about 15%, and narrower
+  types make the multiplies no faster at all. Large-batch layouts, M4 Pro, µs on 17408x5120 / 5120x17408
+  against 1,687 / 1,734 at 64 tokens and 3,317 / 3,333 at 128: a padded
+  threadgroup stride of 72 halves, 1,724 / 1,765 and 3,374 / 3,397; one tile
+  of 128 tokens with eight SIMD groups, 3,389-3,410 at any count up to 128;
+  32 tokens by 64 rows per SIMD group (32 accumulators), 2,469 / 2,613 at
+  64 tokens from register pressure; a 32-token
+  tile of two SIMD groups for 32-55 rows, 950 / 1,027 at 32 against the
+  wide kernel's 958 / 1,146 and 1,798 / 1,918 at 48 against 1,420 / 1,701.
+  With the decode skipped after the first block (results invalid) 64 tokens
+  took 1,634, without the barrier between decode and multiply 1,695, so
+  double-buffering the decode is worth at most about 6%.
 - BF16 alpha/beta with eight rows per SIMD group: 14-60 µs for both matrices
   at 2-64 rows, against four rows' 11.3-50.
 - Converting the 96 BF16 alpha/beta matrices to int8 at load to drop the BF16

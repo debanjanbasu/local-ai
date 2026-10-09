@@ -1,4 +1,7 @@
-use super::{BonsaiOps, CommandBatch, GDN_HEADS, MetalBuffer, arg, need, no_alias, sequence_bytes};
+use super::{
+    BonsaiOps, CommandBatch, GDN_DIM, GDN_HEADS, MetalBuffer, arg, need, no_alias, sequence_bytes,
+};
+use crate::bonsai::SignedHadamard;
 
 /// Storage of a 48-head x 128 x 128 recurrent state. The recurrence always
 /// computes in F32 registers; the format only rounds what a block leaves in
@@ -158,9 +161,14 @@ impl BonsaiOps {
         no_alias(state, &[qkv, decay, beta])?;
         no_alias(final_state, &[qkv, decay, beta])?;
         // Four value rows share Q/K loads during prefill. Single-token decode
-        // remains on the original kernel: the wider variant's gain was noisy.
+        // keeps one row per SIMD group (the wider variant's gain was noisy),
+        // four SIMD groups per threadgroup.
         let (single, wide) = format.pipelines();
-        let (pipeline, rows) = if tokens > 1 { (wide, 4) } else { (single, 1) };
+        let (pipeline, threads) = if tokens > 1 {
+            (wide, 32)
+        } else {
+            (single, 128)
+        };
         self.go(
             b,
             pipeline,
@@ -174,8 +182,8 @@ impl BonsaiOps {
             ],
             &[tokens],
             &[],
-            48 * 128 / rows,
-            32,
+            48 * 128 / 4,
+            threads,
         );
         Ok(())
     }
@@ -217,6 +225,51 @@ impl BonsaiOps {
             &[],
             &[epsilon],
             48 * tokens as usize,
+            128,
+        );
+        Ok(())
+    }
+
+    /// [`Self::gdn_postprocess_rows`] followed by the forward `rotation`
+    /// (6144 columns) of its output, in one dispatch: `out` receives bitwise
+    /// what the separate post-processing then rotation would leave in the
+    /// rotated buffer. The unrotated rows are not stored.
+    pub fn gdn_postprocess_transform(
+        &self,
+        b: &mut CommandBatch,
+        input: &MetalBuffer,
+        z: &MetalBuffer,
+        norm: &MetalBuffer,
+        rotation: &SignedHadamard,
+        out: &MetalBuffer,
+        epsilon: f32,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        if epsilon <= 0.0 || !epsilon.is_finite() {
+            return Err(arg("invalid post RMS epsilon"));
+        }
+        if rotation.columns != GDN_HEADS * GDN_DIM {
+            return Err(arg("GDN output rotation must be 6144 wide"));
+        }
+        let bytes = sequence_bytes(tokens, GDN_HEADS * GDN_DIM)?;
+        for v in [input, z, out] {
+            need(v, bytes)?;
+        }
+        need(norm, GDN_DIM as usize * 4)?;
+        no_alias(out, &[input, z, norm, &rotation.signs])?;
+        self.go(
+            b,
+            25,
+            &[
+                (input, 0),
+                (z, 0),
+                (norm, 0),
+                (&rotation.signs, 0),
+                (out, 0),
+            ],
+            &[],
+            &[epsilon],
+            6 * tokens as usize,
             128,
         );
         Ok(())

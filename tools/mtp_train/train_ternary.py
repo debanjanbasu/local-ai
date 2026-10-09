@@ -226,6 +226,8 @@ def main():
     ap.add_argument("--recompute-ternary", action="store_true",
                     help="re-quantize in backward instead of saving ternary weights")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--val-fraction", type=float, default=0.02,
+                    help="share of capture shards held out for EVAL")
     ap.add_argument("--int8", help="int8 runtime matrices (ternary.parse_int8 spec; "
                     "default: the --init checkpoint's, else none)")
     ap.add_argument("--sweep", help="eval-only: JSON list of {label, int8} configs")
@@ -284,7 +286,8 @@ def main():
         t = min(1.0, (step - args.warmup) / max(1, args.total_steps - args.warmup))
         return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * t))
 
-    batcher = DocBatcher(args.capture, window=args.window, batch=args.batch, seed=args.seed)
+    batcher = DocBatcher(args.capture, window=args.window, batch=args.batch, seed=args.seed,
+                         val_fraction=args.val_fraction)
     if args.start_step:
         # Same held-out split (fixed in the constructor), fresh training order.
         batcher.rng = np.random.default_rng((args.seed, args.start_step))
@@ -413,14 +416,16 @@ def main():
                 group["lr"] = lr * group["lr_mult"]
             optimizer.zero_grad(set_to_none=True)
             if args.grad_accum > 1:
+                # Weight unequal or fewer chunks by their share of the batch.
                 micro = zip(*(t.chunk(args.grad_accum) for t in batch))
                 loss = 0.0
                 for part in micro:
                     tokens, top_ids, top_logits, hidden, positions = (t.to(device) for t in part)
                     part_loss, _ = forward(tokens, top_ids, top_logits, hidden.float(),
                                            positions)
-                    (part_loss / args.grad_accum).backward()
-                    loss += part_loss.detach() / args.grad_accum
+                    weight = tokens.shape[0] / batch[0].shape[0]
+                    (part_loss * weight).backward()
+                    loss += part_loss.detach() * weight
                     del part_loss
             else:
                 tokens, top_ids, top_logits, hidden, positions = (t.to(device) for t in batch)

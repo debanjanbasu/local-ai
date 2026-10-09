@@ -78,14 +78,17 @@ fn encode_into(batch: &mut CommandBatch, kernel: &Kernel, buffers: [&MetalBuffer
             6,
         );
     }
+    // The single-row kernels run four SIMD groups (one row each) per
+    // threadgroup; the tiled ones one SIMD group of `rows` rows.
+    let simds = if kernel.rows == 1 { 4 } else { 1 };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
-            width: OUTPUT / kernel.rows,
+            width: OUTPUT / (kernel.rows * simds),
             height: 1,
             depth: 1,
         },
         MTLSize {
-            width: 32,
+            width: 32 * simds,
             height: 1,
             depth: 1,
         },

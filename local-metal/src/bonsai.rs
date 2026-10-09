@@ -215,7 +215,10 @@ pub struct BonsaiKernels {
     small_batch: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// Simdgroup-matrix kernel for up to `SMALL_BATCH_WIDE_TOKENS` rows.
     small_batch_wide: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// 64-token by 64-row threadgroup tiles for blocks of `large_batch_min` rows or more.
+    large_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     small_batch_max: u32,
+    large_batch_min: u32,
     prefill_kernel: PrefillKernel,
     int8: int8::Int8Kernels,
 }
@@ -241,18 +244,39 @@ pub const SMALL_BATCH_KERNEL_TOKENS: u32 = 4;
 /// rows, are the limit, not trit decoding.
 pub const SMALL_BATCH_WIDE_TOKENS: u32 = 8;
 
-/// Token blocks up to this size use chunked small-batch dispatches; larger
-/// blocks use the prefill tensor tile (32-, 64- or 128-token tiles).
+/// Token blocks up to this size (and below [`DEFAULT_LARGE_BATCH_MIN`]) use
+/// chunked small-batch dispatches.
+///
+/// Larger blocks use the prefill tensor tile (32, 64 or 128 tokens) only when
+/// the large-batch kernel is disabled.
 ///
 /// Whole-model blocks on an M4 Pro at a 1,024-token prefix, best of five,
 /// with eight-byte activation loads in the wide kernel: small batch 520 / 588 /
 /// 594 / 634 ms at 56 / 60 / 64 / 65 verify rows against 776 / 1,224 ms on the
 /// 64- and 128-token tiles at 64 / 65, and 866 / 1,155 ms at 96 / 128 rows
 /// without logits against the 128-token tile's 1,221. Every verify block and
-/// prefill chunk (at most 128 rows) therefore stays on the small-batch
-/// kernels. (Before those loads the range ended at 60 rows: 860.5 ms against
-/// the 64-token tile's 876.6.)
+/// prefill chunk (at most 128 rows) therefore stays off the tensor tile: below
+/// [`DEFAULT_LARGE_BATCH_MIN`] rows on the small-batch kernels, from there on
+/// the large-batch kernel. (Before those loads the range ended at 60 rows:
+/// 860.5 ms against the 64-token tile's 876.6.)
 pub const DEFAULT_SMALL_BATCH_MAX: u32 = 128;
+
+/// Token blocks of at least this many rows use the large-batch kernel.
+///
+/// It decodes each packed block once per 64-token by 64-row threadgroup tile
+/// and runs the multiplies near the 8x8 matrix units' peak (3.4 T
+/// multiply-adds per second against the wide kernel's 3.0 T). A remainder of
+/// fewer rows past the last whole tile goes to the small-batch kernels.
+///
+/// Whole-model blocks on an M4 Pro (`prefill_block_timings`, no logits), ms,
+/// small-batch against large-batch routing: 32 rows 285 / 483, 48 rows 427 /
+/// 490, 64 rows 568-574 / 497-499, 128 rows 1,141-1,165 / 965-967. An empty
+/// tile costs what a full one does, so the crossover is where seven or eight
+/// eight-row passes (500 / 570 ms) exceed one tile.
+pub const DEFAULT_LARGE_BATCH_MIN: u32 = 56;
+
+/// Token rows per large-batch threadgroup tile.
+const LARGE_BATCH_TILE: usize = 64;
 
 impl BonsaiKernels {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
@@ -308,7 +332,9 @@ impl BonsaiKernels {
                 .map(|tokens| pipeline(&format!("bonsai_ptq1_small_batch_{tokens}"), 32))
                 .collect::<crate::Result<_>>()?,
             small_batch_wide: pipeline("bonsai_ptq1_small_batch_wide", 128)?,
+            large_batch: pipeline("bonsai_ptq1_large_batch", 128)?,
             small_batch_max: DEFAULT_SMALL_BATCH_MAX,
+            large_batch_min: DEFAULT_LARGE_BATCH_MIN,
             prefill_kernel,
             int8: int8::Int8Kernels::new(pipeline)?,
         })
@@ -326,10 +352,28 @@ impl BonsaiKernels {
     }
 
     /// Override the small-batch routing threshold; `1` disables it so every
-    /// multi-token block uses the prefill tile (for measurements and controls).
+    /// multi-token block below [`Self::large_batch_min`] uses the prefill tile
+    /// (for measurements and controls). Large-batch remainders still use the
+    /// small-batch kernels; also pass `u32::MAX` to
+    /// [`Self::with_large_batch_min`] to put every block on the tile.
     #[must_use]
     pub const fn with_small_batch_max(mut self, tokens: u32) -> Self {
         self.small_batch_max = tokens;
+        self
+    }
+
+    /// Smallest token block routed to the large-batch kernel by [`Self::matmul`].
+    #[must_use]
+    pub const fn large_batch_min(&self) -> u32 {
+        self.large_batch_min
+    }
+
+    /// Override the large-batch routing threshold; `u32::MAX` disables it so
+    /// blocks keep the small-batch kernels or the prefill tile (for
+    /// measurements and controls).
+    #[must_use]
+    pub const fn with_large_batch_min(mut self, tokens: u32) -> Self {
+        self.large_batch_min = tokens;
         self
     }
 
@@ -654,8 +698,10 @@ impl BonsaiKernels {
 
     /// Packed-weight projection of contiguous `[tokens, columns]` F32 rows.
     /// Output is `[tokens, rows]`. A single token retains the measured matvec;
-    /// blocks up to [`Self::small_batch_max`] stream the weights once per
-    /// `SMALL_BATCH_KERNEL_TOKENS` rows; larger blocks use the constructor-
+    /// blocks of at least [`Self::large_batch_min`] rows use 64-token tiles
+    /// that decode the weights once per tile; smaller blocks up to
+    /// [`Self::small_batch_max`] stream the weights once per
+    /// `SMALL_BATCH_WIDE_TOKENS` rows; larger blocks use the constructor-
     /// selected prefill primitive. Nothing expands the model; activations,
     /// accumulation and output stay F32.
     #[allow(unsafe_code)]
@@ -686,8 +732,24 @@ impl BonsaiKernels {
                 "PTQ1_0 matmul buffers are empty, too short, or aliased".into(),
             ));
         }
+        if tokens >= self.large_batch_min {
+            // Whole 64-token tiles go to the large-batch kernel; a remainder
+            // below the threshold costs less as small-batch passes than as a
+            // mostly empty tile (a remainder of one keeps two rows so no
+            // small-batch dispatch has one).
+            let tail = match tokens % LARGE_BATCH_TILE as u32 {
+                1 => 2,
+                remainder if remainder < self.large_batch_min => remainder,
+                _ => 0,
+            };
+            self.large_batch(batch, matrix, input, output, tokens - tail);
+            if tail != 0 {
+                self.small_batch(batch, matrix, input, output, tokens - tail, tail);
+            }
+            return Ok(());
+        }
         if tokens <= self.small_batch_max {
-            self.small_batch(batch, matrix, input, output, tokens);
+            self.small_batch(batch, matrix, input, output, 0, tokens);
             return Ok(());
         }
         let (pipeline, tile_tokens) = match (&self.matmul_short, tokens) {
@@ -728,7 +790,43 @@ impl BonsaiKernels {
         Ok(())
     }
 
-    /// Exact-token dispatches; the caller has validated extents and aliasing.
+    /// One large-batch dispatch; the caller has validated extents and aliasing.
+    #[allow(unsafe_code)]
+    fn large_batch(
+        &self,
+        batch: &mut CommandBatch,
+        matrix: Ptq1Matrix<'_>,
+        input: &MetalBuffer,
+        output: &MetalBuffer,
+        tokens: u32,
+    ) {
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.large_batch);
+        unsafe {
+            bind(encoder, matrix.buffer, matrix.offset, 0);
+            bind(encoder, input, 0, 1);
+            bind(encoder, output, 0, 2);
+            set_u32(encoder, &matrix.rows, 3);
+            set_u32(encoder, &matrix.columns, 4);
+            set_u32(encoder, &tokens, 5);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (matrix.rows as usize).div_ceil(LARGE_BATCH_TILE),
+                height: (tokens as usize).div_ceil(LARGE_BATCH_TILE),
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        batch.record_dispatch();
+    }
+
+    /// Exact-token dispatches for activation rows `first..first + tokens`;
+    /// the caller has validated extents and aliasing.
     /// Each dispatch reads the packed matrix once. Blocks of up to
     /// `SMALL_BATCH_KERNEL_TOKENS` rows use one scalar dispatch; larger blocks
     /// use wide dispatches of at most `SMALL_BATCH_WIDE_TOKENS` rows, plus one
@@ -741,6 +839,7 @@ impl BonsaiKernels {
         matrix: Ptq1Matrix<'_>,
         input: &MetalBuffer,
         output: &MetalBuffer,
+        first: u32,
         tokens: u32,
     ) {
         debug_assert!(tokens >= 2);
@@ -752,9 +851,9 @@ impl BonsaiKernels {
         };
         let wide = tokens - tail;
         let chunks = wide.div_ceil(SMALL_BATCH_WIDE_TOKENS);
-        let mut start = 0;
+        let mut start = first;
         for chunk in 0..chunks {
-            let end = (wide * (chunk + 1)).div_ceil(chunks);
+            let end = first + (wide * (chunk + 1)).div_ceil(chunks);
             let count = end - start;
             let encoder = batch.encoder();
             encoder.setComputePipelineState(&self.small_batch_wide);

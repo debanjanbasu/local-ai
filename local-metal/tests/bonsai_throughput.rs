@@ -48,7 +48,15 @@ fn ptq1_projection_throughput() {
         return;
     };
     let shaders = ShaderLibrary::new(context.device()).expect("shaders");
-    let kernels = BonsaiKernels::new(&context, &shaders).expect("kernels");
+    // `PTQ1_BENCH_LARGE_MIN=4294967295` measures the small-batch route instead.
+    let large_min = std::env::var("PTQ1_BENCH_LARGE_MIN")
+        .ok()
+        .map_or(local_metal::bonsai::DEFAULT_LARGE_BATCH_MIN, |value| {
+            value.parse().expect("large-batch minimum")
+        });
+    let kernels = BonsaiKernels::new(&context, &shaders)
+        .expect("kernels")
+        .with_large_batch_min(large_min);
     let filter = std::env::var("PTQ1_BENCH_TOKENS").ok();
     let token_counts: Vec<u32> = filter.as_deref().map_or_else(
         || vec![1, 2, 3, 4, 5, 8],

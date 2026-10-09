@@ -1,6 +1,7 @@
 #include <metal_stdlib>
 #include "bonsai_gdn.h"
 #include "bonsai_mixer.h"
+#include "bonsai_projection.h"
 #if __METAL_VERSION__ >= 400
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -171,14 +172,23 @@ static inline void bonsai_gdn_row(
     }
 }
 
+// bo_gdn computes one value row per SIMD group, whatever the threadgroup size:
+// single-token decode runs four per threadgroup, each exactly as before, since
+// 6144 one-SIMD threadgroups took 21.2 us per layer on an M4 Pro (F16 state)
+// and 1,536 four-SIMD ones 15.8 us. Row-range callers still dispatch one SIMD.
 #define BONSAI_GDN(SUFFIX, STATE) \
 kernel void bo_gdn##SUFFIX( \
     device const float *qkv [[buffer(0)]], device const float *decay [[buffer(1)]], \
     device const float *beta [[buffer(2)]], device const STATE *state [[buffer(3)]], \
     device float *output [[buffer(4)]], device STATE *final_state [[buffer(5)]], \
     constant uint &tokens [[buffer(6)]], \
-    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]] \
-) { bonsai_gdn_row<STATE>(qkv, decay, beta, state, output, final_state, tokens, row, lane); } \
+    uint group [[threadgroup_position_in_grid]], \
+    uint simds [[simdgroups_per_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]] \
+) { \
+    bonsai_gdn_row<STATE>(qkv, decay, beta, state, output, final_state, tokens, \
+                          group * simds + simd, lane); \
+} \
 kernel void bo_gdn_rows_4##SUFFIX( \
     device const float *qkv [[buffer(0)]], device const float *decay [[buffer(1)]], \
     device const float *beta [[buffer(2)]], device const STATE *state [[buffer(3)]], \
@@ -200,6 +210,128 @@ kernel void bo_gdn_post(
 ) {
     threadgroup float partial[4];
     bonsai_gdn_post_impl(input, gate, weights, output, epsilon, head, tid, partial);
+}
+
+// bo_gdn_post followed by the forward 1024-wide rotation of its 6144-wide
+// output row, in one dispatch: threadgroup b of a row gathers the eight grouped
+// heads 8b.. that bo_gdn_post would store in its block (grouped head g reads
+// head (g % 3) * 16 + g / 3), computes each exactly as bo_gdn_post does and
+// rotates them as bonsai_fwht_forward would. Dispatch 6 * tokens groups of 128.
+kernel void bo_gdn_post_fwht(
+    device const float *input [[buffer(0)]], device const float *gate [[buffer(1)]],
+    device const float *weights [[buffer(2)]], device const float *signs [[buffer(3)]],
+    device float *output [[buffer(4)]], constant float &epsilon [[buffer(5)]],
+    uint block [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float partial[8][4];
+    threadgroup float shared[1024];
+    const uint token = block / 6, first = (block % 6) * 8;
+    float values[8];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; ++i) {
+        const uint grouped = first + i;
+        const uint index = (token * 48 + (grouped % 3) * 16 + grouped / 3) * 128 + tid;
+        values[i] = input[index];
+        // bonsai_group_sum's per-SIMD partial sums, all eight heads at once.
+        const float sum = simd_sum(values[i] * values[i]);
+        if (tid % 32 == 0) partial[i][tid / 32] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = weights[tid];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; ++i) {
+        const uint grouped = first + i;
+        const uint index = (token * 48 + (grouped % 3) * 16 + grouped / 3) * 128 + tid;
+        float sum = 0.0f;
+        for (uint s = 0; s < 4; ++s) sum += partial[i][s];
+        values[i] = values[i] * rsqrt(sum / 128.0f + epsilon) * scale * bonsai_silu(gate[index]);
+    }
+    bonsai_fwht_values<false>(values, signs, output, 6, block, tid, shared);
+}
+
+// bo_add (`hidden + branch`) followed by bonsai_rms_fwht_forward, in one
+// dispatch. Every 1024-wide threadgroup recomputes its row's sums for the
+// square sum, so the sum goes to `sum_out`, which must not alias `hidden` or
+// `branch`; the threadgroup stores only its own block of it. Values are
+// bitwise those of bo_add, then bonsai_rms_fwht_forward on its output: each
+// thread still accumulates elements tid, tid + 128, ... in order, but loads
+// a whole 1024-wide block (or, for a known width, the whole row) before its
+// FMA chain, so the loads overlap instead of waiting on one another.
+template<uint known_blocks>
+static inline void bonsai_add_rms_fwht_impl(
+    device const float *hidden, device const float *branch, device const float *weights,
+    device const float *signs, device float *sum_out, device float *normalized,
+    device float *output, uint blocks_per_row, float epsilon, uint block, uint tid,
+    threadgroup float *partial, threadgroup float *shared
+) {
+    const uint blocks = known_blocks != 0 ? known_blocks : blocks_per_row;
+    const uint dimension = blocks * 1024;
+    const uint own = block % blocks;
+    device const float *row_hidden = hidden + ulong(block / blocks) * dimension;
+    device const float *row_branch = branch + ulong(block / blocks) * dimension;
+    float square_sum = 0.0f;
+    float values[8];
+    if (known_blocks != 0) {
+        float row[known_blocks != 0 ? known_blocks * 8 : 1];
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < known_blocks * 8; ++k) {
+            row[k] = row_branch[k * 128 + tid] + row_hidden[k * 128 + tid];
+        }
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < known_blocks * 8; ++k) {
+            square_sum = fma(row[k], row[k], square_sum);
+        }
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; ++i) {
+            values[i] = row_branch[own * 1024 + i * 128 + tid] + row_hidden[own * 1024 + i * 128 + tid];
+        }
+    } else {
+        for (uint chunk = 0; chunk < blocks; ++chunk) {
+            float chunk_values[8];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+                const uint index = chunk * 1024 + i * 128 + tid;
+                chunk_values[i] = row_branch[index] + row_hidden[index];
+            }
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+                square_sum = fma(chunk_values[i], chunk_values[i], square_sum);
+                if (chunk == own) values[i] = chunk_values[i];
+            }
+        }
+    }
+    const float sum = bonsai_group_sum<128>(square_sum, tid, partial);
+    const float inverse = rsqrt(sum / float(dimension) + epsilon);
+    const ulong base = ulong(block) * 1024;
+    const uint column = own * 1024;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; ++i) {
+        const uint local = i * 128 + tid;
+        sum_out[base + local] = values[i];
+        values[i] = values[i] * inverse * weights[column + local];
+        normalized[base + local] = values[i];
+    }
+    bonsai_fwht_values<false>(values, signs, output, blocks, block, tid, shared);
+}
+
+kernel void bo_add_rms_fwht(
+    device const float *hidden [[buffer(0)]], device const float *branch [[buffer(1)]],
+    device const float *weights [[buffer(2)]], device const float *signs [[buffer(3)]],
+    device float *sum_out [[buffer(4)]], device float *normalized [[buffer(5)]],
+    device float *output [[buffer(6)]], constant uint &blocks_per_row [[buffer(7)]],
+    constant float &epsilon [[buffer(8)]],
+    uint block [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float partial[4];
+    threadgroup float shared[1024];
+    // The model width (5120) keeps its whole row in registers.
+    if (blocks_per_row == 5) {
+        bonsai_add_rms_fwht_impl<5>(hidden, branch, weights, signs, sum_out, normalized,
+                                    output, blocks_per_row, epsilon, block, tid, partial, shared);
+    } else {
+        bonsai_add_rms_fwht_impl<0>(hidden, branch, weights, signs, sum_out, normalized,
+                                    output, blocks_per_row, epsilon, block, tid, partial, shared);
+    }
 }
 
 static inline float bonsai_text_rope(
@@ -785,7 +917,10 @@ static inline void bonsai_attn_split_tensor_quantized_impl(
     threadgroup float *correction, threadgroup float *maximum, threadgroup float *denominator
 ) {
     constexpr int nq = 8, nk = NK, dimension = 256, live = 6;
-    const uint kv_head = group / splits, split = group % splits;
+    // KV head fastest: a token's four head rows share the cache lines of its
+    // scale block, so the four groups of one split run together and fetch
+    // those lines once (5-6 % at 2K-128K tokens over split-major order).
+    const uint kv_head = group % 4, split = group / 4;
     const uint begin = split * split_tokens, end = min(begin + split_tokens, prefix);
     const uint row = tid / 16, lane = tid % 16;
     const bool active = row < live;

@@ -333,4 +333,140 @@ static inline void bonsai_ptq1_small_batch_wide_impl(
     if (first_row + fn + 1 < rows) output[out + 1] = sums[1];
 }
 
+// Large-batch variant for prefill chunks: a threadgroup owns 64 output rows
+// and 64 tokens and decodes each packed block once into threadgroup memory
+// for all of them, as trit * scale in half (exact: the trit is -1/0/+1 and
+// the scale is a half), instead of once per eight tokens. Four SIMD groups
+// each multiply a 32-token by 32-row quarter with sixteen 8x8 accumulators,
+// so every W tile load serves four multiplies and every activation tile load
+// four more. Activations stay F32 and go straight from device memory into
+// the multiplies (rows past `tokens` repeat the last row and are not
+// stored); the F32 x half multiplies keep the F32 operand (checked by
+// `matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range`) and
+// accumulate in F32, so only the summation order differs from the wide
+// kernel. Dispatch (ceil(rows / 64), ceil(tokens / 64)) groups of 128
+// threads.
+//
+// M4 Pro, 17408x5120 / 5120x17408: 1,687 / 1,734 us at 64 tokens and
+// 3,317 / 3,333 at 128, against eight-token wide passes' 1,912 / 2,292 and
+// 3,834 / 4,586 (3.4 T against 3.0 T multiply-adds per second; the 8x8
+// multiplies peak near 3.9 T on this part whatever their operand types).
+// With decoding skipped after the first block 64 tokens took 1,634 us, so
+// the multiplies, not the decode, set the cost. Measured and not kept: a
+// padded threadgroup stride (72 halves), 1-2% slower; 32 x 64 quarters per
+// SIMD group (two or four groups for 64-256 tokens), 1.3-2x slower from
+// register pressure; a 32-token tile (64 threads), 950 / 1,027 us at 32
+// tokens against the wide passes' 958 / 1,146.
+constant constexpr metal::uint bonsai_large_tile = 64;
+
+template<typename Packed, typename Output>
+static inline void bonsai_ptq1_large_batch_impl(
+    Packed packed,
+    device const float *input,
+    Output output,
+    metal::uint rows,
+    metal::uint columns,
+    metal::uint tokens,
+    metal::uint2 group,
+    metal::uint tid,
+    metal::uint simd,
+    metal::uint lane,
+    threadgroup half *decoded
+) {
+    // decoded[element * stride + row] holds one block of the tile's rows.
+    constexpr metal::uint stride = bonsai_large_tile;
+    const metal::uint blocks = columns / 128;
+    const metal::uint first_row = group.x * bonsai_large_tile;
+    const metal::uint first_token = group.y * bonsai_large_tile;
+    // Decoder role: thread tid fills row tid / 2's elements from qs bytes
+    // 12h..12h+11 and qh byte 24 + h, h = tid & 1. Rows past the end are
+    // clamped to a real row; their products are never stored.
+    const metal::uint decode_row = tid / 2, decode_half = tid & 1;
+    const metal::ulong decode_base =
+        metal::ulong(metal::min(first_row + decode_row, rows - 1)) * blocks;
+    // Multiplier role: SIMD group simd covers tokens 32 (simd / 2).. and
+    // rows 32 (simd & 1)..; lane owns row fm and columns fn, fn + 1 of each
+    // 8x8 tile, as in the wide kernel.
+    const metal::uint quad = lane / 4;
+    const metal::uint fm = (quad & 4) + ((lane / 2) % 4);
+    const metal::uint fn = (quad & 2) * 2 + (lane % 2) * 2;
+    const metal::uint token_base = first_token + (simd / 2) * 32;
+    const metal::uint row_base = (simd & 1) * 32;
+    device const float *x[4];
+    #pragma clang loop unroll(full)
+    for (metal::uint i = 0; i < 4; ++i) {
+        x[i] = input +
+            metal::ulong(metal::min(token_base + 8 * i + fm, tokens - 1)) * columns + fn;
+    }
+    metal::simdgroup_float8x8 sums[4][4];
+    #pragma clang loop unroll(full)
+    for (metal::uint i = 0; i < 4; ++i) {
+        #pragma clang loop unroll(full)
+        for (metal::uint j = 0; j < 4; ++j) {
+            sums[i][j] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    for (metal::uint block = 0; block < blocks; ++block) {
+        {
+            const metal::ulong packed_block = decode_base + block;
+            const half scale = half(packed.scale(packed_block));
+            threadgroup half *column = decoded + decode_row;
+            #pragma clang loop unroll(full)
+            for (metal::uint b = 0; b < 12; ++b) {
+                const metal::uint byte = 12 * decode_half + b;
+                half trits[5];
+                bonsai_ptq1_trits(bonsai_ptq1_code(packed.code(packed_block, byte)), trits);
+                #pragma clang loop unroll(full)
+                for (metal::uint n = 0; n < 5; ++n) {
+                    // Element layout as in bonsai_ptq1_trit.
+                    const metal::uint element = byte < 16 ? byte + 16 * n : 64 + byte + 8 * n;
+                    column[element * stride] = trits[n] * scale;
+                }
+            }
+            half trits[5];
+            bonsai_ptq1_trits(
+                bonsai_ptq1_code(packed.code(packed_block, 24 + decode_half)), trits);
+            #pragma clang loop unroll(full)
+            for (metal::uint n = 0; n < 4; ++n) {
+                column[(120 + decode_half + 2 * n) * stride] = trits[n] * scale;
+            }
+        }
+        metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        const metal::uint offset = block * 128;
+        #pragma clang loop unroll(full)
+        for (metal::uint k = 0; k < 128; k += 8) {
+            metal::simdgroup_half8x8 w[4];
+            #pragma clang loop unroll(full)
+            for (metal::uint j = 0; j < 4; ++j) {
+                metal::simdgroup_load(w[j], decoded + k * stride + row_base + 8 * j, stride);
+            }
+            #pragma clang loop unroll(full)
+            for (metal::uint i = 0; i < 4; ++i) {
+                metal::simdgroup_float8x8 a;
+                const metal::float2 pair =
+                    *reinterpret_cast<device const metal::float2 *>(x[i] + offset + k);
+                a.thread_elements()[0] = pair.x;
+                a.thread_elements()[1] = pair.y;
+                #pragma clang loop unroll(full)
+                for (metal::uint j = 0; j < 4; ++j) {
+                    metal::simdgroup_multiply_accumulate(sums[i][j], a, w[j], sums[i][j]);
+                }
+            }
+        }
+        metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    }
+    #pragma clang loop unroll(full)
+    for (metal::uint i = 0; i < 4; ++i) {
+        const metal::uint token = token_base + 8 * i + fm;
+        if (token >= tokens) continue;
+        #pragma clang loop unroll(full)
+        for (metal::uint j = 0; j < 4; ++j) {
+            const metal::uint row = first_row + row_base + 8 * j + fn;
+            const metal::ulong out = metal::ulong(token) * rows + row;
+            if (row < rows) output[out] = sums[i][j].thread_elements()[0];
+            if (row + 1 < rows) output[out + 1] = sums[i][j].thread_elements()[1];
+        }
+    }
+}
+
 #endif

@@ -65,6 +65,32 @@ impl BonsaiModel {
         Ok(())
     }
 
+    /// `output = input + scratch.branch`, normalized by `weights` into
+    /// `scratch.normalized` and rotated into `scratch.rotated_hidden`, in one
+    /// dispatch: bitwise a residual add then [`Self::normalize_input`] of its
+    /// sum. `output` must be a different buffer from `input`.
+    pub(super) fn residual_normalize(
+        &self,
+        batch: &mut CommandBatch,
+        input: &MetalBuffer,
+        output: &MetalBuffer,
+        weights: &MetalBuffer,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        let scratch = &self.scratch;
+        self.ops.residual_normalize_transform(
+            batch,
+            &self.input_rotation,
+            input,
+            &scratch.branch,
+            weights,
+            [output, &scratch.normalized, &scratch.rotated_hidden],
+            tokens,
+            self.epsilon,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn feed_forward(
         &self,
         batch: &mut CommandBatch,
@@ -73,6 +99,26 @@ impl BonsaiModel {
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
         self.normalize_input(batch, &scratch.hidden, &layer.post_attention_norm, tokens)?;
+        self.feed_forward_branch(batch, layer, tokens)?;
+        self.ops.residual_add(
+            batch,
+            &scratch.branch,
+            &scratch.hidden,
+            &scratch.hidden,
+            WIDTH as u32 * tokens,
+        )?;
+        Ok(())
+    }
+
+    /// The FFN of rows already normalized and rotated into
+    /// `scratch.rotated_hidden`, leaving its output in `scratch.branch`.
+    pub(super) fn feed_forward_branch(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &Layer,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        let scratch = &self.scratch;
         if tokens == 1 {
             self.kernels.matvec_swiglu(
                 batch,
@@ -120,15 +166,7 @@ impl BonsaiModel {
             &scratch.rotated_ffn,
             &scratch.branch,
             tokens,
-        )?;
-        self.ops.residual_add(
-            batch,
-            &scratch.branch,
-            &scratch.hidden,
-            &scratch.hidden,
-            WIDTH as u32 * tokens,
-        )?;
-        Ok(())
+        )
     }
 
     /// During verification the layer keeps its start state and history: the
@@ -182,16 +220,25 @@ impl BonsaiModel {
             &scratch.recurrent_output,
             tokens,
         )?;
-        self.ops.gdn_postprocess_rows(
+        // The output norm, gate and rotation in one dispatch, bitwise
+        // `gdn_postprocess_rows` then `project_attention`'s rotation.
+        self.ops.gdn_postprocess_transform(
             batch,
             &scratch.recurrent_output,
             &scratch.gate,
             &layer.norm,
-            &scratch.attention_output,
+            &self.attention_rotation,
+            &scratch.rotated_attention,
             self.epsilon,
             tokens,
         )?;
-        self.project_attention(batch, &layer.output, tokens)
+        self.project(
+            batch,
+            &layer.output,
+            &scratch.rotated_attention,
+            &scratch.branch,
+            tokens,
+        )
     }
 
     /// The recurrence's per-row inputs: the raw QKV projection into

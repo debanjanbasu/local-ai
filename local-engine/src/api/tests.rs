@@ -3,6 +3,35 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::{CompletionRequest, Event, PrefillProgress, Sampling, Signal};
 use crate::Engine;
 
+#[test]
+fn a_silent_stream_times_out_without_closing_the_generation() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let mut events = super::EventStream {
+        receiver,
+        progress: std::collections::VecDeque::new(),
+        cancel: crate::bonsai_model::CancelToken::new(),
+        not_sync: std::marker::PhantomData,
+    };
+    let (resume, waiting) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        // Close after one second if the wait is broken, so this regression
+        // fails rather than hanging the suite indefinitely.
+        if waiting.recv_timeout(Duration::from_secs(1)).is_ok() {
+            sender
+                .blocking_send(super::Delivered::Event(Event::Content("ready".into())))
+                .expect("stream remains open after a timeout");
+        }
+    });
+    assert!(matches!(
+        events.next_timeout(Duration::from_millis(10)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    resume.send(()).expect("resume producer");
+    assert!(matches!(events.next(), Some(Event::Content(text)) if text == "ready"));
+    assert!(events.next().is_none());
+    producer.join().expect("producer");
+}
+
 /// Prefill reports every chunk, in order, before the first event exists.
 ///
 /// This is the claim the whole prefill heartbeat rests on: the model emits
