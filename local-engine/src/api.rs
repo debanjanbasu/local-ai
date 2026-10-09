@@ -15,22 +15,29 @@ use tokio::sync::mpsc as async_mpsc;
 use crate::bonsai_model::{BonsaiEngine, BonsaiInfo, CancelToken, PromptCacheSource, StopReason};
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
-use crate::bonsai_tokenizer::{BonsaiTokenizer, ChatMessage as TokenizerMessage};
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
 use crate::runtime::{EVENT_BUFFER, PrefillProgress};
+use crate::tools::{ToolCall, ToolCallParser, ToolDefinition, ToolSet, Turn};
 use crate::{GenerateParams, GenerationStats};
 
 const THINK_END: &str = "</think>";
 
-/// A role/content pair used by the checkpoint chat template.
-#[derive(Clone, Debug)]
+/// One message rendered through the checkpoint chat template.
+#[derive(Clone, Debug, Default)]
 pub struct ChatMessage {
-    /// OpenAI-compatible role (`system`, `user`, or `assistant`).
+    /// OpenAI-compatible role: `system` or `developer` (first message only;
+    /// both use the template's single system slot), `user`, `assistant`, or
+    /// `tool`.
     pub role: String,
-    /// Visible message content.
+    /// Visible message content, or the result text of a `tool` message.
     pub content: String,
     /// Optional prior assistant reasoning content.
     pub reasoning_content: Option<String>,
+    /// Calls a prior `assistant` message made, replayed verbatim. Each must be
+    /// answered by exactly one following `tool` message.
+    pub tool_calls: Vec<ToolCall>,
+    /// For a `tool` message, the [`ToolCall::id`] this result answers.
+    pub tool_call_id: Option<String>,
 }
 
 /// Sampling controls for one generation.
@@ -50,6 +57,10 @@ pub struct ChatRequest {
     pub thinking: bool,
     /// Optional prompt-cache affinity hint.
     pub session: Option<String>,
+    /// Functions the model may call. Empty disables tool-call parsing, so
+    /// `<tool_call>` text stays ordinary content. The model decides whether to
+    /// call; nothing forces a call.
+    pub tools: Vec<ToolDefinition>,
 }
 
 /// A raw-text generation request.
@@ -100,6 +111,10 @@ pub struct Stats {
     pub stop_reason: StopReason,
     /// Prompt-cache tier used by the request.
     pub cache_source: PromptCacheSource,
+    /// Generated tokens through the first `</think>` delimiter (inclusive),
+    /// or all generated tokens if thinking ended before that delimiter.
+    /// Zero for requests with thinking disabled and for raw completions.
+    pub reasoning_tokens: usize,
     /// Token and speculation measurements.
     pub generation: GenerationStats,
 }
@@ -111,6 +126,8 @@ pub struct ChatOutput {
     pub content: String,
     /// Model reasoning emitted before the closing thinking delimiter.
     pub reasoning: String,
+    /// Validated tool calls, identical to the streamed [`Event::ToolCall`]s.
+    pub tool_calls: Vec<ToolCall>,
     /// Generated token IDs.
     pub token_ids: Vec<u32>,
     /// Generation measurements.
@@ -124,6 +141,14 @@ pub enum Event {
     Content(String),
     /// Hidden reasoning text when the template exposes it separately.
     Reasoning(String),
+    /// A complete call whose name and arguments passed the tool's schema.
+    ///
+    /// Emitted only for requests with tools, once `</tool_call>` has been
+    /// generated and parsed; never partial. The engine does not execute it. A
+    /// malformed, invalid or truncated call ends the generation with an error
+    /// instead ([`Event::Error`] on a stream, `Err` from the synchronous API)
+    /// and no [`Event::Finished`].
+    ToolCall(ToolCall),
     /// Generated token IDs, emitted as a batch before [`Event::Finished`].
     TokenIds(Vec<u32>),
     /// Successful terminal event.
@@ -243,15 +268,17 @@ impl Engine {
 
     /// Render messages through the checkpoint's chat template.
     pub fn render_chat(messages: &[ChatMessage], thinking: bool) -> crate::Result<String> {
-        let borrowed = messages
-            .iter()
-            .map(|message| TokenizerMessage {
-                role: &message.role,
-                content: &message.content,
-                reasoning_content: message.reasoning_content.as_deref(),
-            })
-            .collect::<Vec<_>>();
-        BonsaiTokenizer::chat_messages(&borrowed, thinking)
+        Self::render_chat_with_tools(messages, thinking, &[])
+    }
+
+    /// Render messages and tool definitions through the checkpoint's chat
+    /// template, validating the tools and any replayed calls and results.
+    pub fn render_chat_with_tools(
+        messages: &[ChatMessage],
+        thinking: bool,
+        tools: &[ToolDefinition],
+    ) -> crate::Result<String> {
+        render_messages(messages, thinking, &ToolSet::new(tools)?)
     }
 
     /// Chat with one user prompt and collect the final answer and statistics.
@@ -267,20 +294,23 @@ impl Engine {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: prompt.into(),
-                reasoning_content: None,
+                ..ChatMessage::default()
             }],
             max_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
             sampling: Sampling::default(),
             thinking: true,
             session: None,
+            tools: Vec::new(),
         };
         let mut content = String::new();
         let mut reasoning = String::new();
+        let mut tool_calls = Vec::new();
         let mut token_ids = Vec::new();
         let stats = self.chat_with(&request, |event| {
             match event {
                 Event::Content(piece) => content.push_str(&piece),
                 Event::Reasoning(piece) => reasoning.push_str(&piece),
+                Event::ToolCall(call) => tool_calls.push(call),
                 Event::TokenIds(ids) => token_ids = ids,
                 Event::Finished(_) | Event::Error(_) => {}
             }
@@ -289,6 +319,7 @@ impl Engine {
         Ok(ChatOutput {
             content,
             reasoning,
+            tool_calls,
             token_ids,
             stats,
         })
@@ -312,13 +343,14 @@ impl Engine {
         progress: &mut dyn FnMut(PrefillProgress),
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
-        let prompt = Self::render_chat(&request.messages, request.thinking)?;
+        let (prompt, tools) = prepare_chat(request)?;
         self.generate(
             &prompt,
             request.max_tokens,
             &request.sampling,
             request.session.as_deref(),
             request.thinking,
+            tools,
             cancel,
             progress,
             callback,
@@ -349,6 +381,7 @@ impl Engine {
             &request.sampling,
             request.session.as_deref(),
             false,
+            None,
             cancel,
             progress,
             callback,
@@ -363,6 +396,7 @@ impl Engine {
         sampling: &Sampling,
         session: Option<&str>,
         thinking: bool,
+        tools: Option<Arc<ToolSet>>,
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
         mut callback: impl FnMut(Event) -> ControlFlow<()>,
@@ -370,7 +404,7 @@ impl Engine {
         let ids = self.inner.encode_prompt(prompt, true, false)?;
         let mut params = sampling.0.clone();
         params.max_tokens = max_tokens;
-        let mut splitter = EventSplitter::new(thinking);
+        let mut splitter = EventSplitter::new(thinking, tools);
         let output = self.inner.generate_session_progress(
             &ids,
             &params,
@@ -379,10 +413,21 @@ impl Engine {
             cancel,
             progress,
         )?;
-        if splitter.finish(&mut callback).is_break() {
+        let reasoning_tokens = crate::bonsai_tokenizer::answer_start(&output.token_ids, thinking)
+            .unwrap_or(output.token_ids.len());
+        let finished = if splitter.failed() {
+            ControlFlow::Break(())
+        } else {
+            splitter.finish(&mut callback)
+        };
+        if let Some(failure) = splitter.take_failure() {
+            return Err(crate::Error::Generation(failure));
+        }
+        if finished.is_break() {
             return Ok(Stats {
                 stop_reason: StopReason::Cancelled,
                 cache_source: output.cache_source,
+                reasoning_tokens,
                 generation: output.stats,
             });
         }
@@ -390,12 +435,14 @@ impl Engine {
             return Ok(Stats {
                 stop_reason: StopReason::Cancelled,
                 cache_source: output.cache_source,
+                reasoning_tokens,
                 generation: output.stats,
             });
         }
         let stats = Stats {
             stop_reason: output.stop_reason,
             cache_source: output.cache_source,
+            reasoning_tokens,
             generation: output.stats,
         };
         let _ = callback(Event::Finished(Box::new(stats.clone())));
@@ -474,7 +521,7 @@ impl EngineHandle {
     /// ```no_run
     /// # use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
     /// let handle = Engine::open()?.into_handle();
-    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), reasoning_content: None }], max_tokens: 32, sampling: Sampling::default(), thinking: true, session: None };
+    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, session: None, tools: Vec::new() };
     /// for event in handle.chat(request)? {
     ///     if let Event::Content(text) = event { print!("{text}"); }
     /// }
@@ -548,6 +595,7 @@ struct Prepared {
     params: GenerateParams,
     session: Option<String>,
     thinking: bool,
+    tools: Option<Arc<ToolSet>>,
     events: async_mpsc::Sender<Delivered>,
     cancel: CancelToken,
 }
@@ -575,7 +623,7 @@ impl Delivery {
     }
 
     fn emit(&mut self, piece: &str) -> bool {
-        let mut splitter = std::mem::replace(&mut self.splitter, EventSplitter::new(false));
+        let mut splitter = std::mem::replace(&mut self.splitter, EventSplitter::new(false, None));
         let flow = splitter.emit(piece, &mut |event| self.push(event));
         self.splitter = splitter;
         flow.is_continue()
@@ -591,15 +639,28 @@ impl Delivery {
                 return;
             }
         };
-        let mut splitter = std::mem::replace(&mut self.splitter, EventSplitter::new(false));
-        if splitter.finish(&mut |event| self.push(event)).is_break()
-            || self.push(Event::TokenIds(output.token_ids)).is_break()
-        {
+        let mut splitter = std::mem::replace(&mut self.splitter, EventSplitter::new(false, None));
+        let finished = if splitter.failed() {
+            ControlFlow::Break(())
+        } else {
+            splitter.finish(&mut |event| self.push(event))
+        };
+        if let Some(failure) = splitter.take_failure() {
+            // A parse failure is terminal: report it, never `Finished`.
+            self.outbox
+                .push_back(Delivered::Event(Event::Error(failure)));
+            return;
+        }
+        let reasoning_tokens =
+            crate::bonsai_tokenizer::answer_start(&output.token_ids, splitter.thinking)
+                .unwrap_or(output.token_ids.len());
+        if finished.is_break() || self.push(Event::TokenIds(output.token_ids)).is_break() {
             return;
         }
         let stats = Stats {
             stop_reason: output.stop_reason,
             cache_source: output.cache_source,
+            reasoning_tokens,
             generation: output.stats,
         };
         let _ = self.push(Event::Finished(Box::new(stats)));
@@ -729,7 +790,7 @@ impl Worker {
             let mut delivery = Delivery {
                 events: prepared.events,
                 cancel: prepared.cancel,
-                splitter: EventSplitter::new(prepared.thinking),
+                splitter: EventSplitter::new(prepared.thinking, prepared.tools),
                 outbox: VecDeque::new(),
             };
             let cancel = delivery.cancel.clone();
@@ -755,7 +816,7 @@ impl Worker {
     fn prepare(&self, job: Job) -> Option<Prepared> {
         let (prompt, max_tokens, sampling, session, thinking, events, cancel) = match job {
             Job::Chat(request, events, cancel) => (
-                Engine::render_chat(&request.messages, request.thinking),
+                prepare_chat(&request),
                 request.max_tokens,
                 request.sampling,
                 request.session,
@@ -764,7 +825,7 @@ impl Worker {
                 cancel,
             ),
             Job::Completion(request, events, cancel) => (
-                Ok(request.prompt),
+                Ok((request.prompt, None)),
                 request.max_tokens,
                 request.sampling,
                 request.session,
@@ -773,9 +834,14 @@ impl Worker {
                 cancel,
             ),
         };
-        let ids = prompt.and_then(|prompt| self.engine.inner.encode_prompt(&prompt, true, false));
+        let ids = prompt.and_then(|(prompt, tools)| {
+            Ok((
+                self.engine.inner.encode_prompt(&prompt, true, false)?,
+                tools,
+            ))
+        });
         match ids {
-            Ok(ids) => {
+            Ok((ids, tools)) => {
                 let mut params = sampling.0;
                 params.max_tokens = max_tokens;
                 Some(Prepared {
@@ -783,6 +849,7 @@ impl Worker {
                     params,
                     session,
                     thinking,
+                    tools,
                     events,
                     cancel,
                 })
@@ -1047,20 +1114,64 @@ impl Drop for EventStream {
     }
 }
 
+/// Render a request and validate its tools; the one path shared by the
+/// synchronous [`Engine`] and the worker.
+fn prepare_chat(request: &ChatRequest) -> crate::Result<(String, Option<Arc<ToolSet>>)> {
+    let tools = ToolSet::new(&request.tools)?;
+    let prompt = render_messages(&request.messages, request.thinking, &tools)?;
+    Ok((prompt, (!tools.is_empty()).then(|| Arc::new(tools))))
+}
+
+fn render_messages(
+    messages: &[ChatMessage],
+    thinking: bool,
+    tools: &ToolSet,
+) -> crate::Result<String> {
+    let turns = messages
+        .iter()
+        .map(|message| Turn {
+            role: &message.role,
+            content: &message.content,
+            reasoning_content: message.reasoning_content.as_deref(),
+            tool_calls: &message.tool_calls,
+            tool_call_id: message.tool_call_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    crate::tools::render(&turns, thinking, tools)
+}
+
+/// Splits generated text into reasoning, content and (when the request has
+/// tools) validated tool calls. Reasoning is split off first, so tool-call
+/// markup is only recognised in the visible answer.
 struct EventSplitter {
+    /// Original template mode, retained after the reasoning delimiter for usage.
+    thinking: bool,
     reasoning: bool,
     pending: String,
     /// The chat template puts `\n\n` after `</think>`; drop it from the answer.
     answer_started: bool,
+    tools: Option<ToolCallParser>,
 }
 
 impl EventSplitter {
-    const fn new(reasoning: bool) -> Self {
+    fn new(reasoning: bool, tools: Option<Arc<ToolSet>>) -> Self {
         Self {
+            thinking: reasoning,
             reasoning,
             pending: String::new(),
             answer_started: !reasoning,
+            tools: tools.map(ToolCallParser::new),
         }
+    }
+
+    /// Whether a tool-call parse failure has stopped this stream.
+    const fn failed(&self) -> bool {
+        matches!(&self.tools, Some(parser) if parser.failed())
+    }
+
+    /// The tool-call parse failure that stopped this stream, if any.
+    fn take_failure(&mut self) -> Option<String> {
+        self.tools.as_mut().and_then(ToolCallParser::take_failure)
     }
 
     fn content(
@@ -1077,7 +1188,10 @@ impl EventSplitter {
             return ControlFlow::Continue(());
         }
         self.answer_started = true;
-        callback(Event::Content(text.to_owned()))
+        match &mut self.tools {
+            Some(parser) => parser.feed(text, callback),
+            None => callback(Event::Content(text.to_owned())),
+        }
     }
 
     fn emit(
@@ -1120,13 +1234,20 @@ impl EventSplitter {
     }
 
     fn finish(&mut self, callback: &mut impl FnMut(Event) -> ControlFlow<()>) -> ControlFlow<()> {
-        if self.pending.is_empty() {
-            ControlFlow::Continue(())
-        } else if self.reasoning {
-            callback(Event::Reasoning(std::mem::take(&mut self.pending)))
-        } else {
-            callback(Event::Content(std::mem::take(&mut self.pending)))
+        if !self.pending.is_empty() {
+            let text = std::mem::take(&mut self.pending);
+            let event = if self.reasoning {
+                Event::Reasoning(text)
+            } else {
+                Event::Content(text)
+            };
+            if callback(event).is_break() {
+                return ControlFlow::Break(());
+            }
         }
+        self.tools
+            .as_mut()
+            .map_or(ControlFlow::Continue(()), |parser| parser.finish(callback))
     }
 }
 

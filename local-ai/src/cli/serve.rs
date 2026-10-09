@@ -22,6 +22,7 @@ mod http3;
 mod options;
 mod request;
 mod response;
+mod responses;
 mod sse;
 
 #[cfg(test)]
@@ -36,9 +37,10 @@ use self::http3::serve_h3;
 use self::options::{parse, usage};
 use self::request::{GenerationRequest, prepare_generation};
 use self::response::{
-    add_alt_svc, error_response, error_status, error_status_message, json_response,
-    queue_full_response, wants_zstd,
+    Protocol, Reply, add_alt_svc, error_response, error_status, error_status_message,
+    json_response, queue_full_response, wants_zstd,
 };
+use self::responses::prepare_responses;
 use self::sse::start_stream;
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -57,6 +59,10 @@ struct Args {
 struct AppState {
     engine: EngineHandle,
     model: Arc<str>,
+    /// Tokens one request may hold, prompt and output together, as the engine
+    /// admitted them at load (`BonsaiInfo::context`). Requests over it fail
+    /// with a context-overflow error rather than being truncated.
+    context: usize,
     thinking: bool,
     api_key: Option<Arc<str>>,
     alt_svc: Option<Arc<str>>,
@@ -128,15 +134,16 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
         return json_response(
             StatusCode::OK,
-            json!({"object":"list","data":[{"id":state.model.as_ref(),"object":"model","owned_by":"local"}]}),
+            models_json(&state.model, state.context),
             &state,
             &parts.headers,
         )
         .await;
     }
-    let chat = match (parts.method, parts.uri.path()) {
-        (Method::POST, "/v1/chat/completions") => true,
-        (Method::POST, "/v1/completions") => false,
+    let api = match (parts.method, parts.uri.path()) {
+        (Method::POST, "/v1/chat/completions") => Api::Chat,
+        (Method::POST, "/v1/completions") => Api::Completion,
+        (Method::POST, "/v1/responses") => Api::Responses,
         _ => {
             return error_response(
                 StatusCode::NOT_FOUND,
@@ -172,7 +179,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             .await;
         }
     };
-    let prepared = match prepare_generation(&body, chat, state.thinking) {
+    let prepared = match prepare(api, &body, state.thinking) {
         Ok(prepared) => prepared,
         Err(error) => {
             return error_response(
@@ -184,7 +191,9 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             .await;
         }
     };
-    let events = match prepared.request {
+    let (stream, request, protocol) = prepared;
+    let reply = Reply::new(protocol, Arc::clone(&state.model));
+    let events = match request {
         GenerationRequest::Chat(request) => state.engine.chat(request),
         GenerationRequest::Completion(request) => state.engine.complete(request),
     };
@@ -204,16 +213,8 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         }
     };
     let admitted = state.depth.admit();
-    if prepared.stream {
-        match start_stream(
-            events,
-            chat,
-            Arc::clone(&state.model),
-            admitted,
-            state.stall,
-        )
-        .await
-        {
+    if stream {
+        match start_stream(events, reply, admitted, state.stall).await {
             Ok(events) => {
                 let mut response = Response::new(Body::from_stream(ReceiverStream::new(events)));
                 response.headers_mut().insert(
@@ -237,9 +238,8 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         // fails a write instead of being waited out. `zstd` is decided from the
         // request here and reported back from the body, because the response may
         // only claim an encoding it is really using.
-        let model = Arc::clone(&state.model);
         let zstd = wants_zstd(&parts.headers);
-        match start_chunked(events, chat, model, admitted, state.stall, zstd).await {
+        match start_chunked(events, reply, admitted, state.stall, zstd).await {
             Ok((frames, compressed)) => {
                 let mut response = Response::new(Body::from_stream(ReceiverStream::new(frames)));
                 response.headers_mut().insert(
@@ -262,6 +262,54 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Api {
+    Completion,
+    Chat,
+    Responses,
+}
+
+/// Parse a request body for `api` into the engine request and how to answer it.
+fn prepare(
+    api: Api,
+    body: &[u8],
+    thinking: bool,
+) -> crate::Result<(bool, GenerationRequest, Protocol)> {
+    match api {
+        Api::Completion | Api::Chat => {
+            let chat = matches!(api, Api::Chat);
+            let prepared = prepare_generation(body, chat, thinking)?;
+            let protocol = if chat {
+                Protocol::Chat {
+                    include_usage: prepared.include_usage,
+                }
+            } else {
+                Protocol::Completion
+            };
+            Ok((prepared.stream, prepared.request, protocol))
+        }
+        Api::Responses => {
+            let prepared = prepare_responses(body, thinking)?;
+            Ok((
+                prepared.stream,
+                GenerationRequest::Chat(prepared.request),
+                Protocol::Responses(Arc::new(prepared.echo)),
+            ))
+        }
+    }
+}
+
+/// `GET /v1/models`: the one loaded model and the context the engine admitted
+/// for it.
+///
+/// `context_length` (the name `OpenRouter` and LM Studio read) and
+/// `max_model_len` (vLLM's) are both the per-request admission limit from
+/// `BonsaiInfo::context`, prompt plus output, not the checkpoint's training
+/// length: it is what a request can actually use on this machine.
+fn models_json(model: &str, context: usize) -> serde_json::Value {
+    json!({"object":"list","data":[{"id":model,"object":"model","owned_by":"local","context_length":context,"max_model_len":context}]})
+}
+
 async fn run_async(args: Args) -> crate::Result<()> {
     // One discovery serves both the engine and the TLS lookup: each one probes
     // the disk's write rate with a 16 MiB file, so a second is wasted startup.
@@ -269,9 +317,11 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let model: Arc<str> = resources.model.to_string_lossy().into_owned().into();
     let engine = Engine::from_resources(&resources)?;
     eprintln!("{}", engine.info().json);
+    let context = engine.info().model.context;
     let state = AppState {
         engine: engine.into_handle(),
         model,
+        context,
         thinking: args.thinking,
         api_key: args.api_key.map(Into::into),
         alt_svc: resources
@@ -339,3 +389,7 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod protocol_tests;

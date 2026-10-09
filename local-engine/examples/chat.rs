@@ -18,12 +18,13 @@ fn main() -> local_engine::Result<()> {
         messages: vec![ChatMessage {
             role: "user".into(),
             content: "Say hello in one sentence.".into(),
-            reasoning_content: None,
+            ..ChatMessage::default()
         }],
         max_tokens: 128,
         sampling: Sampling::default(),
         thinking: true,
         session: None,
+        tools: Vec::new(),
     };
     engine.chat_with(&request, |event| {
         if let Event::Content(text) = event {

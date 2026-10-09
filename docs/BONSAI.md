@@ -160,18 +160,53 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | readiness |
-| `GET` | `/v1/models` | installed model |
-| `POST` | `/v1/chat/completions` | templated chat |
+| `GET` | `/v1/models` | installed model and admitted `context_length`/`max_model_len` |
+| `POST` | `/v1/chat/completions` | templated text and function calling |
 | `POST` | `/v1/completions` | raw completion |
+| `POST` | `/v1/responses` | stateless text and function calling |
 
 Generation accepts `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
-`presence_penalty`, `frequency_penalty`, `seed`, and `stream`. `session_id` or
-`user` supplies prompt-cache affinity. Chat messages support text and optional
-`reasoning_content`; media is rejected. Requests are limited to 2 MiB.
+`presence_penalty`, `frequency_penalty`, `seed`, and `stream`. Chat's
+`max_completion_tokens` takes precedence over `max_tokens`; Responses uses
+`max_output_tokens`. Cache affinity prefers `prompt_cache_key`, then
+`session_id`, then `user`. Requests are limited to 2 MiB; media is rejected.
 
-With `stream: true`, responses are `text/event-stream` chunks terminated by
+Chat supports function `tools`, assistant `tool_calls`, and tool-result messages
+with `tool_call_id`. Native rendering and validation belong to `local-engine`
+([contract](../local-engine/README.md#native-tool-calling)); HTTP never executes
+a tool. Calls carry stable IDs and canonical JSON argument strings. A complete
+validated call is delivered as one argument delta: incremental partial argument
+streaming is not implemented. Chat finishes with `tool_calls` unless a token
+limit takes precedence. Ordinary answer and reasoning text still stream.
+
+Responses accepts explicit message, reasoning, `function_call` and
+`function_call_output` history in `input`, plus `instructions`. Set `store:false`
+and resend history: storage, `previous_response_id`, conversations, background
+requests and item references are unsupported. SSE uses typed `response.*` events
+with sequence numbers and stable response/item IDs, ending with completed,
+incomplete (output limit), or failed. It does not use Chat's `[DONE]` sentinel.
+Non-streaming Responses sends whitespace heartbeats before its final JSON.
+
+Reasoning controls are `reasoning_effort` (Chat) and `reasoning.effort`
+(Responses): `none` or `xhigh`. A server started with `--no-thinking` rejects
+`xhigh`. Usage counts reasoning tokens from generated IDs through the first
+`</think>` token, inclusive; a response truncated before that token counts all
+generated tokens as reasoning. Prior reasoning is retained in replayed history.
+Responses reports measured prefix reuse as `input_tokens_details.cached_tokens`.
+`cache_write_tokens` is zero: local cache creation has no separately accounted
+or charged cache-write tier.
+
+This is **not the full OpenAI platform contract**. Guaranteed/forced tool
+choices, `strict:true`, JSON-schema-constrained generation, built-in/hosted
+tools, encrypted reasoning, reasoning summaries, images and audio are rejected.
+`tool_choice:auto` and `none` are supported; `none` hides tools and produces no
+structured tool events, not a guarantee against tool-like literal text.
+Decisions requires a separately trained and evaluated judgment head; the MTP
+head and next-token softmax are not calibrated decision probabilities.
+
+With `stream: true`, Chat/completions are `text/event-stream` chunks terminated by
 `data: [DONE]`. Chat separates `reasoning_content` from visible `content`.
-Non-streamed JSON includes token usage, cache source, timings, and speculation
+Non-streamed Chat/completion JSON includes token usage, cache source, timings, and speculation
 counters. JSON responses use zstd when `Accept-Encoding` contains `zstd`, at
 level 22, chosen for ratio rather than for a cheaper CPU bill. A zstd
 dictionary was measured for this path and rejected; see
@@ -1012,6 +1047,61 @@ weights and spend more time computing, so their lower weight GB/s does not
 by itself identify a memory bottleneck. Optimize verified tokens per second,
 not bytes moved for their own sake; retain the mixed-precision head.
 
+Q8 attention now shares each dequantized K/V tile across two to four query
+tokens. Their six GQA heads are packed into eight-query tensor tiles: four
+tokens fill three tiles instead of leaving two lanes idle in each of four.
+Each query retains its own causal prefix. Blocks of five to eight tokens
+use multiple groups; crossing a split-size boundary falls back to per-row
+attention. Reduction shares split metadata and reads numerator values ahead
+without changing the FMA order, then applies the inverse Hadamard transform
+and gate in the same dispatch. Workspace adds 96 KiB for gathered queries;
+partial storage covers four tensor rows without quadrupling the existing
+full-context SIMD allocation.
+
+Full-model timings on M4 Pro, synthetic nonzero Q8 caches, best of two
+interleaved runs (six timed samples after two warm-ups per case), milliseconds
+per target block:
+
+| Prefix | 1 row, before → after | 2 rows | 3 rows | 4 rows |
+| --- | ---: | ---: | ---: | ---: |
+| 8,192 | 31.78 → 31.86 | 48.54 → 47.84 | 64.37 → 62.53 | 78.67 → 75.21 |
+| 32,768 | 36.91 → 37.14 | 58.83 → 54.92 | 79.33 → 72.91 | 99.27 → 85.31 |
+| 131,072 | 55.64 → 54.61 | 95.15 → 83.10 | 134.23 → 112.13 | 171.86 → 121.33 |
+
+All twelve configurations produce identical baseline/candidate logit
+fingerprints. The four-row reduction is 4.4%, 14.1% and 29.4% respectively;
+single-row differences below 128K are within noise. These are synthetic-cache
+target execution costs, not real long-prompt generation rates, acceptance
+measurements or context-quality results. Numerical tests compare causal
+blocks of two through eight rows against F64 attention, and check four-row
+attention at the 262,144-token limit with an asymmetric final-token probe.
+Six real short prompts, 300-token cap, plain and default speculative modes,
+two interleaved runs: all 24 baseline/candidate pairs have identical text and
+token counts. Best-of-two geomeans are 32.10 → 32.32 tok/s plain and
+39.17 → 39.05 speculative, effectively unchanged at short context. The
+installed mixed-precision MTP head is unchanged.
+
+The two-/three-token split kernels subsequently combine all 12/18 packed query
+rows into one 16-/24-row matrix operation per K/V tile, rather than issuing one
+operation per eight rows. This keeps each SIMD group's tile slice reusable
+across every packed row. Interleaved kernel-only GPU timings, microseconds:
+
+| Prefix | 2 rows, before → after | 3 rows, before → after |
+| --- | ---: | ---: |
+| 1,024 | 35.1 → 33.5 | 49.1 → 47.6 |
+| 8,190 | 189.3 → 168.8 | 271.0 → 244.9 |
+| 131,072 | 2,378 → 2,129 | 3,358 → 3,138 |
+| 262,140 | 4,700 → 4,211 | 6,577 → 6,260 |
+
+Every partial output word matches the prior kernel in twelve configurations;
+reversed-order runs confirm the gain. These are additional **kernel-only**
+measurements, not updated full-model numbers for the table above. Four rows
+retain the previous kernel: combining them regressed 1–2.5% at 128K–262K.
+Halving tile storage to gain occupancy cost 13–25%; extra SIMD groups,
+transposing K and alternative split sizes also lost. Single-row attention
+retained about 74% of its latency with K/V loads removed in an ablation, so
+unused memory bandwidth alone does not establish recoverable decode speed.
+
 Two- to four-row projections (speculative verify blocks, short prefill
 chunks, batched decode) then got cheaper with bit-identical outputs. Trits
 come from balanced prefixes, prefix(p) - (3^p - 1) / 2, whose offsets fold
@@ -1268,6 +1358,10 @@ decode from 19.23 to 20.39 tok/s.
 
 ## Tried and rejected
 
+- PTQ1 pipeline descriptor hints (32-thread maximum and the multiple-of-SIMD
+  execution-width flag): outputs stayed bitwise identical, but timing shifts
+  were within about 2% and moved with the repeated default control. No
+  repeatable gain, so the default descriptors remain.
 - BF16 recurrent state: mean KL 4.7e-5 against F32 state (511/512 top-1) in
   the test above, six times F16's 7.5e-6 for the same bytes.
 - Chunkwise GDN prefill: recurrence is 17.25 ms per 128-row block, only
@@ -1580,3 +1674,20 @@ cargo test --workspace --release -- --ignored --test-threads 1
 The engine targets text inference on Apple Silicon. Model quality relative to
 the unquantized checkpoint and broad application benchmarks are outside these
 runtime measurements.
+
+A real-model repository-retrieval probe on 2026-10-09 processed 69,097 input
+tokens and generated six output tokens in 798.7 seconds on AC power without
+sleep. With greedy sampling and reasoning disabled, it returned `56, 17`
+instead of `38, 17`: the fixture placed the actual fee and factor near the
+beginning, the helper in the middle, and 1,800 similarly named distractor
+modules throughout. This is a failed quality check, not a passing long-context
+coding benchmark. The admitted 262,144-token context and maximum-length kernel
+tests do not establish reliable repository reasoning at that length. A short
+prompt with the same formula and arguments returned the correct `38, 17`;
+that control does not isolate the cause of the long-context failure.
+
+Real-model Chat and Responses each completed a three-turn read/edit/result/final
+loop whose edit passed two executed assertions. Seven unmodified live response
+objects and 57 Responses SSE events, including reasoning and function calls,
+validated against OpenAI Python SDK 3.27.0. These checks cover the supported
+text/function subset, not full platform compatibility or coding benchmarks.

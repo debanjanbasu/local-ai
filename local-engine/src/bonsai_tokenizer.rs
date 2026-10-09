@@ -237,80 +237,17 @@ impl BonsaiTokenizer {
 
     #[doc(hidden)]
     pub fn chat_messages(messages: &[ChatMessage<'_>], thinking: bool) -> crate::Result<String> {
-        if messages.is_empty() {
-            return Err(crate::Error::InvalidArgument("no messages provided".into()));
-        }
-        if messages.len() == 1
-            && messages[0].role == "user"
-            && messages[0].content.trim().is_empty()
-        {
-            return Err(crate::Error::InvalidArgument(
-                "message content is empty".into(),
-            ));
-        }
-        let mut rendered = String::new();
-        let mut has_user = false;
-        if thinking {
-            rendered.push_str("<|im_start|>system\n");
-            rendered.push_str(DEFAULT_REASONING_INSTRUCTION);
-            if messages[0].role == "system" {
-                let system = messages[0].content.trim();
-                if !system.is_empty() {
-                    rendered.push_str("\n\n");
-                    rendered.push_str(system);
-                }
-            }
-            rendered.push_str("<|im_end|>\n");
-        } else if messages[0].role == "system" {
-            let system = messages[0].content.trim();
-            if !system.is_empty() {
-                rendered.push_str("<|im_start|>system\n");
-                rendered.push_str(system);
-                rendered.push_str("<|im_end|>\n");
-            }
-        }
-        for (index, message) in messages.iter().enumerate() {
-            let content = message.content.trim();
-            match message.role {
-                "system" if index == 0 => {}
-                "system" => {
-                    return Err(crate::Error::InvalidArgument(
-                        "system message must be first".into(),
-                    ));
-                }
-                "user" => {
-                    has_user = true;
-                    rendered.push_str("<|im_start|>user\n");
-                    rendered.push_str(content);
-                    rendered.push_str("<|im_end|>\n");
-                }
-                "assistant" => {
-                    rendered.push_str("<|im_start|>assistant\n<think>\n");
-                    rendered.push_str(message.reasoning_content.unwrap_or_default().trim());
-                    rendered.push_str("\n</think>\n\n");
-                    rendered.push_str(content);
-                    rendered.push_str("<|im_end|>\n");
-                }
-                _ => {
-                    return Err(crate::Error::InvalidArgument(format!(
-                        "unsupported message role {:?}",
-                        message.role
-                    )));
-                }
-            }
-        }
-        if !has_user {
-            return Err(crate::Error::InvalidArgument(
-                "no user query found in messages".into(),
-            ));
-        }
-        rendered.push_str("<|im_start|>assistant\n");
-        if thinking {
-            rendered.push_str("<think>\n");
-        } else {
-            rendered.push_str("<think>\n\n</think>\n\n");
-        }
-        Ok(rendered)
+        let turns = messages
+            .iter()
+            .map(|message| crate::tools::Turn {
+                role: message.role,
+                content: message.content,
+                reasoning_content: message.reasoning_content,
+                tool_calls: &[],
+                tool_call_id: None,
+            })
+            .collect::<Vec<_>>();
+        crate::tools::render(&turns, thinking, &crate::tools::ToolSet::default())
     }
 }
 
@@ -323,7 +260,7 @@ fn nonempty<'a>(text: &'a str, field: &str) -> crate::Result<&'a str> {
     }
 }
 
-fn answer_start(ids: &[u32], thinking: bool) -> Option<usize> {
+pub(crate) fn answer_start(ids: &[u32], thinking: bool) -> Option<usize> {
     if thinking {
         ids.iter()
             .position(|&id| id == THINK_END)
