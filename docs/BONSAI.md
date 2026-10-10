@@ -712,6 +712,17 @@ also passed. Capture measured about 115–130 tokens/s on the M4 Pro, and later
 generations wait behind it. These checks establish implementation parity,
 not general judgment quality or calibration.
 
+The three development-only hard-v1 heads subsequently completed private CPU
+training, reaching 58.10–58.21% accuracy against a 30.12% majority baseline on
+the 883-row checkpoint-selection split. They remain uninstalled experimental
+artifacts, not production heads. Real-model checks passed for all three heads:
+36 native cases with MTP off/on and 18 HTTP cases with MTP on matched stored
+features exactly across choices, both boolean orders, predicates and scores.
+See the [hard-v1 results and limitations](../local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)
+for calibration, provenance and weak task families. No locked test was scored;
+these synthetic results do not establish coding quality or Decisions confidence
+and refusal semantics.
+
 ### Concurrent requests
 
 Decode is bound by trit-decode ALU work per weight byte, so one projection

@@ -571,9 +571,8 @@ mismatch it records the errors and prepares nothing. The private Kaggle
 regeneration completed on 2026-10-10: all partition hashes matched the pinned
 manifest, and local preparation reproduced the same 8,479 rows (5,716 train,
 1,880 calibration, 883 validation). No locked test was written or scored.
-No trained hard-v1 head or quality result is claimed here. Its labels are
-produced by family solvers over generated facts, so any later score is
-synthetic-task evidence, not natural code-review quality.
+Its labels are produced by family solvers over generated facts, so scores
+are synthetic-task evidence, not natural code-review quality.
 
 Both `judgment_train.py` and `kaggle_judgment_job.py` accept `--development`
 for this three-split workflow. It refuses test rows, selects on validation,
@@ -582,6 +581,45 @@ uniform and majority baselines, with family/type/option-count breakdowns.
 Validation selected the checkpoint: those numbers are not held-out test
 results. The default four-split devtools workflow is unchanged. Train on
 Kaggle, after capturing features with the native model; staging submits nothing.
+
+Three private offline CPU Kaggle runs completed on 2026-10-10, one version
+each, with seeds 0/1/2. All used the recipe frozen before hard-v1 feature
+capture: 40 epochs, learning rate 3e-5, weight decay 0.01, batch 64, feature
+width 5,120 and pointer-head dimension 256. Only the head was trained; the
+Bonsai trunk and speculative MTP head were unchanged. Checkpoints were selected
+by validation NLL and temperature was fitted on the separate calibration split.
+
+| Seed | Selected epoch | Temperature | Validation accuracy | NLL | Brier | ECE |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 | 8 | 1.514628 | 58.21% | 0.940797 | 0.526739 | 0.035773 |
+| 1 | 4 | 1.446252 | 58.10% | 0.960556 | 0.527300 | 0.029395 |
+| 2 | 4 | 1.263283 | 58.21% | 0.967057 | 0.534123 | 0.039192 |
+
+All metrics above use the 883-row **checkpoint-selection split**, not a
+held-out test. The train-position majority baseline scores 30.12% accuracy,
+NLL 1.280109 and Brier 0.699157; uniform expected accuracy is 30.09%.
+Calibration reduced validation NLL from 0.977–0.982 to the values above;
+none of the temperatures hit the search bounds. Small aggregate ECE does not
+establish useful confidence: even the majority baseline has ECE 0.011132.
+The seeds agree on only about 77–80% of predictions. Temporal/numeric accuracy
+is about 44%, and score-question accuracy varies from 37–51% on just 35 rows.
+Training overfits after the selected checkpoints (epoch-40 validation NLL
+1.51–1.54). `long_policy` remains excluded. This is evidence that frozen-trunk
+features support learning these synthetic tasks, not evidence of general
+coding quality, reliable refusal or production calibration. No head was
+installed, published or promoted, and no locked test was scored.
+
+The captured feature manifest SHA-256 is
+`dabe32c4a14c40a1041599b113609b8a2e8bc8cccb1db05695792a209f115d63`;
+all 8,479 feature hashes, split IDs and frozen training settings were verified
+against the downloaded reports. Independent CPU recomputation of validation
+metrics agreed within 7e-8. Exported head SHA-256 values, in seed order:
+
+```text
+24971f5fadb02fb0770f9beb372e5f0ef1bb650e4215064cafb5b901203ac39e
+11bf6f7459a25e035c16a0d4dce2afa412286e3061bddf98679d513160731465
+657cde86d4a8fa45fffbe9ffc4f18b087600cb4bc79cc5d82f7fcaf606079e2d
+```
 
 ### Experimental native decisions
 
@@ -606,6 +644,15 @@ bytes and option/decision endpoints through native rendering and the real
 tokenizer (5,994 choices, 2,170 predicates and 315 scores), with no embedded
 special-token ambiguity. This verifies format compatibility, not a trained
 hard-v1 head's quality; the locked test split was not read.
+
+After training, six validation rows (143–330 tokens, 2/3/5/6 options) were
+checked with each of the three downloaded heads: text choices, a boolean
+choice ordered No/Yes, a Yes/No predicate, and a six-level score. All 36 native
+cases (MTP off/on) reproduced stored-feature logits and probabilities exactly;
+all 18 HTTP cases (MTP on) reproduced the native probabilities, selected values,
+score means, prompt counts and artifact-declared provenance. These checks ran
+serially on the M4 Pro in 122 seconds with normal memory pressure and zero swap
+use. They establish integration parity, not accuracy or long-context quality.
 
 A `Decision` carries the head's probability per option, the argmax and its
 value, for scores the probability-weighted mean level index, the prompt token
