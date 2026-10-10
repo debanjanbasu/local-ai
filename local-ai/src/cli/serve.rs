@@ -42,7 +42,7 @@ use axum::http::HeaderMap;
 #[cfg(test)]
 use local_engine::Event;
 
-use self::background::{Background, Failure, Temporary};
+use self::background::{Background, Failure, Resumed, Temporary};
 use self::chunked::start_chunked;
 use self::http3::serve_h3;
 use self::options::{parse, usage};
@@ -115,26 +115,41 @@ struct AppState {
 /// tracked here. Every job reaching the queue comes through this module, so it
 /// counts queued and running requests together.
 #[derive(Clone, Default)]
-struct QueueDepth(Arc<AtomicUsize>);
+struct QueueDepth(Arc<Depth>);
+
+#[derive(Default)]
+struct Depth {
+    count: AtomicUsize,
+    /// Told each time a slot is released, for resumptions the full queue
+    /// deferred (see [`resume_interrupted`]).
+    freed: tokio::sync::Notify,
+}
 
 impl QueueDepth {
     fn load(&self) -> usize {
-        self.0.load(Ordering::SeqCst)
+        self.0.count.load(Ordering::SeqCst)
     }
 
     /// Take a queue slot. The returned guard releases it on drop, so an early
     /// return, a failed generation and a disconnected client all release it.
     fn admit(&self) -> Admitted {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.0.count.fetch_add(1, Ordering::SeqCst);
         Admitted(Arc::clone(&self.0))
+    }
+
+    /// Wait until a slot is released. A release with nobody waiting is kept
+    /// for the next wait, so none is missed between a full queue and the wait.
+    async fn freed(&self) {
+        self.0.freed.notified().await;
     }
 }
 
-struct Admitted(Arc<AtomicUsize>);
+struct Admitted(Arc<Depth>);
 
 impl Drop for Admitted {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.count.fetch_sub(1, Ordering::SeqCst);
+        self.0.freed.notify_one();
     }
 }
 
@@ -456,11 +471,26 @@ async fn stream_events(
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let not_found = format!("response with id {id:?} not found");
-    let background = Arc::clone(&state.background);
-    let (temporary, durable) = (state.temporary.clone(), state.responses.clone());
+    let resuming = state.clone();
     let subscribed = tokio::task::spawn_blocking(move || {
-        let located = locate(temporary.as_ref(), durable.as_ref(), &background, &id)?;
-        resume::subscribe(&background, &located.store, &id, after)
+        let state = resuming;
+        let background = &state.background;
+        let located = locate(
+            state.temporary.as_ref(),
+            state.responses.as_ref(),
+            background,
+            &id,
+        )?;
+        if adopt_orphan(&state, &located, &id)? {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "response {id} was interrupted by a restart and is waiting for an engine \
+                     queue slot to be resumed; retry shortly"
+                ),
+            ));
+        }
+        resume::subscribe(background, &located.store, &id, after)
     })
     .await
     .unwrap_or_else(|error| {
@@ -575,9 +605,15 @@ async fn stored_response(
             let (id, method) = (id.to_owned(), method.clone());
             let background = Arc::clone(&state.background);
             let (temporary, durable) = (state.temporary.clone(), state.responses.clone());
+            let resuming = state.clone();
             tokio::task::spawn_blocking(move || {
                 let located = locate(temporary.as_ref(), durable.as_ref(), &background, &id)?;
                 let store = &located.store;
+                if method == Method::GET && page.is_none() {
+                    // Retrieving an orphaned job resumes it; one waiting for a
+                    // queue slot is reported as it stands.
+                    adopt_orphan(&resuming, &located, &id)?;
+                }
                 if cancel {
                     background.cancel(store, &id)
                 } else if method == Method::DELETE {
@@ -605,6 +641,109 @@ async fn stored_response(
         Ok(None) => error_response(StatusCode::NOT_FOUND, &not_found, state, headers).await,
         Err((status, message)) => error_response(status, &message, state, headers).await,
     }
+}
+
+/// Resume interrupted background response `id` in `store` here and start its
+/// pump: `Ok(true)` when the full engine queue (or shutdown) leaves it
+/// pending with no writer. Blocks on the store and on submission.
+fn resume_background(
+    state: &AppState,
+    store: &Arc<ResponseStore>,
+    id: &str,
+) -> Result<bool, Failure> {
+    let (engine, depth) = (state.engine.clone(), state.depth.clone());
+    let resumed = state.background.resume(
+        store,
+        id,
+        (state.thinking, state.cipher.as_ref()),
+        move |request| {
+            let mut events = engine.chat(request)?;
+            let cancel = events.cancel_handle();
+            // No deadline: the job has no client to stall, and a closed
+            // channel is `None`.
+            let next = move || events.next_signal(None).ok().flatten();
+            Ok((next, move || cancel.cancel(), Some(depth.admit())))
+        },
+    )?;
+    Ok(match resumed {
+        Resumed::Started(pump) => {
+            tokio::task::spawn_blocking(move || pump.run());
+            false
+        }
+        Resumed::Settled | Resumed::Owned => false,
+        Resumed::Deferred => true,
+    })
+}
+
+/// Resume response `id` if it is a durable background Response left pending
+/// by a writer that is gone (another server sharing the store died): `true`
+/// when it waits for a queue slot. Nothing for any other response, so
+/// reading one never creates a lease sidecar. Blocks on the store.
+fn adopt_orphan(state: &AppState, located: &Located, id: &str) -> Result<bool, Failure> {
+    if located.temporary.is_some() || state.background.watch(id).is_some() {
+        return Ok(false);
+    }
+    let orphan = matches!(
+        located.store.load(id),
+        Ok(Some(stored)) if stored.request.is_some() && background::pending(&stored.response)
+    );
+    if orphan {
+        resume_background(state, &located.store, id)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Resume the interrupted background Responses `ids` in order, returning
+/// those the full engine queue deferred.
+async fn resume_each(
+    state: &AppState,
+    store: &Arc<ResponseStore>,
+    mut ids: std::collections::VecDeque<String>,
+) -> std::collections::VecDeque<String> {
+    while let Some(id) = ids.front().cloned() {
+        let (resuming, store) = (state.clone(), Arc::clone(store));
+        let resumed =
+            tokio::task::spawn_blocking(move || resume_background(&resuming, &store, &id)).await;
+        match resumed {
+            Ok(Ok(true)) => return ids,
+            Ok(Ok(false)) => {}
+            Ok(Err((_, message))) => eprintln!("background response not resumed: {message}"),
+            Err(error) => eprintln!("background response not resumed: {error}"),
+        }
+        ids.pop_front();
+    }
+    ids
+}
+
+/// Resume every background Response a crash or restart interrupted in
+/// `store`: as many as the engine queue admits now, before the server
+/// serves, and each deferred one once a queue slot is released, on a task of
+/// its own that waits for those releases and stops at shutdown.
+async fn resume_interrupted(state: &AppState, store: &Arc<ResponseStore>) {
+    let listed = Arc::clone(store);
+    let ids = match tokio::task::spawn_blocking(move || listed.resumable()).await {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(error)) => {
+            eprintln!("warning: interrupted background responses not listed: {error}");
+            return;
+        }
+        Err(error) => {
+            eprintln!("warning: interrupted background responses not listed: {error}");
+            return;
+        }
+    };
+    let mut deferred = resume_each(state, store, ids.into()).await;
+    if deferred.is_empty() {
+        return;
+    }
+    let (state, store) = (state.clone(), Arc::clone(store));
+    tokio::spawn(async move {
+        while !deferred.is_empty() && !state.background.closing() {
+            state.depth.freed().await;
+            deferred = resume_each(&state, &store, deferred).await;
+        }
+    });
 }
 
 /// Why an ID that is not a temporary response is never found without a store.
@@ -810,6 +949,10 @@ async fn run_async(args: Args) -> crate::Result<()> {
         // Expiry still happens on access; unread responses wait for shutdown.
         eprintln!("warning: temporary responses expire only when accessed: {error}");
     }
+    // Before serving, so a client finds every resumed job already running.
+    if let Some(store) = state.responses.clone() {
+        resume_interrupted(&state, &store).await;
+    }
     eprintln!("Bonsai server listening on http://{address}");
     let background = Arc::clone(&state.background);
     let app = Router::new().fallback(any(route)).with_state(state);
@@ -904,3 +1047,7 @@ mod background_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod resume_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod recovery_tests;
