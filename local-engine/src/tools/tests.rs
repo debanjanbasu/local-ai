@@ -417,7 +417,8 @@ const TWO_CALLS: &str = "Let me check.\n\n<tool_call>\n<function=get_weather>\n<
 
 #[test]
 fn streams_text_and_emits_validated_calls_one_character_at_a_time() {
-    let pieces = chars(TWO_CALLS);
+    let text = TWO_CALLS.replace(r#"{"lang": "fr"}"#, r#"{"z":{"b":2,"a":1},"lang":"fr"}"#);
+    let pieces = chars(&text);
     let pieces = pieces.iter().map(String::as_str).collect::<Vec<_>>();
     let (events, failure) = parse(&[weather(), search()], &pieces);
     assert_eq!(failure, None);
@@ -444,7 +445,13 @@ fn streams_text_and_emits_validated_calls_one_character_at_a_time() {
     // A declared string stays raw text even when it looks like JSON.
     assert_eq!(
         calls[1].arguments,
-        json!({"query":"42","filters":{"lang":"fr"}})
+        json!({"query":"42","filters":{"z":{"b":2,"a":1},"lang":"fr"}})
+    );
+    // HTTP argument strings keep their original canonical ordering, even
+    // when another dependency enables serde_json's preserve_order feature.
+    assert_eq!(
+        calls[1].arguments.to_string(),
+        r#"{"filters":{"lang":"fr","z":{"a":1,"b":2}},"query":"42"}"#
     );
     assert_ne!(calls[0].id, calls[1].id);
     assert!(calls[0].id.starts_with("call_"));
