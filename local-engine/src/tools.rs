@@ -813,7 +813,10 @@ fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
         arguments.insert(key.to_owned(), value);
         rest = after;
     }
-    let arguments = Value::Object(arguments);
+    let mut arguments = Value::Object(arguments);
+    // Preserve canonical argument strings for every adapter even when a
+    // dependency enables serde_json's preserve_order feature.
+    arguments.sort_all_objects();
     validate_arguments(tool, &arguments).map_err(|error| format!("{name}: {error}"))?;
     Ok(ToolCall {
         id: next_call_id(),
