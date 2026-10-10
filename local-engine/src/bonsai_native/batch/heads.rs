@@ -21,7 +21,7 @@ use crate::bonsai_mtp::{DRAFT_CHAIN_MIN_MARGIN, HeadSpan, HeadState};
 use crate::bonsai_native::{BufferCopyRequest, CommandBatch, MetalBuffer, decode_embeddings};
 use crate::sampler::Sampler;
 
-/// One sequence's request for drafts in [`BonsaiModel::draft_heads`].
+/// One sequence's request for drafts in `BonsaiModel::draft_heads`.
 pub struct HeadDraft<'a> {
     /// The sampled token the drafts follow, not yet decoded.
     pub seed: u32,

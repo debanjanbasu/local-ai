@@ -653,8 +653,12 @@ these requests.
 `--experimental-decision-head FILE` enables `POST /v1/experimental/decisions`.
 Without the flag the route is a 404 and no head is loaded. The head is opened
 and its width checked before the model loads, so a wrong file fails startup,
-and the server announces the route as experimental together with the head's
-calibration scope. The route bridges to the engine's
+as does a head whose `renderer` metadata names anything but the native
+`kev-devtools-v1-judgment-render.v1`. The server announces the route as
+experimental together with what the loaded file declares: its renderer
+(declared, or assumed for a legacy head that declares none) and its
+`calibration_scope` metadata, or an explicit "unknown" when it has none. The
+route bridges to the engine's
 [native decisions](../local-engine/README.md#experimental-native-decisions)
 and sits behind `--api-key` like every other route.
 
@@ -671,7 +675,9 @@ refused with 400 rather than approximated. A 200 response has
 `probabilities`; a score's probability-weighted mean level index as `score`
 and per-level `probabilities`. `usage.input_tokens` sums the rendered prompt
 tokens (`output_tokens` is 0), and an `experimental` object repeats the
-renderer, the calibration scope and the limitations.
+`renderer`, `renderer_source` (`"artifact"` when the head declared it,
+`"assumed"` for a legacy head), the loaded head's `calibration_scope` (or the
+unknown-provenance text) and the limitations.
 
 Questions run one after another over the same input, each taking one slot of
 the engine's bounded FIFO queue and running only once no generation is
@@ -686,9 +692,12 @@ way. These waits are futures woken by the engine or by shutdown, not polling.
 `POST /v1/decisions` is always a 404 with an explanation. OpenAI's Decisions
 responses require a `confidence` on every choice and score answer and may
 answer with a `refusal`; the head produces neither, and a confidence could
-only be invented. Its probabilities are calibrated only for the two-option
-Yes/No code-diff questions it was trained on, and are the head's softmax
-output for anything else. This is not a production judgment service. Real-model
+only be invented. The existing devtools-v1 head declares no renderer or
+calibration scope, so the route reports `renderer_source: "assumed"` and an
+unknown calibration scope for it; as measured when it was evaluated, its
+probabilities are calibrated only for the two-option Yes/No code-diff
+questions it was trained on, and are the head's softmax output for anything
+else. This is not a production judgment service. Real-model
 native and HTTP checks reproduced stored-feature probabilities bit-for-bit
 on four rows from both training tasks and both option orders, with and without
 MTP. Queue ordering, cancellation, and generation/cache parity after a decision

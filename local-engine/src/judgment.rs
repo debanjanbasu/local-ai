@@ -20,6 +20,14 @@
 //! `head_dim` matching the tensor shapes. Every value must be finite and the
 //! temperature strictly positive. Anything else is refused.
 //!
+//! Two optional metadata strings are retained as the artifact's provenance:
+//! `renderer` (the prompt renderer its training rows used,
+//! [`JudgmentHead::renderer`]) and `calibration_scope` (what its temperature
+//! was fit on, [`JudgmentHead::calibration_scope`]). When present each must
+//! be non-empty. Absent values stay unknown: nothing is inferred from other
+//! metadata, and the CPU scorer accepts any renderer, since it only scores
+//! features. Native decisions are stricter; see [`DecisionRequest`].
+//!
 //! # Feature representation
 //!
 //! `features` is `rows × width` `f32`s, position-major: the option rows first,
@@ -49,8 +57,9 @@
 //! [`crate::EngineHandle::decide`] capture its features on the loaded model
 //! and score them with a caller-supplied head (never loaded automatically).
 //! A [`Decision`] reports the head's probabilities per caller option, the
-//! argmax and, for scores, the probability-weighted level index; see
-//! [`CALIBRATION_SCOPE`] for what those probabilities are not.
+//! argmax and, for scores, the probability-weighted level index, together
+//! with the loaded head's own `calibration_scope` (or
+//! [`UNKNOWN_CALIBRATION_SCOPE`]) for what those probabilities are not.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -61,8 +70,9 @@ mod decision;
 
 pub(crate) use self::decision::PreparedDecision;
 pub use self::decision::{
-    CALIBRATION_SCOPE, DECISION_CAPTURE_ROWS, DECISION_RENDERER, Decision, DecisionKind,
-    DecisionProbability, DecisionRequest, DecisionValue, MAX_DECISION_OPTIONS, RenderedDecision,
+    DECISION_CAPTURE_ROWS, DECISION_RENDERER, Decision, DecisionKind, DecisionProbability,
+    DecisionRequest, DecisionValue, MAX_DECISION_OPTIONS, RenderedDecision,
+    UNKNOWN_CALIBRATION_SCOPE,
 };
 
 /// The `format` metadata value the loader accepts.
@@ -84,6 +94,10 @@ pub struct JudgmentHead {
     k_weight: Vec<f32>,
     k_bias: Vec<f32>,
     temperature: f32,
+    /// `renderer` metadata, if the artifact declared one.
+    renderer: Option<String>,
+    /// `calibration_scope` metadata, if the artifact declared one.
+    calibration_scope: Option<String>,
 }
 
 /// Scores for one sample, one entry per option in the supplied row order.
@@ -100,6 +114,16 @@ fn invalid<T>(message: impl Into<String>) -> crate::Result<T> {
         "judgment head: {}",
         message.into()
     )))
+}
+
+/// Optional provenance metadata `key`: absent stays unknown, present must be
+/// non-empty.
+fn provenance(metadata: &HashMap<String, String>, key: &str) -> crate::Result<Option<String>> {
+    match metadata.get(key) {
+        None => Ok(None),
+        Some(value) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => invalid(format!("{key} must not be empty when present")),
+    }
 }
 
 impl JudgmentHead {
@@ -138,6 +162,8 @@ impl JudgmentHead {
             _ => invalid(format!("{key} must be a positive integer")),
         };
         let (width, head_dim) = (dimension("width")?, dimension("head_dim")?);
+        let renderer = provenance(&metadata, "renderer")?;
+        let calibration_scope = provenance(&metadata, "calibration_scope")?;
 
         let names = ["q.weight", "q.bias", "k.weight", "k.bias", "temperature"];
         if entries.len() != names.len() {
@@ -200,10 +226,13 @@ impl JudgmentHead {
             k_weight,
             k_bias,
             temperature,
+            renderer,
+            calibration_scope,
         })
     }
 
-    /// A head from raw parts, for tests elsewhere in the crate.
+    /// A head from raw parts, with no provenance metadata, for tests
+    /// elsewhere in the crate.
     #[cfg(test)]
     pub(crate) const fn for_tests(
         width: usize,
@@ -222,6 +251,8 @@ impl JudgmentHead {
             k_weight,
             k_bias,
             temperature,
+            renderer: None,
+            calibration_scope: None,
         }
     }
 
@@ -241,6 +272,21 @@ impl JudgmentHead {
     #[must_use]
     pub const fn temperature(&self) -> f32 {
         self.temperature
+    }
+
+    /// The artifact's `renderer` metadata: the prompt renderer its training
+    /// rows used. `None` for a legacy artifact that does not declare one.
+    #[must_use]
+    pub fn renderer(&self) -> Option<&str> {
+        self.renderer.as_deref()
+    }
+
+    /// The artifact's `calibration_scope` metadata: what its temperature was
+    /// fit on. `None` when the artifact does not declare one, in which case
+    /// its calibration provenance is unknown.
+    #[must_use]
+    pub fn calibration_scope(&self) -> Option<&str> {
+        self.calibration_scope.as_deref()
     }
 
     /// Score `features` (option rows, then the decision row; see the
@@ -393,6 +439,45 @@ mod tests {
                 0.199_611_147_767_686,
             ],
         );
+    }
+
+    /// Declared provenance round-trips verbatim; absent provenance stays
+    /// unknown (a `mode` alone implies nothing); empty values are refused;
+    /// and the CPU scorer still scores a head declaring another renderer.
+    #[test]
+    fn retains_declared_provenance_and_scores_any_renderer() {
+        let legacy = open(&tensors(), &metadata()).unwrap();
+        assert_eq!(
+            (legacy.renderer(), legacy.calibration_scope()),
+            (None, None)
+        );
+
+        let mut staged = metadata();
+        staged["mode"] = json!("development");
+        staged["renderer"] = json!("kev-hard-v1-judgment-render.v1");
+        staged["calibration_scope"] = json!("calibration split of a synthetic set only");
+        let head = open(&tensors(), &staged).unwrap();
+        assert_eq!(head.renderer(), Some("kev-hard-v1-judgment-render.v1"));
+        assert_eq!(
+            head.calibration_scope(),
+            Some("calibration split of a synthetic set only")
+        );
+        assert_eq!(
+            head.score(&FEATURES).unwrap(),
+            legacy.score(&FEATURES).unwrap()
+        );
+
+        let mut mode_only = metadata();
+        mode_only["mode"] = json!("development");
+        let head = open(&tensors(), &mode_only).unwrap();
+        assert_eq!((head.renderer(), head.calibration_scope()), (None, None));
+
+        for key in ["renderer", "calibration_scope"] {
+            let mut empty = metadata();
+            empty[key] = json!(" ");
+            let error = open(&tensors(), &empty).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
     }
 
     #[test]

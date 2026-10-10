@@ -1,5 +1,5 @@
 //! EXPERIMENTAL: `POST /v1/experimental/decisions`, the opt-in HTTP bridge to
-//! the native judgment-head decisions ([`EngineHandle::decide`]).
+//! the native judgment-head decisions ([`local_engine::EngineHandle::decide`]).
 //!
 //! Served only when the server was started with
 //! `--experimental-decision-head FILE`; the head is never loaded otherwise.
@@ -11,8 +11,9 @@
 //! "Interpret the answers") requires a `confidence` on every `choice` and
 //! `score` answer, separate from the probability distribution, and may answer
 //! a question with a `refusal`. The judgment head produces neither: it
-//! returns its softmax over the options and nothing else, and
-//! [`CALIBRATION_SCOPE`] says what even those probabilities are not. A
+//! returns its softmax over the options and nothing else, and the loaded
+//! head's `calibration_scope` (or [`UNKNOWN_CALIBRATION_SCOPE`]) says what
+//! even those probabilities are not. A
 //! `confidence` here could only be invented, so `/v1/decisions` is refused
 //! with an explanation and this route answers in its own shape instead.
 //!
@@ -25,6 +26,12 @@
 //! option values or level labels without descriptions. Anything else —
 //! messages, images, descriptions, more choices than option letters — is
 //! refused rather than approximated.
+//!
+//! A head declaring a renderer other than [`DECISION_RENDERER`] is refused
+//! at startup. Each response's `experimental` object reports the renderer,
+//! whether the head declared it (`renderer_source` `"artifact"`) or a legacy
+//! head left it assumed (`"assumed"`), and the head's own calibration scope,
+//! all taken from the decisions that answered it.
 //!
 //! Each question is one native decision over the same input. Questions run
 //! one after another on the loaded model (no second model), each taking one
@@ -52,8 +59,8 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use local_engine::judgment::{
-    CALIBRATION_SCOPE, DECISION_RENDERER, Decision, DecisionKind, DecisionRequest, DecisionValue,
-    JudgmentHead, MAX_DECISION_OPTIONS,
+    DECISION_RENDERER, Decision, DecisionKind, DecisionRequest, DecisionValue, JudgmentHead,
+    MAX_DECISION_OPTIONS, UNKNOWN_CALIBRATION_SCOPE,
 };
 
 use super::response::{error_response, error_status, json_response, queue_full_response};
@@ -110,7 +117,8 @@ impl Decisions {
     }
 
     /// Load and validate the head at `path` for a model of `width`, so a
-    /// wrong file fails at startup rather than on the first request.
+    /// wrong file (including one declaring a renderer the native decisions
+    /// do not reproduce) fails at startup rather than on the first request.
     pub(super) fn open(path: &Path, width: usize) -> crate::Result<Self> {
         let head = JudgmentHead::open(path).map_err(|error| {
             crate::Error::InvalidArgument(format!("cannot open {FLAG} {}: {error}", path.display()))
@@ -122,11 +130,34 @@ impl Decisions {
                 head.width()
             )));
         }
+        if let Some(renderer) = head.renderer()
+            && renderer != DECISION_RENDERER
+        {
+            return Err(crate::Error::InvalidArgument(format!(
+                "{FLAG} {}: head renderer {renderer:?} is not the native decision renderer \
+                 {DECISION_RENDERER:?}",
+                path.display()
+            )));
+        }
         Ok(Self::new(head))
     }
 
+    /// What the loaded head says about itself, for the startup notice.
+    fn provenance(&self) -> String {
+        let renderer = if self.head.renderer().is_some() {
+            format!("renderer {DECISION_RENDERER} (declared by the head)")
+        } else {
+            format!("renderer {DECISION_RENDERER} (assumed: legacy head declares none)")
+        };
+        let scope = self
+            .head
+            .calibration_scope()
+            .unwrap_or(UNKNOWN_CALIBRATION_SCOPE);
+        format!("{renderer}; calibration scope: {scope}")
+    }
+
     /// The service `--experimental-decision-head` asks for, if any, with
-    /// its experimental status announced.
+    /// its experimental status and the head's own provenance announced.
     pub(super) fn start(path: Option<&Path>) -> crate::Result<Option<Arc<Self>>> {
         let Some(path) = path else {
             return Ok(None);
@@ -134,7 +165,8 @@ impl Decisions {
         let decisions = Self::open(path, local_engine::bonsai::WIDTH)?;
         eprintln!(
             "EXPERIMENTAL decisions at POST {ROUTE} (head probabilities only; no confidence or \
-             refusal; not the OpenAI Decisions API): {CALIBRATION_SCOPE}"
+             refusal; not the OpenAI Decisions API): {}",
+            decisions.provenance()
         );
         Ok(Some(Arc::new(decisions)))
     }
@@ -455,11 +487,32 @@ pub(super) enum Failure {
     Internal(String),
 }
 
-/// The answers to `prepared` and the prompt tokens they read.
+/// The answers to `prepared`, the prompt tokens they read and the head
+/// provenance the decisions reported.
 #[derive(Debug)]
 pub(super) struct Answered {
     answers: Vec<Value>,
     input_tokens: usize,
+    provenance: Provenance,
+}
+
+/// A decision's renderer and calibration provenance, as the native decision
+/// reported it.
+#[derive(Debug)]
+struct Provenance {
+    renderer: &'static str,
+    renderer_declared: bool,
+    calibration_scope: String,
+}
+
+impl Provenance {
+    fn of(decision: &Decision) -> Self {
+        Self {
+            renderer: decision.renderer,
+            renderer_declared: decision.renderer_declared,
+            calibration_scope: decision.calibration_scope.clone(),
+        }
+    }
 }
 
 /// Answer `prepared`'s questions in order, submitting each with `submit`
@@ -481,6 +534,7 @@ where
 {
     let mut answers = Vec::with_capacity(prepared.questions.len());
     let mut input_tokens = 0usize;
+    let mut provenance: Option<Provenance> = None;
     for question in &prepared.questions {
         let request = question.request(&prepared.state);
         let decided = async { submit(request).await?.await };
@@ -496,25 +550,37 @@ where
             Err(error) => return Err(Failure::Engine(error)),
         };
         input_tokens = input_tokens.saturating_add(decision.prompt_tokens);
+        // Every question uses the service's same immutable head.
+        provenance.get_or_insert_with(|| Provenance::of(&decision));
         answers.push(question.answer(&decision).map_err(Failure::Internal)?);
     }
+    let provenance =
+        provenance.ok_or_else(|| Failure::Internal("the request asked no questions".into()))?;
     Ok(Answered {
         answers,
         input_tokens,
+        provenance,
     })
 }
 
-/// The response body for `answered`.
+/// The response body for `answered`; its `experimental` provenance is what
+/// the decisions reported for the loaded head.
 pub(super) fn response_json(model: &str, answered: Answered) -> Value {
     let tokens = answered.input_tokens;
+    let Provenance {
+        renderer,
+        renderer_declared,
+        calibration_scope,
+    } = answered.provenance;
     json!({
         "object":"experimental.decision",
         "model":model,
         "answers":Value::Array(answered.answers),
         "usage":{"input_tokens":tokens,"output_tokens":0,"total_tokens":tokens},
         "experimental":{
-            "renderer":DECISION_RENDERER,
-            "calibration_scope":CALIBRATION_SCOPE,
+            "renderer":renderer,
+            "renderer_source":if renderer_declared { "artifact" } else { "assumed" },
+            "calibration_scope":calibration_scope,
             "limitations":LIMITATIONS,
         },
     })

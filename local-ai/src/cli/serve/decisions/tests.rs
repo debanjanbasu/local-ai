@@ -6,11 +6,15 @@ use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 
 use local_engine::judgment::{
-    CALIBRATION_SCOPE, DECISION_RENDERER, Decision, DecisionKind, DecisionProbability,
-    DecisionRequest, DecisionValue,
+    DECISION_RENDERER, Decision, DecisionKind, DecisionProbability, DecisionRequest, DecisionValue,
+    UNKNOWN_CALIBRATION_SCOPE,
 };
 
 use super::{Decisions, FLAG, Failure, MAX_CONCURRENT, Prepared, answer, prepare, response_json};
+
+/// The synthetic calibration scope [`decision`] reports, as a head's
+/// `calibration_scope` metadata would.
+const SCOPE: &str = "synthetic test scope: calibration split of a test set only";
 
 fn prepared(body: &Value) -> Prepared {
     prepare(&serde_json::to_vec(body).expect("encode")).expect("valid request")
@@ -58,7 +62,8 @@ fn decision(kind: &DecisionKind, probabilities: &[f64], tokens: usize) -> Decisi
         prompt_tokens: tokens,
         captured: true,
         renderer: DECISION_RENDERER,
-        calibration_scope: CALIBRATION_SCOPE,
+        renderer_declared: true,
+        calibration_scope: SCOPE.into(),
     }
 }
 
@@ -144,8 +149,9 @@ async fn maps_each_question_type_without_confidence_or_refusal() {
         body["usage"],
         json!({"input_tokens": 33, "output_tokens": 0, "total_tokens": 33})
     );
-    assert_eq!(body["experimental"]["calibration_scope"], CALIBRATION_SCOPE);
+    assert_eq!(body["experimental"]["calibration_scope"], SCOPE);
     assert_eq!(body["experimental"]["renderer"], DECISION_RENDERER);
+    assert_eq!(body["experimental"]["renderer_source"], "artifact");
     // Each question is one native request over the same input.
     let seen = seen.lock().expect("lock");
     assert_eq!(seen.len(), 3);
@@ -397,11 +403,42 @@ async fn engine_outcomes_map_to_failures() {
     assert!(matches!(outcome, Err(Failure::Internal(_))), "{outcome:?}");
 }
 
+/// The response reports the provenance the decisions carried, not a fixed
+/// claim: a legacy head's assumed renderer and unknown scope pass through.
+#[tokio::test]
+async fn the_response_reports_the_decisions_provenance() {
+    let request = prepared(&json!({"input": "x", "questions": [
+        {"type": "predicate", "instructions": "A?"},
+        {"type": "predicate", "instructions": "B?"},
+    ]}));
+    let legacy = |request: DecisionRequest| {
+        let mut outcome = decision(&request.kind, &[0.5, 0.5], 1);
+        outcome.renderer_declared = false;
+        outcome.calibration_scope = UNKNOWN_CALIBRATION_SCOPE.into();
+        std::future::ready(Ok(std::future::ready(Ok(Some(outcome)))))
+    };
+    let body = response_json(
+        "bonsai",
+        answer(&request, legacy, open()).await.expect("answered"),
+    );
+    assert_eq!(body["experimental"]["renderer"], DECISION_RENDERER);
+    assert_eq!(body["experimental"]["renderer_source"], "assumed");
+    assert_eq!(
+        body["experimental"]["calibration_scope"],
+        UNKNOWN_CALIBRATION_SCOPE
+    );
+}
+
 /// A minimal valid judgment-head file of `width`, removed on drop.
 struct HeadFile(std::path::PathBuf);
 
 impl HeadFile {
     fn new(width: usize) -> Self {
+        Self::with_metadata(width, &[])
+    }
+
+    /// A head whose metadata also carries `extra` key/value pairs.
+    fn with_metadata(width: usize, extra: &[(&str, &str)]) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let tensors = [
             ("q.weight", vec![1, width]),
@@ -411,15 +448,16 @@ impl HeadFile {
             ("temperature", vec![1]),
         ];
         let mut header = serde_json::Map::new();
-        header.insert(
-            "__metadata__".into(),
-            json!({
-                "format": local_engine::judgment::JUDGMENT_HEAD_FORMAT,
-                "experimental": "true",
-                "width": width.to_string(),
-                "head_dim": "1",
-            }),
-        );
+        let mut metadata = json!({
+            "format": local_engine::judgment::JUDGMENT_HEAD_FORMAT,
+            "experimental": "true",
+            "width": width.to_string(),
+            "head_dim": "1",
+        });
+        for (key, value) in extra {
+            metadata[*key] = json!(value);
+        }
+        header.insert("__metadata__".into(), metadata);
         let mut data = Vec::new();
         for (name, shape) in tensors {
             let count: usize = shape.iter().product();
@@ -486,6 +524,51 @@ fn the_head_is_checked_at_startup_and_admission_is_bounded() {
     decisions.close();
     decisions.close();
     assert!(decisions.closing() && *receiver.borrow());
+}
+
+/// Startup reports the file's own provenance and refuses a renderer the
+/// native decisions do not reproduce; a legacy file's is assumed, its
+/// calibration unknown.
+#[test]
+fn startup_reports_the_heads_own_provenance() {
+    let legacy = Decisions::open(&HeadFile::new(4).0, 4).expect("legacy head");
+    let notice = legacy.provenance();
+    assert!(
+        notice.contains("assumed") && notice.contains(UNKNOWN_CALIBRATION_SCOPE),
+        "{notice}"
+    );
+
+    let staged = HeadFile::with_metadata(
+        4,
+        &[
+            ("mode", "development"),
+            ("renderer", DECISION_RENDERER),
+            ("calibration_scope", SCOPE),
+        ],
+    );
+    let notice = Decisions::open(&staged.0, 4)
+        .expect("declared head")
+        .provenance();
+    assert!(
+        notice.contains("declared by the head") && notice.contains(SCOPE),
+        "{notice}"
+    );
+
+    let unscoped = HeadFile::with_metadata(4, &[("mode", "development")]);
+    let notice = Decisions::open(&unscoped.0, 4)
+        .expect("unscoped head")
+        .provenance();
+    assert!(notice.contains(UNKNOWN_CALIBRATION_SCOPE), "{notice}");
+
+    let foreign = HeadFile::with_metadata(4, &[("renderer", "kev-hard-v1-judgment-render.v1")]);
+    let error = Decisions::open(&foreign.0, 4)
+        .err()
+        .expect("a foreign renderer is refused")
+        .to_string();
+    assert!(
+        error.contains(FLAG) && error.contains("kev-hard-v1-judgment-render.v1"),
+        "{error}"
+    );
 }
 
 #[test]

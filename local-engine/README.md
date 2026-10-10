@@ -523,7 +523,12 @@ in option order. Supply output-normalized, unrotated hidden states as flat
 position-major rows: at least two option rows, then the decision row. Check
 `width()` against the capture model, and round captured values through FP16
 to match the training representation. The loader checks format metadata,
-dimensions, tensor byte ranges and finite values. Native scoring matched an
+dimensions, tensor byte ranges and finite values. It also keeps the
+artifact's optional `renderer` and `calibration_scope` metadata
+(`renderer()`, `calibration_scope()`; `None` when absent, never inferred).
+`--development` exports record both (the renderer only when every feature
+row agrees); the existing devtools-v1 head and default-mode exports record
+neither. The CPU scorer accepts any declared renderer. Native scoring matched an
 independent Python reference on two real captured examples within 1e-12.
 This validates the scoring formula, not judgment quality on new tasks or
 the calibration of returned probabilities outside the evaluation dataset.
@@ -594,14 +599,22 @@ features used, rounded through FP16 and scored on the CPU.
 
 A `Decision` carries the head's probability per option, the argmax and its
 value, for scores the probability-weighted mean level index, the prompt token
-count, the renderer and `judgment::CALIBRATION_SCOPE`. It has no confidence,
-threshold or refusal. The head was trained and temperature-fitted only on
-two-option Yes/No code-diff questions, so its probabilities are calibrated
-only within that held-out split; for other questions, states or more than two
-options they are the head's softmax output and nothing more.
+count, the renderer, `renderer_declared` and the loaded head's
+`calibration_scope`. It has no confidence, threshold or refusal. Provenance
+comes from the loaded file only: a head declaring a renderer other than
+`kev-devtools-v1-judgment-render.v1` is refused, a legacy head declaring none
+is accepted with the renderer assumed (`renderer_declared: false`), and a head
+declaring no `calibration_scope` reports `judgment::UNKNOWN_CALIBRATION_SCOPE`
+rather than a guessed training set. The existing devtools-v1 head is such a
+legacy file, so at run time it reports an assumed renderer and unknown
+calibration. Its scope was documented separately when it was evaluated: it
+was trained and temperature-fitted only on two-option Yes/No code-diff
+questions, so for other questions, states or more than two options its
+probabilities are the head's softmax output and nothing more.
 
 Invalid requests, text that spells a special token, and a head whose width is
-not the model's fail before any GPU work; a single-level score is answered
+not the model's or whose declared renderer is not the native one fail before
+any GPU work; a single-level score is answered
 without capture. On a handle, preparation and tokenization run on the calling
 thread and the decision takes one slot of the bounded FIFO queue (a full queue
 is `Error::QueueFull`). It runs synchronously on the worker only once no

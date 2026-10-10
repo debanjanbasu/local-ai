@@ -473,9 +473,11 @@ fn cancellation_starts_retention_and_expiry_never_cancels_a_draining_job() {
     let draining = doc.id().to_owned();
     let (stopped, stop) = stopper();
     let (gate, wait) = std::sync::mpsc::channel::<()>();
+    let (entered, draining_started) = std::sync::mpsc::sync_channel(1);
     let steps: Vec<Step> = vec![
         event(Event::Finished(stats(StopReason::Eos))),
         Box::new(move || {
+            entered.send(()).expect("announce drain");
             let _ = wait.recv();
             Signal::Progress(PrefillProgress {
                 tokens: 0,
@@ -487,9 +489,12 @@ fn cancellation_starts_retention_and_expiry_never_cancels_a_draining_job() {
         .admit(doc, script(steps), stop, None)
         .expect("admitted");
     let pump = std::thread::spawn(move || pump.run());
-    while status(temporary.store(), &draining) != "completed" {
-        std::thread::yield_now();
-    }
+    // The terminal record is written before retention starts. Wait for the
+    // entire Finished signal to settle before moving the injected clock.
+    draining_started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("pump entered drain after settlement");
+    assert_eq!(status(temporary.store(), &draining), "completed");
     advance(&clock, TTL);
     assert_eq!(temporary.expire_due(&background), 2, "both are due");
     assert_eq!(stored(temporary.store(), &id), None);

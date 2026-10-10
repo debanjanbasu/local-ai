@@ -18,14 +18,24 @@
 //! training features were captured with), rounded through FP16 as the
 //! training features were stored, and scored by the head.
 //!
+//! # Renderer and provenance
+//!
+//! Only [`DECISION_RENDERER`] is rendered. A head whose `renderer` metadata
+//! names anything else is refused before any tokenization or GPU work (its
+//! features can still be scored directly with [`JudgmentHead::score`]). A
+//! legacy head that declares no renderer is accepted with the renderer
+//! *assumed*, reported as [`Decision::renderer_declared`] `false`.
+//!
+//! A [`Decision`] carries the loaded head's own `calibration_scope` metadata,
+//! or [`UNKNOWN_CALIBRATION_SCOPE`] when the head declares none; nothing is
+//! inferred from the file's other metadata or from which head it might be.
+//!
 //! # Scope
 //!
-//! The current head was trained on two-option (Yes/No) code-diff questions
-//! only, and its temperature was fit on that dataset's calibration split
-//! ([`CALIBRATION_SCOPE`]). Probabilities for other questions, other state
-//! text, or more than two options are the head's softmax output, nothing
-//! more: no confidence, threshold or refusal is derived here, and nothing
-//! claims production quality.
+//! Probabilities are the head's softmax output, nothing more: no confidence,
+//! threshold or refusal is derived here, and nothing claims production
+//! quality. Questions, state text or option counts unlike the head's
+//! training rows are outside any calibration it has.
 
 use super::{JudgmentHead, JudgmentScores};
 use crate::bonsai_model::{BonsaiEngine, CancelToken};
@@ -43,11 +53,11 @@ pub const MAX_DECISION_OPTIONS: usize = 26;
 /// so this is part of the feature contract.
 pub const DECISION_CAPTURE_ROWS: usize = 60;
 
-/// What the head's probabilities are, and are not, calibrated for.
-pub const CALIBRATION_SCOPE: &str = "experimental: head trained only on two-option Yes/No \
-     code-diff questions (Kev devtools-v1 CodeReviewer needs_comment and CommitPackFT \
-     message_match); temperature fit on that dataset's calibration split only; \
-     probabilities are the head's softmax output, not a calibrated confidence elsewhere";
+/// [`Decision::calibration_scope`] for a head whose artifact declares no
+/// `calibration_scope` metadata.
+pub const UNKNOWN_CALIBRATION_SCOPE: &str = "unknown: the judgment head artifact declares no \
+     calibration_scope; its training data and temperature-fit split are not recorded, so \
+     probabilities are the head's softmax output with no known calibration";
 
 /// A typed option value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,10 +146,14 @@ pub struct Decision {
     pub prompt_tokens: usize,
     /// Whether hidden states were captured and scored.
     pub captured: bool,
-    /// [`DECISION_RENDERER`].
+    /// The renderer that produced the prompt: always [`DECISION_RENDERER`].
     pub renderer: &'static str,
-    /// [`CALIBRATION_SCOPE`].
-    pub calibration_scope: &'static str,
+    /// Whether the head's artifact declared [`renderer`](Self::renderer) in
+    /// its metadata; `false` for a legacy head, whose renderer is assumed.
+    pub renderer_declared: bool,
+    /// The head's `calibration_scope` metadata, verbatim, or
+    /// [`UNKNOWN_CALIBRATION_SCOPE`] when the artifact declares none.
+    pub calibration_scope: String,
 }
 
 impl DecisionRequest {
@@ -227,14 +241,19 @@ pub struct PreparedDecision {
     tokens: Vec<u32>,
     /// Token index of each option endpoint, then the decision endpoint.
     positions: Vec<usize>,
+    /// [`Decision::renderer_declared`], from the head.
+    renderer_declared: bool,
+    /// [`Decision::calibration_scope`], from the head.
+    calibration_scope: String,
 }
 
 impl PreparedDecision {
     /// Render, tokenize and validate `request` for `head`, on the CPU.
     ///
-    /// Rejects a head whose width is not the model's, any input whose text
-    /// tokenizes to a special token, and any endpoint that is not an exact
-    /// token boundary.
+    /// Rejects a head whose width is not the model's or whose declared
+    /// renderer is not [`DECISION_RENDERER`], any input whose text tokenizes
+    /// to a special token, and any endpoint that is not an exact token
+    /// boundary.
     pub(crate) fn new(
         tokenizer: &BonsaiTokenizer,
         head: &JudgmentHead,
@@ -255,6 +274,14 @@ impl PreparedDecision {
                 head.width()
             )));
         }
+        if let Some(renderer) = head.renderer()
+            && renderer != DECISION_RENDERER
+        {
+            return Err(invalid(format!(
+                "judgment head renderer {renderer:?} is not the native renderer \
+                 {DECISION_RENDERER:?}; score its features with JudgmentHead::score instead"
+            )));
+        }
         let rendered = request.render()?;
         let (tokens, positions) =
             tokenizer.encode_with_token_ends(&rendered.text, &rendered.byte_ends)?;
@@ -268,6 +295,11 @@ impl PreparedDecision {
             score: matches!(request.kind, DecisionKind::Score(_)),
             tokens,
             positions,
+            renderer_declared: head.renderer().is_some(),
+            calibration_scope: head
+                .calibration_scope()
+                .unwrap_or(UNKNOWN_CALIBRATION_SCOPE)
+                .to_owned(),
         })
     }
 
@@ -367,7 +399,8 @@ impl PreparedDecision {
             prompt_tokens: self.tokens.len(),
             captured: scores.is_some(),
             renderer: DECISION_RENDERER,
-            calibration_scope: CALIBRATION_SCOPE,
+            renderer_declared: self.renderer_declared,
+            calibration_scope: self.calibration_scope.clone(),
         })
     }
 }
@@ -384,7 +417,7 @@ fn score_features(head: &JudgmentHead, mut features: Vec<f32>) -> crate::Result<
 mod tests {
     use super::{
         DECISION_RENDERER, DecisionKind, DecisionRequest, DecisionValue, JudgmentHead,
-        MAX_DECISION_OPTIONS, PreparedDecision, score_features,
+        MAX_DECISION_OPTIONS, PreparedDecision, UNKNOWN_CALIBRATION_SCOPE, score_features,
     };
     use crate::bonsai_tokenizer::BonsaiTokenizer;
 
@@ -576,6 +609,64 @@ mod tests {
         );
         assert!(choice.assemble(Some(&scores)).is_err(), "count mismatch");
         assert!(choice.ready().is_err(), "two options need capture");
+        Ok(())
+    }
+
+    /// A decision reports the loaded head's provenance, never a fixed one:
+    /// declared scope verbatim, unknown for a legacy head (renderer assumed),
+    /// and an explicitly different renderer is refused before any work.
+    #[test]
+    fn decisions_report_the_loaded_heads_provenance() -> crate::Result<()> {
+        let tokenizer = BonsaiTokenizer::tiny_for_tests();
+        let with = |renderer: Option<&str>, scope: Option<&str>| JudgmentHead {
+            renderer: renderer.map(str::to_owned),
+            calibration_scope: scope.map(str::to_owned),
+            ..head()
+        };
+        let single = request(DecisionKind::Score(vec!["only".into()]));
+        let decide = |head: &JudgmentHead| {
+            PreparedDecision::with_width(&tokenizer, head, 3, &single).and_then(|p| p.ready())
+        };
+
+        let legacy = decide(&head())?;
+        assert_eq!(legacy.renderer, DECISION_RENDERER);
+        assert!(!legacy.renderer_declared, "a legacy renderer is assumed");
+        assert_eq!(legacy.calibration_scope, UNKNOWN_CALIBRATION_SCOPE);
+
+        let declared = decide(&with(
+            Some(DECISION_RENDERER),
+            Some("synthetic calibration"),
+        ))?;
+        assert!(declared.renderer_declared);
+        assert_eq!(declared.calibration_scope, "synthetic calibration");
+
+        let unscoped = decide(&with(Some(DECISION_RENDERER), None))?;
+        assert!(unscoped.renderer_declared);
+        assert_eq!(unscoped.calibration_scope, UNKNOWN_CALIBRATION_SCOPE);
+
+        // Captured outcomes carry the same provenance.
+        let two = crate::judgment::JudgmentScores {
+            logits: vec![0.0, 1.0],
+            probabilities: vec![0.4, 0.6],
+        };
+        let captured = PreparedDecision::with_width(
+            &tokenizer,
+            &with(None, Some("scope")),
+            3,
+            &request(DecisionKind::Predicate),
+        )?
+        .assemble(Some(&two))?;
+        assert!(!captured.renderer_declared);
+        assert_eq!(captured.calibration_scope, "scope");
+
+        let foreign = with(Some("kev-hard-v1-judgment-render.v1"), Some("scope"));
+        let error = decide(&foreign).err().map(|e| e.to_string());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("kev-hard-v1-judgment-render.v1")),
+            "{error:?}"
+        );
         Ok(())
     }
 
