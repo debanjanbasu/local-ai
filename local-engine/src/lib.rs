@@ -16,6 +16,7 @@ pub mod bonsai_ngram;
 #[doc(hidden)]
 #[allow(clippy::too_long_first_doc_paragraph)]
 pub mod bonsai_tokenizer;
+pub mod judgment;
 mod prompt_cache;
 #[doc(hidden)]
 #[allow(clippy::must_use_candidate)]
