@@ -498,9 +498,11 @@ fn responses_parse_instructions_history_and_tools() {
 #[test]
 fn responses_string_input_is_one_user_message_and_instructions_lead() {
     let prepared = prepare_responses(
-        json!({"input":"hi","instructions":"sys"})
-            .to_string()
-            .as_bytes(),
+        json!({"input":"hi","instructions":"sys","client_metadata":{
+            "session_id":"telemetry-only", "instructions":"not a model instruction",
+            "x-codex-turn-metadata":"{\"turn_id\":\"turn-1\"}"}})
+        .to_string()
+        .as_bytes(),
         true,
     )
     .expect("valid");
@@ -512,6 +514,10 @@ fn responses_string_input_is_one_user_message_and_instructions_lead() {
         .collect();
     assert_eq!(roles, [("system", "sys"), ("user", "hi")]);
     assert!(prepared.request.thinking, "server default applies");
+    assert!(
+        prepared.request.session.is_none(),
+        "telemetry is not a session key"
+    );
 }
 
 #[test]
@@ -562,6 +568,11 @@ fn responses_reject_what_they_cannot_honour() {
         (json!({"input":"hi","truncation":"auto"}), "truncation"),
         (json!({"input":"hi","frobnicate":1}), "unknown field"),
         (
+            json!({"input":"hi","client_metadata":{"turn_id":42}}),
+            "expected a string",
+        ),
+        (json!({"input":"hi","client_metadata":[]}), "expected a map"),
+        (
             json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]}),
             "text-only",
         ),
@@ -586,7 +597,7 @@ fn responses_reject_what_they_cannot_honour() {
     let accepted = json!({"input":"hi","store":false,"previous_response_id":null,
         "background":false,"truncation":"disabled","include":[],"text":{"format":{"type":"text"}},
         "tool_choice":"auto","parallel_tool_calls":true,"service_tier":"default",
-        "reasoning":{"effort":"xhigh","summary":null},"conversation":null});
+        "reasoning":{"effort":"xhigh","summary":null},"conversation":null,"client_metadata":null});
     assert!(prepare_responses(accepted.to_string().as_bytes(), true).is_ok());
 }
 
@@ -777,7 +788,8 @@ fn responses_stream_reports_a_mid_generation_failure() {
 
 #[test]
 fn responses_body_is_the_streamed_terminal_response_after_whitespace() {
-    let request = json!({"input":"hi","instructions":"sys","metadata":{"k":"v"}});
+    let request = json!({"input":"hi","instructions":"sys","metadata":{"k":"v"},
+        "client_metadata":{"session_id":"telemetry-only"}});
     let reply = responses_reply(&request);
     let events = || {
         vec![
@@ -818,6 +830,8 @@ fn responses_body_is_the_streamed_terminal_response_after_whitespace() {
     assert_eq!(document["object"], "response");
     assert_eq!(document["instructions"], "sys");
     assert_eq!(document["metadata"], json!({"k":"v"}));
+    assert!(document.get("client_metadata").is_none());
+    assert!(!document.to_string().contains("telemetry-only"));
     assert_eq!(document["output"][2]["arguments"], "{\"x\":[1,2]}");
 }
 
