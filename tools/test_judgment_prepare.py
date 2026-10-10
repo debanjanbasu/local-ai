@@ -382,5 +382,314 @@ class PrepareTest(unittest.TestCase):
         self.assertIn("refusing to overwrite", stderr.getvalue())
 
 
+# --- hard-v1: synthetic fixtures in Kev's hard-v1 record shape ---------------
+
+TRADE_KEYS = ["alpha_one", "beta", "gamma", "delta", "epsilon", "none_qualifies"]
+LEVELS = ["Under 10%", "10% to 30%", "30% to 50%", "50% to 70%", "70% to 90%", "Over 90%"]
+
+
+def hard_record(partition, family, index, template, questions, group=None, state=None):
+    state = state or f"MEMO\n{family} case {partition} {index} t{template} é😀"
+    rid = f"hard-v1/{family}/{partition}/{index:05d}"
+    return {
+        "state": state,
+        "questions": questions,
+        "_meta": {
+            "id": rid,
+            "source": f"hard_{family}",
+            "group_id": group or rid,
+            "variant": "clean",
+            "split": partition,
+            "template": f"{family}/t{template}",
+            "family": family,
+            "subtype": "s",
+            "facts": {"n": index},
+            "text_sha256": sha(" ".join(state.casefold().split())),
+            "state_tokens": 12,
+        },
+    }
+
+
+def hq(qtype, family, label, criteria=None, instructions="Decide."):
+    q = {"type": qtype, "instructions": instructions, "label": label, "src": f"hard_{family}"}
+    if criteria is not None:
+        q["criteria"] = criteria
+    return q
+
+
+def hard_family_records(partition, family, template, start):
+    out = []
+    for i in range(start, start + 3):
+        if family == "tradeoff":
+            qs = {
+                "choice": hq(
+                    "choice",
+                    family,
+                    TRADE_KEYS[i % 6],
+                    {k: ("No option qualifies" if k == "none_qualifies" else None) for k in TRADE_KEYS},
+                ),
+                "meets": hq(
+                    "noul", family, i % 2 == 0, {"true": "Meets all", "false": "Misses one"}
+                ),
+            }
+        elif family == "probability":
+            qs = {
+                "value": hq("choice", family, "abc"[i % 3], {"a": "10%", "b": "20%", "c": "30%"}),
+                "bucket": hq("score", family, i % 6, list(LEVELS)),
+            }
+        elif family == "long_policy":
+            qs = {"outcome": hq("choice", family, "abcde"[i % 5], {k: f"${k}1" for k in "abcde"})}
+        else:  # ambiguous twins share a group and a template
+            crit = {"not_enough_information": "Cannot decide", "valid": "Valid", "invalid": None}
+            group = f"hard-v1/{family}/{partition}/g{i:05d}"
+            out.append(hard_record(partition, family, 2 * i, template,
+                                   {"decision": hq("choice", family, "valid" if i % 2 else "invalid", crit)},
+                                   group))
+            qs = {"decision": hq("choice", family, "not_enough_information", crit)}
+            out.append(hard_record(partition, family, 2 * i + 1, template, qs, group))
+            continue
+        out.append(hard_record(partition, family, i, template, qs))
+    return out
+
+
+HARD_FIXTURE_FAMILIES = ("tradeoff", "probability", "ambiguous", "long_policy")
+
+
+def hard_partitions():
+    parts = {"train": [], "development": []}
+    for family in HARD_FIXTURE_FAMILIES:
+        for template in range(4):
+            parts["train"] += hard_family_records("train", family, template, 10 * template)
+        parts["development"] += hard_family_records("development", family, 4, 0)
+    return parts
+
+
+def write_hard(root, partitions, mutate=None):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for partition, rows in partitions.items():
+        data = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows).encode()
+        (root / f"{partition}.jsonl").write_bytes(data)
+        by_family = {}
+        for r in rows:
+            cell = by_family.setdefault(r["_meta"]["family"], {"records": 0, "questions": 0})
+            cell["records"] += 1
+            cell["questions"] += len(r["questions"])
+        files[f"{partition}.jsonl"] = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+            "records": len(rows),
+            "questions": sum(len(r["questions"]) for r in rows),
+            "by_family": by_family,
+        }
+    # The locked test partition is declared but is garbage on disk: it is never read.
+    (root / "test.jsonl").write_bytes(b"\x00 not json")
+    files["test.jsonl"] = {"sha256": "0" * 64, "bytes": 9, "records": 1, "questions": 1}
+    manifest = {
+        "version": "hard-v1",
+        "partitions": ["train", "development", "test"],
+        "locked": ["test"],
+        "seed": "s",
+        "families": list(jp.HARD_FAMILIES),
+        "templates": {"train": [0, 1, 2, 3], "development": [4], "test": [5]},
+        "trainable_sources": [f"hard_{f}" for f in jp.HARD_FAMILIES],
+        "eval_only_sources": [],
+        "eval_only": False,
+        "tokenizer": dict(jp.HARD_TOKENIZER),
+        "labels": "programmatic",
+        "files": files,
+        "code_sha256": {"scripts/build_hard_v1.py": "0" * 64},
+    }
+    if mutate:
+        mutate(manifest)
+    data = json.dumps(manifest).encode()
+    (root / "manifest.json").write_bytes(data)
+    return hashlib.sha256(data).hexdigest()
+
+
+class HardV1Test(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.kev = self.tmp / "kev"
+
+    def run_hard(self, partitions=None, out="out", mutate=None, **options):
+        digest = write_hard(self.kev, partitions or hard_partitions(), mutate)
+        return jp.prepare_hard_v1(self.kev, self.tmp / out, manifest_sha256=digest, **options)
+
+    def rows(self, out="out"):
+        text = (self.tmp / out / "rows.jsonl").read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()]
+
+    def assert_fails(self, needle, partitions=None, mutate=None, **options):
+        with self.assertRaises(jp.PrepareError) as caught:
+            self.run_hard(partitions, out="bad", mutate=mutate, **options)
+        self.assertIn(needle, str(caught.exception))
+        self.assertFalse((self.tmp / "bad").exists())
+
+    def test_rows_split_by_template_and_match_the_capture_contract(self):
+        report = self.run_hard()
+        rows = self.rows()
+        split_templates = {}
+        for row in rows:
+            meta, data, ends = row["metadata"], row["text"].encode(), row["token_end_offsets"]
+            split_templates.setdefault(meta["split"], set()).add(meta["template"][-2:])
+            self.assertEqual(set(row), {"id", "text", "token_end_offsets", "metadata"})
+            self.assertEqual(len(ends), meta["option_count"] + 1)
+            self.assertEqual(len(meta["options"]), meta["option_count"])
+            start = data.index(b"Options:\n") + len(b"Options:\n")
+            for index, end in enumerate(ends[:-1]):
+                line = data[start:end].decode("utf-8")
+                self.assertEqual(line, f"{chr(65 + index)}) {meta['options'][index]}\n")
+                start = end
+            self.assertEqual(data[start:], b"Decision:")
+            self.assertEqual(meta["option_labels"][meta["target"]], meta["native_label"])
+            self.assertEqual(meta["renderer"], jp.HARD_RENDERER)
+            self.assertNotIn("facts", meta)
+            self.assertNotEqual(meta["family"], "long_policy")
+        self.assertEqual(
+            split_templates,
+            {"train": {"t0", "t1", "t2"}, "calibration": {"t3"}, "validation": {"t4"}},
+        )
+        counts = {
+            (r["metadata"]["family"], r["metadata"]["question_type"], r["metadata"]["option_count"])
+            for r in rows
+        }
+        self.assertEqual(
+            counts,
+            {("tradeoff", "choice", 6), ("tradeoff", "noul", 2), ("probability", "choice", 3),
+             ("probability", "score", 6), ("ambiguous", "choice", 3)},
+        )
+        by_id = {r["id"]: r["metadata"] for r in rows}
+        trade = by_id["kev-hard-v1/tradeoff/train/00000/choice"]
+        self.assertEqual(trade["options"][1:], ["beta", "gamma", "delta", "epsilon",
+                                                "none qualifies: No option qualifies"])
+        self.assertEqual(by_id["kev-hard-v1/probability/train/00000/value"]["options"],
+                         ["10%", "20%", "30%"])
+        self.assertEqual(by_id["kev-hard-v1/probability/train/00000/bucket"]["options"], LEVELS)
+        self.assertEqual(sorted(by_id["kev-hard-v1/tradeoff/train/00000/meets"]["options"]),
+                         ["No: Misses one", "Yes: Meets all"])
+        # long_policy is counted, not silently dropped; test is declared but never read.
+        self.assertEqual(
+            report["excluded_rows"]["long_policy_excluded_round1_capture_cost"],
+            {"development": {"long_policy/questions": 3, "long_policy/records": 3},
+             "train": {"long_policy/questions": 12, "long_policy/records": 12}},
+        )
+        self.assertFalse(report["kev"]["files"]["test.jsonl"]["read"])
+        self.assertEqual(report["counts"]["calibration"]["ambiguous"]["groups"], 3)
+        self.assertEqual(
+            report["counts"]["train"]["probability"]["question_types"]["score"]["option_counts"],
+            {"6": 9},
+        )
+        payload = (self.tmp / "out" / "rows.jsonl").read_bytes()
+        self.assertEqual(report["output"]["sha256"], hashlib.sha256(payload).hexdigest())
+        self.run_hard(out="again")
+        self.assertEqual((self.tmp / "again" / "rows.jsonl").read_bytes(), payload)
+
+    def test_options_long_policy_and_descriptions_are_explicit(self):
+        report = self.run_hard(include_families=("long_policy",), option_descriptions=False)
+        rows = {r["id"]: r["metadata"] for r in self.rows()}
+        self.assertEqual(report["excluded_rows"], {})
+        self.assertEqual(rows["kev-hard-v1/long_policy/train/00000/outcome"]["options"],
+                         ["$a1", "$b1", "$c1", "$d1", "$e1"])
+        self.assertEqual(rows["kev-hard-v1/ambiguous/train/00000/decision"]["options"],
+                         ["not enough information", "valid", "invalid"])
+        self.assertEqual(rows["kev-hard-v1/tradeoff/train/00000/choice"]["options"][-1],
+                         "none qualifies")
+        self.assertEqual(report["renderer"], jp.HARD_RENDERER_NO_DESCRIPTIONS)
+        with self.assertRaisesRegex(jp.PrepareError, "can be included"):
+            jp.prepare_hard_v1(self.kev, self.tmp / "x", include_families=("judge",))
+
+    def test_malformed_records_fail(self):
+        def broken(change, partition="train", index=0):
+            parts = hard_partitions()
+            change(parts[partition][index])
+            return parts
+
+        cases = {
+            "not a train template": lambda r: r["_meta"].update(template="tradeoff/t4"),
+            "text_sha256 does not match": lambda r: r.update(state="other state"),
+            "is not an option": lambda r: r["questions"]["choice"].update(label="zeta"),
+            "choice needs 3-6": lambda r: r["questions"]["choice"].update(
+                criteria={"x": None, "alpha_one": None}, label="x"),
+            "question keys": lambda r: r["questions"]["meets"].update(target={"true": 1}),
+            "noul label must be a boolean": lambda r: r["questions"]["meets"].update(label=1),
+            "unsupported question type": lambda r: r["questions"]["meets"].update(type="rank"),
+            "unexpected group_id": lambda r: r["_meta"].update(group_id="x"),
+            "_meta must include": lambda r: r["_meta"].pop("facts"),
+        }
+        for needle, change in cases.items():
+            with self.subTest(needle):
+                self.assert_fails(needle, broken(change))
+        with self.subTest("score levels"):
+            self.assert_fails("score needs 6 levels", broken(
+                lambda r: r["questions"]["bucket"].update(criteria=LEVELS[:5], label=0),
+                index=12))
+
+    def test_pins_and_manifest_provenance_are_enforced(self):
+        digest = write_hard(self.kev, hard_partitions())
+        with self.assertRaisesRegex(jp.PrepareError, "does not match pinned"):
+            jp.prepare_hard_v1(self.kev, self.tmp / "bad")
+        with open(self.kev / "train.jsonl", "ab") as handle:
+            handle.write(b"\n")
+        with self.assertRaisesRegex(jp.PrepareError, "train.jsonl: sha256"):
+            jp.prepare_hard_v1(self.kev, self.tmp / "bad", manifest_sha256=digest)
+
+        def tokenizer(m):
+            m["tokenizer"]["revision"] = "main"
+
+        def unlocked(m):
+            m["locked"] = []
+
+        def counts(m):
+            m["files"]["train.jsonl"]["by_family"]["tradeoff"]["questions"] += 1
+
+        self.assert_fails("manifest tokenizer", mutate=tokenizer)
+        self.assert_fails("does not lock", mutate=unlocked)
+        self.assert_fails("per-family counts", mutate=counts)
+        self.assertFalse((self.tmp / "bad").exists())
+
+    def test_overlap_and_coverage_failures(self):
+        parts = hard_partitions()
+        dev = parts["development"][0]
+        train = parts["train"][0]
+        dev["state"] = train["state"].upper() + "  "
+        dev["_meta"]["text_sha256"] = train["_meta"]["text_sha256"]
+        self.assert_fails("overlap", parts)
+
+        parts = hard_partitions()
+        calib = next(r for r in parts["train"] if r["_meta"]["template"] == "ambiguous/t3")
+        twin = next(r for r in parts["train"] if r["_meta"]["template"] == "ambiguous/t0")
+        calib["_meta"]["group_id"] = twin["_meta"]["group_id"]
+        self.assert_fails("group overlap", parts)
+
+        parts = hard_partitions()
+        for r in parts["development"]:
+            if r["_meta"]["family"] == "probability":
+                r["questions"]["bucket"]["label"] = 2
+        self.assert_fails("validation/probability/score: one class only", parts)
+
+        parts = hard_partitions()
+        for r in parts["train"]:
+            if r["_meta"]["template"] == "probability/t3":
+                del r["questions"]["bucket"]
+        self.assert_fails("calibration/probability: no score questions", parts)
+        self.assert_fails("groups, need 4", min_groups=4)
+
+    def test_cli_selects_the_dataset_and_rejects_mixed_options(self):
+        digest = write_hard(self.kev, hard_partitions())
+        stdout, stderr = io.StringIO(), io.StringIO()
+        base = ["--kev-dir", str(self.kev), "--manifest-sha256", digest]
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            ok = jp.main(base + ["--dataset", "hard-v1", "--out", str(self.tmp / "cli")])
+            mixed = jp.main(base + ["--dataset", "hard-v1", "--calibration-fraction", "0.2",
+                                    "--out", str(self.tmp / "mixed")])
+            devtools = jp.main(base + ["--include-long-policy", "--out", str(self.tmp / "dt")])
+        self.assertEqual((ok, mixed, devtools), (0, 2, 2))
+        self.assertIn("template 3", stderr.getvalue())
+        self.assertIn("hard-v1 options", stderr.getvalue())
+        self.assertTrue((self.tmp / "cli" / "rows.jsonl").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
