@@ -70,8 +70,8 @@ mod decision;
 
 pub(crate) use self::decision::PreparedDecision;
 pub use self::decision::{
-    DECISION_CAPTURE_ROWS, DECISION_RENDERER, Decision, DecisionKind, DecisionProbability,
-    DecisionRequest, DecisionValue, MAX_DECISION_OPTIONS, RenderedDecision,
+    DECISION_CAPTURE_ROWS, DECISION_RENDERER, DECISION_RENDERERS, Decision, DecisionKind,
+    DecisionProbability, DecisionRequest, DecisionValue, MAX_DECISION_OPTIONS, RenderedDecision,
     UNKNOWN_CALIBRATION_SCOPE,
 };
 

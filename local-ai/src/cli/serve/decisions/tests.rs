@@ -538,21 +538,29 @@ fn startup_reports_the_heads_own_provenance() {
         "{notice}"
     );
 
-    let staged = HeadFile::with_metadata(
-        4,
-        &[
-            ("mode", "development"),
-            ("renderer", DECISION_RENDERER),
-            ("calibration_scope", SCOPE),
-        ],
-    );
-    let notice = Decisions::open(&staged.0, 4)
-        .expect("declared head")
-        .provenance();
-    assert!(
-        notice.contains("declared by the head") && notice.contains(SCOPE),
-        "{notice}"
-    );
+    for renderer in [
+        DECISION_RENDERER,
+        "kev-hard-v1-judgment-render.v1",
+        "kev-hard-v1-judgment-render.v1-no-descriptions",
+    ] {
+        let staged = HeadFile::with_metadata(
+            4,
+            &[
+                ("mode", "development"),
+                ("renderer", renderer),
+                ("calibration_scope", SCOPE),
+            ],
+        );
+        let notice = Decisions::open(&staged.0, 4)
+            .expect("declared head")
+            .provenance();
+        assert!(
+            notice.contains("declared by the head")
+                && notice.contains(renderer)
+                && notice.contains(SCOPE),
+            "{notice}"
+        );
+    }
 
     let unscoped = HeadFile::with_metadata(4, &[("mode", "development")]);
     let notice = Decisions::open(&unscoped.0, 4)
@@ -560,13 +568,13 @@ fn startup_reports_the_heads_own_provenance() {
         .provenance();
     assert!(notice.contains(UNKNOWN_CALIBRATION_SCOPE), "{notice}");
 
-    let foreign = HeadFile::with_metadata(4, &[("renderer", "kev-hard-v1-judgment-render.v1")]);
+    let foreign = HeadFile::with_metadata(4, &[("renderer", "unknown-renderer")]);
     let error = Decisions::open(&foreign.0, 4)
         .err()
         .expect("a foreign renderer is refused")
         .to_string();
     assert!(
-        error.contains(FLAG) && error.contains("kev-hard-v1-judgment-render.v1"),
+        error.contains(FLAG) && error.contains("unknown-renderer"),
         "{error}"
     );
 }

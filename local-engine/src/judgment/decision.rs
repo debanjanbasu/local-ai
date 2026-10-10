@@ -20,9 +20,10 @@
 //!
 //! # Renderer and provenance
 //!
-//! Only [`DECISION_RENDERER`] is rendered. A head whose `renderer` metadata
-//! names anything else is refused before any tokenization or GPU work (its
-//! features can still be scored directly with [`JudgmentHead::score`]). A
+//! [`DECISION_RENDERERS`] share the same prompt format. The caller supplies
+//! the state and option text, including any descriptions used in training.
+//! A head naming another renderer is refused before tokenization or GPU work
+//! (its features can still be scored with [`JudgmentHead::score`]). A
 //! legacy head that declares no renderer is accepted with the renderer
 //! *assumed*, reported as [`Decision::renderer_declared`] `false`.
 //!
@@ -44,6 +45,16 @@ use crate::bonsai_tokenizer::BonsaiTokenizer;
 /// Renderer identity: byte-identical to `tools/judgment_prepare.py`
 /// `RENDERER`.
 pub const DECISION_RENDERER: &str = "kev-devtools-v1-judgment-render.v1";
+
+/// Renderer identities using `tools/judgment_prepare.py::render` unchanged.
+///
+/// They differ in preparation of state and option text, not prompt framing
+/// or endpoint placement. Callers must supply that prepared text verbatim.
+pub const DECISION_RENDERERS: [&str; 3] = [
+    DECISION_RENDERER,
+    "kev-hard-v1-judgment-render.v1",
+    "kev-hard-v1-judgment-render.v1-no-descriptions",
+];
 
 /// Most options a decision may render: option letters are fixed `A`..`Z`.
 pub const MAX_DECISION_OPTIONS: usize = 26;
@@ -146,7 +157,8 @@ pub struct Decision {
     pub prompt_tokens: usize,
     /// Whether hidden states were captured and scored.
     pub captured: bool,
-    /// The renderer that produced the prompt: always [`DECISION_RENDERER`].
+    /// The head's declared member of [`DECISION_RENDERERS`], or
+    /// [`DECISION_RENDERER`] when assumed for a legacy head.
     pub renderer: &'static str,
     /// Whether the head's artifact declared [`renderer`](Self::renderer) in
     /// its metadata; `false` for a legacy head, whose renderer is assumed.
@@ -241,6 +253,8 @@ pub struct PreparedDecision {
     tokens: Vec<u32>,
     /// Token index of each option endpoint, then the decision endpoint.
     positions: Vec<usize>,
+    /// [`Decision::renderer`], checked against the supported formats.
+    renderer: &'static str,
     /// [`Decision::renderer_declared`], from the head.
     renderer_declared: bool,
     /// [`Decision::calibration_scope`], from the head.
@@ -251,7 +265,7 @@ impl PreparedDecision {
     /// Render, tokenize and validate `request` for `head`, on the CPU.
     ///
     /// Rejects a head whose width is not the model's or whose declared
-    /// renderer is not [`DECISION_RENDERER`], any input whose text tokenizes
+    /// renderer is not in [`DECISION_RENDERERS`], any input whose text tokenizes
     /// to a special token, and any endpoint that is not an exact token
     /// boundary.
     pub(crate) fn new(
@@ -274,14 +288,16 @@ impl PreparedDecision {
                 head.width()
             )));
         }
-        if let Some(renderer) = head.renderer()
-            && renderer != DECISION_RENDERER
-        {
-            return Err(invalid(format!(
-                "judgment head renderer {renderer:?} is not the native renderer \
-                 {DECISION_RENDERER:?}; score its features with JudgmentHead::score instead"
-            )));
-        }
+        let declared = head.renderer().unwrap_or(DECISION_RENDERER);
+        let format_id = DECISION_RENDERERS
+            .into_iter()
+            .find(|renderer| *renderer == declared)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "judgment head renderer {declared:?} is not supported natively; \
+                     score its features with JudgmentHead::score instead"
+                ))
+            })?;
         let rendered = request.render()?;
         let (tokens, positions) =
             tokenizer.encode_with_token_ends(&rendered.text, &rendered.byte_ends)?;
@@ -295,6 +311,7 @@ impl PreparedDecision {
             score: matches!(request.kind, DecisionKind::Score(_)),
             tokens,
             positions,
+            renderer: format_id,
             renderer_declared: head.renderer().is_some(),
             calibration_scope: head
                 .calibration_scope()
@@ -398,7 +415,7 @@ impl PreparedDecision {
             score,
             prompt_tokens: self.tokens.len(),
             captured: scores.is_some(),
-            renderer: DECISION_RENDERER,
+            renderer: self.renderer,
             renderer_declared: self.renderer_declared,
             calibration_scope: self.calibration_scope.clone(),
         })
@@ -659,12 +676,31 @@ mod tests {
         assert!(!captured.renderer_declared);
         assert_eq!(captured.calibration_scope, "scope");
 
-        let foreign = with(Some("kev-hard-v1-judgment-render.v1"), Some("scope"));
+        for renderer in [
+            "kev-hard-v1-judgment-render.v1",
+            "kev-hard-v1-judgment-render.v1-no-descriptions",
+        ] {
+            let head = with(Some(renderer), Some("development-only scope"));
+            let declared = decide(&head)?;
+            assert_eq!(declared.renderer, renderer);
+            assert!(declared.renderer_declared);
+            let captured = PreparedDecision::with_width(
+                &tokenizer,
+                &head,
+                3,
+                &request(DecisionKind::Predicate),
+            )?
+            .assemble(Some(&two))?;
+            assert_eq!(captured.renderer, renderer);
+            assert_eq!(captured.calibration_scope, "development-only scope");
+        }
+
+        let foreign = with(Some("unknown-renderer"), Some("scope"));
         let error = decide(&foreign).err().map(|e| e.to_string());
         assert!(
             error
                 .as_deref()
-                .is_some_and(|e| e.contains("kev-hard-v1-judgment-render.v1")),
+                .is_some_and(|e| e.contains("unknown-renderer")),
             "{error:?}"
         );
         Ok(())
