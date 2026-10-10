@@ -49,6 +49,25 @@ def write_dataset(root, rows, payloads=None):
     return root
 
 
+def dev_row(index, split, target, options, family="probability", qtype="choice",
+            width=WIDTH, **meta):
+    item = row(index, split, target, options=options, width=width)
+    item["metadata"].update({"dataset": "hard-v1", "renderer": "render.v1",
+                             "family": family, "question_type": qtype,
+                             "option_count": options, "group_id": f"g-{index}",
+                             "kev_partition": "development" if split == "validation"
+                             else "train", **meta})
+    return item
+
+
+def dev_rows():
+    """train/validation/calibration only, option counts 2..6, no test."""
+    splits = ["train"] * 5 + ["validation"] * 3 + ["calibration"] * 2
+    return [dev_row(i, split, i % (2 + i % 5), 2 + i % 5,
+                    family=("judge", "ambiguous")[i % 2], qtype=("choice", "noul")[i % 2])
+            for i, split in enumerate(splits)]
+
+
 def valid_rows():
     return [
         row(0, "train", 1, options=3),
@@ -165,7 +184,86 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse((Path(self.tmp.name) / "out").exists())
 
 
+    def test_development_validate_accepts_mixed_two_to_six_options_without_test(self):
+        write_dataset(self.root, dev_rows())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            jt.main(["validate", str(self.root), "--width", str(WIDTH), "--development"])
+        summary = json.loads(out.getvalue())
+        self.assertEqual(summary["mode"], "development")
+        self.assertEqual(summary["option_counts"], [2, 3, 4, 5, 6])
+        self.assertEqual(summary["sample_counts"],
+                         {"train": 5, "validation": 3, "calibration": 2, "test": 0})
+        self.assertEqual(summary["option_count_histogram"]["train"],
+                         {"2": 1, "3": 1, "4": 1, "5": 1, "6": 1})
+        self.assertEqual(summary["feature_scope"],
+                         {"dataset": "hard-v1", "renderer": "render.v1"})
+        # The default four-split rule still refuses the same directory.
+        with self.assertRaisesRegex(jt.DatasetError, "empty: \\['test'\\]"):
+            jt.check_mode(jt.load_dataset(self.root, WIDTH))
+
+    def test_development_mode_refuses_test_leaks_and_inconsistencies(self):
+        cases = [
+            (lambda r: r.append(dev_row(10, "test", 0, 2)), "refuses test rows"),
+            (lambda r: r[0]["metadata"].update(kev_partition="test"), "locked-partition"),
+            (lambda r: r[1]["metadata"].update(option_count=5), "option_count"),
+            (lambda r: r[5]["metadata"].update(group_id="g-0"), "spans train"),
+            (lambda r: r.__setitem__(slice(8, 10), []), "empty: \\['calibration'\\]"),
+        ]
+        for edit, message in cases:
+            with self.subTest(message=message):
+                rows = dev_rows()
+                edit(rows)
+                root = write_dataset(Path(self.tmp.name) / message[:6], rows)
+                samples = jt.load_dataset(root, WIDTH)
+                with self.assertRaisesRegex(jt.DatasetError, message):
+                    jt.check_mode(samples, "development")
+        with self.assertRaises(ValueError):
+            jt.check_mode(samples, "lockedtest")
+
+    def test_cli_development_train_refuses_test_rows_before_torch(self):
+        rows = dev_rows() + [dev_row(10, "test", 0, 2)]
+        write_dataset(self.root, rows)
+        out = Path(self.tmp.name) / "out"
+        with self.assertRaisesRegex(SystemExit, "development mode refuses test rows"):
+            jt.main(["train", str(self.root), "--output", str(out), "--width", str(WIDTH),
+                     "--development"])
+        self.assertFalse(out.exists())
+
+    def test_feature_scope_omits_mixed_or_partial_metadata(self):
+        rows = dev_rows()
+        rows[0]["metadata"]["renderer"] = "render.v2"
+        del rows[1]["metadata"]["dataset"]
+        samples = jt.load_dataset(write_dataset(self.root, rows), WIDTH)
+        self.assertEqual(jt.feature_scope(samples), {
+            "dataset": None, "dataset_values": ["hard-v1"],
+            "renderer": None, "renderer_values": ["render.v1", "render.v2"]})
+
+
 class MathTests(unittest.TestCase):
+    def test_baselines_fit_on_train_and_evaluate_elsewhere(self):
+        sample = lambda target, options, **meta: jt.Sample(
+            "x", "train", target, options, 1, b"", "", (0,), meta)
+        train = [sample(1, 2), sample(1, 2), sample(0, 2), sample(2, 3)]
+        evaluated = [sample(1, 2, family="a"), sample(0, 3, family="b"),
+                     sample(3, 4, family="b")]
+        result = jt.baselines(train, evaluated)
+        self.assertEqual(result["majority_table"], {"2": [1, 2], "3": [0, 0, 1]})
+        # Smoothed priors: 2 options [2/5, 3/5]; 3 options [1/4, 1/4, 2/4]; 4 unseen: uniform.
+        self.assertAlmostEqual(result["majority"]["nll"],
+                               -(math.log(3 / 5) + math.log(1 / 4) + math.log(1 / 4)) / 3)
+        self.assertAlmostEqual(result["majority"]["accuracy"], 1 / 3)
+        self.assertAlmostEqual(result["uniform"]["nll"],
+                               (math.log(2) + math.log(3) + math.log(4)) / 3)
+        self.assertAlmostEqual(result["uniform"]["expected_accuracy"], (1/2 + 1/3 + 1/4) / 3)
+        groups = jt.group_metrics(evaluated, [[0.0, 1.0], [1.0, 0.0, 0.0], [0, 0, 0, 1.0]],
+                                  1.0, jt.majority_table(train))
+        self.assertEqual(set(groups), {"option_count", "family"})  # question_type absent
+        self.assertEqual(groups["family"]["b"]["model"]["accuracy"], 1.0)
+        self.assertEqual(groups["family"]["b"]["majority"]["count"], 2)
+        self.assertEqual(groups["option_count"]["2"]["majority"]["accuracy"], 1.0)
+
+
     def test_evaluate_matches_hand_computed_values(self):
         # A: p = [0.75, 0.25], target 1 (wrong). B: p = [0.5, 0.25, 0.25], target 0.
         logits = [[math.log(3) + 1.5, 1.5], [math.log(2) - 0.7, -0.7, -0.7]]
@@ -302,6 +400,54 @@ class TorchTrainingTests(unittest.TestCase):
         expected = jt.evaluate(logits, [s.target for s in samples])
         for key in ("accuracy", "nll", "brier", "ece"):
             self.assertAlmostEqual(expected[key], report["metrics"]["test"][key], places=4)
+        self.assertNotIn("mode", saved)
+        self.assertNotIn("mode", metadata)
+
+    def test_tiny_development_training_reports_validation_without_test(self):
+        width = 8
+        rng = random.Random(11)
+        rows, payloads = [], {}
+        splits = ["train"] * 30 + ["validation"] * 10 + ["calibration"] * 10
+        for index, split in enumerate(splits):
+            options = 2 + index % 5
+            target = rng.randrange(options)
+            decide = [rng.uniform(-1, 1) for _ in range(width)]
+            matrix = [[rng.uniform(-1, 1) for _ in range(width)] for _ in range(options)]
+            matrix[target] = [v + rng.uniform(-0.1, 0.1) for v in decide]
+            item = dev_row(index, split, target, options, width=width,
+                           family=("judge", "tradeoff")[index % 2])
+            rows.append(item)
+            payloads[item["feature_file"]] = fp16([v for r in matrix + [decide] for v in r])
+        with tempfile.TemporaryDirectory() as root:
+            data = write_dataset(Path(root) / "features", rows, payloads)
+            config = {"epochs": 2, "width": width, "head_dim": 4, "batch_size": 8}
+            with self.assertRaisesRegex(jt.DatasetError, "empty: \\['test'\\]"):
+                jt.train_and_export(data, Path(root) / "final", config)
+            output = Path(root) / "head"
+            report = jt.train_and_export(data, output, config, mode="development")
+            tensors, metadata = jt.read_safetensors(output / "head.safetensors")
+            saved = json.loads((output / "report.json").read_text())
+            summary = jt.summary_of(saved)
+        self.assertEqual(saved, json.loads(json.dumps(report)))
+        self.assertEqual(saved["mode"], "development")
+        self.assertFalse(saved["evaluation"]["held_out_final_test"])
+        self.assertFalse(any("test" in key for key in saved["metrics"]))
+        self.assertEqual(saved["sample_counts"]["test"], 0)
+        self.assertEqual(saved["baselines"]["evaluated_split"], "validation")
+        self.assertEqual(saved["baselines"]["majority"]["count"], 10)
+        self.assertEqual(set(saved["groups"]["family"]), {"judge", "tradeoff"})
+        self.assertEqual(sorted(saved["groups"]["option_count"]), ["2", "3", "4", "5", "6"])
+        self.assertEqual(metadata["mode"], "development")
+        self.assertEqual(metadata["renderer"], "render.v1")
+        self.assertEqual(metadata["dataset"], "hard-v1")
+        self.assertEqual(json.loads(metadata["split_counts"]),
+                         {"train": 30, "validation": 10, "calibration": 10, "test": 0})
+        self.assertIn("calibration split", metadata["calibration_scope"])
+        self.assertFalse(any("model" in key for key in metadata))
+        self.assertAlmostEqual(tensors["temperature"][1][0], report["temperature"], places=6)
+        self.assertNotIn("test", summary)
+        self.assertEqual(summary["validation_not_held_out_test"],
+                         saved["metrics"]["validation_calibrated"])
 
 
 if __name__ == "__main__":

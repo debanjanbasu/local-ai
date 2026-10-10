@@ -27,6 +27,13 @@ Splits have fixed roles: weights train on `train`, the checkpoint is chosen by
 this dataset's calibration split only; nothing here makes probabilities
 calibrated beyond the measured data.
 
+Development mode (`--development`, `mode="development"`) is for datasets whose
+final test is locked away (e.g. hard-v1): it needs train/validation/calibration,
+refuses any `test` row (or `metadata.kev_partition == "test"`), and reports the
+validation split -- which also chose the checkpoint, so it is NOT a held-out
+final test -- next to train-only uniform/majority baselines and per
+family/question_type/option-count metrics when that metadata is present.
+
 Export (`head.safetensors`, all F32, row-major, little-endian):
     q.weight [HEAD_DIM, width]   q.bias [HEAD_DIM]
     k.weight [HEAD_DIM, width]   k.bias [HEAD_DIM]
@@ -46,7 +53,7 @@ import math
 import re
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 WIDTH = 5120
@@ -57,6 +64,10 @@ FEATURE_NAME = re.compile(r"feature-[0-9]{6}\.bin")
 TEMPERATURE_BOUNDS = (1e-3, 1e3)
 ECE_BINS = 15
 FORMAT = "local-ai.judgment-pointer-head.v0-experimental"
+MODES = ("final", "development")
+DEVELOPMENT_SPLITS = ("train", "validation", "calibration")
+LOCKED_PARTITIONS = frozenset({"test"})  # metadata.kev_partition values never trained on
+GROUP_KEYS = ("family", "question_type")
 
 
 class DatasetError(ValueError):
@@ -73,6 +84,7 @@ class Sample:
     features: bytes  # raw little-endian fp16, (options + 1) * width values
     sha256: str
     token_ids: tuple[int, ...]
+    metadata: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 def _is_int(value) -> bool:
@@ -126,7 +138,7 @@ def _parse_row(row, line: int, directory: Path, width: int) -> Sample:
         raise DatasetError(f"{where}: {name} contains non-finite values")
     return Sample(
         sample_id, split, target, options, width, data,
-        hashlib.sha256(data).hexdigest(), tuple(tokens),
+        hashlib.sha256(data).hexdigest(), tuple(tokens), metadata,
     )
 
 
@@ -169,6 +181,79 @@ def load_dataset(directory: Path, width: int = WIDTH) -> list[Sample]:
 
 def split_counts(samples) -> dict[str, int]:
     return {split: sum(s.split == split for s in samples) for split in SPLITS}
+
+
+def check_mode(samples, mode: str = "final") -> dict[str, int]:
+    """Enforce a mode's split rules on validated samples; return split counts.
+
+    `final` needs every split. `development` needs train/validation/calibration,
+    refuses test rows, locked-partition rows, `metadata.option_count` that
+    disagrees with the captured option rows, and `metadata.group_id` spanning splits.
+    """
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}")
+    counts = split_counts(samples)
+    if mode == "final":
+        missing = [split for split, n in counts.items() if n == 0]
+        if missing:
+            raise DatasetError(f"every split needs samples; empty: {missing}")
+        return counts
+    if counts["test"]:
+        first = next(s.id for s in samples if s.split == "test")
+        raise DatasetError(f"development mode refuses test rows; found {counts['test']} "
+                           f"(first {first!r})")
+    for sample in samples:
+        if sample.metadata.get("kev_partition") in LOCKED_PARTITIONS:
+            raise DatasetError(f"development mode refuses locked-partition row {sample.id!r}")
+        declared = sample.metadata.get("option_count")
+        if declared is not None and declared != sample.options:
+            raise DatasetError(f"{sample.id!r}: metadata.option_count {declared!r} != "
+                               f"{sample.options} captured option rows")
+    missing = [split for split in DEVELOPMENT_SPLITS if counts[split] == 0]
+    if missing:
+        raise DatasetError(f"development mode needs train, validation and calibration; "
+                           f"empty: {missing}")
+    groups: dict = {}
+    for sample in samples:
+        group = sample.metadata.get("group_id")
+        if isinstance(group, str):
+            other = groups.setdefault(group, sample)
+            if other.split != sample.split:
+                raise DatasetError(f"group {group!r} spans {other.split} ({other.id!r}) and "
+                                   f"{sample.split} ({sample.id!r})")
+    return counts
+
+
+def option_histogram(samples) -> dict[str, dict[str, int]]:
+    """{split: {option count: rows}} over the splits present."""
+    out: dict[str, dict[str, int]] = {}
+    for sample in samples:
+        bucket = out.setdefault(sample.split, {})
+        bucket[str(sample.options)] = bucket.get(str(sample.options), 0) + 1
+    return {split: dict(sorted(b.items(), key=lambda kv: int(kv[0])))
+            for split, b in sorted(out.items())}
+
+
+def consistent_value(samples, key: str):
+    """The single string `metadata[key]` shared by every sample, else None."""
+    values = {sample.metadata.get(key) for sample in samples
+              if isinstance(sample.metadata.get(key), str)}
+    if len(values) == 1 and all(isinstance(s.metadata.get(key), str) for s in samples):
+        return values.pop()
+    return None
+
+
+def feature_scope(samples) -> dict:
+    """Dataset/renderer recorded in the feature metadata, only when every row agrees."""
+    scope = {}
+    for key in ("dataset", "renderer"):
+        value = consistent_value(samples, key)
+        scope[key] = value
+        if value is None:
+            seen = sorted({str(s.metadata[key]) for s in samples if key in s.metadata})
+            if seen:
+                scope[key + "_values"] = seen  # mixed or partial: not exported
+    return scope
 
 
 # ---- pure-Python metrics and temperature fit -------------------------------
@@ -259,6 +344,67 @@ def fit_temperature(logits, targets, bounds=TEMPERATURE_BOUNDS, steps=200) -> fl
         else:
             high = mid
     return 1.0 / math.exp((low + high) / 2)
+
+
+def majority_table(samples) -> dict[int, list[int]]:
+    """Target-position counts per option count (fit on the samples given: train only)."""
+    table: dict[int, list[int]] = {}
+    for sample in samples:
+        table.setdefault(sample.options, [0] * sample.options)[sample.target] += 1
+    return table
+
+
+def majority_logits(table, options: int) -> list[float]:
+    """Log add-one-smoothed position frequencies; argmax is the majority position
+    (ties to the first). Unseen option counts fall back to uniform."""
+    return [math.log(c + 1) for c in table.get(options, [0] * options)]
+
+
+def baselines(train, evaluated) -> dict:
+    """Uniform and train-only majority baselines evaluated on `evaluated`."""
+    table = majority_table(train)
+    targets = [s.target for s in evaluated]
+    uniform = evaluate([[0.0] * s.options for s in evaluated], targets)
+    uniform["expected_accuracy"] = sum(1 / s.options for s in evaluated) / len(evaluated)
+    return {
+        "fit_split": "train",
+        "uniform": uniform,
+        "majority": evaluate([majority_logits(table, s.options) for s in evaluated], targets),
+        "majority_table": {str(k): v for k, v in sorted(table.items())},
+        "note": ("uniform accuracy uses the argmax tie rule (first option); "
+                 "expected_accuracy is mean 1/options. majority predicts the most "
+                 "frequent train target position for the row's option count with "
+                 "add-one-smoothed train frequencies as probabilities."),
+    }
+
+
+def group_metrics(samples, logits, temperature, table) -> dict:
+    """Per-group model (temperature applied) and majority metrics.
+
+    Groups by option count always, and by each of GROUP_KEYS (plus
+    family/question_type jointly) only when every sample carries it as a string.
+    """
+    keys = {"option_count": [str(s.options) for s in samples]}
+    present = [k for k in GROUP_KEYS
+               if all(isinstance(s.metadata.get(k), str) for s in samples)]
+    for key in present:
+        keys[key] = [s.metadata[key] for s in samples]
+    if len(present) == len(GROUP_KEYS):
+        keys["/".join(GROUP_KEYS)] = ["/".join(s.metadata[k] for k in GROUP_KEYS)
+                                      for s in samples]
+    out = {}
+    for key, labels in keys.items():
+        out[key] = {}
+        for label in sorted(set(labels)):
+            index = [i for i, value in enumerate(labels) if value == label]
+            members = [samples[i] for i in index]
+            targets = [s.target for s in members]
+            out[key][label] = {
+                "model": evaluate([logits[i] for i in index], targets, temperature),
+                "majority": evaluate([majority_logits(table, s.options) for s in members],
+                                     targets),
+            }
+    return out
 
 
 # ---- export format ----------------------------------------------------------
@@ -391,17 +537,17 @@ def _validate_config(config: dict) -> dict:
 
 
 def train_and_export(directory: Path, output: Path, config: dict | None = None,
-                     source_sha256: str | None = None) -> dict:
-    """Validate, train on train, select on validation, calibrate, test once, export."""
+                     source_sha256: str | None = None, *, mode: str = "final") -> dict:
+    """Validate, train on train, select on validation, calibrate, then either test
+    once (`final`) or report validation without any test rows (`development`)."""
     config = _validate_config(config or {})
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}")
     output = Path(output)
     if output.exists():
         raise FileExistsError(f"{output} already exists; refusing to overwrite")
     samples = load_dataset(directory, config["width"])
-    counts = split_counts(samples)
-    missing = [split for split, n in counts.items() if n == 0]
-    if missing:
-        raise DatasetError(f"every split needs samples; empty: {missing}")
+    counts = check_mode(samples, mode)
     by_split = {split: [s for s in samples if s.split == split] for split in SPLITS}
 
     torch = _require_torch()
@@ -438,18 +584,30 @@ def train_and_export(directory: Path, output: Path, config: dict | None = None,
                                      for k, v in head.state_dict().items()})
     head.load_state_dict(best[2])
 
-    logits = {split: _logits(torch, head, by_split[split], dim) for split in SPLITS}
-    targets = {split: [s.target for s in by_split[split]] for split in SPLITS}
+    used = SPLITS if mode == "final" else DEVELOPMENT_SPLITS
+    logits = {split: _logits(torch, head, by_split[split], dim) for split in used}
+    targets = {split: [s.target for s in by_split[split]] for split in used}
     temperature = fit_temperature(logits["calibration"], targets["calibration"])
-    metrics = {
-        "train": evaluate(logits["train"], targets["train"]),
-        "validation": evaluate(logits["validation"], targets["validation"]),
-        "calibration_before": evaluate(logits["calibration"], targets["calibration"]),
-        "calibration_after": evaluate(logits["calibration"], targets["calibration"],
-                                      temperature),
-        "test_uncalibrated": evaluate(logits["test"], targets["test"]),
-        "test": evaluate(logits["test"], targets["test"], temperature),
-    }
+    if mode == "development":
+        metrics = {
+            "train": evaluate(logits["train"], targets["train"]),
+            "validation": evaluate(logits["validation"], targets["validation"]),
+            "validation_calibrated": evaluate(logits["validation"], targets["validation"],
+                                              temperature),
+            "calibration_before": evaluate(logits["calibration"], targets["calibration"]),
+            "calibration_after": evaluate(logits["calibration"], targets["calibration"],
+                                          temperature),
+        }
+    else:
+        metrics = {
+            "train": evaluate(logits["train"], targets["train"]),
+            "validation": evaluate(logits["validation"], targets["validation"]),
+            "calibration_before": evaluate(logits["calibration"], targets["calibration"]),
+            "calibration_after": evaluate(logits["calibration"], targets["calibration"],
+                                          temperature),
+            "test_uncalibrated": evaluate(logits["test"], targets["test"]),
+            "test": evaluate(logits["test"], targets["test"], temperature),
+        }
 
     if source_sha256 is None:
         source = Path(__file__)  # frozen Kaggle copies pass their embedded digest instead
@@ -485,21 +643,65 @@ def train_and_export(directory: Path, output: Path, config: dict | None = None,
                       "/ sqrt(head_dim) / temperature, softmax over options in row order",
         },
     }
+    head_metadata = {
+        "format": FORMAT, "width": config["width"], "head_dim": dim,
+        "tool_sha256": source_sha256, "experimental": "true",
+    }
+    if mode == "development":
+        scope = feature_scope(samples)
+        table = majority_table(train)
+        report["mode"] = "development"
+        report["note"] = (
+            "DEVELOPMENT ONLY. Head-only research artifact over a frozen trunk. No test "
+            "rows were present or scored. Validation chose the checkpoint, so validation "
+            "metrics are selection-biased development numbers, not a held-out final "
+            "test. Temperature was fit on this dataset's calibration split only.")
+        report["evaluation"] = {"split": "validation", "held_out_final_test": False,
+                                "selection_split": "validation",
+                                "calibration_split": "calibration"}
+        report["feature_scope"] = scope
+        report["option_count_histogram"] = option_histogram(samples)
+        report["baselines"] = {"evaluated_split": "validation",
+                               **baselines(train, validation)}
+        report["groups"] = {"split": "validation", "temperature": temperature,
+                            **group_metrics(validation, logits["validation"], temperature,
+                                            table)}
+        head_metadata.update({
+            "mode": "development",
+            "evaluation": "validation (selection split; no held-out test)",
+            "calibration_scope": "calibration split of the training feature directory only",
+            "split_counts": json.dumps(counts, sort_keys=True, separators=(",", ":")),
+        })
+        head_metadata.update({k: v for k, v in scope.items() if k in ("dataset", "renderer")
+                              and v is not None})
     state = best[2]
     tensors = {name: (tuple(state[name].shape), state[name].float().flatten().tolist())
                for name in ("q.weight", "q.bias", "k.weight", "k.bias")}
     tensors["temperature"] = ((1,), [temperature])
     partial = output.with_name(output.name + ".partial")
     partial.mkdir(parents=True)
-    write_safetensors(partial / "head.safetensors", tensors, {
-        "format": FORMAT, "width": config["width"], "head_dim": dim,
-        "tool_sha256": source_sha256, "experimental": "true",
-    })
+    write_safetensors(partial / "head.safetensors", tensors, head_metadata)
     report["export"]["sha256"] = hashlib.sha256(
         (partial / "head.safetensors").read_bytes()).hexdigest()
     (partial / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     partial.rename(output)
     return report
+
+
+def summary_of(report: dict) -> dict:
+    """The short printed summary: test for final runs, validation for development."""
+    summary = {"sample_counts": report["sample_counts"], "temperature": report["temperature"]}
+    if report.get("mode") == "development":
+        base = report["baselines"]
+        summary.update({
+            "mode": "development",
+            "validation_not_held_out_test": report["metrics"]["validation_calibrated"],
+            "baselines": {name: {k: base[name][k] for k in ("accuracy", "nll")}
+                          for name in ("uniform", "majority")},
+        })
+    else:
+        summary["test"] = report["metrics"]["test"]
+    return summary
 
 
 def main(argv=None) -> None:
@@ -508,25 +710,36 @@ def main(argv=None) -> None:
     check = sub.add_parser("validate", help="validate a feature directory (no torch)")
     check.add_argument("features", type=Path, help="directory containing features.jsonl")
     check.add_argument("--width", type=int, default=WIDTH)
+    check.add_argument("--development", action="store_true",
+                       help="also enforce development-mode split rules (no test rows)")
     fit = sub.add_parser("train", help="train/select/calibrate/test and export (needs torch)")
     fit.add_argument("features", type=Path,
                      help="directory with features.jsonl; rows must cover all of "
-                          "train, validation, calibration and test via metadata.split")
+                          "train, validation, calibration and test via metadata.split "
+                          "(--development: all but test, and no test rows)")
     fit.add_argument("--output", type=Path, required=True, help="new output directory")
+    fit.add_argument("--development", action="store_true",
+                     help="development-only: train/validation/calibration, refuse test "
+                          "rows, report validation (not a held-out test)")
     for key, value in DEFAULT_CONFIG.items():
         fit.add_argument("--" + key.replace("_", "-"), type=type(value), default=value)
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
             samples = load_dataset(args.features, args.width)
-            print(json.dumps({"sample_counts": split_counts(samples),
-                              "option_counts": sorted({s.options for s in samples})}))
+            summary = {"sample_counts": split_counts(samples),
+                       "option_counts": sorted({s.options for s in samples})}
+            if args.development:
+                check_mode(samples, "development")
+                summary.update({"mode": "development",
+                                "option_count_histogram": option_histogram(samples),
+                                "feature_scope": feature_scope(samples)})
+            print(json.dumps(summary))
         else:
             config = {key: getattr(args, key) for key in DEFAULT_CONFIG}
-            report = train_and_export(args.features, args.output, config)
-            print(json.dumps({"sample_counts": report["sample_counts"],
-                              "temperature": report["temperature"],
-                              "test": report["metrics"]["test"]}, indent=2))
+            mode = "development" if args.development else "final"
+            report = train_and_export(args.features, args.output, config, mode=mode)
+            print(json.dumps(summary_of(report), indent=2))
     except DatasetError as error:
         raise SystemExit(f"invalid feature directory: {error}") from error
 
