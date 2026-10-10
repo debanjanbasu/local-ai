@@ -296,14 +296,18 @@ merely accepting its request fields.
 
 [Codex at 4aa94dc](https://github.com/openai/codex/tree/4aa94dce270de668eff6e2fa8585c82385e84455)
 uses stateless Responses, requests `reasoning.encrypted_content`, and sends
-`client_metadata` (an extension absent from the pinned public spec). With
-`--reasoning-key` the encrypted-content request is now honoured, but
-`client_metadata` is still an unknown field that fails the request, reasoning
-summaries are still refused, so this server is **not a drop-in Codex
-provider**. Optional fields in an output
-schema do not justify silently ignoring requested options or labeling raw
-reasoning as a summary. The Oh My Pi example in the engine README configures
-that client to use only implemented capabilities.
+`client_metadata` (an extension absent from the pinned public spec). Responses
+creation accepts that field as an optional string-to-string map, matching
+[Codex's request type](https://github.com/openai/codex/blob/4aa94dce270de668eff6e2fa8585c82385e84455/codex-rs/codex-api/src/common.rs#L278-L304).
+It is opaque tracking data: discarded, not echoed or persisted, and never
+used for prompts, sampling or cache-session selection. It is distinct from
+the public `metadata` field, which is retained on the response. With
+`--reasoning-key` the encrypted-content request is honoured. Reasoning
+summaries and constrained outputs remain unsupported, so this server is
+**not a drop-in Codex provider**. Codex handles raw `reasoning_text` and
+summary events separately; raw reasoning is not relabeled as a summary.
+The Oh My Pi example in the engine README configures that client to use only
+implemented capabilities.
 
 Legacy Completions now rejects unsupported `stop`, `n`, `logprobs`, `logit_bias`,
 `best_of`, `echo`, `suffix` and streaming usage options rather than silently

@@ -24,6 +24,7 @@
 //! - `reasoning.effort` is `none` or `xhigh`, the checkpoint's only two modes,
 //!   and reasoning is returned as `reasoning_text` content, never a summary.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -52,6 +53,9 @@ struct ResponsesRequest {
     #[allow(dead_code)]
     max_tool_calls: Option<u64>,
     metadata: Option<Value>,
+    /// Opaque client telemetry (Codex extension), never model input or stored.
+    #[allow(dead_code)]
+    client_metadata: Option<HashMap<String, String>>,
     parallel_tool_calls: Option<bool>,
     previous_response_id: Option<String>,
     reasoning: Option<Reasoning>,
