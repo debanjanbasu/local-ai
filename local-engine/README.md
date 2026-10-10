@@ -589,21 +589,31 @@ Kaggle, after capturing features with the native model; staging submits nothing.
 `EngineHandle::decide(Arc<JudgmentHead>, &DecisionRequest)` answer a typed
 text question with an explicitly loaded head. `DecisionRequest { state,
 question, kind }` is rendered exactly as `tools/judgment_prepare.py` renders
-devtools-v1 rows (`State:`, `Question:`, lettered `Options:`, `Decision:`;
-renderer `kev-devtools-v1-judgment-render.v1`). `DecisionKind::Predicate` is
+devtools-v1 and hard-v1 rows (`State:`, `Question:`, lettered `Options:`,
+`Decision:`). The compatible identifiers in `judgment::DECISION_RENDERERS`
+are `kev-devtools-v1-judgment-render.v1`, `kev-hard-v1-judgment-render.v1`
+and `kev-hard-v1-judgment-render.v1-no-descriptions`. All use the same framing
+and byte endpoints; the caller supplies the prepared state and option text,
+including descriptions where training used them. `DecisionKind::Predicate` is
 `A) Yes` / `B) No`; `Choice` takes 2 to 26 distinct single-line values
 (strings or booleans) in the caller's order; `Score` takes 1 to 26 ordered
 labels. The option and decision rows are captured on the already loaded model
 (no second model) in 60-row blocks, the `mtp-capture` default the training
 features used, rounded through FP16 and scored on the CPU.
 
+All 8,479 prepared hard-v1 development rows reproduced their training prompt
+bytes and option/decision endpoints through native rendering and the real
+tokenizer (5,994 choices, 2,170 predicates and 315 scores), with no embedded
+special-token ambiguity. This verifies format compatibility, not a trained
+hard-v1 head's quality; the locked test split was not read.
+
 A `Decision` carries the head's probability per option, the argmax and its
 value, for scores the probability-weighted mean level index, the prompt token
 count, the renderer, `renderer_declared` and the loaded head's
 `calibration_scope`. It has no confidence, threshold or refusal. Provenance
-comes from the loaded file only: a head declaring a renderer other than
-`kev-devtools-v1-judgment-render.v1` is refused, a legacy head declaring none
-is accepted with the renderer assumed (`renderer_declared: false`), and a head
+comes from the loaded file only: a head declaring an unsupported renderer is
+refused; supported identifiers are returned unchanged. A legacy head declaring
+none is accepted with devtools-v1 assumed (`renderer_declared: false`), and a head
 declaring no `calibration_scope` reports `judgment::UNKNOWN_CALIBRATION_SCOPE`
 rather than a guessed training set. The existing devtools-v1 head is such a
 legacy file, so at run time it reports an assumed renderer and unknown
@@ -613,7 +623,7 @@ questions, so for other questions, states or more than two options its
 probabilities are the head's softmax output and nothing more.
 
 Invalid requests, text that spells a special token, and a head whose width is
-not the model's or whose declared renderer is not the native one fail before
+not the model's or whose declared renderer is unsupported fail before
 any GPU work; a single-level score is answered
 without capture. On a handle, preparation and tokenization run on the calling
 thread and the decision takes one slot of the bounded FIFO queue (a full queue

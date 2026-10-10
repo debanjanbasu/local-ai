@@ -543,8 +543,8 @@ impl Engine {
     /// when the artifact declares none.
     ///
     /// Invalid requests (including text spelling a special token) and a head
-    /// whose width is not the model's, or whose declared renderer is not
-    /// [`DECISION_RENDERER`](crate::judgment::DECISION_RENDERER), fail with
+    /// whose width is not the model's, or whose declared renderer is outside
+    /// [`DECISION_RENDERERS`](crate::judgment::DECISION_RENDERERS), fail with
     /// [`crate::Error::InvalidArgument`] before any GPU work. A single-level
     /// score is answered without GPU work. Capture overwrites one sequence
     /// buffer set; the GPU prompt-cache tier is preserved when a free set

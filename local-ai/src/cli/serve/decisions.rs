@@ -27,7 +27,7 @@
 //! messages, images, descriptions, more choices than option letters — is
 //! refused rather than approximated.
 //!
-//! A head declaring a renderer other than [`DECISION_RENDERER`] is refused
+//! A head declaring a renderer outside [`DECISION_RENDERERS`] is refused
 //! at startup. Each response's `experimental` object reports the renderer,
 //! whether the head declared it (`renderer_source` `"artifact"`) or a legacy
 //! head left it assumed (`"assumed"`), and the head's own calibration scope,
@@ -59,8 +59,8 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use local_engine::judgment::{
-    DECISION_RENDERER, Decision, DecisionKind, DecisionRequest, DecisionValue, JudgmentHead,
-    MAX_DECISION_OPTIONS, UNKNOWN_CALIBRATION_SCOPE,
+    DECISION_RENDERER, DECISION_RENDERERS, Decision, DecisionKind, DecisionRequest, DecisionValue,
+    JudgmentHead, MAX_DECISION_OPTIONS, UNKNOWN_CALIBRATION_SCOPE,
 };
 
 use super::response::{error_response, error_status, json_response, queue_full_response};
@@ -131,11 +131,10 @@ impl Decisions {
             )));
         }
         if let Some(renderer) = head.renderer()
-            && renderer != DECISION_RENDERER
+            && !DECISION_RENDERERS.contains(&renderer)
         {
             return Err(crate::Error::InvalidArgument(format!(
-                "{FLAG} {}: head renderer {renderer:?} is not the native decision renderer \
-                 {DECISION_RENDERER:?}",
+                "{FLAG} {}: head renderer {renderer:?} is not supported natively",
                 path.display()
             )));
         }
@@ -144,11 +143,10 @@ impl Decisions {
 
     /// What the loaded head says about itself, for the startup notice.
     fn provenance(&self) -> String {
-        let renderer = if self.head.renderer().is_some() {
-            format!("renderer {DECISION_RENDERER} (declared by the head)")
-        } else {
-            format!("renderer {DECISION_RENDERER} (assumed: legacy head declares none)")
-        };
+        let renderer = self.head.renderer().map_or_else(
+            || format!("renderer {DECISION_RENDERER} (assumed: legacy head declares none)"),
+            |renderer| format!("renderer {renderer} (declared by the head)"),
+        );
         let scope = self
             .head
             .calibration_scope()

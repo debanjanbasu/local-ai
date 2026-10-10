@@ -653,8 +653,8 @@ these requests.
 `--experimental-decision-head FILE` enables `POST /v1/experimental/decisions`.
 Without the flag the route is a 404 and no head is loaded. The head is opened
 and its width checked before the model loads, so a wrong file fails startup,
-as does a head whose `renderer` metadata names anything but the native
-`kev-devtools-v1-judgment-render.v1`. The server announces the route as
+as does a head whose `renderer` metadata is outside the native engine's
+supported devtools-v1 and hard-v1 formats. The server announces the route as
 experimental together with what the loaded file declares: its renderer
 (declared, or assumed for a legacy head that declares none) and its
 `calibration_scope` metadata, or an explicit "unknown" when it has none. The
@@ -678,6 +678,13 @@ tokens (`output_tokens` is 0), and an `experimental` object repeats the
 `renderer`, `renderer_source` (`"artifact"` when the head declared it,
 `"assumed"` for a legacy head), the loaded head's `calibration_scope` (or the
 unknown-provenance text) and the limitations.
+
+Hard-v1 and devtools-v1 use identical prompt framing; compatibility does not
+prepare a caller's state or add training descriptions. To reproduce a described
+hard-v1 option, pass its full rendered label as a string choice (for example,
+`"Yes: Meets all constraints"`), not a bare predicate or a description field.
+Preserve training option order. This preserves prompt bytes, not calibration
+outside the artifact's recorded scope.
 
 Questions run one after another over the same input, each taking one slot of
 the engine's bounded FIFO queue and running only once no generation is
