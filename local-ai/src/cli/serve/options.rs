@@ -35,6 +35,13 @@ pub(super) fn usage() {
     eprintln!("  --api-key KEY      Require bearer authentication");
     eprintln!("  --no-thinking      Disable thinking");
     eprintln!(
+        "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \
+         unencrypted) for retrieval and previous_response_id (default: none kept)"
+    );
+    eprintln!(
+        "  --reasoning-key FILE  Enable encrypted reasoning replay with an owner-only persistent key"
+    );
+    eprintln!(
         "  --stall-timeout SECONDS  Drop a generation whose client stopped reading \
          (default: {DEFAULT_STALL_SECONDS})"
     );
@@ -47,6 +54,8 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         thinking: true,
         api_key: None,
         stall: Duration::from_secs(DEFAULT_STALL_SECONDS),
+        response_store: None,
+        reasoning_key: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -62,7 +71,15 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         index += 1;
         // Recognise the flag before demanding its value, so an unknown option is
         // reported as unknown rather than as a missing argument.
-        if !matches!(flag, "--host" | "--port" | "--api-key" | "--stall-timeout") {
+        if !matches!(
+            flag,
+            "--host"
+                | "--port"
+                | "--api-key"
+                | "--stall-timeout"
+                | "--response-store"
+                | "--reasoning-key"
+        ) {
             return Err(format!("unknown option: {flag}"));
         }
         let value = args
@@ -73,6 +90,18 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
             "--port" => parsed.port = value.parse().map_err(|_| "invalid --port")?,
             "--api-key" => parsed.api_key = Some(value.clone()),
             "--stall-timeout" => parsed.stall = stall_timeout(value)?,
+            "--reasoning-key" => {
+                if value.is_empty() {
+                    return Err("--reasoning-key requires a file path".into());
+                }
+                parsed.reasoning_key = Some(value.into());
+            }
+            "--response-store" => {
+                if value.is_empty() {
+                    return Err("--response-store requires a directory".into());
+                }
+                parsed.response_store = Some(value.into());
+            }
             _ => return Err(format!("unknown option: {flag}")),
         }
         index += 1;

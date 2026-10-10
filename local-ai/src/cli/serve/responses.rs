@@ -1,5 +1,5 @@
 //! `POST /v1/responses`: the text and function-calling subset of the `OpenAI`
-//! Responses API, served statelessly.
+//! Responses API.
 //!
 //! Schema source: <https://developers.openai.com/api/reference/resources/responses/methods/create>
 //! and its streaming-events page. What is implemented is implemented to that
@@ -7,11 +7,16 @@
 //! request answered as if an option were honoured when it was not is worse
 //! than one that fails:
 //!
-//! - Nothing is stored. `store` is reported as `false`, `store: true` and
-//!   `background: true` fail, and so do `previous_response_id`, `conversation`
-//!   and `item_reference` inputs, which all need a response store to resolve.
-//!   Clients carry history explicitly in `input`, which is supported in full
-//!   for messages, reasoning, `function_call` and `function_call_output` items.
+//! - Storage is opt-in. Without `--response-store` nothing is kept: `store`
+//!   is reported as `false`, and `store: true` and `previous_response_id`
+//!   fail. With it, `store` takes `OpenAI`'s default of `true`, completed and
+//!   incomplete responses are persisted (see [`super::store`]) before their
+//!   terminal event is sent, and `previous_response_id` continues one. Only
+//!   conversation items carry over; `instructions`, tools and sampling
+//!   controls are this request's alone. `background`, `conversation` and
+//!   `item_reference` inputs still fail. Clients may instead carry history
+//!   explicitly in `input`, which is supported in full for messages,
+//!   reasoning, `function_call` and `function_call_output` items.
 //! - Function tools only. Built-in, MCP and custom tools, `tool_choice` forcing
 //!   (`required` or a named tool), `strict: true` and `text.format` other than
 //!   `text` all need constrained decoding or hosted services this server lacks.
@@ -27,10 +32,12 @@ use serde_json::{Map, Value, json};
 use local_engine::bonsai_model::StopReason;
 use local_engine::{ChatMessage, ChatRequest, Event, Sampling, Stats, ToolCall, ToolDefinition};
 
+use super::reasoning_crypto::ReasoningCipher;
 use super::request::{
     effective_thinking, function_definition, service_tier, session, tool_call, tool_choice,
 };
-use super::response::{Reply, arguments_text, unix_now};
+use super::response::{Reply, arguments_text, new_id, unix_now};
+use super::store::ResponseStore;
 use crate::GenerateParams;
 
 #[derive(Deserialize)]
@@ -117,6 +124,17 @@ pub(super) struct Echo {
     user: Option<String>,
     prompt_cache_key: Option<String>,
     safety_identifier: Option<String>,
+    previous_response_id: Option<String>,
+    cipher: Option<Arc<ReasoningCipher>>,
+    /// Where the final Response is persisted, when it is to be stored.
+    persist: Option<Persist>,
+}
+
+/// A Response that is to be stored, and the resolved input it answers.
+#[derive(Debug)]
+struct Persist {
+    store: Arc<ResponseStore>,
+    input_items: Vec<Value>,
 }
 
 pub(super) struct PreparedResponses {
@@ -138,11 +156,15 @@ fn present(value: Option<&Value>) -> bool {
 }
 
 impl ResponsesRequest {
-    fn reject_unsupported(&self) -> crate::Result<()> {
-        if self.store == Some(true) {
+    /// Fail on any option whose effect this server cannot produce. `stored`
+    /// says whether a response store was configured.
+    #[allow(clippy::too_many_lines)]
+    fn reject_unsupported(&self, stored: bool, encrypted: bool) -> crate::Result<()> {
+        if !stored && self.store == Some(true) {
             return Err(unsupported(
                 "store=true",
-                "this server keeps no responses; send store=false and carry history in input",
+                "this server was started without --response-store, so it keeps no responses; \
+                 send store=false and carry history in input",
             ));
         }
         if self.background == Some(true) {
@@ -151,10 +173,23 @@ impl ResponsesRequest {
                 "responses are generated in-request",
             ));
         }
-        if self.previous_response_id.is_some() || present(self.conversation.as_ref()) {
+        if !stored && self.previous_response_id.is_some() {
             return Err(unsupported(
-                "previous_response_id and conversation",
-                "they need stored responses; send the earlier items in input instead",
+                "previous_response_id",
+                "this server was started without --response-store, so it keeps no responses; \
+                 send the earlier items in input instead",
+            ));
+        }
+        if self.previous_response_id.is_some() && present(self.conversation.as_ref()) {
+            return Err(invalid(
+                "previous_response_id and conversation cannot be used together",
+            ));
+        }
+        if present(self.conversation.as_ref()) {
+            return Err(unsupported(
+                "conversation",
+                "the Conversations API is not implemented; use previous_response_id or send the \
+                 earlier items in input",
             ));
         }
         for (name, value) in [
@@ -169,14 +204,14 @@ impl ResponsesRequest {
                 return Err(unsupported(name, "it needs a hosted OpenAI service"));
             }
         }
-        if self
-            .include
-            .as_ref()
-            .is_some_and(|include| !include.is_empty())
-        {
+        if self.include.as_ref().is_some_and(|include| {
+            include
+                .iter()
+                .any(|value| value != "reasoning.encrypted_content" || !encrypted)
+        }) {
             return Err(unsupported(
                 "include",
-                "there are no logprobs, encrypted reasoning or tool outputs to add",
+                "only reasoning.encrypted_content is implemented, and it requires --reasoning-key",
             ));
         }
         if self.top_logprobs.is_some_and(|n| n > 0) {
@@ -271,10 +306,69 @@ fn reasoning_effort(reasoning: Option<&Reasoning>) -> crate::Result<Option<&str>
     Ok(reasoning.effort.as_deref())
 }
 
+/// [`prepare_responses_with`] on a server with no response store.
+#[cfg(test)]
 pub(super) fn prepare_responses(body: &[u8], thinking: bool) -> crate::Result<PreparedResponses> {
+    prepare_responses_with(body, thinking, None, None, "m")
+}
+
+/// Count requests use the generation input contract, but never persist a
+/// response or admit generation. Reject generation-only options rather than
+/// silently accepting a misspelled count request.
+pub(super) fn prepare_input_tokens(
+    body: &[u8],
+    thinking: bool,
+    store: Option<&Arc<ResponseStore>>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<ChatRequest> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("token count request must be an object"))?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "model"
+                | "input"
+                | "previous_response_id"
+                | "tools"
+                | "text"
+                | "reasoning"
+                | "truncation"
+                | "instructions"
+                | "conversation"
+                | "tool_choice"
+                | "parallel_tool_calls"
+        ) {
+            return Err(unsupported(
+                key,
+                "not an implemented input-token counting option",
+            ));
+        }
+    }
+    if object.get("input").is_none_or(Value::is_null) {
+        object.insert("input".into(), json!([]));
+    }
+    object.insert("store".into(), json!(false));
+    let body = serde_json::to_vec(&value)
+        .map_err(|error| invalid(format!("invalid token count request: {error}")))?;
+    Ok(prepare_responses_with(&body, thinking, store, cipher, model)?.request)
+}
+
+/// Parse a `POST /v1/responses` body, resolving `previous_response_id`
+/// against `store` and deciding whether the result will be stored there.
+pub(super) fn prepare_responses_with(
+    body: &[u8],
+    thinking: bool,
+    store: Option<&Arc<ResponseStore>>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<PreparedResponses> {
     let request: ResponsesRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
-    request.reject_unsupported()?;
+    request.reject_unsupported(store.is_some(), cipher.is_some())?;
     let thinking = effective_thinking(reasoning_effort(request.reasoning.as_ref())?, thinking)?;
     let choice = tool_choice(request.tool_choice.as_ref())?;
     let mut echoed_tools = Vec::new();
@@ -287,11 +381,66 @@ pub(super) fn prepare_responses(body: &[u8], thinking: bool) -> crate::Result<Pr
     if choice == super::request::ToolChoice::None {
         tools.clear();
     }
+    let empty_input = json!([]);
     let input = request
         .input
         .as_ref()
+        .or_else(|| request.previous_response_id.as_ref().map(|_| &empty_input))
         .ok_or_else(|| invalid("input is required"))?;
-    let messages = input_messages(input, request.instructions.as_deref())?;
+    // The resolved input: the earlier response's stored history, which never
+    // includes its instructions, then this request's items. Each record keeps
+    // its full history, so this is one read however long the chain is.
+    let mut items = match (&request.previous_response_id, store) {
+        (Some(id), Some(store)) => store
+            .load(id)
+            .map_err(|error| {
+                crate::Error::Generation(format!("could not read stored response {id}: {error}"))
+            })?
+            .ok_or_else(|| invalid(format!("previous response with id {id:?} not found")))?
+            .history(),
+        _ => Vec::new(),
+    };
+    normalize_input(input, &mut items)?;
+    for item in &mut items {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        if let Some(encrypted) = item
+            .get("encrypted_content")
+            .filter(|value| !value.is_null())
+        {
+            let cipher = cipher
+                .ok_or_else(|| unsupported("encrypted reasoning", "requires --reasoning-key"))?;
+            let envelope = encrypted
+                .as_str()
+                .ok_or_else(|| invalid("encrypted_content must be a string"))?;
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("encrypted reasoning requires its original item id"))?;
+            let text = cipher
+                .unseal(model, id, envelope)
+                .map_err(|error| invalid(error.to_string()))?;
+            // The authenticated payload is authoritative over any plaintext
+            // supplied alongside it. Internal history stores the decoded text.
+            item["content"] = json!([{"type":"reasoning_text","text":text}]);
+            if let Some(item) = item.as_object_mut() {
+                item.remove("encrypted_content");
+            }
+        }
+    }
+    let messages = input_messages(
+        &Value::Array(items.clone()),
+        request.instructions.as_deref(),
+    )?;
+    // Storing follows OpenAI's default of `true` once a store exists; without
+    // one, `reject_unsupported` has already refused an explicit `true`.
+    let persist = store
+        .filter(|_| request.store.unwrap_or(true))
+        .map(|store| Persist {
+            store: Arc::clone(store),
+            input_items: items,
+        });
     let params = request.params();
     let echo = Echo {
         instructions: request.instructions.clone(),
@@ -305,6 +454,9 @@ pub(super) fn prepare_responses(body: &[u8], thinking: bool) -> crate::Result<Pr
         user: request.user.clone(),
         prompt_cache_key: request.prompt_cache_key.clone(),
         safety_identifier: request.safety_identifier.clone(),
+        previous_response_id: request.previous_response_id.clone(),
+        cipher: cipher.cloned(),
+        persist,
     };
     Ok(PreparedResponses {
         stream: request.stream.unwrap_or(false),
@@ -401,6 +553,94 @@ fn plain(role: &str, content: String, tool_call_id: Option<String>) -> ChatMessa
     }
 }
 
+/// Append `input` to `items` as stored items: each with a unique `id`, its
+/// `type`, text content as a part list, and the status the item resources
+/// require.
+///
+/// Only the shape is normalised; [`input_messages`] still validates every item,
+/// so an invalid one fails with the same message it would without a store.
+/// A client-supplied `id` is kept unless it repeats one already present, so
+/// `input_items` pagination by `after` always names one item.
+fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
+    let new: Vec<Value> = match input {
+        Value::String(text) => {
+            vec![
+                json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]}),
+            ]
+        }
+        Value::Array(new) => new.clone(),
+        _ => return Err(invalid("input must be a string or an array of items")),
+    };
+    let mut seen: std::collections::HashSet<String> = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for item in new {
+        let mut item = match item {
+            Value::Object(item) => item,
+            other => {
+                items.push(other);
+                continue;
+            }
+        };
+        let kind = item
+            .entry("type")
+            .or_insert_with(|| json!("message"))
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let assistant = item.get("role").and_then(Value::as_str) == Some("assistant");
+        let prefix = match kind.as_str() {
+            "message" => "msg_",
+            "reasoning" => "rs_",
+            "function_call" => "fc_",
+            "function_call_output" => "fco_",
+            _ => "item_",
+        };
+        if kind == "message"
+            && let Some(Value::String(text)) = item.get("content")
+        {
+            let part = if assistant {
+                json!({"type":"output_text","text":text,"annotations":[]})
+            } else {
+                json!({"type":"input_text","text":text})
+            };
+            item.insert("content".into(), json!([part]));
+        }
+        if kind == "message"
+            && assistant
+            && let Some(Value::Array(parts)) = item.get_mut("content")
+        {
+            for part in parts {
+                if matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text")
+                ) && let Some(part) = part.as_object_mut()
+                {
+                    part.insert("type".into(), json!("output_text"));
+                    part.entry("annotations").or_insert_with(|| json!([]));
+                }
+            }
+        }
+        let needs_status = matches!(kind.as_str(), "function_call" | "function_call_output")
+            || (kind == "message" && assistant);
+        if needs_status && !item.contains_key("status") {
+            item.insert("status".into(), json!("completed"));
+        }
+        if kind == "reasoning" && !item.contains_key("summary") {
+            item.insert("summary".into(), json!([]));
+        }
+        let id = match item.get("id").and_then(Value::as_str) {
+            Some(id) if !seen.contains(id) => id.to_owned(),
+            _ => new_id(prefix),
+        };
+        seen.insert(id.clone());
+        item.insert("id".into(), json!(id));
+        items.push(Value::Object(item));
+    }
+    Ok(())
+}
+
 /// Convert `instructions` and `input` into the chat history the engine renders.
 pub(super) fn input_messages(
     input: &Value,
@@ -458,7 +698,7 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
             if present(item.get("encrypted_content")) {
                 return Err(unsupported(
                     "encrypted reasoning",
-                    "this server never issues encrypted_content, so it cannot read one",
+                    "encrypted_content must be authenticated before rendering",
                 ));
             }
             flush(turn, messages);
@@ -493,7 +733,7 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
         Some("item_reference") => {
             return Err(unsupported(
                 "item_reference",
-                "this server stores no items; send the item itself",
+                "item lookup is not implemented; send the item itself",
             ));
         }
         Some(other) => {
@@ -598,6 +838,7 @@ pub(super) struct ResponsesState {
     events: Vec<Value>,
     output: Vec<Value>,
     open: Option<Open>,
+    encryption_error: Option<String>,
 }
 
 impl ResponsesState {
@@ -618,6 +859,7 @@ impl ResponsesState {
             events: Vec::new(),
             output: Vec::new(),
             open: None,
+            encryption_error: None,
         }
     }
 
@@ -732,7 +974,14 @@ impl ResponsesState {
                     "response.content_part.done",
                     json!({"item_id":id,"output_index":index,"content_index":0,"part":part}),
                 );
-                json!({"id":id,"type":"reasoning","summary":[],"content":[part],"status":status})
+                let mut item = json!({"id":id,"type":"reasoning","summary":[],"content":[part],"status":status});
+                if let Some(cipher) = &self.echo.cipher {
+                    match cipher.seal(&self.model, &id, &text) {
+                        Ok(envelope) => item["encrypted_content"] = json!(envelope),
+                        Err(error) => self.encryption_error = Some(error.to_string()),
+                    }
+                }
+                item
             }
             ItemKind::Message => {
                 let part = json!({"type":"output_text","text":text,"annotations":[],"logprobs":[]});
@@ -820,7 +1069,28 @@ impl ResponsesState {
             ),
         };
         self.close(item_status);
+        if let Some(message) = self.encryption_error.take() {
+            return self.fail(&message);
+        }
         let response = self.response(overall, incomplete.as_ref(), error.as_ref(), Some(stats));
+        // A stored response is on disk before any client is told it finished,
+        // so an ID a client has seen complete can always be continued. A
+        // response that could not be stored fails rather than claim `store`.
+        if error.is_none()
+            && let Some(persist) = &self.echo.persist
+            && let Err(failure) = persist.store.save(&response, &persist.input_items)
+        {
+            eprintln!("response {} could not be stored: {failure}", self.id);
+            let message = format!("the response could not be stored: {failure}");
+            self.emit(
+                "error",
+                json!({"code":"server_error","message":message,"param":null}),
+            );
+            let error = json!({"code":"server_error","message":message});
+            let failed = self.response("failed", None, Some(&error), Some(stats));
+            self.emit("response.failed", json!({"response":failed}));
+            return failed;
+        }
         self.emit(kind, json!({"response":response}));
         response
     }
@@ -867,9 +1137,11 @@ impl ResponsesState {
             "model":self.model.as_ref(),
             "output":output,
             "parallel_tool_calls":true,
-            "previous_response_id":null,
+            "previous_response_id":echo.previous_response_id,
             "reasoning":{"effort":echo.effort,"summary":null,"context":"all_turns"},
-            "store":false,
+            // Only a response that reached the store says so; a failed one,
+            // including one whose write failed, was never stored.
+            "store":echo.persist.is_some() && status != "failed",
             "background":false,
             "access_programs":null,
             "service_tier":"default",

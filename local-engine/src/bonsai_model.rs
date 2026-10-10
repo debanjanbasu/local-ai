@@ -198,6 +198,11 @@ impl BonsaiEngine {
         }
     }
 
+    /// The tokenizer every prompt is encoded with; clone it to share it.
+    pub const fn tokenizer(&self) -> &BonsaiTokenizer {
+        &self.tokenizer
+    }
+
     #[doc(hidden)]
     pub fn decode_tokens(&self, ids: &[u32]) -> crate::Result<String> {
         self.tokenizer.decode(ids, true)

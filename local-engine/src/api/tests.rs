@@ -286,3 +286,179 @@ fn the_worker_reports_invalid_and_truncated_calls_without_finishing() {
         );
     }
 }
+
+fn message(role: &str, content: &str) -> super::ChatMessage {
+    super::ChatMessage {
+        role: role.into(),
+        content: content.into(),
+        ..super::ChatMessage::default()
+    }
+}
+
+fn weather_call() -> crate::ToolCall {
+    crate::ToolCall {
+        id: "call_1".into(),
+        name: "get_weather".into(),
+        arguments: serde_json::json!({"city":"Paris"}),
+    }
+}
+
+/// A conversation exercising every rendered part: system prompt, prior
+/// reasoning, a replayed call, its result, and a follow-up question.
+fn tool_history(thinking: bool) -> super::ChatRequest {
+    super::ChatRequest {
+        messages: vec![
+            message("system", "Be brief."),
+            message("user", "Weather in Paris?"),
+            super::ChatMessage {
+                role: "assistant".into(),
+                reasoning_content: Some("Need the tool.".into()),
+                tool_calls: vec![weather_call()],
+                ..super::ChatMessage::default()
+            },
+            super::ChatMessage {
+                role: "tool".into(),
+                content: "18C and sunny".into(),
+                tool_call_id: Some("call_1".into()),
+                ..super::ChatMessage::default()
+            },
+            message("user", "And tomorrow?"),
+        ],
+        max_tokens: 1,
+        sampling: Sampling::default(),
+        thinking,
+        session: None,
+        tools: vec![crate::ToolDefinition {
+            name: "get_weather".into(),
+            description: Some("Look up the weather.".into()),
+            parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
+        }],
+    }
+}
+
+#[test]
+fn a_chat_count_is_the_length_of_the_prompt_generation_would_prefill() {
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
+    for thinking in [false, true] {
+        let request = tool_history(thinking);
+        let rendered = Engine::render_chat_with_tools(&request.messages, thinking, &request.tools)
+            .expect("render");
+        let (ids, tools) = super::chat_prompt_ids(&tokenizer, &request).expect("prepare");
+        assert!(tools.is_some());
+        assert_eq!(ids, tokenizer.encode(&rendered).expect("encode"));
+        assert_eq!(
+            super::count_chat(&tokenizer, &request).expect("count"),
+            ids.len()
+        );
+
+        // Tool definitions are part of the prompt, so they are counted.
+        let mut without_tools = request.clone();
+        without_tools.tools.clear();
+        without_tools
+            .messages
+            .retain(|turn| turn.role == "system" || turn.role == "user");
+        let mut with_tools = without_tools.clone();
+        with_tools.tools.clone_from(&request.tools);
+        assert!(
+            super::count_chat(&tokenizer, &with_tools).expect("with tools")
+                > super::count_chat(&tokenizer, &without_tools).expect("without tools")
+        );
+    }
+    // Reasoning mode changes the rendered system prompt and suffix.
+    assert_ne!(
+        super::count_chat(&tokenizer, &tool_history(true)).expect("thinking"),
+        super::count_chat(&tokenizer, &tool_history(false)).expect("plain")
+    );
+}
+
+#[test]
+fn an_invalid_chat_fails_counting_exactly_as_it_fails_generation() {
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
+    let mut unanswered = tool_history(true);
+    unanswered.messages.remove(3);
+    let mut undefined_tool = tool_history(true);
+    undefined_tool.messages[2].tool_calls[0].name = "get_time".into();
+    let mut empty = tool_history(false);
+    empty.messages.clear();
+    for request in [unanswered, undefined_tool, empty] {
+        let expected = super::prepare_chat(&request)
+            .expect_err("generation rejects it")
+            .to_string();
+        let counted = super::count_chat(&tokenizer, &request)
+            .expect_err("counting rejects it")
+            .to_string();
+        assert_eq!(counted, expected);
+    }
+}
+
+#[test]
+fn a_completion_count_parses_special_tokens_without_a_template() {
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
+    let request = |prompt: &str| CompletionRequest {
+        prompt: prompt.into(),
+        max_tokens: 1,
+        sampling: Sampling::default(),
+        session: None,
+    };
+    // `abc` is one merged token and `<|x|>` one special token.
+    assert_eq!(
+        super::count_completion(&tokenizer, &request("abc<|x|>")).expect("count"),
+        2
+    );
+    assert_eq!(
+        super::count_completion(&tokenizer, &request("")).expect("empty"),
+        0
+    );
+}
+
+#[test]
+fn a_handle_can_count_from_any_thread() {
+    const fn shareable<T: Clone + Send + Sync>() {}
+    shareable::<super::EngineHandle>();
+}
+
+/// The counted prompt equals the prompt generation actually prefilled, for a
+/// request with tools, a replayed call and reasoning, through both the
+/// synchronous engine and a handle whose worker is otherwise idle.
+#[test]
+#[ignore = "requires the pinned model and the GPU"]
+fn counted_prompt_tokens_match_generation_stats() {
+    let engine = Engine::open().expect("open engine");
+    let completion = CompletionRequest {
+        prompt: "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n".into(),
+        max_tokens: 1,
+        sampling: Sampling::default(),
+        session: None,
+    };
+    let chats = [tool_history(true), tool_history(false)];
+    let engine_counts = chats
+        .iter()
+        .map(|request| engine.count_chat_tokens(request).expect("engine count"))
+        .collect::<Vec<_>>();
+    let engine_completion = engine
+        .count_completion_tokens(&completion)
+        .expect("engine completion count");
+    let handle = engine.into_handle();
+    let finished = |mut events: super::EventStream| {
+        events
+            .find_map(|event| match event {
+                Event::Finished(stats) => Some(stats.generation.prompt_tokens),
+                Event::Error(error) => panic!("generation failed: {error}"),
+                _ => None,
+            })
+            .expect("finished")
+    };
+    for (request, counted) in chats.into_iter().zip(engine_counts) {
+        assert_eq!(handle.count_chat_tokens(&request).expect("count"), counted);
+        let generated = finished(handle.chat(request).expect("queue chat"));
+        assert_eq!(generated, counted);
+    }
+    assert_eq!(
+        handle
+            .count_completion_tokens(&completion)
+            .expect("completion count"),
+        engine_completion
+    );
+    let generated = finished(handle.complete(completion).expect("queue completion"));
+    assert_eq!(generated, engine_completion);
+}
