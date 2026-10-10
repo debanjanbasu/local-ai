@@ -54,6 +54,7 @@ fn prefill_reports_every_chunk_before_the_first_event() {
         max_tokens: 1,
         sampling: Sampling::default(),
         session: None,
+        response_format: crate::ResponseFormat::default(),
     };
     let mut events = handle.complete(request).expect("queue");
     let mut boundaries: Vec<PrefillProgress> = Vec::new();
@@ -114,6 +115,7 @@ fn a_prefill_boundary_survives_a_wait_that_only_wanted_events() {
         max_tokens: 8,
         sampling: Sampling::default(),
         session: None,
+        response_format: crate::ResponseFormat::default(),
     };
     let mut events = handle.complete(request).expect("queue");
     // Generous on purpose: this wait is allowed to cover the whole prefill, which
@@ -333,6 +335,7 @@ fn tool_history(thinking: bool) -> super::ChatRequest {
             description: Some("Look up the weather.".into()),
             parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
         }],
+        response_format: crate::ResponseFormat::default(),
     }
 }
 
@@ -399,6 +402,7 @@ fn a_completion_count_parses_special_tokens_without_a_template() {
         max_tokens: 1,
         sampling: Sampling::default(),
         session: None,
+        response_format: crate::ResponseFormat::default(),
     };
     // `abc` is one merged token and `<|x|>` one special token.
     assert_eq!(
@@ -429,6 +433,7 @@ fn counted_prompt_tokens_match_generation_stats() {
         max_tokens: 1,
         sampling: Sampling::default(),
         session: None,
+        response_format: crate::ResponseFormat::default(),
     };
     // Allow a complete tool call: a one-token budget can stop just after the
     // opening tag, which correctly fails parsing before Finished is emitted.
@@ -467,4 +472,20 @@ fn counted_prompt_tokens_match_generation_stats() {
     );
     let generated = finished(handle.complete(completion).expect("queue completion"));
     assert_eq!(generated, engine_completion);
+}
+
+#[test]
+fn a_response_format_cannot_ride_with_tools_and_text_needs_no_compiler() {
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
+    let mut request = tool_history(true);
+    assert!(
+        super::chat_grammar(&tokenizer, &request)
+            .expect("text")
+            .is_none()
+    );
+    request.response_format = crate::ResponseFormat::JsonObject;
+    assert!(matches!(
+        super::chat_grammar(&tokenizer, &request),
+        Err(crate::Error::InvalidArgument(_))
+    ));
 }

@@ -11,6 +11,7 @@ use super::{Delivered, Engine, Event, EventSplitter, Job, Stats, encode_prompt, 
 use crate::GenerateParams;
 use crate::bonsai_model::CancelToken;
 use crate::runtime::PrefillProgress;
+use crate::structured::Grammar;
 use crate::tools::ToolSet;
 
 /// Forward prefill boundaries onto a request's channel.
@@ -34,6 +35,7 @@ struct Prepared {
     session: Option<String>,
     thinking: bool,
     tools: Option<Arc<ToolSet>>,
+    grammar: Option<Grammar>,
     events: async_mpsc::Sender<Delivered>,
     cancel: CancelToken,
 }
@@ -235,11 +237,12 @@ impl Worker {
                 outbox: VecDeque::new(),
             };
             let cancel = delivery.cancel.clone();
-            let admitted = self.engine.inner.admit(
+            let admitted = self.engine.inner.admit_constrained(
                 &prepared.ids,
                 &prepared.params,
                 prepared.session.as_deref(),
                 cancel,
+                prepared.grammar,
             );
             match admitted {
                 Ok(id) => {
@@ -255,22 +258,24 @@ impl Worker {
 
     /// Render and tokenize a job, answering it at once if that fails.
     fn prepare(&self, job: Job) -> Option<Prepared> {
-        let (prompt, max_tokens, sampling, session, thinking, events, cancel) = match job {
-            Job::Chat(request, events, cancel) => (
+        let (prompt, max_tokens, sampling, session, thinking, grammar, events, cancel) = match job {
+            Job::Chat(request, grammar, events, cancel) => (
                 prepare_chat(&request),
                 request.max_tokens,
                 request.sampling,
                 request.session,
                 request.thinking,
+                grammar,
                 events,
                 cancel,
             ),
-            Job::Completion(request, events, cancel) => (
+            Job::Completion(request, grammar, events, cancel) => (
                 Ok((request.prompt, None)),
                 request.max_tokens,
                 request.sampling,
                 request.session,
                 false,
+                grammar,
                 events,
                 cancel,
             ),
@@ -288,6 +293,7 @@ impl Worker {
                     session,
                     thinking,
                     tools,
+                    grammar,
                     events,
                     cancel,
                 })

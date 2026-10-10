@@ -7,6 +7,7 @@ use super::{
     SuffixSession, VOCAB, fill_verify_tile,
 };
 use crate::bonsai_tokenizer::{BonsaiTokenizer, StreamDecodeState};
+use crate::structured::Grammar;
 
 /// Acceptance assumed for a sequence's first lookup drafts: a lookup fires
 /// only after a long exact match.
@@ -162,16 +163,31 @@ impl BonsaiEngine {
         prompt: &[u32],
         params: &GenerateParams,
         session_id: Option<&str>,
+        emit: impl FnMut(&str) -> bool,
+        cancel: &CancelToken,
+        progress: &mut dyn FnMut(PrefillProgress),
+    ) -> crate::Result<BonsaiGeneration> {
+        self.generate_constrained(prompt, params, session_id, emit, cancel, progress, None)
+    }
+
+    /// [`Self::generate_session_progress`] under a compiled response format.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_constrained(
+        &mut self,
+        prompt: &[u32],
+        params: &GenerateParams,
+        session_id: Option<&str>,
         mut emit: impl FnMut(&str) -> bool,
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
+        grammar: Option<Grammar>,
     ) -> crate::Result<BonsaiGeneration> {
         if self.active_generations() != 0 {
             return Err(crate::Error::InvalidArgument(
                 "a single generation cannot run beside admitted ones".into(),
             ));
         }
-        let id = self.admit(prompt, params, session_id, cancel.clone())?;
+        let id = self.admit_constrained(prompt, params, session_id, cancel.clone(), grammar)?;
         loop {
             for (finished, result) in self.step(&mut |_, piece| emit(piece), &mut |_, report| {
                 progress(report);
@@ -193,6 +209,7 @@ impl BonsaiEngine {
         params: &GenerateParams,
         session_id: Option<&str>,
         cancel: CancelToken,
+        grammar: Option<Grammar>,
     ) -> crate::Result<ActiveGeneration> {
         // Installed before anything can prefill, so the model always polls the
         // token belonging to the request in flight.
@@ -203,7 +220,7 @@ impl BonsaiEngine {
             prompt_tokens: prompt.len(),
             ..GenerationStats::default()
         };
-        let sampler = Sampler::new(
+        let mut sampler = Sampler::new(
             VOCAB,
             SamplingParams {
                 temperature: params.temperature,
@@ -216,6 +233,9 @@ impl BonsaiEngine {
                 seed: params.seed,
             },
         );
+        if let Some(grammar) = grammar {
+            sampler.constrain(grammar);
+        }
         let mut generation = ActiveGeneration {
             id,
             prompt: prompt.to_vec(),
@@ -328,6 +348,12 @@ impl BonsaiEngine {
         emit: &mut dyn FnMut(&str) -> bool,
     ) -> crate::Result<()> {
         generation.seed = None;
+        if let Some(failure) = generation.sampler.grammar_failure() {
+            // Never an end-of-sequence that claims a complete answer.
+            return Err(crate::Error::Generation(format!(
+                "response format constraint failed: {failure}"
+            )));
+        }
         while let Some(sample) = generation.pending.pop_front() {
             let stats = &mut generation.stats;
             stats.sampled_tokens += 1;
@@ -457,6 +483,9 @@ impl BonsaiEngine {
     ) -> crate::Result<BonsaiGeneration> {
         let mut stats = std::mem::take(&mut generation.stats);
         stats.generated_tokens = generation.token_ids.len();
+        stats.response_format_complete = generation
+            .sampler
+            .response_format_complete(generation.stop_reason == StopReason::Eos);
         let prompt = &generation.prompt;
         let token_ids = std::mem::take(&mut generation.token_ids);
         let session_id = generation.session_id.as_deref();

@@ -12,8 +12,8 @@ use local_engine::{Event, EventStream, Signal, Stats, ToolCall};
 use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
-    EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, event_wait,
-    finish_reason, usage_json,
+    EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, checked,
+    event_wait, finish_reason, usage_json,
 };
 use super::responses::ResponsesState;
 
@@ -361,6 +361,10 @@ pub(super) fn absorb(body: &mut Body, signal: Signal) -> Flow {
     if matches!(body.document, Document::Responses(_)) {
         return absorb_response(body, signal);
     }
+    let signal = match signal {
+        Signal::Event(event) => Signal::Event(checked(event)),
+        progress @ Signal::Progress(_) => progress,
+    };
     match signal {
         // A boundary exists to be written, so it always is: reporting it and not
         // flushing it would leave prefill as silent as it was.

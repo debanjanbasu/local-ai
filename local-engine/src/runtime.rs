@@ -106,6 +106,13 @@ pub struct GenerationStats {
     /// Time from request start to the first sampled token, even without visible text.
     pub first_token: Option<Duration>,
     pub elapsed: Duration,
+    /// For a request with a [`ResponseFormat`](crate::ResponseFormat) other
+    /// than text: whether its answer is a complete document the format
+    /// accepts, which holds exactly when generation stopped at end-of-sequence
+    /// after the constraint began. `Some(false)` for a token limit,
+    /// cancellation, or end-of-sequence during reasoning (no answer at all).
+    /// `None` for unconstrained requests.
+    pub response_format_complete: Option<bool>,
 }
 
 pub(crate) fn validate_generation_params(params: &GenerateParams) -> crate::Result<()> {

@@ -173,7 +173,7 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST` | `/v1/completions` | raw completion |
 | `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
-| `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored response (`--response-store` only) |
+| `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored response, or (`GET ?stream=true`) resume a streamed background response (`--response-store` only) |
 | `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored response (`--response-store` only) |
 | `POST` | `/v1/responses/{id}/cancel` | cancel a background response (`--response-store` only) |
 
@@ -198,6 +198,56 @@ with completed, incomplete (output limit), or failed. It does not use Chat's
 `[DONE]` sentinel. Non-streaming Responses sends whitespace heartbeats before
 its final JSON.
 
+Chat `response_format` and Responses `text.format` constrain the answer to
+JSON. Each accepts `text` (the default), `json_object` (any JSON object) and
+`json_schema`. Chat nests the schema in a `json_schema` object; Responses puts
+`name`, `schema` and the optional `description` and `strict` directly in
+`format`. `name` (1 to 64 of `a-z`, `A-Z`, `0-9`, `_`, `-`) and an object
+`schema` are required, and unknown members are refused. Legacy Completions
+accepts only `{"type":"text"}`.
+
+```bash
+curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
+  "messages":[{"role":"user","content":"Capital of France?"}],
+  "response_format":{"type":"json_schema","json_schema":{"name":"capital",
+    "schema":{"type":"object","properties":{"country":{"type":"string"},
+      "capital":{"type":"string"}},"required":["country","capital"],
+      "additionalProperties":false}}}}'
+curl -s localhost:8080/v1/responses -H 'content-type: application/json' -d '{
+  "input":"Capital of France?",
+  "text":{"format":{"type":"json_schema","name":"capital","strict":true,
+    "schema":{"type":"object","properties":{"country":{"type":"string"},
+      "capital":{"type":"string"}},"required":["country","capital"],
+      "additionalProperties":false}}}}'
+```
+
+The adapter maps either form onto the engine's native `ResponseFormat`
+([contract](../local-engine/README.md#structured-output)). The engine compiles
+the schema with llguidance 1.9.1 before the request is queued, so an invalid
+or unsupported schema is a 400 before any generation, and then masks every
+target token selection of the answer (first token, plain decode, lookup and
+MTP verification, batched rows) to what the grammar allows; drafts remain
+unconstrained proposals that the masked target verifies. The schema is
+enforced whether `strict` is `true`, `false` or absent; Responses echoes
+`strict` as sent (`false` when omitted). Reasoning, when enabled, is
+unconstrained, and the format starts after `</think>`. Properties are generated
+in the schema's own key order.
+
+Compilation is strict rather than lenient. `uniqueItems`, `contains`, `not`,
+unknown `format` values, `x-guidance` and `$ref`s outside the document are
+refused, and nothing is fetched. `oneOf` compiles only when llguidance can
+prove its branches disjoint (different JSON types, or objects whose shared
+required property has different `const` values); overlapping branches such as
+`integer`/`number` and unprovable ones such as `$ref` branches are refused.
+
+A structured format constrains the whole answer, so it cannot be combined
+with tools the model is shown: send no tools, or `tool_choice: "none"`, which
+withholds them. A token limit leaves incomplete JSON reported as
+`finish_reason: "length"` (Chat) or `incomplete` with `max_output_tokens`
+(Responses), never as a successful document. If the model ends its turn while
+still reasoning, before any answer, Chat reports an error and Responses
+`failed`, because `stop`/`completed` would claim a valid document.
+
 Storage is opt-in and **nothing is stored by default**. Without
 `--response-store DIR` the endpoint is stateless: responses report
 `store: false`, `store: true` and `previous_response_id` are refused, and
@@ -218,9 +268,11 @@ rest. Only `resp_` IDs of ASCII letters and digits ever reach the filesystem.
 `previous_response_id` carries over conversation items only: the earlier
 request's `instructions`, tools, reasoning effort and sampling controls are not
 inherited and must be sent again. `GET /v1/responses/{id}` returns the stored
-object; its `stream`, `starting_after` and non-empty `include` are refused
-because records are stored as documents, not replayable event streams, and
-there are no extra fields to add.
+object. `stream=true` (with optional `starting_after`) replays events only for
+a background response created with `stream: true`, described below; other
+records are stored as documents, not event streams, and refuse it with 400.
+`starting_after` without `stream=true`, `include_obfuscation=true` and a
+non-empty `include` are refused, as there are no extra fields to add.
 `GET .../input_items` pages the resolved input with `after`, `limit` (1 to
 100, default 20) and `order` (`desc` by default), reporting `first_id`,
 `last_id` and `has_more`; an unknown `after` is 404. `DELETE` returns `response.deleted`.
@@ -228,12 +280,13 @@ Unknown, malformed, deleted and never-stored IDs are the same 404, and all of
 these routes sit behind `--api-key` when it is set. Conversations and
 `item_reference` inputs remain unsupported.
 
-Background Responses are a non-streaming, stored subset. `background: true`
-requires `--response-store`, and is refused with `store: false` (temporary
-retention is not implemented) or `stream: true` (streamed background
-responses and stream resumption are not implemented). Once the engine has
-admitted the job, `POST /v1/responses` returns 200 with the `queued` response,
-which is already durably in the store; a detached worker then persists
+Background Responses are a stored subset. `background: true` requires
+`--response-store` and `store: true` (the default with a store); `store: false`
+is refused because temporary retention is not implemented. Once the engine has
+admitted the job, the `queued` response is already durably in the store.
+Without `stream`, `POST /v1/responses` returns it with 200; with
+`stream: true` it answers with an SSE stream instead (see below). Either way a
+detached worker persists
 `in_progress` and one terminal state, `completed`, `incomplete`, `failed` or
 `cancelled`. A failure after acceptance, such as a generation error, therefore
 appears as a stored `failed` record rather than as an HTTP 400 on the
@@ -260,12 +313,50 @@ engine before exiting. A job has no client to stall, so `--stall-timeout`
 does not apply to it. Stored records still contain the raw reasoning in plain
 text; there is no encryption at rest.
 
+A streamed background response (`background: true, stream: true`) also keeps
+an append-only, owner-only event journal, `.{id}.events`, beside its record:
+`response.created` and `response.queued`, `response.in_progress`, the output
+events and the terminal events, each line numbered by `sequence_number` from
+0. Each batch is flushed before any subscriber sees it, and terminal events
+are appended only after the terminal record is durable, so a stream never
+announces an end the store does not hold. The `POST` stream and
+`GET /v1/responses/{id}?stream=true&starting_after=N` both read that journal
+and send every event with a sequence number strictly greater than `N` (all of
+them without `starting_after`), byte-for-byte as first written, from this
+server or another sharing the store, and also after a restart. A cursor at or
+past the end of a finished stream gives an empty stream. While this server is
+generating the response, a subscriber is woken by the job's own notifications
+rather than by polling. A response still being generated by another live
+server is refused with 409 rather than followed by polling a file this
+process is not told about; after it finishes it can be replayed anywhere.
+
+The stream is only a reader: a subscriber that disconnects, or stalls past
+`--stall-timeout`, is dropped and the job runs on; reconnect with the last
+`sequence_number` received. Only `POST /v1/responses/{id}/cancel` (or
+`DELETE`) stops it. The published Responses stream has no cancellation event,
+and a cancelled response is neither completed, incomplete nor failed, so as a
+local convention a cancelled stream ends with a valid `error` event whose
+`code` is `response_cancelled`; this is not a claim about `OpenAI`'s exact
+cancellation wire behaviour. A deleted response's stream stops early. If a
+journal write fails and cannot be cut back off, live streams close without a
+terminal event rather than guess the next sequence number; once the writer is
+gone, a replay numbers the end after the lines actually on disk, so every
+sequence number a client has seen still names the same event. A torn final
+line is ignored by readers and truncated by recovery. Only the first and
+terminal batches pay for `F_FULLFSYNC`, so a power cut may lose deltas a
+client saw but never the terminal record.
+
 ```bash
 curl -s localhost:8080/v1/responses -H 'content-type: application/json' \
   -d '{"input":"Summarise RFC 9110 in one line.","background":true}'
 # {"id":"resp_…","status":"queued",…}
 curl -s localhost:8080/v1/responses/resp_…          # poll until terminal
 curl -s -X POST localhost:8080/v1/responses/resp_…/cancel
+
+curl -sN localhost:8080/v1/responses -H 'content-type: application/json' \
+  -d '{"input":"Summarise RFC 9110 in one line.","background":true,"stream":true}'
+# event: response.created … "sequence_number":0 …  (disconnect at any point)
+curl -sN 'localhost:8080/v1/responses/resp_…?stream=true&starting_after=7'
 ```
 
 `--reasoning-key FILE` enables `reasoning.encrypted_content`. The key is 32
@@ -312,7 +403,9 @@ Responses reports measured prefix reuse as `input_tokens_details.cached_tokens`.
 or charged cache-write tier.
 
 This is **not the full OpenAI platform contract**. Guaranteed/forced tool
-choices, `strict:true`, JSON-schema-constrained generation, built-in/hosted
+choices, tool `strict:true` (tool calls are validated after generation, not
+constrained), a structured format together with visible tools, schema
+keywords llguidance cannot enforce exactly, built-in/hosted
 tools, reasoning summaries, `include` values other than
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
 `truncation:auto`, log-probabilities, images and audio are rejected.
@@ -332,12 +425,15 @@ the same HTTP adapters; native Rust callers use the engine's request/event
 types directly. No client-name branches belong in model execution.
 
 Missing endpoint families are not all model limitations. Opt-in local response
-storage (retrieve, delete, `input_items`), non-streaming background responses
-with cancellation, and Responses input-token counting are now implemented as
-described above; conversations, compaction, background streaming and
-resumption, temporary (`store: false`) background retention, files, uploads,
-vector stores and batches still need server implementations; constrained
-outputs need a decoding constraint implementation; media, embedding, audio
+storage (retrieve, delete, `input_items`), polled and streamed background
+responses with cancellation and journal-based stream resumption, Responses
+input-token counting, and JSON-object/JSON-schema output constrained during
+decoding are now implemented as described above; conversations, compaction,
+temporary (`store: false`) background retention, resuming a background job
+interrupted by a restart, files, uploads, vector stores and batches still need
+server implementations; constrained tool calls (tool `strict`, forced
+`tool_choice`, a format alongside tools) need a tool-call constraint
+implementation; media, embedding, audio
 and moderation capabilities need suitable models or heads. Hosted tools,
 evals, fine-tuning and administrative APIs also need their own services. None
 is implemented by merely accepting its request fields.
@@ -351,7 +447,8 @@ It is opaque tracking data: discarded, not echoed or persisted, and never
 used for prompts, sampling or cache-session selection. It is distinct from
 the public `metadata` field, which is retained on the response. With
 `--reasoning-key` the encrypted-content request is honoured. Reasoning
-summaries and constrained outputs remain unsupported, so this server is
+summaries, tool `strict` and forced tool choices remain unsupported, so this
+server is
 **not a drop-in Codex provider**. Codex handles raw `reasoning_text` and
 summary events separately; raw reasoning is not relabeled as a summary.
 The Oh My Pi example in the engine README configures that client to use only
@@ -1981,6 +2078,31 @@ along with 180 additional real-model HTTP checks against the pinned schemas:
 queued and terminal responses, output/usage, cancellation and idempotent
 retry, deletion without resurrection, authentication, pending-history
 rejection, persistence across restart, graceful shutdown, and recovery after
-SIGKILL of the test server. These checks passed without skips. They do not
-cover background streaming/resumption or temporary retention, which remain
-unsupported; cross-server lease conflicts and write failures have CPU tests.
+SIGKILL of the test server. These checks passed without skips. They did not
+cover background streaming and resumption (checked separately below) or
+temporary retention, which remains unsupported; cross-server lease conflicts
+and write failures have CPU tests.
+
+With structured output and streamed background responses added, the existing
+208 HTTP checks passed again on the real model. Natively, 57 real-model checks
+passed through the engine API, including schema-constrained raw completions.
+Four requests with different schemas decoded concurrently in batched rows
+produced the same token IDs as each run alone, and constrained output matched
+with speculation on and off. A streamed background response produced 68
+events with contiguous sequence numbers, each valid against the pinned
+schema; a resumed stream and a replay after server restart were
+byte-identical to the original, a client disconnect did not cancel the job,
+and cancel and delete stopped it.
+The final structured-output/background-streaming HTTP run passed 212 checks,
+and a focused schema-validation follow-up passed 33, with no skips. They cover
+Chat nested `response_format`, Responses flat `text.format`, JSON-object mode,
+strict true/false/absent, Unicode and reasoning, token-limit truncation,
+concurrent schemas, and replay/disconnect/cancel/delete behavior. Disjoint
+`oneOf` is accepted; overlapping branches and unsupported keywords return 400
+JSON before streaming starts, name the correct API field, and store nothing.
+Ending during reasoning before a structured answer is covered by CPU event
+tests, not a forced live-model failure.
+These checks cover the implemented JSON-constrained text subset and the
+journaled background stream, not tool-call constraints, temporary retention
+or full OpenAI conformance; cross-server 409 and journal write faults are
+covered by CPU tests.

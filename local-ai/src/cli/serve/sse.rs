@@ -9,7 +9,7 @@ use local_engine::{Event, EventStream};
 use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
-    Protocol, Reply, chat_finish_reason, chat_tool_call, finish_reason, usage_json,
+    Protocol, Reply, chat_finish_reason, chat_tool_call, checked, finish_reason, usage_json,
 };
 use super::responses::{ResponsesState, sse_frame};
 
@@ -171,13 +171,13 @@ impl Frames {
     pub(super) fn event(&mut self, event: Event) -> (Vec<String>, bool) {
         let terminal = matches!(event, Event::Finished(_) | Event::Error(_));
         let frames = match self {
-            Self::Completion(reply) => completion_frames(reply, event),
+            Self::Completion(reply) => completion_frames(reply, checked(event)),
             Self::Chat {
                 reply,
                 include_usage,
                 announced,
                 calls,
-            } => chat_frames(reply, *include_usage, announced, calls, event),
+            } => chat_frames(reply, *include_usage, announced, calls, checked(event)),
             Self::Responses(state) => {
                 state.event(event);
                 state.take_events().iter().map(sse_frame).collect()

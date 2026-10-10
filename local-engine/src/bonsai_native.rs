@@ -1276,13 +1276,16 @@ impl BonsaiModel {
         logits: &mut MetalBuffer,
     ) -> crate::Result<crate::sampler::Verification> {
         let rows = drafts.len() + 1;
-        if self.selection == Selection::Rows(rows) && sampler.selects_argmax() {
-            let results = self.greedy.results(rows);
-            return verify_greedy_drafts(sampler, drafts, |row, sampler| {
-                Ok(sampler.greedy_result(results[row].best_id))
-            });
-        }
+        let selected = (self.selection == Selection::Rows(rows)).then(|| self.greedy.results(rows));
+        // Asked per row: a response format starts masking mid-round, after
+        // the row that selected `</think>`, and the rows after that must
+        // not take the block's unmasked argmax.
         verify_greedy_drafts(sampler, drafts, |row, sampler| {
+            if let Some(results) = selected
+                && sampler.selects_argmax()
+            {
+                return Ok(sampler.greedy_result(results[row].best_id));
+            }
             sampler.sample_buffer(
                 logits,
                 row * VOCAB * size_of::<f32>(),

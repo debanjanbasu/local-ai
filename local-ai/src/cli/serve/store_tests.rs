@@ -15,7 +15,7 @@ use super::options::parse;
 use super::response::{Protocol, Reply, new_id};
 use super::responses::{PreparedResponses, ResponsesState, prepare_responses_with};
 use super::store::{ItemPage, PageError, ResponseStore, query_pairs, valid_id};
-use super::{stored_answer, stored_request};
+use super::{Retrieval, stored_answer, stored_request};
 use crate::GenerateParams;
 
 /// A store directory under the system temp dir, removed when dropped.
@@ -419,12 +419,13 @@ fn retrieval_and_deletion_answer_with_the_documented_shapes() {
     );
     let id = response["id"].as_str().expect("id");
     let page = stored_request(&Method::GET, false, None).expect("plain get");
+    assert_eq!(page, Retrieval::Document);
     assert_eq!(
-        stored_answer(&store, &Method::GET, id, page.as_ref()).expect("ok"),
+        stored_answer(&store, &Method::GET, id, page.into_page().as_ref()).expect("ok"),
         Some(response.clone())
     );
     let page = stored_request(&Method::GET, true, None).expect("items");
-    let list = stored_answer(&store, &Method::GET, id, page.as_ref())
+    let list = stored_answer(&store, &Method::GET, id, page.into_page().as_ref())
         .expect("ok")
         .expect("found");
     assert_eq!(list["object"], "list");
@@ -446,8 +447,15 @@ fn retrieval_and_deletion_answer_with_the_documented_shapes() {
         None
     );
     for query in [
-        "stream=true",
         "starting_after=3",
+        "stream=false&starting_after=3",
+        "stream=true&starting_after=-1",
+        "stream=true&starting_after=",
+        "stream=true&starting_after=4x",
+        "stream=true&starting_after=+4",
+        "stream=true&starting_after=99999999999999999999999",
+        "stream=yes",
+        "stream=true&include_obfuscation=true",
         "include=reasoning.encrypted_content",
     ] {
         assert!(
@@ -455,8 +463,25 @@ fn retrieval_and_deletion_answer_with_the_documented_shapes() {
             "{query}"
         );
     }
-    assert!(stored_request(&Method::GET, false, Some("stream=false&x=1")).is_ok());
-    assert!(stored_request(&Method::DELETE, false, Some("stream=true")).is_ok());
+    for (query, expected) in [
+        ("stream=false&x=1", Retrieval::Document),
+        ("stream=true", Retrieval::Stream(None)),
+        (
+            "stream=true&starting_after=42&include_obfuscation=false",
+            Retrieval::Stream(Some(42)),
+        ),
+        ("starting_after=0&stream=true", Retrieval::Stream(Some(0))),
+    ] {
+        assert_eq!(
+            stored_request(&Method::GET, false, Some(query)),
+            Ok(expected),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        stored_request(&Method::DELETE, false, Some("stream=true")),
+        Ok(Retrieval::Document)
+    );
 }
 
 #[test]

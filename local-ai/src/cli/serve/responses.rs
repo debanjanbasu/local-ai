@@ -14,13 +14,23 @@
 //!   terminal event is sent, and `previous_response_id` continues one. Only
 //!   conversation items carry over; `instructions`, tools and sampling
 //!   controls are this request's alone. `background: true` is accepted only
-//!   with a store, stored and not streamed (see [`super::background`]);
+//!   with a store, and stored; with `stream: true` its events are journaled so
+//!   a stream can be resumed (see [`super::background`] and [`super::resume`]).
 //!   `conversation` and `item_reference` inputs still fail. Clients may instead carry history
 //!   explicitly in `input`, which is supported in full for messages,
 //!   reasoning, `function_call` and `function_call_output` items.
 //! - Function tools only. Built-in, MCP and custom tools, `tool_choice` forcing
-//!   (`required` or a named tool), `strict: true` and `text.format` other than
-//!   `text` all need constrained decoding or hosted services this server lacks.
+//!   (`required` or a named tool) and tool `strict: true` need tool-call
+//!   constraints or hosted services this server lacks.
+//! - `text.format` is `text`, `json_object`, or the flat `json_schema`
+//!   (`name`, `schema`, optional `description` and `strict`), parsed strictly
+//!   and echoed back as accepted. The engine compiles the schema before
+//!   queueing (an invalid or unsupported one is a 400) and enforces it on
+//!   every answer token whatever `strict` says; reasoning stays unconstrained.
+//!   A structured format cannot be combined with tools the model is shown.
+//!   An answer the format did not complete is never `completed`: a token
+//!   limit is `incomplete` (`max_output_tokens`), and an end of turn during
+//!   reasoning, before any answer, is `failed`.
 //! - Text only: image, file and audio parts fail.
 //! - `reasoning.effort` is `none` or `xhigh`, the checkpoint's only two modes,
 //!   and reasoning is returned as `reasoning_text` content, never a summary.
@@ -36,7 +46,8 @@ use local_engine::{ChatMessage, ChatRequest, Event, Sampling, Stats, ToolCall, T
 
 use super::reasoning_crypto::ReasoningCipher;
 use super::request::{
-    effective_thinking, function_definition, service_tier, session, tool_call, tool_choice,
+    effective_thinking, function_definition, reject_tools_with_format, responses_text_format,
+    service_tier, session, tool_call, tool_choice,
 };
 use super::response::{Reply, arguments_text, new_id, unix_now};
 use super::store::ResponseStore;
@@ -121,6 +132,8 @@ pub(super) struct Echo {
     instructions: Option<String>,
     max_output_tokens: Option<usize>,
     metadata: Value,
+    /// The accepted `text.format`, as the Response reports it.
+    text_format: Value,
     tool_choice: &'static str,
     tools: Vec<Value>,
     temperature: f32,
@@ -196,13 +209,6 @@ impl ResponsesRequest {
                      until it is deleted",
                 ));
             }
-            if self.stream == Some(true) {
-                return Err(unsupported(
-                    "background with stream=true",
-                    "streamed background responses and stream resumption are not implemented; \
-                     poll GET /v1/responses/{id} instead",
-                ));
-            }
         }
         if !stored && self.previous_response_id.is_some() {
             return Err(unsupported(
@@ -274,16 +280,7 @@ impl ResponsesRequest {
             ));
         }
         if let Some(text) = &self.text {
-            if let Some(format) = &text.format
-                && !format.is_null()
-                && format.get("type").and_then(Value::as_str) != Some("text")
-            {
-                return Err(unsupported(
-                    "text.format",
-                    "JSON mode and structured outputs need constrained decoding; only \
-                     {\"type\":\"text\"} is accepted",
-                ));
-            }
+            // `text.format` is parsed, strictly, in `prepare_responses_with`.
             if !matches!(text.verbosity.as_deref(), None | Some("medium")) {
                 return Err(unsupported(
                     "text.verbosity",
@@ -412,6 +409,9 @@ pub(super) fn prepare_responses_with(
     if choice == super::request::ToolChoice::None {
         tools.clear();
     }
+    let (response_format, text_format) =
+        responses_text_format(request.text.as_ref().and_then(|text| text.format.as_ref()))?;
+    reject_tools_with_format(&tools, &response_format, "text.format")?;
     let empty_input = json!([]);
     let input = request
         .input
@@ -469,6 +469,7 @@ pub(super) fn prepare_responses_with(
         instructions: request.instructions.clone(),
         max_output_tokens: request.max_output_tokens,
         metadata: request.metadata.clone().unwrap_or_else(|| json!({})),
+        text_format,
         tool_choice: choice.as_str(),
         tools: echoed_tools,
         temperature: params.temperature,
@@ -492,6 +493,7 @@ pub(super) fn prepare_responses_with(
             thinking,
             session: session(request.prompt_cache_key, request.session_id, request.user),
             tools,
+            response_format,
         },
         echo,
     })
@@ -901,6 +903,11 @@ impl ResponsesState {
         }
     }
 
+    /// Whether this Response materialises streaming events.
+    pub(super) const fn streaming(&self) -> bool {
+        self.streaming
+    }
+
     /// Queue one streaming event, numbering it.
     fn emit(&mut self, kind: &str, fields: Value) {
         if !self.streaming {
@@ -919,6 +926,48 @@ impl ResponsesState {
     /// The events produced since the last call, in order.
     pub(super) fn take_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.events)
+    }
+
+    /// A background stream's opening: `response.created` and
+    /// `response.queued`, both carrying the `queued` Response, since nothing
+    /// has run yet.
+    pub(super) fn start_queued(&mut self) {
+        let response = self.snapshot("queued");
+        self.emit("response.created", json!({"response":response}));
+        self.emit("response.queued", json!({"response":response}));
+    }
+
+    /// `response.in_progress`, once the engine has started the job.
+    pub(super) fn started(&mut self) {
+        let response = self.snapshot("in_progress");
+        self.emit("response.in_progress", json!({"response":response}));
+    }
+
+    /// Withdraw the events announcing the end that was just folded in —
+    /// `response.completed`, `response.incomplete`, or `response.failed` and
+    /// the `error` before it — leaving the output events before them.
+    ///
+    /// A background stream journals its end from the stored record instead,
+    /// once that record is durable (see [`super::journal::terminal_events`]).
+    pub(super) fn retract_end(&mut self) {
+        let kind = |event: Option<&Value>| {
+            event
+                .and_then(|event| event.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let last = kind(self.events.last());
+        if matches!(
+            last.as_deref(),
+            Some("response.completed" | "response.incomplete" | "response.failed")
+        ) {
+            self.events.pop();
+            if last.as_deref() == Some("response.failed")
+                && kind(self.events.last()).as_deref() == Some("error")
+            {
+                self.events.pop();
+            }
+        }
     }
 
     /// `response.created` and `response.in_progress`.
@@ -1089,6 +1138,12 @@ impl ResponsesState {
     }
 
     fn finish(&mut self, stats: &Stats) -> Value {
+        // An end of turn the format did not complete (during reasoning, so
+        // there is no answer at all) is no completed structured answer, and
+        // `incomplete_details` has no reason for it: the Response fails.
+        if let Some(message) = super::response::unfinished_format(stats) {
+            return self.fail(message);
+        }
         let (kind, overall, item_status, incomplete, error) = match stats.stop_reason {
             StopReason::Eos => ("response.completed", "completed", "completed", None, None),
             StopReason::TokenLimit => (
@@ -1219,7 +1274,7 @@ impl ResponsesState {
             "access_programs":null,
             "service_tier":"default",
             "temperature":echo.temperature,
-            "text":{"format":{"type":"text"}},
+            "text":{"format":echo.text_format},
             "tool_choice":echo.tool_choice,
             "tools":echo.tools,
             "top_p":echo.top_p,

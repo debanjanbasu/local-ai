@@ -408,7 +408,7 @@ fn render_call(call: &ToolCall, out: &mut String) {
     out.push_str(&call.name);
     out.push_str(">\n");
     if let Value::Object(arguments) = &call.arguments {
-        for (name, value) in arguments {
+        for (name, value) in sorted_entries(arguments) {
             out.push_str("<parameter=");
             out.push_str(name);
             out.push_str(">\n");
@@ -438,7 +438,7 @@ fn push_python_json(value: &Value, out: &mut String) {
         }
         Value::Object(map) => {
             out.push('{');
-            for (index, (key, item)) in map.iter().enumerate() {
+            for (index, (key, item)) in sorted_entries(map).into_iter().enumerate() {
                 if index > 0 {
                     out.push_str(", ");
                 }
@@ -450,6 +450,16 @@ fn push_python_json(value: &Value, out: &mut String) {
         }
         scalar => out.push_str(&scalar.to_string()),
     }
+}
+
+/// Object entries in sorted key order. The prompt has always rendered schemas
+/// and replayed arguments with sorted keys (`serde_json`'s default `BTreeMap`);
+/// sorting here keeps that prompt stable when a dependency enables
+/// `serde_json/preserve_order` for the whole build.
+fn sorted_entries(map: &Map<String, Value>) -> Vec<(&String, &Value)> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    entries
 }
 
 fn push_json_string(text: &str, out: &mut String) {

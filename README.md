@@ -19,8 +19,8 @@ target/release/local-ai serve
 target/release/local-ai chat 'What is 17 * 23?'
 ```
 
-The server listens on `127.0.0.1:8080` and implements a text and function-calling
-subset of the OpenAI Chat Completions, Completions and Responses HTTP
+The server listens on `127.0.0.1:8080` and implements a text, function-calling and
+JSON-constrained subset of the OpenAI Chat Completions, Completions and Responses HTTP
 contracts (not full OpenAI compatibility). A client that stops reading its
 socket without closing it is invisible to TCP, so `serve`
 takes `--stall-timeout SECONDS` (default 30, accepted 10 to 3600) to bound how
@@ -32,11 +32,22 @@ Responses are stateless and nothing is stored by default. `--response-store DIR`
 opts in to keeping them (owner-only, unencrypted files) for
 `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
 `previous_response_id`, which carries over conversation items but not
-`instructions`, tools or sampling settings. With a store, non-streaming
-`background: true` requests return a `queued` response once it is durably
-stored; poll `GET /v1/responses/{id}` and stop one with
-`POST /v1/responses/{id}/cancel`. Background streaming, `starting_after`
-replay and resuming jobs interrupted by a restart are not implemented.
+`instructions`, tools or sampling settings. With a store, `background: true`
+requests are stored before they are acknowledged: without `stream` the `POST`
+returns the `queued` response for polling `GET /v1/responses/{id}`; with
+`stream: true` it streams journaled events that
+`GET /v1/responses/{id}?stream=true&starting_after=N` resumes after any
+sequence number, even across a server restart. A disconnected or stalled
+stream does not cancel the job; `POST /v1/responses/{id}/cancel` does.
+Background `store: false` (temporary retention) is refused, and a job
+interrupted by a restart is marked `failed`, never resumed.
+
+Chat `response_format` and Responses `text.format` accept `json_object` and
+`json_schema`; the engine compiles the schema with llguidance before queueing
+and masks every answer token to it, whether or not `strict` is set. A format
+cannot be combined with tools unless `tool_choice` is `"none"`, and a token
+limit leaves the JSON incomplete (`length`/`incomplete`, never a success).
+
 `--reasoning-key FILE` adds
 AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
 reasoning is still returned and, with a store, still written, so it is neither
@@ -53,7 +64,7 @@ and `futures-core` supplies the `Stream` implementation. `Engine` is `Send` but
 not `Sync`; `EngineHandle` provides a cloneable `Send + Sync` worker handle.
 
 ```rust,no_run
-use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
+use local_engine::{ChatMessage, ChatRequest, Engine, Event, ResponseFormat, Sampling};
 use std::ops::ControlFlow;
 
 let mut engine = Engine::open()?;
@@ -66,6 +77,7 @@ let request = ChatRequest {
     thinking: true,
     session: None,
     tools: vec![],
+    response_format: ResponseFormat::Text,
 };
 engine.chat_with(&request, |event| {
     if let Event::Content(text) = event { print!("{text}"); }

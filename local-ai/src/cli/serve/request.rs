@@ -1,8 +1,17 @@
+//! Chat Completions and legacy Completions request parsing.
+//!
+//! Chat `response_format` is mapped onto the engine's native
+//! [`ResponseFormat`]: `text`, `json_object`, and `json_schema` with its
+//! nested `json_schema` object (see [`chat_response_format`]). The engine
+//! compiles the schema before queueing and enforces it on every answer token,
+//! whatever `strict` says. Legacy Completions keep refusing every format but
+//! `text`: structured output is not part of that API.
+
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use local_engine::{
-    ChatMessage, ChatRequest, CompletionRequest, Sampling, ToolCall, ToolDefinition,
+    ChatMessage, ChatRequest, CompletionRequest, ResponseFormat, Sampling, ToolCall, ToolDefinition,
 };
 
 use crate::GenerateParams;
@@ -128,14 +137,17 @@ impl GenerateRequest {
         if !matches!(self.verbosity.as_deref(), None | Some("medium")) {
             return unsupported("verbosity", "only the default, medium, is produced");
         }
-        if let Some(format) = &self.response_format
+        // Chat parses its format strictly in `chat_response_format`; legacy
+        // Completions keep their old, lenient refusal of anything but text.
+        if !chat
+            && let Some(format) = &self.response_format
             && !format.is_null()
             && format.get("type").and_then(Value::as_str) != Some("text")
         {
             return unsupported(
                 "response_format",
-                "JSON mode and structured outputs need constrained decoding, which this \
-                 server does not have; only {\"type\":\"text\"} is accepted",
+                "JSON mode and structured outputs are Chat Completions and Responses options, \
+                 not legacy Completions ones; only {\"type\":\"text\"} is accepted here",
             );
         }
         if self.audio.as_ref().is_some_and(|audio| !audio.is_null()) {
@@ -294,6 +306,8 @@ pub(super) fn prepare_generation(
             .map(chat_tool)
             .collect::<crate::Result<Vec<_>>>()?;
         let tools = apply_tool_choice(tools, request.tool_choice.as_ref())?;
+        let response_format = chat_response_format(request.response_format.as_ref())?;
+        reject_tools_with_format(&tools, &response_format, "response_format")?;
         GenerationRequest::Chat(ChatRequest {
             messages,
             max_tokens: params.max_tokens,
@@ -301,6 +315,7 @@ pub(super) fn prepare_generation(
             thinking: effective_thinking(request.reasoning_effort.as_deref(), thinking)?,
             session: session(request.prompt_cache_key, request.session_id, request.user),
             tools,
+            response_format,
         })
     } else {
         let prompt = request
@@ -311,6 +326,7 @@ pub(super) fn prepare_generation(
             max_tokens: params.max_tokens,
             sampling: Sampling(params),
             session: session(request.prompt_cache_key, request.session_id, request.user),
+            response_format: ResponseFormat::Text,
         })
     };
     Ok(PreparedGeneration {
@@ -328,6 +344,210 @@ pub(super) fn session(
     user: Option<String>,
 ) -> Option<String> {
     prompt_cache_key.or(session_id).or(user)
+}
+
+/// Chat's `response_format`: absent or `null` is text; otherwise exactly
+/// `{"type":"text"}`, `{"type":"json_object"}`, or
+/// `{"type":"json_schema","json_schema":{"name",["description"],"schema",["strict"]}}`.
+///
+/// Unknown members, wrong types, an invalid `name` and a missing `schema`
+/// fail here; the schema itself is validated by the engine's compiler, which
+/// enforces it whether `strict` is `true`, `false` or absent.
+pub(super) fn chat_response_format(value: Option<&Value>) -> crate::Result<ResponseFormat> {
+    const FIELD: &str = "response_format";
+    let Some((kind, object)) = format_object(value, FIELD)? else {
+        return Ok(ResponseFormat::Text);
+    };
+    match kind {
+        "text" | "json_object" => {
+            only_members(object, &["type"], FIELD)?;
+            Ok(if kind == "text" {
+                ResponseFormat::Text
+            } else {
+                ResponseFormat::JsonObject
+            })
+        }
+        "json_schema" => {
+            only_members(object, &["type", "json_schema"], FIELD)?;
+            let nested = object
+                .get("json_schema")
+                .ok_or_else(|| invalid_format(format!("{FIELD}.json_schema is required")))?
+                .as_object()
+                .ok_or_else(|| invalid_format(format!("{FIELD}.json_schema must be an object")))?;
+            let field = format!("{FIELD}.json_schema");
+            only_members(nested, &["name", "description", "schema", "strict"], &field)?;
+            Ok(ResponseFormat::JsonSchema(
+                SchemaFormat::parse(nested, &field)?.schema,
+            ))
+        }
+        other => Err(unsupported_format(FIELD, other)),
+    }
+}
+
+/// The Responses `text.format`: absent or `null` is text; otherwise exactly
+/// `{"type":"text"}`, `{"type":"json_object"}`, or the flat
+/// `{"type":"json_schema","name",["description"],"schema",["strict"]}`.
+///
+/// Returns the native format and the format the Response object echoes: the
+/// accepted one, with `strict` reported as sent (`false` when omitted, its
+/// documented default). The schema is enforced either way.
+pub(super) fn responses_text_format(
+    value: Option<&Value>,
+) -> crate::Result<(ResponseFormat, Value)> {
+    const FIELD: &str = "text.format";
+    let Some((kind, object)) = format_object(value, FIELD)? else {
+        return Ok((ResponseFormat::Text, json!({"type":"text"})));
+    };
+    match kind {
+        "text" => {
+            only_members(object, &["type"], FIELD)?;
+            Ok((ResponseFormat::Text, json!({"type":"text"})))
+        }
+        "json_object" => {
+            only_members(object, &["type"], FIELD)?;
+            Ok((ResponseFormat::JsonObject, json!({"type":"json_object"})))
+        }
+        "json_schema" => {
+            only_members(
+                object,
+                &["type", "name", "description", "schema", "strict"],
+                FIELD,
+            )?;
+            let format = SchemaFormat::parse(object, FIELD)?;
+            let mut echo = json!({
+                "type":"json_schema",
+                "name":format.name,
+                "schema":format.schema,
+                "strict":format.strict.unwrap_or(false),
+            });
+            if let Some(description) = format.description {
+                echo["description"] = json!(description);
+            }
+            Ok((ResponseFormat::JsonSchema(format.schema), echo))
+        }
+        other => Err(unsupported_format(FIELD, other)),
+    }
+}
+
+/// Refuse a structured format alongside tools the model is shown: the
+/// engine constrains the whole answer, which would leave no room for a call.
+/// `tool_choice: "none"` withholds the tools, so it combines with any format.
+pub(super) fn reject_tools_with_format(
+    tools: &[ToolDefinition],
+    format: &ResponseFormat,
+    field: &str,
+) -> crate::Result<()> {
+    if tools.is_empty() || format.is_text() {
+        return Ok(());
+    }
+    Err(crate::Error::InvalidArgument(format!(
+        "{field} other than text cannot be combined with tools: the format constrains the whole \
+         answer, so no tool call could be made; drop the tools, set tool_choice to \"none\", or \
+         use a text format"
+    )))
+}
+
+/// A `json_schema` format's members, the same in both APIs.
+struct SchemaFormat {
+    name: String,
+    description: Option<String>,
+    schema: Value,
+    strict: Option<bool>,
+}
+
+impl SchemaFormat {
+    fn parse(object: &Map<String, Value>, field: &str) -> crate::Result<Self> {
+        let name = match object.get("name") {
+            Some(Value::String(name)) => name.clone(),
+            None | Some(Value::Null) => {
+                return Err(invalid_format(format!("{field}.name is required")));
+            }
+            Some(_) => return Err(invalid_format(format!("{field}.name must be a string"))),
+        };
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(invalid_format(format!(
+                "{field}.name {name:?} must be 1 to 64 characters of a-z, A-Z, 0-9, _ or -"
+            )));
+        }
+        let description = match object.get("description") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => {
+                return Err(invalid_format(format!(
+                    "{field}.description must be a string"
+                )));
+            }
+        };
+        let schema = match object.get("schema") {
+            Some(schema @ Value::Object(_)) => schema.clone(),
+            None | Some(Value::Null) => {
+                return Err(invalid_format(format!(
+                    "{field}.schema is required: without one there is nothing to enforce (use \
+                     json_object for any JSON object)"
+                )));
+            }
+            Some(_) => {
+                return Err(invalid_format(format!(
+                    "{field}.schema must be a JSON Schema object"
+                )));
+            }
+        };
+        let strict = match object.get("strict") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(strict)) => Some(*strict),
+            Some(_) => return Err(invalid_format(format!("{field}.strict must be a boolean"))),
+        };
+        Ok(Self {
+            name,
+            description,
+            schema,
+            strict,
+        })
+    }
+}
+
+/// A format's `type` and members, or `None` for an absent or `null` format.
+fn format_object<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+) -> crate::Result<Option<(&'a str, &'a Map<String, Value>)>> {
+    let object = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(object)) => object,
+        Some(_) => return Err(invalid_format(format!("{field} must be an object"))),
+    };
+    match object.get("type") {
+        Some(Value::String(kind)) => Ok(Some((kind.as_str(), object))),
+        None | Some(Value::Null) => Err(invalid_format(format!("{field}.type is required"))),
+        Some(_) => Err(invalid_format(format!("{field}.type must be a string"))),
+    }
+}
+
+fn only_members(object: &Map<String, Value>, allowed: &[&str], field: &str) -> crate::Result<()> {
+    object
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+        .map_or(Ok(()), |key| {
+            Err(invalid_format(format!(
+                "unknown field {field}.{key}; expected only {}",
+                allowed.join(", ")
+            )))
+        })
+}
+
+fn unsupported_format(field: &str, kind: &str) -> crate::Error {
+    crate::Error::InvalidArgument(format!(
+        "{field} type {kind:?} is not supported; use \"text\", \"json_object\" or \"json_schema\""
+    ))
+}
+
+const fn invalid_format(message: String) -> crate::Error {
+    crate::Error::InvalidArgument(message)
 }
 
 /// Resolve a reasoning effort against the server's `--no-thinking` choice.
@@ -402,7 +622,8 @@ pub(super) fn tool_choice(choice: Option<&Value>) -> crate::Result<ToolChoice> {
 fn forced_choice() -> crate::Error {
     crate::Error::InvalidArgument(
         "tool_choice \"required\" and forcing a named tool are not supported: a guaranteed call \
-         needs constrained decoding, which this server does not have; use \"auto\" or \"none\""
+         needs constrained decoding of tool calls, which this server does not implement (only \
+         response formats are constrained); use \"auto\" or \"none\""
             .into(),
     )
 }
@@ -416,7 +637,7 @@ pub(super) fn function_definition(
 ) -> crate::Result<ToolDefinition> {
     if strict == Some(true) {
         return Err(crate::Error::InvalidArgument(format!(
-            "tool {name:?} sets strict=true, which needs constrained decoding; this server only \
+            "tool {name:?} sets strict=true, which needs constrained decoding of tool calls; this server only \
              validates calls after generation, so set strict to false or omit it"
         )));
     }

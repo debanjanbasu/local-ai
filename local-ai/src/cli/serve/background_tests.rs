@@ -20,19 +20,19 @@ use super::responses::{ResponsesState, prepare_responses_with};
 use super::store::ResponseStore;
 
 /// A store directory under the system temp dir, removed when dropped.
-struct Scratch(PathBuf);
+pub(super) struct Scratch(pub(super) PathBuf);
 
 impl Scratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(std::env::temp_dir().join(new_id("local-ai-background-test-")))
     }
 
-    fn open(&self) -> Arc<ResponseStore> {
+    pub(super) fn open(&self) -> Arc<ResponseStore> {
         Arc::new(ResponseStore::open(&self.0).expect("store opens"))
     }
 
     #[cfg(unix)]
-    fn set_mode(&self, mode: u32) {
+    pub(super) fn set_mode(&self, mode: u32) {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(mode))
             .expect("chmod scratch");
@@ -47,7 +47,7 @@ impl Drop for Scratch {
     }
 }
 
-fn stats(stop_reason: StopReason) -> Box<Stats> {
+pub(super) fn stats(stop_reason: StopReason) -> Box<Stats> {
     Box::new(Stats {
         stop_reason,
         cache_source: PromptCacheSource::None,
@@ -68,7 +68,16 @@ fn prepare_error(body: &Value, store: Option<&Arc<ResponseStore>>) -> String {
 }
 
 /// The Response state machine for `body` against `store`.
-fn doc(body: &Value, store: &Arc<ResponseStore>) -> ResponsesState {
+pub(super) fn doc(body: &Value, store: &Arc<ResponseStore>) -> ResponsesState {
+    streamed_doc(body, store, false)
+}
+
+/// [`doc`], materialising stream events when `streaming`.
+pub(super) fn streamed_doc(
+    body: &Value,
+    store: &Arc<ResponseStore>,
+    streaming: bool,
+) -> ResponsesState {
     let prepared =
         prepare_responses_with(body.to_string().as_bytes(), true, Some(store), None, "m")
             .expect("request accepted");
@@ -76,7 +85,7 @@ fn doc(body: &Value, store: &Arc<ResponseStore>) -> ResponsesState {
     let Protocol::Responses(echo) = &reply.protocol else {
         unreachable!("responses reply")
     };
-    ResponsesState::new(&reply, Arc::clone(echo), false)
+    ResponsesState::new(&reply, Arc::clone(echo), streaming)
 }
 
 fn background_doc(store: &Arc<ResponseStore>) -> ResponsesState {
@@ -84,33 +93,33 @@ fn background_doc(store: &Arc<ResponseStore>) -> ResponsesState {
 }
 
 /// One scripted engine step: runs when the pump asks for its next signal.
-type Step = Box<dyn FnOnce() -> Signal + Send>;
+pub(super) type Step = Box<dyn FnOnce() -> Signal + Send>;
 
-fn event(event: Event) -> Step {
+pub(super) fn event(event: Event) -> Step {
     Box::new(move || Signal::Event(event))
 }
 
 /// The engine side of a job: yields `steps` in order, then end-of-stream.
-fn script(steps: Vec<Step>) -> impl FnMut() -> Option<Signal> + Send + 'static {
+pub(super) fn script(steps: Vec<Step>) -> impl FnMut() -> Option<Signal> + Send + 'static {
     let mut steps = steps.into_iter();
     move || steps.next().map(|step| step())
 }
 
 /// A native cancel that only records it was asked for.
-fn stopper() -> (Arc<AtomicBool>, impl Fn() + Send + Sync + 'static) {
+pub(super) fn stopper() -> (Arc<AtomicBool>, impl Fn() + Send + Sync + 'static) {
     let stopped = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stopped);
     (stopped, move || flag.store(true, Ordering::SeqCst))
 }
 
-fn stored(store: &ResponseStore, id: &str) -> Option<Value> {
+pub(super) fn stored(store: &ResponseStore, id: &str) -> Option<Value> {
     store
         .load(id)
         .expect("store readable")
         .map(|stored| stored.response)
 }
 
-fn status(store: &ResponseStore, id: &str) -> String {
+pub(super) fn status(store: &ResponseStore, id: &str) -> String {
     stored(store, id)
         .and_then(|response| response["status"].as_str().map(str::to_owned))
         .unwrap_or_else(|| "absent".into())
@@ -132,7 +141,7 @@ fn admit(
     (id, queued, pump, stopped)
 }
 
-fn drained(background: &Background) {
+pub(super) fn drained(background: &Background) {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime")
@@ -140,7 +149,7 @@ fn drained(background: &Background) {
 }
 
 #[test]
-fn background_needs_a_store_and_refuses_streaming_and_temporary_retention() {
+fn background_needs_a_store_and_refuses_temporary_retention() {
     let scratch = Scratch::new();
     let store = scratch.open();
     let body = json!({"input":"hi","background":true});
@@ -152,13 +161,17 @@ fn background_needs_a_store_and_refuses_streaming_and_temporary_retention() {
         )
         .contains("store=false")
     );
-    assert!(
-        prepare_error(
-            &json!({"input":"hi","background":true,"stream":true}),
-            Some(&store)
-        )
-        .contains("stream=true")
-    );
+    let streamed = prepare_responses_with(
+        json!({"input":"hi","background":true,"stream":true})
+            .to_string()
+            .as_bytes(),
+        true,
+        Some(&store),
+        None,
+        "m",
+    )
+    .expect("background streaming is accepted");
+    assert!(streamed.echo.background() && streamed.stream);
     let prepared =
         prepare_responses_with(body.to_string().as_bytes(), true, Some(&store), None, "m")
             .expect("background with a store");

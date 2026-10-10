@@ -27,6 +27,11 @@
 //! crash or restart; it is marked `failed` rather than resumed. A record whose
 //! lease is held belongs to a live server sharing the directory and is left
 //! alone.
+//!
+//! A background Response created with `stream: true` also has an owner-only
+//! `.{id}.events` journal of the events it published (see [`super::journal`]).
+//! It is created before the record and deleted after it, so every streamed
+//! record has one, and recovery reconciles it with the record it belongs to.
 
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -34,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use super::journal::{JournalReader, JournalWriter, ended_with, terminal_events};
 use super::response::new_id;
 
 /// Version of the on-disk record layout, checked on read.
@@ -47,6 +53,9 @@ const MAX_ID_TAIL: usize = 64;
 
 /// Suffix of a response's lease sidecar, `.{id}.lock`.
 const LOCK_SUFFIX: &str = ".lock";
+
+/// Suffix of a streamed response's event journal, `.{id}.events`.
+const JOURNAL_SUFFIX: &str = ".events";
 
 /// The error a recovered background Response reports.
 const INTERRUPTED_MESSAGE: &str = "the server stopped before this background response finished; \
@@ -148,7 +157,7 @@ impl ResponseStore {
             ));
         }
         let path = self.dir.join(format!(".{id}{LOCK_SUFFIX}"));
-        let file = open_lock(&path)?;
+        let file = open_private(&path, Access::Lock)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(ResponseLease { _file: file })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
@@ -157,52 +166,177 @@ impl ResponseStore {
     }
 
     /// Mark every background response left `queued` or `in_progress` by a
-    /// writer that no longer holds its lease as `failed`.
+    /// writer that no longer holds its lease as `failed`, and remove journals
+    /// whose record is gone and whose lease is free.
     ///
     /// Records that cannot be read are skipped: they are not this pass's to
     /// judge, and `load` reports them to whoever asks for them.
     fn recover_interrupted(&self) -> std::io::Result<()> {
         for entry in fs::read_dir(&self.dir)? {
             let name = entry?.file_name();
-            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            let Some(name) = name.to_str() else {
                 continue;
             };
-            if !valid_id(id) || !matches!(self.load(id), Ok(Some(stored)) if interrupted(&stored)) {
+            if let Some(id) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(JOURNAL_SUFFIX))
+            {
+                self.remove_orphan_journal(id)?;
                 continue;
             }
-            let Some(_lease) = self.lease(id)? else {
+            let Some(id) = name.strip_suffix(".json") else {
                 continue;
             };
-            // Re-read under the lease: the writer may have finished between
-            // the first read and taking the lock.
-            let Ok(Some(mut stored)) = self.load(id) else {
-                continue;
-            };
-            if !interrupted(&stored) {
-                continue;
+            if valid_id(id) && matches!(self.load(id), Ok(Some(stored)) if interrupted(&stored)) {
+                self.recover(id)?;
             }
-            if let Some(response) = stored.response.as_object_mut() {
-                response.insert("status".into(), json!("failed"));
-                response.insert("completed_at".into(), Value::Null);
-                response.insert(
-                    "error".into(),
-                    json!({"code":"server_error","message":INTERRUPTED_MESSAGE}),
-                );
-            }
-            self.save(&stored.response, &stored.input_items)?;
         }
         Ok(())
+    }
+
+    /// Settle response `id` if its writer is gone: `Ok(false)` when another
+    /// writer holds its lease, so it is still being generated.
+    ///
+    /// A pending record whose journal already ends the stream adopts that end,
+    /// because it was published; otherwise it becomes `failed`, and the events
+    /// saying so are appended to its journal after the record is written.
+    pub(super) fn recover(&self, id: &str) -> std::io::Result<bool> {
+        let Some(_lease) = self.lease(id)? else {
+            return Ok(false);
+        };
+        // Re-read under the lease: the writer may have finished between the
+        // caller's read and taking the lock.
+        let Ok(Some(mut stored)) = self.load(id) else {
+            return Ok(true);
+        };
+        if !interrupted(&stored) {
+            return Ok(true);
+        }
+        let mut journal = self.open_journal(id).unwrap_or_else(|error| {
+            eprintln!("response {id}: event journal unreadable: {error}");
+            None
+        });
+        let last = match journal.as_mut().map(JournalReader::last_line).transpose() {
+            Ok(last) => last.flatten(),
+            Err(error) => {
+                eprintln!("response {id}: event journal unreadable: {error}");
+                journal = None;
+                None
+            }
+        };
+        let adopted = last
+            .as_ref()
+            .filter(|line| line.terminal)
+            .and_then(|line| ended_with(&stored.response, line));
+        let ended = adopted.is_some();
+        if let Some(response) = adopted {
+            stored.response = response;
+        } else if let Some(response) = stored.response.as_object_mut() {
+            response.insert("status".into(), json!("failed"));
+            response.insert("completed_at".into(), Value::Null);
+            response.insert(
+                "error".into(),
+                json!({"code":"server_error","message":INTERRUPTED_MESSAGE}),
+            );
+        }
+        self.save(&stored.response, &stored.input_items)?;
+        if let Some(reader) = journal {
+            let events = if ended {
+                Vec::new()
+            } else {
+                terminal_events(&stored.response)
+            };
+            if let Err(error) = self.extend_journal(id, &reader, events) {
+                eprintln!("response {id}: event journal not reconciled: {error}");
+            }
+        }
+        Ok(true)
+    }
+
+    /// Append the events that end `response` to its journal, unless it has
+    /// already ended. The caller holds the lease. Without a journal, nothing.
+    pub(super) fn seal_journal(&self, id: &str, response: &Value) -> std::io::Result<()> {
+        let Some(mut reader) = self.open_journal(id)? else {
+            return Ok(());
+        };
+        if reader.last_line()?.is_some_and(|line| line.terminal) {
+            return Ok(());
+        }
+        self.extend_journal(id, &reader, terminal_events(response))
+    }
+
+    /// Cut the journal `reader` has read to its last whole event and append
+    /// `events` after it.
+    fn extend_journal(
+        &self,
+        id: &str,
+        reader: &JournalReader,
+        events: Vec<Value>,
+    ) -> std::io::Result<()> {
+        let path = self.journal_path(id).ok_or_else(|| invalid_id(id))?;
+        let mut writer = JournalWriter::resume(&path, reader)?;
+        writer.append(events)?;
+        writer.sync()
+    }
+
+    /// Remove the journal of a response with no record, unless a writer holds
+    /// its lease: that is an admission between the two writes.
+    fn remove_orphan_journal(&self, id: &str) -> std::io::Result<()> {
+        let (Some(record), Some(journal)) = (self.path(id), self.journal_path(id)) else {
+            return Ok(());
+        };
+        if record.exists() {
+            return Ok(());
+        }
+        let Some(_lease) = self.lease(id)? else {
+            return Ok(());
+        };
+        if !record.exists() {
+            remove_if_present(&journal)?;
+        }
+        Ok(())
+    }
+
+    fn journal_path(&self, id: &str) -> Option<PathBuf> {
+        valid_id(id).then(|| self.dir.join(format!(".{id}{JOURNAL_SUFFIX}")))
+    }
+
+    /// Create the journal of response `id` holding `events`, fully flushed.
+    /// The caller holds the lease.
+    pub(super) fn create_journal(
+        &self,
+        id: &str,
+        events: Vec<Value>,
+    ) -> std::io::Result<JournalWriter> {
+        let path = self.journal_path(id).ok_or_else(|| invalid_id(id))?;
+        let created = JournalWriter::create(&path).and_then(|mut writer| {
+            writer.append(events)?;
+            writer.sync()?;
+            Ok(writer)
+        });
+        if created.is_err() {
+            let _ = fs::remove_file(&path);
+        }
+        sync_dir(&self.dir);
+        created
+    }
+
+    /// The journal of response `id`; `None` when it has none.
+    pub(super) fn open_journal(&self, id: &str) -> std::io::Result<Option<JournalReader>> {
+        self.journal_path(id)
+            .map_or_else(|| Ok(None), |path| JournalReader::open(&path))
+    }
+
+    /// The journal path of response `id`, for its live writer.
+    #[cfg(test)]
+    pub(super) fn journal_file(&self, id: &str) -> Option<PathBuf> {
+        self.journal_path(id)
     }
 
     /// Persist `response` and its resolved input, durably, before returning.
     pub(super) fn save(&self, response: &Value, input_items: &[Value]) -> std::io::Result<()> {
         let id = response.get("id").and_then(Value::as_str).unwrap_or("");
-        let path = self.path(id).ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!("invalid response ID {id:?}"),
-            )
-        })?;
+        let path = self.path(id).ok_or_else(|| invalid_id(id))?;
         let record = json!({
             "object":"local_ai.stored_response",
             "version":RECORD_VERSION,
@@ -258,19 +392,41 @@ impl ResponseStore {
         }
     }
 
-    /// Delete the stored response `id`, reporting whether there was one.
+    /// Delete the stored response `id` and its event journal, reporting
+    /// whether there was one. The lease sidecar stays, so its inode does.
+    ///
+    /// The record goes first: once it is gone the response is not found,
+    /// whatever became of the journal, and a journal left by a failed unlink
+    /// is removed when a store next opens.
     pub(super) fn delete(&self, id: &str) -> std::io::Result<bool> {
-        let Some(path) = self.path(id) else {
+        let (Some(path), Some(journal)) = (self.path(id), self.journal_path(id)) else {
             return Ok(false);
         };
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                sync_dir(&self.dir);
-                Ok(true)
+        let found = remove_if_present(&path)?;
+        if let Err(error) = remove_if_present(&journal) {
+            if !found {
+                return Err(error);
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
+            eprintln!("response {id}: event journal not removed: {error}");
         }
+        sync_dir(&self.dir);
+        Ok(found)
+    }
+}
+
+fn invalid_id(id: &str) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidInput,
+        format!("invalid response ID {id:?}"),
+    )
+}
+
+/// Unlink `path`, reporting whether it existed.
+fn remove_if_present(path: &Path) -> std::io::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -297,24 +453,44 @@ fn interrupted(stored: &StoredResponse) -> bool {
         )
 }
 
-/// Open, creating owner-only if needed, the lease sidecar at `path`.
+/// How [`open_private`] opens a store sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Access {
+    /// A lease sidecar: read-write, created if missing, never truncated.
+    Lock,
+    /// A new journal: append-only, and an existing file is an error.
+    CreateNew,
+    /// An existing journal, to append to.
+    Append,
+    /// An existing journal, to read.
+    Read,
+}
+
+/// Open the owner-only sidecar at `path` for `access`.
 ///
 /// Never truncates or unlinks it, so concurrent openers share one inode. On
 /// Unix a symlink as the final component is refused rather than followed, a
 /// FIFO cannot block the open, and the result must be an owner-only regular
 /// file belonging to this user.
 #[cfg(unix)]
-fn open_lock(path: &Path) -> std::io::Result<fs::File> {
+pub(super) fn open_private(path: &Path, access: Access) -> std::io::Result<fs::File> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     use rustix::fs::{Mode, OFlags};
 
-    let flags =
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let flags = OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | OFlags::CLOEXEC
+        | match access {
+            Access::Lock => OFlags::RDWR | OFlags::CREATE,
+            Access::CreateNew => OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::APPEND,
+            Access::Append => OFlags::WRONLY | OFlags::APPEND,
+            Access::Read => OFlags::RDONLY,
+        };
     let fd = rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR).map_err(|errno| {
         std::io::Error::new(
             std::io::Error::from(errno).kind(),
-            format!("cannot open response lease {}: {errno}", path.display()),
+            format!("cannot open response file {}: {errno}", path.display()),
         )
     })?;
     let file = fs::File::from(fd);
@@ -322,7 +498,7 @@ fn open_lock(path: &Path) -> std::io::Result<fs::File> {
     let refused = |why: &str| {
         Err(std::io::Error::new(
             ErrorKind::PermissionDenied,
-            format!("response lease {} {why}", path.display()),
+            format!("response file {} {why}", path.display()),
         ))
     };
     if !metadata.file_type().is_file() {
@@ -338,13 +514,15 @@ fn open_lock(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn open_lock(path: &Path) -> std::io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
+pub(super) fn open_private(path: &Path, access: Access) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    match access {
+        Access::Lock => options.read(true).write(true).create(true).truncate(false),
+        Access::CreateNew => options.append(true).create_new(true),
+        Access::Append => options.append(true),
+        Access::Read => options.read(true),
+    };
+    options.open(path)
 }
 
 /// Make a rename or unlink in `dir` durable, where the platform allows it.
