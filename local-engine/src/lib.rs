@@ -22,6 +22,7 @@ mod prompt_cache;
 #[allow(clippy::must_use_candidate)]
 pub mod resources;
 mod sampler;
+mod structured;
 mod tools;
 
 mod error;
@@ -30,6 +31,7 @@ pub use api::{
     EngineInfo, Event, EventStream, Plan, Sampling, Signal, Stats,
 };
 pub use error::Error;
+pub use structured::ResponseFormat;
 pub use tools::{ToolCall, ToolDefinition};
 
 pub type Result<T> = std::result::Result<T, Error>;

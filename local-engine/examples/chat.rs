@@ -25,6 +25,7 @@ fn main() -> local_engine::Result<()> {
         thinking: true,
         session: None,
         tools: Vec::new(),
+        response_format: local_engine::ResponseFormat::Text,
     };
     engine.chat_with(&request, |event| {
         if let Event::Content(text) = event {

@@ -47,15 +47,56 @@ of prompt tokens generation would prefill. A chat request is validated,
 rendered (messages, replayed tool calls and results, tool definitions and
 `thinking`) and tokenized, special tokens included, by the same code as
 `chat_with`, so the count equals `prompt_tokens` in the generation statistics,
-cached prefix included, and an invalid request fails with the error generation
-would return. A completion is tokenized as `complete` tokenizes it, without a
-template; an empty prompt counts zero although generation rejects it.
-`max_tokens`, `sampling` and `session` are ignored and the count is not checked
-against the context window. Counting is CPU-only and submits no GPU work.
+cached prefix included, and invalid prompt content fails with the error
+generation would return. A completion is tokenized as `complete` tokenizes it,
+without a template; an empty prompt counts zero although generation rejects it.
+`max_tokens`, `sampling`, `session` and `response_format` are ignored; no schema
+is compiled and the count is not checked against the context window.
+Counting is CPU-only and submits no GPU work.
 `EngineHandle` offers the same two methods against the worker's shared
 tokenizer: they run on the calling thread, queue no job and never wait for
 running generations, so they work while the queue is full. Async callers should
 run long prompts on a blocking pool.
+
+## Structured output
+
+`ChatRequest::response_format` and `CompletionRequest::response_format` take a
+`ResponseFormat`: `Text` (default), `JsonObject` (`OpenAI` `json_object`) or
+`JsonSchema(schema)` (the `schema` of `OpenAI` `json_schema`; `name`,
+`description` and `strict` are not needed by the engine, and the schema is
+always enforced). The format is compiled with
+[llguidance](https://github.com/guidance-ai/llguidance) before the request is
+queued (`Engine::chat_with`/`complete`, `EngineHandle::chat`/`complete`), so
+invalid or unsupported schemas fail with `Error::InvalidArgument` before any
+generation. Every target token selection (first token, plain decode, n-gram
+and MTP verification, batched rows) is masked to what the grammar allows;
+drafts stay unconstrained proposals that the masked target verifies.
+
+- With `thinking`, reasoning is unconstrained and the format applies from the
+  token after `</think>`; without it, and for raw completions, from the first
+  generated token, with no whitespace before the document.
+- End-of-sequence is only selectable once the document is complete.
+  `GenerationStats::response_format_complete` is `Some(true)` only then;
+  a token limit or cancellation yields `Some(false)` and incomplete JSON.
+  With `thinking`, the model may also end its turn before `</think>`, which
+  is unconstrained; that `Finished` carries `Some(false)` and no answer at
+  all, so check the flag rather than trusting a stop at end-of-sequence
+  (`local-ai` reports it as a failure).
+- Compilation (llguidance 1.9.1) is strict: unsupported keywords (for example
+  `uniqueItems`, `contains`, `not`), unknown `format`s, `x-guidance`, and
+  `$ref`s outside the document are rejected rather than ignored. `oneOf` is
+  accepted only when its branches are provably disjoint (for example
+  different JSON types, or objects sharing a required property with different
+  `const` values); overlapping branches, such as `integer` and `number`, or
+  ones whose exclusivity cannot be proven, such as `$ref` branches, are
+  rejected. Nothing is fetched. Printable characters
+  are generated literally rather than as `\uXXXX` escapes.
+- Object properties are generated in the schema's key order, which is
+  preserved as sent. (Tool schemas are different; see below.)
+- A format cannot be combined with `tools`: it constrains the whole answer,
+  leaving no room for a call.
+- The first constrained request builds the tokenizer's grammar tables once
+  (about 0.5 s on CPU); later schemas compile in well under a millisecond.
 
 ## Native tool calling
 
@@ -94,6 +135,7 @@ let request = ChatRequest {
         description: Some("Current weather for a city.".into()),
         parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}),
     }],
+    response_format: local_engine::ResponseFormat::Text,
 };
 engine.chat_with(&request, |event| {
     if let Event::ToolCall(call) = event {
@@ -138,14 +180,18 @@ references work; network/file retrieval and unknown dialects are rejected.
 Annotations such as `title`, `description` and `default` do not constrain values.
 Ambiguous raw parameter text remains a string when its declared schema accepts
 strings, including nullable strings; the harness should avoid ambiguous unions.
-`serde_json` is built without `preserve_order`, so object keys in rendered
-schemas and replayed arguments are in sorted order rather than client order.
+Object keys in rendered schemas and replayed arguments are in sorted order
+rather than client order, whether or not `serde_json`'s `preserve_order` is
+enabled.
 
 `local-ai` exposes these native calls through Chat Completions and a
 text/function subset of Responses, stateless unless the server is started with
-`--response-store`, which also enables polled, cancellable non-streaming
-background Responses; see [server API](../docs/BONSAI.md#server-api) for
-storage, encrypted reasoning replay, token counting and compatibility limits.
+`--response-store`, which also enables cancellable background Responses,
+polled or streamed with resumable events. It maps Chat `response_format` and
+Responses `text.format` onto `ResponseFormat`. See
+[server API](../docs/BONSAI.md#server-api) for storage, background streams,
+structured output, encrypted reasoning replay, token counting and
+compatibility limits.
 `OpenAI`'s Decisions API is **not implemented**. Keep tool execution out of the engine;
 in particular, a retry must not repeat a partially successful batch's side
 effects. Do not

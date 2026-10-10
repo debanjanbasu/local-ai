@@ -1,7 +1,10 @@
+use llguidance::toktrie::SimpleVob;
 use local_metal::batch::CommandBatch;
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::MetalContext;
 use local_metal::sampling::GpuTopK;
+
+use crate::structured::Grammar;
 
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -28,6 +31,9 @@ pub struct Sampler {
     observed: Vec<bool>,
     candidates: Vec<usize>,
     rng: SplitMix64,
+    /// The request's response format, when it has one. Only target
+    /// selections consult it; [`Self::greedy_draft`] drops it.
+    grammar: Option<Box<Grammar>>,
 }
 
 impl Sampler {
@@ -39,7 +45,30 @@ impl Sampler {
             seen_tokens: Vec::new(),
             observed: vec![false; vocab_size],
             candidates: Vec::with_capacity(vocab_size),
+            grammar: None,
         }
+    }
+
+    /// Constrain every later selection to `grammar` (see [`crate::structured`]).
+    pub(crate) fn constrain(&mut self, grammar: Grammar) {
+        self.grammar = Some(Box::new(grammar));
+    }
+
+    /// Why the response-format grammar stopped this request, once it has.
+    /// A failed selection is reported as end-of-sequence so verification
+    /// stops there; the caller must check this before treating it as one.
+    pub(crate) fn grammar_failure(&self) -> Option<&str> {
+        self.grammar.as_deref().and_then(Grammar::failure)
+    }
+
+    /// For a constrained request that stopped at end-of-sequence (`eos`) or
+    /// otherwise: whether its answer is a complete document. End-of-sequence
+    /// is only selectable once the grammar accepts, so a complete answer is
+    /// one that ended there after its constraint began. `None` unconstrained.
+    pub(crate) fn response_format_complete(&self, eos: bool) -> Option<bool> {
+        self.grammar
+            .as_deref()
+            .map(|grammar| eos && grammar.answering() && grammar.failure().is_none())
     }
 
     pub fn observe(&mut self, tokens: &[u32]) {
@@ -54,11 +83,23 @@ impl Sampler {
         }
     }
 
+    /// The request's greedy proposal sampler for drafting. It never carries
+    /// the response-format grammar: drafts are unconstrained proposals that
+    /// the target's own masked selections verify, and drafting must not
+    /// advance the request's matcher.
     pub fn greedy_draft(&self) -> Self {
-        let mut draft = self.clone();
-        draft.params.temperature = 0.0;
-        draft.params.top_k = 1;
-        draft
+        Self {
+            params: SamplingParams {
+                temperature: 0.0,
+                top_k: 1,
+                ..self.params.clone()
+            },
+            seen_tokens: self.seen_tokens.clone(),
+            observed: self.observed.clone(),
+            candidates: self.candidates.clone(),
+            rng: self.rng.clone(),
+            grammar: None,
+        }
     }
 
     /// Select on the GPU, but keep penalty arithmetic, filtering and RNG on the CPU.
@@ -81,6 +122,12 @@ impl Sampler {
                 "logit row offset is unaligned or exceeds the buffer".into(),
             ));
         }
+        let Ok(mask) = self.grammar_mask() else {
+            return Ok(self.failed());
+        };
+        if let Some(mask) = &mask {
+            forbid(mask, &mut buffer.as_mut_slice::<f32>()[float_offset..end]);
+        }
         let keep = if self.greedy() {
             1
         } else if self.params.top_k == 0 {
@@ -88,23 +135,39 @@ impl Sampler {
         } else {
             self.params.top_k.min(vocab)
         };
-        if vocab <= topk.maximum_supported_k() || keep > topk.maximum_supported_k() {
-            return self.sample(&mut buffer.as_mut_slice::<f32>()[float_offset..end]);
-        }
-        self.apply_penalties(&mut buffer.as_mut_slice::<f32>()[float_offset..end]);
-        let mut batch = CommandBatch::new(context)?;
-        topk.encode(&mut batch, buffer, byte_offset, vocab, keep)?;
-        batch.commit_and_wait()?;
-        self.candidates.clear();
-        self.candidates.extend(
-            topk.candidates(keep)
-                .iter()
-                .map(|item| item.token_id as usize),
-        );
-        if self.greedy() {
-            return Ok(self.result(self.candidates[0] as u32));
-        }
-        self.sample_selected(&mut buffer.as_mut_slice::<f32>()[float_offset..end])
+        let token = if vocab <= topk.maximum_supported_k() || keep > topk.maximum_supported_k() {
+            self.select(
+                &mut buffer.as_mut_slice::<f32>()[float_offset..end],
+                mask.as_ref(),
+            )?
+        } else {
+            self.apply_penalties(&mut buffer.as_mut_slice::<f32>()[float_offset..end]);
+            let mut batch = CommandBatch::new(context)?;
+            topk.encode(&mut batch, buffer, byte_offset, vocab, keep)?;
+            batch.commit_and_wait()?;
+            self.candidates.clear();
+            self.candidates.extend(
+                topk.candidates(keep)
+                    .iter()
+                    .map(|item| item.token_id as usize),
+            );
+            if let Some(mask) = &mask {
+                // Forbidden tokens sit at -inf, behind every allowed one.
+                self.candidates
+                    .retain(|&index| mask.is_allowed(index as u32));
+            }
+            if self.candidates.is_empty() {
+                return Err(crate::Error::Sampling(
+                    "the response format allows no candidate token".into(),
+                ));
+            }
+            if self.greedy() {
+                self.candidates[0] as u32
+            } else {
+                self.sample_selected(&mut buffer.as_mut_slice::<f32>()[float_offset..end])?
+            }
+        };
+        Ok(self.finish(token, mask.as_ref()))
     }
 
     /// Greedy selection that also reports the winner's logit lead over the
@@ -128,9 +191,9 @@ impl Sampler {
                 "logit row offset is unaligned or exceeds the buffer".into(),
             ));
         }
-        if !self.greedy() {
+        if !self.greedy() || self.grammar.is_some() {
             return Err(crate::Error::Sampling(
-                "draft margins need a greedy sampler".into(),
+                "draft margins need an unconstrained greedy sampler".into(),
             ));
         }
         let logits = &mut buffer.as_mut_slice::<f32>()[float_offset..end];
@@ -178,16 +241,21 @@ impl Sampler {
     /// Whether selection is the plain argmax of the logits (`f32::total_cmp`
     /// order, ties to the lower id): greedy with no penalty to apply, which
     /// the GPU can select in place (see [`Self::greedy_result`]).
+    /// Never while a response-format grammar masks the selection: a
+    /// precomputed argmax of unmasked logits could be a forbidden token. The
+    /// answer can start mid-round (at `</think>`), so ask again per row.
     #[must_use]
     pub fn selects_argmax(&self) -> bool {
-        self.greedy() && !self.applies_penalties()
+        self.greedy()
+            && !self.applies_penalties()
+            && !self.grammar.as_deref().is_some_and(Grammar::masking)
     }
 
     /// What [`Self::sample_buffer`] returns for the argmax `token_id` selected
-    /// elsewhere. Only valid when [`Self::selects_argmax`].
-    #[must_use]
-    pub fn greedy_result(&self, token_id: u32) -> SamplingResult {
-        self.result(token_id)
+    /// elsewhere, recording the selection. Only valid when
+    /// [`Self::selects_argmax`]; a masking grammar fails the request instead.
+    pub fn greedy_result(&mut self, token_id: u32) -> SamplingResult {
+        self.finish(token_id, None)
     }
 
     const fn greedy(&self) -> bool {
@@ -202,13 +270,36 @@ impl Sampler {
                 self.observed.len()
             )));
         }
+        let Ok(mask) = self.grammar_mask() else {
+            return Ok(self.failed());
+        };
+        if let Some(mask) = &mask {
+            forbid(mask, logits);
+        }
+        let token = self.select(logits, mask.as_ref())?;
+        Ok(self.finish(token, mask.as_ref()))
+    }
+
+    /// Select from `logits`, already masked to `mask` when there is one.
+    fn select(&mut self, logits: &mut [f32], mask: Option<&SimpleVob>) -> crate::Result<u32> {
         self.apply_penalties(logits);
         if self.greedy() {
-            return Ok(self.result(argmax(logits)));
+            return Ok(argmax(logits));
         }
 
         self.candidates.clear();
-        self.candidates.extend(0..logits.len());
+        match mask {
+            Some(mask) => {
+                let candidates = &mut self.candidates;
+                mask.iter_set_entries(|index| candidates.push(index));
+                if candidates.is_empty() {
+                    return Err(crate::Error::Sampling(
+                        "the response format allows no token".into(),
+                    ));
+                }
+            }
+            None => self.candidates.extend(0..logits.len()),
+        }
         let keep = if self.params.top_k == 0 {
             logits.len()
         } else {
@@ -225,7 +316,7 @@ impl Sampler {
         self.sample_selected(logits)
     }
 
-    fn sample_selected(&mut self, logits: &mut [f32]) -> crate::Result<SamplingResult> {
+    fn sample_selected(&mut self, logits: &mut [f32]) -> crate::Result<u32> {
         let inverse_temperature = self.params.temperature.recip();
         let maximum = logits[self.candidates[0]] * inverse_temperature;
         let mut denominator = 0.0_f32;
@@ -270,7 +361,45 @@ impl Sampler {
                 break;
             }
         }
-        Ok(self.result(selected as u32))
+        Ok(selected as u32)
+    }
+
+    /// The mask for this target selection: `Ok(None)` when nothing masks it,
+    /// `Err(())` once the grammar has failed (the failure is recorded on it).
+    fn grammar_mask(&mut self) -> Result<Option<SimpleVob>, ()> {
+        let Some(grammar) = self.grammar.as_deref_mut() else {
+            return Ok(None);
+        };
+        if grammar.failure().is_some() {
+            return Err(());
+        }
+        if !grammar.masking() {
+            return Ok(None);
+        }
+        grammar
+            .mask()
+            .map(Some)
+            .map_err(|error| grammar.fail(error))
+    }
+
+    /// The result of selecting `token_id` under `mask`, recorded on the
+    /// grammar exactly once.
+    fn finish(&mut self, token_id: u32, mask: Option<&SimpleVob>) -> SamplingResult {
+        let result = self.result(token_id);
+        let accepted = self
+            .grammar
+            .as_deref_mut()
+            .is_none_or(|grammar| grammar.select(token_id, result.is_eos, mask));
+        if accepted { result } else { self.failed() }
+    }
+
+    /// A selection the grammar refused: an end-of-sequence that stops the
+    /// round, which [`Self::grammar_failure`] turns into the request's error.
+    fn failed(&self) -> SamplingResult {
+        SamplingResult {
+            token_id: self.params.eos_tokens.first().copied().unwrap_or(0),
+            is_eos: true,
+        }
     }
 
     fn apply_penalties(&self, logits: &mut [f32]) {
@@ -330,6 +459,15 @@ where
         samples: results,
         accepted,
     })
+}
+
+/// Push every token `mask` forbids to -inf, so no selection can reach it.
+fn forbid(mask: &SimpleVob, logits: &mut [f32]) {
+    mask.iter_unset_entries(|index| {
+        if let Some(logit) = logits.get_mut(index) {
+            *logit = f32::NEG_INFINITY;
+        }
+    });
 }
 
 fn argmax(values: &[f32]) -> u32 {

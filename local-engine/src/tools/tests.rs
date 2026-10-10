@@ -109,6 +109,43 @@ fn replayed_results_render_in_call_order_whatever_order_they_arrive_in() {
 }
 
 #[test]
+fn renders_schema_and_argument_keys_sorted_whatever_order_the_client_sent() {
+    // Written in reverse order so that `serde_json/preserve_order` (enabled by
+    // any dependency) cannot change the prompt unnoticed.
+    let definition = tool(json!({
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "string"},
+            "filters": {
+                "type": "object",
+                "properties": {"z": {"type": "integer"}, "a": {"type": "object"}}
+            }
+        }
+    }));
+    let calls = [call(
+        "a",
+        &definition.name,
+        json!({"query": "café", "filters": {"z": 1, "a": {"y": [{"b": 2, "a": 1}], "x": null}}}),
+    )];
+    let turns = [
+        turn("user", "go"),
+        Turn {
+            tool_calls: &calls,
+            ..turn("assistant", "")
+        },
+        result("a", "ok"),
+    ];
+    let rendered = render(&turns, false, &tools(&[definition])).expect("render");
+    assert!(rendered.contains(
+        "\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"f\", \"parameters\": {\"properties\": {\"filters\": {\"properties\": {\"a\": {\"type\": \"object\"}, \"z\": {\"type\": \"integer\"}}, \"type\": \"object\"}, \"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"type\": \"object\"}}}\n</tools>\n"
+    ), "{rendered}");
+    assert!(rendered.contains(
+        "<tool_call>\n<function=f>\n<parameter=filters>\n{\"a\": {\"x\": null, \"y\": [{\"a\": 1, \"b\": 2}]}, \"z\": 1}\n</parameter>\n<parameter=query>\ncafé\n</parameter>\n</function>\n</tool_call>"
+    ), "{rendered}");
+}
+
+#[test]
 fn renders_an_empty_answer_call_and_a_later_user_turn_without_thinking() {
     let calls = [call("a", "search", json!({}))];
     let turns = [

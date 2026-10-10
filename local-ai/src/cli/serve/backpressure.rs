@@ -89,6 +89,24 @@ pub(super) fn send_frame(
     }
 }
 
+/// Run `future` to completion on this blocking thread, parked between polls.
+///
+/// For waits on Tokio's synchronisation primitives from a pump thread, the
+/// same way [`send_frame`] waits on its channel: whatever completes the future
+/// calls the waker, which unparks this thread, so nothing polls on a timer and
+/// no runtime is needed.
+pub(super) fn park_until<F: std::future::Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        thread::park();
+    }
+}
+
 /// Unparks the pump thread waiting in [`send_frame`].
 ///
 /// Called from whichever thread frees the slot or drops the receiver, so the

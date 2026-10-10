@@ -19,6 +19,9 @@ half.workspace = true
 # Tool argument schemas. No default features: no HTTP or file `$ref`
 # retrieval (and no `idna`), so validation never leaves the process.
 jsonschema = { version = "0.58.6", default-features = false }
+# Schema-constrained decoding. No default features: no `referencing`
+# (remote/file `$ref` retrieval), no rayon thread pool, no Lark front end.
+llguidance = { version = "=1.9.1", default-features = false }
 memmap2 = "0.9"
 objc2 = "0.6"
 objc2-metal = { version = "0.3", features = ["MTLBuffer", "MTLDevice"] }

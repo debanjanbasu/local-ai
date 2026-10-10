@@ -22,11 +22,13 @@ mod background;
 mod backpressure;
 mod chunked;
 mod http3;
+mod journal;
 mod options;
 mod reasoning_crypto;
 mod request;
 mod response;
 mod responses;
+mod resume;
 mod sse;
 mod store;
 
@@ -48,8 +50,9 @@ use self::response::{
     json_response, queue_full_response, wants_zstd,
 };
 use self::responses::prepare_responses_with;
+use self::resume::Retrieval;
 use self::sse::start_stream;
-use self::store::{ItemPage, PageError, ResponseStore, query_pairs};
+use self::store::{ItemPage, PageError, ResponseStore};
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
@@ -291,17 +294,41 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         )
         .await;
     }
+    let responses = matches!(&protocol, Protocol::Responses(_));
     let reply = Reply::new(protocol, Arc::clone(&state.model));
-    let events = match request {
-        GenerationRequest::Chat(request) => state.engine.chat(request),
-        GenerationRequest::Completion(request) => state.engine.complete(request),
-    };
+    // Submission compiles a structured response format synchronously before
+    // queueing (about half a second the first time, building the tokenizer's
+    // grammar tables), so it runs on the blocking pool, never on a runtime
+    // worker. A dropped request drops the stream, which cancels the job.
+    let engine = state.engine.clone();
+    let events = tokio::task::spawn_blocking(move || match request {
+        GenerationRequest::Chat(request) => engine.chat(request),
+        GenerationRequest::Completion(request) => engine.complete(request),
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(crate::Error::Generation(format!(
+            "request submission failed: {error}"
+        )))
+    });
     let events = match events {
         Ok(events) => events,
         Err(error) => {
             if matches!(error, crate::Error::QueueFull) {
                 return queue_full_response(&state, &parts.headers).await;
             }
+            // The native API names its field response_format; Responses
+            // clients need the corresponding field in their own request.
+            let error = match error {
+                crate::Error::InvalidArgument(message) if responses => {
+                    crate::Error::InvalidArgument(message.replacen(
+                        "invalid response_format:",
+                        "invalid text.format:",
+                        1,
+                    ))
+                }
+                other => other,
+            };
             return error_response(
                 error_status(&error),
                 &error.to_string(),
@@ -315,9 +342,21 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     if background {
         // Not waiting for the first event: a pre-generation failure becomes a
         // `failed` status on the stored response, not this request's status.
-        let started =
-            background::start(Arc::clone(&state.background), events, reply, admitted).await;
+        let started = background::start(
+            Arc::clone(&state.background),
+            events,
+            reply,
+            admitted,
+            stream,
+        )
+        .await;
         return match started {
+            Ok(queued) if stream => {
+                // The client follows the journal from its first event; going
+                // away only ends this stream, never the job.
+                let id = queued["id"].as_str().unwrap_or_default().to_owned();
+                stream_events(&state, id, None, &parts.headers).await
+            }
             Ok(queued) => json_response(StatusCode::OK, queued, &state, &parts.headers).await,
             Err((status, message)) => {
                 error_response(status, &message, &state, &parts.headers).await
@@ -326,19 +365,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     }
     if stream {
         match start_stream(events, reply, admitted, state.stall).await {
-            Ok(events) => {
-                let mut response = Response::new(Body::from_stream(ReceiverStream::new(events)));
-                response.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    header::HeaderValue::from_static("text/event-stream"),
-                );
-                response.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    header::HeaderValue::from_static("no-cache"),
-                );
-                add_alt_svc(&mut response, &state);
-                response
-            }
+            Ok(events) => event_stream(events, &state),
             Err(error) => {
                 error_response(error_status_message(&error), &error, &state, &parts.headers).await
             }
@@ -370,6 +397,54 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
                 error_response(error_status_message(&error), &error, &state, &parts.headers).await
             }
         }
+    }
+}
+
+/// A `text/event-stream` response whose frames arrive on `frames`.
+fn event_stream(
+    frames: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    state: &AppState,
+) -> Response {
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(frames)));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
+    add_alt_svc(&mut response, state);
+    response
+}
+
+/// Stream background response `id`'s events after `after`, or answer with
+/// the status that refuses it before any stream starts.
+async fn stream_events(
+    state: &AppState,
+    id: String,
+    after: Option<u64>,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    let not_found = format!("response with id {id:?} not found");
+    let Some(store) = state.responses.clone() else {
+        let message = format!("{not_found}: this server was started without --response-store");
+        return error_response(StatusCode::NOT_FOUND, &message, state, headers).await;
+    };
+    let background = Arc::clone(&state.background);
+    let subscribed =
+        tokio::task::spawn_blocking(move || resume::subscribe(&background, &store, &id, after))
+            .await
+            .unwrap_or_else(|error| {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("response store task failed: {error}"),
+                ))
+            });
+    match subscribed {
+        Ok(Some(subscription)) => event_stream(resume::start(subscription, state.stall), state),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, &not_found, state, headers).await,
+        Err((status, message)) => error_response(status, &message, state, headers).await,
     }
 }
 
@@ -440,7 +515,11 @@ async fn stored_response(
         return error_response(StatusCode::NOT_FOUND, &message, state, headers).await;
     };
     let outcome = match stored_request(method, items, query) {
-        Ok(page) => {
+        Ok(Retrieval::Stream(after)) => {
+            return stream_events(state, id.to_owned(), after, headers).await;
+        }
+        Ok(retrieval) => {
+            let page = retrieval.into_page();
             let (id, method) = (id.to_owned(), method.clone());
             let background = Arc::clone(&state.background);
             tokio::task::spawn_blocking(move || {
@@ -469,49 +548,23 @@ async fn stored_response(
     }
 }
 
-/// Validate the query of a stored-response request, returning the page to
-/// list for `input_items`.
+/// Validate the query of a stored-response request.
 ///
-/// Retrieval supports neither `stream` nor `starting_after`: both replay a
-/// background response's events, and background responses are not streamed.
-/// `include` has nothing to add. Other parameters are ignored.
-fn stored_request(
-    method: &Method,
-    items: bool,
-    query: Option<&str>,
-) -> Result<Option<ItemPage>, String> {
+/// `GET /v1/responses/{id}` streams with `stream=true`, resuming after
+/// `starting_after` (see [`resume::retrieval`]); `include` has nothing to
+/// add. Other parameters are ignored.
+fn stored_request(method: &Method, items: bool, query: Option<&str>) -> Result<Retrieval, String> {
     if items {
         return ItemPage::parse(query)
-            .map(Some)
+            .map(Retrieval::Items)
             .map_err(|error| match error {
                 PageError::Invalid(message) | PageError::AfterNotFound(message) => message,
             });
     }
     if *method == Method::GET {
-        for (key, value) in query_pairs(query) {
-            match key.as_str() {
-                "stream" if value == "true" => {
-                    return Err("stream is not supported: responses, background ones \
-                                included, are stored as documents, not as event streams \
-                                to replay"
-                        .into());
-                }
-                "starting_after" => {
-                    return Err("starting_after is not supported: it resumes a streamed \
-                                retrieval, which this server does not offer"
-                        .into());
-                }
-                "include" | "include[]" if !value.is_empty() => {
-                    return Err(format!(
-                        "include {value:?} is not supported: there are no logprobs, encrypted \
-                         reasoning or tool outputs to add"
-                    ));
-                }
-                _ => {}
-            }
-        }
+        return resume::retrieval(query);
     }
-    Ok(None)
+    Ok(Retrieval::Document)
 }
 
 /// The answer to a successful `DELETE /v1/responses/{id}`.
@@ -692,3 +745,7 @@ mod store_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod background_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod resume_tests;

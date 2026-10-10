@@ -1,12 +1,22 @@
 //! Background Responses: `POST /v1/responses` with `background: true`.
 //!
-//! The supported subset is non-streaming and stored. The request returns the
-//! `queued` Response once the engine has admitted the job and that Response is
-//! durably in the store; a pump thread then drains the generation, independent
-//! of any HTTP client, and persists `in_progress` on the first progress or
-//! event and one terminal state: `completed`, `incomplete`, `failed` or
-//! `cancelled`. `GET /v1/responses/{id}` reads the store, so it reports the
-//! latest durable status, from this server or another sharing the directory.
+//! Background responses are stored. The request returns the `queued` Response
+//! once the engine has admitted the job and that Response is durably in the
+//! store; a pump thread then drains the generation, independent of any HTTP
+//! client, and persists `in_progress` on the first progress or event and one
+//! terminal state: `completed`, `incomplete`, `failed` or `cancelled`.
+//! `GET /v1/responses/{id}` reads the store, so it reports the latest durable
+//! status, from this server or another sharing the directory.
+//!
+//! With `stream: true` the job also keeps a numbered event journal (see
+//! [`super::journal`]): `response.created` and `response.queued` with the
+//! `queued` Response, `response.in_progress` once the engine signals, the
+//! output events, and the events that end the stream. Every batch is appended,
+//! under the job's lock, before [`Published`] tells subscribers it exists, and
+//! the end is appended only once the terminal record is durable, so no
+//! subscriber ever sees an end the store does not hold. Subscribers (see
+//! [`super::resume`]) only read; one that disconnects or stalls never cancels
+//! or slows the job.
 //!
 //! Every write and every state change of one job happens under that job's
 //! lock, so the pump, `cancel`, `DELETE` and shutdown settle it exactly once:
@@ -27,6 +37,7 @@ use tokio::sync::watch;
 use local_engine::{EventStream, Signal};
 
 use super::Admitted;
+use super::journal::{JournalWriter, terminal_events};
 use super::response::{Protocol, Reply};
 use super::responses::ResponsesState;
 use super::store::{ResponseLease, ResponseStore};
@@ -69,16 +80,37 @@ impl Default for Background {
     }
 }
 
+/// How much of a streamed job's journal subscribers may read, and whether
+/// any more is coming.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Published {
+    /// Bytes of whole, flushed event batches in the journal.
+    pub(super) bytes: u64,
+    /// The job has settled: nothing more will be appended.
+    pub(super) settled: bool,
+    /// The response was deleted: subscribers stop at once.
+    pub(super) deleted: bool,
+    /// A failed write left the journal past `bytes` unknown: subscribers send
+    /// what was published and stop without deriving an end, which a replay
+    /// after the job is gone numbers from the journal as it is.
+    pub(super) torn: bool,
+}
+
 /// One background Response and the lock that serialises its settlement.
 struct Job {
     state: Mutex<Inner>,
     /// Cooperatively cancels the native work.
     stop: Box<dyn Fn() + Send + Sync>,
+    /// What subscribers clone to follow the journal; it never waits itself.
+    watcher: watch::Receiver<Published>,
 }
 
 struct Inner {
     doc: ResponsesState,
     phase: Phase,
+    /// The event journal, for a job created with `stream: true`.
+    journal: Option<JournalWriter>,
+    published: watch::Sender<Published>,
 }
 
 enum Phase {
@@ -99,15 +131,62 @@ impl Inner {
         matches!(self.phase, Phase::Queued | Phase::InProgress)
     }
 
+    /// Append `events` to the journal and tell subscribers. Nothing without
+    /// a journal. `Err` once the journal cannot be written.
+    fn append(&mut self, events: Vec<Value>) -> Result<(), String> {
+        let Some(journal) = self.journal.as_mut() else {
+            return Ok(());
+        };
+        if let Err(error) = journal.append(events) {
+            if journal.torn() {
+                self.published
+                    .send_if_modified(|published| !std::mem::replace(&mut published.torn, true));
+            }
+            let message = format!("the response's events could not be stored: {error}");
+            eprintln!("background response {}: {message}", self.doc.id());
+            return Err(message);
+        }
+        let bytes = journal.bytes();
+        self.published
+            .send_modify(|published| published.bytes = bytes);
+        Ok(())
+    }
+
+    /// Journal the events the document has produced since the last call.
+    fn publish(&mut self) -> Result<(), String> {
+        let events = self.doc.take_events();
+        self.append(events)
+    }
+
+    /// Journal the end of `response`, which is durable, fully flushed.
+    fn publish_end(&mut self, response: &Value) {
+        if self.append(terminal_events(response)).is_ok()
+            && let Some(journal) = &self.journal
+            && let Err(error) = journal.sync()
+        {
+            eprintln!(
+                "background response {}: event journal not flushed: {error}",
+                self.doc.id()
+            );
+        }
+    }
+
     /// Persist the terminal `response` and settle on it.
     ///
-    /// When it cannot be written the job settles `failed` instead, and that is
+    /// The output events before the end are journaled first, the record is
+    /// written, and only then the end, derived from that record. When the
+    /// record cannot be written the job settles `failed` instead, and that is
     /// written if it can; if neither can be, the record is removed rather than
     /// left claiming work that is no longer running. `Err` carries why the
     /// intended state is not durable.
     fn settle(&mut self, response: Value) -> Result<Value, String> {
-        match self.doc.save(&response) {
+        self.doc.retract_end();
+        // A journal failure here leaves the record to decide; readers then
+        // derive the end from it.
+        let _ = self.publish();
+        let settled = match self.doc.save(&response) {
             Ok(()) => {
+                self.publish_end(&response);
                 self.phase = Phase::Settled(response.clone());
                 Ok(response)
             }
@@ -116,6 +195,8 @@ impl Inner {
                 let message = format!("the response could not be stored: {error}");
                 eprintln!("background response {id}: {message}");
                 let failed = self.doc.fail(&message);
+                self.doc.retract_end();
+                let _ = self.publish();
                 if let Err(error) = self.doc.save(&failed) {
                     eprintln!("background response {id}: failure not stored either: {error}");
                     if let Some(store) = self.doc.store() {
@@ -123,11 +204,15 @@ impl Inner {
                     }
                     self.phase = Phase::StoreFailed(message.clone());
                 } else {
+                    self.publish_end(&failed);
                     self.phase = Phase::Settled(failed);
                 }
                 Err(message)
             }
-        }
+        };
+        self.published
+            .send_modify(|published| published.settled = true);
+        settled
     }
 }
 
@@ -154,12 +239,24 @@ impl Job {
                 (self.stop)();
                 return;
             }
+            inner.doc.started();
             inner.phase = Phase::InProgress;
         }
-        if let Signal::Event(event) = signal
-            && let Some(done) = inner.doc.event(event)
-            && inner.settle(done).is_err()
-        {
+        let done = match signal {
+            Signal::Event(event) => inner.doc.event(event),
+            Signal::Progress(_) => None,
+        };
+        let failed = match done {
+            Some(done) => inner.settle(done).is_err(),
+            None => inner.publish().is_err_and(|message| {
+                // Subscribers can no longer be told what was generated, so the
+                // job ends here rather than run on unobserved.
+                let failed = inner.doc.fail(&message);
+                let _ = inner.settle(failed);
+                true
+            }),
+        };
+        if failed {
             drop(inner);
             (self.stop)();
         }
@@ -205,6 +302,10 @@ impl Job {
         let found = store.delete(id).map_err(|error| store_failed(&error))?;
         let pending = inner.pending();
         inner.phase = Phase::Deleted;
+        inner.journal = None;
+        inner
+            .published
+            .send_modify(|published| published.deleted = true);
         drop(inner);
         if pending {
             (self.stop)();
@@ -235,6 +336,7 @@ impl Pump {
             let failed = inner.doc.fail(STOPPED_MESSAGE);
             let _ = inner.settle(failed);
         }
+        inner.journal = None;
         drop(inner);
         // The worker has let go of the request: release the native slot and
         // the lease, then stop answering for the job here.
@@ -258,14 +360,42 @@ impl Background {
         self.registry.borrow().jobs.get(id).cloned()
     }
 
+    /// Follow the journal of job `id`, when this server is running it.
+    pub(super) fn watch(&self, id: &str) -> Option<watch::Receiver<Published>> {
+        self.job(id).map(|job| job.watcher.clone())
+    }
+
+    /// Make every later journal write of job `id` fail.
+    #[cfg(test)]
+    pub(super) fn break_journal(&self, store: &ResponseStore, id: &str) {
+        if let (Some(job), Some(path)) = (self.job(id), store.journal_file(id))
+            && let Some(journal) = job.lock().journal.as_mut()
+        {
+            let _ = journal.break_for_test(&path);
+        }
+    }
+
+    /// Make the next journal write of job `id` leave whole lines behind and
+    /// fail to roll them back.
+    #[cfg(test)]
+    pub(super) fn tear_journal(&self, store: &ResponseStore, id: &str) {
+        if let (Some(job), Some(path)) = (self.job(id), store.journal_file(id))
+            && let Some(journal) = job.lock().journal.as_mut()
+        {
+            journal.tear_for_test(&path);
+        }
+    }
+
     /// Take the lease, durably store `doc` as `queued` and register the job.
     ///
     /// `next` yields the engine's signals and `None` once the native work has
     /// released the request; `stop` cancels it. On failure both are dropped,
-    /// which cancels the native work. Blocks on the store.
+    /// which cancels the native work. A streaming `doc` gets its journal,
+    /// holding its opening events, before the record is written. Blocks on
+    /// the store.
     pub(super) fn admit(
         self: &Arc<Self>,
-        doc: ResponsesState,
+        mut doc: ResponsesState,
         next: impl FnMut() -> Option<Signal> + Send + 'static,
         stop: impl Fn() + Send + Sync + 'static,
         admitted: Option<Admitted>,
@@ -289,20 +419,43 @@ impl Background {
                     format!("response {id} is already leased"),
                 )
             })?;
+        let not_stored = |error: std::io::Error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the background response could not be stored: {error}"),
+            )
+        };
+        let journal = if doc.streaming() {
+            doc.start_queued();
+            match store.create_journal(&id, doc.take_events()) {
+                Ok(journal) => Some(journal),
+                Err(error) => {
+                    stop();
+                    return Err(not_stored(error));
+                }
+            }
+        } else {
+            None
+        };
         let queued = doc.snapshot("queued");
         if let Err(error) = doc.save(&queued) {
             stop();
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("the background response could not be stored: {error}"),
-            ));
+            let _ = store.delete(&id);
+            return Err(not_stored(error));
         }
+        let (published, watcher) = watch::channel(Published {
+            bytes: journal.as_ref().map_or(0, JournalWriter::bytes),
+            ..Published::default()
+        });
         let job = Arc::new(Job {
             state: Mutex::new(Inner {
                 doc,
                 phase: Phase::Queued,
+                journal,
+                published,
             }),
             stop: Box::new(stop),
+            watcher,
         });
         let mut registered = false;
         self.registry.send_modify(|registry| {
@@ -365,6 +518,10 @@ impl Background {
             store
                 .save(&stored.response, &stored.input_items)
                 .map_err(|error| store_failed(&error))?;
+            if let Err(error) = store.seal_journal(id, &stored.response) {
+                // Readers derive the same end from the record.
+                eprintln!("response {id}: event journal not sealed: {error}");
+            }
         }
         Ok(Some(stored.response))
     }
@@ -409,7 +566,7 @@ pub(super) fn delete_unowned(store: &ResponseStore, id: &str) -> Result<bool, Fa
     store.delete(id).map_err(|error| store_failed(&error))
 }
 
-fn pending(response: &Value) -> bool {
+pub(super) fn pending(response: &Value) -> bool {
     matches!(
         response.get("status").and_then(Value::as_str),
         Some("queued" | "in_progress")
@@ -431,7 +588,8 @@ fn lease_or_conflict(store: &ResponseStore, id: &str) -> Result<ResponseLease, F
         })
 }
 
-/// Start `events` as a background job and return its `queued` Response.
+/// Start `events` as a background job and return its `queued` Response;
+/// with `stream`, the job journals its events for [`super::resume`].
 ///
 /// The pump runs on the blocking pool, where it parks on the engine channel
 /// between signals; it owns `events`, the lease and `admitted` until the
@@ -441,6 +599,7 @@ pub(super) async fn start(
     mut events: EventStream,
     reply: Reply,
     admitted: Admitted,
+    stream: bool,
 ) -> Result<Value, Failure> {
     let Protocol::Responses(echo) = &reply.protocol else {
         return Err((
@@ -448,7 +607,7 @@ pub(super) async fn start(
             "only Responses run in the background".to_owned(),
         ));
     };
-    let doc = ResponsesState::new(&reply, Arc::clone(echo), false);
+    let doc = ResponsesState::new(&reply, Arc::clone(echo), stream);
     let cancel = events.cancel_handle();
     // No deadline: the job has no client to stall, and a closed channel is `None`.
     let next = move || events.next_signal(None).ok().flatten();

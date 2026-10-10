@@ -233,6 +233,38 @@ pub(super) const fn chat_finish_reason(
     }
 }
 
+/// Why a generation that stopped at end-of-sequence still has no complete
+/// structured answer, or `None` when it has one or was unconstrained.
+///
+/// The engine only allows end-of-sequence in a constrained answer once the
+/// document is complete, so an incomplete one that ended there ended during
+/// reasoning, before the answer began. No API has a finish reason for that,
+/// and `stop`/`completed` would claim a valid document, so it is reported as
+/// a failure. A token limit or cancellation keeps its own status
+/// (`length`/`incomplete`, `cancelled`/`failed`), which already says the
+/// answer was cut short.
+pub(super) fn unfinished_format(stats: &Stats) -> Option<&'static str> {
+    (stats.stop_reason == crate::bonsai_model::StopReason::Eos
+        && stats.generation.response_format_complete == Some(false))
+    .then_some(
+        "the model ended its turn during reasoning, before the answer the response format \
+         requires; no structured output was produced",
+    )
+}
+
+/// An engine event as a Chat or Completions client may be told it: a
+/// `Finished` without the complete structured answer it promises becomes the
+/// error it is (see [`unfinished_format`]).
+pub(super) fn checked(event: local_engine::Event) -> local_engine::Event {
+    match event {
+        local_engine::Event::Finished(stats) => unfinished_format(&stats).map_or_else(
+            || local_engine::Event::Finished(stats),
+            |message| local_engine::Event::Error(message.into()),
+        ),
+        other => other,
+    }
+}
+
 /// Seconds since the Unix epoch, for the `created` members.
 pub(super) fn unix_now() -> u64 {
     SystemTime::now()

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
-use local_engine::{ChatRequest, Event, GenerationStats, PrefillProgress, Signal, Stats, ToolCall};
+use local_engine::{
+    ChatRequest, Event, GenerationStats, PrefillProgress, ResponseFormat, Signal, Stats, ToolCall,
+};
 
 use super::chunked::{Body, Flow, absorb};
 use super::request::{GenerationRequest, prepare_generation};
@@ -176,14 +178,6 @@ fn chat_rejects_options_it_cannot_honour() {
         (json!({"n":2}), "n is not supported"),
         (json!({"stop":["\n"]}), "stop"),
         (json!({"logprobs":true}), "logprobs"),
-        (
-            json!({"response_format":{"type":"json_schema","json_schema":{}}}),
-            "response_format",
-        ),
-        (
-            json!({"response_format":{"type":"json_object"}}),
-            "response_format",
-        ),
         (json!({"functions":[{"name":"f"}]}), "functions"),
         (json!({"parallel_tool_calls":false}), "parallel_tool_calls"),
         (json!({"service_tier":"flex"}), "service_tier"),
@@ -548,10 +542,6 @@ fn responses_reject_what_they_cannot_honour() {
         (
             json!({"input":"hi","tool_choice":{"type":"function","name":"f"}}),
             "constrained decoding",
-        ),
-        (
-            json!({"input":"hi","text":{"format":{"type":"json_schema","name":"x","schema":{}}}}),
-            "text.format",
         ),
         (
             json!({"input":"hi","reasoning":{"effort":"high"}}),
@@ -1049,4 +1039,311 @@ fn models_report_the_admitted_context() {
     assert_eq!(models["data"][0]["created"], 1234);
     assert_eq!(models["data"][0]["context_length"], 32768);
     assert_eq!(models["data"][0]["max_model_len"], 32768);
+}
+
+fn structured_stats(stop_reason: StopReason, complete: bool) -> Box<Stats> {
+    let mut stats = stats(stop_reason);
+    stats.generation.response_format_complete = Some(complete);
+    stats
+}
+
+fn schema() -> Value {
+    json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})
+}
+
+#[test]
+fn chat_response_format_maps_onto_the_native_format() {
+    let format = |format: Value| {
+        let mut body = json!({"messages":[user()]});
+        body["response_format"] = format;
+        chat_request(&body, true).map(|request| request.response_format)
+    };
+    assert_eq!(
+        chat_request(&json!({"messages":[user()]}), true)
+            .expect("valid")
+            .response_format,
+        ResponseFormat::Text
+    );
+    assert_eq!(format(Value::Null).expect("null"), ResponseFormat::Text);
+    assert_eq!(
+        format(json!({"type":"text"})).expect("text"),
+        ResponseFormat::Text
+    );
+    assert_eq!(
+        format(json!({"type":"json_object"})).expect("json_object"),
+        ResponseFormat::JsonObject
+    );
+    // `strict` is accepted either way and never relaxes enforcement.
+    for strict in [json!(true), json!(false), Value::Null] {
+        let format = format(json!({"type":"json_schema","json_schema":{
+            "name":"Weather_1-x","description":"d","schema":schema(),"strict":strict}}))
+        .expect("json_schema");
+        assert_eq!(format, ResponseFormat::JsonSchema(schema()));
+    }
+}
+
+#[test]
+fn chat_response_format_envelope_is_strict() {
+    let long = "n".repeat(65);
+    for (format, needle) in [
+        (json!("json_object"), "response_format must be an object"),
+        (json!({}), "response_format.type is required"),
+        (json!({"type":1}), "response_format.type must be a string"),
+        (
+            json!({"type":"grammar"}),
+            "type \"grammar\" is not supported",
+        ),
+        (
+            json!({"type":"text","schema":{}}),
+            "unknown field response_format.schema",
+        ),
+        (
+            json!({"type":"json_object","strict":true}),
+            "unknown field response_format.strict",
+        ),
+        (
+            json!({"type":"json_schema"}),
+            "response_format.json_schema is required",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":[]}),
+            "json_schema must be an object",
+        ),
+        // The Responses shape is not the Chat one.
+        (
+            json!({"type":"json_schema","name":"x","schema":schema()}),
+            "unknown field response_format.name",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"schema":schema()}}),
+            "response_format.json_schema.name is required",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"name":"a b","schema":schema()}}),
+            "must be 1 to 64 characters",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"name":long,"schema":schema()}}),
+            "must be 1 to 64 characters",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"name":"x"}}),
+            "response_format.json_schema.schema is required",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"name":"x","schema":true}}),
+            "schema must be a JSON Schema object",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"name":"x","schema":{},"strict":"yes"}}),
+            "strict must be a boolean",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"name":"x","schema":{},"description":1}}),
+            "description must be a string",
+        ),
+        (
+            json!({"type":"json_schema","json_schema":{"name":"x","schema":{},"extra":1}}),
+            "unknown field response_format.json_schema.extra",
+        ),
+    ] {
+        let error = chat_error(&json!({"messages":[user()],"response_format":format}));
+        assert!(error.contains(needle), "{format}: {error}");
+    }
+}
+
+#[test]
+fn structured_formats_refuse_tools_the_model_is_shown() {
+    let tools = json!([{"type":"function","function":{"name":"weather"}}]);
+    let body = json!({"messages":[user()],"tools":tools,"response_format":{"type":"json_object"}});
+    assert!(chat_error(&body).contains("cannot be combined with tools"));
+    let mut withheld = body;
+    withheld["tool_choice"] = json!("none");
+    let request = chat_request(&withheld, true).expect("tools withheld");
+    assert_eq!(request.tools.len(), 0);
+    assert_eq!(request.response_format, ResponseFormat::JsonObject);
+    let text = json!({"messages":[user()],"tools":tools,"response_format":{"type":"text"}});
+    assert_eq!(chat_request(&text, true).expect("text").tools.len(), 1);
+
+    let tools = json!([{"type":"function","name":"weather"}]);
+    let body = json!({"input":"hi","tools":tools,
+        "text":{"format":{"type":"json_schema","name":"w","schema":schema()}}});
+    assert!(responses_error(&body).contains("text.format other than text cannot be combined"));
+    let mut withheld = body;
+    withheld["tool_choice"] = json!("none");
+    assert!(prepare_responses(withheld.to_string().as_bytes(), true).is_ok());
+}
+
+#[test]
+fn legacy_completions_keep_refusing_structured_formats() {
+    for format in [
+        json!({"type":"json_object"}),
+        json!({"type":"json_schema","json_schema":{"name":"x","schema":schema()}}),
+    ] {
+        let body = json!({"prompt":"hi","response_format":format});
+        let error = prepare_generation(body.to_string().as_bytes(), false, true)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains("not legacy Completions"), "{error}");
+    }
+    for format in [json!({"type":"text"}), Value::Null] {
+        let body = json!({"prompt":"hi","response_format":format});
+        let prepared = prepare_generation(body.to_string().as_bytes(), false, true).expect("text");
+        let GenerationRequest::Completion(request) = prepared.request else {
+            unreachable!("completion")
+        };
+        assert_eq!(request.response_format, ResponseFormat::Text);
+    }
+}
+
+#[test]
+fn responses_text_format_maps_and_is_echoed_as_accepted() {
+    let terminal = |body: &Value| {
+        let mut frames = Frames::new(responses_reply(body));
+        let _ = frames.start();
+        let _ = frames.event(Event::Content("{}".into()));
+        let (out, _) = frames.event(Event::Finished(structured_stats(StopReason::Eos, true)));
+        sse_events(&out).last().expect("terminal").clone()
+    };
+    let plain = json!({"input":"hi"});
+    assert_eq!(
+        terminal(&plain)["response"]["text"],
+        json!({"format":{"type":"text"}})
+    );
+    let object = json!({"input":"hi","text":{"format":{"type":"json_object"}}});
+    let prepared = prepare_responses(object.to_string().as_bytes(), true).expect("valid");
+    assert_eq!(prepared.request.response_format, ResponseFormat::JsonObject);
+    assert_eq!(
+        terminal(&object)["response"]["text"]["format"],
+        json!({"type":"json_object"})
+    );
+    // `strict` is reported as sent, `false` when omitted; enforced either way.
+    let flat = json!({"input":"hi","text":{"format":{"type":"json_schema","name":"weather",
+        "description":"A city.","schema":schema()},"verbosity":"medium"}});
+    let prepared = prepare_responses(flat.to_string().as_bytes(), true).expect("valid");
+    assert_eq!(
+        prepared.request.response_format,
+        ResponseFormat::JsonSchema(schema())
+    );
+    let event = terminal(&flat);
+    assert_eq!(event["type"], "response.completed");
+    assert_eq!(
+        event["response"]["text"]["format"],
+        json!({"type":"json_schema","name":"weather","description":"A city.",
+            "schema":schema(),"strict":false})
+    );
+    let strict = json!({"input":"hi","text":{"format":{"type":"json_schema","name":"w",
+        "schema":schema(),"strict":true}}});
+    assert_eq!(
+        terminal(&strict)["response"]["text"]["format"]["strict"],
+        true
+    );
+}
+
+#[test]
+fn responses_text_format_envelope_is_strict() {
+    for (format, needle) in [
+        (json!("text"), "text.format must be an object"),
+        (json!({"type":"python"}), "type \"python\" is not supported"),
+        (
+            json!({"type":"text","name":"x"}),
+            "unknown field text.format.name",
+        ),
+        // The Chat shape is not the Responses one.
+        (
+            json!({"type":"json_schema","json_schema":{"name":"x","schema":schema()}}),
+            "unknown field text.format.json_schema",
+        ),
+        (
+            json!({"type":"json_schema","schema":schema()}),
+            "text.format.name is required",
+        ),
+        (
+            json!({"type":"json_schema","name":"x"}),
+            "text.format.schema is required",
+        ),
+        (
+            json!({"type":"json_schema","name":"x","schema":{},"strict":1}),
+            "text.format.strict must be a boolean",
+        ),
+    ] {
+        let error = responses_error(&json!({"input":"hi","text":{"format":format}}));
+        assert!(error.contains(needle), "{format}: {error}");
+    }
+}
+
+#[test]
+fn an_unfinished_structured_answer_is_never_reported_complete() {
+    let structured = json!({"input":"hi","text":{"format":{"type":"json_object"}}});
+    // End of turn during reasoning: no answer at all, so the Response fails.
+    let mut frames = Frames::new(responses_reply(&structured));
+    let _ = frames.start();
+    let _ = frames.event(Event::Reasoning("hmm".into()));
+    let (out, terminal) = frames.event(Event::Finished(structured_stats(StopReason::Eos, false)));
+    assert!(terminal);
+    let events = sse_events(&out);
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["type"], "response.failed");
+    assert_eq!(last["response"]["status"], "failed");
+    assert!(
+        last["response"]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("during reasoning"))
+    );
+    // The buffered body is the same failed document.
+    let body = body_bytes(
+        responses_reply(&structured),
+        vec![
+            Signal::Event(Event::Reasoning("hmm".into())),
+            Signal::Event(Event::Finished(structured_stats(StopReason::Eos, false))),
+        ],
+    );
+    let document: Value = serde_json::from_slice(&body).expect("a JSON document");
+    assert_eq!(document["status"], "failed");
+    // A token limit cut the answer short: incomplete, not completed.
+    let mut frames = Frames::new(responses_reply(&structured));
+    let _ = frames.start();
+    let _ = frames.event(Event::Content("{\"a\":".into()));
+    let (out, _) = frames.event(Event::Finished(structured_stats(
+        StopReason::TokenLimit,
+        false,
+    )));
+    let events = sse_events(&out);
+    let last = events.last().expect("terminal event");
+    assert_eq!(last["type"], "response.incomplete");
+    assert_eq!(last["response"]["output"][0]["status"], "incomplete");
+
+    // Chat: the stream ends on an error frame, never a `stop` finish.
+    let mut frames = Frames::new(chat_reply(true));
+    let _ = frames.event(Event::Reasoning("hmm".into()));
+    let (tail, terminal) = frames.event(Event::Finished(structured_stats(StopReason::Eos, false)));
+    assert!(terminal);
+    assert_eq!(tail.len(), 1, "{tail:?}");
+    let error = parse_data(&tail[0]);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("during reasoning")),
+        "{error}"
+    );
+    // The buffered Chat body is left truncated, not a short `stop` document.
+    let body = body_bytes(
+        chat_reply(false),
+        vec![
+            Signal::Event(Event::Reasoning("hmm".into())),
+            Signal::Event(Event::Finished(structured_stats(StopReason::Eos, false))),
+        ],
+    );
+    assert!(serde_json::from_slice::<Value>(&body).is_err());
+    // A token limit keeps `length`; a complete document is an ordinary `stop`.
+    for (stop, complete, reason) in [
+        (StopReason::TokenLimit, false, "length"),
+        (StopReason::Eos, true, "stop"),
+    ] {
+        let mut frames = Frames::new(chat_reply(false));
+        let _ = frames.event(Event::Content("{".into()));
+        let (tail, _) = frames.event(Event::Finished(structured_stats(stop, complete)));
+        assert_eq!(parse_data(&tail[0])["choices"][0]["finish_reason"], reason);
+    }
 }

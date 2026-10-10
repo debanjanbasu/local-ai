@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 use crate::bonsai::BonsaiPackage;
+use crate::structured::{Grammar, GrammarCompiler, ResponseFormat};
 
 pub const DEFAULT_REASONING_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
 
@@ -24,6 +25,8 @@ const THINK_END: u32 = 248_069;
 pub struct BonsaiTokenizer {
     inner: Arc<Tokenizer>,
     eos_ids: Vec<u32>,
+    /// Response-format compiler over these token bytes, built on first use.
+    grammar: Arc<GrammarCompiler>,
 }
 
 /// Everything the tokenizer needs from the checkpoint, in the shape
@@ -170,7 +173,29 @@ impl BonsaiTokenizer {
         Ok(Self {
             inner: Arc::new(inner),
             eos_ids: vec![eos],
+            grammar: Arc::default(),
         })
+    }
+
+    /// Compile `format` for one request before any of its prompt work.
+    /// With `reasoning`, the constraint starts after the closing `</think>`.
+    /// `None` for [`ResponseFormat::Text`].
+    pub(crate) fn compile_format(
+        &self,
+        format: &ResponseFormat,
+        reasoning: bool,
+    ) -> crate::Result<Option<Grammar>> {
+        self.compile_format_ending(format, reasoning.then_some(THINK_END))
+    }
+
+    /// [`Self::compile_format`] with an explicit reasoning delimiter.
+    pub(crate) fn compile_format_ending(
+        &self,
+        format: &ResponseFormat,
+        reasoning_end: Option<u32>,
+    ) -> crate::Result<Option<Grammar>> {
+        self.grammar
+            .compile(&self.inner, &self.eos_ids, format, reasoning_end)
     }
 
     #[doc(hidden)]
@@ -434,27 +459,48 @@ impl BonsaiTokenizer {
     /// The real pre-tokenizer/byte-level pipeline over a tiny vocabulary: the
     /// 256 byte symbols, merges `a b` and `ab c`, and one special token `<|x|>`.
     pub(crate) fn tiny_for_tests() -> Self {
+        Self::tiny_with_specials_for_tests(&["<|x|>"], &[])
+    }
+
+    /// [`Self::tiny_for_tests`] with `specials` (ids 258 on, in order) in
+    /// place of `<|x|>`, and the specials named in `eos` as end-of-sequence.
+    pub(crate) fn tiny_with_specials_for_tests(specials: &[&str], eos: &[&str]) -> Self {
         let mut symbols: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
             .into_iter()
             .collect();
         symbols.sort_unstable();
         let mut vocab: Vec<String> = symbols.iter().map(char::to_string).collect();
-        vocab.extend(["ab".into(), "abc".into(), "<|x|>".into()]);
-        let special = vocab.len() - 1;
+        vocab.extend(["ab".into(), "abc".into()]);
+        let first = vocab.len();
+        vocab.extend(specials.iter().map(|&special| special.to_owned()));
         let map = vocab
             .iter()
             .enumerate()
             .map(|(id, token)| (token.clone(), serde_json::Value::from(id)))
             .collect();
-        let added = vec![serde_json::json!({
-            "id": special, "content": "<|x|>", "single_word": false,
-            "lstrip": false, "rstrip": false, "normalized": false, "special": true
-        })];
+        let added = specials
+            .iter()
+            .enumerate()
+            .map(|(index, special)| {
+                serde_json::json!({
+                    "id": first + index, "content": special, "single_word": false,
+                    "lstrip": false, "rstrip": false, "normalized": false, "special": true
+                })
+            })
+            .collect();
         let definition = tokenizer_json(map, added, vec!["a b".into(), "ab c".into()]);
         let bytes = serde_json::to_vec(&definition).expect("json");
+        let eos_ids = eos
+            .iter()
+            .map(|name| {
+                let index = specials.iter().position(|special| special == name);
+                (first + index.expect("eos names a special")) as u32
+            })
+            .collect();
         Self {
             inner: Arc::new(Tokenizer::from_bytes(&bytes).expect("tiny tokenizer")),
-            eos_ids: vec![],
+            eos_ids,
+            grammar: Arc::default(),
         }
     }
 }

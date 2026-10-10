@@ -27,6 +27,7 @@ use super::{
     draft_depth,
 };
 use crate::bonsai_native::{HeadDraft, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState};
+use crate::structured::Grammar;
 
 mod policy;
 
@@ -143,6 +144,19 @@ impl BonsaiEngine {
         session_id: Option<&str>,
         cancel: CancelToken,
     ) -> crate::Result<u64> {
+        self.admit_constrained(prompt, params, session_id, cancel, None)
+    }
+
+    /// [`Self::admit`] under a compiled response format, which every
+    /// target selection of the request then obeys.
+    pub(crate) fn admit_constrained(
+        &mut self,
+        prompt: &[u32],
+        params: &GenerateParams,
+        session_id: Option<&str>,
+        cancel: CancelToken,
+        grammar: Option<Grammar>,
+    ) -> crate::Result<u64> {
         if self.active.len() >= MAX_BATCH_SEQUENCES {
             return Err(crate::Error::QueueFull);
         }
@@ -150,7 +164,7 @@ impl BonsaiEngine {
         let id = self.next_generation;
         self.make_room_for(id)?;
         self.claim_gpu_cache();
-        match self.begin_generation(id, prompt, params, session_id, cancel) {
+        match self.begin_generation(id, prompt, params, session_id, cancel, grammar) {
             Ok(generation) => {
                 self.active.push(generation);
                 Ok(id)
