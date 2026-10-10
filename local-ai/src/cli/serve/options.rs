@@ -48,8 +48,8 @@ pub(super) fn usage() {
     );
     eprintln!(
         "  --experimental-decision-head FILE  EXPERIMENTAL: serve POST /v1/experimental/decisions \
-         with this judgment head (probabilities only; no confidence or refusal; calibrated only \
-         for two-option code-diff questions; default: off)"
+         with this judgment head (probabilities only; no confidence or refusal; calibration \
+         provenance comes from the artifact, unknown when absent; default: off)"
     );
 }
 

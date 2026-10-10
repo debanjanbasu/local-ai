@@ -401,8 +401,8 @@ impl CommandBatch {
     }
 
     /// Submit the current batch, keep encoding into a fresh command buffer,
-    /// and defer the wait/error check until a later [`commit_and_wait`] or
-    /// [`commit_async`] on this batch.
+    /// and defer the wait/error check until a later [`Self::commit_and_wait`] or
+    /// [`Self::commit_async`] on this batch.
     ///
     /// # Errors
     ///

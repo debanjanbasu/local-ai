@@ -538,12 +538,13 @@ impl Engine {
     /// blocks, FP16-rounded and scored. The result carries the head's
     /// probabilities per caller option, the argmax and, for scores, the
     /// probability-weighted level index — no confidence, threshold or
-    /// refusal. The current head was trained on two-option code-diff
-    /// questions only; see
-    /// [`CALIBRATION_SCOPE`](crate::judgment::CALIBRATION_SCOPE).
+    /// refusal. It reports the head's own `calibration_scope` metadata, or
+    /// [`UNKNOWN_CALIBRATION_SCOPE`](crate::judgment::UNKNOWN_CALIBRATION_SCOPE)
+    /// when the artifact declares none.
     ///
     /// Invalid requests (including text spelling a special token) and a head
-    /// whose width is not the model's fail with
+    /// whose width is not the model's, or whose declared renderer is not
+    /// [`DECISION_RENDERER`](crate::judgment::DECISION_RENDERER), fail with
     /// [`crate::Error::InvalidArgument`] before any GPU work. A single-level
     /// score is answered without GPU work. Capture overwrites one sequence
     /// buffer set; the GPU prompt-cache tier is preserved when a free set
@@ -874,7 +875,7 @@ impl EventStream {
     /// silent-but-running generation both arrive as `None` from
     /// [`Iterator::next`], and a consumer that must give up on a wedged reader
     /// needs to tell them apart. A caller tracking that with a side flag has to
-    /// remember to clear it; [`RecvTimeoutError`] is std's own name for the
+    /// remember to clear it; [`RecvTimeoutError`](std::sync::mpsc::RecvTimeoutError) is std's own name for the
     /// same distinction, so the whole answer stays in the return type.
     ///
     /// Unlike [`Iterator::next`] this is safe to call from inside a runtime

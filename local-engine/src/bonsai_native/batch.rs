@@ -152,7 +152,7 @@ pub struct BatchRow<'a> {
     /// The token to decode at the sequence's position.
     pub token: u32,
     /// Draft tokens verified after `token` in the same pass. A sequence with
-    /// drafts advances only when [`BonsaiModel::commit_batch`] settles how
+    /// drafts advances only when `BonsaiModel::commit_batch` settles how
     /// many of its rows to keep.
     pub drafts: Vec<u32>,
     /// `None` for the resident sequence.
