@@ -369,9 +369,21 @@ neither a Decisions implementation nor an MTP upgrade: it does not touch
 speculative decoding. No production judgment head is supplied. Frozen Bonsai
 features may not match Kev's adapter-trained representations; Kev's labels are
 balanced by sampling, not natural rates. Larger held-out and out-of-domain
-results, refusal/confidence semantics, and a native loader remain prerequisites
-for Decisions. The existing
-MTP rollout data has no judgment labels and is not silently reused for this task.
+results, prompt/capture orchestration and refusal/confidence semantics remain
+prerequisites for Decisions. The existing MTP rollout data has no judgment
+labels and is not silently reused for this task.
+
+`judgment::JudgmentHead::open(path)` explicitly loads the experimental F32
+artifact; nothing discovers or activates it automatically. Its CPU-only
+`score(&features)` returns temperature-scaled logits and softmax probabilities
+in option order. Supply output-normalized, unrotated hidden states as flat
+position-major rows: at least two option rows, then the decision row. Check
+`width()` against the capture model, and round captured values through FP16
+to match the training representation. The loader checks format metadata,
+dimensions, tensor byte ranges and finite values. Native scoring matched an
+independent Python reference on two real captured examples within 1e-12.
+This validates the scoring formula, not judgment quality on new tasks or
+the calibration of returned probabilities outside the evaluation dataset.
 
 Acceptance should exercise native calls as well as HTTP: a complete read/edit/
 tool-result turn, malformed and interrupted arguments that cannot execute,
