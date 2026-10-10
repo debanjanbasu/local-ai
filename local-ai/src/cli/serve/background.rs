@@ -35,6 +35,23 @@
 //! retrievable, cancellable and replayable until [`TEMPORARY_RETENTION`]
 //! after it ends; a running job is never expired. Nothing about it is
 //! durable: a restart discards it.
+//!
+//! A durable job survives a crash or `kill -9`. Its record moves `queued`
+//! -> `in_progress` -> one terminal state, each durable, and while it is
+//! pending it keeps the request body it was created from. A pending record
+//! whose lease is free has lost its writer; [`Background::resume`] then
+//! regenerates it from that request under the lease, so of several servers
+//! sharing the directory exactly one resumes it and none while its writer
+//! lives. Generation state is not checkpointed: the job restarts from its
+//! original request, and a streamed one continues its journal after a
+//! documented restart boundary (see [`Background::resume`]). The server
+//! resumes jobs when it starts, before it serves, and one it finds orphaned
+//! later (another server sharing the store died) when a client retrieves it;
+//! a job the full engine queue defers is retried each time a queue slot is
+//! released. A job continuing a conversation, or recorded without its
+//! request, is settled `failed` instead. Graceful shutdown is unchanged: it
+//! settles running jobs `failed`, so only an interrupted process leaves work
+//! to resume.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -45,13 +62,14 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use local_engine::{EventStream, Signal};
+use local_engine::{ChatRequest, EventStream, Signal};
 
 use super::Admitted;
 use super::journal::{JournalWriter, terminal_events};
+use super::reasoning_crypto::ReasoningCipher;
 use super::response::{Protocol, Reply};
-use super::responses::ResponsesState;
-use super::store::{ResponseLease, ResponseStore};
+use super::responses::{ResponsesState, prepare_resumed};
+use super::store::{NO_REQUEST, ResponseLease, ResponseStore};
 
 /// What a stopped server reports for a job it did not finish.
 const SHUTDOWN_MESSAGE: &str =
@@ -232,6 +250,28 @@ impl Inner {
 }
 
 impl Job {
+    fn new(
+        doc: ResponsesState,
+        phase: Phase,
+        journal: Option<JournalWriter>,
+        stop: Box<dyn Fn() + Send + Sync>,
+    ) -> Arc<Self> {
+        let (published, watcher) = watch::channel(Published {
+            bytes: journal.as_ref().map_or(0, JournalWriter::bytes),
+            ..Published::default()
+        });
+        Arc::new(Self {
+            state: Mutex::new(Inner {
+                doc,
+                phase,
+                journal,
+                published,
+            }),
+            stop,
+            watcher,
+        })
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -329,6 +369,20 @@ impl Job {
     }
 }
 
+/// How [`Background::resume`] left an interrupted response.
+pub(super) enum Resumed {
+    /// It runs here again; the caller runs the pump.
+    Started(Pump),
+    /// Nothing is left to resume: it runs here already, ended, is gone, or
+    /// could not be resumed and was settled saying why.
+    Settled,
+    /// A live writer, in this process or another, holds its lease.
+    Owned,
+    /// The engine queue was full, or shutdown has begun: it stays pending,
+    /// to be resumed once a queue slot frees or by the next server.
+    Deferred,
+}
+
 /// The detached half of a started job: drains the engine stream and then
 /// releases everything the job held.
 pub(super) struct Pump {
@@ -341,6 +395,19 @@ pub(super) struct Pump {
 }
 
 impl Pump {
+    /// Fold in at most `signals` engine signals, then stop as a killed
+    /// process would: nothing more is written for the job, and its lease is
+    /// released, as the kernel releases a dead process's locks.
+    #[cfg(test)]
+    pub(super) fn crash_after(mut self, signals: usize) {
+        for _ in 0..signals {
+            let Some(signal) = (self.next)() else {
+                break;
+            };
+            self.job.advance(signal);
+        }
+    }
+
     /// Run until the engine closes the stream. Blocks the calling thread.
     pub(super) fn run(mut self) {
         while let Some(signal) = (self.next)() {
@@ -467,20 +534,22 @@ impl Background {
             let _ = store.delete(&id);
             return Err(not_stored(error));
         }
-        let (published, watcher) = watch::channel(Published {
-            bytes: journal.as_ref().map_or(0, JournalWriter::bytes),
-            ..Published::default()
-        });
-        let job = Arc::new(Job {
-            state: Mutex::new(Inner {
-                doc,
-                phase: Phase::Queued,
-                journal,
-                published,
-            }),
-            stop: Box::new(stop),
-            watcher,
-        });
+        let job = Job::new(doc, Phase::Queued, journal, Box::new(stop));
+        let pump = self.register(id, job, Box::new(next), admitted, lease)?;
+        Ok((queued, pump))
+    }
+
+    /// Answer for `job` here and hand back its pump, unless shutdown has
+    /// begun: then the job is settled `failed` and stopped at once, so no
+    /// pending record is left behind.
+    fn register(
+        self: &Arc<Self>,
+        id: String,
+        job: Arc<Job>,
+        next: Box<dyn FnMut() -> Option<Signal> + Send>,
+        admitted: Option<Admitted>,
+        lease: ResponseLease,
+    ) -> Result<Pump, Failure> {
         let mut registered = false;
         self.registry.send_modify(|registry| {
             if !registry.closing {
@@ -489,22 +558,153 @@ impl Background {
             }
         });
         if !registered {
-            // Shutdown began after the queued write: leave no pending record.
             job.abandon(SHUTDOWN_MESSAGE);
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the server is shutting down".to_owned(),
             ));
         }
-        let pump = Pump {
+        Ok(Pump {
             background: Arc::clone(self),
             id,
             job,
-            next: Box::new(next),
+            next,
             lease,
             admitted,
+        })
+    }
+
+    /// Resume background response `id`, which a crash or restart left
+    /// `queued` or `in_progress` with no live writer, by generating it again
+    /// from the request its record keeps.
+    ///
+    /// Generation state is not checkpointed, so the job restarts from its
+    /// original request; it keeps its ID, creation time and stored input. A
+    /// streamed job first continues its journal with the restart boundary
+    /// (see [`ResponsesState::resume_from`]): every output item the lost
+    /// generation opened is finished, exactly once, and the regenerated output
+    /// follows it at the next output index, so the journal never repeats or
+    /// contradicts an event a client may have seen, and the final Response
+    /// holds every item its stream announced. The boundary is appended before
+    /// the engine is asked, and is a no-op the second time, so a deferred or
+    /// repeated resumption appends nothing twice.
+    ///
+    /// The lease decides who resumes: one held by any process (a live writer)
+    /// is [`Resumed::Owned`] and left alone. Under the lease the record is
+    /// read again; one that ended meanwhile, or whose journal already ends,
+    /// is settled from that end; one that cannot be regenerated (no stored
+    /// request, a conversation, a request this server refuses or an engine
+    /// error) is settled `failed`, saying why. `thinking` and `cipher` are
+    /// this server's, as for a new request. `submit` queues the request on
+    /// the engine, returning the job's signals, its cancel and its queue slot;
+    /// a full queue leaves the job pending ([`Resumed::Deferred`]). Blocks on
+    /// the store.
+    pub(super) fn resume<N, S>(
+        self: &Arc<Self>,
+        store: &Arc<ResponseStore>,
+        id: &str,
+        (thinking, cipher): (bool, Option<&Arc<ReasoningCipher>>),
+        submit: impl FnOnce(ChatRequest) -> crate::Result<(N, S, Option<Admitted>)>,
+    ) -> Result<Resumed, Failure>
+    where
+        N: FnMut() -> Option<Signal> + Send + 'static,
+        S: Fn() + Send + Sync + 'static,
+    {
+        if self.closing() {
+            return Ok(Resumed::Deferred);
+        }
+        if self.job(id).is_some() {
+            return Ok(Resumed::Settled);
+        }
+        let Some(lease) = store.lease(id).map_err(|error| store_failed(&error))? else {
+            return Ok(Resumed::Owned);
         };
-        Ok((queued, pump))
+        // Read under the lease: a writer may have finished or the response
+        // been cancelled or deleted since the caller looked.
+        let Some(stored) = store.load(id).map_err(|error| store_failed(&error))? else {
+            return Ok(Resumed::Settled);
+        };
+        if stored.response.get("background").and_then(Value::as_bool) != Some(true)
+            || !pending(&stored.response)
+        {
+            return Ok(Resumed::Settled);
+        }
+        let settle = |reason: &str| {
+            eprintln!("background response {id} not resumed: {reason}");
+            store
+                .settle_interrupted(&lease, id, reason)
+                .map(|()| Resumed::Settled)
+                .map_err(|error| store_failed(&error))
+        };
+        let Some(request) = stored.request.as_ref() else {
+            return settle(NO_REQUEST);
+        };
+        let mut reader = match store.open_journal(id) {
+            Ok(reader) => reader,
+            Err(error) => return settle(&format!("its event journal is unreadable: {error}")),
+        };
+        let mut journaled = Vec::new();
+        if let Some(reader) = reader.as_mut() {
+            loop {
+                match reader.next_line(u64::MAX) {
+                    Ok(Some(line)) if line.terminal => {
+                        // The end was published: the record adopts it.
+                        return settle("its stream had already ended");
+                    }
+                    Ok(Some(line)) => {
+                        journaled.push(serde_json::from_str(&line.text).unwrap_or(Value::Null));
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return settle(&format!("its event journal is unreadable: {error}"));
+                    }
+                }
+            }
+        }
+        let (request, reply) = match prepare_resumed(&stored, request, thinking, store, cipher) {
+            Ok(prepared) => prepared,
+            Err(error) => return settle(&error.to_string()),
+        };
+        let Protocol::Responses(echo) = &reply.protocol else {
+            return settle("it is not a Response");
+        };
+        let mut doc = ResponsesState::new(&reply, Arc::clone(echo), reader.is_some());
+        let announced = doc.resume_from(&journaled);
+        let started = if reader.is_some() {
+            announced
+        } else {
+            stored.response.get("status").and_then(Value::as_str) == Some("in_progress")
+        };
+        let journal = match reader {
+            Some(reader) => {
+                let continued = store.reopen_journal(id, &reader).and_then(|mut writer| {
+                    writer.append(doc.take_events())?;
+                    writer.sync()?;
+                    Ok(writer)
+                });
+                match continued {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        return settle(&format!("its events could not be stored: {error}"));
+                    }
+                }
+            }
+            None => None,
+        };
+        let (next, stop, admitted) = match submit(request) {
+            Ok(submitted) => submitted,
+            Err(crate::Error::QueueFull) => return Ok(Resumed::Deferred),
+            Err(error) => return settle(&error.to_string()),
+        };
+        let phase = if started {
+            Phase::InProgress
+        } else {
+            Phase::Queued
+        };
+        eprintln!("background response {id}: resumed after a restart");
+        let job = Job::new(doc, phase, journal, Box::new(stop));
+        let pump = self.register(id.to_owned(), job, Box::new(next), admitted, lease)?;
+        Ok(Resumed::Started(pump))
     }
 
     /// `POST /v1/responses/{id}/cancel`: the final Response, `Ok(None)` for 404.

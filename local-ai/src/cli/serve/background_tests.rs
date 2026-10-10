@@ -929,8 +929,12 @@ fn write_failures_never_claim_durable_success() {
     scratch.set_mode(0o700);
     assert!(stopped.load(Ordering::SeqCst), "the job stopped instead");
     assert_eq!(status(&store, &id), "queued", "never reported completed");
-    // Once the lease is released, a restart fails the stranded record.
-    assert_eq!(status(&scratch.open(), &id), "failed");
+    // Once the lease is released the stranded record is left for a server to
+    // resume; one that does not resume it fails it.
+    let reopened = scratch.open();
+    assert_eq!(status(&reopened, &id), "queued");
+    assert!(reopened.recover(&id).expect("recovered"));
+    assert_eq!(status(&reopened, &id), "failed");
 
     // Retrying cancellation must not return an in-memory result as durable
     // when both the cancellation write and the fallback failure write failed.
@@ -943,7 +947,9 @@ fn write_failures_never_claim_durable_success() {
     scratch.set_mode(0o700);
     assert!(stopped.load(Ordering::SeqCst));
     pump.run();
-    assert_eq!(status(&scratch.open(), &id), "failed");
+    let reopened = scratch.open();
+    assert!(reopened.recover(&id).expect("recovered"));
+    assert_eq!(status(&reopened, &id), "failed");
 
     // The initial write failing refuses the request and cancels the work.
     scratch.set_mode(0o500);
