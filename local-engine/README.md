@@ -143,10 +143,12 @@ schemas and replayed arguments are in sorted order rather than client order.
 
 `local-ai` exposes these native calls through Chat Completions and a
 text/function subset of Responses, stateless unless the server is started with
-`--response-store`; see [server API](../docs/BONSAI.md#server-api) for storage,
-encrypted reasoning replay, token counting and compatibility limits. Decisions
-is **not implemented**. Keep tool execution out of the engine; in particular, a
-retry must not repeat a partially successful batch's side effects. Do not
+`--response-store`, which also enables polled, cancellable non-streaming
+background Responses; see [server API](../docs/BONSAI.md#server-api) for
+storage, encrypted reasoning replay, token counting and compatibility limits.
+`OpenAI`'s Decisions API is **not implemented**. Keep tool execution out of the engine;
+in particular, a retry must not repeat a partially successful batch's side
+effects. Do not
 change the pinned checkpoint template merely to match another Qwen model's
 conventions.
 

@@ -693,3 +693,159 @@ fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
     follow["input"][1]["encrypted_content"] = json!("tampered");
     assert!(replay(&follow).is_err());
 }
+
+/// A stored Response object with the fields recovery reads and must keep.
+fn record(id: &str, background: bool, status: &str) -> Value {
+    json!({
+        "id":id,
+        "object":"response",
+        "created_at":1,
+        "status":status,
+        "completed_at":null,
+        "background":background,
+        "error":null,
+        "model":"m",
+        "output":[{"id":"msg_1","type":"message","status":"in_progress","role":"assistant","content":[]}],
+        "instructions":"be brief",
+        "metadata":{"k":"v"},
+    })
+}
+
+fn input() -> Vec<Value> {
+    vec![json!({"id":"msg_0","type":"message","role":"user","content":"hi"})]
+}
+
+#[test]
+fn a_held_lease_excludes_other_stores_and_protects_an_active_job() {
+    let scratch = Scratch::new();
+    let first = scratch.open();
+    let second = scratch.open();
+    let id = "resp_active";
+    let lease = first.lease(id).expect("lease").expect("free");
+    assert!(second.lease(id).expect("lease").is_none(), "held elsewhere");
+    assert!(
+        first.lease(id).expect("lease").is_none(),
+        "held by this store too"
+    );
+    assert!(
+        second.lease("resp_other").expect("lease").is_some(),
+        "per response"
+    );
+    first
+        .save(&record(id, true, "queued"), &input())
+        .expect("queued");
+    // A server starting beside the live one must not fail its job.
+    let third = scratch.open();
+    let stored = third.load(id).expect("readable").expect("stored");
+    assert_eq!(stored.response, record(id, true, "queued"));
+    first
+        .save(&record(id, true, "in_progress"), &input())
+        .expect("running");
+    drop(lease);
+    assert!(
+        second.lease(id).expect("lease").is_some(),
+        "released on drop"
+    );
+}
+
+#[test]
+fn an_abandoned_background_job_is_failed_on_open_but_not_resumed() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    for (id, status) in [("resp_queued", "queued"), ("resp_running", "in_progress")] {
+        let lease = store.lease(id).expect("lease").expect("free");
+        store
+            .save(&record(id, true, status), &input())
+            .expect("saved");
+        drop(lease);
+        let reopened = scratch.open();
+        let stored = reopened.load(id).expect("readable").expect("stored");
+        let mut expected = record(id, true, status);
+        expected["status"] = json!("failed");
+        expected["error"] = json!({
+            "code":"server_error",
+            "message":"the server stopped before this background response finished; \
+                interrupted execution is not resumed",
+        });
+        assert_eq!(stored.response, expected, "{status}");
+        assert_eq!(stored.input_items, input());
+        assert!(stored.response["completed_at"].is_null());
+    }
+}
+
+#[test]
+fn recovery_leaves_foreground_terminal_and_unrelated_files_alone() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let records = [
+        record("resp_fg", false, "in_progress"),
+        record("resp_done", true, "completed"),
+        record("resp_failed", true, "failed"),
+        record("resp_cancelled", true, "cancelled"),
+        record("resp_incomplete", true, "incomplete"),
+    ];
+    for response in &records {
+        store.save(response, &input()).expect("saved");
+    }
+    let unrelated = [
+        scratch.0.join("notes.txt"),
+        scratch.0.join(".resp_gone.lock"),
+        scratch.0.join("resp_corrupt.json"),
+        scratch.0.join(".resp_fg.123.tmp"),
+    ];
+    for path in &unrelated {
+        std::fs::write(path, b"{\"trunc").expect("planted");
+    }
+    let reopened = scratch.open();
+    for response in &records {
+        let id = response["id"].as_str().expect("id");
+        let stored = reopened.load(id).expect("readable").expect("stored");
+        assert_eq!(&stored.response, response, "{id}");
+    }
+    for path in &unrelated {
+        assert!(path.exists(), "{}", path.display());
+    }
+}
+
+#[test]
+fn leases_refuse_bad_ids_and_symlinks_and_keep_their_sidecar() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let long = format!("resp_{}", "a".repeat(65));
+    for invalid in [
+        "",
+        "resp_",
+        "resp_../x",
+        "resp_a/b",
+        "../resp_a",
+        "resp_a.json",
+        long.as_str(),
+    ] {
+        let error = store.lease(invalid).expect_err("refused");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{invalid:?}"
+        );
+    }
+    let id = "resp_stable";
+    let sidecar = scratch.0.join(format!(".{id}.lock"));
+    drop(store.lease(id).expect("lease").expect("free"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = std::fs::metadata(&sidecar).expect("sidecar kept");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        drop(store.lease(id).expect("lease").expect("free"));
+        assert_eq!(
+            std::fs::metadata(&sidecar).expect("still kept").ino(),
+            metadata.ino()
+        );
+        let target = scratch.0.with_extension("lock-target");
+        std::fs::write(&target, b"").expect("target");
+        std::os::unix::fs::symlink(&target, scratch.0.join(".resp_link.lock")).expect("link");
+        assert!(store.lease("resp_link").is_err(), "symlink not followed");
+        let _ = std::fs::remove_file(target);
+    }
+    assert!(sidecar.exists());
+}

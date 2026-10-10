@@ -18,6 +18,8 @@ use local_engine::{Engine, EngineHandle};
 
 use crate::resources::Resources;
 
+mod background;
+mod backpressure;
 mod chunked;
 mod http3;
 mod options;
@@ -35,6 +37,7 @@ use axum::http::HeaderMap;
 #[cfg(test)]
 use local_engine::Event;
 
+use self::background::Background;
 use self::chunked::start_chunked;
 use self::http3::serve_h3;
 use self::options::{parse, usage};
@@ -82,6 +85,8 @@ struct AppState {
     /// The opt-in Responses store; `None` serves Responses statelessly.
     responses: Option<Arc<ResponseStore>>,
     cipher: Option<Arc<ReasoningCipher>>,
+    /// Background Responses running on this server.
+    background: Arc<Background>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -156,7 +161,8 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     // Authentication has already passed, so a stored response is never read or
     // deleted for a caller without the key.
     if let Some(rest) = parts.uri.path().strip_prefix("/v1/responses/")
-        && matches!(parts.method, Method::GET | Method::DELETE)
+        && (matches!(parts.method, Method::GET | Method::DELETE)
+            || (parts.method == Method::POST && rest.ends_with("/cancel")))
     {
         return stored_response(
             &state,
@@ -275,6 +281,16 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         }
     };
     let (stream, request, protocol) = prepared;
+    let background = matches!(&protocol, Protocol::Responses(echo) if echo.background());
+    if background && state.background.closing() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is shutting down",
+            &state,
+            &parts.headers,
+        )
+        .await;
+    }
     let reply = Reply::new(protocol, Arc::clone(&state.model));
     let events = match request {
         GenerationRequest::Chat(request) => state.engine.chat(request),
@@ -296,6 +312,18 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         }
     };
     let admitted = state.depth.admit();
+    if background {
+        // Not waiting for the first event: a pre-generation failure becomes a
+        // `failed` status on the stored response, not this request's status.
+        let started =
+            background::start(Arc::clone(&state.background), events, reply, admitted).await;
+        return match started {
+            Ok(queued) => json_response(StatusCode::OK, queued, &state, &parts.headers).await,
+            Err((status, message)) => {
+                error_response(status, &message, &state, &parts.headers).await
+            }
+        };
+    }
     if stream {
         match start_stream(events, reply, admitted, state.stall).await {
             Ok(events) => {
@@ -385,7 +413,8 @@ fn prepare(
     }
 }
 
-/// `GET` and `DELETE /v1/responses/{id}` and `GET .../{id}/input_items`.
+/// `GET` and `DELETE /v1/responses/{id}`, `GET .../{id}/input_items` and
+/// `POST .../{id}/cancel`.
 ///
 /// `rest` is the path after `/v1/responses/`. Unknown, malformed, deleted and
 /// never-stored IDs are all the same 404, and so is every ID when no store is
@@ -397,10 +426,11 @@ async fn stored_response(
     query: Option<&str>,
     headers: &axum::http::HeaderMap,
 ) -> Response {
-    let (id, items) = match rest.split_once('/') {
-        None => (rest, false),
-        Some((id, "input_items")) if *method == Method::GET => (id, true),
-        Some(_) => {
+    let (id, items, cancel) = match rest.split_once('/') {
+        None if *method != Method::POST => (rest, false, false),
+        Some((id, "input_items")) if *method == Method::GET => (id, true, false),
+        Some((id, "cancel")) if *method == Method::POST => (id, false, true),
+        _ => {
             return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
         }
     };
@@ -412,14 +442,23 @@ async fn stored_response(
     let outcome = match stored_request(method, items, query) {
         Ok(page) => {
             let (id, method) = (id.to_owned(), method.clone());
-            tokio::task::spawn_blocking(move || stored_answer(&store, &method, &id, page.as_ref()))
-                .await
-                .unwrap_or_else(|error| {
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("response store task failed: {error}"),
-                    ))
-                })
+            let background = Arc::clone(&state.background);
+            tokio::task::spawn_blocking(move || {
+                if cancel {
+                    background.cancel(&store, &id)
+                } else if method == Method::DELETE {
+                    Ok(background.delete(&store, &id)?.then(|| deleted(&id)))
+                } else {
+                    stored_answer(&store, &method, &id, page.as_ref())
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("response store task failed: {error}"),
+                ))
+            })
         }
         Err(message) => Err((StatusCode::BAD_REQUEST, message)),
     };
@@ -434,7 +473,7 @@ async fn stored_response(
 /// list for `input_items`.
 ///
 /// Retrieval supports neither `stream` nor `starting_after`: both replay a
-/// background response's events, and there are no background responses.
+/// background response's events, and background responses are not streamed.
 /// `include` has nothing to add. Other parameters are ignored.
 fn stored_request(
     method: &Method,
@@ -452,8 +491,9 @@ fn stored_request(
         for (key, value) in query_pairs(query) {
             match key.as_str() {
                 "stream" if value == "true" => {
-                    return Err("stream is not supported: responses are stored only once \
-                                complete, so there is no event stream to replay"
+                    return Err("stream is not supported: responses, background ones \
+                                included, are stored as documents, not as event streams \
+                                to replay"
                         .into());
                 }
                 "starting_after" => {
@@ -474,6 +514,11 @@ fn stored_request(
     Ok(None)
 }
 
+/// The answer to a successful `DELETE /v1/responses/{id}`.
+fn deleted(id: &str) -> serde_json::Value {
+    json!({"id":id,"object":"response.deleted","deleted":true})
+}
+
 /// Read, list or delete stored response `id`; `Ok(None)` is a 404.
 fn stored_answer(
     store: &ResponseStore,
@@ -488,10 +533,7 @@ fn stored_answer(
         )
     };
     if *method == Method::DELETE {
-        return Ok(store
-            .delete(id)
-            .map_err(failed)?
-            .then(|| json!({"id":id,"object":"response.deleted","deleted":true})));
+        return Ok(background::delete_unowned(store, id)?.then(|| deleted(id)));
     }
     let Some(stored) = store.load(id).map_err(failed)? else {
         return Ok(None);
@@ -565,6 +607,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         stall: args.stall,
         responses,
         cipher,
+        background: Arc::default(),
     };
     let address = SocketAddr::new(args.host, args.port);
     let h3_task = if let Some((cert, key)) = resources.tls {
@@ -574,15 +617,28 @@ async fn run_async(args: Args) -> crate::Result<()> {
     };
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!("Bonsai server listening on http://{address}");
+    let background = Arc::clone(&state.background);
     let app = Router::new().fallback(any(route)).with_state(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+    // Background jobs are settled and cancelled as soon as shutdown begins,
+    // while axum is still draining foreground connections.
+    let closing = Arc::clone(&background);
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown().await;
+            let _ = tokio::task::spawn_blocking(move || closing.close()).await;
+        })
         .await
-        .map_err(crate::Error::Io)?;
+        .map_err(crate::Error::Io);
+    // Again, for a server that stopped without the signal; settling is idempotent.
+    let closing = Arc::clone(&background);
+    let _ = tokio::task::spawn_blocking(move || closing.close()).await;
+    // Each cancelled job still holds its engine slot and lease until the worker
+    // lets go of it, which is at most one prefill chunk or decode step away.
+    background.drained().await;
     if let Some(task) = h3_task {
         task.abort();
     }
-    Ok(())
+    served
 }
 
 async fn shutdown() {
@@ -632,3 +688,7 @@ mod protocol_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod store_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod background_tests;
