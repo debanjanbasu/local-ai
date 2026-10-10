@@ -10,12 +10,12 @@ use zstd::stream::write::Encoder;
 use local_engine::{Event, EventStream, Signal, Stats, ToolCall};
 
 use super::Admitted;
+use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, event_wait,
     finish_reason, usage_json,
 };
 use super::responses::ResponsesState;
-use super::sse::{FrameOutcome, send_frame};
 
 /// Body bytes written per frame when the generation is outrunning the clock.
 ///

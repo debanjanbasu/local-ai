@@ -10,3 +10,9 @@ Rules:
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+
+## Waiting and scheduling
+
+- Prefer channel notifications, completion callbacks, condition variables, or blocking waits with deadlines over periodic polling and sleep/retry loops.
+- Keep nonblocking admission checks between GPU steps and cooperative cancellation checks at dispatch boundaries; these are part of active work, not idle polling.
+- When an external protocol offers only polling, use a bounded, appropriate cadence and document why an event-driven alternative is unavailable.

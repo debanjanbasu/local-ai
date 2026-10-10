@@ -17,6 +17,16 @@
 //! sees either the whole record or none of it, and a crash mid-write leaves
 //! only an ignored temporary file. Opening a second server must not remove
 //! the first server's in-flight writes or unrelated files in the directory.
+//!
+//! A background Response is written more than once (queued, then terminal),
+//! so its writer holds a [`ResponseLease`]: an exclusive advisory lock on an
+//! owner-only `.{id}.lock` sidecar, taken before the first save and released
+//! after the terminal one. Sidecars are never unlinked, so every process
+//! always locks the same inode. When a store opens, a background record still
+//! `queued` or `in_progress` whose lease is free has lost its writer to a
+//! crash or restart; it is marked `failed` rather than resumed. A record whose
+//! lease is held belongs to a live server sharing the directory and is left
+//! alone.
 
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -35,9 +45,25 @@ const TEMPORARY_SUFFIX: &str = ".tmp";
 /// Longest accepted ID after `resp_`; this server's own are 32 hex digits.
 const MAX_ID_TAIL: usize = 64;
 
+/// Suffix of a response's lease sidecar, `.{id}.lock`.
+const LOCK_SUFFIX: &str = ".lock";
+
+/// The error a recovered background Response reports.
+const INTERRUPTED_MESSAGE: &str = "the server stopped before this background response finished; \
+     interrupted execution is not resumed";
+
 #[derive(Debug)]
 pub(super) struct ResponseStore {
     dir: PathBuf,
+}
+
+/// Exclusive ownership of one stored response's writes, across processes.
+///
+/// Held for as long as this value lives; dropping it closes the sidecar and
+/// releases the lock. The sidecar itself stays, so its inode never changes.
+#[derive(Debug)]
+pub(super) struct ResponseLease {
+    _file: fs::File,
 }
 
 /// A stored Response and the resolved input it was generated from.
@@ -100,11 +126,72 @@ impl ResponseStore {
                 ));
             }
         }
-        Ok(Self { dir })
+        let store = Self { dir };
+        store.recover_interrupted()?;
+        Ok(store)
     }
 
     fn path(&self, id: &str) -> Option<PathBuf> {
         valid_id(id).then(|| self.dir.join(format!("{id}.json")))
+    }
+
+    /// Take the write lease for response `id` without waiting.
+    ///
+    /// `Ok(None)` when another writer, in this process or another, holds it.
+    /// An `id` that could not name a response is refused, as is a sidecar that
+    /// is a symlink, not a regular file, or not owner-only.
+    pub(super) fn lease(&self, id: &str) -> std::io::Result<Option<ResponseLease>> {
+        if !valid_id(id) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid response ID {id:?}"),
+            ));
+        }
+        let path = self.dir.join(format!(".{id}{LOCK_SUFFIX}"));
+        let file = open_lock(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(ResponseLease { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Mark every background response left `queued` or `in_progress` by a
+    /// writer that no longer holds its lease as `failed`.
+    ///
+    /// Records that cannot be read are skipped: they are not this pass's to
+    /// judge, and `load` reports them to whoever asks for them.
+    fn recover_interrupted(&self) -> std::io::Result<()> {
+        for entry in fs::read_dir(&self.dir)? {
+            let name = entry?.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            if !valid_id(id) || !matches!(self.load(id), Ok(Some(stored)) if interrupted(&stored)) {
+                continue;
+            }
+            let Some(_lease) = self.lease(id)? else {
+                continue;
+            };
+            // Re-read under the lease: the writer may have finished between
+            // the first read and taking the lock.
+            let Ok(Some(mut stored)) = self.load(id) else {
+                continue;
+            };
+            if !interrupted(&stored) {
+                continue;
+            }
+            if let Some(response) = stored.response.as_object_mut() {
+                response.insert("status".into(), json!("failed"));
+                response.insert("completed_at".into(), Value::Null);
+                response.insert(
+                    "error".into(),
+                    json!({"code":"server_error","message":INTERRUPTED_MESSAGE}),
+                );
+            }
+            self.save(&stored.response, &stored.input_items)?;
+        }
+        Ok(())
     }
 
     /// Persist `response` and its resolved input, durably, before returning.
@@ -199,6 +286,65 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+/// Whether `stored` is a background response its writer never finished.
+fn interrupted(stored: &StoredResponse) -> bool {
+    stored.response.get("background").and_then(Value::as_bool) == Some(true)
+        && matches!(
+            stored.response.get("status").and_then(Value::as_str),
+            Some("queued" | "in_progress")
+        )
+}
+
+/// Open, creating owner-only if needed, the lease sidecar at `path`.
+///
+/// Never truncates or unlinks it, so concurrent openers share one inode. On
+/// Unix a symlink as the final component is refused rather than followed, a
+/// FIFO cannot block the open, and the result must be an owner-only regular
+/// file belonging to this user.
+#[cfg(unix)]
+fn open_lock(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use rustix::fs::{Mode, OFlags};
+
+    let flags =
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR).map_err(|errno| {
+        std::io::Error::new(
+            std::io::Error::from(errno).kind(),
+            format!("cannot open response lease {}: {errno}", path.display()),
+        )
+    })?;
+    let file = fs::File::from(fd);
+    let metadata = file.metadata()?;
+    let refused = |why: &str| {
+        Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("response lease {} {why}", path.display()),
+        ))
+    };
+    if !metadata.file_type().is_file() {
+        return refused("is not a regular file");
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return refused("belongs to another user");
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return refused("must be owner-only (mode 0600)");
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_lock(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// Make a rename or unlink in `dir` durable, where the platform allows it.

@@ -13,8 +13,9 @@
 //!   incomplete responses are persisted (see [`super::store`]) before their
 //!   terminal event is sent, and `previous_response_id` continues one. Only
 //!   conversation items carry over; `instructions`, tools and sampling
-//!   controls are this request's alone. `background`, `conversation` and
-//!   `item_reference` inputs still fail. Clients may instead carry history
+//!   controls are this request's alone. `background: true` is accepted only
+//!   with a store, stored and not streamed (see [`super::background`]);
+//!   `conversation` and `item_reference` inputs still fail. Clients may instead carry history
 //!   explicitly in `input`, which is supported in full for messages,
 //!   reasoning, `function_call` and `function_call_output` items.
 //! - Function tools only. Built-in, MCP and custom tools, `tool_choice` forcing
@@ -132,6 +133,15 @@ pub(super) struct Echo {
     cipher: Option<Arc<ReasoningCipher>>,
     /// Where the final Response is persisted, when it is to be stored.
     persist: Option<Persist>,
+    /// `background: true`: generated detached from the request, and persisted
+    /// by [`super::background`] rather than by [`ResponsesState`].
+    background: bool,
+}
+
+impl Echo {
+    pub(super) const fn background(&self) -> bool {
+        self.background
+    }
 }
 
 /// A Response that is to be stored, and the resolved input it answers.
@@ -172,10 +182,27 @@ impl ResponsesRequest {
             ));
         }
         if self.background == Some(true) {
-            return Err(unsupported(
-                "background",
-                "responses are generated in-request",
-            ));
+            if !stored {
+                return Err(unsupported(
+                    "background",
+                    "a background response is kept in the response store until it is retrieved, \
+                     and this server was started without --response-store",
+                ));
+            }
+            if self.store == Some(false) {
+                return Err(unsupported(
+                    "background with store=false",
+                    "temporary retention is not implemented; a background response is stored \
+                     until it is deleted",
+                ));
+            }
+            if self.stream == Some(true) {
+                return Err(unsupported(
+                    "background with stream=true",
+                    "streamed background responses and stream resumption are not implemented; \
+                     poll GET /v1/responses/{id} instead",
+                ));
+            }
         }
         if !stored && self.previous_response_id.is_some() {
             return Err(unsupported(
@@ -395,13 +422,7 @@ pub(super) fn prepare_responses_with(
     // includes its instructions, then this request's items. Each record keeps
     // its full history, so this is one read however long the chain is.
     let mut items = match (&request.previous_response_id, store) {
-        (Some(id), Some(store)) => store
-            .load(id)
-            .map_err(|error| {
-                crate::Error::Generation(format!("could not read stored response {id}: {error}"))
-            })?
-            .ok_or_else(|| invalid(format!("previous response with id {id:?} not found")))?
-            .history(),
+        (Some(id), Some(store)) => previous_history(store, id)?,
         _ => Vec::new(),
     };
     normalize_input(input, &mut items)?;
@@ -458,6 +479,8 @@ pub(super) fn prepare_responses_with(
         safety_identifier: request.safety_identifier.clone(),
         previous_response_id: request.previous_response_id.clone(),
         cipher: cipher.cloned(),
+        // `reject_unsupported` has ensured a background response is stored.
+        background: request.background == Some(true) && persist.is_some(),
         persist,
     };
     Ok(PreparedResponses {
@@ -472,6 +495,23 @@ pub(super) fn prepare_responses_with(
         },
         echo,
     })
+}
+
+/// The history stored response `id` continues with.
+fn previous_history(store: &ResponseStore, id: &str) -> crate::Result<Vec<Value>> {
+    let stored = store
+        .load(id)
+        .map_err(|error| {
+            crate::Error::Generation(format!("could not read stored response {id}: {error}"))
+        })?
+        .ok_or_else(|| invalid(format!("previous response with id {id:?} not found")))?;
+    // A background response has no output to continue until it ends.
+    match stored.response.get("status").and_then(Value::as_str) {
+        Some(status @ ("queued" | "in_progress")) => Err(invalid(format!(
+            "previous response {id} is still {status}; wait until it finishes"
+        ))),
+        _ => Ok(stored.history()),
+    }
 }
 
 fn function_tool(tool: &Value) -> crate::Result<ToolDefinition> {
@@ -1074,7 +1114,10 @@ impl ResponsesState {
         // A stored response is on disk before any client is told it finished,
         // so an ID a client has seen complete can always be continued. A
         // response that could not be stored fails rather than claim `store`.
+        // A background response is persisted by its pump, under the lock that
+        // also serialises cancellation and deletion, never from here.
         if error.is_none()
+            && !self.echo.background
             && let Some(persist) = &self.echo.persist
             && let Err(failure) = persist.store.save(&response, &persist.input_items)
         {
@@ -1093,7 +1136,38 @@ impl ResponsesState {
         response
     }
 
-    fn fail(&mut self, message: &str) -> Value {
+    /// The Response as it stands, before any terminal state: `queued` or
+    /// `in_progress`. Usage is only known at the end, so it is `null`.
+    pub(super) fn snapshot(&self, status: &str) -> Value {
+        self.response(status, None, None, None)
+    }
+
+    /// End the Response as `cancelled`, keeping the output produced so far
+    /// with any unfinished item marked `incomplete`.
+    pub(super) fn cancelled(&mut self) -> Value {
+        self.close("incomplete");
+        self.response("cancelled", None, None, None)
+    }
+
+    /// Persist `response` with this request's resolved input, durably. Fails
+    /// when the response is not to be stored at all.
+    pub(super) fn save(&self, response: &Value) -> std::io::Result<()> {
+        let persist = self.echo.persist.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "response is not stored")
+        })?;
+        persist.store.save(response, &persist.input_items)
+    }
+
+    /// The store this Response is persisted in, when it is stored.
+    pub(super) fn store(&self) -> Option<&Arc<ResponseStore>> {
+        self.echo.persist.as_ref().map(|persist| &persist.store)
+    }
+
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn fail(&mut self, message: &str) -> Value {
         self.close("incomplete");
         self.emit(
             "error",
@@ -1137,10 +1211,11 @@ impl ResponsesState {
             "parallel_tool_calls":true,
             "previous_response_id":echo.previous_response_id,
             "reasoning":{"effort":echo.effort,"summary":null,"context":"all_turns"},
-            // Only a response that reached the store says so; a failed one,
-            // including one whose write failed, was never stored.
-            "store":echo.persist.is_some() && status != "failed",
-            "background":false,
+            // Only a response that reached the store says so. A failed
+            // foreground one, including one whose write failed, was never
+            // stored; a background one is stored in every state it reports.
+            "store":echo.persist.is_some() && (echo.background || status != "failed"),
+            "background":echo.background,
             "access_programs":null,
             "service_tier":"default",
             "temperature":echo.temperature,

@@ -8,9 +8,9 @@ use serde_json::{Value, json};
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{GenerationStats, PrefillProgress, Signal, Stats};
 
+use super::backpressure::{FrameOutcome, send_frame};
 use super::chunked::{BODY_FLUSH_BYTES, BODY_FLUSH_INTERVAL, Body, Flow, absorb};
 use super::response::{EventWait, event_wait};
-use super::sse::{FrameOutcome, send_frame};
 use super::*;
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).into()).collect()
@@ -127,6 +127,10 @@ fn bounded_frame_send_gives_up_only_on_a_client_that_stopped_reading() {
 
     // The capacity-1 slot starts free, so a live client never waits at all.
     assert_eq!(send_frame(&sender, frame(), stall), FrameOutcome::Sent);
+    assert_eq!(
+        send_frame(&sender, frame(), Duration::ZERO),
+        FrameOutcome::Stalled
+    );
 
     // The slot is now taken and nobody drains it: the frame is abandoned, and
     // only after the whole budget has passed.
@@ -144,6 +148,67 @@ fn bounded_frame_send_gives_up_only_on_a_client_that_stopped_reading() {
     // not be reported as one.
     drop(receiver);
     assert_eq!(send_frame(&sender, frame(), stall), FrameOutcome::Closed);
+}
+#[test]
+fn bounded_frame_send_wakes_when_the_client_frees_the_slot() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    // Far longer than the test should take, so only a wake can end the wait.
+    let stall = Duration::from_secs(30);
+    let release = Duration::from_millis(100);
+    assert_eq!(
+        send_frame(&sender, Bytes::from_static(b"data: 1\n\n"), stall),
+        FrameOutcome::Sent
+    );
+
+    // The slot is taken, and a reader drains it from another thread partway
+    // through the wait, with no Tokio runtime anywhere.
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(release);
+        let first = receiver.blocking_recv().expect("first frame");
+        let second = receiver.blocking_recv().expect("second frame");
+        (first.expect("bytes"), second.expect("bytes"))
+    });
+    let started = Instant::now();
+    assert_eq!(
+        send_frame(&sender, Bytes::from_static(b"data: 2\n\n"), stall),
+        FrameOutcome::Sent
+    );
+    let waited = started.elapsed();
+    let (first, second) = reader.join().expect("reader");
+    assert_eq!(&first[..], b"data: 1\n\n");
+    assert_eq!(&second[..], b"data: 2\n\n");
+    assert!(
+        waited < Duration::from_secs(5),
+        "waited {waited:?} for a free slot"
+    );
+}
+#[test]
+fn bounded_frame_send_wakes_as_closed_when_the_client_drops_mid_wait() {
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    let stall = Duration::from_secs(30);
+    let release = Duration::from_millis(100);
+    assert_eq!(
+        send_frame(&sender, Bytes::from_static(b"data: 1\n\n"), stall),
+        FrameOutcome::Sent
+    );
+
+    // A disconnect while the pump waits is the normal end, reported at the
+    // moment of the drop rather than after the stall budget.
+    let dropper = std::thread::spawn(move || {
+        std::thread::sleep(release);
+        drop(receiver);
+    });
+    let started = Instant::now();
+    assert_eq!(
+        send_frame(&sender, Bytes::from_static(b"data: 2\n\n"), stall),
+        FrameOutcome::Closed
+    );
+    let waited = started.elapsed();
+    dropper.join().expect("dropper");
+    assert!(
+        waited < Duration::from_secs(5),
+        "waited {waited:?} to see the drop"
+    );
 }
 
 /// The bytes a streamed body opens with, as the tests see them.

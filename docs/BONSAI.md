@@ -4,7 +4,11 @@
 Apple Silicon. This document describes the runtime policy and interfaces. The
 top-level [README](../README.md) contains installation instructions.
 
-Measurements use an M4 Pro with 48 GB unified memory and greedy sampling.
+Measurements use an M4 Pro with 48 GB unified memory and greedy sampling
+unless a section names another machine; several server-timeout, compression
+and speculation-decomposition figures come from a 16 GB M2 MacBook Air. A
+kernel-only timing, an end-to-end throughput and a quality check are not
+interchangeable; read each figure in its section's context.
 
 ## Checkpoint format
 
@@ -171,6 +175,7 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
 | `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored response (`--response-store` only) |
 | `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored response (`--response-store` only) |
+| `POST` | `/v1/responses/{id}/cancel` | cancel a background response (`--response-store` only) |
 
 Generation accepts `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `presence_penalty`, `frequency_penalty`, `seed`, and `stream`. Chat's
@@ -200,9 +205,10 @@ Storage is opt-in and **nothing is stored by default**. Without
 instead. With a store configured, `store` takes OpenAI's default of `true`
 (an explicit `store: false` is honoured), and completed and incomplete
 responses are written durably before their terminal event is sent; a failed
-generation is not stored, and a response whose write fails is reported as
-failed rather than as stored. Each record is one JSON file holding the final
-response and its resolved input (the earlier response's input and output, then
+foreground generation is not stored, and a response whose write fails is
+reported as failed rather than as stored (background responses differ; see
+below). Each record is one JSON file holding the final response and its
+resolved input (the earlier response's input and output, then
 this request's items), so a follow-up never walks a chain and deleting an
 earlier response does not break a later one. Records contain prompts, tool
 results and the model's raw reasoning in plain text. The directory is created
@@ -213,13 +219,54 @@ rest. Only `resp_` IDs of ASCII letters and digits ever reach the filesystem.
 request's `instructions`, tools, reasoning effort and sampling controls are not
 inherited and must be sent again. `GET /v1/responses/{id}` returns the stored
 object; its `stream`, `starting_after` and non-empty `include` are refused
-because there are no background responses or extra fields to add.
+because records are stored as documents, not replayable event streams, and
+there are no extra fields to add.
 `GET .../input_items` pages the resolved input with `after`, `limit` (1 to
 100, default 20) and `order` (`desc` by default), reporting `first_id`,
 `last_id` and `has_more`; an unknown `after` is 404. `DELETE` returns `response.deleted`.
 Unknown, malformed, deleted and never-stored IDs are the same 404, and all of
-these routes sit behind `--api-key` when it is set. Conversations, background
-requests and `item_reference` inputs remain unsupported.
+these routes sit behind `--api-key` when it is set. Conversations and
+`item_reference` inputs remain unsupported.
+
+Background Responses are a non-streaming, stored subset. `background: true`
+requires `--response-store`, and is refused with `store: false` (temporary
+retention is not implemented) or `stream: true` (streamed background
+responses and stream resumption are not implemented). Once the engine has
+admitted the job, `POST /v1/responses` returns 200 with the `queued` response,
+which is already durably in the store; a detached worker then persists
+`in_progress` and one terminal state, `completed`, `incomplete`, `failed` or
+`cancelled`. A failure after acceptance, such as a generation error, therefore
+appears as a stored `failed` record rather than as an HTTP 400 on the
+`POST`; requests that fail validation or engine admission are still rejected
+in-request. Every state keeps the resolved `input_items` and reports
+`store: true` and `background: true`. `GET /v1/responses/{id}` reads the
+latest durable state, so polling works from any server sharing the directory,
+and `previous_response_id` refuses a response that is still `queued` or
+`in_progress`.
+
+`POST /v1/responses/{id}/cancel` settles a pending background response as
+`cancelled`, keeping any output produced so far, and stops its generation.
+It is idempotent: a response already terminal is returned unchanged. A
+foreground (non-background) response is refused with 400. `DELETE` of a
+background response this server is running deletes the record and cancels the
+work, and the worker never writes it back. Each job holds an advisory lease on
+an owner-only `.{id}.lock` sidecar in the store; cancel or delete of a
+response still pending under another live server's lease is refused with 409.
+At startup, a pending background record whose lease is free lost its writer to
+a crash or restart and is marked `failed`; interrupted work is never resumed.
+Graceful shutdown refuses new background requests (503), marks every
+unfinished job `failed`, cancels it and waits for the workers to release the
+engine before exiting. A job has no client to stall, so `--stall-timeout`
+does not apply to it. Stored records still contain the raw reasoning in plain
+text; there is no encryption at rest.
+
+```bash
+curl -s localhost:8080/v1/responses -H 'content-type: application/json' \
+  -d '{"input":"Summarise RFC 9110 in one line.","background":true}'
+# {"id":"resp_…","status":"queued",…}
+curl -s localhost:8080/v1/responses/resp_…          # poll until terminal
+curl -s -X POST localhost:8080/v1/responses/resp_…/cancel
+```
 
 `--reasoning-key FILE` enables `reasoning.encrypted_content`. The key is 32
 random bytes in an owner-only file, created on first start without
@@ -285,14 +332,15 @@ the same HTTP adapters; native Rust callers use the engine's request/event
 types directly. No client-name branches belong in model execution.
 
 Missing endpoint families are not all model limitations. Opt-in local response
-storage (retrieve, delete, `input_items`) and Responses input-token counting
-are now implemented as described above; conversations, compaction, response
-cancellation and background mode, files, uploads, vector stores and batches
-still need server implementations; constrained outputs need a decoding
-constraint implementation; media, embedding, audio and moderation capabilities
-need suitable models or heads. Hosted tools, evals, fine-tuning and
-administrative APIs also need their own services. None is implemented by
-merely accepting its request fields.
+storage (retrieve, delete, `input_items`), non-streaming background responses
+with cancellation, and Responses input-token counting are now implemented as
+described above; conversations, compaction, background streaming and
+resumption, temporary (`store: false`) background retention, files, uploads,
+vector stores and batches still need server implementations; constrained
+outputs need a decoding constraint implementation; media, embedding, audio
+and moderation capabilities need suitable models or heads. Hosted tools,
+evals, fine-tuning and administrative APIs also need their own services. None
+is implemented by merely accepting its request fields.
 
 [Codex at 4aa94dc](https://github.com/openai/codex/tree/4aa94dce270de668eff6e2fa8585c82385e84455)
 uses stateless Responses, requests `reasoning.encrypted_content`, and sends
@@ -374,6 +422,13 @@ engine free for the next client. The default is 30 seconds; a value outside
 10 to 3600 inclusive, or one that is not a whole number of seconds, is refused
 at startup.
 
+Both HTTP body pumps share an event-driven backpressure wait. A full channel
+parks the pump thread until capacity becomes available, the receiver closes,
+or the single stall deadline expires. It does not retry every few milliseconds.
+The engine's worker likewise blocks on its request channel when idle; its
+nonblocking admission checks between GPU steps are active scheduling, not
+idle polling.
+
 One number bounds two clocks, but not to the same depth on the two paths. On a
 streaming response it is a consumer-liveness budget: the server only produces a
 frame when the engine emits one, so frames arrive as fast as the engine makes
@@ -390,10 +445,12 @@ The budget starts only after the first event arrives, so it does not bound
 time-to-first-token. Prefill now reports a boundary at every 128-token block (or
 every chunk of 24 to 32 tokens while other requests decode; see
 [Concurrent requests](#concurrent-requests)) and the boundary is written to the
-client, but it deliberately does not start a clock. This class of machine prefills at roughly 3.6-4.2 tok/s, so one chunk is
-about 35 seconds of work that is entirely healthy, and a budget armed on a
-boundary would abandon ordinary long prompts. A cold 6,438-token prompt measured
-50 boundaries and 349.9 seconds of prefill at the 10-second floor with no false
+client, but it deliberately does not start a clock. On the M2 these
+timeout measurements used, an early build prefilled at roughly 3.6-4.2 tok/s,
+about 35 seconds per 128-token block of entirely healthy work, and a budget
+armed on a boundary would abandon ordinary long prompts. A later cold
+6,438-token prompt on that M2 measured 50 boundaries and 349.9 seconds of
+prefill (about 7 seconds per boundary) at the 10-second floor with no false
 cancellation.
 
 Two limits are worth stating plainly. On streaming, the clock starts late by
@@ -681,20 +738,24 @@ stacked rows.
 
 All choices and reasons are reported in startup JSON.
 
-- **Model:** explicit path, then the pinned path in the working directory,
-  beside the executable, or under `~/Library/Caches/local-ai/models`.
+- **Model:** a library caller's explicit `Engine::open_model` path; otherwise
+  the pinned path in the working directory, beside the executable, or under
+  `~/Library/Caches/local-ai/models`. The commands have no model flag.
 - **Context:** largest value up to 262,144 tokens whose fully grown model state
   fits 90% of Metal's recommended working set.
-- **K/V:** F16 unless it cannot reach a useful 32,768-token context, then Q8.
+- **K/V:** Hadamard-rotated Q8 for the target, always (see
+  [K/V cache](#kv-cache)); the MTP head's one-layer cache is F16.
 - **Prefill:** fixed 128-token chunks with Metal 4 kernels where supported;
   beside two or more decoding requests, a long prompt prefills 24 to 31
   tokens per step inside their batched pass, and 32 per step in a pass of its
   own beside one.
-- **Speculation:** suffix lookup is enabled; the ternary MTP head artifact,
-  when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`, adds gated
-  depth-3 drafting. Without it MTP is off and the policy says why.
-- **Prompt cache:** GPU checkpoint count derives from working-set headroom.
-  Disk budget is the smaller of 512 GiB and 25% of free space.
+- **Speculation:** suffix lookup is enabled; the mixed ternary/int8 MTP head
+  artifact, when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`,
+  adds gated depth-3 drafting. Without it MTP is off and the policy says why.
+- **Prompt cache:** GPU checkpoint count (at most four) derives from
+  working-set headroom. The disk budget is the smallest of the checkpoint's
+  own size, an eighth of free disk and a quarter of physical memory; the
+  startup reason prints every term.
 - **Host snapshots:** disabled when the startup write probe measures at least
   500 MiB/s, making the integrity-checked disk tier the first durable tier;
   otherwise capped at one quarter of remaining headroom or 4 GiB.
@@ -857,8 +918,9 @@ of decode. That ordering is what makes the unit costs worth recording.
 These figures were taken with the retired int8 head, whose matrix-vector
 product read four output rows per SIMD group with eight-byte weight loads; that
 took drafting on the planets prompt from 0.588 s to 0.503 s on an M4 Pro,
-leaving it about 8% of decode time. The shipped ternary head runs on the
-target's own PTQ1 kernels.
+leaving it about 8% of decode time. The shipped mixed head runs its ternary
+matrices on the target's own PTQ1 kernels and its int8 matrices on the int8
+kernels; this breakdown has not been re-measured with it.
 
 | Quantity | Value |
 | --- | ---: |
@@ -1122,14 +1184,25 @@ that end-of-request readback (673 MB) on its way to the disk writer.
 
 ## Performance
 
-| Workload | Result |
-| --- | ---: |
-| Plain short-prompt decode | 31.1 tok/s |
-| Six-prompt speculative decode (geomean) | 36.5 tok/s |
-| Arithmetic with speculation | about 27 tok/s |
-| Code copy-edits with speculation | 40–54 tok/s |
-| 4K prefill | about 125 tok/s |
-| 128K prefill | 56 tok/s |
+End-to-end summary (M4 Pro, greedy). Each row names where it was measured;
+the sections below give the A/B detail. Rates move by a few percent between
+interleaved runs, so compare builds within one run, not across rows.
+
+`tools/benchmark.py` records macOS power source at the start and around each
+measured sample. Battery power, an unknown source, and source changes do not
+block a run; mixed power states are reported as an uncontrolled comparison.
+Sleep and competing builds remain timing-validity guards. `--allow-busy`
+bypasses the load/build guards and downgrades sleep failures to warnings with
+an `UNTRUSTED` result. There is no background power-polling loop.
+
+| Workload | Result | Source |
+| --- | ---: | --- |
+| Plain short-prompt decode, six-prompt geomean | 30.4–32.3 tok/s | best-of-two A/B runs below, across recent kernel changes |
+| Default speculative decode, six-prompt geomean | 38.0–39.2 tok/s | same runs; 38.6 in the depth/margin sweep |
+| Two 600-token copy-edit prompts, suffix lookup | 89.8 and 90.5 tok/s | 5- to 128-row kernel change |
+| Cold prefill, 2K–8K tokens | 123–126 tok/s | large-batch kernel change |
+| Cold prefill, 32,767 tokens | 105.9 tok/s | same, one run |
+| 128K prefill | 56 tok/s | [original build](https://github.com/debanjanbasu/local-ai/commit/b389329); not re-measured |
 
 Decode spends 97–98% of wall time on the GPU. PTQ1 decode moves 5.65 GB of
 weights per token. The packed projections were ALU-bound, not bandwidth-bound:
@@ -1511,6 +1584,12 @@ decode from 19.23 to 20.39 tok/s.
 
 ## Tried and rejected
 
+Entries are measured on the build current when they were tried. Decode rates
+of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
+[the original build](https://github.com/debanjanbasu/local-ai/commit/b389329),
+about 22 before the half-prefix decoder) and compare only within
+their own entry, not with current rates.
+
 - PTQ1 pipeline descriptor hints (32-thread maximum and the multiple-of-SIMD
   execution-width flag): outputs stayed bitwise identical, but timing shifts
   were within about 2% and moved with the repeated default control. No
@@ -1563,8 +1642,11 @@ decode from 19.23 to 20.39 tok/s.
   measured 20.30 versus 19.33, by hiding the alpha/beta latency.
 - SwiGLU with four rows of each matrix per SIMD group: 264.5 versus 262.1 us
   for two.
-- Multi-request batching: 25.5/29.5/31.4 aggregate tok/s at 2/3/4 requests,
-  versus 31.1/35.4/37.7 for serial requests retaining speculation.
+- Multi-request batching on the original kernels: 25.5/29.5/31.4 aggregate
+  tok/s at 2/3/4 requests, versus 31.1/35.4/37.7 for serial requests
+  retaining speculation. Superseded:
+  batched serving with in-batch speculation now ships (see
+  [Concurrent requests](#concurrent-requests)).
 - Weight prewarm: increases resident footprint without improving steady-state inference.
 - Q6 K/V (six-bit codes, F16 scale per 32, 26 KiB per token) as a fallback
   for machines where Q8 could not reach 32K tokens. Rotated: mean KL 1.3e-4
@@ -1846,8 +1928,13 @@ the reasoning run allowed 1,024 output tokens instead of 32 and included the
 template's reasoning instruction. It is a passing paired probe, not evidence
 of reliable coding at 262,144 tokens or a causal isolation of every difference.
 These roughly 69K-token runs remain the longest real-model quality probes
-recorded here. A 261,119-token fixture plus a 1,024-token output budget is
-prepared; a full end-to-end result is not yet available. Validation serializes
+recorded here. A 261,119-token fixture plus a 1,024-token output budget
+(262,143 tokens in all) began on the M4 Pro on 2026-10-10 and has not
+finished; no long-context result is recorded, and prefill progress is not a
+quality result. Only its short control has completed: the same formula
+question over a 3,163-token prompt, default reasoning, answered the expected
+`255,90` in 345 generated tokens. That control checks the fixture and
+harness, not long-context reasoning. Validation serializes
 GPU work and records the power source; battery power is not a correctness-test
 blocker.
 

@@ -19,8 +19,10 @@ target/release/local-ai serve
 target/release/local-ai chat 'What is 17 * 23?'
 ```
 
-The server exposes an OpenAI-compatible API at `127.0.0.1:8080`. A client that
-stops reading its socket without closing it is invisible to TCP, so `serve`
+The server listens on `127.0.0.1:8080` and implements a text and function-calling
+subset of the OpenAI Chat Completions, Completions and Responses HTTP
+contracts (not full OpenAI compatibility). A client that stops reading its
+socket without closing it is invisible to TCP, so `serve`
 takes `--stall-timeout SECONDS` (default 30, accepted 10 to 3600) to bound how
 long a generation may go undelivered before it is cancelled and the engine
 released; the budgets, measurements and limits are in
@@ -30,7 +32,12 @@ Responses are stateless and nothing is stored by default. `--response-store DIR`
 opts in to keeping them (owner-only, unencrypted files) for
 `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
 `previous_response_id`, which carries over conversation items but not
-`instructions`, tools or sampling settings. `--reasoning-key FILE` adds
+`instructions`, tools or sampling settings. With a store, non-streaming
+`background: true` requests return a `queued` response once it is durably
+stored; poll `GET /v1/responses/{id}` and stop one with
+`POST /v1/responses/{id}/cancel`. Background streaming, `starting_after`
+replay and resuming jobs interrupted by a restart are not implemented.
+`--reasoning-key FILE` adds
 AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
 reasoning is still returned and, with a store, still written, so it is neither
 encryption at rest nor hidden reasoning. `POST /v1/responses/input_tokens`
@@ -89,17 +96,20 @@ Startup prints every decision and reason under `experimental_bonsai`.
 | Context | Largest value up to 262,144 whose fully grown state fits 90% of Metal's recommended working set |
 | K/V | Hadamard-rotated Q8 (8.5 bits/value); start at 1,024 tokens and grow on demand |
 | Kernels | Metal 4 tensor kernels where supported, SIMD fallbacks elsewhere |
-| Speculation | Lossless suffix lookup; gated depth-3 MTP when the ternary head artifact is installed |
+| Speculation | Lossless suffix lookup; gated depth-3 MTP when the mixed ternary/int8 head artifact is installed |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
-| Disk | `min(512 GiB, 25% of free space)` under `~/Library/Caches/local-ai/prompt-cache` |
-| Server | Up to eight requests decoded together in one batched pass per step, verifying lookup drafts where a cost model finds them worth their rows; long prompts prefill 32 tokens per step beside them; eight more queued; HTTP/3 when its certificate and key are discovered |
+| Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache` |
+| Server | Up to eight requests decoded together in one batched pass per step, verifying lookup and MTP drafts where a cost model finds them worth their rows; a long prompt prefills 24 to 31 tokens per step inside that pass (32 in a pass of its own beside a single stream); eight more queued; HTTP/3 when its certificate and key are discovered |
 
 ## Performance
 
 - Decode: 31.2 tok/s plain and 38.6 tok/s geomean with the default gated
   depth-3 speculation (35–43 across prose, explanation, arithmetic, code,
-  essay and thinking prompts), with byte-identical greedy text; code
-  copy-edits reach 54–66 tok/s with suffix lookup.
+  essay and thinking prompts) in the depth/margin sweep, with byte-identical
+  greedy text; later best-of-two six-prompt A/B runs on newer kernels
+  measured 30–32 and 38–39 tok/s. Two 600-token copy-edit prompts reached
+  about 90 tok/s with suffix lookup. Run-by-run provenance is in
+  [docs/BONSAI.md](docs/BONSAI.md#performance).
 - Server: concurrent requests decode in one batched pass per step, their MTP
   heads drafting together in one head pass per depth; 300-token chat
   requests reach about 39, 56 and 74 tok/s aggregate at 2, 4 and 8 streams
@@ -109,7 +119,9 @@ Startup prints every decision and reason under `experimental_bonsai`.
   suffix-lookup drafts inside the batch: 37.9 against 34.9 tok/s aggregate
   at four streams for the previous build, byte-identical to each request
   alone.
-- Prefill: about 96 tok/s at 4K tokens and 56 tok/s at 128K.
+- Prefill (cold, no speculation): about 125 tok/s from 2K to 8K tokens and
+  106 tok/s at 32K on the large-batch kernels. The 56 tok/s at 128K was
+  measured on the original build and has not been re-measured.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s.
 - Memory: 0.8–0.9 GB peak for a short request and 2.09 GB peak footprint for
@@ -143,8 +155,9 @@ baseline a counting prompt, so the original single "2.0x" was a ratio across two
 different workloads. Re-measured on one prompt with
 [`tools/benchmark.py`](tools/benchmark.py), which refuses to compare
 configurations that emit different text, the gain is **1.15x on varied prose**
-and **1.62x on repetitive text**, where the n-gram suffix lookup contributes as
-well as the MTP head. `docs/BONSAI.md` decomposes the two mechanisms.
+and **1.62x on repetitive text**. A separate run with the speculation counters
+([below](#speculation-decomposed)) found n-gram lookup idle on both kinds of
+workload, so those gains come from the MTP head.
 
 Absolute rates are the least portable number here: they move with prompt length
 because prefill amortizes differently (a 160-token generation runs well above
@@ -152,14 +165,16 @@ the rate a 1024-token one does on identical hardware), and two measurements of
 the same configuration on this box have differed by 1.6x when the machine was
 busy. Measure the ratio, not the rate.
 
-The lower tok/s is hardware, not a defect. Decode is memory-bandwidth-bound:
-PTQ1 decode moves about 5.65 GB of weights per token, and
-[docs/BONSAI.md](docs/BONSAI.md) records 97–98% of decode wall time on the
-GPU, so throughput tracks memory bandwidth closely. This machine's roughly
-100 GB/s is about a third of the M4 Pro's, and its decode rate is about a third
-too. Expect prefill to be slower by a similar margin;
-`GenerationStats.prefill` (`local-engine/src/runtime.rs:77`) is a duration
-rather than a rate, so no prefill tok/s figure is published here.
+The lower tok/s is mostly hardware, not a defect. PTQ1 decode moves about
+5.65 GB of weights per token and [docs/BONSAI.md](docs/BONSAI.md) records
+97–98% of decode wall time on the GPU. This machine's roughly 100 GB/s is
+about a third of the M4 Pro's, and on the build measured here its decode rate
+was about a third too. The M4 Pro's current single-row kernels were
+ALU-limited before the half-FMA decoder and now reach 82–95% of a streaming
+read control; the M2 has not been re-measured on them. Expect prefill to be
+slower by a similar margin; `GenerationStats.prefill`
+(`local-engine/src/runtime.rs`) is a duration rather than a rate, so no M2
+prefill tok/s figure is published here.
 
 Two things adapt without configuration. Context is derived at startup from
 Metal's `recommendedMaxWorkingSetSize`, which is why 16 GB of unified memory
@@ -172,25 +187,17 @@ selects Metal 4 tensor kernels for full-attention prefill
 
 ### Speculation, decomposed
 
-`--no-speculation` is one flag over two independent mechanisms: the MTP head,
-a learned draft that speculates ahead, and n-gram suffix lookup
-(`ngram_policy`, `min_match: 12`), an exact-match reuse of a previously-seen
-12-token suffix that proposes its known continuation. Both are honestly called
-speculation and the flag disables both, so the 2.0x above is not in dispute;
-what an A/B against that flag cannot show is how the gain divides between them.
-Measured today on this M2, greedy, median of three repetitions per arm, every
-arm producing byte-identical output: on varied prose and on ordinary repetition
-the n-gram path never fired at all, and the gains there — **1.26x** (1.22x on an
-independent second run) and **1.62x** — are MTP alone. The larger figure appears
-only where n-gram lookup engages, which on a verbatim repetition workload it did
-at 260 of 261 proposals accepted for 0.1 ms of total lookup time; both
-mechanisms were live in that run, so these figures bound the head's contribution
-rather than dividing the gain between the two. Verification, not drafting, is
-89.0% of decode time, and a batched verify token costs **0.65x** what a standalone
-decode token costs — which is also why a published CUDA measurement of the same
-PTQ1 format gained only 1.6%.
-
-See [docs/BONSAI.md](docs/BONSAI.md) for the technical reference.
+`--no-speculation` disables two independent mechanisms: the MTP head and
+n-gram suffix lookup (`min_match: 12`). On this M2, greedy, median of three
+repetitions per arm, every arm byte-identical: varied prose gained **1.26x**
+(1.22x on a second run) and counting **1.62x** with n-gram lookup never
+firing, so those gains are the head alone. The **1.96x** verbatim-repetition
+row is the only one where n-gram lookup engaged (260 of 261 proposals
+accepted), with both mechanisms live, so the split there is not measured.
+Verification, not drafting, is 89.0% of decode time, and a batched verify
+token costs **0.65x** a standalone decode token. The full table, time
+breakdown and comparison with a published CUDA result are in
+[docs/BONSAI.md](docs/BONSAI.md#what-the-speculation-gain-is-made-of).
 
 ## Model install
 
@@ -201,25 +208,21 @@ Weights are not included. The runtime validates these pinned files:
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` | always |
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | for MTP speculation |
 
-The GGUF is required. The [ternary MTP head](#mtp-head-artifact) is not:
-without it speculation falls back to suffix lookup alone and the startup policy
-says why.
+The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
+not: without it speculation falls back to suffix lookup alone and the startup
+policy says why.
 
-The head is published as a release asset,
-[`mtp-head-mixed-v1`](https://github.com/debanjanbasu/local-ai/releases/tag/mtp-head-mixed-v1)
-(with its model card, license, notice and checksums), mirrored on Hugging Face
-as
-[`debanjanbasu/Ternary-Bonsai-2-27B-MTP-mixed`](https://huggingface.co/debanjanbasu/Ternary-Bonsai-2-27B-MTP-mixed).
-From the repository root:
+The GGUF repository is pinned. Its head has moved past `6ed5e12b`, so keep the
+pin rather than tracking the branch.
 
 ```bash
-python3 tools/fetch_mtp_head.py
+hf download prism-ml/Ternary-Bonsai-2-27B-gguf \
+  --revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b \
+  --include 'Ternary-Bonsai-2-27B-PTQ1_0.gguf' \
+  --local-dir models/bonsai2-27b-ptq1
 ```
 
-It streams the pinned asset into `models/bonsai2-27b-mtp/`, checks its size and
-SHA256, and never replaces an existing file.
-
-`--include` is required. Without it `hf download` fetches the
+The `--include` filter is required. Without it `hf download` fetches the
 whole repository: it holds 68.5 GB across five checkpoints, most of it
 unusable here. One
 measured attempt transferred 21 GB+ before being stopped. Only the files listed
@@ -237,23 +240,6 @@ There is no vision, clip, projector, mmproj, or image code anywhere in
 loaded. `local-engine/src/resources.rs` names the only two paths the runtime
 resolves, `MODEL_RELATIVE` and the head's `MTP_DIRECTORY`/`MTP_HEAD_ARTIFACT`.
 
-The GGUF repository is pinned. Its head has moved past `6ed5e12b`, so keep the
-pin rather than tracking the branch.
-
-```bash
-hf download prism-ml/Ternary-Bonsai-2-27B-gguf \
-  --revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b \
-  --include 'Ternary-Bonsai-2-27B-PTQ1_0.gguf' \
-  --local-dir models/bonsai2-27b-ptq1
-shasum -a 256 \
-  models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-  models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin
-```
-
-Compare against the table above. The `shasum` arguments are spelled out rather
-than globbed so a stray F16 or PQ2_0 file in the directory cannot pass for the
-checkpoint.
-
 If Hugging Face is unavailable, stage a private CPU-only Kaggle job. Staging
 does not submit it; review the generated directory first.
 
@@ -264,6 +250,31 @@ python3 tools/kaggle_bonsai_job.py \
 
 The tool produces digest-checked, no-clobber archives and retains upstream
 licenses.
+
+The optional MTP head is published as a release asset,
+[`mtp-head-mixed-v1`](https://github.com/debanjanbasu/local-ai/releases/tag/mtp-head-mixed-v1)
+(with its model card, license, notice and checksums), mirrored on Hugging Face
+as
+[`debanjanbasu/Ternary-Bonsai-2-27B-MTP-mixed`](https://huggingface.co/debanjanbasu/Ternary-Bonsai-2-27B-MTP-mixed).
+From the repository root:
+
+```bash
+python3 tools/fetch_mtp_head.py
+```
+
+It streams the pinned asset into `models/bonsai2-27b-mtp/`, checks its size and
+SHA256, and never replaces an existing file.
+
+If you installed both files, verify them against the table above:
+
+```bash
+shasum -a 256 \
+  models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+  models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin
+```
+
+The `shasum` arguments are spelled out rather than globbed so a stray F16 or
+PQ2_0 file in the directory cannot pass for the checkpoint.
 
 ### MTP head artifact
 
@@ -296,7 +307,9 @@ by ProCreations, which is the teacher, not a runtime input. The recipe is ours:
 `mtp-capture` records the target's hidden states and logits,
 `tools/mtp_train/train_ternary.py` runs ternary QAT with a KL objective to the
 teacher's draft chains, and `tools/mtp_train/convert.py to-ternary` writes
-`model_mtp_ternary.safetensors`. Pack it into the artifact with:
+`model_mtp_ternary.safetensors` (its `--int8` option, defaulting to the
+training checkpoint's own set, selects the int8 matrices). Pack it into the
+artifact with:
 
 ```bash
 target/release/local-ai bonsai --export mtp-head=DIR
@@ -321,12 +334,14 @@ python3 tools/kaggle_bonsai_mtp_job.py \
   --kernel USER/bonsai2-mtp --output cache/kaggle-bonsai-mtp
 ```
 
-Against the retired int8 head the ternary head measured 27.46 tok/s at 74.3%
-draft acceptance versus 28.40 at 80.8% (six prompts, byte-identical text); see
-[docs/BONSAI.md](docs/BONSAI.md) for the measurements.
+An earlier all-ternary QAT head measured 27.46 tok/s at 74.3% draft acceptance
+against the retired int8 head's 28.40 at 80.8% (six prompts, byte-identical
+text); the mixed head above superseded it. See
+[docs/BONSAI.md](docs/BONSAI.md#tried-and-rejected) for those measurements.
 
-This is specific to the head. The 5,946,648,928-byte GGUF is not compressible in
-practice: the measured ceiling is 1.074x and the best measured result 1.29%.
+Artifact compression only ever applied to the retired int8 head. The
+5,946,648,928-byte GGUF is not compressible in practice: the measured ceiling
+is 1.074x and the best measured result 1.29%.
 
 ## Workspace
 

@@ -1,24 +1,17 @@
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 
 use local_engine::{Event, EventStream};
 
 use super::Admitted;
+use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     Protocol, Reply, chat_finish_reason, chat_tool_call, finish_reason, usage_json,
 };
 use super::responses::{ResponsesState, sse_frame};
-
-/// Retry interval for a frame the client has not taken yet.
-///
-/// Only a stalled client ever waits this long: a live one leaves the capacity-1
-/// slot free, so the first attempt sends and this constant is never reached.
-const STALL_RETRY: Duration = Duration::from_millis(2);
 
 /// Start a streaming response and hand the frame receiver to axum.
 ///
@@ -126,52 +119,6 @@ fn deliver(
         }
     }
     true
-}
-
-/// What became of a frame offered to the client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FrameOutcome {
-    /// The frame is in the channel, or never needed sending.
-    Sent,
-    /// The body was dropped, so the client is gone. The normal end.
-    Closed,
-    /// The client stopped taking frames for the whole stall budget.
-    Stalled,
-}
-
-/// Offer one frame to `sender`, abandoning it if the client stops reading.
-///
-/// A bare `blocking_send` is what wedges a server: it parks this thread until
-/// the slot frees, and a client that stops reading with its socket open never
-/// frees it — no TCP event distinguishes that client from a slow one. Polling
-/// with [`mpsc::Sender::try_send`] is bounded because the deadline is checked
-/// here; `try_send` hands the frame back on `Full`, so the retry keeps the same
-/// allocation instead of cloning a frame per attempt.
-///
-/// `try_send` rather than `blocking_send` is also what makes the healthy case
-/// free: a live reader leaves the capacity-1 slot free, the first `try_send`
-/// succeeds, and the frame is on its way without a clock read or a sleep. The
-/// deadline is therefore started on the first retry, not before the send.
-pub(super) fn send_frame(
-    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
-    frame: Bytes,
-    stall: Duration,
-) -> FrameOutcome {
-    let mut frame = Ok(frame);
-    let mut retrying_since = None;
-    loop {
-        match sender.try_send(frame) {
-            Ok(()) => return FrameOutcome::Sent,
-            Err(TrySendError::Closed(_)) => return FrameOutcome::Closed,
-            Err(TrySendError::Full(returned)) => frame = returned,
-        }
-        let started = *retrying_since.get_or_insert_with(Instant::now);
-        let waited = started.elapsed();
-        if waited >= stall {
-            return FrameOutcome::Stalled;
-        }
-        sleep(STALL_RETRY.min(stall.saturating_sub(waited)));
-    }
 }
 
 /// Turns engine events into the SSE frames of one API's streaming format.
