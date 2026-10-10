@@ -181,6 +181,10 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored or temporary background response, or (`GET ?stream=true`) resume a streamed background response |
 | `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored or temporary background response |
 | `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
+| `POST`, `GET`, `DELETE` | `/v1/conversations[/{id}[/items[/{item_id}]]]` | durable conversations and items ([native services](#native-services)) |
+| `POST`, `GET`, `DELETE` | `/v1/files[/{id}[/content]]` | streamed multipart files |
+| `POST` | `/v1/uploads[/{id}/parts\|complete\|cancel]` | multipart uploads with optional MD5 |
+| `POST`, `GET` | `/v1/batches[/{id}[/cancel]]` | batches of the three text endpoints on the loaded model |
 | `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
 | `POST` | `/v1/decisions` | always 404, explaining why OpenAI Decisions is not implemented |
 
@@ -188,7 +192,8 @@ Generation accepts `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `presence_penalty`, `frequency_penalty`, `seed`, and `stream`. Chat's
 `max_completion_tokens` takes precedence over `max_tokens`; Responses uses
 `max_output_tokens`. Cache affinity prefers `prompt_cache_key`, then
-`session_id`, then `user`. Requests are limited to 2 MiB; media is rejected.
+`session_id`, then `user`. Requests are limited to 2 MiB (multipart file and
+upload-part bodies have their own streamed limits); media is rejected.
 
 Chat supports function `tools`, assistant `tool_calls`, and tool-result messages
 with `tool_call_id`. Native rendering and validation belong to `local-engine`
@@ -283,7 +288,9 @@ still reasoning, before any answer, Chat reports an error and Responses
 Optional tools with a text answer may end during reasoning without a call;
 required or named calls mask end-of-sequence until the call is complete.
 
-Storage is opt-in and **nothing is stored durably by default**; only
+Response storage is opt-in and **no Response is stored durably by default**
+(conversations, files and batches use the always-on
+[native services](#native-services) store); only
 background responses are kept, briefly, without it. Without
 `--response-store DIR` the endpoint is stateless: responses report
 `store: false`, `store: true` and `previous_response_id` are refused, and
@@ -314,8 +321,9 @@ non-empty `include` are refused, as there are no extra fields to add.
 100, default 20) and `order` (`desc` by default), reporting `first_id`,
 `last_id` and `has_more`; an unknown `after` is 404. `DELETE` returns `response.deleted`.
 Unknown, malformed, deleted and never-stored IDs are the same 404, and all of
-these routes sit behind `--api-key` when it is set. Conversations and
-`item_reference` inputs remain unsupported.
+these routes sit behind `--api-key` when it is set. `item_reference` inputs
+remain unsupported; Responses `conversation` uses the separate
+[native services](#native-services) store, not `--response-store`.
 
 Background Responses are kept either durably or temporarily. With
 `--response-store` and `store: true` (the default with a store) they are
@@ -459,8 +467,12 @@ decoding, as is a structured format beside tools; a grammar guarantees the
 form of what is generated, not that the model chooses well. OpenAI Decisions
 is not implemented: the opt-in
 [experimental decisions](#experimental-decisions) route returns a head's
-probabilities without the confidence and refusal Decisions requires, and the
-head is calibrated only for two-option code-diff questions. The MTP head and
+probabilities without the confidence and refusal Decisions requires, and any
+calibration holds only within the loaded artifact's own evaluated scope (for
+example, the legacy devtools-v1 head's two-option Yes/No code-diff questions,
+or the development-only
+[hard-v1 results](../local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)).
+The MTP head and
 next-token softmax are not calibrated decision probabilities either.
 
 The compatibility target is the public OpenAI contract, not a particular
@@ -474,10 +486,11 @@ Missing endpoint families are not all model limitations. Opt-in local response
 storage (retrieve, delete, `input_items`), polled and streamed background
 responses with cancellation and journal-based stream resumption, temporary
 (`store: false`) background retention, Responses input-token counting,
-JSON-object/JSON-schema output and tool calls constrained during decoding are
-now implemented as described above; conversations, compaction, resuming a
-background job interrupted by a restart, files, uploads, vector stores and
-batches still need server implementations; OpenAI-compatible Decisions needs
+JSON-object/JSON-schema output, tool calls constrained during decoding, and
+durable conversations, files, uploads and text-endpoint batches
+([native services](#native-services)) are now implemented as described;
+compaction, resuming a background Response interrupted by a restart and
+vector stores still need server implementations; OpenAI-compatible Decisions needs
 a judgment head with evaluated confidence and refusal semantics; media,
 embedding, audio and moderation capabilities need suitable models or heads. Hosted tools,
 evals, fine-tuning and administrative APIs also need their own services. None
@@ -647,6 +660,62 @@ the whole directory, so nothing temporary survives a restart. A crash or
 temporary directory; the next start creates a new one and never reads it. If
 the private store cannot be created, the server warns at startup and refuses
 these requests.
+
+### Native services
+
+`serve` always opens one durable store at
+`~/Library/Application Support/local-ai/services` (an owner-only SQLite
+database in WAL mode plus file blobs, all plaintext) and refuses to start if
+it cannot. There is no flag and no alternative backend. The store is separate
+from `--response-store`, which stays opt-in. Storage, limits, crash safety and
+the native API, including the workspace search that has no HTTP route, are in
+[local-services/README.md](../local-services/README.md). Routes sit behind
+`--api-key` and are also served over HTTP/3. Service CRUD uses a bounded
+blocking pool; conversation reads and appends run on the existing Response
+preparation and generation blocking tasks, never on runtime workers.
+
+- **Conversations.** Create, retrieve, update metadata, delete, and list, add,
+  retrieve and delete items. JSON bodies and query strings are strict:
+  unknown or repeated fields are a 400. Items cover text messages, function
+  calls and outputs, and reasoning. Any other item type is refused.
+  `include` accepts only `reasoning.encrypted_content`, which is a no-op.
+  Deleted conversations become unreachable, but their items stay on disk.
+- **Responses `conversation`.** A Response may name a conversation by ID or
+  `{"id"}`, but not together with `previous_response_id`. The conversation's
+  items, read as one snapshot, are placed before the new input, and the
+  Response echoes `conversation`. When the Response completes or ends
+  `incomplete`, its new input and output are appended once, keyed by the
+  response ID. The append happens only if the conversation is still at the
+  version the prompt was built from. Otherwise, or if the append fails, the
+  Response fails and nothing is appended. Failed and cancelled Responses
+  append nothing. Background Responses append once, at their end.
+  `input_tokens` counting reads the conversation without changing it.
+- **Files and Uploads.** Multipart bodies stream into an owner-only spool and
+  are never held in memory. A file is at most 512 MiB (200 MiB for `batch`)
+  and a part at most 64 MiB; anything larger is a 413. Completion verifies an
+  optional `md5`. At most 4 multipart transfers and 16 downloads run at once;
+  past that the answer is a 503 with `Retry-After: 1`. Expired objects are a
+  404, and changes to an expired or cancelled upload are a 410. Expiry is
+  enforced on access. Bytes are purged physically only at startup or through
+  the native `purge_file_storage`. A `purpose` is stored and echoed only; it
+  enables no processing.
+- **Batches.** These run `/v1/responses`, `/v1/chat/completions` and
+  `/v1/completions`, with `completion_window: "24h"`, on the loaded model
+  only. The whole input file is validated before anything is stored.
+  `output_expires_after` is refused, like any unknown field. One worker thread
+  runs one line at a time through the same preparation and collector as the
+  HTTP endpoints. Lines are stateless: `store: true`, `previous_response_id`
+  and `conversation` fail their line. Batch lines share the engine queue with
+  interactive requests. A full queue is retried with a 50 ms to 2 s capped
+  backoff. Other than that backoff, the worker does no polling: it scans for
+  runnable batches at startup and after each create or cancel. A per-batch OS
+  lock gives one server ownership of a batch. A restart reclaims batches with
+  free leases and resumes their unsettled lines. A line interrupted before
+  settling is generated again. Result files have stable `batch_output` IDs.
+
+These services do not resume background Responses after a crash or restart.
+Batch resumption is a separate mechanism. They also provide no compaction,
+training or change to the model.
 
 ### Experimental decisions
 

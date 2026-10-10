@@ -21,9 +21,18 @@
 //!   `store: false` (see [`super::background::Temporary`]). With
 //!   `stream: true` its events are journaled so a stream can be resumed (see
 //!   [`super::background`] and [`super::resume`]).
-//!   `conversation` and `item_reference` inputs still fail. Clients may instead carry history
+//!   `item_reference` inputs still fail. Clients may instead carry history
 //!   explicitly in `input`, which is supported in full for messages,
 //!   reasoning, `function_call` and `function_call_output` items.
+//! - `conversation` (an ID or `{"id"}`, never with `previous_response_id`)
+//!   needs the durable conversation store. The conversation's items, read as
+//!   one snapshot, precede this request's input; the Response echoes
+//!   `conversation: {"id"}`. A completed or incomplete Response appends this
+//!   request's new input and its output to the conversation exactly once,
+//!   keyed by the response ID and only if the conversation is still at the
+//!   version the prompt was built from, before its terminal state is
+//!   reported; if that append fails the Response fails instead. Failed and
+//!   cancelled Responses append nothing.
 //! - Function tools only; built-in, MCP and custom tools need hosted
 //!   services this server lacks. `tool_choice` (`auto`, `none`, `required` or
 //!   `{"type":"function","name"}`), `parallel_tool_calls` and a tool's
@@ -52,6 +61,8 @@ use serde_json::{Map, Value, json};
 
 use local_engine::bonsai_model::StopReason;
 use local_engine::{ChatMessage, ChatRequest, Event, Sampling, Stats, ToolCall, ToolDefinition};
+use local_services::conversations::{MAX_APPEND_ITEMS, MAX_ID_CHARS};
+use local_services::{Append, Error as ServiceError, Store as ConversationStore};
 
 use super::background::Temporary;
 use super::reasoning_crypto::ReasoningCipher;
@@ -161,6 +172,59 @@ pub(super) struct Echo {
     /// `background: true`: generated detached from the request, and persisted
     /// by [`super::background`] rather than by [`ResponsesState`].
     background: bool,
+    /// The durable conversation this Response continues and is appended to.
+    conversation: Option<Conversing>,
+}
+
+/// A durable conversation a Response continues, and what it will append.
+#[derive(Debug)]
+struct Conversing {
+    store: ConversationStore,
+    id: String,
+    /// The history version the prompt was built from. The append expects it,
+    /// so generation that raced another writer is refused, never appended.
+    version: u64,
+    /// This request's new input items as the client sent them (normalized,
+    /// before any reasoning was decrypted), appended before the output. The
+    /// replayed history is never among them.
+    input: Vec<Value>,
+}
+
+impl Conversing {
+    /// Append this request's input and `response`'s output, exactly once:
+    /// keyed by the response ID, so a retry of the same append is a no-op.
+    /// `Err` says why nothing was appended.
+    fn append(&self, response: &Value) -> Result<(), String> {
+        let request_id = response
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the response has no id".to_owned())?
+            .to_owned();
+        let mut items = self.input.clone();
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            items.extend_from_slice(output);
+        }
+        if items.is_empty() {
+            // Nothing new to record; the history is unchanged either way.
+            return Ok(());
+        }
+        let append = Append {
+            request_id,
+            expected_version: self.version,
+            items,
+        };
+        // A conflict (another writer moved the conversation on) says so in
+        // its own message: "conversation ... is at version N, not the expected M".
+        self.store
+            .append_items(&self.id, append)
+            .map(drop)
+            .map_err(|error| {
+                format!(
+                    "the response could not be added to conversation {}: {error}",
+                    self.id
+                )
+            })
+    }
 }
 
 impl Echo {
@@ -206,13 +270,15 @@ impl ResponsesRequest {
 
     /// Fail on any option whose effect this server cannot produce. `stored`
     /// says whether a response store was configured, `temporary` whether the
-    /// private temporary store is available.
-    #[allow(clippy::too_many_lines)]
+    /// private temporary store is available, `conversations` whether the
+    /// durable conversation store is.
+    #[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
     fn reject_unsupported(
         &self,
         stored: bool,
         temporary: bool,
         encrypted: bool,
+        conversations: bool,
     ) -> crate::Result<()> {
         if !stored && self.store == Some(true) {
             return Err(unsupported(
@@ -246,11 +312,11 @@ impl ResponsesRequest {
                 "previous_response_id and conversation cannot be used together",
             ));
         }
-        if present(self.conversation.as_ref()) {
+        if !conversations && present(self.conversation.as_ref()) {
             return Err(unsupported(
                 "conversation",
-                "the Conversations API is not implemented; use previous_response_id or send the \
-                 earlier items in input",
+                "this server has no durable conversation store; use previous_response_id or send \
+                 the earlier items in input",
             ));
         }
         for (name, value) in [
@@ -358,13 +424,29 @@ pub(super) fn prepare_responses(body: &[u8], thinking: bool) -> crate::Result<Pr
     prepare_responses_with(body, thinking, None, None, "m")
 }
 
-/// Count requests use the generation input contract, but never persist a
-/// response or admit generation. Reject generation-only options rather than
-/// silently accepting a misspelled count request.
+/// [`prepare_input_tokens_conversing`] on a server with no conversation store.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_input_tokens(
     body: &[u8],
     thinking: bool,
     store: Option<&Arc<ResponseStore>>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<ChatRequest> {
+    prepare_input_tokens_conversing(body, thinking, store, None, cipher, model)
+}
+
+/// Count requests use the generation input contract, but never persist a
+/// response or admit generation. Reject generation-only options rather than
+/// silently accepting a misspelled count request.
+///
+/// A `conversation` is read, as one snapshot, exactly as generation would
+/// read it, and never written. Blocks on the stores.
+pub(super) fn prepare_input_tokens_conversing(
+    body: &[u8],
+    thinking: bool,
+    store: Option<&Arc<ResponseStore>>,
+    conversations: Option<&ConversationStore>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<ChatRequest> {
@@ -400,10 +482,13 @@ pub(super) fn prepare_input_tokens(
     object.insert("store".into(), json!(false));
     let body = serde_json::to_vec(&value)
         .map_err(|error| invalid(format!("invalid token count request: {error}")))?;
-    Ok(prepare_responses_with(&body, thinking, store, cipher, model)?.request)
+    let prepared =
+        prepare_responses_conversing(&body, thinking, store, None, conversations, cipher, model)?;
+    Ok(prepared.request)
 }
 
 /// [`prepare_responses_retaining`] on a server with no temporary store.
+#[cfg(test)]
 pub(super) fn prepare_responses_with(
     body: &[u8],
     thinking: bool,
@@ -414,9 +499,8 @@ pub(super) fn prepare_responses_with(
     prepare_responses_retaining(body, thinking, store, None, cipher, model)
 }
 
-/// Parse a `POST /v1/responses` body, resolving `previous_response_id`
-/// against `store` and deciding whether the result will be stored there, or,
-/// for `background` with `store: false`, kept in `temporary`.
+/// [`prepare_responses_conversing`] on a server with no conversation store.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_responses_retaining(
     body: &[u8],
     thinking: bool,
@@ -425,10 +509,37 @@ pub(super) fn prepare_responses_retaining(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedResponses> {
+    prepare_responses_conversing(body, thinking, store, temporary, None, cipher, model)
+}
+
+/// Parse a `POST /v1/responses` body, resolving `previous_response_id`
+/// against `store` and deciding whether the result will be stored there, or,
+/// for `background` with `store: false`, kept in `temporary`.
+///
+/// A `conversation` is read from `conversations` as one ordered snapshot
+/// whose items precede this request's input; its version and the request's
+/// new items are kept for the append when the Response ends. Blocks on the
+/// stores, so it runs on the blocking pool.
+#[allow(clippy::too_many_lines)]
+pub(super) fn prepare_responses_conversing(
+    body: &[u8],
+    thinking: bool,
+    store: Option<&Arc<ResponseStore>>,
+    temporary: Option<&Arc<Temporary>>,
+    conversations: Option<&ConversationStore>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<PreparedResponses> {
     let request: ResponsesRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
     reject_temporary_previous(request.previous_response_id.as_deref(), temporary)?;
-    request.reject_unsupported(store.is_some(), temporary.is_some(), cipher.is_some())?;
+    request.reject_unsupported(
+        store.is_some(),
+        temporary.is_some(),
+        cipher.is_some(),
+        conversations.is_some(),
+    )?;
+    let conversation_id = conversation_id(request.conversation.as_ref())?;
     let thinking = effective_thinking(reasoning_effort(request.reasoning.as_ref())?, thinking)?;
     let (choice, echoed_choice) = responses_tool_choice(request.tool_choice.as_ref())?;
     let mut echoed_tools = Vec::new();
@@ -443,19 +554,37 @@ pub(super) fn prepare_responses_retaining(
     let (response_format, text_format) =
         responses_text_format(request.text.as_ref().and_then(|text| text.format.as_ref()))?;
     let empty_input = json!([]);
+    let continues = request.previous_response_id.is_some() || conversation_id.is_some();
     let input = request
         .input
         .as_ref()
-        .or_else(|| request.previous_response_id.as_ref().map(|_| &empty_input))
+        .or_else(|| continues.then_some(&empty_input))
         .ok_or_else(|| invalid("input is required"))?;
     // The resolved input: the earlier response's stored history, which never
     // includes its instructions, then this request's items. Each record keeps
-    // its full history, so this is one read however long the chain is.
+    // its full history, so this is one read however long the chain is. A
+    // conversation (never combined with `previous_response_id`) is likewise
+    // one consistent snapshot, oldest item first, at a known version.
     let mut items = match (&request.previous_response_id, store) {
         (Some(id), Some(store)) => previous_history(store, id)?,
         _ => Vec::new(),
     };
+    let snapshot = if let (Some(id), Some(conversations)) = (conversation_id, conversations) {
+        let (version, history) = conversation_history(conversations, &id)?;
+        items = history;
+        Some((conversations.clone(), id, version))
+    } else {
+        None
+    };
+    let replayed = items.len();
     normalize_input(input, &mut items)?;
+    // This request's own items, before any reasoning is decrypted below: only
+    // these, never the replayed history, are appended to a conversation.
+    let new_input = if snapshot.is_some() {
+        items[replayed..].to_vec()
+    } else {
+        Vec::new()
+    };
     for item in &mut items {
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
             continue;
@@ -486,6 +615,10 @@ pub(super) fn prepare_responses_retaining(
         &Value::Array(items.clone()),
         request.instructions.as_deref(),
     )?;
+    // Refused now, before generation, rather than when the append fails.
+    let conversation = snapshot
+        .map(|(conversations, id, version)| conversing(conversations, id, version, new_input))
+        .transpose()?;
     let persist = persist(&request, store, temporary, items);
     let params = request.params();
     let echo = Echo {
@@ -508,6 +641,7 @@ pub(super) fn prepare_responses_retaining(
         // durably or temporarily.
         background: request.background == Some(true) && persist.is_some(),
         persist,
+        conversation,
     };
     Ok(PreparedResponses {
         stream: request.stream.unwrap_or(false),
@@ -587,6 +721,133 @@ fn previous_history(store: &ResponseStore, id: &str) -> crate::Result<Vec<Value>
         ))),
         _ => Ok(stored.history()),
     }
+}
+
+/// The conversation ID a request names: a string, or `{"id": string}`.
+fn conversation_id(conversation: Option<&Value>) -> crate::Result<Option<String>> {
+    let id = match conversation {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(id)) => Some(id.clone()),
+        Some(Value::Object(object)) if object.len() == 1 => {
+            object.get("id").and_then(Value::as_str).map(str::to_owned)
+        }
+        Some(_) => None,
+    };
+    id.filter(|id| !id.is_empty()).map(Some).ok_or_else(|| {
+        invalid("conversation must be a conversation ID or an object with only an id string")
+    })
+}
+
+/// Conversation `id`'s version and items, oldest first, from one snapshot,
+/// each item as one flat object with its `id`.
+fn conversation_history(
+    conversations: &ConversationStore,
+    id: &str,
+) -> crate::Result<(u64, Vec<Value>)> {
+    let history = conversations
+        .conversation_history(id)
+        .map_err(|error| match error {
+            ServiceError::NotFound(_) => invalid(format!("conversation with id {id:?} not found")),
+            ServiceError::InvalidArgument(message) => invalid(message),
+            other => crate::Error::Generation(format!("could not read conversation {id}: {other}")),
+        })?;
+    let items = history
+        .items
+        .into_iter()
+        .map(|item| {
+            let mut body = item.body;
+            body.insert("id".into(), json!(item.id));
+            Value::Object(body)
+        })
+        .collect();
+    Ok((history.conversation.version, items))
+}
+
+/// What a Response continuing conversation `id`, read at `version`, will
+/// append: this request's `input` items, which must fit the conversation
+/// item contract (checked here, so a misfit is refused before generation
+/// rather than failing the append after it).
+fn conversing(
+    store: ConversationStore,
+    id: String,
+    version: u64,
+    input: Vec<Value>,
+) -> crate::Result<Conversing> {
+    // Room is kept for at least one output item.
+    if input.len() >= MAX_APPEND_ITEMS {
+        return Err(invalid(format!(
+            "a request continuing a conversation may add at most {} input items",
+            MAX_APPEND_ITEMS - 1
+        )));
+    }
+    for item in &input {
+        conversation_input(item)?;
+    }
+    Ok(Conversing {
+        store,
+        id,
+        version,
+        input,
+    })
+}
+
+/// Refuse a new input item the conversation store would not keep as sent.
+///
+/// `input_messages` has already validated the item for generation; this
+/// only refuses fields the stored item forms do not carry, an item ID the
+/// store cannot key by, and non-string call arguments, instead of dropping
+/// or rewriting them. The store validates everything else on append.
+fn conversation_input(item: &Value) -> crate::Result<()> {
+    let Some(object) = item.as_object() else {
+        return Err(invalid("each input item must be an object"));
+    };
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("message");
+    let allowed: &[&str] = match kind {
+        "message" => &["id", "type", "role", "content", "status"],
+        "function_call" => &["id", "type", "call_id", "name", "arguments", "status"],
+        "function_call_output" => &["id", "type", "call_id", "output", "status"],
+        "reasoning" => &[
+            "id",
+            "type",
+            "summary",
+            "content",
+            "encrypted_content",
+            "status",
+        ],
+        other => {
+            return Err(unsupported(
+                &format!("input item type {other:?}"),
+                "only messages, reasoning, function_call and function_call_output are accepted",
+            ));
+        }
+    };
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(unsupported(
+            &format!("{kind} field {key:?} with conversation"),
+            "a conversation keeps only the fields of the items local generation implements",
+        ));
+    }
+    let id = object.get("id").and_then(Value::as_str).unwrap_or_default();
+    let keyable = !id.is_empty()
+        && id.len() <= MAX_ID_CHARS
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    if !keyable {
+        return Err(invalid(format!(
+            "with conversation, an input item id must be 1 to {MAX_ID_CHARS} ASCII letters, \
+             digits, '_' or '-', not {id:?}"
+        )));
+    }
+    if kind == "function_call" && !object.get("arguments").is_some_and(Value::is_string) {
+        return Err(invalid(
+            "with conversation, function_call arguments must be a JSON string",
+        ));
+    }
+    Ok(())
 }
 
 fn function_tool(tool: &Value) -> crate::Result<ToolDefinition> {
@@ -1247,29 +1508,47 @@ impl ResponsesState {
             return self.fail(&message);
         }
         let response = self.response(overall, incomplete.as_ref(), error.as_ref(), Some(stats));
-        // A stored response is on disk before any client is told it finished,
-        // so an ID a client has seen complete can always be continued. A
-        // response that could not be stored fails rather than claim `store`.
+        // A conversation's new items are appended, and a stored response is
+        // on disk, before any client is told it finished, so what a client
+        // has seen complete can always be continued. A response whose items
+        // could not be kept fails rather than claim them. The conversation
+        // goes first: its append is the step that can conflict, and when it
+        // fails nothing at all has been written.
         // A background response is persisted by its pump, under the lock that
-        // also serialises cancellation and deletion, never from here.
-        if error.is_none()
-            && !self.echo.background
-            && let Some(persist) = &self.echo.persist
-            && let Err(failure) = persist.store.save(&response, &persist.input_items)
-        {
-            eprintln!("response {} could not be stored: {failure}", self.id);
-            let message = format!("the response could not be stored: {failure}");
-            self.emit(
-                "error",
-                json!({"code":"server_error","message":message,"param":null}),
-            );
-            let error = json!({"code":"server_error","message":message});
-            let failed = self.response("failed", None, Some(&error), Some(stats));
-            self.emit("response.failed", json!({"response":failed}));
-            return failed;
+        // also serialises cancellation and deletion, never from here (see
+        // [`Self::save`]).
+        if error.is_none() && !self.echo.background {
+            if let Some(conversing) = &self.echo.conversation
+                && let Err(message) = conversing.append(&response)
+            {
+                eprintln!("response {}: {message}", self.id);
+                return self.not_kept(&message, stats);
+            }
+            if let Some(persist) = &self.echo.persist
+                && let Err(failure) = persist.store.save(&response, &persist.input_items)
+            {
+                eprintln!("response {} could not be stored: {failure}", self.id);
+                let mut message = format!("the response could not be stored: {failure}");
+                if let Some(conversing) = &self.echo.conversation {
+                    message.push_str(&already_appended(&conversing.id));
+                }
+                return self.not_kept(&message, stats);
+            }
         }
         self.emit(kind, json!({"response":response}));
         response
+    }
+
+    /// End a Response whose items could not be kept as `failed`, with `message`.
+    fn not_kept(&mut self, message: &str, stats: &Stats) -> Value {
+        self.emit(
+            "error",
+            json!({"code":"server_error","message":message,"param":null}),
+        );
+        let error = json!({"code":"server_error","message":message});
+        let failed = self.response("failed", None, Some(&error), Some(stats));
+        self.emit("response.failed", json!({"response":failed}));
+        failed
     }
 
     /// The Response as it stands, before any terminal state: `queued` or
@@ -1287,11 +1566,32 @@ impl ResponsesState {
 
     /// Persist `response` with this request's resolved input, durably. Fails
     /// when the response is not to be stored at all.
+    ///
+    /// A completed or incomplete `response` continuing a conversation first
+    /// appends its items there, exactly once: saving the same response again
+    /// replays that append rather than repeating it. When the append fails
+    /// nothing is saved and the error says why.
     pub(super) fn save(&self, response: &Value) -> std::io::Result<()> {
         let persist = self.echo.persist.as_ref().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "response is not stored")
         })?;
-        persist.store.save(response, &persist.input_items)
+        let ended = matches!(
+            response.get("status").and_then(Value::as_str),
+            Some("completed" | "incomplete")
+        );
+        let Some(conversing) = self.echo.conversation.as_ref().filter(|_| ended) else {
+            return persist.store.save(response, &persist.input_items);
+        };
+        conversing.append(response).map_err(std::io::Error::other)?;
+        persist
+            .store
+            .save(response, &persist.input_items)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("{error}{}", already_appended(&conversing.id)),
+                )
+            })
     }
 
     /// The store this Response is persisted in, when it is stored.
@@ -1341,7 +1641,7 @@ impl ResponsesState {
         });
         let completed_at = (status == "completed").then(unix_now);
         let output: Vec<&Value> = self.output.iter().filter(|item| !item.is_null()).collect();
-        json!({
+        let mut response = json!({
             "id":self.id,
             "object":"response",
             "created_at":self.created,
@@ -1377,8 +1677,20 @@ impl ResponsesState {
             "prompt_cache_key":echo.prompt_cache_key,
             "safety_identifier":echo.safety_identifier,
             "metadata":echo.metadata,
-        })
+        });
+        // Only a Response that continues a conversation names one, so every
+        // other Response keeps exactly its existing shape.
+        if let Some(conversing) = &echo.conversation {
+            response["conversation"] = json!({"id":conversing.id});
+        }
+        response
     }
+}
+
+/// Said of a Response that failed to be stored after its items were appended
+/// to `conversation`, which keeps them: the append is not undone.
+fn already_appended(conversation: &str) -> String {
+    format!("; its items were already added to conversation {conversation}")
 }
 
 /// One Responses SSE frame: the event type is repeated in the `event:` line,
@@ -1387,3 +1699,8 @@ pub(super) fn sse_frame(event: &Value) -> String {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("error");
     format!("event: {kind}\ndata: {event}\n\n")
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "conversation_response_tests.rs"]
+mod conversation_response_tests;

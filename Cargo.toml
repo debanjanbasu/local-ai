@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "local-metal",
     "local-engine",
+    "local-services",
     "local-ai",
 ]
 
