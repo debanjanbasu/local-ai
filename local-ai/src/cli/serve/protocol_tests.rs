@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{
     ChatRequest, Event, GenerationStats, PrefillProgress, ResponseFormat, Signal, Stats, ToolCall,
+    ToolChoice,
 };
 
 use super::chunked::{Body, Flow, absorb};
@@ -152,24 +153,130 @@ fn chat_reasoning_effort_only_accepts_the_modes_the_template_has() {
 }
 
 #[test]
-fn chat_tool_choice_none_withholds_tools_and_forced_modes_fail() {
-    let tools = json!([{"type":"function","function":{"name":"weather"}}]);
-    let none = chat_request(
-        &json!({"messages":[user()],"tools":tools,"tool_choice":"none"}),
-        true,
-    )
-    .expect("none is valid");
-    assert_eq!(none.tools, []);
-    for forced in [
-        json!("required"),
-        json!({"type":"function","function":{"name":"weather"}}),
+fn chat_tool_choice_maps_onto_the_native_choice() {
+    let tools = json!([
+        {"type":"function","function":{"name":"weather"}},
+        {"type":"function","function":{"name":"time"}}
+    ]);
+    let choose = |choice: Value| {
+        chat_request(
+            &json!({"messages":[user()],"tools":tools,"tool_choice":choice}),
+            true,
+        )
+    };
+    for (choice, native) in [
+        (Value::Null, ToolChoice::Auto),
+        (json!("auto"), ToolChoice::Auto),
+        (json!("none"), ToolChoice::None),
+        (json!("required"), ToolChoice::Required),
+        (
+            json!({"type":"function","function":{"name":"time"}}),
+            ToolChoice::Function("time".into()),
+        ),
     ] {
-        let error = chat_error(&json!({"messages":[user()],"tools":tools,"tool_choice":forced}));
-        assert!(error.contains("constrained decoding"), "{error}");
+        let request = choose(choice.clone()).expect("valid choice");
+        assert_eq!(request.tool_choice, native, "{choice}");
+        // `none` is enforced natively; the tools are still declared, so the
+        // prompt is the same for every choice.
+        assert_eq!(request.tools.len(), 2, "{choice}");
+        assert!(request.parallel_tool_calls, "parallel calls by default");
     }
+    let request = chat_request(&json!({"messages":[user()]}), true).expect("no tools");
+    assert_eq!(request.tool_choice, ToolChoice::Auto);
+    assert_eq!(request.tools, []);
+}
+
+#[test]
+fn chat_tool_choice_shape_is_exact_and_checked_against_tools() {
+    let tools = json!([{"type":"function","function":{"name":"weather"}}]);
+    for (choice, needle) in [
+        (json!("sometimes"), "invalid tool_choice \"sometimes\""),
+        (json!("any"), "invalid tool_choice \"any\""),
+        (json!(true), "invalid tool_choice true"),
+        (json!({}), "tool_choice.type is required"),
+        (json!({"type":1}), "tool_choice.type must be a string"),
+        (
+            json!({"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[]}}),
+            "allowed_tools",
+        ),
+        (
+            json!({"type":"custom","custom":{"name":"weather"}}),
+            "tool_choice type \"custom\" is not supported",
+        ),
+        // The Responses shape is not the Chat one.
+        (
+            json!({"type":"function","name":"weather"}),
+            "unknown field tool_choice.name",
+        ),
+        (
+            json!({"type":"function"}),
+            "tool_choice.function is required",
+        ),
+        (
+            json!({"type":"function","function":"weather"}),
+            "tool_choice.function must be an object",
+        ),
+        (
+            json!({"type":"function","function":{}}),
+            "tool_choice.function.name is required",
+        ),
+        (
+            json!({"type":"function","function":{"name":7}}),
+            "tool_choice.function.name must be a string",
+        ),
+        (
+            json!({"type":"function","function":{"name":""}}),
+            "tool_choice.function.name must not be empty",
+        ),
+        (
+            json!({"type":"function","function":{"name":"weather","arguments":"{}"}}),
+            "unknown field tool_choice.function.arguments",
+        ),
+        (
+            json!({"type":"function","function":{"name":"time"}}),
+            "\"time\", which is not declared in tools",
+        ),
+    ] {
+        let error = chat_error(&json!({"messages":[user()],"tools":tools,"tool_choice":choice}));
+        assert!(error.contains(needle), "{choice}: {error}");
+    }
+    let error = chat_error(&json!({"messages":[user()],"tool_choice":"required"}));
+    assert!(error.contains("needs at least one tool"), "{error}");
+    let error = chat_error(&json!({"messages":[user()],
+        "tool_choice":{"type":"function","function":{"name":"weather"}}}));
+    assert!(error.contains("not declared in tools"), "{error}");
+    // Without tools, `auto` and `none` change nothing and stay accepted.
+    for choice in ["auto", "none"] {
+        assert!(chat_request(&json!({"messages":[user()],"tool_choice":choice}), true).is_ok());
+    }
+}
+
+#[test]
+fn chat_parallel_tool_calls_and_strict_reach_the_engine() {
+    let body = json!({"messages":[user()],"parallel_tool_calls":false,"tools":[
+        {"type":"function","function":{"name":"weather","strict":true,"parameters":{
+            "type":"object","properties":{"city":{"type":"string"}},
+            "required":["city"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"time","strict":false}},
+        {"type":"function","function":{"name":"noop","strict":null}},
+        {"type":"function","function":{"name":"plain"}}
+    ]});
+    let request = chat_request(&body, true).expect("valid");
+    assert!(!request.parallel_tool_calls);
+    let strict: Vec<bool> = request.tools.iter().map(|tool| tool.strict).collect();
+    assert_eq!(strict, [true, false, false, false]);
+    let mut parallel = body;
+    parallel["parallel_tool_calls"] = json!(true);
     assert!(
-        chat_error(&json!({"messages":[user()],"tool_choice":"sometimes"})).contains("tool_choice")
+        chat_request(&parallel, true)
+            .expect("valid")
+            .parallel_tool_calls
     );
+    let error = chat_error(&json!({"messages":[user()],"tools":[
+        {"type":"function","function":{"name":"f","strict":"yes"}}]}));
+    assert!(error.contains("invalid JSON request"), "{error}");
+    let error = chat_error(&json!({"messages":[user()],"parallel_tool_calls":"no"}));
+    assert!(error.contains("invalid JSON request"), "{error}");
 }
 
 #[test]
@@ -179,15 +286,14 @@ fn chat_rejects_options_it_cannot_honour() {
         (json!({"stop":["\n"]}), "stop"),
         (json!({"logprobs":true}), "logprobs"),
         (json!({"functions":[{"name":"f"}]}), "functions"),
-        (json!({"parallel_tool_calls":false}), "parallel_tool_calls"),
         (json!({"service_tier":"flex"}), "service_tier"),
         (json!({"store":true}), "store"),
         (json!({"verbosity":"high"}), "verbosity"),
-        (
-            json!({"tools":[{"type":"function","function":{"name":"f","strict":true}}]}),
-            "strict",
-        ),
         (json!({"tools":[{"type":"web_search"}]}), "tool type"),
+        (
+            json!({"tools":[{"type":"function"}]}),
+            "requires a function object",
+        ),
     ] {
         let mut body = json!({"messages":[user()]});
         if let (Value::Object(body), Value::Object(extra)) = (&mut body, extra) {
@@ -532,16 +638,12 @@ fn responses_reject_what_they_cannot_honour() {
             "tool type",
         ),
         (
-            json!({"input":"hi","tools":[{"type":"function","name":"f","strict":true}]}),
-            "strict",
-        ),
-        (
             json!({"input":"hi","tool_choice":"required"}),
-            "constrained decoding",
+            "needs at least one tool",
         ),
         (
             json!({"input":"hi","tool_choice":{"type":"function","name":"f"}}),
-            "constrained decoding",
+            "not declared in tools",
         ),
         (
             json!({"input":"hi","reasoning":{"effort":"high"}}),
@@ -1153,25 +1255,166 @@ fn chat_response_format_envelope_is_strict() {
 }
 
 #[test]
-fn structured_formats_refuse_tools_the_model_is_shown() {
+fn structured_formats_combine_with_tools_and_every_choice() {
     let tools = json!([{"type":"function","function":{"name":"weather"}}]);
-    let body = json!({"messages":[user()],"tools":tools,"response_format":{"type":"json_object"}});
-    assert!(chat_error(&body).contains("cannot be combined with tools"));
-    let mut withheld = body;
-    withheld["tool_choice"] = json!("none");
-    let request = chat_request(&withheld, true).expect("tools withheld");
-    assert_eq!(request.tools.len(), 0);
-    assert_eq!(request.response_format, ResponseFormat::JsonObject);
-    let text = json!({"messages":[user()],"tools":tools,"response_format":{"type":"text"}});
-    assert_eq!(chat_request(&text, true).expect("text").tools.len(), 1);
+    for choice in [
+        json!("auto"),
+        json!("none"),
+        json!("required"),
+        json!({"type":"function","function":{"name":"weather"}}),
+    ] {
+        let body = json!({"messages":[user()],"tools":tools,"tool_choice":choice,
+            "response_format":{"type":"json_object"}});
+        let request = chat_request(&body, true).expect("tools with a format");
+        assert_eq!(request.tools.len(), 1, "{choice}");
+        assert_eq!(request.response_format, ResponseFormat::JsonObject);
+    }
 
     let tools = json!([{"type":"function","name":"weather"}]);
-    let body = json!({"input":"hi","tools":tools,
-        "text":{"format":{"type":"json_schema","name":"w","schema":schema()}}});
-    assert!(responses_error(&body).contains("text.format other than text cannot be combined"));
-    let mut withheld = body;
-    withheld["tool_choice"] = json!("none");
-    assert!(prepare_responses(withheld.to_string().as_bytes(), true).is_ok());
+    for choice in [json!("auto"), json!("none"), json!("required")] {
+        let body = json!({"input":"hi","tools":tools,"tool_choice":choice,
+            "text":{"format":{"type":"json_schema","name":"w","schema":schema()}}});
+        let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("combined");
+        assert_eq!(prepared.request.tools.len(), 1, "{choice}");
+        assert_eq!(
+            prepared.request.response_format,
+            ResponseFormat::JsonSchema(schema())
+        );
+    }
+}
+
+#[test]
+fn legacy_completions_refuse_tools() {
+    for extra in [
+        json!({"tools":[{"type":"function","function":{"name":"f"}}]}),
+        json!({"tool_choice":"none"}),
+        json!({"parallel_tool_calls":false}),
+    ] {
+        let mut body = json!({"prompt":"hi"});
+        if let (Value::Object(body), Value::Object(extra)) = (&mut body, extra) {
+            body.extend(extra);
+        }
+        let error = prepare_generation(body.to_string().as_bytes(), false, true)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("not legacy Completions"), "{body}: {error}");
+    }
+    let defaults = json!({"prompt":"hi","tools":[],"tool_choice":null,"parallel_tool_calls":true});
+    assert!(prepare_generation(defaults.to_string().as_bytes(), false, true).is_ok());
+}
+
+#[test]
+fn responses_tool_policy_maps_onto_the_engine_and_is_echoed_as_accepted() {
+    let terminal = |body: &Value| {
+        let mut frames = Frames::new(responses_reply(body));
+        let _ = frames.start();
+        let _ = frames.event(Event::Content("ok".into()));
+        let (out, _) = frames.event(Event::Finished(stats(StopReason::Eos)));
+        sse_events(&out).last().expect("terminal")["response"].clone()
+    };
+    let tools = json!([
+        {"type":"function","name":"weather","parameters":{"type":"object",
+            "properties":{"city":{"type":"string"}},"required":["city"],
+            "additionalProperties":false},"strict":true},
+        {"type":"function","name":"time","strict":false},
+        {"type":"function","name":"plain"}
+    ]);
+    let defaults = json!({"input":"hi","tools":tools});
+    let prepared = prepare_responses(defaults.to_string().as_bytes(), true).expect("valid");
+    assert_eq!(prepared.request.tool_choice, ToolChoice::Auto);
+    assert!(prepared.request.parallel_tool_calls);
+    let strict: Vec<bool> = prepared
+        .request
+        .tools
+        .iter()
+        .map(|tool| tool.strict)
+        .collect();
+    assert_eq!(strict, [true, false, false]);
+    let response = terminal(&defaults);
+    assert_eq!(response["tool_choice"], "auto");
+    assert_eq!(response["parallel_tool_calls"], true);
+    let echoed: Vec<&Value> = response["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| &tool["strict"])
+        .collect();
+    assert_eq!(echoed, [&json!(true), &json!(false), &json!(false)]);
+
+    for (choice, native) in [
+        (json!("none"), ToolChoice::None),
+        (json!("required"), ToolChoice::Required),
+        (
+            json!({"type":"function","name":"time"}),
+            ToolChoice::Function("time".into()),
+        ),
+    ] {
+        let body = json!({"input":"hi","tools":tools,"tool_choice":choice,
+            "parallel_tool_calls":false});
+        let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("valid");
+        assert_eq!(prepared.request.tool_choice, native, "{choice}");
+        assert!(!prepared.request.parallel_tool_calls);
+        assert_eq!(prepared.request.tools.len(), 3, "tools stay declared");
+        let response = terminal(&body);
+        assert_eq!(response["tool_choice"], choice);
+        assert_eq!(response["parallel_tool_calls"], false);
+    }
+}
+
+#[test]
+fn responses_tool_choice_shape_is_exact_and_checked_against_tools() {
+    let tools = json!([{"type":"function","name":"weather"}]);
+    for (choice, needle) in [
+        (json!("sometimes"), "invalid tool_choice \"sometimes\""),
+        (json!(1), "invalid tool_choice 1"),
+        (json!({"name":"weather"}), "tool_choice.type is required"),
+        (
+            json!({"type":"allowed_tools","mode":"auto","tools":[]}),
+            "allowed_tools",
+        ),
+        (
+            json!({"type":"web_search_preview"}),
+            "tool_choice type \"web_search_preview\" is not supported",
+        ),
+        (
+            json!({"type":"mcp","server_label":"x"}),
+            "tool_choice type \"mcp\" is not supported",
+        ),
+        // The Chat shape is not the Responses one.
+        (
+            json!({"type":"function","function":{"name":"weather"}}),
+            "unknown field tool_choice.function",
+        ),
+        (json!({"type":"function"}), "tool_choice.name is required"),
+        (
+            json!({"type":"function","name":["weather"]}),
+            "tool_choice.name must be a string",
+        ),
+        (
+            json!({"type":"function","name":"time"}),
+            "\"time\", which is not declared in tools",
+        ),
+    ] {
+        let error = responses_error(&json!({"input":"hi","tools":tools,"tool_choice":choice}));
+        assert!(error.contains(needle), "{choice}: {error}");
+    }
+    for (tool, needle) in [
+        (
+            json!({"type":"function","name":"f","strict":"yes"}),
+            "strict must be a boolean",
+        ),
+        (json!("f"), "each tool must be an object"),
+        (
+            json!({"type":"function","name":"f","parameters":[]}),
+            "parameters must be a JSON Schema object",
+        ),
+    ] {
+        let error = responses_error(&json!({"input":"hi","tools":[tool]}));
+        assert!(error.contains(needle), "{tool}: {error}");
+    }
+    let error = responses_error(&json!({"input":"hi","parallel_tool_calls":"no"}));
+    assert!(error.contains("invalid JSON request"), "{error}");
 }
 
 #[test]

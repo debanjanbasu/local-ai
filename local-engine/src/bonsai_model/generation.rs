@@ -486,6 +486,9 @@ impl BonsaiEngine {
         stats.response_format_complete = generation
             .sampler
             .response_format_complete(generation.stop_reason == StopReason::Eos);
+        stats.tool_constraints_complete = generation
+            .sampler
+            .tool_constraints_complete(generation.stop_reason == StopReason::Eos);
         let prompt = &generation.prompt;
         let token_ids = std::mem::take(&mut generation.token_ids);
         let session_id = generation.session_id.as_deref();
@@ -553,6 +556,71 @@ impl BonsaiEngine {
             stats,
             cache_source: generation.cache_source,
         })
+    }
+}
+
+impl BonsaiEngine {
+    /// Capture the output-normalized hidden of `positions` over `tokens`
+    /// (see [`BonsaiModel::capture_hidden`]) in blocks of at most `rows`, on
+    /// the loaded model: no second model and no new sequence allocation.
+    ///
+    /// Only between generations: with any [`Self::admit`]ted generation still
+    /// active this refuses, so a caller must drain them first. `cancel` is
+    /// polled before every block; a trip returns `Ok(None)`.
+    ///
+    /// Prompt-cache ownership: capture overwrites the buffer set it runs on.
+    /// When the resident set is not the one the GPU prompt-cache tier
+    /// describes, it runs there and the tier is untouched. When it is and a
+    /// free pooled set exists, capture runs on the pooled set, which is then
+    /// swapped back out, so the tier still describes intact buffers. Only
+    /// when the resident set is the cached one and no pooled set exists is
+    /// the GPU tier cleared. Host and disk snapshots are copies and are never
+    /// affected. Every later request restores or resets its own state.
+    pub(crate) fn capture_hidden(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        rows: usize,
+        cancel: &CancelToken,
+    ) -> crate::Result<Option<Vec<f32>>> {
+        if !self.active.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "hidden capture cannot run beside admitted generations".into(),
+            ));
+        }
+        // No active generation owns the resident set.
+        self.resident = None;
+        let describes_resident = self.cache_state == self.model.state_id()
+            && !(self.cached_tokens.is_empty() && self.prompt_checkpoints.is_empty());
+        let mut borrowed = None;
+        if describes_resident {
+            if let Some(mut slot) = self.pool.pop() {
+                if let Err(error) = self.model.swap_sequence(&mut slot) {
+                    // An interrupted swap leaves no set trustworthy.
+                    self.clear_gpu_cache();
+                    return Err(error);
+                }
+                borrowed = Some(slot);
+            } else {
+                self.clear_gpu_cache();
+            }
+        }
+        self.model.set_cancel(cancel.clone());
+        self.model.take_gpu_time();
+        let result = self.model.capture_hidden(tokens, positions, rows);
+        self.model.take_gpu_time();
+        // Never leave a decision's token installed for later work.
+        self.model.set_cancel(CancelToken::new());
+        if let Some(mut slot) = borrowed {
+            // `slot` holds the cached set; bring it back and pool the
+            // overwritten one.
+            if let Err(error) = self.model.swap_sequence(&mut slot) {
+                self.clear_gpu_cache();
+                return Err(error);
+            }
+            self.pool.push(slot);
+        }
+        result
     }
 }
 

@@ -36,7 +36,8 @@ pub(super) fn usage() {
     eprintln!("  --no-thinking      Disable thinking");
     eprintln!(
         "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \
-         unencrypted) for retrieval and previous_response_id (default: none kept)"
+         unencrypted) for retrieval and previous_response_id (default: no durable storage; \
+         background responses are kept temporarily)"
     );
     eprintln!(
         "  --reasoning-key FILE  Enable encrypted reasoning replay with an owner-only persistent key"
@@ -44,6 +45,11 @@ pub(super) fn usage() {
     eprintln!(
         "  --stall-timeout SECONDS  Drop a generation whose client stopped reading \
          (default: {DEFAULT_STALL_SECONDS})"
+    );
+    eprintln!(
+        "  --experimental-decision-head FILE  EXPERIMENTAL: serve POST /v1/experimental/decisions \
+         with this judgment head (probabilities only; no confidence or refusal; calibrated only \
+         for two-option code-diff questions; default: off)"
     );
 }
 
@@ -56,6 +62,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         stall: Duration::from_secs(DEFAULT_STALL_SECONDS),
         response_store: None,
         reasoning_key: None,
+        decision_head: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -79,6 +86,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 | "--stall-timeout"
                 | "--response-store"
                 | "--reasoning-key"
+                | "--experimental-decision-head"
         ) {
             return Err(format!("unknown option: {flag}"));
         }
@@ -95,6 +103,12 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                     return Err("--reasoning-key requires a file path".into());
                 }
                 parsed.reasoning_key = Some(value.into());
+            }
+            "--experimental-decision-head" => {
+                if value.is_empty() {
+                    return Err("--experimental-decision-head requires a file path".into());
+                }
+                parsed.decision_head = Some(value.into());
             }
             "--response-store" => {
                 if value.is_empty() {

@@ -19,7 +19,8 @@ use local_engine::{Event, PrefillProgress, Signal};
 use super::QueueDepth;
 use super::background::{Background, Pump};
 use super::background_tests::{
-    Scratch, Step, drained, event, script, stats, status, stopper, stored, streamed_doc,
+    Scratch, Step, TTL, advance, drained, event, manual_temporary, script, stats, status, stopper,
+    stored, streamed_doc, temporary_doc,
 };
 use super::journal::terminal_events;
 use super::responses::sse_frame;
@@ -737,4 +738,54 @@ fn another_servers_live_stream_is_a_conflict_and_its_finished_one_replays() {
         collect(open(&Background::default(), &other, &id, None)),
         own
     );
+}
+
+#[test]
+fn a_temporary_streamed_response_replays_until_it_expires() {
+    let (durable_dir, temporary_dir) = (Scratch::new(), Scratch::new());
+    let durable = durable_dir.open();
+    let (temporary, clock) = manual_temporary(&temporary_dir);
+    let background = Arc::new(Background::default());
+    let doc = temporary_doc(
+        &json!({"input":"hi","background":true,"store":false,"stream":true}),
+        Some(&durable),
+        &temporary,
+        true,
+    );
+    let id = doc.id().to_owned();
+    let (stopped, stop) = stopper();
+    let (_, pump) = background
+        .admit(doc, script(finished_steps()), stop, None)
+        .expect("admitted");
+    let store = Arc::clone(
+        &super::locate(Some(&temporary), Some(&durable), &background, &id)
+            .expect("located")
+            .store,
+    );
+    // One subscriber follows live; another leaves at once, cancelling nothing.
+    let follower = spawn(open(&background, &store, &id, None), STALL);
+    drop(spawn(open(&background, &store, &id, None), STALL).0);
+    pump.run();
+    let frames = frames_of(follower.0);
+    follower.1.join().expect("follower");
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "a disconnect never cancels"
+    );
+    assert_numbered(&frames, 0);
+    let last = parse(frames.last().expect("frames"));
+    assert_eq!(last["type"], "response.completed");
+    assert_eq!(last["response"]["store"], false, "reported truthfully");
+    assert_eq!(parse(&frames[0])["response"]["store"], false);
+    drained(&background);
+    advance(&clock, TTL.saturating_sub(Duration::from_secs(1)));
+    for after in [0, 5] {
+        let resumed = collect(open(&background, &store, &id, Some(after)));
+        assert_eq!(resumed, frames[after as usize + 1..], "after {after}");
+    }
+    advance(&clock, Duration::from_secs(1));
+    let (code, _) =
+        super::locate(Some(&temporary), Some(&durable), &background, &id).expect_err("expired");
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(store.open_journal(&id).expect("readable").map(|_| ()), None);
 }

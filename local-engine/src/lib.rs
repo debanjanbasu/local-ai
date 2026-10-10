@@ -28,11 +28,11 @@ mod tools;
 mod error;
 pub use api::{
     CancelHandle, ChatMessage, ChatOutput, ChatRequest, CompletionRequest, Engine, EngineHandle,
-    EngineInfo, Event, EventStream, Plan, Sampling, Signal, Stats,
+    EngineInfo, Event, EventStream, PendingDecision, Plan, Sampling, Signal, Stats,
 };
 pub use error::Error;
 pub use structured::ResponseFormat;
-pub use tools::{ToolCall, ToolDefinition};
+pub use tools::{ToolCall, ToolChoice, ToolDefinition};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

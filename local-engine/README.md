@@ -50,8 +50,10 @@ rendered (messages, replayed tool calls and results, tool definitions and
 cached prefix included, and invalid prompt content fails with the error
 generation would return. A completion is tokenized as `complete` tokenizes it,
 without a template; an empty prompt counts zero although generation rejects it.
-`max_tokens`, `sampling`, `session` and `response_format` are ignored; no schema
-is compiled and the count is not checked against the context window.
+`max_tokens`, `sampling`, `session`, `response_format`, `tool_choice`,
+`parallel_tool_calls` and tool `strict` are ignored (none of them changes the
+prompt); no schema or tool grammar is compiled and the count is not checked
+against the context window.
 Counting is CPU-only and submits no GPU work.
 `EngineHandle` offers the same two methods against the worker's shared
 tokenizer: they run on the calling thread, queue no job and never wait for
@@ -81,7 +83,10 @@ drafts stay unconstrained proposals that the masked target verifies.
   With `thinking`, the model may also end its turn before `</think>`, which
   is unconstrained; that `Finished` carries `Some(false)` and no answer at
   all, so check the flag rather than trusting a stop at end-of-sequence
-  (`local-ai` reports it as a failure).
+  (`local-ai` reports it as a failure). This flag is `None` for text formats.
+  `tool_constraints_complete` separately reports tool-policy completion;
+  optional calls may end during reasoning without a call. With tools and a
+  format, a completed call also satisfies the combined answer contract.
 - Compilation (llguidance 1.9.1) is strict: unsupported keywords (for example
   `uniqueItems`, `contains`, `not`), unknown `format`s, `x-guidance`, and
   `$ref`s outside the document are rejected rather than ignored. `oneOf` is
@@ -93,15 +98,23 @@ drafts stay unconstrained proposals that the masked target verifies.
   are generated literally rather than as `\uXXXX` escapes.
 - Object properties are generated in the schema's key order, which is
   preserved as sent. (Tool schemas are different; see below.)
-- A format cannot be combined with `tools`: it constrains the whole answer,
-  leaving no room for a call.
+- A format can be combined with `tools`: the native tool grammar (see
+  [constrained tool calling](#constrained-tool-calling)) then makes the
+  answer either tool calls or, unless a call is required, one document in
+  the format, both enforced by one grammar.
 - The first constrained request builds the tokenizer's grammar tables once
   (about 0.5 s on CPU); later schemas compile in well under a millisecond.
+- The mask is applied to the logits a 32-id mask word at a time, skipping
+  fully allowed words and filling fully forbidden ones. An isolated CPU
+  microbenchmark of that step measured roughly 2.5-3x faster than the
+  previous per-id loop; its effect on end-to-end constrained decoding on the
+  GPU has not been measured.
 
 ## Native tool calling
 
-`ChatRequest::tools` takes `ToolDefinition { name, description, parameters }`,
-where `parameters` is a JSON Schema for the arguments object. With tools
+`ChatRequest::tools` takes `ToolDefinition { name, description, parameters,
+strict }`, where `parameters` is a JSON Schema for the arguments object and
+`strict` opts into enforcing it during generation (below). With tools
 configured the engine renders them exactly as the pinned checkpoint template
 ([`chat_template.jinja` at `3f926b4`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit/blob/3f926b415992eaa2ae9dd7b573706494d6bbf787/chat_template.jinja))
 does, and parses the model's own call format from the visible answer:
@@ -120,7 +133,7 @@ String arguments are raw (possibly multiline) text; other values are JSON. This
 is not the generic Qwen JSON `<tool_call>` format.
 
 ```rust,no_run
-use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling, ToolDefinition};
+use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling, ToolChoice, ToolDefinition};
 use std::ops::ControlFlow;
 
 let mut engine = Engine::open()?;
@@ -134,7 +147,10 @@ let request = ChatRequest {
         name: "get_weather".into(),
         description: Some("Current weather for a city.".into()),
         parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}),
+        strict: false,
     }],
+    tool_choice: ToolChoice::Auto,
+    parallel_tool_calls: true,
     response_format: local_engine::ResponseFormat::Text,
 };
 engine.chat_with(&request, |event| {
@@ -154,9 +170,12 @@ Contract:
   whole `<tool_call>` block has been generated, parsed and validated against
   the tool's schema. Ordinary text still streams; only a possible `<tool_call>`
   prefix and trailing whitespace are held back. Partial calls are never emitted.
-- A malformed, unknown, schema-violating or truncated call ends the generation:
+- A malformed, unknown, schema-violating or EOS-truncated call ends the generation:
   `EventStream` yields `Event::Error` and no `Event::Finished`; `Engine::chat_with`
   returns `Err`. Earlier valid calls in the same answer have already been emitted.
+- A token limit or cancellation instead discards an unfinished call and preserves
+  the original stop reason and statistics. Previously completed calls remain;
+  no partial call can execute.
 - IDs (`call_…`) are generated by the engine, identical in the stream and in
   `ChatOutput::tool_calls`, and unique across generations. They are not shown to
   the model.
@@ -169,7 +188,10 @@ Contract:
   schemas are rejected with `Error::InvalidArgument` before generation.
 - `developer` is accepted as the first message and fills the template's single
   system slot, like `system`.
-- There is no forced `tool_choice`: the model decides whether to call.
+- With the defaults (`ToolChoice::Auto`, `parallel_tool_calls: true`, no
+  strict tool, `ResponseFormat::Text`) generation is unconstrained and the
+  model decides whether to call. Any other setting is enforced by the
+  native tool grammar described below.
 - The engine never executes a tool. Execution, permissions and side effects
   belong to the harness.
 
@@ -184,19 +206,84 @@ Object keys in rendered schemas and replayed arguments are in sorted order
 rather than client order, whether or not `serde_json`'s `preserve_order` is
 enabled.
 
+### Constrained tool calling
+
+`ChatRequest::tool_choice` (`ToolChoice::{Auto, None, Required,
+Function(name)}`), `ChatRequest::parallel_tool_calls` and
+`ToolDefinition::strict` are enforced by the sampler, not requested in the
+prompt: the prompt, and therefore the prompt-token count, is identical for
+every choice, and the tools are rendered even for `None`. When any of them
+differs from the defaults, or a non-text `response_format` accompanies tools,
+the request compiles one llguidance grammar (a Lark root over the
+checkpoint's own call layout, plus JSON-schema subgrammars) before it is
+queued, and every target token selection is masked by it exactly as for
+[structured output](#structured-output), including batched rows and lookup
+and MTP verification; drafts stay unconstrained proposals. With `thinking`
+the grammar starts after `</think>`.
+
+| Setting | What the grammar allows in the answer |
+| --- | --- |
+| `Auto` | free text without `<tool_call>`, or text followed by calls |
+| `None` | free text that can never contain `<tool_call>` |
+| `Required` | up to four newlines, then at least one call; end-of-sequence is not selectable before a complete call, and with `thinking` the reasoning phase cannot end the request either |
+| `Function(name)` | as `Required`, but only calls to `name` |
+| `parallel_tool_calls: false` | at most one call, followed only by whitespace |
+| non-text `response_format` | `Auto`: one document in the format, or calls; `None`: only the document; `Required`/`Function`: only calls |
+
+After a call only whitespace and (with parallel calls) further calls are
+allowed. `<tool_call>` and `</tool_call>` are single special tokens in the
+pinned checkpoint; the grammar accepts either that token or the literal text,
+and no other special token. `Required` with no tools, or `Function` naming an
+undeclared tool, is `Error::InvalidArgument` before queueing.
+
+A non-strict tool inside a grammar only has its call framing enforced; its
+arguments are still parsed and validated once the call is complete, as
+without a grammar. A `strict: true` tool has its arguments enforced token by
+token in the template's layout: declared parameters in sorted order, every
+required one exactly once, optional ones at most once. Its schema must be a
+closed object (`"additionalProperties": false`) that the engine can enforce
+exactly:
+
+- A string parameter (`"type": "string"`, optionally nullable, or a string
+  `enum`/`const`) is raw text constrained by `enum`/`const`, `pattern`
+  (ECMA-262 translated where exact; lookarounds, backreferences, word
+  boundaries, inline flags and inner anchors are refused), `minLength` and
+  `maxLength` (up to 16,384). No raw value may contain `</parameter>` or
+  `</tool_call>`.
+- Any other parameter is compact JSON (`", "` and `": "`) from its own schema,
+  compiled by llguidance with the same strictness as a response format.
+- Document-local `$ref`s into `$defs`/`definitions` are followed. Anything
+  else, such as other top-level keywords, a `minProperties`/`maxProperties`
+  the fixed layout does not provably satisfy, mixed string/non-string type
+  lists or a parameter schema llguidance refuses, fails the request before
+  generation with the reason; it is never enforced partially.
+
+A strict call is read back by its exact layout (it ends at
+`\n</function>\n</tool_call>`, so a JSON string holding `</tool_call>` does
+not cut it short) and then validated against the whole schema like every call.
+The grammar guarantees the shape of what is generated, not that the model
+calls the right tool with sensible values. A token limit still applies: a
+call it cuts off is discarded, and a limit reached before a required call
+starts (for example during reasoning) finishes without one. Check the stop
+reason and `tool_constraints_complete` before assuming a required call exists.
+
+Unit tests cover the grammar against synthetic vocabularies and, CPU-only,
+the real tokenizer's special tags (an ignored test). Real-model HTTP checks
+with MTP enabled and disabled cover forced/named/none choices, strict UTF-8,
+numeric and nested JSON arguments, parallel limits and format/tool branches.
+
 `local-ai` exposes these native calls through Chat Completions and a
-text/function subset of Responses, stateless unless the server is started with
-`--response-store`, which also enables cancellable background Responses,
-polled or streamed with resumable events. It maps Chat `response_format` and
-Responses `text.format` onto `ResponseFormat`. See
+text/function subset of Responses, including `tool_choice`,
+`parallel_tool_calls` and tool `strict`. Responses are stateless unless the
+server is started with `--response-store`; background Responses work either
+way (with `store: false` they are kept only temporarily). The server maps Chat
+`response_format` and Responses `text.format` onto `ResponseFormat`. See
 [server API](../docs/BONSAI.md#server-api) for storage, background streams,
-structured output, encrypted reasoning replay, token counting and
-compatibility limits.
-`OpenAI`'s Decisions API is **not implemented**. Keep tool execution out of the engine;
-in particular, a retry must not repeat a partially successful batch's side
-effects. Do not
-change the pinned checkpoint template merely to match another Qwen model's
-conventions.
+structured output, encrypted reasoning replay, token counting, the
+experimental decisions route and compatibility limits. Keep tool execution out
+of the engine; in particular, a retry must not repeat a partially successful
+batch's side effects. Do not change the pinned checkpoint template merely to
+match another Qwen model's conventions.
 
 ### Oh My Pi custom provider
 
@@ -255,11 +342,16 @@ show what each flag changes:
   `requiresEffort: false` declares that off is accepted, so it is never
   clamped up to `xhigh`; auto-detection gave the same result in the check below.
 - `supportsStrictMode: false` keeps `strict` out of tool definitions. It is
-  already off for hosts other than `OpenAI` and a few known providers; set it
-  explicitly because `strict: true` is refused.
+  already off for hosts other than `OpenAI` and a few known providers. The
+  server now accepts `strict: true`, but then requires every such tool's
+  schema to be a closed object it can enforce exactly and refuses the whole
+  request otherwise; Oh My Pi's tool schemas have not been audited for that,
+  so keep it off.
 - `supportsForcedToolChoice: false` turns Oh My Pi's forced tool choices into
-  `auto`, so the model may answer without calling the tool. Without it those
-  requests fail.
+  `auto`, so the model may answer without calling the tool. The server now
+  enforces `required` and named tool choices, but this configuration was
+  recorded when they were refused; enabling forced choices has not been
+  re-checked against Oh My Pi.
 
 Oh My Pi already sends `store: false`, resends earlier turns in `input`, puts
 the system prompt in `instructions`, and leaves out the `developer` role and
@@ -283,8 +375,9 @@ and `xhigh`, and `high` also sent `summary: "auto"`. The recorded turn is the
 uses `input` and named question/answer arrays. At the pinned revision, Oh My Pi's
 [`openrouter-decisions` adapter](https://github.com/can1357/oh-my-pi/blob/dde3fc44ed16d3bbec292893c7a902e92d6ce00e/packages/ai/src/judgment/typesafe.ts)
 uses the older System One `state`, keyed questions/answers and `noul` predicate
-format. They require distinct adapters to any future native judgment interface.
-A judgment head is separate from the speculative MTP head: MTP accelerates
+format. They require distinct adapters to the native judgment interface
+described [below](#experimental-native-decisions), which is not either of
+them. A judgment head is separate from the speculative MTP head: MTP accelerates
 generation and does not train classification, tool use or confidence calibration.
 
 ### Experimental judgment-head preparation
@@ -412,9 +505,11 @@ It is one seed and one in-domain dataset with balanced, sampled labels, and
 there is still no zero-shot Bonsai comparison. The scores describe
 this dataset's held-out split only.
 
-This head is **not installed**, is not loaded by the engine or server, and is
-neither a Decisions implementation nor an MTP upgrade: it does not touch
-speculative decoding. No production judgment head is supplied. Frozen Bonsai
+This head is **not installed** or discovered: the engine and server load it
+only when explicitly given its path (see
+[native decisions](#experimental-native-decisions)). It is not an
+implementation of `OpenAI` Decisions and not an MTP upgrade: it does not
+touch speculative decoding. No production judgment head is supplied. Frozen Bonsai
 features may not match Kev's adapter-trained representations; Kev's labels are
 balanced by sampling, not natural rates. Larger held-out and out-of-domain
 results, prompt/capture orchestration and refusal/confidence semantics remain
@@ -432,6 +527,101 @@ dimensions, tensor byte ranges and finite values. Native scoring matched an
 independent Python reference on two real captured examples within 1e-12.
 This validates the scoring formula, not judgment quality on new tasks or
 the calibration of returned probabilities outside the evaluation dataset.
+
+#### Kev hard-v1 preparation and development-only training
+
+`tools/judgment_prepare.py --dataset hard-v1` adapts Kev's synthetic
+[`hard-v1`](https://github.com/jaredpalmer/kev/tree/62c91838b9a6adc5b386cbeae8ed73daa36ce220/evals/hard-v1)
+suite at a pinned commit and manifest digest. Kev keeps `train.jsonl` out of
+git, so it must be regenerated byte-identically by Kev's own generator, which
+needs the pinned Qwen3.5-4B-Base tokenizer. Only train and development are
+read; the test partition (template 5) is never read, rendered or scored.
+Splits follow the surface template, so every evaluation split measures
+transfer to an unseen phrasing: train templates 0-2 train, template 3
+calibrates, development (template 4) validates. Kev's programmatic labels are
+kept unchanged: predicate questions become Yes/No, choice questions three to
+six options in Kev's order, score questions six ordered levels (2-6 options in
+all). `long_policy` is excluded in this round for capture cost
+(`--include-long-policy` keeps it), and `--no-option-descriptions` renders
+named options without descriptions. The default devtools-v1 output is
+unchanged byte for byte.
+
+```sh
+python3 tools/kaggle_judgment_job.py --regenerate-hard-v1 \
+  --kernel OWNER/kev-hard-v1 --output STAGING [--hf-secret HF_TOKEN]
+```
+
+stages, but does not submit, a private CPU Kaggle job. Unlike the training
+job it needs internet: it downloads Kev at the pinned commit, checks the
+generator, library, lockfile and licence digests, builds Kev's locked
+environment with CPU `torch`, regenerates the partitions, compares every one
+with the manifest and writes train and development only. The generator also
+builds test in memory, because train is deduplicated against it; only its
+digest comparison is kept and the job fails if `test.jsonl` is ever written.
+A Hugging Face token is read from the named Kaggle secret if one is attached
+and is never printed or saved. If every digest matches, the job runs
+`judgment_prepare.py --dataset hard-v1` on the result and writes
+`hard-v1-kev/`, `hard-v1-rows/` and a `hard-v1-job.json` summary; on any
+mismatch it records the errors and prepares nothing. The private Kaggle
+regeneration completed on 2026-10-10: all partition hashes matched the pinned
+manifest, and local preparation reproduced the same 8,479 rows (5,716 train,
+1,880 calibration, 883 validation). No locked test was written or scored.
+No trained hard-v1 head or quality result is claimed here. Its labels are
+produced by family solvers over generated facts, so any later score is
+synthetic-task evidence, not natural code-review quality.
+
+Both `judgment_train.py` and `kaggle_judgment_job.py` accept `--development`
+for this three-split workflow. It refuses test rows, selects on validation,
+calibrates on calibration, and reports validation metrics beside train-only
+uniform and majority baselines, with family/type/option-count breakdowns.
+Validation selected the checkpoint: those numbers are not held-out test
+results. The default four-split devtools workflow is unchanged. Train on
+Kaggle, after capturing features with the native model; staging submits nothing.
+
+### Experimental native decisions
+
+`Engine::decide(&head, &DecisionRequest)` and
+`EngineHandle::decide(Arc<JudgmentHead>, &DecisionRequest)` answer a typed
+text question with an explicitly loaded head. `DecisionRequest { state,
+question, kind }` is rendered exactly as `tools/judgment_prepare.py` renders
+devtools-v1 rows (`State:`, `Question:`, lettered `Options:`, `Decision:`;
+renderer `kev-devtools-v1-judgment-render.v1`). `DecisionKind::Predicate` is
+`A) Yes` / `B) No`; `Choice` takes 2 to 26 distinct single-line values
+(strings or booleans) in the caller's order; `Score` takes 1 to 26 ordered
+labels. The option and decision rows are captured on the already loaded model
+(no second model) in 60-row blocks, the `mtp-capture` default the training
+features used, rounded through FP16 and scored on the CPU.
+
+A `Decision` carries the head's probability per option, the argmax and its
+value, for scores the probability-weighted mean level index, the prompt token
+count, the renderer and `judgment::CALIBRATION_SCOPE`. It has no confidence,
+threshold or refusal. The head was trained and temperature-fitted only on
+two-option Yes/No code-diff questions, so its probabilities are calibrated
+only within that held-out split; for other questions, states or more than two
+options they are the head's softmax output and nothing more.
+
+Invalid requests, text that spells a special token, and a head whose width is
+not the model's fail before any GPU work; a single-level score is answered
+without capture. On a handle, preparation and tokenization run on the calling
+thread and the decision takes one slot of the bounded FIFO queue (a full queue
+is `Error::QueueFull`). It runs synchronously on the worker only once no
+generation is active, and while it waits nothing queued behind it is admitted,
+so a long capture delays later requests. The returned `PendingDecision` is a
+`Future` (or blocks with `wait`); dropping or cancelling it skips a queued
+decision or stops a running capture before its next block, resolving to
+`Ok(None)`. Capture overwrites one sequence buffer set: the GPU prompt-cache
+tier is kept when a free pooled set exists and cleared otherwise; host and
+disk snapshots are unaffected.
+
+`local-ai serve --experimental-decision-head FILE` exposes this as
+`POST /v1/experimental/decisions`; see the
+[server API](../docs/BONSAI.md#server-api). Unit tests cover rendering, token
+endpoints, validation, queueing, cancellation and score mapping with a
+synthetic head. Real-model native and HTTP checks reproduce stored-feature
+probabilities bit-for-bit for four rows covering both devtools tasks and both
+option orders, with and without MTP. Capture/cancellation preserve later
+generation token IDs and cache correctness. Capture measured about 115–130
+tokens/s on the M4 Pro; later generations wait behind it.
 
 Acceptance should exercise native calls as well as HTTP: a complete read/edit/
 tool-result turn, malformed and interrupted arguments that cannot execute,

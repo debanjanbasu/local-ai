@@ -27,7 +27,8 @@ use tokenizers::Tokenizer;
 /// For a chat request with `thinking`, reasoning stays unconstrained and the
 /// format applies from the token after the closing `</think>`; without
 /// thinking, and for raw completions, it applies from the first generated
-/// token. Requests with tools cannot also carry a format.
+/// token. With tools, the native tool grammar carries the format as the
+/// final-answer branch beside the call branch.
 ///
 /// Generation ends at end-of-sequence only once the answer is a complete
 /// document the schema accepts. A token limit or cancellation still stops it
@@ -55,7 +56,7 @@ impl ResponseFormat {
     }
 
     /// The JSON Schema to compile, or `None` for unconstrained text.
-    fn schema(&self) -> crate::Result<Option<Value>> {
+    pub(crate) fn schema(&self) -> crate::Result<Option<Value>> {
         match self {
             Self::Text => Ok(None),
             Self::JsonObject => Ok(Some(json!({"type": "object"}))),
@@ -74,7 +75,7 @@ impl ResponseFormat {
     }
 }
 
-fn invalid(message: impl std::fmt::Display) -> crate::Error {
+fn invalid(message: &str) -> crate::Error {
     crate::Error::InvalidArgument(format!("invalid response_format: {message}"))
 }
 
@@ -109,25 +110,62 @@ impl GrammarCompiler {
         let Some(schema) = format.schema()? else {
             return Ok(None);
         };
+        self.compile_grammar(
+            tokenizer,
+            eos_ids,
+            TopLevelGrammar::from_json_schema(schema),
+            reasoning_end,
+            false,
+            invalid,
+        )
+        .map(Some)
+    }
+
+    /// Compile any llguidance grammar for one request, strictly: errors and
+    /// warnings both fail it, through `error`. With `answer_required`, the
+    /// reasoning phase (while `reasoning_end` is pending) is masked too, to
+    /// every token but end-of-sequence, so the request cannot end before the
+    /// grammar has even started.
+    pub(crate) fn compile_grammar(
+        &self,
+        tokenizer: &Arc<Tokenizer>,
+        eos_ids: &[u32],
+        grammar: TopLevelGrammar,
+        reasoning_end: Option<u32>,
+        answer_required: bool,
+        error: fn(&str) -> crate::Error,
+    ) -> crate::Result<Grammar> {
         let factory = self.factory(tokenizer, eos_ids)?;
         let parser = factory
-            .create_parser(TopLevelGrammar::from_json_schema(schema))
-            .map_err(invalid)?;
+            .create_parser(grammar)
+            .map_err(|failure| error(&failure.to_string()))?;
         let mut matcher = Matcher::new(Ok(parser));
-        if let Some(error) = matcher.get_error() {
-            return Err(invalid(error));
+        if let Some(failure) = matcher.get_error() {
+            return Err(error(&failure));
         }
         let warnings = matcher.grammar_warnings();
         if !warnings.is_empty() {
-            return Err(invalid(warnings.join("; ")));
+            return Err(error(&warnings.join("; ")));
         }
         // The first mask proves the grammar can start and warms its caches.
-        matcher.compute_mask().map_err(invalid)?;
-        Ok(Some(Grammar {
+        matcher
+            .compute_mask()
+            .map_err(|failure| error(&failure.to_string()))?;
+        let reasoning_mask = (answer_required && reasoning_end.is_some()).then(|| {
+            let mut mask = SimpleVob::alloc_ones(factory.tok_env().tok_trie().vocab_size());
+            for &eos in eos_ids {
+                mask.disallow_token(eos);
+            }
+            mask
+        });
+        Ok(Grammar {
             matcher,
             reasoning_end,
+            reasoning_mask,
+            response_format: true,
+            tool_constraints: false,
             failure: None,
-        }))
+        })
     }
 }
 
@@ -206,8 +244,14 @@ impl TokenizerEnv for BonsaiTokEnv {
 #[derive(Clone)]
 pub struct Grammar {
     matcher: Matcher,
+    /// Which public completion contracts this matcher enforces.
+    pub(crate) response_format: bool,
+    pub(crate) tool_constraints: bool,
     /// While reasoning: the token that ends it and starts the constraint.
     reasoning_end: Option<u32>,
+    /// While reasoning, when the answer is mandatory (a required tool
+    /// call): every token but end-of-sequence.
+    reasoning_mask: Option<SimpleVob>,
     /// Why the grammar stopped accepting tokens, once it has.
     failure: Option<String>,
 }
@@ -215,12 +259,17 @@ pub struct Grammar {
 impl Grammar {
     /// Whether the next selection must be masked.
     pub const fn masking(&self) -> bool {
-        self.reasoning_end.is_none() && self.failure.is_none()
+        self.failure.is_none() && (self.reasoning_end.is_none() || self.reasoning_mask.is_some())
     }
 
     /// Whether the constrained answer has begun.
     pub const fn answering(&self) -> bool {
         self.reasoning_end.is_none()
+    }
+
+    /// Optional tool policies also accept a turn containing only reasoning.
+    pub(crate) const fn tools_complete(&self) -> bool {
+        self.reasoning_end.is_none() || self.reasoning_mask.is_none()
     }
 
     pub fn failure(&self) -> Option<&str> {
@@ -234,6 +283,11 @@ impl Grammar {
     /// The tokens the grammar allows next; only end-of-sequence once the
     /// document is complete and cannot continue.
     pub fn mask(&mut self) -> Result<SimpleVob, String> {
+        if self.reasoning_end.is_some()
+            && let Some(mask) = &self.reasoning_mask
+        {
+            return Ok(mask.clone());
+        }
         self.matcher
             .compute_mask_or_eos()
             .map_err(|error| error.to_string())
@@ -248,6 +302,12 @@ impl Grammar {
             return false;
         }
         let outcome = match (self.reasoning_end, mask) {
+            (Some(_), None) if self.reasoning_mask.is_some() => {
+                Err("a reasoning token was selected without the grammar mask".into())
+            }
+            (Some(_), Some(mask)) if !mask.is_allowed(token) => Err(format!(
+                "token {token} was selected outside the reasoning mask"
+            )),
             (Some(end), _) => {
                 if token == end {
                     self.reasoning_end = None;

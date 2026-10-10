@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -14,9 +15,9 @@ use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{Event, GenerationStats, PrefillProgress, Signal, Stats};
 
 use super::QueueDepth;
-use super::background::{Background, Pump};
+use super::background::{Background, Pump, Temporary};
 use super::response::{Protocol, Reply, new_id};
-use super::responses::{ResponsesState, prepare_responses_with};
+use super::responses::{ResponsesState, prepare_responses_retaining, prepare_responses_with};
 use super::store::ResponseStore;
 
 /// A store directory under the system temp dir, removed when dropped.
@@ -148,48 +149,429 @@ pub(super) fn drained(background: &Background) {
         .block_on(background.drained());
 }
 
-#[test]
-fn background_needs_a_store_and_refuses_temporary_retention() {
-    let scratch = Scratch::new();
-    let store = scratch.open();
-    let body = json!({"input":"hi","background":true});
-    assert!(prepare_error(&body, None).contains("--response-store"));
-    assert!(
-        prepare_error(
-            &json!({"input":"hi","background":true,"store":false}),
-            Some(&store)
-        )
-        .contains("store=false")
+/// How long the tests' temporary responses are retained.
+pub(super) const TTL: Duration = Duration::from_secs(600);
+
+/// A temporary store in `scratch` whose clock only moves when the returned
+/// offset is advanced.
+pub(super) fn manual_temporary(scratch: &Scratch) -> (Arc<Temporary>, Arc<Mutex<Duration>>) {
+    let base = Instant::now();
+    let offset = Arc::new(Mutex::new(Duration::ZERO));
+    let clock = Arc::clone(&offset);
+    let temporary = Temporary::with(
+        scratch.open(),
+        TTL,
+        Arc::new(move || base + *clock.lock().expect("clock")),
     );
+    (Arc::new(temporary), offset)
+}
+
+pub(super) fn advance(offset: &Mutex<Duration>, by: Duration) {
+    *offset.lock().expect("clock") += by;
+}
+
+/// The Response state machine for `body` on a server with `durable` and
+/// `temporary` stores.
+pub(super) fn temporary_doc(
+    body: &Value,
+    durable: Option<&Arc<ResponseStore>>,
+    temporary: &Arc<Temporary>,
+    streaming: bool,
+) -> ResponsesState {
+    let prepared = prepare_responses_retaining(
+        body.to_string().as_bytes(),
+        true,
+        durable,
+        Some(temporary),
+        None,
+        "m",
+    )
+    .expect("request accepted");
+    let reply = Reply::new(Protocol::Responses(Arc::new(prepared.echo)), "m".into());
+    let Protocol::Responses(echo) = &reply.protocol else {
+        unreachable!("responses reply")
+    };
+    ResponsesState::new(&reply, Arc::clone(echo), streaming)
+}
+
+/// Every file name in `dir` mentioning `id`.
+fn files_naming(dir: &std::path::Path, id: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("listable")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.contains(id))
+        .collect()
+}
+
+#[test]
+fn background_store_false_is_temporary_and_refused_without_a_temporary_store() {
+    let (durable_dir, temporary_dir) = (Scratch::new(), Scratch::new());
+    let durable = durable_dir.open();
+    let (temporary, _) = manual_temporary(&temporary_dir);
+    let body = json!({"input":"hi","background":true});
+    let temporary_body = json!({"input":"hi","background":true,"store":false});
+    // Neither store: refused, naming both ways it could be kept.
+    let error = prepare_error(&body, None);
+    assert!(
+        error.contains("background") && error.contains("--response-store"),
+        "{error}"
+    );
+    // A durable store but no temporary one: store=false is still refused.
+    assert!(prepare_error(&temporary_body, Some(&durable)).contains("store=false"));
+
+    // store=false goes to the temporary store only, and says store=false.
+    for (body, durable) in [
+        (&temporary_body, Some(&durable)),
+        (&temporary_body, None),
+        // Without a durable store, an omitted store means false.
+        (&body, None),
+    ] {
+        let doc = temporary_doc(body, durable, &temporary, false);
+        assert!(doc.temporary().is_some(), "{body}");
+        assert!(Arc::ptr_eq(doc.store().expect("kept"), temporary.store()));
+        let queued = doc.snapshot("queued");
+        assert_eq!(queued["store"], false, "{body}");
+        assert_eq!(queued["background"], true, "{body}");
+    }
+    // With a durable store, an omitted store keeps OpenAI's default of true.
+    let doc = temporary_doc(&body, Some(&durable), &temporary, false);
+    assert!(doc.temporary().is_none());
+    assert!(Arc::ptr_eq(doc.store().expect("kept"), &durable));
+    assert_eq!(doc.snapshot("queued")["store"], true);
+    // store=true still needs a durable store.
+    let error = prepare_responses_retaining(
+        json!({"input":"hi","background":true,"store":true})
+            .to_string()
+            .as_bytes(),
+        true,
+        None,
+        Some(&temporary),
+        None,
+        "m",
+    )
+    .err()
+    .map(|error| error.to_string())
+    .unwrap_or_default();
+    assert!(error.contains("store=true"), "{error}");
+    // Foreground store=false is unchanged: stateless, never temporary.
+    let prepared = prepare_responses_retaining(
+        json!({"input":"hi","store":false,"stream":true})
+            .to_string()
+            .as_bytes(),
+        true,
+        Some(&durable),
+        Some(&temporary),
+        None,
+        "m",
+    )
+    .expect("foreground");
+    assert!(!prepared.echo.background());
     let streamed = prepare_responses_with(
         json!({"input":"hi","background":true,"stream":true})
             .to_string()
             .as_bytes(),
         true,
-        Some(&store),
+        Some(&durable),
         None,
         "m",
     )
     .expect("background streaming is accepted");
     assert!(streamed.echo.background() && streamed.stream);
-    let prepared =
-        prepare_responses_with(body.to_string().as_bytes(), true, Some(&store), None, "m")
-            .expect("background with a store");
-    assert!(prepared.echo.background() && !prepared.stream);
-    for foreground in [
-        json!({"input":"hi"}),
-        json!({"input":"hi","background":false,"stream":true,"store":false}),
-    ] {
-        let prepared = prepare_responses_with(
-            foreground.to_string().as_bytes(),
-            true,
-            Some(&store),
-            None,
-            "m",
-        )
-        .expect("foreground unchanged");
-        assert!(!prepared.echo.background());
+}
+
+#[test]
+fn a_temporary_response_expires_only_after_it_ends_and_never_reaches_the_durable_store() {
+    let (durable_dir, temporary_dir) = (Scratch::new(), Scratch::new());
+    let durable = durable_dir.open();
+    let (temporary, clock) = manual_temporary(&temporary_dir);
+    let background = Arc::new(Background::default());
+    let depth = QueueDepth::default();
+    let doc = temporary_doc(
+        &json!({"input":"hi","background":true,"store":false}),
+        Some(&durable),
+        &temporary,
+        false,
+    );
+    let id = doc.id().to_owned();
+    let (stopped, stop) = stopper();
+    let steps = vec![
+        event(Event::Content("Hi".into())),
+        event(Event::Finished(stats(StopReason::Eos))),
+    ];
+    let (queued, pump) = background
+        .admit(doc, script(steps), stop, Some(depth.admit()))
+        .expect("admitted");
+    assert_eq!(queued["store"], false);
+    assert_eq!(stored(temporary.store(), &id), Some(queued));
+    assert!(
+        files_naming(&durable_dir.0, &id).is_empty(),
+        "nothing durable"
+    );
+    let located =
+        super::locate(Some(&temporary), Some(&durable), &background, &id).expect("located");
+    assert!(Arc::ptr_eq(&located.store, temporary.store()));
+    assert!(located.temporary.is_some());
+
+    // A job that runs for longer than the retention is never expired.
+    advance(&clock, TTL * 6);
+    assert_eq!(temporary.expire_due(&background), 0);
+    assert_eq!(
+        temporary.next_deadline(),
+        None,
+        "retention starts at the end"
+    );
+    assert_eq!(status(temporary.store(), &id), "queued");
+
+    pump.run();
+    drained(&background);
+    assert!(!stopped.load(Ordering::SeqCst));
+    let done = stored(temporary.store(), &id).expect("kept");
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["store"], false, "reported truthfully");
+    assert!(
+        files_naming(&durable_dir.0, &id).is_empty(),
+        "still nothing durable"
+    );
+    assert!(temporary.next_deadline().is_some());
+    // Retrievable, and cancelling is idempotent, until the retention ends.
+    advance(&clock, TTL.saturating_sub(Duration::from_secs(1)));
+    assert_eq!(temporary.expire_due(&background), 0);
+    let located =
+        super::locate(Some(&temporary), Some(&durable), &background, &id).expect("still retained");
+    assert_eq!(
+        super::stored_answer(&located.store, &axum::http::Method::GET, &id, None).expect("get"),
+        Some(done.clone())
+    );
+    assert_eq!(
+        background.cancel(&located.store, &id).expect("cancel"),
+        Some(done)
+    );
+    // Lazily on access: the first lookup past the deadline deletes it.
+    advance(&clock, Duration::from_secs(1));
+    let (status_code, message) =
+        super::locate(Some(&temporary), Some(&durable), &background, &id).expect_err("expired");
+    assert_eq!(status_code, StatusCode::NOT_FOUND);
+    assert!(message.contains("not found"), "{message}");
+    assert!(
+        files_naming(&temporary_dir.0, &id)
+            .iter()
+            .all(|name| name.starts_with('.') && name.contains(".lock"))
+    );
+    assert!(!temporary.knows(&id) && temporary.next_deadline().is_none());
+    // From then on the ID is an ordinary unknown one, wherever it is looked up.
+    let located = super::locate(Some(&temporary), Some(&durable), &background, &id)
+        .expect("the durable store answers");
+    assert!(located.temporary.is_none());
+    assert_eq!(
+        super::stored_answer(&located.store, &axum::http::Method::GET, &id, None).expect("get"),
+        None
+    );
+    let (_, message) =
+        super::locate(Some(&temporary), None, &background, &id).expect_err("no durable store");
+    assert!(message.contains("--response-store"), "{message}");
+}
+
+#[test]
+fn durable_responses_are_never_answered_from_the_temporary_store() {
+    let (durable_dir, temporary_dir) = (Scratch::new(), Scratch::new());
+    let durable = durable_dir.open();
+    let (temporary, clock) = manual_temporary(&temporary_dir);
+    let background = Arc::new(Background::default());
+    let depth = QueueDepth::default();
+    let doc = temporary_doc(
+        &json!({"input":"hi","background":true}),
+        Some(&durable),
+        &temporary,
+        false,
+    );
+    let id = doc.id().to_owned();
+    let (_, stop) = stopper();
+    let steps = vec![event(Event::Finished(stats(StopReason::Eos)))];
+    let (_, pump) = background
+        .admit(doc, script(steps), stop, Some(depth.admit()))
+        .expect("admitted");
+    pump.run();
+    assert!(!temporary.knows(&id));
+    assert_eq!(files_naming(&temporary_dir.0, &id), Vec::<String>::new());
+    advance(&clock, TTL * 10);
+    assert_eq!(temporary.expire_due(&background), 0);
+    let located =
+        super::locate(Some(&temporary), Some(&durable), &background, &id).expect("located");
+    assert!(Arc::ptr_eq(&located.store, &durable));
+    assert_eq!(status(&durable, &id), "completed", "never expired");
+    assert_eq!(stored(&durable, &id).expect("stored")["store"], true);
+    // A temporary response cannot be continued, and says why.
+    let doc = temporary_doc(
+        &json!({"input":"hi","background":true,"store":false}),
+        Some(&durable),
+        &temporary,
+        false,
+    );
+    let temporary_id = doc.id().to_owned();
+    let (_, stop) = stopper();
+    let (_, pump) = background
+        .admit(doc, script(Vec::new()), stop, None)
+        .expect("admitted");
+    pump.run();
+    let error = prepare_responses_retaining(
+        json!({"input":"next","previous_response_id":temporary_id})
+            .to_string()
+            .as_bytes(),
+        true,
+        Some(&durable),
+        Some(&temporary),
+        None,
+        "m",
+    )
+    .err()
+    .map(|error| error.to_string())
+    .unwrap_or_default();
+    assert!(error.contains("store=false"), "{error}");
+}
+
+#[test]
+fn cancellation_starts_retention_and_expiry_never_cancels_a_draining_job() {
+    let temporary_dir = Scratch::new();
+    let (temporary, clock) = manual_temporary(&temporary_dir);
+    let background = Arc::new(Background::default());
+    let body = json!({"input":"hi","background":true,"store":false});
+
+    // Cancelled while the native work still runs: retention counts from the
+    // cancellation, and the pump only drains afterwards.
+    let doc = temporary_doc(&body, None, &temporary, false);
+    let id = doc.id().to_owned();
+    let (stopped, stop) = stopper();
+    let (_, pump) = background
+        .admit(doc, script(Vec::new()), stop, None)
+        .expect("admitted");
+    let cancelled = background
+        .cancel(temporary.store(), &id)
+        .expect("cancel")
+        .expect("found");
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["store"], false);
+    assert!(stopped.load(Ordering::SeqCst), "native work is cancelled");
+    let deadline = temporary
+        .next_deadline()
+        .expect("retained from the cancellation");
+    assert_eq!(
+        background.cancel(temporary.store(), &id).expect("again"),
+        Some(cancelled),
+        "cancelling twice returns the final Response"
+    );
+    assert_eq!(temporary.next_deadline(), Some(deadline), "not extended");
+    pump.run();
+
+    // Ended but still draining: expiry deletes it without cancelling it.
+    let doc = temporary_doc(&body, None, &temporary, false);
+    let draining = doc.id().to_owned();
+    let (stopped, stop) = stopper();
+    let (gate, wait) = std::sync::mpsc::channel::<()>();
+    let steps: Vec<Step> = vec![
+        event(Event::Finished(stats(StopReason::Eos))),
+        Box::new(move || {
+            let _ = wait.recv();
+            Signal::Progress(PrefillProgress {
+                tokens: 0,
+                chunks: 1,
+            })
+        }),
+    ];
+    let (_, pump) = background
+        .admit(doc, script(steps), stop, None)
+        .expect("admitted");
+    let pump = std::thread::spawn(move || pump.run());
+    while status(temporary.store(), &draining) != "completed" {
+        std::thread::yield_now();
     }
+    advance(&clock, TTL);
+    assert_eq!(temporary.expire_due(&background), 2, "both are due");
+    assert_eq!(stored(temporary.store(), &id), None);
+    assert_eq!(stored(temporary.store(), &draining), None);
+    assert!(background.watch(&draining).is_some(), "still draining");
+    gate.send(()).expect("open the gate");
+    pump.join().expect("pump");
+    assert!(!stopped.load(Ordering::SeqCst), "expiry never cancels");
+    assert_eq!(
+        stored(temporary.store(), &draining),
+        None,
+        "never written back"
+    );
+    drained(&background);
+}
+
+#[test]
+fn the_reaper_deletes_due_responses_without_access_and_close_removes_everything() {
+    let temporary = Temporary::create().expect("private temporary store");
+    let dir = temporary.dir().expect("owned").to_owned();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&dir).expect("dir").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "owner-only");
+    }
+    let temporary_dir = Scratch::new();
+    let reaped = Arc::new(Temporary::with(
+        temporary_dir.open(),
+        Duration::from_millis(20),
+        Arc::new(Instant::now),
+    ));
+    let background = Arc::new(Background::default());
+    let expiry = reaped.reap(Arc::clone(&background)).expect("reaper");
+    let doc = temporary_doc(
+        &json!({"input":"hi","background":true,"store":false}),
+        None,
+        &reaped,
+        false,
+    );
+    let id = doc.id().to_owned();
+    let (_, stop) = stopper();
+    let steps = vec![event(Event::Finished(stats(StopReason::Eos)))];
+    let (_, pump) = background
+        .admit(doc, script(steps), stop, None)
+        .expect("admitted");
+    pump.run();
+    let start = Instant::now();
+    while reaped.knows(&id) {
+        assert!(start.elapsed() < Duration::from_secs(10), "reaped in time");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(stored(reaped.store(), &id), None, "deleted unread");
+    reaped.close();
+    expiry.join().expect("the reaper stops on close");
+
+    // Streamed records and journals are owner-only, and close removes them.
+    let doc = temporary_doc(
+        &json!({"input":"hi","background":true,"store":false,"stream":true}),
+        None,
+        &temporary,
+        true,
+    );
+    let id = doc.id().to_owned();
+    let (_, stop) = stopper();
+    let (_, pump) = background
+        .admit(doc, script(Vec::new()), stop, None)
+        .expect("admitted");
+    pump.run();
+    #[cfg(unix)]
+    for name in files_naming(&dir, &id) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dir.join(&name))
+            .expect("file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{name} is owner-only");
+    }
+    assert!(files_naming(&dir, &id).len() >= 2, "record and journal");
+    temporary.close();
+    assert!(!dir.exists(), "discarded, never kept across a restart");
+    assert!(!temporary.knows(&id));
 }
 
 #[test]

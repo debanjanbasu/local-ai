@@ -122,9 +122,12 @@ local-ai serve [options]
   --stall-timeout N  drop a generation whose client stopped reading; seconds,
                      default 30, accepted 10 to 3600
   --response-store DIR  keep Responses API responses in DIR (owner-only,
-                     unencrypted); default: nothing is kept
+                     unencrypted); default: nothing is kept durably
   --reasoning-key FILE  enable reasoning.encrypted_content replay with an
                      owner-only persistent AES-256-GCM key in FILE
+  --experimental-decision-head FILE  EXPERIMENTAL: serve
+                     POST /v1/experimental/decisions with this judgment head
+                     (probabilities only; default: off)
 
 local-ai bonsai [options] <prompt>
   --max-tokens N     output cap (default 8192)
@@ -143,7 +146,9 @@ local-ai bonsai [options] <prompt>
 There is no model flag. The engine runs one pinned checkpoint and discovers it
 under `./models`, beside the executable, or under
 `~/Library/Caches/local-ai/models`, and nothing at runtime reads an
-environment variable other than `HOME`.
+environment variable other than `HOME`, plus `TMPDIR` where `serve` places
+its private [temporary background store](#temporary-background-responses)
+through the system temporary directory.
 
 `chat` and `bonsai` stream text to stdout. Startup policy JSON goes to stderr.
 `--no-thinking` skips the checkpoint's xhigh reasoning, which is on by default;
@@ -173,9 +178,11 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST` | `/v1/completions` | raw completion |
 | `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
-| `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored response, or (`GET ?stream=true`) resume a streamed background response (`--response-store` only) |
-| `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored response (`--response-store` only) |
-| `POST` | `/v1/responses/{id}/cancel` | cancel a background response (`--response-store` only) |
+| `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored or temporary background response, or (`GET ?stream=true`) resume a streamed background response |
+| `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored or temporary background response |
+| `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
+| `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
+| `POST` | `/v1/decisions` | always 404, explaining why OpenAI Decisions is not implemented |
 
 Generation accepts `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `presence_penalty`, `frequency_penalty`, `seed`, and `stream`. Chat's
@@ -190,6 +197,29 @@ a tool. Calls carry stable IDs and canonical JSON argument strings. A complete
 validated call is delivered as one argument delta: incremental partial argument
 streaming is not implemented. Chat finishes with `tool_calls` unless a token
 limit takes precedence. Ordinary answer and reasoning text still stream.
+
+Both APIs accept `tool_choice`, `parallel_tool_calls` and a function tool's
+`strict`, and map them one to one onto the engine's native settings, which a
+grammar enforces on every sampled token
+([contract](../local-engine/README.md#constrained-tool-calling)).
+`tool_choice` is `auto` (the default), `none`, `required`, or one named
+function: `{"type":"function","function":{"name":"NAME"}}` in Chat and
+`{"type":"function","name":"NAME"}` in Responses; the other API's shape,
+unknown members, `allowed_tools` and other tool kinds are refused. `required`
+with no tools, or a name not in `tools`, is a 400. `none` no longer withholds
+the tools from the prompt: they are rendered as for every choice, and the
+grammar keeps the answer from containing a call. `parallel_tool_calls: false`
+allows at most one call. `strict` (absent or `null` is `false`, unlike
+OpenAI Responses, which attempts strict-schema normalization when omitted)
+enforces that tool's arguments and needs a closed
+schema the engine can enforce exactly; otherwise the request fails with 400
+before generation, with the reason, rather than being enforced partially.
+Responses echoes the accepted `tool_choice`, `parallel_tool_calls` and each
+tool's `strict`. With all defaults, generation is unconstrained and calls are
+validated after they are generated, as before. Legacy Completions refuses
+`tools`, `tool_choice` and `parallel_tool_calls: false`. The grammar
+constrains the call layout and strict arguments, not which tool is
+appropriate or whether its values are sensible.
 
 Responses accepts explicit message, reasoning, `function_call` and
 `function_call_output` history in `input`, plus `instructions`. SSE uses typed
@@ -240,19 +270,26 @@ prove its branches disjoint (different JSON types, or objects whose shared
 required property has different `const` values); overlapping branches such as
 `integer`/`number` and unprovable ones such as `$ref` branches are refused.
 
-A structured format constrains the whole answer, so it cannot be combined
-with tools the model is shown: send no tools, or `tool_choice: "none"`, which
-withholds them. A token limit leaves incomplete JSON reported as
+A structured format may accompany tools. The native tool grammar then carries
+the format as the final-answer branch: with `auto` the answer is either calls
+or one document in the format, with `none` only the document, and with
+`required` or a named function only calls. A token limit leaves incomplete JSON reported as
 `finish_reason: "length"` (Chat) or `incomplete` with `max_output_tokens`
 (Responses), never as a successful document. If the model ends its turn while
 still reasoning, before any answer, Chat reports an error and Responses
-`failed`, because `stop`/`completed` would claim a valid document.
+`failed`, because `stop`/`completed` would claim a valid document. The engine's
+`response_format_complete` applies only to non-text formats;
+`tool_constraints_complete` separately reports tool-policy completion.
+Optional tools with a text answer may end during reasoning without a call;
+required or named calls mask end-of-sequence until the call is complete.
 
-Storage is opt-in and **nothing is stored by default**. Without
+Storage is opt-in and **nothing is stored durably by default**; only
+background responses are kept, briefly, without it. Without
 `--response-store DIR` the endpoint is stateless: responses report
 `store: false`, `store: true` and `previous_response_id` are refused, and
-`GET`/`DELETE /v1/responses/{id}` answer 404; resend history in `input`
-instead. With a store configured, `store` takes OpenAI's default of `true`
+`GET`/`DELETE /v1/responses/{id}` answer 404 for everything except a
+temporary background response (below); resend history in `input` instead.
+With a store configured, `store` takes OpenAI's default of `true`
 (an explicit `store: false` is honoured), and completed and incomplete
 responses are written durably before their terminal event is sent; a failed
 foreground generation is not stored, and a response whose write fails is
@@ -280,11 +317,14 @@ Unknown, malformed, deleted and never-stored IDs are the same 404, and all of
 these routes sit behind `--api-key` when it is set. Conversations and
 `item_reference` inputs remain unsupported.
 
-Background Responses are a stored subset. `background: true` requires
-`--response-store` and `store: true` (the default with a store); `store: false`
-is refused because temporary retention is not implemented. Once the engine has
-admitted the job, the `queued` response is already durably in the store.
-Without `stream`, `POST /v1/responses` returns it with 200; with
+Background Responses are kept either durably or temporarily. With
+`--response-store` and `store: true` (the default with a store) they are
+stored durably as described here. With `store: false`, or on a server without
+a store, they are kept temporarily (see
+[Temporary background responses](#temporary-background-responses)); the
+lifecycle below is the same apart from where and how long they are kept. Once
+the engine has admitted the job, the `queued` response is already written to
+its store. Without `stream`, `POST /v1/responses` returns it with 200; with
 `stream: true` it answers with an SSE stream instead (see below). Either way a
 detached worker persists
 `in_progress` and one terminal state, `completed`, `incomplete`, `failed` or
@@ -292,9 +332,10 @@ detached worker persists
 appears as a stored `failed` record rather than as an HTTP 400 on the
 `POST`; requests that fail validation or engine admission are still rejected
 in-request. Every state keeps the resolved `input_items` and reports
-`store: true` and `background: true`. `GET /v1/responses/{id}` reads the
-latest durable state, so polling works from any server sharing the directory,
-and `previous_response_id` refuses a response that is still `queued` or
+`background: true`, and `store: true` for a durable response. For a durable
+response `GET /v1/responses/{id}` reads the latest state from the store, so
+polling works from any server sharing the directory, and
+`previous_response_id` refuses a response that is still `queued` or
 `in_progress`.
 
 `POST /v1/responses/{id}/cancel` settles a pending background response as
@@ -389,7 +430,10 @@ calls and the reasoning mode included) and tokenized by the same code that
 generation uses, so it equals the `input_tokens` generation would report,
 cached prefix included. Counting is CPU-only, never queues behind or waits for
 generation, stores nothing and is not checked against the context window. Other
-fields are refused rather than ignored.
+fields are refused rather than ignored. `tool_choice`, `parallel_tool_calls`
+and tool `strict` do not change the prompt, so the count is the same for every
+setting; no tool grammar is compiled, so a strict schema the grammar cannot
+enforce is refused only when generation is requested.
 
 Reasoning controls are `reasoning_effort` (Chat) and `reasoning.effort`
 (Responses): `none` or `xhigh`. A server started with `--no-thinking` rejects
@@ -402,20 +446,22 @@ Responses reports measured prefix reuse as `input_tokens_details.cached_tokens`.
 `cache_write_tokens` is zero: local cache creation has no separately accounted
 or charged cache-write tier.
 
-This is **not the full OpenAI platform contract**. Guaranteed/forced tool
-choices, tool `strict:true` (tool calls are validated after generation, not
-constrained), a structured format together with visible tools, schema
-keywords llguidance cannot enforce exactly, built-in/hosted
+This is **not the full OpenAI platform contract**. Schema keywords
+llguidance cannot enforce exactly, strict tool schemas the native grammar
+cannot enforce exactly (including any without `"additionalProperties": false`),
+`allowed_tools` and non-function tool choices, built-in/hosted
 tools, reasoning summaries, `include` values other than
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
 `truncation:auto`, log-probabilities, images and audio are rejected.
-`tool_choice:auto` and `none` are supported; `none` hides tools and produces no
-structured tool events, not a guarantee against tool-like literal text.
-Decisions is not implemented: it requires a separately trained, evaluated and
-installed judgment head. The experimental head evaluated in the
-[engine README](../local-engine/README.md#experimental-judgment-head-preparation)
-is not installed or loaded, and the MTP head and next-token softmax are not
-calibrated decision probabilities.
+`tool_choice` `auto`, `none`, `required` and a named function,
+`parallel_tool_calls` and tool `strict` are supported and enforced during
+decoding, as is a structured format beside tools; a grammar guarantees the
+form of what is generated, not that the model chooses well. OpenAI Decisions
+is not implemented: the opt-in
+[experimental decisions](#experimental-decisions) route returns a head's
+probabilities without the confidence and refusal Decisions requires, and the
+head is calibrated only for two-option code-diff questions. The MTP head and
+next-token softmax are not calibrated decision probabilities either.
 
 The compatibility target is the public OpenAI contract, not a particular
 harness. The current schema audit is pinned to
@@ -426,15 +472,14 @@ types directly. No client-name branches belong in model execution.
 
 Missing endpoint families are not all model limitations. Opt-in local response
 storage (retrieve, delete, `input_items`), polled and streamed background
-responses with cancellation and journal-based stream resumption, Responses
-input-token counting, and JSON-object/JSON-schema output constrained during
-decoding are now implemented as described above; conversations, compaction,
-temporary (`store: false`) background retention, resuming a background job
-interrupted by a restart, files, uploads, vector stores and batches still need
-server implementations; constrained tool calls (tool `strict`, forced
-`tool_choice`, a format alongside tools) need a tool-call constraint
-implementation; media, embedding, audio
-and moderation capabilities need suitable models or heads. Hosted tools,
+responses with cancellation and journal-based stream resumption, temporary
+(`store: false`) background retention, Responses input-token counting,
+JSON-object/JSON-schema output and tool calls constrained during decoding are
+now implemented as described above; conversations, compaction, resuming a
+background job interrupted by a restart, files, uploads, vector stores and
+batches still need server implementations; OpenAI-compatible Decisions needs
+a judgment head with evaluated confidence and refusal semantics; media,
+embedding, audio and moderation capabilities need suitable models or heads. Hosted tools,
 evals, fine-tuning and administrative APIs also need their own services. None
 is implemented by merely accepting its request fields.
 
@@ -447,8 +492,9 @@ It is opaque tracking data: discarded, not echoed or persisted, and never
 used for prompts, sampling or cache-session selection. It is distinct from
 the public `metadata` field, which is retained on the response. With
 `--reasoning-key` the encrypted-content request is honoured. Reasoning
-summaries, tool `strict` and forced tool choices remain unsupported, so this
-server is
+summaries and hosted tools remain unsupported, strict tools are accepted only
+when their schemas can be enforced exactly, and the constrained tool settings
+have not been exercised with Codex, so this server is
 **not a drop-in Codex provider**. Codex handles raw `reasoning_text` and
 summary events separately; raw reasoning is not relabeled as a summary.
 The Oh My Pi example in the engine README configures that client to use only
@@ -568,6 +614,87 @@ that detection. What it does now bound on this path is a request going
 undeliverable for longer than the budget, which a body that exists on the wire
 makes observable and a buffered body could not be at all. That buffered body is
 what one measured vanished client cost: 706 seconds of engine time.
+
+### Temporary background responses
+
+A background Response with `store: false`, or with `store` omitted on a
+server without `--response-store`, is kept only temporarily, approximating
+OpenAI's documented retention of roughly 10 minutes. (`store: true` without a
+store is still refused, and a foreground `store: false` response is still not
+kept at all.) At startup the server creates a fresh private store for these
+in a randomly named directory under the system temporary directory, created
+`0700` and checked to be a real directory owned by the server's user; it is
+never shared with another server or reused. Its records and journals are the
+ordinary response-store files, in plain text with the raw reasoning, so this
+is short-lived owner-only local data on disk, not memory-only or encrypted
+storage. The configured `--response-store` is never touched: an ID is
+answered from the temporary store exactly while it holds it.
+
+Everything else follows the background lifecycle above: the `queued`
+response, `in_progress` and terminal states, `GET`, `input_items`, cancel,
+`DELETE`, and journaled `stream: true` events with
+`?stream=true&starting_after=N` resumption, all reporting `store: false`. A
+running job never expires. Its 10-minute retention starts once it reaches a
+terminal state; afterwards it is deleted and is the same 404 as an unknown ID.
+An expiry thread sleeps until the nearest deadline (or until a new, earlier
+one arrives) rather than scanning, and any access past a deadline also expires
+the response on the spot; if that thread cannot be started, the server warns
+and expiry happens only on access. `previous_response_id` naming a temporary
+response is refused with 400 instead of being looked up in the durable store.
+Graceful shutdown cancels unfinished jobs like durable ones and then removes
+the whole directory, so nothing temporary survives a restart. A crash or
+`SIGKILL` skips that removal and can leave the directory behind in the system
+temporary directory; the next start creates a new one and never reads it. If
+the private store cannot be created, the server warns at startup and refuses
+these requests.
+
+### Experimental decisions
+
+`--experimental-decision-head FILE` enables `POST /v1/experimental/decisions`.
+Without the flag the route is a 404 and no head is loaded. The head is opened
+and its width checked before the model loads, so a wrong file fails startup,
+and the server announces the route as experimental together with the head's
+calibration scope. The route bridges to the engine's
+[native decisions](../local-engine/README.md#experimental-native-decisions)
+and sits behind `--api-key` like every other route.
+
+The body borrows the Decisions request vocabulary but accepts only what the
+native renderer reproduces exactly: `input` must be a non-empty text string
+(rendered as the `State:`); `questions` holds 1 to 200 questions of `type`
+`predicate`, `choice` (2 to 26 string or boolean `choices[].value`) or
+`score` (2 to 10 `levels[].label`), each with `instructions` and an optional
+`name`; `model` and `safety_identifier` are accepted and ignored. Message
+arrays, images, non-empty option or level descriptions and unknown fields are
+refused with 400 rather than approximated. A 200 response has
+`"object":"experimental.decision"` and one answer per question: a predicate's
+`probability` of Yes; a choice's argmax `choice` and per-value
+`probabilities`; a score's probability-weighted mean level index as `score`
+and per-level `probabilities`. `usage.input_tokens` sums the rendered prompt
+tokens (`output_tokens` is 0), and an `experimental` object repeats the
+renderer, the calibration scope and the limitations.
+
+Questions run one after another over the same input, each taking one slot of
+the engine's bounded FIFO queue and running only once no generation is
+active, so other requests interleave between questions; a long input delays
+generations queued behind a running capture. At most eight decision requests
+are admitted at once; more get 503 with `Retry-After: 1`, and a full engine
+queue gets the usual queue-full 503. A client that disconnects drops its
+pending decision, which cancels it, queued or running; shutdown refuses new
+requests and ends waiting ones with 503, cancelling their decisions the same
+way. These waits are futures woken by the engine or by shutdown, not polling.
+
+`POST /v1/decisions` is always a 404 with an explanation. OpenAI's Decisions
+responses require a `confidence` on every choice and score answer and may
+answer with a `refusal`; the head produces neither, and a confidence could
+only be invented. Its probabilities are calibrated only for the two-option
+Yes/No code-diff questions it was trained on, and are the head's softmax
+output for anything else. This is not a production judgment service. Real-model
+native and HTTP checks reproduced stored-feature probabilities bit-for-bit
+on four rows from both training tasks and both option orders, with and without
+MTP. Queue ordering, cancellation, and generation/cache parity after a decision
+also passed. Capture measured about 115–130 tokens/s on the M4 Pro, and later
+generations wait behind it. These checks establish implementation parity,
+not general judgment quality or calibration.
 
 ### Concurrent requests
 
@@ -2080,7 +2207,7 @@ retry, deletion without resurrection, authentication, pending-history
 rejection, persistence across restart, graceful shutdown, and recovery after
 SIGKILL of the test server. These checks passed without skips. They did not
 cover background streaming and resumption (checked separately below) or
-temporary retention, which remains unsupported; cross-server lease conflicts
+temporary retention, which was then unsupported; cross-server lease conflicts
 and write failures have CPU tests.
 
 With structured output and streamed background responses added, the existing
@@ -2106,3 +2233,18 @@ These checks cover the implemented JSON-constrained text subset and the
 journaled background stream, not tool-call constraints, temporary retention
 or full OpenAI conformance; cross-server 409 and journal write faults are
 covered by CPU tests.
+
+Native constrained tool calling (`tool_choice`, `parallel_tool_calls`, tool
+`strict`, a format beside tools), temporary `store: false` background
+retention and the experimental decisions route were added after those live
+runs. CPU unit and HTTP-adapter tests cover grammar masks over synthetic
+vocabularies, an ignored CPU-only test against the real tokenizer's call tags,
+request parsing and echo, temporary-store expiry with an injected clock,
+decision validation, queueing, cancellation and shutdown with a synthetic
+head. Real-model runs with MTP enabled and disabled cover all three features:
+forced and strict calls, mixed format/tool branches, temporary retrieval,
+cancellation, deletion, SSE cursor replay and shutdown cleanup, plus native
+decision feature parity and cache/FIFO/cancellation checks. The earlier 208
+HTTP regression checks passed again. The ten-minute expiry is tested with an
+injected clock, not a ten-minute live wait. No full OpenAI conformance or
+general coding-quality claim follows from these contract checks.

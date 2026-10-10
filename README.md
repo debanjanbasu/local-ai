@@ -28,25 +28,42 @@ long a generation may go undelivered before it is cancelled and the engine
 released; the budgets, measurements and limits are in
 [docs/BONSAI.md](docs/BONSAI.md#server-api).
 
-Responses are stateless and nothing is stored by default. `--response-store DIR`
-opts in to keeping them (owner-only, unencrypted files) for
-`GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
+Responses are stateless and nothing is stored durably by default.
+`--response-store DIR` opts in to keeping them (owner-only, unencrypted files)
+for `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
 `previous_response_id`, which carries over conversation items but not
-`instructions`, tools or sampling settings. With a store, `background: true`
-requests are stored before they are acknowledged: without `stream` the `POST`
-returns the `queued` response for polling `GET /v1/responses/{id}`; with
-`stream: true` it streams journaled events that
+`instructions`, tools or sampling settings. `background: true` requests are
+written before they are acknowledged: without `stream` the `POST` returns the
+`queued` response for polling `GET /v1/responses/{id}`; with `stream: true` it
+streams journaled events that
 `GET /v1/responses/{id}?stream=true&starting_after=N` resumes after any
-sequence number, even across a server restart. A disconnected or stalled
-stream does not cancel the job; `POST /v1/responses/{id}/cancel` does.
-Background `store: false` (temporary retention) is refused, and a job
-interrupted by a restart is marked `failed`, never resumed.
+sequence number. A disconnected or stalled stream does not cancel the job;
+`POST /v1/responses/{id}/cancel` does. With `store: true` (the default once a
+store exists) the job lives in `--response-store`, and its record and event
+journal survive a restart, though an interrupted job is marked `failed`, never
+resumed. With `store: false` (the only choice without a store) it is kept
+temporarily in a private owner-only directory under the system temporary
+directory: retrievable, cancellable and resumable until 10 minutes after it
+ends, reported as `store: false`, never continued by `previous_response_id`,
+and discarded at shutdown.
 
 Chat `response_format` and Responses `text.format` accept `json_object` and
 `json_schema`; the engine compiles the schema with llguidance before queueing
-and masks every answer token to it, whether or not `strict` is set. A format
-cannot be combined with tools unless `tool_choice` is `"none"`, and a token
+and masks every answer token to it, whether or not `strict` is set. A token
 limit leaves the JSON incomplete (`length`/`incomplete`, never a success).
+`tool_choice` (`auto`, `none`, `required` or a named function),
+`parallel_tool_calls: false` and tool `strict: true` are enforced the same way,
+by a native grammar over the checkpoint's own tool-call format, and a format
+may now accompany tools: the answer is then either calls or the document.
+Strict tools need closed schemas the engine can enforce exactly; anything else
+is refused with 400 rather than partly enforced.
+
+`--experimental-decision-head FILE` opts in to
+`POST /v1/experimental/decisions`, which returns an explicitly loaded
+judgment head's option probabilities for text questions. It is experimental,
+has no confidence or refusal, is calibrated only for two-option code-diff
+questions, and is not the OpenAI Decisions API; `POST /v1/decisions` is
+refused with an explanation.
 
 `--reasoning-key FILE` adds
 AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
@@ -64,7 +81,7 @@ and `futures-core` supplies the `Stream` implementation. `Engine` is `Send` but
 not `Sync`; `EngineHandle` provides a cloneable `Send + Sync` worker handle.
 
 ```rust,no_run
-use local_engine::{ChatMessage, ChatRequest, Engine, Event, ResponseFormat, Sampling};
+use local_engine::{ChatMessage, ChatRequest, Engine, Event, ResponseFormat, Sampling, ToolChoice};
 use std::ops::ControlFlow;
 
 let mut engine = Engine::open()?;
@@ -77,6 +94,8 @@ let request = ChatRequest {
     thinking: true,
     session: None,
     tools: vec![],
+    tool_choice: ToolChoice::Auto,
+    parallel_tool_calls: true,
     response_format: ResponseFormat::Text,
 };
 engine.chat_with(&request, |event| {
@@ -97,6 +116,13 @@ another executor should reach the model through `Engine::open` plus
 `EngineHandle` return the exact prompt length generation would prefill, using
 the same template and tokenizer. They run on the CPU, queue no job and submit
 no GPU work.
+
+`ChatRequest::tool_choice`, `parallel_tool_calls` and `ToolDefinition::strict`
+select [native constrained tool calling](local-engine/README.md#constrained-tool-calling);
+the defaults shown above leave generation unconstrained. The experimental
+`Engine::decide` and `EngineHandle::decide` score typed text questions with an
+explicitly loaded judgment head
+([experimental native decisions](local-engine/README.md#experimental-native-decisions)).
 
 ## Automatic policy
 

@@ -182,28 +182,10 @@ impl MtpCapture {
         tokens: &[u32],
         positions: &[usize],
     ) -> crate::Result<Vec<f32>> {
-        validate_feature_request(tokens, positions, self.context())?;
-        self.model.reset();
-        let mut features = Vec::with_capacity(positions.len() * WIDTH);
-        let mut next = 0;
-        let mut start = 0;
-        for take in block_sizes(tokens.len(), self.rows) {
-            if next == positions.len() {
-                // Causal: later blocks cannot change rows already read.
-                break;
-            }
-            let block = &tokens[start..start + take];
-            self.model.forward_block(block, BlockOutput::Hidden)?;
-            let normalized = &self.model.scratch.normalized.as_slice::<f32>()[..take * WIDTH];
-            next = select_rows(normalized, start, positions, next, &mut features);
-            start += take;
-        }
-        if next != positions.len() || features.len() != positions.len() * WIDTH {
-            return Err(crate::Error::Generation(
-                "feature capture did not reach every requested position".into(),
-            ));
-        }
-        Ok(features)
+        // The capture model's cancel token is never tripped.
+        self.model
+            .capture_hidden(tokens, positions, self.rows)?
+            .ok_or_else(|| crate::Error::Generation("feature capture was cancelled".into()))
     }
 
     /// [`Self::capture_features`], written to `out` as consecutive
@@ -286,6 +268,59 @@ impl MtpCapture {
         let result = run();
         self.model.speculation = Some(speculation);
         result
+    }
+}
+
+impl BonsaiModel {
+    /// The body of [`MtpCapture::capture_features`], on whichever sequence
+    /// buffers are resident: reset them, run `tokens` in committed
+    /// hidden-only blocks of at most `rows` (split by [`block_sizes`], so the
+    /// same `rows` reproduces the same blocks and FP16 state rounding), and
+    /// return the output-normalized, unrotated hidden of each of
+    /// `positions`, `positions.len() × WIDTH` `f32`s, position-major.
+    ///
+    /// The installed cancel token is polled before every block; a trip
+    /// returns `Ok(None)` and submits nothing further. Either way the
+    /// resident buffers are left holding a partial capture, not any earlier
+    /// sequence: the caller owns invalidating whatever described them.
+    pub(crate) fn capture_hidden(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        rows: usize,
+    ) -> crate::Result<Option<Vec<f32>>> {
+        validate_feature_request(tokens, positions, self.info.context)?;
+        if !(3..=self.block_rows).contains(&rows) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "capture rows must be within 3..={}",
+                self.block_rows
+            )));
+        }
+        self.reset();
+        let mut features = Vec::with_capacity(positions.len() * WIDTH);
+        let mut next = 0;
+        let mut start = 0;
+        for take in block_sizes(tokens.len(), rows) {
+            if next == positions.len() {
+                // Causal: later blocks cannot change rows already read.
+                break;
+            }
+            if self.stop_for_cancel() {
+                self.cancel_observed = false;
+                return Ok(None);
+            }
+            let block = &tokens[start..start + take];
+            self.forward_block(block, BlockOutput::Hidden)?;
+            let normalized = &self.scratch.normalized.as_slice::<f32>()[..take * WIDTH];
+            next = select_rows(normalized, start, positions, next, &mut features);
+            start += take;
+        }
+        if next != positions.len() || features.len() != positions.len() * WIDTH {
+            return Err(crate::Error::Generation(
+                "feature capture did not reach every requested position".into(),
+            ));
+        }
+        Ok(Some(features))
     }
 }
 
@@ -388,6 +423,21 @@ fn features_f16_bytes(values: &[f32]) -> crate::Result<Vec<u8>> {
         bytes.extend_from_slice(&half.to_le_bytes());
     }
     Ok(bytes)
+}
+
+/// Round `values` in place through FP16, exactly as [`features_f16_bytes`]
+/// stores them for training, rejecting the same non-finite values.
+pub(crate) fn round_features_f16(values: &mut [f32]) -> crate::Result<()> {
+    for (index, value) in values.iter_mut().enumerate() {
+        let half = half::f16::from_f32(*value);
+        if !half.is_finite() {
+            return Err(crate::Error::Generation(format!(
+                "feature value {value} at element {index} is not finite in FP16"
+            )));
+        }
+        *value = half.to_f32();
+    }
+    Ok(())
 }
 
 /// Highest `k` entries of one row, best first; ties keep the lower id, as the
@@ -745,6 +795,27 @@ mod tests {
         );
         assert!(features_f16_bytes(&[1.0e6]).is_err());
         assert!(features_f16_bytes(&[f32::NAN]).is_err());
+    }
+
+    /// In-place rounding matches the stored FP16 bytes value for value.
+    #[test]
+    fn feature_rounding_matches_stored_f16() -> crate::Result<()> {
+        let values = [1.0e-3_f32, -2.5, 0.1, 65_504.0];
+        let mut rounded = values;
+        super::round_features_f16(&mut rounded)?;
+        let stored: Vec<f32> = features_f16_bytes(&values)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| half::f16::from_le_bytes(*pair).to_f32())
+            .collect();
+        assert_eq!(rounded.to_vec(), stored);
+        assert!(
+            (rounded[2] - 0.1).abs() > 1.0e-6,
+            "0.1 is not exact in FP16"
+        );
+        assert!(super::round_features_f16(&mut [1.0e6]).is_err());
+        Ok(())
     }
 
     /// The butterflies are the natural (Sylvester) order Walsh-Hadamard

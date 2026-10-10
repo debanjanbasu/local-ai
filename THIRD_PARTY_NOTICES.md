@@ -58,8 +58,9 @@ runtime's capture shards and frozen tables and to match its draft chain layout.
 
 ## llguidance, toktrie and derivre
 
-Schema-constrained generation in `local-engine` links these crates from
-crates.io, unmodified: [`llguidance`](https://github.com/guidance-ai/llguidance)
+Schema-constrained generation and the native tool-call grammar (llguidance's
+built-in `lark` feature, which adds no crate) in `local-engine` link these
+crates from crates.io, unmodified: [`llguidance`](https://github.com/guidance-ai/llguidance)
 1.9.1 and its dependencies `toktrie` 1.9.1 (same repository) and
 [`derivre`](https://github.com/microsoft/derivre) 0.3.13. Each is licensed
 under the MIT License; the `LICENSE` file shipped in each crate's registry

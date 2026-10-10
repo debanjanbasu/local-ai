@@ -17,6 +17,7 @@ fn weather() -> ToolDefinition {
         name: "get_weather".into(),
         description: Some("Get the weather.".into()),
         parameters: json!({"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]}),
+        strict: false,
     }
 }
 
@@ -25,6 +26,7 @@ fn search() -> ToolDefinition {
         name: "search".into(),
         description: None,
         parameters: json!({"type":"object","properties":{"query":{"type":"string"},"filters":{"type":"object"}}}),
+        strict: false,
     }
 }
 
@@ -192,6 +194,7 @@ fn rejects_invalid_tool_definitions() {
         name: "f".into(),
         description: None,
         parameters,
+        strict: false,
     };
     for parameters in [
         json!("object"),
@@ -231,6 +234,7 @@ fn tool(parameters: Value) -> ToolDefinition {
         name: "f".into(),
         description: None,
         parameters,
+        strict: false,
     }
 }
 
@@ -405,7 +409,7 @@ fn parse(tools: &[ToolDefinition], pieces: &[&str]) -> (Vec<Event>, Option<Strin
             return (events, parser.take_failure());
         }
     }
-    let _ = parser.finish(&mut sink);
+    let _ = parser.finish(crate::bonsai_model::StopReason::Eos, &mut sink);
     (events, parser.take_failure())
 }
 

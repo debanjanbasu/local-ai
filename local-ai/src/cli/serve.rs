@@ -21,6 +21,7 @@ use crate::resources::Resources;
 mod background;
 mod backpressure;
 mod chunked;
+mod decisions;
 mod http3;
 mod journal;
 mod options;
@@ -39,7 +40,7 @@ use axum::http::HeaderMap;
 #[cfg(test)]
 use local_engine::Event;
 
-use self::background::Background;
+use self::background::{Background, Failure, Temporary};
 use self::chunked::start_chunked;
 use self::http3::serve_h3;
 use self::options::{parse, usage};
@@ -49,7 +50,7 @@ use self::response::{
     Protocol, Reply, add_alt_svc, error_response, error_status, error_status_message,
     json_response, queue_full_response, wants_zstd,
 };
-use self::responses::prepare_responses_with;
+use self::responses::prepare_responses_retaining;
 use self::resume::Retrieval;
 use self::sse::start_stream;
 use self::store::{ItemPage, PageError, ResponseStore};
@@ -67,6 +68,9 @@ struct Args {
     /// `--response-store`: where Responses are kept. `None` keeps nothing.
     response_store: Option<PathBuf>,
     reasoning_key: Option<PathBuf>,
+    /// `--experimental-decision-head`: the judgment head that enables
+    /// `POST /v1/experimental/decisions`. `None` serves no decisions.
+    decision_head: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -90,6 +94,12 @@ struct AppState {
     cipher: Option<Arc<ReasoningCipher>>,
     /// Background Responses running on this server.
     background: Arc<Background>,
+    /// Where background `store: false` Responses are kept briefly; `None`
+    /// when no private temporary store could be created.
+    temporary: Option<Arc<Temporary>>,
+    /// The opt-in experimental decision service; `None` without
+    /// `--experimental-decision-head`.
+    decisions: Option<Arc<decisions::Decisions>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -161,6 +171,18 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         )
         .await;
     }
+    if parts.method == Method::POST && parts.uri.path() == decisions::ROUTE {
+        return decisions::handle(&state, &parts.headers, body).await;
+    }
+    if parts.method == Method::POST && parts.uri.path() == decisions::OPENAI_ROUTE {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &decisions::openai_refusal(),
+            &state,
+            &parts.headers,
+        )
+        .await;
+    }
     // Authentication has already passed, so a stored response is never read or
     // deleted for a caller without the key.
     if let Some(rest) = parts.uri.path().strip_prefix("/v1/responses/")
@@ -220,6 +242,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     // Off the runtime: resolving `previous_response_id` reads the store.
     let (thinking, store) = (state.thinking, state.responses.clone());
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
+    let temporary = state.temporary.clone();
     if count_tokens {
         let engine = state.engine.clone();
         let counted = tokio::task::spawn_blocking(move || {
@@ -256,11 +279,11 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         };
     }
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare(
+        prepare_retaining(
             api,
             &body,
             thinking,
-            store.as_ref(),
+            (store.as_ref(), temporary.as_ref()),
             cipher.as_ref(),
             &model,
         )
@@ -427,20 +450,19 @@ async fn stream_events(
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let not_found = format!("response with id {id:?} not found");
-    let Some(store) = state.responses.clone() else {
-        let message = format!("{not_found}: this server was started without --response-store");
-        return error_response(StatusCode::NOT_FOUND, &message, state, headers).await;
-    };
     let background = Arc::clone(&state.background);
-    let subscribed =
-        tokio::task::spawn_blocking(move || resume::subscribe(&background, &store, &id, after))
-            .await
-            .unwrap_or_else(|error| {
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("response store task failed: {error}"),
-                ))
-            });
+    let (temporary, durable) = (state.temporary.clone(), state.responses.clone());
+    let subscribed = tokio::task::spawn_blocking(move || {
+        let located = locate(temporary.as_ref(), durable.as_ref(), &background, &id)?;
+        resume::subscribe(&background, &located.store, &id, after)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("response store task failed: {error}"),
+        ))
+    });
     match subscribed {
         Ok(Some(subscription)) => event_stream(resume::start(subscription, state.stall), state),
         Ok(None) => error_response(StatusCode::NOT_FOUND, &not_found, state, headers).await,
@@ -455,12 +477,26 @@ enum Api {
     Responses,
 }
 
-/// Parse a request body for `api` into the engine request and how to answer it.
+/// [`prepare_retaining`] on a server with no temporary store.
+#[cfg(test)]
 fn prepare(
     api: Api,
     body: &[u8],
     thinking: bool,
     store: Option<&Arc<ResponseStore>>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<(bool, GenerationRequest, Protocol)> {
+    prepare_retaining(api, body, thinking, (store, None), cipher, model)
+}
+
+/// Parse a request body for `api` into the engine request and how to answer
+/// it, keeping background `store: false` Responses in `temporary`.
+fn prepare_retaining(
+    api: Api,
+    body: &[u8],
+    thinking: bool,
+    (store, temporary): (Option<&Arc<ResponseStore>>, Option<&Arc<Temporary>>),
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<(bool, GenerationRequest, Protocol)> {
@@ -478,7 +514,8 @@ fn prepare(
             Ok((prepared.stream, prepared.request, protocol))
         }
         Api::Responses => {
-            let prepared = prepare_responses_with(body, thinking, store, cipher, model)?;
+            let prepared =
+                prepare_responses_retaining(body, thinking, store, temporary, cipher, model)?;
             Ok((
                 prepared.stream,
                 GenerationRequest::Chat(prepared.request),
@@ -491,9 +528,10 @@ fn prepare(
 /// `GET` and `DELETE /v1/responses/{id}`, `GET .../{id}/input_items` and
 /// `POST .../{id}/cancel`.
 ///
-/// `rest` is the path after `/v1/responses/`. Unknown, malformed, deleted and
-/// never-stored IDs are all the same 404, and so is every ID when no store is
-/// configured: none of them names a response this server can produce.
+/// `rest` is the path after `/v1/responses/`. Unknown, malformed, deleted,
+/// expired and never-stored IDs are all the same 404, and so is every ID but
+/// a retained temporary one when no store is configured: none of them names a
+/// response this server can produce. See [`locate`] for which store answers.
 async fn stored_response(
     state: &AppState,
     method: &Method,
@@ -510,10 +548,10 @@ async fn stored_response(
         }
     };
     let not_found = format!("response with id {id:?} not found");
-    let Some(store) = state.responses.clone() else {
+    if state.responses.is_none() && state.temporary.is_none() {
         let message = format!("{not_found}: this server was started without --response-store");
         return error_response(StatusCode::NOT_FOUND, &message, state, headers).await;
-    };
+    }
     let outcome = match stored_request(method, items, query) {
         Ok(Retrieval::Stream(after)) => {
             return stream_events(state, id.to_owned(), after, headers).await;
@@ -522,13 +560,20 @@ async fn stored_response(
             let page = retrieval.into_page();
             let (id, method) = (id.to_owned(), method.clone());
             let background = Arc::clone(&state.background);
+            let (temporary, durable) = (state.temporary.clone(), state.responses.clone());
             tokio::task::spawn_blocking(move || {
+                let located = locate(temporary.as_ref(), durable.as_ref(), &background, &id)?;
+                let store = &located.store;
                 if cancel {
-                    background.cancel(&store, &id)
+                    background.cancel(store, &id)
                 } else if method == Method::DELETE {
-                    Ok(background.delete(&store, &id)?.then(|| deleted(&id)))
+                    let found = background.delete(store, &id)?;
+                    if let Some(temporary) = &located.temporary {
+                        temporary.forget(&id);
+                    }
+                    Ok(found.then(|| deleted(&id)))
                 } else {
-                    stored_answer(&store, &method, &id, page.as_ref())
+                    stored_answer(store, &method, &id, page.as_ref())
                 }
             })
             .await
@@ -546,6 +591,59 @@ async fn stored_response(
         Ok(None) => error_response(StatusCode::NOT_FOUND, &not_found, state, headers).await,
         Err((status, message)) => error_response(status, &message, state, headers).await,
     }
+}
+
+/// Why an ID that is not a temporary response is never found without a store.
+const WITHOUT_STORE: &str = "this server was started without --response-store, so it keeps only \
+     background store=false responses, and only briefly";
+
+/// The store that answers for response `id`.
+#[derive(Debug)]
+struct Located {
+    store: Arc<ResponseStore>,
+    /// Set when that is the temporary store.
+    temporary: Option<Arc<Temporary>>,
+}
+
+/// Which store answers for response `id`: the temporary one while it keeps
+/// `id`, otherwise the configured one. Never both, so a temporary response is
+/// never looked up in, or confused with, the durable store.
+///
+/// A temporary response whose retention has ended is deleted here and is
+/// then the same 404 as any unknown ID. Blocks on the store.
+fn locate(
+    temporary: Option<&Arc<Temporary>>,
+    durable: Option<&Arc<ResponseStore>>,
+    background: &Background,
+    id: &str,
+) -> Result<Located, Failure> {
+    let not_found = format!("response with id {id:?} not found");
+    if let Some(temporary) = temporary {
+        match temporary.holds(background, id) {
+            Some(true) => {
+                return Ok(Located {
+                    store: Arc::clone(temporary.store()),
+                    temporary: Some(Arc::clone(temporary)),
+                });
+            }
+            Some(false) => return Err((StatusCode::NOT_FOUND, not_found)),
+            None => {}
+        }
+    }
+    durable.map_or_else(
+        || {
+            Err((
+                StatusCode::NOT_FOUND,
+                format!("{not_found}: {WITHOUT_STORE}"),
+            ))
+        },
+        |store| {
+            Ok(Located {
+                store: Arc::clone(store),
+                temporary: None,
+            })
+        },
+    )
 }
 
 /// Validate the query of a stored-response request.
@@ -638,6 +736,18 @@ async fn run_async(args: Args) -> crate::Result<()> {
             })
         })
         .transpose()?;
+    // Also before the model loads: a wrong head fails in milliseconds.
+    let decisions = decisions::Decisions::start(args.decision_head.as_deref())?;
+    // Background `store: false` Responses are kept only in a private store of
+    // this process; without one they are refused, and nothing else changes.
+    let temporary = Temporary::create()
+        .map_err(|error| {
+            eprintln!(
+                "warning: background requests with store=false are unavailable: cannot create a \
+                 private temporary response store: {error}"
+            );
+        })
+        .ok();
     // One discovery serves both the engine and the TLS lookup: each one probes
     // the disk's write rate with a 16 MiB file, so a second is wasted startup.
     let resources = Resources::discover(None, true)?;
@@ -661,6 +771,8 @@ async fn run_async(args: Args) -> crate::Result<()> {
         responses,
         cipher,
         background: Arc::default(),
+        temporary: temporary.clone(),
+        decisions: decisions.clone(),
     };
     let address = SocketAddr::new(args.host, args.port);
     let h3_task = if let Some((cert, key)) = resources.tls {
@@ -669,25 +781,43 @@ async fn run_async(args: Args) -> crate::Result<()> {
         None
     };
     let listener = tokio::net::TcpListener::bind(address).await?;
+    // Started once nothing can fail early, since it holds the store until
+    // shutdown closes it.
+    if let Some(temporary) = &temporary
+        && let Err(error) = temporary.reap(Arc::clone(&state.background))
+    {
+        // Expiry still happens on access; unread responses wait for shutdown.
+        eprintln!("warning: temporary responses expire only when accessed: {error}");
+    }
     eprintln!("Bonsai server listening on http://{address}");
     let background = Arc::clone(&state.background);
     let app = Router::new().fallback(any(route)).with_state(state);
     // Background jobs are settled and cancelled as soon as shutdown begins,
     // while axum is still draining foreground connections.
     let closing = Arc::clone(&background);
+    let closing_decisions = decisions.clone();
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown().await;
+            // Waiting decisions end at once, cancelling their engine work,
+            // so they never hold up the drain.
+            decisions::close(closing_decisions.as_deref());
             let _ = tokio::task::spawn_blocking(move || closing.close()).await;
         })
         .await
         .map_err(crate::Error::Io);
     // Again, for a server that stopped without the signal; settling is idempotent.
+    decisions::close(decisions.as_deref());
     let closing = Arc::clone(&background);
     let _ = tokio::task::spawn_blocking(move || closing.close()).await;
     // Each cancelled job still holds its engine slot and lease until the worker
     // lets go of it, which is at most one prefill chunk or decode step away.
     background.drained().await;
+    // No job writes any more: temporary responses are discarded, never kept
+    // across a restart.
+    if let Some(temporary) = temporary {
+        let _ = tokio::task::spawn_blocking(move || temporary.close()).await;
+    }
     if let Some(task) = h3_task {
         task.abort();
     }

@@ -144,6 +144,7 @@ fn weather_tools() -> std::sync::Arc<crate::tools::ToolSet> {
         name: "get_weather".into(),
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
+        strict: false,
     };
     std::sync::Arc::new(crate::tools::ToolSet::new(&[tool]).expect("tools"))
 }
@@ -167,7 +168,7 @@ fn split(
         }
     }
     if !splitter.failed() {
-        let _ = splitter.finish(&mut sink);
+        let _ = splitter.finish(crate::bonsai_model::StopReason::Eos, &mut sink);
     }
     (events, splitter.take_failure())
 }
@@ -289,6 +290,58 @@ fn the_worker_reports_invalid_and_truncated_calls_without_finishing() {
     }
 }
 
+#[test]
+fn a_call_cut_off_by_the_budget_is_dropped_and_the_stop_reason_stands() {
+    use crate::bonsai_model::StopReason;
+    let strict = crate::ToolDefinition {
+        name: "tag".into(),
+        description: None,
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+            "required": ["names"],
+            "additionalProperties": false
+        }),
+        strict: true,
+    };
+    let strict = std::sync::Arc::new(crate::tools::ToolSet::new(&[strict]).expect("tools"));
+    // A forced strict call stopped mid-JSON, and a valid call followed by
+    // a second one the budget interrupted.
+    let partial = "<tool_call>\n<function=tag>\n<parameter=names>\n[\"a";
+    let after_call = format!("{CALL}\n<tool_call>\n<function=get_weather>\n<parameter=ci");
+    for (tools, output, calls) in [
+        (strict, partial.to_owned(), 0),
+        (weather_tools(), after_call, 1),
+    ] {
+        for reason in [StopReason::TokenLimit, StopReason::Cancelled] {
+            let (mut delivery, _receiver) = delivery(Some(std::sync::Arc::clone(&tools)));
+            assert!(delivery.emit(&output));
+            let mut generation = generation();
+            generation.stop_reason = reason;
+            delivery.complete(Ok(generation));
+            let events = outbox_events(&delivery);
+            let emitted = events
+                .iter()
+                .filter(
+                    |event| matches!(event, Event::ToolCall(call) if call.name == "get_weather"),
+                )
+                .count();
+            assert_eq!(emitted, calls, "{events:?}");
+            assert!(
+                events.iter().all(
+                    |event| !matches!(event, Event::Error(_) | Event::Content(_))
+                        && !matches!(event, Event::ToolCall(call) if call.name == "tag")
+                ),
+                "{events:?}"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finished(stats)) if stats.stop_reason == reason),
+                "{events:?}"
+            );
+        }
+    }
+}
+
 fn message(role: &str, content: &str) -> super::ChatMessage {
     super::ChatMessage {
         role: role.into(),
@@ -334,7 +387,10 @@ fn tool_history(thinking: bool) -> super::ChatRequest {
             name: "get_weather".into(),
             description: Some("Look up the weather.".into()),
             parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
+            strict: false,
         }],
+        tool_choice: crate::ToolChoice::Auto,
+        parallel_tool_calls: true,
         response_format: crate::ResponseFormat::default(),
     }
 }
@@ -475,17 +531,98 @@ fn counted_prompt_tokens_match_generation_stats() {
 }
 
 #[test]
-fn a_response_format_cannot_ride_with_tools_and_text_needs_no_compiler() {
-    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
+fn default_tool_settings_need_no_compiler_and_native_ones_compile_up_front() {
+    // No end-of-sequence token: any attempt to compile would fail, so a
+    // `None` here proves the default path builds no grammar at all.
+    let plain = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
     let mut request = tool_history(true);
     assert!(
-        super::chat_grammar(&tokenizer, &request)
+        super::chat_grammar(&plain, &request)
             .expect("text")
             .is_none()
     );
+    let constrained = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_with_specials_for_tests(
+        &["<|im_end|>", "</think>"],
+        &["<|im_end|>"],
+    );
+    // Tools and a response format now ride together in one grammar.
     request.response_format = crate::ResponseFormat::JsonObject;
-    assert!(matches!(
-        super::chat_grammar(&tokenizer, &request),
-        Err(crate::Error::InvalidArgument(_))
-    ));
+    assert!(
+        super::chat_grammar(&constrained, &request)
+            .expect("tools with a format")
+            .is_some()
+    );
+    request.response_format = crate::ResponseFormat::Text;
+    for (choice, parallel, strict) in [
+        (crate::ToolChoice::Required, true, false),
+        (crate::ToolChoice::None, true, false),
+        (
+            crate::ToolChoice::Function("get_weather".into()),
+            true,
+            false,
+        ),
+        (crate::ToolChoice::Auto, false, false),
+        (crate::ToolChoice::Auto, true, true),
+    ] {
+        let mut native = request.clone();
+        native.tool_choice = choice;
+        native.parallel_tool_calls = parallel;
+        native.tools[0].strict = strict;
+        native.tools[0].parameters["additionalProperties"] = serde_json::Value::Bool(false);
+        assert!(
+            super::chat_grammar(&constrained, &native)
+                .expect("native")
+                .is_some()
+        );
+        // The prompt never depends on the tool policy.
+        let mut default = native.clone();
+        default.tool_choice = crate::ToolChoice::Auto;
+        default.parallel_tool_calls = true;
+        default.tools[0].strict = false;
+        assert_eq!(
+            super::count_chat(&plain, &native).expect("count"),
+            super::count_chat(&plain, &default).expect("count")
+        );
+    }
+    // Choices that cannot apply fail before any compiling.
+    let mut unknown = request.clone();
+    unknown.tool_choice = crate::ToolChoice::Function("get_time".into());
+    let mut toolless = request;
+    toolless.tools.clear();
+    toolless.messages.truncate(2);
+    toolless.tool_choice = crate::ToolChoice::Required;
+    for invalid in [unknown, toolless] {
+        assert!(matches!(
+            super::chat_grammar(&plain, &invalid),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+    }
+}
+
+#[test]
+fn a_strict_call_is_parsed_by_its_exact_layout_after_reasoning() {
+    let tool = crate::ToolDefinition {
+        name: "tag".into(),
+        description: None,
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+            "required": ["names"],
+            "additionalProperties": false
+        }),
+        strict: true,
+    };
+    let tools = std::sync::Arc::new(crate::tools::ToolSet::new(&[tool]).expect("tools"));
+    // A JSON string may hold `</tool_call>`: only the strict end marker,
+    // which no value can contain, closes the call.
+    let call = "<tool_call>\n<function=tag>\n<parameter=names>\n[\"</tool_call>\", \"b\"]\n</parameter>\n</function>\n</tool_call>";
+    let text = format!("think</think>\n\n{call}");
+    let pieces = text.split_inclusive(['>', '"']).collect::<Vec<_>>();
+    let (events, failure) = split(true, Some(tools), &pieces);
+    assert_eq!(failure, None);
+    assert!(
+        matches!(events.as_slice(), [Event::Reasoning(_), Event::ToolCall(call)]
+            if call.arguments == serde_json::json!({"names": ["</tool_call>", "b"]})),
+        "{events:?}"
+    );
 }

@@ -113,6 +113,10 @@ pub struct GenerationStats {
     /// cancellation, or end-of-sequence during reasoning (no answer at all).
     /// `None` for unconstrained requests.
     pub response_format_complete: Option<bool>,
+    /// Whether a constrained tool policy completed at end-of-sequence.
+    /// Optional calls permit a turn containing only reasoning. `None` when
+    /// no tool grammar was used; limits and cancellation yield `Some(false)`.
+    pub tool_constraints_complete: Option<bool>,
 }
 
 pub(crate) fn validate_generation_params(params: &GenerateParams) -> crate::Result<()> {
