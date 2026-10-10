@@ -1,0 +1,32 @@
+[package]
+name = "local-services"
+version = "0.1.0"
+description = "Durable native services (conversations and friends) backed by SQLite"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Bundled SQLite: one audited engine version (WAL, multi-process locking)
+# regardless of the host library; no statement cache or other extras.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+cap-std = "4.0.3"
+ignore = "0.4.33"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+grep-matcher = "0.1.9"
+tantivy = { version = "=0.26.2", default-features = false }
+md5 = "0.8"
+# OS randomness for identifiers; already in the lock through rustls.
+ring = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

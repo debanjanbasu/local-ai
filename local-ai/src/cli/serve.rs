@@ -10,7 +10,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
 use axum::{Router, routing::any};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -20,6 +20,7 @@ use crate::resources::Resources;
 
 mod background;
 mod backpressure;
+mod batches;
 mod chunked;
 mod decisions;
 mod http3;
@@ -30,6 +31,7 @@ mod request;
 mod response;
 mod responses;
 mod resume;
+mod services;
 mod sse;
 mod store;
 
@@ -50,7 +52,7 @@ use self::response::{
     Protocol, Reply, add_alt_svc, error_response, error_status, error_status_message,
     json_response, queue_full_response, wants_zstd,
 };
-use self::responses::prepare_responses_retaining;
+use self::responses::prepare_responses_conversing;
 use self::resume::Retrieval;
 use self::sse::start_stream;
 use self::store::{ItemPage, PageError, ResponseStore};
@@ -100,6 +102,9 @@ struct AppState {
     /// The opt-in experimental decision service; `None` without
     /// `--experimental-decision-head`.
     decisions: Option<Arc<decisions::Decisions>>,
+    /// Native durable services, available automatically in the user's data directory.
+    services: Option<Arc<services::Services>>,
+    batches: Option<Arc<batches::Batches>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -152,6 +157,12 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             )
             .await;
         }
+    }
+    if services::matches(parts.uri.path()) {
+        return services::handle(&state, &parts, body).await;
+    }
+    if batches::matches(parts.uri.path()) {
+        return batches::handle(&state, &parts, body).await;
     }
     if parts.method == Method::GET && parts.uri.path() == "/health" {
         return json_response(
@@ -214,24 +225,16 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             .await;
         }
     };
-    let body = match body.collect().await {
-        Ok(value) => {
-            let value = value.to_bytes();
-            if value.len() <= MAX_REQUEST_BYTES {
-                value.to_vec()
-            } else {
-                return error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "HTTP request is too large",
-                    &state,
-                    &parts.headers,
-                )
-                .await;
-            }
-        }
+    let body = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
+        Ok(value) => value.to_bytes().to_vec(),
         Err(error) => {
+            let status = if error.is::<LengthLimitError>() {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
             return error_response(
-                StatusCode::BAD_REQUEST,
+                status,
                 &format!("invalid HTTP body: {error}"),
                 &state,
                 &parts.headers,
@@ -243,13 +246,15 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     let (thinking, store) = (state.thinking, state.responses.clone());
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
     let temporary = state.temporary.clone();
+    let services = state.services.clone();
     if count_tokens {
         let engine = state.engine.clone();
         let counted = tokio::task::spawn_blocking(move || {
-            let request = responses::prepare_input_tokens(
+            let request = responses::prepare_input_tokens_conversing(
                 &body,
                 thinking,
                 store.as_ref(),
+                services.as_deref().map(services::Services::store),
                 cipher.as_ref(),
                 &model,
             )?;
@@ -284,6 +289,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             &body,
             thinking,
             (store.as_ref(), temporary.as_ref()),
+            services.as_deref().map(services::Services::store),
             cipher.as_ref(),
             &model,
         )
@@ -487,7 +493,7 @@ fn prepare(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<(bool, GenerationRequest, Protocol)> {
-    prepare_retaining(api, body, thinking, (store, None), cipher, model)
+    prepare_retaining(api, body, thinking, (store, None), None, cipher, model)
 }
 
 /// Parse a request body for `api` into the engine request and how to answer
@@ -497,6 +503,7 @@ fn prepare_retaining(
     body: &[u8],
     thinking: bool,
     (store, temporary): (Option<&Arc<ResponseStore>>, Option<&Arc<Temporary>>),
+    conversations: Option<&local_services::Store>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<(bool, GenerationRequest, Protocol)> {
@@ -514,8 +521,15 @@ fn prepare_retaining(
             Ok((prepared.stream, prepared.request, protocol))
         }
         Api::Responses => {
-            let prepared =
-                prepare_responses_retaining(body, thinking, store, temporary, cipher, model)?;
+            let prepared = prepare_responses_conversing(
+                body,
+                thinking,
+                store,
+                temporary,
+                conversations,
+                cipher,
+                model,
+            )?;
             Ok((
                 prepared.stream,
                 GenerationRequest::Chat(prepared.request),
@@ -713,7 +727,10 @@ fn models_json(model: &str, context: usize, created: u64) -> serde_json::Value {
     json!({"object":"list","data":[{"id":model,"object":"model","created":created,"owned_by":"local","context_length":context,"max_model_len":context}]})
 }
 
+// Keep service startup and shutdown ownership together.
+#[allow(clippy::too_many_lines)]
 async fn run_async(args: Args) -> crate::Result<()> {
+    let services = services::Services::open_default()?;
     let cipher = args
         .reasoning_key
         .as_ref()
@@ -755,7 +772,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let engine = Engine::from_resources(&resources)?;
     eprintln!("{}", engine.info().json);
     let context = engine.info().model.context;
-    let state = AppState {
+    let mut state = AppState {
         engine: engine.into_handle(),
         model,
         created: response::unix_now(),
@@ -773,14 +790,18 @@ async fn run_async(args: Args) -> crate::Result<()> {
         background: Arc::default(),
         temporary: temporary.clone(),
         decisions: decisions.clone(),
+        services: Some(services),
+        batches: None,
     };
     let address = SocketAddr::new(args.host, args.port);
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let batches = batches::Batches::start(&state)?;
+    state.batches = Some(Arc::clone(&batches));
     let h3_task = if let Some((cert, key)) = resources.tls {
         Some(tokio::spawn(serve_h3(address, state.clone(), cert, key)))
     } else {
         None
     };
-    let listener = tokio::net::TcpListener::bind(address).await?;
     // Started once nothing can fail early, since it holds the store until
     // shutdown closes it.
     if let Some(temporary) = &temporary
@@ -796,9 +817,11 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // while axum is still draining foreground connections.
     let closing = Arc::clone(&background);
     let closing_decisions = decisions.clone();
+    let closing_batches = Arc::clone(&batches);
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown().await;
+            closing_batches.close();
             // Waiting decisions end at once, cancelling their engine work,
             // so they never hold up the drain.
             decisions::close(closing_decisions.as_deref());
@@ -808,6 +831,8 @@ async fn run_async(args: Args) -> crate::Result<()> {
         .map_err(crate::Error::Io);
     // Again, for a server that stopped without the signal; settling is idempotent.
     decisions::close(decisions.as_deref());
+    batches.close();
+    batches.drained().await;
     let closing = Arc::clone(&background);
     let _ = tokio::task::spawn_blocking(move || closing.close()).await;
     // Each cancelled job still holds its engine slot and lease until the worker

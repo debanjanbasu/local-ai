@@ -28,7 +28,8 @@ long a generation may go undelivered before it is cancelled and the engine
 released; the budgets, measurements and limits are in
 [docs/BONSAI.md](docs/BONSAI.md#server-api).
 
-Responses are stateless and nothing is stored durably by default.
+Response objects are stateless and are not stored by default (the separate
+native services store is described below).
 `--response-store DIR` opts in to keeping them (owner-only, unencrypted files)
 for `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
 `previous_response_id`, which carries over conversation items but not
@@ -61,9 +62,25 @@ is refused with 400 rather than partly enforced.
 `--experimental-decision-head FILE` opts in to
 `POST /v1/experimental/decisions`, which returns an explicitly loaded
 judgment head's option probabilities for text questions. It is experimental,
-has no confidence or refusal, is calibrated only for two-option code-diff
-questions, and is not the OpenAI Decisions API; `POST /v1/decisions` is
-refused with an explanation.
+has no confidence or refusal, carries only the calibration evaluated for that
+artifact's scope (the legacy devtools-v1 head: two-option Yes/No code-diff
+questions; the development-only hard-v1 heads: see
+[their results](local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)),
+and is not the OpenAI Decisions API; `POST /v1/decisions` is refused with an
+explanation.
+
+The server also always opens a durable native services store at
+`~/Library/Application Support/local-ai/services` (owner-only SQLite plus file
+blobs, in plaintext, with no flag and no alternative backend). It serves
+Conversations and their items, Responses `conversation` (appended once, and
+refused on a version conflict), streamed Files and Uploads (with optional
+MD5), and Batches for the three text endpoints. Batches run on one worker that
+resumes unsettled lines after a restart. File expiry is enforced on access, and
+expired bytes are purged at startup. A background Response interrupted by a
+restart is still not resumed. The same crate offers native repository search
+(ranked, exact or regex) with no HTTP route. See
+[local-services/README.md](local-services/README.md) and
+[docs/BONSAI.md](docs/BONSAI.md#native-services).
 
 `--reasoning-key FILE` adds
 AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
@@ -385,6 +402,8 @@ is 1.074x and the best measured result 1.29%.
 
 - `local-engine`: GGUF reader, tokenizer, inference, caching, speculation, API.
 - `local-ai`: `chat`, `bonsai`, and `serve` commands and HTTP server.
+- `local-services`: durable conversations, files, uploads and batches (SQLite)
+  and read-only workspace search; no model required.
 - `local-metal`, `shaders`: Metal dispatch code, kernels, and GPU tests.
 - `tools`: Kaggle staging and installation helpers and tests.
 - `docs/BONSAI.md`: technical reference and measurements.

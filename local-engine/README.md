@@ -39,6 +39,11 @@ inform this division:
 | Cancellable generation and prefill progress | Deadlines, retry policy and tool execution concurrency |
 | Model output decoding | Whether a completed tool call may execute or be replayed |
 
+The engine keeps no conversation or file records (only its prompt caches). A
+harness that wants durable conversations, files, or bounded read-only
+repository search (ranked, exact or regex) can call the model-free [`local-services`](../local-services/README.md) crate, which the
+server also uses. Compaction remains the harness's job.
+
 ### Counting prompt tokens
 
 `Engine::count_chat_tokens(&ChatRequest)` and

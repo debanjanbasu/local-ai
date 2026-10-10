@@ -7,8 +7,9 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use bytes::Buf;
 use http_body_util::BodyExt;
+use tokio_stream::wrappers::ReceiverStream;
 
-use super::{AppState, MAX_REQUEST_BYTES, route};
+use super::{AppState, route};
 
 pub(super) async fn serve_h3(
     address: SocketAddr,
@@ -55,20 +56,37 @@ pub(super) async fn serve_h3(
                 };
                 let state = state.clone();
                 tokio::spawn(async move {
-                    let Ok((request, mut stream)) = resolver.resolve_request().await else {
+                    let Ok((request, stream)) = resolver.resolve_request().await else {
                         return;
                     };
                     let (parts, ()) = request.into_parts();
-                    let mut data = Vec::new();
-                    while let Ok(Some(mut chunk)) = stream.recv_data().await {
-                        if data.len().saturating_add(chunk.remaining()) > MAX_REQUEST_BYTES {
-                            return;
+                    let (mut stream, mut input) = stream.split();
+                    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+                    let receiving = tokio::spawn(async move {
+                        loop {
+                            let data = match input.recv_data().await {
+                                Ok(Some(mut chunk)) => {
+                                    let size = chunk.remaining();
+                                    Ok(chunk.copy_to_bytes(size))
+                                }
+                                Ok(None) => break,
+                                Err(error) => Err(std::io::Error::other(error.to_string())),
+                            };
+                            let failed = data.is_err();
+                            if sender.send(data).await.is_err() || failed {
+                                input.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+                                break;
+                            }
                         }
-                        let remaining = chunk.remaining();
-                        data.extend_from_slice(&chunk.copy_to_bytes(remaining));
-                    }
-                    let request = Request::from_parts(parts, Body::from(data));
+                    });
+                    // The authenticated route enforces its own bounded JSON or
+                    // multipart limit, identically to HTTP/1 and HTTP/2.
+                    let request = Request::from_parts(
+                        parts,
+                        Body::from_stream(ReceiverStream::new(receiver)),
+                    );
                     let response = route(State(state), request).await;
+                    receiving.abort();
                     let (parts, mut body) = response.into_parts();
                     if stream
                         .send_response(axum::http::Response::from_parts(parts, ()))
