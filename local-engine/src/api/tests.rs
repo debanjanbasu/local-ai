@@ -430,7 +430,13 @@ fn counted_prompt_tokens_match_generation_stats() {
         sampling: Sampling::default(),
         session: None,
     };
-    let chats = [tool_history(true), tool_history(false)];
+    // Allow a complete tool call: a one-token budget can stop just after the
+    // opening tag, which correctly fails parsing before Finished is emitted.
+    let chats = [tool_history(true), tool_history(false)].map(|mut request| {
+        request.max_tokens = 128;
+        request.sampling.0.temperature = 0.0;
+        request
+    });
     let engine_counts = chats
         .iter()
         .map(|request| engine.count_chat_tokens(request).expect("engine count"))

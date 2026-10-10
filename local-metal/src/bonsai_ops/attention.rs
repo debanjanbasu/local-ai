@@ -1,8 +1,8 @@
 use super::{
     AttentionKernel, AttentionWorkspace, BonsaiOps, CommandBatch, KV_HEADS, KvLayout,
-    MAX_PREFILL_TOKENS, MetalBuffer, Q_HEADS, ROW_BLOCK_MIN_PREFIX, ROW_BLOCK_TOKENS, SPLIT_HEADS,
-    SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_ROWS, SPLIT_TENSOR_SHORT,
-    arg, need, no_alias, sequence_bytes, simd_split_tokens, tensor_split_tokens,
+    MAX_PREFILL_TOKENS, MetalBuffer, Q_HEADS, ROW_BLOCK_MIN_PREFIX, ROW_BLOCK_TOKENS, SPLIT,
+    SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_ROWS,
+    SPLIT_TENSOR_SHORT, arg, need, no_alias, sequence_bytes, tensor_split_tokens,
 };
 
 impl BonsaiOps {
@@ -53,8 +53,7 @@ impl BonsaiOps {
     /// On a tensor build, F16 caches use `bo_attn_split_tensor` and quantized
     /// ones `bo_attn_split_tensor_<layout>` (the six GQA heads as one Q tile per
     /// split); the SIMD build uses `bo_attn_split` with `SPLIT_HEADS` heads per
-    /// SIMD group and `simd_split_tokens` tokens per split. All feed the same
-    /// partial records to `bo_attn_reduce`.
+    /// SIMD group. All feed the same partial records to `bo_attn_reduce`.
     pub fn attention_row_kv(
         &self,
         layout: KvLayout,
@@ -122,8 +121,7 @@ impl BonsaiOps {
             );
             splits
         } else {
-            let split_tokens = simd_split_tokens(prefix);
-            let splits = prefix.div_ceil(split_tokens);
+            let splits = prefix.div_ceil(SPLIT);
             need(
                 &workspace.partials,
                 splits as usize * Q_HEADS as usize * 258 * 4,
@@ -132,7 +130,7 @@ impl BonsaiOps {
                 b,
                 10,
                 &caches,
-                &[prefix, splits, codes[0], codes[1], split_tokens],
+                &[prefix, splits, codes[0], codes[1]],
                 &[],
                 (24 / SPLIT_HEADS * splits) as usize,
                 32,

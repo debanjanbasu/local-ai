@@ -606,7 +606,7 @@ fn token_count_prepares_the_same_history_without_storing() {
 fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
     use super::reasoning_crypto::ReasoningCipher;
     let scratch = Scratch::new();
-    let _store = scratch.open();
+    let store = scratch.open();
     let path = scratch.0.join("reasoning.key");
     let cipher = Arc::new(ReasoningCipher::open(&path).expect("cipher"));
     let body = json!({"input":"hi","store":false,"include":["reasoning.encrypted_content"]});
@@ -644,6 +644,48 @@ fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
     assert_eq!(
         request.messages[1].reasoning_content.as_deref(),
         Some("Check α before choosing.")
+    );
+    let prepared = prepare_responses_with(
+        follow.to_string().as_bytes(),
+        true,
+        Some(&store),
+        Some(&reopened),
+        "m",
+    )
+    .expect("stored encrypted replay");
+    let (continued, _) = run(prepared, vec![Event::Finished(stats(StopReason::Eos))]);
+    let saved = store
+        .load(continued["id"].as_str().expect("id"))
+        .expect("load")
+        .expect("stored");
+    assert_eq!(
+        saved.input_items[1]["encrypted_content"],
+        response["output"][0]["encrypted_content"]
+    );
+    assert_eq!(
+        saved.input_items[1]["content"],
+        response["output"][0]["content"]
+    );
+    let mut missing = follow.clone();
+    missing["input"][1]
+        .as_object_mut()
+        .expect("item")
+        .remove("id");
+    assert!(
+        replay(&missing)
+            .err()
+            .expect("missing id rejected")
+            .to_string()
+            .contains("item id")
+    );
+    let mut duplicate = follow.clone();
+    duplicate["input"][0]["id"] = duplicate["input"][1]["id"].clone();
+    assert!(
+        replay(&duplicate)
+            .err()
+            .expect("duplicate id rejected")
+            .to_string()
+            .contains("item id")
     );
     follow["input"][1]["id"] = json!("rs_other");
     assert!(replay(&follow).is_err());

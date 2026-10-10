@@ -1029,11 +1029,9 @@ runs, two rounds): 30.1 → 30.0 tok/s at 8K, 25.5 → 25.9 at 32K, and 16.2 →
 62 ms).
 
 Below a 1,024-token prefix, decode attention uses the SIMD `bo_attn_split`
-kernel on every build, and there a few 128-token splits left most of the GPU
-idle. Those splits are now 32 tokens; at and above 1,024 the SIMD path keeps
-128 and the tensor paths are unchanged. The workspace records the split it was
-sized for, so record count and dispatch cannot disagree. A one-layer
-microbenchmark on the development GPU (median GPU time per call over nine
+kernel on every build. A **rejected candidate** reduced its 128-token splits
+to 32 below that threshold to expose more parallel work. A one-layer
+microbenchmark on the M4 Pro (median GPU time per call over nine
 trials of 64 calls; 128-token baseline given as the range of two bracketing
 runs; 64-token splits were also measured and were slower than 32 at every
 short prefix except a tie at 33):
@@ -1052,9 +1050,14 @@ short prefix except a tie at 33):
 | F16 / Q8, 2,048 (control) | 29.6–32.6 / 34.7–34.9 µs | 29.4 / 35.0 µs |
 
 Short prefixes match the F64 reference, and prefixes at or above 1,024 stay
-bitwise identical to the 128-token build. This is a kernel microbenchmark
-only: the end-to-end effect on short-prompt decode and speculation has not been
-measured yet, so no whole-model throughput change is claimed for it.
+bitwise identical to the 128-token build. However, an interleaved six-prompt
+full-model comparison (300-token cap, AC power, no sleep) changed greedy text
+on two of six plain-decode prompts: arithmetic and essay. Plain-decode
+geomean was 31.95 → 32.50 tok/s (1.7%); default speculative decode was
+38.92 → 38.97 tok/s (0.1%, within noise), with identical text in all six
+speculative pairs. These are one-round observations, not stable throughput
+estimates. The candidate failed the byte-identity acceptance bar and was
+removed; the runtime retains 128-token SIMD splits.
 
 Causal prefill uses a tensor kernel of the same shape. Whole model, plain
 decode without speculation, M4 Pro:
@@ -1840,7 +1843,9 @@ template's reasoning instruction. It is a passing paired probe, not evidence
 of reliable coding at 262,144 tokens or a causal isolation of every difference.
 These roughly 69K-token runs remain the longest real-model quality probes
 recorded here. A 261,119-token fixture plus a 1,024-token output budget is
-prepared, but has not run: local GPU verification requires AC power.
+prepared; a full end-to-end result is not yet available. Validation serializes
+GPU work and records the power source; battery power is not a correctness-test
+blocker.
 
 Real-model Chat and Responses each completed a three-turn read/edit/result/final
 loop whose edit passed two executed assertions. Seven unmodified live response
@@ -1853,3 +1858,13 @@ against the pinned public OpenAPI schemas: Models, buffered and streaming
 Chat/Completions/Responses, and rejected requests. Negative controls removing
 required `created` and `param` fields failed validation as expected. This is
 schema coverage of those sampled exchanges, not proof of full API conformance.
+
+The opt-in lifecycle extension passed 208 real-model HTTP checks against that
+same pinned schema: completed/incomplete persistence, `previous_response_id`,
+input-item pagination, deletion, authentication, and exact input-token counts.
+Encrypted replay matched its plaintext equivalent before and after a server
+restart; altered envelopes and mismatched model/item IDs were rejected.
+Continuation preserves the encrypted envelope in returned input items.
+Stateless requests left no response records. Native chat and completion token
+counts also matched real generation, including tool history and both reasoning
+modes. These checks cover this text/function subset, not all OpenAI endpoints.

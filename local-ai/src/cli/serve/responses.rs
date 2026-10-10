@@ -422,11 +422,9 @@ pub(super) fn prepare_responses_with(
                 .unseal(model, id, envelope)
                 .map_err(|error| invalid(error.to_string()))?;
             // The authenticated payload is authoritative over any plaintext
-            // supplied alongside it. Internal history stores the decoded text.
+            // supplied alongside it. Keep the envelope in stored input items
+            // so pagination and subsequent stateless replay preserve it.
             item["content"] = json!([{"type":"reasoning_text","text":text}]);
-            if let Some(item) = item.as_object_mut() {
-                item.remove("encrypted_content");
-            }
         }
     }
     let messages = input_messages(
@@ -632,6 +630,11 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
         }
         let id = match item.get("id").and_then(Value::as_str) {
             Some(id) if !seen.contains(id) => id.to_owned(),
+            _ if kind == "reasoning" && present(item.get("encrypted_content")) => {
+                return Err(invalid(
+                    "encrypted reasoning requires its original unique item id",
+                ));
+            }
             _ => new_id(prefix),
         };
         seen.insert(id.clone());
@@ -641,11 +644,8 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
     Ok(())
 }
 
-/// Convert `instructions` and `input` into the chat history the engine renders.
-pub(super) fn input_messages(
-    input: &Value,
-    instructions: Option<&str>,
-) -> crate::Result<Vec<ChatMessage>> {
+/// Convert already-authenticated `input` into the chat history the engine renders.
+fn input_messages(input: &Value, instructions: Option<&str>) -> crate::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
     match input {
         Value::String(text) => messages.push(plain("user", text.clone(), None)),
@@ -695,12 +695,6 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
             }
         }
         Some("reasoning") => {
-            if present(item.get("encrypted_content")) {
-                return Err(unsupported(
-                    "encrypted reasoning",
-                    "encrypted_content must be authenticated before rendering",
-                ));
-            }
             flush(turn, messages);
             turn.reasoning = Some(reasoning_text(item)?);
         }
