@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,10 +21,12 @@ use crate::resources::Resources;
 mod chunked;
 mod http3;
 mod options;
+mod reasoning_crypto;
 mod request;
 mod response;
 mod responses;
 mod sse;
+mod store;
 
 #[cfg(test)]
 use self::request::message_text;
@@ -35,13 +38,15 @@ use local_engine::Event;
 use self::chunked::start_chunked;
 use self::http3::serve_h3;
 use self::options::{parse, usage};
+use self::reasoning_crypto::ReasoningCipher;
 use self::request::{GenerationRequest, prepare_generation};
 use self::response::{
     Protocol, Reply, add_alt_svc, error_response, error_status, error_status_message,
     json_response, queue_full_response, wants_zstd,
 };
-use self::responses::prepare_responses;
+use self::responses::prepare_responses_with;
 use self::sse::start_stream;
+use self::store::{ItemPage, PageError, ResponseStore, query_pairs};
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
@@ -53,6 +58,9 @@ struct Args {
     api_key: Option<String>,
     /// How long a client may stop consuming before its generation is dropped.
     stall: Duration,
+    /// `--response-store`: where Responses are kept. `None` keeps nothing.
+    response_store: Option<PathBuf>,
+    reasoning_key: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -71,6 +79,9 @@ struct AppState {
     depth: QueueDepth,
     /// How long a client may stop consuming before its generation is dropped.
     stall: Duration,
+    /// The opt-in Responses store; `None` serves Responses statelessly.
+    responses: Option<Arc<ResponseStore>>,
+    cipher: Option<Arc<ReasoningCipher>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -142,10 +153,26 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         )
         .await;
     }
+    // Authentication has already passed, so a stored response is never read or
+    // deleted for a caller without the key.
+    if let Some(rest) = parts.uri.path().strip_prefix("/v1/responses/")
+        && matches!(parts.method, Method::GET | Method::DELETE)
+    {
+        return stored_response(
+            &state,
+            &parts.method,
+            rest,
+            parts.uri.query(),
+            &parts.headers,
+        )
+        .await;
+    }
+    let count_tokens =
+        parts.method == Method::POST && parts.uri.path() == "/v1/responses/input_tokens";
     let api = match (parts.method, parts.uri.path()) {
         (Method::POST, "/v1/chat/completions") => Api::Chat,
         (Method::POST, "/v1/completions") => Api::Completion,
-        (Method::POST, "/v1/responses") => Api::Responses,
+        (Method::POST, "/v1/responses" | "/v1/responses/input_tokens") => Api::Responses,
         _ => {
             return error_response(
                 StatusCode::NOT_FOUND,
@@ -181,7 +208,61 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             .await;
         }
     };
-    let prepared = match prepare(api, &body, state.thinking) {
+    // Off the runtime: resolving `previous_response_id` reads the store.
+    let (thinking, store) = (state.thinking, state.responses.clone());
+    let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
+    if count_tokens {
+        let engine = state.engine.clone();
+        let counted = tokio::task::spawn_blocking(move || {
+            let request = responses::prepare_input_tokens(
+                &body,
+                thinking,
+                store.as_ref(),
+                cipher.as_ref(),
+                &model,
+            )?;
+            engine.count_chat_tokens(&request)
+        })
+        .await
+        .unwrap_or_else(|error| Err(crate::Error::Generation(error.to_string())));
+        return match counted {
+            Ok(tokens) => {
+                json_response(
+                    StatusCode::OK,
+                    json!({"object":"response.input_tokens","input_tokens":tokens}),
+                    &state,
+                    &parts.headers,
+                )
+                .await
+            }
+            Err(error) => {
+                error_response(
+                    error_status(&error),
+                    &error.to_string(),
+                    &state,
+                    &parts.headers,
+                )
+                .await
+            }
+        };
+    }
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare(
+            api,
+            &body,
+            thinking,
+            store.as_ref(),
+            cipher.as_ref(),
+            &model,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(crate::Error::Generation(format!(
+            "request preparation failed: {error}"
+        )))
+    });
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             return error_response(
@@ -276,6 +357,9 @@ fn prepare(
     api: Api,
     body: &[u8],
     thinking: bool,
+    store: Option<&Arc<ResponseStore>>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
 ) -> crate::Result<(bool, GenerationRequest, Protocol)> {
     match api {
         Api::Completion | Api::Chat => {
@@ -291,13 +375,137 @@ fn prepare(
             Ok((prepared.stream, prepared.request, protocol))
         }
         Api::Responses => {
-            let prepared = prepare_responses(body, thinking)?;
+            let prepared = prepare_responses_with(body, thinking, store, cipher, model)?;
             Ok((
                 prepared.stream,
                 GenerationRequest::Chat(prepared.request),
                 Protocol::Responses(Arc::new(prepared.echo)),
             ))
         }
+    }
+}
+
+/// `GET` and `DELETE /v1/responses/{id}` and `GET .../{id}/input_items`.
+///
+/// `rest` is the path after `/v1/responses/`. Unknown, malformed, deleted and
+/// never-stored IDs are all the same 404, and so is every ID when no store is
+/// configured: none of them names a response this server can produce.
+async fn stored_response(
+    state: &AppState,
+    method: &Method,
+    rest: &str,
+    query: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    let (id, items) = match rest.split_once('/') {
+        None => (rest, false),
+        Some((id, "input_items")) if *method == Method::GET => (id, true),
+        Some(_) => {
+            return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
+        }
+    };
+    let not_found = format!("response with id {id:?} not found");
+    let Some(store) = state.responses.clone() else {
+        let message = format!("{not_found}: this server was started without --response-store");
+        return error_response(StatusCode::NOT_FOUND, &message, state, headers).await;
+    };
+    let outcome = match stored_request(method, items, query) {
+        Ok(page) => {
+            let (id, method) = (id.to_owned(), method.clone());
+            tokio::task::spawn_blocking(move || stored_answer(&store, &method, &id, page.as_ref()))
+                .await
+                .unwrap_or_else(|error| {
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("response store task failed: {error}"),
+                    ))
+                })
+        }
+        Err(message) => Err((StatusCode::BAD_REQUEST, message)),
+    };
+    match outcome {
+        Ok(Some(value)) => json_response(StatusCode::OK, value, state, headers).await,
+        Ok(None) => error_response(StatusCode::NOT_FOUND, &not_found, state, headers).await,
+        Err((status, message)) => error_response(status, &message, state, headers).await,
+    }
+}
+
+/// Validate the query of a stored-response request, returning the page to
+/// list for `input_items`.
+///
+/// Retrieval supports neither `stream` nor `starting_after`: both replay a
+/// background response's events, and there are no background responses.
+/// `include` has nothing to add. Other parameters are ignored.
+fn stored_request(
+    method: &Method,
+    items: bool,
+    query: Option<&str>,
+) -> Result<Option<ItemPage>, String> {
+    if items {
+        return ItemPage::parse(query)
+            .map(Some)
+            .map_err(|error| match error {
+                PageError::Invalid(message) | PageError::AfterNotFound(message) => message,
+            });
+    }
+    if *method == Method::GET {
+        for (key, value) in query_pairs(query) {
+            match key.as_str() {
+                "stream" if value == "true" => {
+                    return Err("stream is not supported: responses are stored only once \
+                                complete, so there is no event stream to replay"
+                        .into());
+                }
+                "starting_after" => {
+                    return Err("starting_after is not supported: it resumes a streamed \
+                                retrieval, which this server does not offer"
+                        .into());
+                }
+                "include" | "include[]" if !value.is_empty() => {
+                    return Err(format!(
+                        "include {value:?} is not supported: there are no logprobs, encrypted \
+                         reasoning or tool outputs to add"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Read, list or delete stored response `id`; `Ok(None)` is a 404.
+fn stored_answer(
+    store: &ResponseStore,
+    method: &Method,
+    id: &str,
+    page: Option<&ItemPage>,
+) -> Result<Option<serde_json::Value>, (StatusCode, String)> {
+    let failed = |error: std::io::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("response store failed: {error}"),
+        )
+    };
+    if *method == Method::DELETE {
+        return Ok(store
+            .delete(id)
+            .map_err(failed)?
+            .then(|| json!({"id":id,"object":"response.deleted","deleted":true})));
+    }
+    let Some(stored) = store.load(id).map_err(failed)? else {
+        return Ok(None);
+    };
+    let Some(page) = page else {
+        return Ok(Some(stored.response));
+    };
+    match page.list(&stored.input_items) {
+        Ok(list) => Ok(Some(list)),
+        Err(PageError::AfterNotFound(after)) => Err((
+            StatusCode::NOT_FOUND,
+            format!("input item with id {after:?} not found in response {id}"),
+        )),
+        Err(PageError::Invalid(message)) => Err((StatusCode::BAD_REQUEST, message)),
     }
 }
 
@@ -313,6 +521,28 @@ fn models_json(model: &str, context: usize, created: u64) -> serde_json::Value {
 }
 
 async fn run_async(args: Args) -> crate::Result<()> {
+    let cipher = args
+        .reasoning_key
+        .as_ref()
+        .map(|path| {
+            ReasoningCipher::open(path)
+                .map(Arc::new)
+                .map_err(|error| crate::Error::InvalidArgument(error.to_string()))
+        })
+        .transpose()?;
+    // Opened before the model loads, so a bad directory fails in milliseconds.
+    let responses = args
+        .response_store
+        .as_ref()
+        .map(|dir| {
+            ResponseStore::open(dir).map(Arc::new).map_err(|error| {
+                crate::Error::InvalidArgument(format!(
+                    "cannot open --response-store {}: {error}",
+                    dir.display()
+                ))
+            })
+        })
+        .transpose()?;
     // One discovery serves both the engine and the TLS lookup: each one probes
     // the disk's write rate with a 16 MiB file, so a second is wasted startup.
     let resources = Resources::discover(None, true)?;
@@ -333,6 +563,8 @@ async fn run_async(args: Args) -> crate::Result<()> {
             .map(|_| Arc::from(format!("h3=\":{}\"; ma=86400", args.port))),
         depth: QueueDepth::default(),
         stall: args.stall,
+        responses,
+        cipher,
     };
     let address = SocketAddr::new(args.host, args.port);
     let h3_task = if let Some((cert, key)) = resources.tls {
@@ -396,3 +628,7 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod protocol_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod store_tests;

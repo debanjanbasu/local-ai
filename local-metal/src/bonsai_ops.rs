@@ -57,6 +57,21 @@ const SPLIT_TENSOR_MIN_PREFIX: u32 = 1024;
 /// Query heads served by one SIMD group of `bo_attn_split`; must match the
 /// shader's `BONSAI_SPLIT_HEADS` and divide the six heads per KV head.
 const SPLIT_HEADS: u32 = 2;
+/// `bo_attn_split` tokens per split below `SPLIT_TENSOR_MIN_PREFIX`, where a
+/// few 128-token splits leave the GPU idle. On the development GPU (Apple
+/// tensor build, 64 attention calls per command buffer) 32 beat 128 at every
+/// short prefix (F16 prefix 128: 12.3 vs 34.1 us; 1,023: 21.1 vs 44.1 us)
+/// and beat 64 too. Longer SIMD prefixes keep `SPLIT`.
+const SPLIT_SIMD_SHORT: u32 = 32;
+
+/// `bo_attn_split` tokens per split for `prefix`.
+const fn simd_split_tokens(prefix: u32) -> u32 {
+    if prefix < SPLIT_TENSOR_MIN_PREFIX {
+        SPLIT_SIMD_SHORT
+    } else {
+        SPLIT
+    }
+}
 /// Short blocks use split attention rather than walking a long prefix with
 /// mostly idle prefill tiles. Tensor Q8 packs up to four rows per split pass.
 const ROW_BLOCK_TOKENS: u32 = 8;
@@ -115,6 +130,14 @@ impl AttentionWorkspace {
         if max_context == 0 || max_context > 262_144 {
             return Err(arg("attention context must be within 1..=262144"));
         }
+        // SIMD splits: 32-token below the tensor threshold (at most 32
+        // records), 128-token from it on; size for the larger over all
+        // prefixes up to `max_context`.
+        let simd = max_context.div_ceil(SPLIT).max(
+            max_context
+                .min(SPLIT_TENSOR_MIN_PREFIX - 1)
+                .div_ceil(SPLIT_SIMD_SHORT),
+        );
         // Short tensor splits (prefixes 1,024..4,095) need more records than
         // the 128-token SIMD splits a short context implies.
         let tensor_short = if max_context >= SPLIT_TENSOR_MIN_PREFIX {
@@ -135,9 +158,7 @@ impl AttentionWorkspace {
         } else {
             0
         };
-        let splits = max_context
-            .div_ceil(SPLIT)
-            .max(SPLIT_TENSOR_ROWS * tensor_short.max(tensor_long)) as usize;
+        let splits = simd.max(SPLIT_TENSOR_ROWS * tensor_short.max(tensor_long)) as usize;
         let partial_bytes = splits
             .checked_mul(Q_HEADS as usize)
             .and_then(|n| n.checked_mul(258 * 4))

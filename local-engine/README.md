@@ -39,6 +39,24 @@ inform this division:
 | Cancellable generation and prefill progress | Deadlines, retry policy and tool execution concurrency |
 | Model output decoding | Whether a completed tool call may execute or be replayed |
 
+### Counting prompt tokens
+
+`Engine::count_chat_tokens(&ChatRequest)` and
+`Engine::count_completion_tokens(&CompletionRequest)` return the exact number
+of prompt tokens generation would prefill. A chat request is validated,
+rendered (messages, replayed tool calls and results, tool definitions and
+`thinking`) and tokenized, special tokens included, by the same code as
+`chat_with`, so the count equals `prompt_tokens` in the generation statistics,
+cached prefix included, and an invalid request fails with the error generation
+would return. A completion is tokenized as `complete` tokenizes it, without a
+template; an empty prompt counts zero although generation rejects it.
+`max_tokens`, `sampling` and `session` are ignored and the count is not checked
+against the context window. Counting is CPU-only and submits no GPU work.
+`EngineHandle` offers the same two methods against the worker's shared
+tokenizer: they run on the calling thread, queue no job and never wait for
+running generations, so they work while the queue is full. Async callers should
+run long prompts on a blocking pool.
+
 ## Native tool calling
 
 `ChatRequest::tools` takes `ToolDefinition { name, description, parameters }`,
@@ -123,12 +141,14 @@ strings, including nullable strings; the harness should avoid ambiguous unions.
 `serde_json` is built without `preserve_order`, so object keys in rendered
 schemas and replayed arguments are in sorted order rather than client order.
 
-`local-ai` exposes these native calls through Chat Completions and a stateless
-text/function subset of Responses; see [server API](../docs/BONSAI.md#server-api)
-for compatibility limits. Decisions is **not implemented**. Keep tool execution
-out of the engine; in particular, a retry must not repeat a partially successful
-batch's side effects. Do not change the pinned checkpoint template merely to
-match another Qwen model's conventions.
+`local-ai` exposes these native calls through Chat Completions and a
+text/function subset of Responses, stateless unless the server is started with
+`--response-store`; see [server API](../docs/BONSAI.md#server-api) for storage,
+encrypted reasoning replay, token counting and compatibility limits. Decisions
+is **not implemented**. Keep tool execution out of the engine; in particular, a
+retry must not repeat a partially successful batch's side effects. Do not
+change the pinned checkpoint template merely to match another Qwen model's
+conventions.
 
 ### Oh My Pi custom provider
 
@@ -174,7 +194,9 @@ and [effort resolution](https://github.com/can1357/oh-my-pi/blob/703a261df9533e7
 show what each flag changes:
 
 - `includeEncryptedReasoning: false` stops `include: ["reasoning.encrypted_content"]`,
-  sent on every reasoning request by default.
+  sent on every reasoning request by default. The server refuses that `include`
+  unless it was started with `--reasoning-key`; with a key it is honoured, but
+  this configuration was not re-checked against Oh My Pi with it enabled.
 - `supportsReasoningSummary: false` stops `reasoning.summary: "auto"`.
 - `reasoningDisableMode: none-effort` makes `--thinking off` send
   `reasoning.effort: "none"`. The default sends the lowest listed effort,
@@ -297,10 +319,58 @@ exported head without `PyTorch` reproduced these metrics within 0.00001.
 groups, and there is no zero-shot Bonsai comparison. These observed pilot test
 rows are no longer an untouched evaluation set for future model selection.
 
-No production judgment head is supplied. Frozen Bonsai features may not match
-Kev's adapter-trained representations; Kev's labels are balanced by sampling,
-not natural rates. Larger held-out and out-of-domain results, refusal/confidence
-semantics, and a native loader remain prerequisites for Decisions. The existing
+A full evaluation then ran once, as a private offline CPU job, on a single
+frozen split of the same two audited tasks: 2,694 train, 299 validation, 306
+calibration and 234 test rows (3,533 captured rows). The 64 observed pilot test
+rows were excluded, and staging checked that no remaining test row shares a
+group with them. The configuration was fixed before the run (40 epochs,
+learning rate 3e-5, weight decay 0.01, batch 64, seed 0, head dimension 256
+over the 5,120-wide frozen features), informed only by the pilot's diverging
+train/validation history at learning rate 1e-3, never by test. Validation NLL
+selected epoch 26, and temperature 1.72146 was fitted on calibration only (not
+at its bound). The test split was scored once by the job and not used for any
+selection.
+
+| Split | Rows | Accuracy | NLL | Brier | ECE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Train | 2,694 | 92.95% | 0.1971 | 0.1186 | 0.0572 |
+| Validation | 299 | 83.61% | 0.3168 | 0.2165 | 0.0365 |
+| Calibration, after temperature | 306 | 82.35% | 0.3554 | 0.2399 | 0.0264 |
+| Test, uncalibrated | 234 | 79.91% | 0.4157 | 0.2818 | 0.0886 |
+| Test, calibrated | 234 | 187/234 = 79.91% | 0.3750 | 0.2608 | 0.0523 |
+
+By task on test, `CodeReviewer` `needs_comment` scored 75/118 (63.6%) against a
+train-majority baseline of 59/118 (50.0%), and `CommitPackFT` `message_match`
+112/116 (96.6%) against 59/116 (50.9%). The pilot head scored 131/234 (56.0%)
+on the same test rows. Most of the margin comes from `CommitPackFT`, whose
+labels hold by construction; code-review judgment is only modestly above the
+baseline. An independent local re-scoring, recomputing logits in pure Python
+from the exported head and refitting the temperature, reproduced every metric
+within 2e-8 and checked the head, trainer-source and per-sample feature
+hashes, the frozen configuration, the sample counts and the temperature refit.
+Provenance hashes (SHA256):
+
+| Item | SHA256 |
+| --- | --- |
+| Exported head, `head.safetensors` (F32 pointer head) | `b3227ce477a2b010fc1c14a335653562f16ac27a90e04fd13d65893801ae7539` |
+| Captured `features.jsonl` | `5084534aa23705d5001b9f4467d69dfc8a0402f0e05022eba9d78c21c82eb0db` |
+| Trainer source | `e2bfdacf6a5b4da2764eac898b70f91c09999d9dc2ca490097bdd160f8eaf973` |
+
+The recipe is the pipeline above without `--pilot-rows`; the 64 pilot test
+rows were then dropped at staging (a one-off filter, not an option of
+`tools/judgment_prepare.py`), and `tools/judgment_train.py` at the hash above
+trained on CPU (Python 3.13, `PyTorch` 2.11 CPU) after its 13 self-tests passed.
+It is one seed and one in-domain dataset with balanced, sampled labels, and
+there is still no zero-shot Bonsai comparison. The scores describe
+this dataset's held-out split only.
+
+This head is **not installed**, is not loaded by the engine or server, and is
+neither a Decisions implementation nor an MTP upgrade: it does not touch
+speculative decoding. No production judgment head is supplied. Frozen Bonsai
+features may not match Kev's adapter-trained representations; Kev's labels are
+balanced by sampling, not natural rates. Larger held-out and out-of-domain
+results, refusal/confidence semantics, and a native loader remain prerequisites
+for Decisions. The existing
 MTP rollout data has no judgment labels and is not silently reused for this task.
 
 Acceptance should exercise native calls as well as HTTP: a complete read/edit/

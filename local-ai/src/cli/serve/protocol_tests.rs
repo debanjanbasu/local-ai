@@ -969,6 +969,9 @@ fn route_preparation_maps_each_api_to_its_protocol() {
         super::Api::Responses,
         br#"{"input":"hi","stream":true}"#,
         true,
+        None,
+        None,
+        "m",
     )
     .expect("ok");
     assert!(stream);
@@ -978,6 +981,9 @@ fn route_preparation_maps_each_api_to_its_protocol() {
         super::Api::Chat,
         br#"{"messages":[{"role":"user","content":"x"}],"stream":true,"stream_options":{"include_usage":true}}"#,
         true,
+        None,
+        None,
+        "m",
     )
     .expect("ok");
     assert!(matches!(
@@ -986,8 +992,15 @@ fn route_preparation_maps_each_api_to_its_protocol() {
             include_usage: true
         }
     ));
-    let (_, request, protocol) =
-        prepare(super::Api::Completion, br#"{"prompt":"x"}"#, true).expect("ok");
+    let (_, request, protocol) = prepare(
+        super::Api::Completion,
+        br#"{"prompt":"x"}"#,
+        true,
+        None,
+        None,
+        "m",
+    )
+    .expect("ok");
     assert!(matches!(request, GenerationRequest::Completion(_)));
     assert!(matches!(protocol, Protocol::Completion));
 }

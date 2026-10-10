@@ -15,6 +15,7 @@ use tokio::sync::mpsc as async_mpsc;
 use crate::bonsai_model::{BonsaiEngine, BonsaiInfo, CancelToken, PromptCacheSource, StopReason};
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
+use crate::bonsai_tokenizer::BonsaiTokenizer;
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
 use crate::runtime::{EVENT_BUFFER, PrefillProgress};
 use crate::tools::{ToolCall, ToolCallParser, ToolDefinition, ToolSet, Turn};
@@ -252,6 +253,7 @@ impl Engine {
     }
 
     /// Return model and resource-discovery decisions.
+    #[must_use]
     pub const fn info(&self) -> &EngineInfo {
         &self.info
     }
@@ -279,6 +281,31 @@ impl Engine {
         tools: &[ToolDefinition],
     ) -> crate::Result<String> {
         render_messages(messages, thinking, &ToolSet::new(tools)?)
+    }
+
+    /// Count the prompt tokens `request` would prefill, without generating.
+    ///
+    /// The count is exact: the request is validated, rendered (messages,
+    /// replayed tool calls and results, tool definitions and `thinking`) and
+    /// tokenized, special tokens included, through the same code as
+    /// [`Engine::chat_with`]. It equals the `prompt_tokens` that generation
+    /// reports in [`Stats::generation`], cached prefix included. An invalid
+    /// request fails with the error generation would return. `max_tokens`,
+    /// `sampling` and `session` are ignored, and the count is not checked
+    /// against the context window. CPU-only; no GPU work is submitted.
+    pub fn count_chat_tokens(&self, request: &ChatRequest) -> crate::Result<usize> {
+        count_chat(self.inner.tokenizer(), request)
+    }
+
+    /// Count the prompt tokens a raw completion would prefill, without
+    /// generating.
+    ///
+    /// The prompt is tokenized as [`Engine::complete`] tokenizes it: no
+    /// template, special-token text parsed as special tokens. An empty prompt
+    /// counts zero, although generation rejects it. `max_tokens`, `sampling`
+    /// and `session` are ignored. CPU-only; no GPU work is submitted.
+    pub fn count_completion_tokens(&self, request: &CompletionRequest) -> crate::Result<usize> {
+        count_completion(self.inner.tokenizer(), request)
     }
 
     /// Chat with one user prompt and collect the final answer and statistics.
@@ -343,9 +370,9 @@ impl Engine {
         progress: &mut dyn FnMut(PrefillProgress),
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
-        let (prompt, tools) = prepare_chat(request)?;
+        let (ids, tools) = chat_prompt_ids(self.inner.tokenizer(), request)?;
         self.generate(
-            &prompt,
+            &ids,
             request.max_tokens,
             &request.sampling,
             request.session.as_deref(),
@@ -375,8 +402,9 @@ impl Engine {
         progress: &mut dyn FnMut(PrefillProgress),
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
+        let ids = encode_prompt(self.inner.tokenizer(), &request.prompt)?;
         self.generate(
-            &request.prompt,
+            &ids,
             request.max_tokens,
             &request.sampling,
             request.session.as_deref(),
@@ -391,7 +419,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn generate(
         &mut self,
-        prompt: &str,
+        ids: &[u32],
         max_tokens: usize,
         sampling: &Sampling,
         session: Option<&str>,
@@ -401,12 +429,11 @@ impl Engine {
         progress: &mut dyn FnMut(PrefillProgress),
         mut callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
-        let ids = self.inner.encode_prompt(prompt, true, false)?;
         let mut params = sampling.0.clone();
         params.max_tokens = max_tokens;
         let mut splitter = EventSplitter::new(thinking, tools);
         let output = self.inner.generate_session_progress(
-            &ids,
+            ids,
             &params,
             session,
             |piece| splitter.emit(piece, &mut callback).is_continue(),
@@ -462,6 +489,7 @@ impl Engine {
     }
 
     /// Move this engine to a dedicated worker thread.
+    #[must_use]
     pub fn into_handle(self) -> EngineHandle {
         EngineHandle::new(self)
     }
@@ -492,6 +520,8 @@ const fn ignore_progress(_: PrefillProgress) {}
 #[derive(Clone)]
 pub struct EngineHandle {
     sender: async_mpsc::Sender<Job>,
+    /// The worker engine's tokenizer, shared so counting never queues a job.
+    tokenizer: BonsaiTokenizer,
 }
 
 impl EngineHandle {
@@ -508,9 +538,27 @@ impl EngineHandle {
     }
 
     fn new(engine: Engine) -> Self {
+        let tokenizer = engine.inner.tokenizer().clone();
         let (sender, receiver) = async_mpsc::channel::<Job>(SERVE_QUEUE);
         std::thread::spawn(move || Worker::new(engine, receiver).run());
-        Self { sender }
+        Self { sender, tokenizer }
+    }
+
+    /// Count the prompt tokens `request` would prefill, exactly as
+    /// [`Engine::count_chat_tokens`] does.
+    ///
+    /// Runs on the calling thread against the worker's shared tokenizer: it
+    /// queues no job, never waits for running generations and submits no GPU
+    /// work, so it succeeds even when the queue is full. Tokenizing a long
+    /// prompt is CPU-bound; async callers should run it on a blocking pool.
+    pub fn count_chat_tokens(&self, request: &ChatRequest) -> crate::Result<usize> {
+        count_chat(&self.tokenizer, request)
+    }
+
+    /// Count the prompt tokens a raw completion would prefill, exactly as
+    /// [`Engine::count_completion_tokens`] does, without queueing a job.
+    pub fn count_completion_tokens(&self, request: &CompletionRequest) -> crate::Result<usize> {
+        count_completion(&self.tokenizer, request)
     }
 
     /// Queue a chat request and return a blocking event iterator.
@@ -834,12 +882,9 @@ impl Worker {
                 cancel,
             ),
         };
-        let ids = prompt.and_then(|(prompt, tools)| {
-            Ok((
-                self.engine.inner.encode_prompt(&prompt, true, false)?,
-                tools,
-            ))
-        });
+        let tokenizer = self.engine.inner.tokenizer();
+        let ids =
+            prompt.and_then(|(prompt, tools)| Ok((encode_prompt(tokenizer, &prompt)?, tools)));
         match ids {
             Ok((ids, tools)) => {
                 let mut params = sampling.0;
@@ -1120,6 +1165,32 @@ fn prepare_chat(request: &ChatRequest) -> crate::Result<(String, Option<Arc<Tool
     let tools = ToolSet::new(&request.tools)?;
     let prompt = render_messages(&request.messages, request.thinking, &tools)?;
     Ok((prompt, (!tools.is_empty()).then(|| Arc::new(tools))))
+}
+
+/// Tokenize a rendered or raw prompt; every generation and count goes through
+/// here, so a count is the prompt length generation prefills.
+fn encode_prompt(tokenizer: &BonsaiTokenizer, prompt: &str) -> crate::Result<Vec<u32>> {
+    tokenizer.encode(prompt)
+}
+
+/// Validate, render and tokenize a chat request.
+fn chat_prompt_ids(
+    tokenizer: &BonsaiTokenizer,
+    request: &ChatRequest,
+) -> crate::Result<(Vec<u32>, Option<Arc<ToolSet>>)> {
+    let (prompt, tools) = prepare_chat(request)?;
+    Ok((encode_prompt(tokenizer, &prompt)?, tools))
+}
+
+fn count_chat(tokenizer: &BonsaiTokenizer, request: &ChatRequest) -> crate::Result<usize> {
+    chat_prompt_ids(tokenizer, request).map(|(ids, _)| ids.len())
+}
+
+fn count_completion(
+    tokenizer: &BonsaiTokenizer,
+    request: &CompletionRequest,
+) -> crate::Result<usize> {
+    encode_prompt(tokenizer, &request.prompt).map(|ids| ids.len())
 }
 
 fn render_messages(

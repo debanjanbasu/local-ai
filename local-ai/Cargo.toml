@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 local-engine = { path = "../local-engine" }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"] }
+base64 = "0.22"
 bytes = "1"
 http-body-util = "0.1"
 h3 = "0.0.8"
@@ -24,5 +25,10 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-stream = "0.1"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Both already in the lock (ring via rustls/quinn, rustix via tempfile); used
+# directly by the opt-in reasoning envelope cipher (AES-256-GCM, OS randomness)
+# and its owner-only, symlink-refusing key file.
+ring = "0.17"
+rustix = { version = "1", features = ["fs", "process"] }
 rustls-pemfile = "2"
 zstd = { version = "0.13", default-features = false }

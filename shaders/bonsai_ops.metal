@@ -517,7 +517,8 @@ kernel void bo_kv_prep(
     bonsai_kv_store(v_cache, v_format, absolute_position, head, tid / 32, tid % 32, v);
 }
 
-// Decode attention over one 128-token split. One SIMD group serves
+// Decode attention over one `split_tokens` split (128, or 32 below 1,024
+// tokens; see `simd_split_tokens`). One SIMD group serves
 // BONSAI_SPLIT_HEADS of the six query heads that share a KV head, so each
 // cached K/V element is fetched from device memory once for all of them
 // (the one-head-per-group form re-read every byte six times and held the
@@ -530,7 +531,7 @@ constant uint BONSAI_SPLIT_GROUPS_PER_KV_HEAD = 6 / BONSAI_SPLIT_HEADS;
 template <uint KF, uint VF>
 static inline void bonsai_attn_split_impl(
     device const float *query, device const uchar *key, device const uchar *value,
-    device float *partials, uint prefix, uint splits, uint group, uint lane
+    device float *partials, uint prefix, uint splits, uint split_tokens, uint group, uint lane
 ) {
     const uint split = group % splits, slot = group / splits;
     const uint kv_head = slot / BONSAI_SPLIT_GROUPS_PER_KV_HEAD;
@@ -545,8 +546,8 @@ static inline void bonsai_attn_split_impl(
         maximum[h] = -INFINITY;
         denominator[h] = 0.0f;
     }
-    const uint end = min(split * 128 + 128, prefix);
-    for (uint token = split * 128; token < end; ++token) {
+    const uint start = split * split_tokens, end = min(start + split_tokens, prefix);
+    for (uint token = start; token < end; ++token) {
         float k[8], score[BONSAI_SPLIT_HEADS];
         for (uint i = 0; i < 8; ++i) k[i] = bonsai_kv_load<KF>(key, token, kv_head, i, lane);
         for (uint h = 0; h < BONSAI_SPLIT_HEADS; ++h) {
@@ -578,10 +579,11 @@ kernel void bo_attn_split(
     device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],
     constant uint &prefix [[buffer(4)]], constant uint &splits [[buffer(5)]],
     constant uint &k_format [[buffer(6)]], constant uint &v_format [[buffer(7)]],
+    constant uint &split_tokens [[buffer(8)]],
     uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
     BONSAI_KV_DISPATCH(bonsai_attn_split_impl, k_format, v_format,
-        query, key, value, partials, prefix, splits, group, lane);
+        query, key, value, partials, prefix, splits, split_tokens, group, lane);
 }
 
 // Share split metadata and read numerator values ahead, retaining the original

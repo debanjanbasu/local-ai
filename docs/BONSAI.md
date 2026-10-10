@@ -117,6 +117,10 @@ local-ai serve [options]
   --no-thinking      disable reasoning
   --stall-timeout N  drop a generation whose client stopped reading; seconds,
                      default 30, accepted 10 to 3600
+  --response-store DIR  keep Responses API responses in DIR (owner-only,
+                     unencrypted); default: nothing is kept
+  --reasoning-key FILE  enable reasoning.encrypted_content replay with an
+                     owner-only persistent AES-256-GCM key in FILE
 
 local-ai bonsai [options] <prompt>
   --max-tokens N     output cap (default 8192)
@@ -163,7 +167,10 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `GET` | `/v1/models` | installed model and admitted `context_length`/`max_model_len` |
 | `POST` | `/v1/chat/completions` | templated text and function calling |
 | `POST` | `/v1/completions` | raw completion |
-| `POST` | `/v1/responses` | stateless text and function calling |
+| `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
+| `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
+| `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored response (`--response-store` only) |
+| `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored response (`--response-store` only) |
 
 Generation accepts `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `presence_penalty`, `frequency_penalty`, `seed`, and `stream`. Chat's
@@ -180,12 +187,71 @@ streaming is not implemented. Chat finishes with `tool_calls` unless a token
 limit takes precedence. Ordinary answer and reasoning text still stream.
 
 Responses accepts explicit message, reasoning, `function_call` and
-`function_call_output` history in `input`, plus `instructions`. Set `store:false`
-and resend history: storage, `previous_response_id`, conversations, background
-requests and item references are unsupported. SSE uses typed `response.*` events
-with sequence numbers and stable response/item IDs, ending with completed,
-incomplete (output limit), or failed. It does not use Chat's `[DONE]` sentinel.
-Non-streaming Responses sends whitespace heartbeats before its final JSON.
+`function_call_output` history in `input`, plus `instructions`. SSE uses typed
+`response.*` events with sequence numbers and stable response/item IDs, ending
+with completed, incomplete (output limit), or failed. It does not use Chat's
+`[DONE]` sentinel. Non-streaming Responses sends whitespace heartbeats before
+its final JSON.
+
+Storage is opt-in and **nothing is stored by default**. Without
+`--response-store DIR` the endpoint is stateless: responses report
+`store: false`, `store: true` and `previous_response_id` are refused, and
+`GET`/`DELETE /v1/responses/{id}` answer 404; resend history in `input`
+instead. With a store configured, `store` takes OpenAI's default of `true`
+(an explicit `store: false` is honoured), and completed and incomplete
+responses are written durably before their terminal event is sent; a failed
+generation is not stored, and a response whose write fails is reported as
+failed rather than as stored. Each record is one JSON file holding the final
+response and its resolved input (the earlier response's input and output, then
+this request's items), so a follow-up never walks a chain and deleting an
+earlier response does not break a later one. Records contain prompts, tool
+results and the model's raw reasoning in plain text. The directory is created
+`0700` and records `0600`; that is owner-only local data, not encryption at
+rest. Only `resp_` IDs of ASCII letters and digits ever reach the filesystem.
+
+`previous_response_id` carries over conversation items only: the earlier
+request's `instructions`, tools, reasoning effort and sampling controls are not
+inherited and must be sent again. `GET /v1/responses/{id}` returns the stored
+object; its `stream`, `starting_after` and non-empty `include` are refused
+because there are no background responses or extra fields to add.
+`GET .../input_items` pages the resolved input with `after`, `limit` (1 to
+100, default 20) and `order` (`desc` by default), reporting `first_id`,
+`last_id` and `has_more`; an unknown `after` is 404. `DELETE` returns `response.deleted`.
+Unknown, malformed, deleted and never-stored IDs are the same 404, and all of
+these routes sit behind `--api-key` when it is set. Conversations, background
+requests and `item_reference` inputs remain unsupported.
+
+`--reasoning-key FILE` enables `reasoning.encrypted_content`. The key is 32
+random bytes in an owner-only file, created on first start without
+overwriting anything and reused across restarts; a symlink, a non-regular
+file, a file owned by another user, a file with group or other access, or a
+malformed key is refused at startup. Reasoning output items then carry an
+AES-256-GCM envelope (fresh random nonce per item) whose associated data binds
+the envelope version, the model ID and the reasoning item's ID. A client may
+send the item back, with its original `id`, in a later stateless request; the
+authenticated text replaces any plaintext beside it, and an altered envelope,
+one from another key, model or item, or an unknown version fails the request.
+`include: ["reasoning.encrypted_content"]` is accepted only with a key and is
+the only `include` value implemented; without a key it, and any
+`encrypted_content` input, are refused. Replay after a server restart and
+tamper rejection are covered by tests.
+
+The key option is replay authentication, **not secrecy**: the raw reasoning is
+still sent in the same response as `reasoning_text` content (streaming and
+buffered), and with a store configured it is still written in plain text. It is
+not encryption at rest and does not hide chain-of-thought from the client or
+from anyone who can read the store.
+
+`POST /v1/responses/input_tokens` accepts the Responses input contract
+(`input`, `instructions`, `tools`, `reasoning`, `previous_response_id`, `text`,
+`tool_choice`, `parallel_tool_calls`, `truncation`, `model`) and returns
+`{"object":"response.input_tokens","input_tokens":N}`. `N` is exact: the
+request is validated, rendered by the checkpoint template (tools, replayed
+calls and the reasoning mode included) and tokenized by the same code that
+generation uses, so it equals the `input_tokens` generation would report,
+cached prefix included. Counting is CPU-only, never queues behind or waits for
+generation, stores nothing and is not checked against the context window. Other
+fields are refused rather than ignored.
 
 Reasoning controls are `reasoning_effort` (Chat) and `reasoning.effort`
 (Responses): `none` or `xhigh`. A server started with `--no-thinking` rejects
@@ -200,11 +266,16 @@ or charged cache-write tier.
 
 This is **not the full OpenAI platform contract**. Guaranteed/forced tool
 choices, `strict:true`, JSON-schema-constrained generation, built-in/hosted
-tools, encrypted reasoning, reasoning summaries, images and audio are rejected.
+tools, reasoning summaries, `include` values other than
+`reasoning.encrypted_content` (and that one without `--reasoning-key`),
+`truncation:auto`, log-probabilities, images and audio are rejected.
 `tool_choice:auto` and `none` are supported; `none` hides tools and produces no
 structured tool events, not a guarantee against tool-like literal text.
-Decisions requires a separately trained and evaluated judgment head; the MTP
-head and next-token softmax are not calibrated decision probabilities.
+Decisions is not implemented: it requires a separately trained, evaluated and
+installed judgment head. The experimental head evaluated in the
+[engine README](../local-engine/README.md#experimental-judgment-head-preparation)
+is not installed or loaded, and the MTP head and next-token softmax are not
+calibrated decision probabilities.
 
 The compatibility target is the public OpenAI contract, not a particular
 harness. The current schema audit is pinned to
@@ -213,20 +284,26 @@ harness. The current schema audit is pinned to
 the same HTTP adapters; native Rust callers use the engine's request/event
 types directly. No client-name branches belong in model execution.
 
-Missing endpoint families are not all model limitations: response storage,
-conversations, input-token counting, compaction, files and batches need server
-implementations; constrained outputs need a decoding constraint implementation;
-media, embedding and moderation capabilities need suitable models or heads.
-Hosted tools and administrative APIs also need their own services. None is
-implemented by merely accepting its request fields.
+Missing endpoint families are not all model limitations. Opt-in local response
+storage (retrieve, delete, `input_items`) and Responses input-token counting
+are now implemented as described above; conversations, compaction, response
+cancellation and background mode, files, uploads, vector stores and batches
+still need server implementations; constrained outputs need a decoding
+constraint implementation; media, embedding, audio and moderation capabilities
+need suitable models or heads. Hosted tools, evals, fine-tuning and
+administrative APIs also need their own services. None is implemented by
+merely accepting its request fields.
 
 [Codex at 4aa94dc](https://github.com/openai/codex/tree/4aa94dce270de668eff6e2fa8585c82385e84455)
-uses stateless Responses but requests `reasoning.encrypted_content`, and sends
-`client_metadata` (an extension absent from the pinned public spec). These are
-still blockers, so this server is **not yet a drop-in Codex provider**. Optional
-fields in an output schema do not justify silently ignoring requested encryption
-or labeling raw reasoning as a summary. The Oh My Pi example in the engine
-README configures that client to use only implemented capabilities.
+uses stateless Responses, requests `reasoning.encrypted_content`, and sends
+`client_metadata` (an extension absent from the pinned public spec). With
+`--reasoning-key` the encrypted-content request is now honoured, but
+`client_metadata` is still an unknown field that fails the request, reasoning
+summaries are still refused, so this server is **not a drop-in Codex
+provider**. Optional fields in an output
+schema do not justify silently ignoring requested options or labeling raw
+reasoning as a summary. The Oh My Pi example in the engine README configures
+that client to use only implemented capabilities.
 
 Legacy Completions now rejects unsupported `stop`, `n`, `logprobs`, `logit_bias`,
 `best_of`, `echo`, `suffix` and streaming usage options rather than silently
@@ -950,6 +1027,34 @@ Whole model, plain decode after a synthetic prefix (best of three 8-token
 runs, two rounds): 30.1 → 30.0 tok/s at 8K, 25.5 → 25.9 at 32K, and 16.2 →
 17.5 at 128K, where attention was half of a token (16 layers x 1.87 ms of
 62 ms).
+
+Below a 1,024-token prefix, decode attention uses the SIMD `bo_attn_split`
+kernel on every build, and there a few 128-token splits left most of the GPU
+idle. Those splits are now 32 tokens; at and above 1,024 the SIMD path keeps
+128 and the tensor paths are unchanged. The workspace records the split it was
+sized for, so record count and dispatch cannot disagree. A one-layer
+microbenchmark on the development GPU (median GPU time per call over nine
+trials of 64 calls; 128-token baseline given as the range of two bracketing
+runs; 64-token splits were also measured and were slower than 32 at every
+short prefix except a tie at 33):
+
+| Layout, prefix | 128-token splits | 32-token splits |
+| --- | ---: | ---: |
+| F16, 64 | 19.1–23.9 µs | 11.9 µs |
+| F16, 128 | 34.1–37.4 µs | 12.3 µs |
+| F16, 512 | 34.6–38.1 µs | 14.4 µs |
+| F16, 1,023 | 44.1–47.5 µs | 21.1 µs |
+| Q8, 33 | 13.1–13.7 µs | 12.8 µs |
+| Q8, 128 | 36.6–39.7 µs | 13.2 µs |
+| Q8, 512 | 37.5–40.8 µs | 16.8 µs |
+| Q8, 1,023 | 40.3–42.7 µs | 26.7 µs |
+| F16 / Q8, 1,024 (control) | 19.5–23.4 / 20.2–20.6 µs | 19.7 / 20.6 µs |
+| F16 / Q8, 2,048 (control) | 29.6–32.6 / 34.7–34.9 µs | 29.4 / 35.0 µs |
+
+Short prefixes match the F64 reference, and prefixes at or above 1,024 stay
+bitwise identical to the 128-token build. This is a kernel microbenchmark
+only: the end-to-end effect on short-prompt decode and speculation has not been
+measured yet, so no whole-model throughput change is claimed for it.
 
 Causal prefill uses a tensor kernel of the same shape. Whole model, plain
 decode without speculation, M4 Pro:
@@ -1733,6 +1838,9 @@ reasoning returned the correct `38,17`: 69,137 input tokens, 208 output tokens
 the reasoning run allowed 1,024 output tokens instead of 32 and included the
 template's reasoning instruction. It is a passing paired probe, not evidence
 of reliable coding at 262,144 tokens or a causal isolation of every difference.
+These roughly 69K-token runs remain the longest real-model quality probes
+recorded here. A 261,119-token fixture plus a 1,024-token output budget is
+prepared, but has not run: local GPU verification requires AC power.
 
 Real-model Chat and Responses each completed a three-turn read/edit/result/final
 loop whose edit passed two executed assertions. Seven unmodified live response

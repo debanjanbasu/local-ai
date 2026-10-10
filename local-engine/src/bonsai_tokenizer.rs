@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,8 +16,13 @@ const CHAT_TEMPLATE_SHA256: &str =
 const QWEN35_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const THINK_END: u32 = 248_069;
 
+/// The checkpoint tokenizer.
+///
+/// Cloning is cheap and shares the one immutable vocabulary and merge table, so
+/// a clone can count prompt tokens on another thread without rereading the GGUF.
+#[derive(Clone)]
 pub struct BonsaiTokenizer {
-    inner: Tokenizer,
+    inner: Arc<Tokenizer>,
     eos_ids: Vec<u32>,
 }
 
@@ -162,7 +168,7 @@ impl BonsaiTokenizer {
         let inner = Tokenizer::from_bytes(&bytes)
             .map_err(|error| crate::Error::Tokenizer(error.to_string()))?;
         Ok(Self {
-            inner,
+            inner: Arc::new(inner),
             eos_ids: vec![eos],
         })
     }
@@ -228,7 +234,7 @@ impl BonsaiTokenizer {
         id: u32,
     ) -> crate::Result<Option<String>> {
         tokenizers::step_decode_stream(
-            &*self.inner,
+            &**self.inner,
             vec![id],
             false,
             &mut state.ids,
@@ -424,6 +430,37 @@ pub(crate) struct StreamDecodeState {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+impl BonsaiTokenizer {
+    /// The real pre-tokenizer/byte-level pipeline over a tiny vocabulary: the
+    /// 256 byte symbols, merges `a b` and `ab c`, and one special token `<|x|>`.
+    pub(crate) fn tiny_for_tests() -> Self {
+        let mut symbols: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+            .into_iter()
+            .collect();
+        symbols.sort_unstable();
+        let mut vocab: Vec<String> = symbols.iter().map(char::to_string).collect();
+        vocab.extend(["ab".into(), "abc".into(), "<|x|>".into()]);
+        let special = vocab.len() - 1;
+        let map = vocab
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), serde_json::Value::from(id)))
+            .collect();
+        let added = vec![serde_json::json!({
+            "id": special, "content": "<|x|>", "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": false, "special": true
+        })];
+        let definition = tokenizer_json(map, added, vec!["a b".into(), "ab c".into()]);
+        let bytes = serde_json::to_vec(&definition).expect("json");
+        Self {
+            inner: Arc::new(Tokenizer::from_bytes(&bytes).expect("tiny tokenizer")),
+            eos_ids: vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         BonsaiTokenizer, ChatMessage, DEFAULT_REASONING_INSTRUCTION, THINK_END,
@@ -453,31 +490,16 @@ mod tests {
         assert_eq!(answer_start(&[], true), None);
     }
 
-    /// The real pre-tokenizer/byte-level pipeline over a tiny vocabulary: the
-    /// 256 byte symbols, merges `a b` and `ab c`, and one special token.
     fn tiny_tokenizer() -> BonsaiTokenizer {
-        let mut symbols: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
-            .into_iter()
-            .collect();
-        symbols.sort_unstable();
-        let mut vocab: Vec<String> = symbols.iter().map(char::to_string).collect();
-        vocab.extend(["ab".into(), "abc".into(), "<|x|>".into()]);
-        let special = vocab.len() - 1;
-        let map = vocab
-            .iter()
-            .enumerate()
-            .map(|(id, token)| (token.clone(), serde_json::Value::from(id)))
-            .collect();
-        let added = vec![serde_json::json!({
-            "id": special, "content": "<|x|>", "single_word": false,
-            "lstrip": false, "rstrip": false, "normalized": false, "special": true
-        })];
-        let definition = super::tokenizer_json(map, added, vec!["a b".into(), "ab c".into()]);
-        let bytes = serde_json::to_vec(&definition).expect("json");
-        BonsaiTokenizer {
-            inner: tokenizers::Tokenizer::from_bytes(&bytes).expect("tiny tokenizer"),
-            eos_ids: vec![],
-        }
+        BonsaiTokenizer::tiny_for_tests()
+    }
+
+    #[test]
+    fn clones_share_one_tokenizer() {
+        let tokenizer = tiny_tokenizer();
+        let clone = tokenizer.clone();
+        assert!(std::sync::Arc::ptr_eq(&tokenizer.inner, &clone.inner));
+        assert_eq!(clone.encode("abc<|x|>").expect("encode"), vec![257, 258]);
     }
 
     #[test]

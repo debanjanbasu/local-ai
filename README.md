@@ -26,6 +26,18 @@ long a generation may go undelivered before it is cancelled and the engine
 released; the budgets, measurements and limits are in
 [docs/BONSAI.md](docs/BONSAI.md#server-api).
 
+Responses are stateless and nothing is stored by default. `--response-store DIR`
+opts in to keeping them (owner-only, unencrypted files) for
+`GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
+`previous_response_id`, which carries over conversation items but not
+`instructions`, tools or sampling settings. `--reasoning-key FILE` adds
+AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
+reasoning is still returned and, with a store, still written, so it is neither
+encryption at rest nor hidden reasoning. `POST /v1/responses/input_tokens`
+returns the exact templated prompt-token count without generating. This is a
+subset of the public OpenAI contract, not a drop-in Codex provider; the gaps
+are listed in [docs/BONSAI.md](docs/BONSAI.md#server-api).
+
 ## Library use
 
 `local-engine` computes synchronously and reaches no network, but it does depend
@@ -61,6 +73,11 @@ that are both a blocking `Iterator` and a `Stream`. `EngineHandle::open` is
 `async` and needs a runtime; everything else works without one, so a program on
 another executor should reach the model through `Engine::open` plus
 `spawn_blocking`. See `local-engine/examples/chat.rs`.
+
+`count_chat_tokens` and `count_completion_tokens` on `Engine` and
+`EngineHandle` return the exact prompt length generation would prefill, using
+the same template and tokenizer. They run on the CPU, queue no job and submit
+no GPU work.
 
 ## Automatic policy
 
