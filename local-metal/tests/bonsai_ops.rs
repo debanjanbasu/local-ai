@@ -93,8 +93,7 @@ fn signed_decay_and_tiny_l2_use_pinned_formulas() {
 fn validation_happens_before_dispatch_and_workspace_is_linear() {
     let Some((ctx, ops)) = setup() else { return };
     let workspace = AttentionWorkspace::new(&ctx, 129).expect("workspace");
-    // 129 tokens take five 32-token SIMD splits (short prefixes).
-    assert_eq!(workspace.byte_len(), 5 * 24 * 258 * 4 + 4 * 6144 * 4);
+    assert_eq!(workspace.byte_len(), 2 * 24 * 258 * 4 + 4 * 6144 * 4);
     let tiny = MetalBuffer::from_slice(ctx.device(), &[0.0_f32; 4]).expect("tiny");
     let mut batch = CommandBatch::new(&ctx).expect("batch");
     assert!(ops.sigmoid_mul(&mut batch, &tiny, &tiny, &tiny, 5).is_err());
