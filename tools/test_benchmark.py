@@ -88,33 +88,45 @@ class MainTests(unittest.TestCase):
             self.assertEqual(argv[:3], [CAFFEINATE, "-i", "-s"])
             self.assertEqual(argv[3], str(benchmark.BINARY))
 
-    def test_refuses_on_battery_before_running_the_engine(self):
+    def test_battery_measures_and_reports_provenance_without_refusing(self):
         machine = FakeMachine([BATTERY])
         code, out, err = self.main(machine)
-        self.assertEqual(code, 2)
-        self.assertIn("refusing to measure", err)
-        self.assertIn("Battery Power", err)
-        self.assertEqual(machine.engine_calls, [])
-        self.assertEqual(out, "")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("refusing", err)
+        self.assertNotIn("UNTRUSTED", out)
+        self.assertIn("power source: Battery Power", err)
+        self.assertIn("  power", out)
+        self.assertIn("20.00", out)
+        self.assertIn(
+            "power provenance: started on Battery Power, ended on Battery Power", out
+        )
+        self.assertNotIn("note:", out)
+        # identity check + warm-up + two rounds, all still under caffeinate
+        self.assertEqual(len(machine.engine_calls), 4)
+        for argv in machine.engine_calls:
+            self.assertEqual(argv[:3], [CAFFEINATE, "-i", "-s"])
 
-    def test_switch_to_battery_mid_run_rejects_the_sample(self):
-        # Readings: status line, before measuring, before sample 1, then the
-        # charger is pulled while sample 1 runs.
-        machine = FakeMachine([AC, AC, AC, BATTERY])
+    def test_switch_to_battery_mid_run_is_reported_not_refused(self):
+        # Readings: start, before sample 1, then the charger is pulled while
+        # sample 1 runs.
+        machine = FakeMachine([AC, AC, BATTERY])
         code, out, err = self.main(machine)
-        self.assertEqual(code, 2)
-        self.assertIn("Battery Power after a default sample", err)
-        # identity check + warm-up + the one rejected sample; nothing after it
-        self.assertEqual(len(machine.engine_calls), 3)
-        self.assertNotIn("best tok/s", out)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("refusing", err)
+        self.assertNotIn("UNTRUSTED", out)
+        self.assertEqual(len(machine.engine_calls), 4)
+        self.assertIn("AC Power + Battery Power", out)
+        self.assertIn("started on AC Power, ended on Battery Power", out)
+        self.assertIn("AC Power -> Battery Power after a default sample", out)
+        self.assertIn("not a controlled comparison", out)
 
-    def test_allow_busy_measures_through_battery_but_labels_it_untrusted(self):
-        machine = FakeMachine([AC, AC, AC, BATTERY])
+    def test_allow_busy_does_not_change_power_handling(self):
+        machine = FakeMachine([AC, AC, BATTERY])
         code, out, err = self.main(machine, "--allow-busy")
         self.assertEqual(code, 0, err)
-        self.assertIn("warning (--allow-busy)", err)
-        self.assertIn("Battery Power", err)
-        self.assertIn("UNTRUSTED", out)
+        self.assertNotIn("warning (--allow-busy)", err)
+        self.assertNotIn("UNTRUSTED", out)
+        self.assertIn("not a controlled comparison", out)
         self.assertEqual(len(machine.engine_calls), 4)
 
     def test_sleep_during_a_sample_is_rejected(self):
@@ -125,17 +137,50 @@ class MainTests(unittest.TestCase):
         self.assertIn("slept for about 30.0s", err)
         self.assertNotIn("best tok/s", out)
 
-    def test_unreadable_power_source_is_not_trusted(self):
-        machine = FakeMachine(["garbage\n"])
+    def test_sleep_on_battery_is_still_rejected(self):
+        machine = FakeMachine([BATTERY], sleep_on_sample=3)
         code, _, err = self.main(machine)
         self.assertEqual(code, 2)
-        self.assertIn("AC power cannot be verified", err)
+        self.assertIn("slept for about 30.0s", err)
+        self.assertNotIn("Battery Power", err.split("refusing to measure", 1)[1])
+
+    def test_allow_busy_waives_sleep_and_labels_it_untrusted(self):
+        machine = FakeMachine([AC], sleep_on_sample=3)
+        code, out, err = self.main(machine, "--allow-busy")
+        self.assertEqual(code, 0, err)
+        self.assertIn("warning (--allow-busy)", err)
+        self.assertIn("UNTRUSTED: 1 sleep check(s)", out)
+
+    def test_unreadable_power_source_is_reported_as_unverified(self):
+        machine = FakeMachine(["garbage\n"])
+        code, out, err = self.main(machine)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("UNTRUSTED", out)
+        self.assertIn("power source: unknown", err)
+        self.assertIn("unverified power provenance", out)
+
+    def test_competing_build_still_refuses(self):
+        machine = FakeMachine([BATTERY])
+        build = "%CPU ARGS\n 99.0 /usr/bin/rustc --crate-name other\n"
+        run = machine.run
+
+        def busy_ps(argv, **kwargs):
+            if argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 0, build, "")
+            return run(argv, **kwargs)
+
+        machine.run = busy_ps
+        code, _, err = self.main(machine)
+        self.assertEqual(code, 2)
+        self.assertIn("another build is saturating the CPU: rustc", err)
+        self.assertEqual(machine.engine_calls, [])
 
     def test_other_platforms_skip_power_checks_and_caffeinate(self):
         machine = FakeMachine([BATTERY])
         code, out, err = self.main(machine, platform="linux")
         self.assertEqual(code, 0, err)
         self.assertNotIn("power source", err)
+        self.assertNotIn("power provenance", out)
         self.assertNotIn("UNTRUSTED", out)
         for argv in machine.engine_calls:
             self.assertEqual(argv[0], str(benchmark.BINARY))
@@ -145,6 +190,7 @@ class MainTests(unittest.TestCase):
         code, _, err = self.main(machine, "--check-only")
         self.assertEqual(code, 0)
         self.assertIn("power source: Battery Power", err)
+        self.assertNotIn("refusing", err)
         self.assertEqual(machine.engine_calls, [])
 
 

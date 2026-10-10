@@ -9,10 +9,11 @@ working streaming change as broken. Both produced byte-identical model output,
 so nothing about the work differed -- only what else was competing for memory
 bandwidth.
 
-Decode here is bandwidth-bound (97-98% of wall time is GPU, and each token
-moves about 5.65 GB of weights). A busy CPU does not steal compute from a
-discrete GPU; on a unified-memory part it steals the bandwidth the GPU is
-waiting on. So the idle check below is not ceremony.
+Decode spends 97-98% of wall time on the GPU and reads about 5.65 GB of weights
+per token; individual kernels can be arithmetic- or latency-limited as well.
+On a unified-memory machine, CPU workloads compete for memory bandwidth too,
+so the idle check guards against interference without assuming every kernel
+is bandwidth-bound.
 
 The estimator is the **maximum** observed rate, not the median or mean.
 Contention can only ever slow a run down, so the best sample is the one least
@@ -34,17 +35,26 @@ reported, not refused.
     tools/benchmark.py --rounds 3 -- '--no-thinking' '--greedy'
     tools/benchmark.py --check-only
 
-Power state is part of the same guard. A 7 tok/s run in this project's history
-was taken on battery with the lid closing, and the engine's own timing gave no
-hint that anything was wrong. On macOS every measured sample is therefore
-bracketed by an AC-power check, the wall clock is compared with the monotonic
-clock (which stops while the machine sleeps), and each generation runs under
-`caffeinate` when it is available. `--allow-busy` downgrades these refusals to
-warnings, and the report is then labelled untrusted rather than passed off as
-clean.
+Sleep is part of the same guard. A 7 tok/s run in this project's history was
+taken on battery with the lid closing, and the engine's own timing gave no hint
+that anything was wrong. Every measured sample compares the wall clock with the
+monotonic clock (which stops while the machine sleeps) and is refused if the
+machine slept, and on macOS each generation runs under `caffeinate` when it is
+available. `--allow-busy` downgrades load, build and sleep refusals; a waived
+sleep labels the report untrusted rather than passing it off as clean.
 
-Exit status is 0 on success, 2 if the machine is too busy (or not on AC power,
-or slept) to measure, 1 on a usage or runtime error.
+Power source never blocks a run. Battery and AC are both valid ways to work, so
+on macOS the source is *observed* -- once at the start and immediately before
+and after each measured sample, never by a background poller -- and reported
+rather than refused. Battery, an unreadable source (`unknown`) or a change of
+source mid-run does not stop the run and does not by itself mark it untrusted.
+What it does do is show up: the table carries a per-config `power` column and
+the run ends with the start and end source plus a note when samples span more
+than one source (or an unverified one), so timings taken under different power
+states are never silently presented as a controlled comparison.
+
+Exit status is 0 on success, 2 if the machine is too busy (or slept) to
+measure, 1 on a usage or runtime error. Power source never affects it.
 """
 
 from __future__ import annotations
@@ -101,9 +111,9 @@ class Busy(RuntimeError):
 def power_source() -> str | None:
     """Return macOS's current power source, or None where it is not checked.
 
-    Only macOS is checked; elsewhere this returns None and the guard is a no-op.
-    On macOS a missing or unparseable `pmset` returns "unknown", which the guard
-    treats as unverified rather than as fine.
+    Only macOS is checked; elsewhere this returns None and nothing is recorded.
+    On macOS a missing or unparseable `pmset` returns "unknown", which is
+    reported as unverified provenance rather than as AC. Neither value blocks.
     """
     if sys.platform != "darwin":
         return None
@@ -131,10 +141,15 @@ def keep_awake(argv: list[str]) -> list[str]:
 
 @dataclass
 class PowerGuard:
-    """Refuse (or, with --allow-busy, record) samples taken off AC or across sleep."""
+    """Refuse (or, with --allow-busy, waive) sleep; record power provenance.
+
+    Power-source readings are observations only: they are appended to
+    `observations` as (stage, source) pairs and never raise or waive anything.
+    """
 
     allow_busy: bool = False
     waived: list[str] = field(default_factory=list)
+    observations: list[tuple[str, str]] = field(default_factory=list)
 
     def reject(self, problem: str) -> None:
         if not self.allow_busy:
@@ -142,21 +157,52 @@ class PowerGuard:
         self.waived.append(problem)
         print(f"warning (--allow-busy): {problem}", file=sys.stderr, flush=True)
 
-    def check_power(self, stage: str) -> None:
-        source = power_source()
-        if source is None or source == "AC Power":
-            return
-        if source == "unknown":
-            self.reject(
-                f"could not read the power source {stage} (`pmset -g batt`), so "
-                "AC power cannot be verified."
+    def observe_power(self, stage: str, source: str | None = None) -> str | None:
+        """Record the power source at `stage`; never refuses.
+
+        Pass `source` to record a reading already taken, so the start of the
+        run does not query `pmset` twice. Returns the recorded source, or None
+        where power is not observed (non-macOS).
+        """
+        if source is None:
+            source = power_source()
+        if source is not None:
+            self.observations.append((stage, source))
+        return source
+
+    def power_summary(self) -> list[str]:
+        """Lines describing power provenance for the end of the report."""
+        if not self.observations:
+            return []
+        start, end = self.observations[0][1], self.observations[-1][1]
+        sources = list(dict.fromkeys(source for _, source in self.observations))
+        lines = [
+            (
+                f"power provenance: started on {start}, ended on {end}; "
+                f"observed {', '.join(sources)} "
+                f"across {len(self.observations)} reading(s)."
             )
-        else:
-            self.reject(
-                f"running on {source} {stage}. Battery power throttles the GPU and "
-                "lets the machine sleep, so timings are not comparable. Connect AC "
-                "power and rerun."
+        ]
+        if len(sources) > 1:
+            changes = [
+                f"{before} -> {after} {stage}"
+                for (_, before), (stage, after) in zip(
+                    self.observations, self.observations[1:]
+                )
+                if before != after
+            ]
+            lines.append(
+                "note: the power source changed during the run ("
+                + "; ".join(changes)
+                + "). Samples span power states, so this is not a controlled "
+                "comparison; check the power column before comparing rates."
             )
+        elif "unknown" in sources:
+            lines.append(
+                "note: the power source could not be read (`pmset -g batt`), so "
+                "these rates have unverified power provenance."
+            )
+        return lines
 
     def check_awake(self, stage: str, wall: float, steady: float) -> None:
         slept = wall - steady
@@ -195,6 +241,8 @@ class Sample:
     generated: int
     stop: str
     text: str
+    # Distinct power sources observed before/after this sample, in order.
+    power: tuple[str, ...] = ()
 
 
 @dataclass
@@ -208,19 +256,28 @@ class Report:
 
     def render(self) -> str:
         width = max(len(name) for name in self.samples)
+        show_power = any(
+            sample.power for samples in self.samples.values() for sample in samples
+        )
         header = (
             f"{'config'.ljust(width)}  {'best tok/s':>10}  {'median':>8}  "
             f"{'worst':>8}  {'spread':>7}  tokens  stop"
         )
-        lines = [header]
+        lines = [header + ("  power" if show_power else "")]
         for name, samples in self.samples.items():
             rates = [sample.tokens_per_second for sample in samples]
             spread = max(rates) / min(rates) if min(rates) > 0 else float("inf")
-            lines.append(
+            line = (
                 f"{name.ljust(width)}  {max(rates):10.2f}  {median(rates):8.2f}  "
                 f"{min(rates):8.2f}  {spread:6.2f}x  {samples[0].generated:6d}  "
                 f"{samples[0].stop}"
             )
+            if show_power:
+                sources = dict.fromkeys(
+                    source for sample in samples for source in sample.power
+                )
+                line += "  " + " + ".join(sources)
+            lines.append(line)
         return "\n".join(lines)
 
 
@@ -276,15 +333,18 @@ def run_once(
 ) -> Sample:
     """Run one generation and parse the engine's own measurement of it.
 
-    With a guard, the sample is bracketed by AC-power checks and rejected if
-    the machine slept during it; without one (warm-up, output comparison) the
-    timing is not used, so it is not policed.
+    With a guard, the sample is rejected if the machine slept during it, and
+    the power source is observed (not enforced) immediately before and after
+    it; without one (warm-up, output comparison) the timing is not used, so it
+    is not policed. These are two `pmset` reads per sample, not a poller.
     """
     # The engine reports its own decode timing; the clocks here only detect
     # sleep. From the repository root, where the engine discovers the pinned
     # model.
+    power: list[str] = []
     if guard is not None:
-        guard.check_power(f"before a {config.name} sample")
+        before = guard.observe_power(f"before a {config.name} sample")
+        power += [before] if before is not None else []
     wall, steady = time.time(), time.monotonic()
     done = subprocess.run(
         keep_awake(config.argv(prompt, max_tokens)),
@@ -296,7 +356,8 @@ def run_once(
     if guard is not None:
         stage = f"during a {config.name} sample"
         guard.check_awake(stage, time.time() - wall, time.monotonic() - steady)
-        guard.check_power(f"after a {config.name} sample")
+        after = guard.observe_power(f"after a {config.name} sample")
+        power += [after] if after is not None else []
     if done.returncode != 0:
         raise RuntimeError(
             f"{config.name} exited {done.returncode}: {done.stderr.strip()[:400]}"
@@ -313,6 +374,7 @@ def run_once(
         generated=int(stats["generated_tokens"]),
         stop=str(stats["stop_reason"]),
         text=stats["final_text"],
+        power=tuple(dict.fromkeys(power)),
     )
 
 
@@ -323,7 +385,9 @@ def check_identical(configs: list[Config], prompt: str, max_tokens: int) -> None
     does not, the runs are not comparable, and the likelier explanation is the
     model changing its mind rather than the configuration being faster.
     """
-    texts = {config.name: run_once(config, prompt, max_tokens).text for config in configs}
+    texts = {
+        config.name: run_once(config, prompt, max_tokens).text for config in configs
+    }
     if len(set(texts.values())) > 1:
         detail = ", ".join(f"{name}: {len(text)} chars" for name, text in texts.items())
         raise RuntimeError(
@@ -349,9 +413,7 @@ def measure(
     for round_index in range(rounds):
         for config in configs:
             report.add(config.name, run_once(config, prompt, max_tokens, guard))
-        print(
-            f"  round {round_index + 1}/{rounds} done", file=sys.stderr, flush=True
-        )
+        print(f"  round {round_index + 1}/{rounds} done", file=sys.stderr, flush=True)
     return report
 
 
@@ -362,7 +424,10 @@ def depth_sweep() -> list[Config]:
         # Space-separated, not `--mtp-depth=N`: every value-taking flag in this
         # CLI takes its value as a separate argument. `--export` is the only
         # exception, because its own value grammar contains `=`.
-        *[Config(f"depth {depth}", ("--mtp-depth", str(depth))) for depth in (1, 2, 3, 4)],
+        *[
+            Config(f"depth {depth}", ("--mtp-depth", str(depth)))
+            for depth in (1, 2, 3, 4)
+        ],
     ]
 
 
@@ -415,7 +480,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--check-only",
         action="store_true",
-        help="report machine state and exit without measuring",
+        help="report machine state (load, builds, power source) and exit "
+        "without measuring",
     )
     parser.add_argument(
         "--no-warmup",
@@ -425,8 +491,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--allow-busy",
         action="store_true",
-        help="measure anyway, downgrading load, power and sleep refusals to "
-        "warnings (results will not be trustworthy)",
+        help="measure anyway: skip the load and competing-build refusals and "
+        "downgrade sleep refusals to warnings (a waived sleep labels the "
+        "results untrusted). Power source never blocks, with or without this",
     )
     parser.add_argument(
         "configs",
@@ -463,10 +530,11 @@ def main(argv: list[str]) -> int:
         return 1
 
     guard = PowerGuard(allow_busy=args.allow_busy)
+    # Reuse the status-line reading as the start of the provenance record.
+    guard.observe_power("at start", source)
     try:
         if not args.allow_busy:
             require_idle()
-        guard.check_power("before measuring")
 
         configs = depth_sweep() if args.sweep_depth else parse_configs(args.configs)
         print(
@@ -493,10 +561,12 @@ def main(argv: list[str]) -> int:
     print("best tok/s is the estimator: contention only ever slows a run down.")
     if guard.waived:
         print(
-            f"UNTRUSTED: {len(guard.waived)} power/sleep check(s) failed and were "
+            f"UNTRUSTED: {len(guard.waived)} sleep check(s) failed and were "
             "waived by --allow-busy; see the warnings above. Do not compare these "
             "rates with clean runs."
         )
+    for line in guard.power_summary():
+        print(line)
     return 0
 
 
