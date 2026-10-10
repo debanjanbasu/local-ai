@@ -1927,16 +1927,32 @@ reasoning returned the correct `38,17`: 69,137 input tokens, 208 output tokens
 the reasoning run allowed 1,024 output tokens instead of 32 and included the
 template's reasoning instruction. It is a passing paired probe, not evidence
 of reliable coding at 262,144 tokens or a causal isolation of every difference.
-These roughly 69K-token runs remain the longest real-model quality probes
-recorded here. A 261,119-token fixture plus a 1,024-token output budget
-(262,143 tokens in all) began on the M4 Pro on 2026-10-10 and has not
-finished; no long-context result is recorded, and prefill progress is not a
-quality result. Only its short control has completed: the same formula
-question over a 3,163-token prompt, default reasoning, answered the expected
-`255,90` in 345 generated tokens. That control checks the fixture and
-harness, not long-context reasoning. Validation serializes
-GPU work and records the power source; battery power is not a correctness-test
-blocker.
+
+On 2026-10-10, a near-maximum-context probe **passed** on the 48 GB M4 Pro:
+261,119 input tokens plus a 1,024-token output budget (262,143 tokens in
+all, within the admitted 262,144). The synthetic repository contained 4,218
+files, with production constants near token 91, the helper near token
+129,531 and the question near token 261,030. Greedy generation with default
+`xhigh` reasoning returned the expected `255,90` in 384 generated tokens,
+closed its thinking section and stopped at EOS. The 3,163-token short
+control also answered correctly, in 345 generated tokens. Native chat and
+completion counts both matched the long fixture's exact 261,119 tokens.
+
+This was staged prefill, not a cold single-request latency benchmark. Four
+GPU checkpoints retained token-aligned prefixes across 14 bounded warmup
+windows, with no host or disk snapshots. The final request reused 261,030
+tokens, prefilled the remaining 89 in 3.67 seconds and decoded at 16.0 tok/s;
+its 27.65-second duration excludes building that prefix. The complete run,
+including the short control and 20-second cooldowns, took 6,516.5 seconds
+(108.6 minutes); cumulative long-prefix prefill took 6,153.5 seconds.
+No resource guard fired, the longest window took 588.4 seconds, sampled
+free memory stayed at or above 59%, and sampled swap usage stayed at zero.
+The local evidence is `context-max/run-20261010T135129/{progress.json,run.log,provenance.txt}`
+under `.amp/in/`, including prompt/token hashes and build provenance.
+It is one passing long-context repository-retrieval/reasoning probe, not
+evidence of general coding reliability at 262K or parity with the unquantized
+model. Validation serializes GPU work and records the power source;
+battery power is not a correctness-test blocker.
 
 Real-model Chat and Responses each completed a three-turn read/edit/result/final
 loop whose edit passed two executed assertions. Seven unmodified live response
@@ -1959,3 +1975,12 @@ Continuation preserves the encrypted envelope in returned input items.
 Stateless requests left no response records. Native chat and completion token
 counts also matched real generation, including tool history and both reasoning
 modes. These checks cover this text/function subset, not all OpenAI endpoints.
+
+After background Responses were added, the same 208 checks passed again,
+along with 180 additional real-model HTTP checks against the pinned schemas:
+queued and terminal responses, output/usage, cancellation and idempotent
+retry, deletion without resurrection, authentication, pending-history
+rejection, persistence across restart, graceful shutdown, and recovery after
+SIGKILL of the test server. These checks passed without skips. They do not
+cover background streaming/resumption or temporary retention, which remain
+unsupported; cross-server lease conflicts and write failures have CPU tests.
