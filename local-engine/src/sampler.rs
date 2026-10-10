@@ -68,7 +68,15 @@ impl Sampler {
     pub(crate) fn response_format_complete(&self, eos: bool) -> Option<bool> {
         self.grammar
             .as_deref()
+            .filter(|grammar| grammar.response_format)
             .map(|grammar| eos && grammar.answering() && grammar.failure().is_none())
+    }
+
+    pub(crate) fn tool_constraints_complete(&self, eos: bool) -> Option<bool> {
+        self.grammar
+            .as_deref()
+            .filter(|grammar| grammar.tool_constraints)
+            .map(|grammar| eos && grammar.tools_complete() && grammar.failure().is_none())
     }
 
     pub fn observe(&mut self, tokens: &[u32]) {
@@ -462,12 +470,31 @@ where
 }
 
 /// Push every token `mask` forbids to -inf, so no selection can reach it.
+/// Ids past either the mask or the logits are left alone. Works a mask word
+/// (32 ids) at a time: allowed words are skipped, forbidden words filled.
 fn forbid(mask: &SimpleVob, logits: &mut [f32]) {
-    mask.iter_unset_entries(|index| {
-        if let Some(logit) = logits.get_mut(index) {
+    const BITS: usize = u32::BITS as usize;
+    let covered = mask.len().min(logits.len());
+    let (chunks, remainder) = logits[..covered].as_chunks_mut::<BITS>();
+    for (chunk, &word) in chunks.iter_mut().zip(mask.as_slice()) {
+        match word {
+            u32::MAX => {}
+            0 => chunk.fill(f32::NEG_INFINITY),
+            _ => {
+                for (bit, logit) in chunk.iter_mut().enumerate() {
+                    if word & (1 << bit) == 0 {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
+    }
+    let start = covered - covered % BITS;
+    for (index, logit) in (start..).zip(remainder) {
+        if !mask.is_allowed(index as u32) {
             *logit = f32::NEG_INFINITY;
         }
-    });
+    }
 }
 
 fn argmax(values: &[f32]) -> u32 {

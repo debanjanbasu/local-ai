@@ -6,12 +6,19 @@
 //! compiles the schema before queueing and enforces it on every answer token,
 //! whatever `strict` says. Legacy Completions keep refusing every format but
 //! `text`: structured output is not part of that API.
+//!
+//! Chat `tool_choice` (`auto`, `none`, `required` or
+//! `{"type":"function","function":{"name"}}`), `parallel_tool_calls` and a
+//! tool's `function.strict` map one to one onto the engine's native
+//! [`ToolChoice`], `parallel_tool_calls` and [`ToolDefinition::strict`],
+//! which the engine enforces with its tool grammar (see [`tool_policy`]).
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use local_engine::{
-    ChatMessage, ChatRequest, CompletionRequest, ResponseFormat, Sampling, ToolCall, ToolDefinition,
+    ChatMessage, ChatRequest, CompletionRequest, ResponseFormat, Sampling, ToolCall, ToolChoice,
+    ToolDefinition,
 };
 
 use crate::GenerateParams;
@@ -185,12 +192,6 @@ impl GenerateRequest {
         {
             return unsupported("web_search_options", "there is no built-in web search");
         }
-        if self.parallel_tool_calls == Some(false) {
-            return unsupported(
-                "parallel_tool_calls=false",
-                "a single call per turn cannot be guaranteed without constrained decoding",
-            );
-        }
         service_tier(self.service_tier.as_deref())
     }
 }
@@ -284,6 +285,23 @@ pub(super) fn prepare_generation(
         .and_then(|options| options.include_usage)
         .unwrap_or(false);
     request.reject_unsupported(chat)?;
+    if !chat
+        && (request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            || request
+                .tool_choice
+                .as_ref()
+                .is_some_and(|choice| !choice.is_null())
+            || request.parallel_tool_calls == Some(false))
+    {
+        return Err(crate::Error::InvalidArgument(
+            "tools is not supported: tools, tool_choice and parallel_tool_calls are Chat \
+             Completions and Responses options, not legacy Completions ones"
+                .into(),
+        ));
+    }
     if !chat && include_usage {
         return Err(crate::Error::InvalidArgument(
             "stream_options.include_usage is not supported for legacy Completions".into(),
@@ -305,9 +323,9 @@ pub(super) fn prepare_generation(
             .iter()
             .map(chat_tool)
             .collect::<crate::Result<Vec<_>>>()?;
-        let tools = apply_tool_choice(tools, request.tool_choice.as_ref())?;
+        let tool_choice = chat_tool_choice(request.tool_choice.as_ref())?;
+        tool_policy(&tools, &tool_choice)?;
         let response_format = chat_response_format(request.response_format.as_ref())?;
-        reject_tools_with_format(&tools, &response_format, "response_format")?;
         GenerationRequest::Chat(ChatRequest {
             messages,
             max_tokens: params.max_tokens,
@@ -315,6 +333,8 @@ pub(super) fn prepare_generation(
             thinking: effective_thinking(request.reasoning_effort.as_deref(), thinking)?,
             session: session(request.prompt_cache_key, request.session_id, request.user),
             tools,
+            tool_choice,
+            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
             response_format,
         })
     } else {
@@ -427,24 +447,6 @@ pub(super) fn responses_text_format(
         }
         other => Err(unsupported_format(FIELD, other)),
     }
-}
-
-/// Refuse a structured format alongside tools the model is shown: the
-/// engine constrains the whole answer, which would leave no room for a call.
-/// `tool_choice: "none"` withholds the tools, so it combines with any format.
-pub(super) fn reject_tools_with_format(
-    tools: &[ToolDefinition],
-    format: &ResponseFormat,
-    field: &str,
-) -> crate::Result<()> {
-    if tools.is_empty() || format.is_text() {
-        return Ok(());
-    }
-    Err(crate::Error::InvalidArgument(format!(
-        "{field} other than text cannot be combined with tools: the format constrains the whole \
-         answer, so no tool call could be made; drop the tools, set tool_choice to \"none\", or \
-         use a text format"
-    )))
 }
 
 /// A `json_schema` format's members, the same in both APIs.
@@ -574,73 +576,156 @@ pub(super) fn effective_thinking(effort: Option<&str>, server: bool) -> crate::R
     }
 }
 
-/// Apply `tool_choice` to the declared tools.
+/// Check `choice` against the declared `tools` before anything is queued.
 ///
-/// `auto` hands the tools to the template. `none` withholds them, so the model
-/// is never shown a tool it may not call; prior calls and results in the
-/// history are still rendered. `required` and naming a function are promises
-/// that need constrained decoding, so they fail rather than being treated as a
-/// hint the model is free to ignore.
-pub(super) fn apply_tool_choice(
-    tools: Vec<ToolDefinition>,
-    choice: Option<&Value>,
-) -> crate::Result<Vec<ToolDefinition>> {
-    match tool_choice(choice)? {
-        ToolChoice::Auto => Ok(tools),
-        ToolChoice::None => Ok(Vec::new()),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ToolChoice {
-    Auto,
-    None,
-}
-
-impl ToolChoice {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::None => "none",
-        }
-    }
-}
-
-pub(super) fn tool_choice(choice: Option<&Value>) -> crate::Result<ToolChoice> {
+/// The engine enforces every choice with its native tool grammar: `none`
+/// shows the model the tools (the prompt is the same for every choice) but
+/// its answer can never contain a call, `required` makes at least one call
+/// mandatory, and a named function makes exactly that one mandatory. A
+/// mandatory call needs a tool to call, and a named one must be declared;
+/// both are refused here with the request's own field names.
+pub(super) fn tool_policy(tools: &[ToolDefinition], choice: &ToolChoice) -> crate::Result<()> {
     match choice {
-        None | Some(Value::Null) => Ok(ToolChoice::Auto),
-        Some(Value::String(mode)) if mode == "auto" => Ok(ToolChoice::Auto),
-        Some(Value::String(mode)) if mode == "none" => Ok(ToolChoice::None),
-        Some(Value::String(mode)) if mode == "required" => Err(forced_choice()),
-        Some(Value::Object(_)) => Err(forced_choice()),
-        Some(other) => Err(crate::Error::InvalidArgument(format!(
-            "invalid tool_choice {other}; expected \"auto\" or \"none\""
+        ToolChoice::Required if tools.is_empty() => Err(crate::Error::InvalidArgument(
+            "tool_choice \"required\" needs at least one tool in tools".into(),
+        )),
+        ToolChoice::Function(name) if !tools.iter().any(|tool| tool.name == *name) => {
+            Err(crate::Error::InvalidArgument(format!(
+                "tool_choice names function {name:?}, which is not declared in tools"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A `tool_choice` mode string shared by both APIs.
+fn choice_mode(mode: &str, named: &str) -> crate::Result<ToolChoice> {
+    match mode {
+        "auto" => Ok(ToolChoice::Auto),
+        "none" => Ok(ToolChoice::None),
+        "required" => Ok(ToolChoice::Required),
+        other => Err(crate::Error::InvalidArgument(format!(
+            "invalid tool_choice {other:?}; expected \"auto\", \"none\", \"required\" or {named}"
         ))),
     }
 }
 
-fn forced_choice() -> crate::Error {
-    crate::Error::InvalidArgument(
-        "tool_choice \"required\" and forcing a named tool are not supported: a guaranteed call \
-         needs constrained decoding of tool calls, which this server does not implement (only \
-         response formats are constrained); use \"auto\" or \"none\""
-            .into(),
-    )
+/// A named function's `name`, which must be a non-empty string.
+fn choice_name(object: &Map<String, Value>, field: &str) -> crate::Result<String> {
+    match object.get("name") {
+        Some(Value::String(name)) if !name.is_empty() => Ok(name.clone()),
+        Some(Value::String(_)) => Err(crate::Error::InvalidArgument(format!(
+            "{field}.name must not be empty"
+        ))),
+        None | Some(Value::Null) => Err(crate::Error::InvalidArgument(format!(
+            "{field}.name is required"
+        ))),
+        Some(_) => Err(crate::Error::InvalidArgument(format!(
+            "{field}.name must be a string"
+        ))),
+    }
+}
+
+/// The `type` of a `tool_choice` object, refusing the kinds this server
+/// cannot honour by name.
+fn choice_kind<'a>(object: &'a Map<String, Value>, function_shape: &str) -> crate::Result<&'a str> {
+    match object.get("type") {
+        Some(Value::String(kind)) if kind == "function" => Ok(kind),
+        Some(Value::String(kind)) if kind == "allowed_tools" => Err(crate::Error::InvalidArgument(
+            "tool_choice type \"allowed_tools\" is not supported; send only the allowed tools \
+             in tools instead"
+                .into(),
+        )),
+        Some(Value::String(kind)) => Err(crate::Error::InvalidArgument(format!(
+            "tool_choice type {kind:?} is not supported; only function tools run here, named as \
+             {function_shape}"
+        ))),
+        None | Some(Value::Null) => Err(crate::Error::InvalidArgument(
+            "tool_choice.type is required".into(),
+        )),
+        Some(_) => Err(crate::Error::InvalidArgument(
+            "tool_choice.type must be a string".into(),
+        )),
+    }
+}
+
+const CHAT_NAMED: &str = "{\"type\":\"function\",\"function\":{\"name\":...}}";
+const RESPONSES_NAMED: &str = "{\"type\":\"function\",\"name\":...}";
+
+/// Chat's `tool_choice`: absent or `null` is `auto`; otherwise exactly
+/// `"auto"`, `"none"`, `"required"` or
+/// `{"type":"function","function":{"name":"NAME"}}`. The Responses shape,
+/// unknown members and other tool kinds fail.
+pub(super) fn chat_tool_choice(choice: Option<&Value>) -> crate::Result<ToolChoice> {
+    let object = match choice {
+        None | Some(Value::Null) => return Ok(ToolChoice::Auto),
+        Some(Value::String(mode)) => return choice_mode(mode, CHAT_NAMED),
+        Some(Value::Object(object)) => object,
+        Some(other) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "invalid tool_choice {other}; expected \"auto\", \"none\", \"required\" or \
+                 {CHAT_NAMED}"
+            )));
+        }
+    };
+    choice_kind(object, CHAT_NAMED)?;
+    only_members(object, &["type", "function"], "tool_choice")?;
+    let function = match object.get("function") {
+        Some(Value::Object(function)) => function,
+        None | Some(Value::Null) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "tool_choice.function is required: name a function as {CHAT_NAMED}"
+            )));
+        }
+        Some(_) => {
+            return Err(crate::Error::InvalidArgument(
+                "tool_choice.function must be an object".into(),
+            ));
+        }
+    };
+    only_members(function, &["name"], "tool_choice.function")?;
+    Ok(ToolChoice::Function(choice_name(
+        function,
+        "tool_choice.function",
+    )?))
+}
+
+/// The Responses `tool_choice`: absent or `null` is `auto`; otherwise
+/// exactly `"auto"`, `"none"`, `"required"` or
+/// `{"type":"function","name":"NAME"}`. Returns the native choice and the
+/// value the Response object echoes: the mode string, or the named object.
+pub(super) fn responses_tool_choice(choice: Option<&Value>) -> crate::Result<(ToolChoice, Value)> {
+    let object = match choice {
+        None | Some(Value::Null) => return Ok((ToolChoice::Auto, json!("auto"))),
+        Some(Value::String(mode)) => {
+            return choice_mode(mode, RESPONSES_NAMED).map(|choice| (choice, json!(mode)));
+        }
+        Some(Value::Object(object)) => object,
+        Some(other) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "invalid tool_choice {other}; expected \"auto\", \"none\", \"required\" or \
+                 {RESPONSES_NAMED}"
+            )));
+        }
+    };
+    choice_kind(object, RESPONSES_NAMED)?;
+    only_members(object, &["type", "name"], "tool_choice")?;
+    let name = choice_name(object, "tool_choice")?;
+    let echo = json!({"type":"function","name":name});
+    Ok((ToolChoice::Function(name), echo))
 }
 
 /// A function tool definition, or a clear refusal of anything else.
+///
+/// `strict` (absent or `null` is `false`) asks the engine to enforce
+/// `parameters` while the call is generated; a schema it cannot enforce
+/// exactly is refused when the request is submitted, never weakened.
 pub(super) fn function_definition(
     name: String,
     description: Option<String>,
     parameters: Option<Value>,
     strict: Option<bool>,
 ) -> crate::Result<ToolDefinition> {
-    if strict == Some(true) {
-        return Err(crate::Error::InvalidArgument(format!(
-            "tool {name:?} sets strict=true, which needs constrained decoding of tool calls; this server only \
-             validates calls after generation, so set strict to false or omit it"
-        )));
-    }
     let parameters = match parameters {
         // The engine reads `null` as "takes no arguments", which is what an
         // omitted `parameters` means in both OpenAI APIs.
@@ -656,6 +741,7 @@ pub(super) fn function_definition(
         name,
         description,
         parameters,
+        strict: strict.unwrap_or(false),
     })
 }
 

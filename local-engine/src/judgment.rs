@@ -39,13 +39,31 @@
 //!
 //! The temperature was fit on one dataset's calibration split only. The
 //! returned probabilities are the head's softmax output, not a calibrated
-//! confidence on other data, and this module defines no argmax, threshold or
+//! confidence on other data, and the scorer defines no argmax, threshold or
 //! refusal policy.
+//!
+//! # Native decisions
+//!
+//! [`DecisionRequest`] renders a typed text question exactly as the training
+//! rows were rendered; [`crate::Engine::decide`] and
+//! [`crate::EngineHandle::decide`] capture its features on the loaded model
+//! and score them with a caller-supplied head (never loaded automatically).
+//! A [`Decision`] reports the head's probabilities per caller option, the
+//! argmax and, for scores, the probability-weighted level index; see
+//! [`CALIBRATION_SCOPE`] for what those probabilities are not.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
+
+mod decision;
+
+pub(crate) use self::decision::PreparedDecision;
+pub use self::decision::{
+    CALIBRATION_SCOPE, DECISION_CAPTURE_ROWS, DECISION_RENDERER, Decision, DecisionKind,
+    DecisionProbability, DecisionRequest, DecisionValue, MAX_DECISION_OPTIONS, RenderedDecision,
+};
 
 /// The `format` metadata value the loader accepts.
 pub const JUDGMENT_HEAD_FORMAT: &str = "local-ai.judgment-pointer-head.v0-experimental";
@@ -183,6 +201,28 @@ impl JudgmentHead {
             k_bias,
             temperature,
         })
+    }
+
+    /// A head from raw parts, for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) const fn for_tests(
+        width: usize,
+        head_dim: usize,
+        q_weight: Vec<f32>,
+        q_bias: Vec<f32>,
+        k_weight: Vec<f32>,
+        k_bias: Vec<f32>,
+        temperature: f32,
+    ) -> Self {
+        Self {
+            width,
+            head_dim,
+            q_weight,
+            q_bias,
+            k_weight,
+            k_bias,
+            temperature,
+        }
     }
 
     /// Hidden width each feature row must have.

@@ -13,21 +13,30 @@
 //!   incomplete responses are persisted (see [`super::store`]) before their
 //!   terminal event is sent, and `previous_response_id` continues one. Only
 //!   conversation items carry over; `instructions`, tools and sampling
-//!   controls are this request's alone. `background: true` is accepted only
-//!   with a store, and stored; with `stream: true` its events are journaled so
-//!   a stream can be resumed (see [`super::background`] and [`super::resume`]).
+//!   controls are this request's alone. `background: true` is stored in the
+//!   response store when `store` is `true` (the default once a store exists);
+//!   with `store: false`, or with `store` omitted on a server without one, it
+//!   is kept only temporarily, in a private store of this process, until
+//!   [`super::background::TEMPORARY_RETENTION`] after it ends, and reports
+//!   `store: false` (see [`super::background::Temporary`]). With
+//!   `stream: true` its events are journaled so a stream can be resumed (see
+//!   [`super::background`] and [`super::resume`]).
 //!   `conversation` and `item_reference` inputs still fail. Clients may instead carry history
 //!   explicitly in `input`, which is supported in full for messages,
 //!   reasoning, `function_call` and `function_call_output` items.
-//! - Function tools only. Built-in, MCP and custom tools, `tool_choice` forcing
-//!   (`required` or a named tool) and tool `strict: true` need tool-call
-//!   constraints or hosted services this server lacks.
+//! - Function tools only; built-in, MCP and custom tools need hosted
+//!   services this server lacks. `tool_choice` (`auto`, `none`, `required` or
+//!   `{"type":"function","name"}`), `parallel_tool_calls` and a tool's
+//!   `strict` map onto the engine's native tool grammar, which enforces them
+//!   on every sampled token, and are echoed back as accepted (`strict` as
+//!   `false` when omitted: this server enforces arguments only on request).
 //! - `text.format` is `text`, `json_object`, or the flat `json_schema`
 //!   (`name`, `schema`, optional `description` and `strict`), parsed strictly
 //!   and echoed back as accepted. The engine compiles the schema before
 //!   queueing (an invalid or unsupported one is a 400) and enforces it on
 //!   every answer token whatever `strict` says; reasoning stays unconstrained.
-//!   A structured format cannot be combined with tools the model is shown.
+//!   With tools, the answer is either a call or (unless a call is
+//!   required) the final answer in that format, enforced by one grammar.
 //!   An answer the format did not complete is never `completed`: a token
 //!   limit is `incomplete` (`max_output_tokens`), and an end of turn during
 //!   reasoning, before any answer, is `failed`.
@@ -44,10 +53,11 @@ use serde_json::{Map, Value, json};
 use local_engine::bonsai_model::StopReason;
 use local_engine::{ChatMessage, ChatRequest, Event, Sampling, Stats, ToolCall, ToolDefinition};
 
+use super::background::Temporary;
 use super::reasoning_crypto::ReasoningCipher;
 use super::request::{
-    effective_thinking, function_definition, reject_tools_with_format, responses_text_format,
-    service_tier, session, tool_call, tool_choice,
+    effective_thinking, function_definition, responses_text_format, responses_tool_choice,
+    service_tier, session, tool_call, tool_policy,
 };
 use super::response::{Reply, arguments_text, new_id, unix_now};
 use super::store::ResponseStore;
@@ -134,7 +144,9 @@ pub(super) struct Echo {
     metadata: Value,
     /// The accepted `text.format`, as the Response reports it.
     text_format: Value,
-    tool_choice: &'static str,
+    /// The accepted `tool_choice`: a mode string or the named function.
+    tool_choice: Value,
+    parallel_tool_calls: bool,
     tools: Vec<Value>,
     temperature: f32,
     top_p: f32,
@@ -162,6 +174,9 @@ impl Echo {
 struct Persist {
     store: Arc<ResponseStore>,
     input_items: Vec<Value>,
+    /// A `background` `store: false` Response: `store` is this server's
+    /// private temporary store, which expires it after it ends.
+    temporary: Option<Arc<Temporary>>,
 }
 
 pub(super) struct PreparedResponses {
@@ -183,10 +198,22 @@ fn present(value: Option<&Value>) -> bool {
 }
 
 impl ResponsesRequest {
+    /// Whether this is a background request kept only temporarily: `store`
+    /// is `false`, explicitly or by default on a server without a store.
+    fn temporary_background(&self, stored: bool) -> bool {
+        self.background == Some(true) && !self.store.unwrap_or(stored)
+    }
+
     /// Fail on any option whose effect this server cannot produce. `stored`
-    /// says whether a response store was configured.
+    /// says whether a response store was configured, `temporary` whether the
+    /// private temporary store is available.
     #[allow(clippy::too_many_lines)]
-    fn reject_unsupported(&self, stored: bool, encrypted: bool) -> crate::Result<()> {
+    fn reject_unsupported(
+        &self,
+        stored: bool,
+        temporary: bool,
+        encrypted: bool,
+    ) -> crate::Result<()> {
         if !stored && self.store == Some(true) {
             return Err(unsupported(
                 "store=true",
@@ -194,21 +221,18 @@ impl ResponsesRequest {
                  send store=false and carry history in input",
             ));
         }
-        if self.background == Some(true) {
-            if !stored {
-                return Err(unsupported(
-                    "background",
-                    "a background response is kept in the response store until it is retrieved, \
-                     and this server was started without --response-store",
-                ));
-            }
-            if self.store == Some(false) {
-                return Err(unsupported(
-                    "background with store=false",
-                    "temporary retention is not implemented; a background response is stored \
-                     until it is deleted",
-                ));
-            }
+        if self.temporary_background(stored) && !temporary {
+            return Err(unsupported(
+                "background",
+                if stored {
+                    "with store=false a background response is kept briefly in a private \
+                     temporary store, which could not be created on this server; send store=true"
+                } else {
+                    "a background response is kept until it is retrieved, durably in \
+                     --response-store or, with store=false, briefly in a private temporary \
+                     store, and this server has neither"
+                },
+            ));
         }
         if !stored && self.previous_response_id.is_some() {
             return Err(unsupported(
@@ -255,12 +279,6 @@ impl ResponsesRequest {
             return Err(unsupported(
                 "top_logprobs",
                 "log-probabilities are not reported",
-            ));
-        }
-        if self.parallel_tool_calls == Some(false) {
-            return Err(unsupported(
-                "parallel_tool_calls=false",
-                "a single call per turn cannot be guaranteed without constrained decoding",
             ));
         }
         if !matches!(self.truncation.as_deref(), None | Some("disabled")) {
@@ -385,8 +403,7 @@ pub(super) fn prepare_input_tokens(
     Ok(prepare_responses_with(&body, thinking, store, cipher, model)?.request)
 }
 
-/// Parse a `POST /v1/responses` body, resolving `previous_response_id`
-/// against `store` and deciding whether the result will be stored there.
+/// [`prepare_responses_retaining`] on a server with no temporary store.
 pub(super) fn prepare_responses_with(
     body: &[u8],
     thinking: bool,
@@ -394,24 +411,37 @@ pub(super) fn prepare_responses_with(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedResponses> {
+    prepare_responses_retaining(body, thinking, store, None, cipher, model)
+}
+
+/// Parse a `POST /v1/responses` body, resolving `previous_response_id`
+/// against `store` and deciding whether the result will be stored there, or,
+/// for `background` with `store: false`, kept in `temporary`.
+pub(super) fn prepare_responses_retaining(
+    body: &[u8],
+    thinking: bool,
+    store: Option<&Arc<ResponseStore>>,
+    temporary: Option<&Arc<Temporary>>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<PreparedResponses> {
     let request: ResponsesRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
-    request.reject_unsupported(store.is_some(), cipher.is_some())?;
+    reject_temporary_previous(request.previous_response_id.as_deref(), temporary)?;
+    request.reject_unsupported(store.is_some(), temporary.is_some(), cipher.is_some())?;
     let thinking = effective_thinking(reasoning_effort(request.reasoning.as_ref())?, thinking)?;
-    let choice = tool_choice(request.tool_choice.as_ref())?;
+    let (choice, echoed_choice) = responses_tool_choice(request.tool_choice.as_ref())?;
     let mut echoed_tools = Vec::new();
     let mut tools = Vec::new();
     for tool in request.tools.as_deref().unwrap_or_default() {
         let definition = function_tool(tool)?;
-        echoed_tools.push(json!({"type":"function","name":definition.name,"description":definition.description,"parameters":definition.parameters,"strict":false}));
+        echoed_tools.push(json!({"type":"function","name":definition.name,"description":definition.description,"parameters":definition.parameters,"strict":definition.strict}));
         tools.push(definition);
     }
-    if choice == super::request::ToolChoice::None {
-        tools.clear();
-    }
+    tool_policy(&tools, &choice)?;
+    let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let (response_format, text_format) =
         responses_text_format(request.text.as_ref().and_then(|text| text.format.as_ref()))?;
-    reject_tools_with_format(&tools, &response_format, "text.format")?;
     let empty_input = json!([]);
     let input = request
         .input
@@ -456,21 +486,15 @@ pub(super) fn prepare_responses_with(
         &Value::Array(items.clone()),
         request.instructions.as_deref(),
     )?;
-    // Storing follows OpenAI's default of `true` once a store exists; without
-    // one, `reject_unsupported` has already refused an explicit `true`.
-    let persist = store
-        .filter(|_| request.store.unwrap_or(true))
-        .map(|store| Persist {
-            store: Arc::clone(store),
-            input_items: items,
-        });
+    let persist = persist(&request, store, temporary, items);
     let params = request.params();
     let echo = Echo {
         instructions: request.instructions.clone(),
         max_output_tokens: request.max_output_tokens,
         metadata: request.metadata.clone().unwrap_or_else(|| json!({})),
         text_format,
-        tool_choice: choice.as_str(),
+        tool_choice: echoed_choice,
+        parallel_tool_calls,
         tools: echoed_tools,
         temperature: params.temperature,
         top_p: params.top_p,
@@ -480,7 +504,8 @@ pub(super) fn prepare_responses_with(
         safety_identifier: request.safety_identifier.clone(),
         previous_response_id: request.previous_response_id.clone(),
         cipher: cipher.cloned(),
-        // `reject_unsupported` has ensured a background response is stored.
+        // `reject_unsupported` has ensured a background response is stored,
+        // durably or temporarily.
         background: request.background == Some(true) && persist.is_some(),
         persist,
     };
@@ -493,10 +518,58 @@ pub(super) fn prepare_responses_with(
             thinking,
             session: session(request.prompt_cache_key, request.session_id, request.user),
             tools,
+            tool_choice: choice,
+            parallel_tool_calls,
             response_format,
         },
         echo,
     })
+}
+
+/// Where the Response to `request` is to be kept, with its resolved input
+/// `items`, if anywhere.
+///
+/// Storing follows `OpenAI`'s default of `true` once a store exists; without
+/// one, `reject_unsupported` has already refused an explicit `true`. A
+/// temporary background response goes only to the temporary store.
+fn persist(
+    request: &ResponsesRequest,
+    store: Option<&Arc<ResponseStore>>,
+    temporary: Option<&Arc<Temporary>>,
+    items: Vec<Value>,
+) -> Option<Persist> {
+    match temporary.filter(|_| request.temporary_background(store.is_some())) {
+        Some(temporary) => Some(Persist {
+            store: Arc::clone(temporary.store()),
+            input_items: items,
+            temporary: Some(Arc::clone(temporary)),
+        }),
+        None => store
+            .filter(|_| request.store.unwrap_or(true))
+            .map(|store| Persist {
+                store: Arc::clone(store),
+                input_items: items,
+                temporary: None,
+            }),
+    }
+}
+
+/// Refuse to continue a temporary response. It is never looked up in the
+/// response store, so it is not reported as merely missing there.
+fn reject_temporary_previous(
+    previous: Option<&str>,
+    temporary: Option<&Arc<Temporary>>,
+) -> crate::Result<()> {
+    match (previous, temporary) {
+        (Some(id), Some(temporary)) if temporary.knows(id) => Err(unsupported(
+            "previous_response_id",
+            &format!(
+                "response {id} was created with background=true and store=false, so it is kept \
+                 only briefly for retrieval and cannot be continued; send its items in input"
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The history stored response `id` continues with.
@@ -517,6 +590,9 @@ fn previous_history(store: &ResponseStore, id: &str) -> crate::Result<Vec<Value>
 }
 
 fn function_tool(tool: &Value) -> crate::Result<ToolDefinition> {
+    if !tool.is_object() {
+        return Err(invalid(format!("each tool must be an object, not {tool}")));
+    }
     let kind = tool.get("type").and_then(Value::as_str).unwrap_or_default();
     if kind != "function" {
         return Err(unsupported(
@@ -545,11 +621,16 @@ fn function_tool(tool: &Value) -> crate::Result<ToolDefinition> {
             )));
         }
     };
+    let strict = match tool.get("strict") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(strict)) => Some(*strict),
+        Some(_) => return Err(invalid(format!("tool {name:?} strict must be a boolean"))),
+    };
     function_definition(
         name.to_owned(),
         description,
         tool.get("parameters").cloned(),
-        tool.get("strict").and_then(Value::as_bool),
+        strict,
     )
 }
 
@@ -1218,6 +1299,15 @@ impl ResponsesState {
         self.echo.persist.as_ref().map(|persist| &persist.store)
     }
 
+    /// The temporary store that expires this Response, when it is kept only
+    /// temporarily (`background` with `store: false`).
+    pub(super) fn temporary(&self) -> Option<&Arc<Temporary>> {
+        self.echo
+            .persist
+            .as_ref()
+            .and_then(|persist| persist.temporary.as_ref())
+    }
+
     pub(super) fn id(&self) -> &str {
         &self.id
     }
@@ -1263,13 +1353,16 @@ impl ResponsesState {
             "max_output_tokens":echo.max_output_tokens,
             "model":self.model.as_ref(),
             "output":output,
-            "parallel_tool_calls":true,
+            "parallel_tool_calls":echo.parallel_tool_calls,
             "previous_response_id":echo.previous_response_id,
             "reasoning":{"effort":echo.effort,"summary":null,"context":"all_turns"},
             // Only a response that reached the store says so. A failed
             // foreground one, including one whose write failed, was never
             // stored; a background one is stored in every state it reports.
-            "store":echo.persist.is_some() && (echo.background || status != "failed"),
+            // A temporary background one is kept only to be retrieved, so it
+            // says `false`, as the client asked.
+            "store":echo.persist.as_ref().is_some_and(|persist| persist.temporary.is_none())
+                && (echo.background || status != "failed"),
             "background":echo.background,
             "access_programs":null,
             "service_tier":"default",

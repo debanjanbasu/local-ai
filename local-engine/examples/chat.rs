@@ -25,6 +25,8 @@ fn main() -> local_engine::Result<()> {
         thinking: true,
         session: None,
         tools: Vec::new(),
+        tool_choice: local_engine::ToolChoice::Auto,
+        parallel_tool_calls: true,
         response_format: local_engine::ResponseFormat::Text,
     };
     engine.chat_with(&request, |event| {

@@ -9,6 +9,8 @@ use tokenizers::Tokenizer;
 
 use crate::bonsai::BonsaiPackage;
 use crate::structured::{Grammar, GrammarCompiler, ResponseFormat};
+use crate::tools::grammar::CallTags;
+use crate::tools::{ToolChoice, ToolSet};
 
 pub const DEFAULT_REASONING_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
 
@@ -196,6 +198,87 @@ impl BonsaiTokenizer {
     ) -> crate::Result<Option<Grammar>> {
         self.grammar
             .compile(&self.inner, &self.eos_ids, format, reasoning_end)
+    }
+
+    /// Compile a request's native tool policy (see [`crate::tools::grammar`])
+    /// before any of its prompt work. With `reasoning`, the grammar starts
+    /// after the closing `</think>`; a required call also keeps reasoning from
+    /// ending the request.
+    pub(crate) fn compile_tools(
+        &self,
+        tools: &ToolSet,
+        choice: &ToolChoice,
+        parallel: bool,
+        format: &ResponseFormat,
+        reasoning: bool,
+    ) -> crate::Result<Grammar> {
+        self.compile_tools_ending(
+            tools,
+            choice,
+            parallel,
+            format,
+            reasoning.then_some(THINK_END),
+        )
+    }
+
+    /// [`Self::compile_tools`] with an explicit reasoning delimiter.
+    pub(crate) fn compile_tools_ending(
+        &self,
+        tools: &ToolSet,
+        choice: &ToolChoice,
+        parallel: bool,
+        format: &ResponseFormat,
+        reasoning_end: Option<u32>,
+    ) -> crate::Result<Grammar> {
+        let final_schema = format.schema()?;
+        let tags = CallTags {
+            open: self.special_id("<tool_call>"),
+            close: self.special_id("</tool_call>"),
+        };
+        let built = crate::tools::grammar::build(tools, choice, parallel, final_schema, tags)
+            .map_err(|error| invalid_tools(&error))?;
+        let compiled = self.grammar.compile_grammar(
+            &self.inner,
+            &self.eos_ids,
+            built.grammar,
+            reasoning_end,
+            built.call_required,
+            invalid_tools,
+        );
+        if compiled.is_err() {
+            // Name the parameter whose schema the grammar engine refused.
+            for (context, schema) in built.parameters {
+                let alone = llguidance::api::TopLevelGrammar::from_json_schema(schema);
+                if let Err(crate::Error::InvalidArgument(error)) = self.grammar.compile_grammar(
+                    &self.inner,
+                    &self.eos_ids,
+                    alone,
+                    None,
+                    false,
+                    invalid_tools,
+                ) {
+                    let reason = error
+                        .strip_prefix("invalid tool constraints: ")
+                        .unwrap_or(&error);
+                    return Err(invalid_tools(&format!("{context}: {reason}")));
+                }
+            }
+        }
+        compiled.map(|mut grammar| {
+            grammar.response_format = !format.is_text();
+            grammar.tool_constraints = true;
+            grammar
+        })
+    }
+
+    /// The id of `text` when it is one special token of this vocabulary.
+    fn special_id(&self, text: &str) -> Option<u32> {
+        let id = self.inner.token_to_id(text)?;
+        self.inner
+            .get_added_tokens_decoder()
+            .get(&id)
+            .is_some_and(|token| token.special && token.content == text)
+            .then_some(id)
     }
 
     #[doc(hidden)]
@@ -428,6 +511,10 @@ fn validate_merges(merges: &[String], vocab: &HashSet<&str>) -> crate::Result<()
         }
     }
     Ok(())
+}
+
+fn invalid_tools(message: &str) -> crate::Error {
+    crate::Error::InvalidArgument(format!("invalid tool constraints: {message}"))
 }
 
 fn require(actual: &str, expected: &str, field: &str) -> crate::Result<()> {

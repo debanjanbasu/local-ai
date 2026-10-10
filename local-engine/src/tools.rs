@@ -22,6 +22,11 @@
 //! and turns generated text back into validated calls. It never executes a
 //! tool: a [`ToolCall`] is only a complete, schema-checked request that the
 //! harness may choose to run.
+//!
+//! [`ToolChoice`], `parallel_tool_calls` and [`ToolDefinition::strict`] opt a
+//! request into native constrained calling (see [`grammar`]): the call layout
+//! and, for strict tools, the arguments are enforced on every sampled token.
+//! The defaults leave generation unconstrained.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
@@ -34,7 +39,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::api::Event;
+use crate::bonsai_model::StopReason;
 use crate::bonsai_tokenizer::DEFAULT_REASONING_INSTRUCTION;
+
+pub mod grammar;
+
+use grammar::{
+    FUNCTION_OPEN, PARAMETER_CLOSE, PARAMETER_OPEN, STRICT_CALL_END, StrictTool, ValueKind,
+};
 
 const CALL_START: &str = "<tool_call>";
 const CALL_END: &str = "</tool_call>";
@@ -57,6 +69,40 @@ pub struct ToolDefinition {
     /// JSON Schema for the arguments object. `null` means no parameters.
     #[serde(default)]
     pub parameters: Value,
+    /// Enforce `parameters` while the call is generated (`OpenAI` `strict`).
+    ///
+    /// The arguments are then constrained token by token to the declared
+    /// parameters in the template's layout, each value to its own schema.
+    /// The schema must be a closed object (`"additionalProperties": false`)
+    /// whose parameters this engine can enforce exactly: a raw string with
+    /// `enum`/`const`/`pattern`/`minLength`/`maxLength`, or any JSON value
+    /// whose schema the grammar engine supports. Anything else fails the
+    /// request before generation with the reason, rather than being enforced
+    /// partially. Not shown to the model. Defaults to `false`: arguments are
+    /// only validated once the call is complete.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
+}
+
+/// Whether and which tool the model must call (`OpenAI` `tool_choice`).
+///
+/// Anything but [`Self::Auto`] is enforced by the sampler, not requested in
+/// the prompt: the prompt is the same for every choice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// The model decides (the default). Unconstrained unless another setting
+    /// (`parallel_tool_calls: false`, a strict tool or a `response_format`)
+    /// needs the grammar, in which case free text never contains
+    /// `<tool_call>` outside a call.
+    #[default]
+    Auto,
+    /// No call: the answer can never contain `<tool_call>`.
+    None,
+    /// At least one call, before which the answer may hold only blank lines;
+    /// generation cannot end before a complete call.
+    Required,
+    /// One call to the named tool, as for [`Self::Required`].
+    Function(String),
 }
 
 /// A complete, validated call the model requested. The engine never runs it.
@@ -82,6 +128,10 @@ struct Tool {
     definition: ToolDefinition,
     /// `None` when the tool takes no parameters.
     schema: Option<ArgumentSchema>,
+    /// For a strict tool, its native spelling, or why it cannot be enforced.
+    /// The error surfaces only when a grammar is built, so counting and
+    /// rendering never depend on it.
+    strict: Option<Result<StrictTool, String>>,
 }
 
 #[derive(Debug)]
@@ -112,9 +162,11 @@ impl ToolSet {
             let schema = compile_parameters(&tool.parameters).map_err(|error| {
                 crate::Error::InvalidArgument(format!("tool {:?} parameters: {error}", tool.name))
             })?;
+            let strict = tool.strict.then(|| grammar::classify(&tool.parameters));
             compiled.push(Tool {
                 definition: tool.clone(),
                 schema,
+                strict,
             });
         }
         Ok(Self { tools: compiled })
@@ -126,6 +178,23 @@ impl ToolSet {
 
     fn get(&self, name: &str) -> Option<&Tool> {
         self.tools.iter().find(|tool| tool.definition.name == name)
+    }
+
+    /// Whether any tool is strict, which always comes with a grammar.
+    pub fn any_strict(&self) -> bool {
+        self.tools.iter().any(|tool| tool.strict.is_some())
+    }
+}
+
+/// Check that `choice` can apply to `tools`.
+pub fn check_choice(tools: &[ToolDefinition], choice: &ToolChoice) -> crate::Result<()> {
+    match choice {
+        ToolChoice::Required if tools.is_empty() => {
+            invalid("tool_choice \"required\" needs at least one tool")
+        }
+        ToolChoice::Auto | ToolChoice::None | ToolChoice::Required => Ok(()),
+        ToolChoice::Function(name) if tools.iter().any(|tool| tool.name == *name) => Ok(()),
+        ToolChoice::Function(name) => invalid(format!("tool_choice names unknown tool {name:?}")),
     }
 }
 
@@ -685,15 +754,20 @@ impl ToolCallParser {
         self.pending.push_str(text);
         loop {
             if self.in_call {
-                let Some(end) = self.pending.find(CALL_END) else {
+                let tools = Arc::clone(&self.tools);
+                let Some((end, marker, strict)) = call_end(&self.pending, &tools) else {
                     return ControlFlow::Continue(());
                 };
-                let rest = self.pending.split_off(end + CALL_END.len());
+                let rest = self.pending.split_off(end + marker.len());
                 let mut block = std::mem::replace(&mut self.pending, rest);
                 block.truncate(end);
                 self.in_call = false;
                 self.after_call = true;
-                match parse_call(&block, &self.tools) {
+                let parsed = strict.map_or_else(
+                    || parse_call(&block, &tools),
+                    |tool| parse_strict(&block, tool),
+                );
+                match parsed {
                     Ok(call) => {
                         if callback(Event::ToolCall(call)).is_break() {
                             return ControlFlow::Break(());
@@ -726,16 +800,33 @@ impl ToolCallParser {
         }
     }
 
+    /// Close the stream for generation that stopped for `reason`.
+    ///
+    /// A call still open when the model ends its turn is malformed and
+    /// fails the stream. A call cut off by the token budget or cancellation
+    /// is no call at all: its buffered text is dropped, never emitted, and
+    /// the events already delivered stand.
     pub fn finish(
         &mut self,
+        reason: StopReason,
         callback: &mut impl FnMut(Event) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         if self.failure.is_some() {
             return ControlFlow::Break(());
         }
         if self.in_call {
-            self.failure = Some("invalid tool call: generation ended before </tool_call>".into());
-            return ControlFlow::Break(());
+            match reason {
+                StopReason::Eos => {
+                    self.failure =
+                        Some("invalid tool call: generation ended before </tool_call>".into());
+                    return ControlFlow::Break(());
+                }
+                StopReason::TokenLimit | StopReason::Cancelled => {
+                    self.pending.clear();
+                    self.in_call = false;
+                    return ControlFlow::Continue(());
+                }
+            }
         }
         let text = std::mem::take(&mut self.pending);
         self.text(&text, callback)
@@ -756,6 +847,36 @@ impl ToolCallParser {
         }
         self.after_call = false;
         callback(Event::Content(text.to_owned()))
+    }
+}
+
+/// Where the open call ends: the block's end, the marker after it, and
+/// the strict tool whose exact layout the grammar enforced, if any.
+///
+/// A strict call ends at `\n</function>\n</tool_call>`, which neither a
+/// raw value (no `</tool_call>`) nor JSON (no raw newline before `<`) can
+/// contain, so a JSON string holding `</tool_call>` does not cut it short.
+/// Every other call ends at the first `</tool_call>`, as it always has.
+fn call_end<'t>(
+    pending: &str,
+    tools: &'t ToolSet,
+) -> Option<(usize, &'static str, Option<&'t Tool>)> {
+    let legacy = || pending.find(CALL_END).map(|end| (end, CALL_END, None));
+    if !tools.any_strict() {
+        return legacy();
+    }
+    // Until the header names a strict tool, only a legacy end can apply.
+    let Some((name, _)) = pending
+        .strip_prefix(FUNCTION_OPEN)
+        .and_then(|rest| rest.split_once('>'))
+    else {
+        return legacy();
+    };
+    match tools.get(name) {
+        Some(tool) if tool.strict.is_some() => pending
+            .find(STRICT_CALL_END)
+            .map(|end| (end, STRICT_CALL_END, Some(tool))),
+        _ => legacy(),
     }
 }
 
@@ -821,6 +942,58 @@ fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
     Ok(ToolCall {
         id: next_call_id(),
         name: name.to_owned(),
+        arguments,
+    })
+}
+
+/// Parse a strict tool's call exactly as its grammar spelled it.
+///
+/// `block` runs from just after `<tool_call>` to just before
+/// [`STRICT_CALL_END`]: `\n<function=NAME>` and then, per parameter,
+/// `\n<parameter=KEY>\nVALUE\n</parameter>`. A raw value is the string
+/// itself; any other value is JSON. The arguments are then validated against
+/// the tool's whole schema, like every call.
+fn parse_strict(block: &str, tool: &Tool) -> Result<ToolCall, String> {
+    let name = &tool.definition.name;
+    let Some(Ok(strict)) = &tool.strict else {
+        return Err(format!("{name}: strict tool has no enforced layout"));
+    };
+    let mut rest = block
+        .strip_prefix(FUNCTION_OPEN)
+        .and_then(|rest| rest.strip_prefix(name.as_str()))
+        .and_then(|rest| rest.strip_prefix('>'))
+        .ok_or("expected <function=NAME>")?;
+    let mut arguments = Map::new();
+    while !rest.is_empty() {
+        let parameter = rest
+            .strip_prefix(PARAMETER_OPEN)
+            .ok_or("expected <parameter=NAME>")?;
+        let (key, parameter) = parameter
+            .split_once(">\n")
+            .ok_or("unterminated <parameter= tag")?;
+        let declared = strict
+            .parameter(key)
+            .ok_or_else(|| format!("unknown parameter {key:?}"))?;
+        let (raw, after) = parameter
+            .split_once(PARAMETER_CLOSE)
+            .ok_or_else(|| format!("parameter {key:?} is missing </parameter>"))?;
+        if arguments.contains_key(key) {
+            return Err(format!("duplicate parameter {key:?}"));
+        }
+        let value = match &declared.value {
+            ValueKind::Raw(_) => Value::from(raw),
+            ValueKind::Json(_) => serde_json::from_str(raw)
+                .map_err(|error| format!("parameter {key:?} is not JSON: {error}"))?,
+        };
+        arguments.insert(key.to_owned(), value);
+        rest = after;
+    }
+    let mut arguments = Value::Object(arguments);
+    arguments.sort_all_objects();
+    validate_arguments(tool, &arguments).map_err(|error| format!("{name}: {error}"))?;
+    Ok(ToolCall {
+        id: next_call_id(),
+        name: name.clone(),
         arguments,
     })
 }

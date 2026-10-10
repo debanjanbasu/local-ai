@@ -5,11 +5,12 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use tokio::sync::mpsc as async_mpsc;
+use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 use super::{Delivered, Engine, Event, EventSplitter, Job, Stats, encode_prompt, prepare_chat};
 use crate::GenerateParams;
 use crate::bonsai_model::CancelToken;
+use crate::judgment::{Decision, JudgmentHead, PreparedDecision};
 use crate::runtime::PrefillProgress;
 use crate::structured::Grammar;
 use crate::tools::ToolSet;
@@ -38,6 +39,52 @@ struct Prepared {
     grammar: Option<Grammar>,
     events: async_mpsc::Sender<Delivered>,
     cancel: CancelToken,
+}
+
+/// An experimental decision waiting for the engine.
+pub(in crate::api) struct DecisionJob {
+    pub(in crate::api) prepared: PreparedDecision,
+    pub(in crate::api) head: Arc<JudgmentHead>,
+    pub(in crate::api) reply: oneshot::Sender<crate::Result<Option<Decision>>>,
+    pub(in crate::api) cancel: CancelToken,
+}
+
+impl DecisionJob {
+    /// Whether nobody wants the answer any more.
+    fn abandoned(&self) -> bool {
+        self.cancel.is_cancelled() || self.reply.is_closed()
+    }
+}
+
+/// What a waiting decision does at an admission point.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    /// Answer `Ok(None)` without GPU work.
+    Drop,
+    /// Hold the queue until running generations finish.
+    Wait,
+    /// Capture now.
+    Run,
+}
+
+/// Decisions capture on the resident buffers, so they run only with no
+/// active generation; a cancelled one is dropped wherever it waits.
+const fn decision_gate(abandoned: bool, active: usize) -> Gate {
+    if abandoned {
+        Gate::Drop
+    } else if active == 0 {
+        Gate::Run
+    } else {
+        Gate::Wait
+    }
+}
+
+/// A job taken off the queue and not yet admitted. There is at most one, so
+/// its size does not matter.
+#[allow(clippy::large_enum_variant)]
+enum Pending {
+    Generation(Prepared),
+    Decision(Box<DecisionJob>),
 }
 
 /// One admitted request's delivery side.
@@ -86,7 +133,7 @@ impl Delivery {
         let finished = if splitter.failed() {
             ControlFlow::Break(())
         } else {
-            splitter.finish(&mut |event| self.push(event))
+            splitter.finish(output.stop_reason, &mut |event| self.push(event))
         };
         if let Some(failure) = splitter.take_failure() {
             // A parse failure is terminal: report it, never `Finished`.
@@ -147,8 +194,9 @@ impl Delivery {
 pub(super) struct Worker {
     engine: Engine,
     receiver: async_mpsc::Receiver<Job>,
-    /// A request taken off the queue that did not fit yet.
-    waiting: Option<Prepared>,
+    /// A job taken off the queue that cannot start yet. While it waits no
+    /// later job is taken, so admission stays FIFO.
+    waiting: Option<Pending>,
     running: std::collections::HashMap<u64, Delivery>,
     /// Finished requests whose last events have not reached their channel.
     draining: Vec<Delivery>,
@@ -206,17 +254,43 @@ impl Worker {
     }
 
     /// Admit the waiting request and any queued behind it while they fit.
+    /// A decision runs here, synchronously, once no generation is active.
     fn admit_waiting(&mut self) {
         loop {
-            let prepared = match self.waiting.take() {
-                Some(prepared) => prepared,
+            let pending = match self.waiting.take() {
+                Some(pending) => pending,
                 None => match self.receiver.try_recv() {
                     Ok(job) => match self.prepare(job) {
-                        Some(prepared) => prepared,
+                        Some(pending) => pending,
                         None => continue,
                     },
                     Err(_) => return,
                 },
+            };
+            let prepared = match pending {
+                Pending::Generation(prepared) => prepared,
+                Pending::Decision(job) => {
+                    match decision_gate(job.abandoned(), self.engine.inner.active_generations()) {
+                        Gate::Drop => {
+                            let _ = job.reply.send(Ok(None));
+                        }
+                        Gate::Wait => {
+                            self.waiting = Some(Pending::Decision(job));
+                            return;
+                        }
+                        Gate::Run => {
+                            let DecisionJob {
+                                prepared,
+                                head,
+                                reply,
+                                cancel,
+                            } = *job;
+                            let result = prepared.run(&mut self.engine.inner, &head, &cancel);
+                            let _ = reply.send(result);
+                        }
+                    }
+                    continue;
+                }
             };
             if prepared.cancel.is_cancelled() || prepared.events.is_closed() {
                 prepared.cancel.cancel();
@@ -227,7 +301,7 @@ impl Worker {
                 .inner
                 .can_admit(prepared.ids.len(), prepared.params.max_tokens)
             {
-                self.waiting = Some(prepared);
+                self.waiting = Some(Pending::Generation(prepared));
                 return;
             }
             let mut delivery = Delivery {
@@ -257,8 +331,10 @@ impl Worker {
     }
 
     /// Render and tokenize a job, answering it at once if that fails.
-    fn prepare(&self, job: Job) -> Option<Prepared> {
+    /// Decisions were prepared when they were queued.
+    fn prepare(&self, job: Job) -> Option<Pending> {
         let (prompt, max_tokens, sampling, session, thinking, grammar, events, cancel) = match job {
+            Job::Decision(job) => return Some(Pending::Decision(job)),
             Job::Chat(request, grammar, events, cancel) => (
                 prepare_chat(&request),
                 request.max_tokens,
@@ -287,7 +363,7 @@ impl Worker {
             Ok((ids, tools)) => {
                 let mut params = sampling.0;
                 params.max_tokens = max_tokens;
-                Some(Prepared {
+                Some(Pending::Generation(Prepared {
                     ids,
                     params,
                     session,
@@ -296,7 +372,7 @@ impl Worker {
                     grammar,
                     events,
                     cancel,
-                })
+                }))
             }
             Err(error) => {
                 let _ = events.blocking_send(Delivered::Event(Event::Error(error.to_string())));
@@ -320,5 +396,143 @@ impl Worker {
             }
             left
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc as async_mpsc;
+
+    use super::{Gate, Job, decision_gate};
+    use crate::api::EngineHandle;
+    use crate::bonsai_tokenizer::BonsaiTokenizer;
+    use crate::judgment::{DecisionKind, DecisionRequest, DecisionValue, JudgmentHead};
+
+    /// A head of the model's width; its weights are never used here.
+    fn head() -> Arc<JudgmentHead> {
+        let width = crate::bonsai::WIDTH;
+        Arc::new(JudgmentHead::for_tests(
+            width,
+            1,
+            vec![0.0; width],
+            vec![0.0],
+            vec![0.0; width],
+            vec![0.0],
+            1.0,
+        ))
+    }
+
+    fn handle(capacity: usize) -> (EngineHandle, async_mpsc::Receiver<Job>) {
+        let (sender, receiver) = async_mpsc::channel(capacity);
+        let handle = EngineHandle {
+            sender,
+            tokenizer: BonsaiTokenizer::tiny_for_tests(),
+        };
+        (handle, receiver)
+    }
+
+    fn request(kind: DecisionKind) -> DecisionRequest {
+        DecisionRequest {
+            state: "Diff:\n+x".into(),
+            question: "Is it right?".into(),
+            kind,
+        }
+    }
+
+    fn decision(job: Job) -> super::DecisionJob {
+        match job {
+            Job::Decision(job) => *job,
+            _ => panic!("not a decision job"),
+        }
+    }
+
+    #[test]
+    fn decisions_wait_for_running_generations_and_drop_when_abandoned() {
+        assert_eq!(decision_gate(false, 0), Gate::Run);
+        assert_eq!(decision_gate(false, 3), Gate::Wait);
+        assert_eq!(decision_gate(true, 3), Gate::Drop);
+        assert_eq!(decision_gate(true, 0), Gate::Drop);
+    }
+
+    /// Invalid requests and foreign heads fail on the caller's thread and
+    /// queue nothing; valid ones share the bounded queue.
+    #[test]
+    fn decisions_validate_before_queueing_and_respect_the_bound() {
+        let (handle, mut jobs) = handle(1);
+        let bad = DecisionRequest {
+            state: "<|x|>".into(),
+            ..request(DecisionKind::Predicate)
+        };
+        assert!(handle.decide(head(), &bad).is_err());
+        let narrow = Arc::new(JudgmentHead::for_tests(
+            3,
+            1,
+            vec![0.0; 3],
+            vec![0.0],
+            vec![0.0; 3],
+            vec![0.0],
+            1.0,
+        ));
+        assert!(
+            handle
+                .decide(narrow, &request(DecisionKind::Predicate))
+                .is_err()
+        );
+        assert!(jobs.try_recv().is_err(), "nothing was queued");
+
+        let first = handle
+            .decide(head(), &request(DecisionKind::Predicate))
+            .expect("queued");
+        assert!(matches!(
+            handle.decide(head(), &request(DecisionKind::Predicate)),
+            Err(crate::Error::QueueFull)
+        ));
+        let job = decision(jobs.try_recv().expect("one job"));
+        assert!(!job.abandoned());
+        drop(first);
+        assert!(job.abandoned(), "dropping the pending decision cancels it");
+    }
+
+    #[test]
+    fn cancelled_decisions_resolve_to_none() {
+        let (handle, mut jobs) = handle(2);
+        let pending = handle
+            .decide(
+                head(),
+                &request(DecisionKind::Choice(vec![
+                    DecisionValue::Text("left".into()),
+                    DecisionValue::Bool(false),
+                ])),
+            )
+            .expect("queued");
+        let job = decision(jobs.try_recv().expect("job"));
+        pending.cancel_handle().cancel();
+        assert!(job.abandoned());
+        assert_eq!(decision_gate(job.abandoned(), 1), Gate::Drop);
+        // What the worker answers for a dropped decision.
+        let _ = job.reply.send(Ok(None));
+        assert!(matches!(pending.wait(), Ok(None)));
+
+        // A worker that goes away without answering is an error, not a hang.
+        let pending = handle
+            .decide(head(), &request(DecisionKind::Predicate))
+            .expect("queued");
+        drop(jobs);
+        assert!(pending.wait().is_err());
+    }
+
+    #[test]
+    fn a_single_level_score_resolves_without_the_worker() {
+        let (handle, mut jobs) = handle(1);
+        let pending = handle
+            .decide(head(), &request(DecisionKind::Score(vec!["only".into()])))
+            .expect("ready");
+        assert!(jobs.try_recv().is_err(), "nothing was queued");
+        let decision = pending.wait().expect("ok").expect("decided");
+        assert_eq!((decision.argmax, decision.score), (0, Some(0.0)));
+        assert!(!decision.captured);
     }
 }

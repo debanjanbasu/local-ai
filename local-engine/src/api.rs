@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -10,23 +11,24 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use futures_core::Stream;
-use tokio::sync::mpsc as async_mpsc;
+use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 use crate::bonsai_model::{BonsaiEngine, BonsaiInfo, CancelToken, PromptCacheSource, StopReason};
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
 use crate::bonsai_tokenizer::BonsaiTokenizer;
+use crate::judgment::{Decision, DecisionRequest, JudgmentHead, PreparedDecision};
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
 use crate::runtime::{EVENT_BUFFER, PrefillProgress};
 use crate::structured::{Grammar, ResponseFormat};
-use crate::tools::{ToolCall, ToolCallParser, ToolDefinition, ToolSet, Turn};
+use crate::tools::{ToolCall, ToolCallParser, ToolChoice, ToolDefinition, ToolSet, Turn};
 use crate::{GenerateParams, GenerationStats};
 
 mod worker;
 
 #[cfg(test)]
 use worker::Delivery;
-use worker::Worker;
+use worker::{DecisionJob, Worker};
 
 const THINK_END: &str = "</think>";
 
@@ -66,14 +68,25 @@ pub struct ChatRequest {
     /// Optional prompt-cache affinity hint.
     pub session: Option<String>,
     /// Functions the model may call. Empty disables tool-call parsing, so
-    /// `<tool_call>` text stays ordinary content. The model decides whether to
-    /// call; nothing forces a call.
+    /// `<tool_call>` text stays ordinary content. With the defaults
+    /// ([`ToolChoice::Auto`], `parallel_tool_calls`, no
+    /// [`ToolDefinition::strict`] tool, text answer) the model decides
+    /// whether to call and nothing constrains generation.
     pub tools: Vec<ToolDefinition>,
+    /// Whether and which tool must be called. Anything but
+    /// [`ToolChoice::Auto`] is enforced by the native tool grammar; a
+    /// required or named call needs `tools` (and a configured name).
+    pub tool_choice: ToolChoice,
+    /// Whether one answer may hold several calls. `false` enforces at most
+    /// one call through the native tool grammar: nothing but whitespace may
+    /// follow it, and free text can never contain `<tool_call>`.
+    pub parallel_tool_calls: bool,
     /// The shape the final answer must take. Anything but
     /// [`ResponseFormat::Text`] is compiled before the request is queued
     /// and enforced on every generated answer token; reasoning (with
-    /// `thinking`) stays unconstrained up to `</think>`. Cannot be combined
-    /// with `tools`.
+    /// `thinking`) stays unconstrained up to `</think>`. With `tools`, the
+    /// answer is either a call or (unless a call is required) the final
+    /// answer in this format, both enforced by one grammar.
     pub response_format: ResponseFormat,
 }
 
@@ -346,6 +359,8 @@ impl Engine {
             thinking: true,
             session: None,
             tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: true,
             response_format: ResponseFormat::Text,
         };
         let mut content = String::new();
@@ -470,7 +485,7 @@ impl Engine {
         let finished = if splitter.failed() {
             ControlFlow::Break(())
         } else {
-            splitter.finish(&mut callback)
+            splitter.finish(output.stop_reason, &mut callback)
         };
         if let Some(failure) = splitter.take_failure() {
             return Err(crate::Error::Generation(failure));
@@ -513,6 +528,37 @@ impl Engine {
         Ok(text)
     }
 
+    /// EXPERIMENTAL: answer a typed text question with an explicitly
+    /// supplied judgment `head`; see [`crate::judgment`].
+    ///
+    /// The request is rendered exactly as the head's training rows were,
+    /// tokenized, and its option and decision rows are captured on this
+    /// engine's loaded model (no second model) in
+    /// [`DECISION_CAPTURE_ROWS`](crate::judgment::DECISION_CAPTURE_ROWS)-row
+    /// blocks, FP16-rounded and scored. The result carries the head's
+    /// probabilities per caller option, the argmax and, for scores, the
+    /// probability-weighted level index — no confidence, threshold or
+    /// refusal. The current head was trained on two-option code-diff
+    /// questions only; see
+    /// [`CALIBRATION_SCOPE`](crate::judgment::CALIBRATION_SCOPE).
+    ///
+    /// Invalid requests (including text spelling a special token) and a head
+    /// whose width is not the model's fail with
+    /// [`crate::Error::InvalidArgument`] before any GPU work. A single-level
+    /// score is answered without GPU work. Capture overwrites one sequence
+    /// buffer set; the GPU prompt-cache tier is preserved when a free set
+    /// exists and cleared otherwise, so a later request may prefill more.
+    pub fn decide(
+        &mut self,
+        head: &JudgmentHead,
+        request: &DecisionRequest,
+    ) -> crate::Result<Decision> {
+        let prepared = PreparedDecision::new(self.inner.tokenizer(), head, request)?;
+        prepared
+            .run(&mut self.inner, head, &CancelToken::new())?
+            .ok_or_else(|| crate::Error::Generation("decision was cancelled".into()))
+    }
+
     /// Move this engine to a dedicated worker thread.
     #[must_use]
     pub fn into_handle(self) -> EngineHandle {
@@ -534,6 +580,8 @@ enum Job {
         async_mpsc::Sender<Delivered>,
         CancelToken,
     ),
+    /// An experimental decision, validated and tokenized.
+    Decision(Box<DecisionJob>),
 }
 
 /// A progress reporter that records nothing.
@@ -595,9 +643,10 @@ impl EngineHandle {
 
     /// Queue a chat request and return a blocking event iterator.
     ///
-    /// A [`ChatRequest::response_format`] other than text is compiled here,
-    /// on the calling thread, so an invalid or unsupported schema fails this
-    /// call with [`crate::Error::InvalidArgument`] and nothing is queued. The
+    /// A [`ChatRequest::response_format`] other than text, and any native
+    /// tool constraint, is compiled here, on the calling thread, so an
+    /// invalid or unsupported schema fails this call with
+    /// [`crate::Error::InvalidArgument`] and nothing is queued. The
     /// first constrained request also builds the tokenizer's grammar tables
     /// once; async callers should submit constrained requests from a
     /// blocking pool.
@@ -608,7 +657,7 @@ impl EngineHandle {
     /// ```no_run
     /// # use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
     /// let handle = Engine::open()?.into_handle();
-    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, session: None, tools: Vec::new(), response_format: local_engine::ResponseFormat::Text };
+    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, session: None, tools: Vec::new(), tool_choice: local_engine::ToolChoice::Auto, parallel_tool_calls: true, response_format: local_engine::ResponseFormat::Text };
     /// for event in handle.chat(request)? {
     ///     if let Event::Content(text) = event { print!("{text}"); }
     /// }
@@ -642,26 +691,124 @@ impl EngineHandle {
         self.complete(request)
     }
 
+    /// EXPERIMENTAL: queue a typed text question for an explicitly supplied
+    /// judgment `head`, as [`Engine::decide`] answers it.
+    ///
+    /// The request is validated, rendered and tokenized here, on the calling
+    /// thread against the shared tokenizer, so an invalid request or a head
+    /// of the wrong width fails this call and nothing is queued; async
+    /// callers should call it from a blocking pool for long state text. A
+    /// single-level score resolves at once without queueing.
+    ///
+    /// The decision shares the bounded job queue (a full queue is
+    /// [`crate::Error::QueueFull`]) and its FIFO order: once it reaches the
+    /// worker, nothing queued behind it is admitted until it has run, and it
+    /// runs only once every running generation has finished, so neither side
+    /// starves. Dropping the returned [`PendingDecision`] or cancelling its
+    /// [`CancelHandle`] skips a queued decision, or stops a running capture
+    /// before its next block, resolving to `Ok(None)`.
+    pub fn decide(
+        &self,
+        head: Arc<JudgmentHead>,
+        request: &DecisionRequest,
+    ) -> crate::Result<PendingDecision> {
+        let prepared = PreparedDecision::new(&self.tokenizer, &head, request)?;
+        let (reply, receiver) = oneshot::channel();
+        let cancel = CancelToken::new();
+        let pending = PendingDecision {
+            receiver,
+            cancel: cancel.clone(),
+        };
+        if !prepared.needs_capture() {
+            let _ = reply.send(prepared.ready().map(Some));
+            return Ok(pending);
+        }
+        self.send(Job::Decision(Box::new(DecisionJob {
+            prepared,
+            head,
+            reply,
+            cancel,
+        })))?;
+        Ok(pending)
+    }
+
+    fn send(&self, job: Job) -> crate::Result<()> {
+        self.sender.try_send(job).map_err(|error| match error {
+            async_mpsc::error::TrySendError::Full(_) => crate::Error::QueueFull,
+            async_mpsc::error::TrySendError::Closed(_) => {
+                crate::Error::Generation("engine worker stopped".into())
+            }
+        })
+    }
+
     fn submit(
         &self,
         job: impl FnOnce(async_mpsc::Sender<Delivered>, CancelToken) -> Job,
     ) -> crate::Result<EventStream> {
         let (sender, receiver) = async_mpsc::channel::<Delivered>(EVENT_BUFFER);
         let cancel = CancelToken::new();
-        self.sender
-            .try_send(job(sender, cancel.clone()))
-            .map_err(|error| match error {
-                async_mpsc::error::TrySendError::Full(_) => crate::Error::QueueFull,
-                async_mpsc::error::TrySendError::Closed(_) => {
-                    crate::Error::Generation("engine worker stopped".into())
-                }
-            })?;
+        self.send(job(sender, cancel.clone()))?;
         Ok(EventStream {
             receiver,
             progress: VecDeque::new(),
             cancel,
             not_sync: std::marker::PhantomData,
         })
+    }
+}
+
+/// An experimental decision queued on an [`EngineHandle`]; dropping it
+/// cancels the decision.
+///
+/// Resolves to `Ok(Some(decision))`, `Ok(None)` when cancelled before it
+/// finished, or the decision's error. Await it as a [`Future`], or block
+/// with [`Self::wait`].
+pub struct PendingDecision {
+    receiver: oneshot::Receiver<crate::Result<Option<Decision>>>,
+    cancel: CancelToken,
+}
+
+impl PendingDecision {
+    /// Obtain an independently owned cancellation control.
+    #[must_use]
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            cancel: self.cancel.clone(),
+        }
+    }
+
+    /// Block the calling thread until the decision resolves. Safe inside a
+    /// runtime task (it parks rather than panicking), though it blocks the
+    /// runtime worker.
+    pub fn wait(mut self) -> crate::Result<Option<Decision>> {
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(result) = Pin::new(&mut self).poll(&mut context) {
+                return result;
+            }
+            std::thread::park();
+        }
+    }
+}
+
+impl Future for PendingDecision {
+    type Output = crate::Result<Option<Decision>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().receiver)
+            .poll(cx)
+            .map(|result| {
+                result.unwrap_or_else(|_| {
+                    Err(crate::Error::Generation("engine worker stopped".into()))
+                })
+            })
+    }
+}
+
+impl Drop for PendingDecision {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -924,18 +1071,39 @@ fn chat_prompt_ids(
     Ok((encode_prompt(tokenizer, &prompt)?, tools))
 }
 
-/// Compile a chat request's response format: from `</think>` on with
-/// thinking, else from the first token.
+/// Compile a chat request's constraint: from `</think>` on with thinking,
+/// else from the first token.
+///
+/// A request whose tool settings need it (see
+/// [`crate::tools::grammar::needs_grammar`]) gets the native tool grammar,
+/// which also carries its response format; otherwise only a response format
+/// is compiled, as before tools could be constrained.
 fn chat_grammar(
     tokenizer: &BonsaiTokenizer,
     request: &ChatRequest,
 ) -> crate::Result<Option<Grammar>> {
-    if !request.response_format.is_text() && !request.tools.is_empty() {
-        return Err(crate::Error::InvalidArgument(
-            "response_format cannot be combined with tools".into(),
-        ));
+    crate::tools::check_choice(&request.tools, &request.tool_choice)?;
+    if request.tools.is_empty() {
+        return tokenizer.compile_format(&request.response_format, request.thinking);
     }
-    tokenizer.compile_format(&request.response_format, request.thinking)
+    let tools = ToolSet::new(&request.tools)?;
+    if !crate::tools::grammar::needs_grammar(
+        &tools,
+        &request.tool_choice,
+        request.parallel_tool_calls,
+        request.response_format.is_text(),
+    ) {
+        return Ok(None);
+    }
+    tokenizer
+        .compile_tools(
+            &tools,
+            &request.tool_choice,
+            request.parallel_tool_calls,
+            &request.response_format,
+            request.thinking,
+        )
+        .map(Some)
 }
 
 /// Compile a raw completion's response format, which has no reasoning phase.
@@ -1068,7 +1236,13 @@ impl EventSplitter {
         callback(Event::Reasoning(text))
     }
 
-    fn finish(&mut self, callback: &mut impl FnMut(Event) -> ControlFlow<()>) -> ControlFlow<()> {
+    /// Flush held text for generation that stopped for `reason`; see
+    /// [`ToolCallParser::finish`] for what an unfinished call becomes.
+    fn finish(
+        &mut self,
+        reason: StopReason,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         if !self.pending.is_empty() {
             let text = std::mem::take(&mut self.pending);
             let event = if self.reasoning {
@@ -1082,7 +1256,9 @@ impl EventSplitter {
         }
         self.tools
             .as_mut()
-            .map_or(ControlFlow::Continue(()), |parser| parser.finish(callback))
+            .map_or(ControlFlow::Continue(()), |parser| {
+                parser.finish(reason, callback)
+            })
     }
 }
 

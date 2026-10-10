@@ -26,9 +26,20 @@
 //! native work is the channel closing, which a cancelled request does without
 //! sending `Finished`. The job's store lease and engine queue slot are held
 //! until that close, so neither is released while the worker still runs.
+//!
+//! A background Response created with `store: false` (or with `store`
+//! omitted on a server without `--response-store`) runs exactly the same
+//! way, but in [`Temporary`]: a private, owner-only store this process
+//! creates under the system temporary directory and removes when it stops.
+//! It reports `store: false`, never touches the configured store, and stays
+//! retrievable, cancellable and replayable until [`TEMPORARY_RETENTION`]
+//! after it ends; a running job is never expired. Nothing about it is
+//! durable: a restart discards it.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -212,6 +223,10 @@ impl Inner {
         };
         self.published
             .send_modify(|published| published.settled = true);
+        // Retention of a temporary response counts from here, its end.
+        if let Some(temporary) = self.doc.temporary() {
+            temporary.retain(self.doc.id());
+        }
         settled
     }
 }
@@ -419,7 +434,16 @@ impl Background {
                     format!("response {id} is already leased"),
                 )
             })?;
+        // A temporary response is answered for from the temporary store from
+        // here on, and forgotten again if it is not admitted.
+        let temporary = doc.temporary().cloned();
+        if let Some(temporary) = &temporary {
+            temporary.track(&id);
+        }
         let not_stored = |error: std::io::Error| {
+            if let Some(temporary) = &temporary {
+                temporary.forget(&id);
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("the background response could not be stored: {error}"),
@@ -586,6 +610,283 @@ fn lease_or_conflict(store: &ResponseStore, id: &str) -> Result<ResponseLease, F
                 ),
             )
         })
+}
+
+/// How long a background `store: false` Response stays retrievable after it
+/// ends, as `OpenAI` documents its temporary retention ("roughly 10 minutes").
+pub(super) const TEMPORARY_RETENTION: Duration = Duration::from_mins(10);
+
+/// What [`Temporary`] reads the time from.
+pub(super) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// The private store of background `store: false` Responses, and when each
+/// expires.
+///
+/// Its records and journals are the ordinary [`ResponseStore`] files, so
+/// every lifecycle path (admission, the pump, cancellation, deletion,
+/// streaming and replay) is the durable one; only where they live and how
+/// long differ. An ID is answered for here exactly while this index holds
+/// it, and never looked up in the configured store meanwhile, so the two
+/// never answer for the same ID.
+///
+/// Expiry needs no scan: a response gets its deadline when it settles, an
+/// access past the deadline expires it on the spot, and [`Self::reap`] parks
+/// until the nearest deadline or a new one, deleting only what is due.
+/// Expiring a response deletes it through [`Background::delete`], under its
+/// job's lock; it has already settled, so no native work is cancelled.
+pub(super) struct Temporary {
+    store: Arc<ResponseStore>,
+    ttl: Duration,
+    clock: Clock,
+    index: Mutex<Index>,
+    /// Wakes [`Self::reap`] for an earlier deadline or for shutdown.
+    wake: Condvar,
+    /// The private directory this process created, removed by
+    /// [`Self::close`] or on drop; `None` when the store is borrowed.
+    dir: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct Index {
+    /// Every response kept here: `None` while it runs, its expiry once it
+    /// has ended.
+    ids: HashMap<String, Option<Instant>>,
+    /// The ended ones, earliest expiry first.
+    deadlines: BTreeSet<(Instant, String)>,
+    closed: bool,
+}
+
+impl std::fmt::Debug for Temporary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Temporary")
+            .field("store", &self.store)
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Create a fresh owner-only directory under the system temporary directory.
+///
+/// The name is random and the directory is created, not reused, so nothing
+/// another user prepared can be adopted; on Unix it must then be a real
+/// directory owned by this user.
+fn private_dir() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(super::response::new_id("local-ai-temporary-"));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        if !metadata.is_dir() || metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} is not a private directory", dir.display()),
+            ));
+        }
+    }
+    Ok(dir)
+}
+
+impl Temporary {
+    /// Create the private store, in a new owner-only directory that
+    /// [`Self::close`] removes.
+    pub(super) fn create() -> std::io::Result<Arc<Self>> {
+        let dir = private_dir()?;
+        match ResponseStore::open(&dir) {
+            Ok(store) => {
+                let mut temporary =
+                    Self::with(Arc::new(store), TEMPORARY_RETENTION, Arc::new(Instant::now));
+                temporary.dir = Some(dir);
+                Ok(Arc::new(temporary))
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                Err(error)
+            }
+        }
+    }
+
+    /// Keep temporary responses in `store` for `ttl` after they end, by
+    /// `clock`. The directory is the caller's.
+    pub(super) fn with(store: Arc<ResponseStore>, ttl: Duration, clock: Clock) -> Self {
+        Self {
+            store,
+            ttl,
+            clock,
+            index: Mutex::default(),
+            wake: Condvar::new(),
+            dir: None,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Index> {
+        self.index.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) const fn store(&self) -> &Arc<ResponseStore> {
+        &self.store
+    }
+
+    /// Answer for response `id`, which is being admitted, from here.
+    pub(super) fn track(&self, id: &str) {
+        self.lock().ids.insert(id.to_owned(), None);
+    }
+
+    /// Start the retention of response `id`, which has just ended. Once only:
+    /// a later settlement attempt does not extend it.
+    pub(super) fn retain(&self, id: &str) {
+        let mut index = self.lock();
+        let deadline = (self.clock)() + self.ttl;
+        if let Some(slot @ None) = index.ids.get_mut(id) {
+            *slot = Some(deadline);
+            index.deadlines.insert((deadline, id.to_owned()));
+            drop(index);
+            self.wake.notify_all();
+        }
+    }
+
+    /// Stop answering for response `id`.
+    pub(super) fn forget(&self, id: &str) {
+        let mut index = self.lock();
+        if let Some(Some(deadline)) = index.ids.remove(id) {
+            index.deadlines.remove(&(deadline, id.to_owned()));
+        }
+    }
+
+    /// Whether response `id` is kept here, expired or not.
+    pub(super) fn knows(&self, id: &str) -> bool {
+        self.lock().ids.contains_key(id)
+    }
+
+    /// Whether response `id` is kept here: `None` when it is not this
+    /// store's, `Some(false)` when its retention had ended, and it has now
+    /// been deleted. Blocks on the store.
+    pub(super) fn holds(&self, background: &Background, id: &str) -> Option<bool> {
+        let deadline = *self.lock().ids.get(id)?;
+        let expired = deadline.is_some_and(|deadline| deadline <= (self.clock)());
+        if expired {
+            self.expire(background, id);
+        }
+        Some(!expired)
+    }
+
+    /// Delete response `id` and stop answering for it. Its job, if it is
+    /// still draining, sees a deletion; it has ended, so nothing is cancelled.
+    fn expire(&self, background: &Background, id: &str) {
+        if let Err((_, message)) = background.delete(&self.store, id) {
+            // Unreachable from now on all the same; the directory goes when
+            // the server stops.
+            eprintln!("temporary response {id} not deleted on expiry: {message}");
+        }
+        self.forget(id);
+    }
+
+    /// Delete every response whose retention has ended, returning how many.
+    /// Blocks on the store.
+    pub(super) fn expire_due(&self, background: &Background) -> usize {
+        let now = (self.clock)();
+        let due: Vec<String> = {
+            let index = self.lock();
+            index
+                .deadlines
+                .iter()
+                .take_while(|(deadline, _)| *deadline <= now)
+                .map(|(_, id)| id.clone())
+                .collect()
+        };
+        for id in &due {
+            self.expire(background, id);
+        }
+        due.len()
+    }
+
+    /// The private directory this process created for the store.
+    #[cfg(test)]
+    pub(super) fn dir(&self) -> Option<&std::path::Path> {
+        self.dir.as_deref()
+    }
+
+    /// The earliest pending expiry.
+    #[cfg(test)]
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        self.lock().deadlines.first().map(|(deadline, _)| *deadline)
+    }
+
+    /// Expire responses as they fall due, on a thread of its own that parks
+    /// until the nearest deadline or a new one, until [`Self::close`].
+    pub(super) fn reap(
+        self: &Arc<Self>,
+        background: Arc<Background>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let temporary = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("local-ai-temporary-expiry".into())
+            .spawn(move || {
+                loop {
+                    let mut index = temporary.lock();
+                    loop {
+                        if index.closed {
+                            return;
+                        }
+                        let now = (temporary.clock)();
+                        index = match index.deadlines.first() {
+                            Some((deadline, _)) if *deadline <= now => break,
+                            Some((deadline, _)) => {
+                                let wait = *deadline - now;
+                                temporary
+                                    .wake
+                                    .wait_timeout(index, wait)
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .0
+                            }
+                            None => temporary
+                                .wake
+                                .wait(index)
+                                .unwrap_or_else(PoisonError::into_inner),
+                        };
+                    }
+                    drop(index);
+                    temporary.expire_due(&background);
+                }
+            })
+    }
+
+    /// Stop expiring, forget every response and remove the private
+    /// directory, records and journals with it. For shutdown, once no job
+    /// writes any more.
+    pub(super) fn close(&self) {
+        {
+            let mut index = self.lock();
+            index.closed = true;
+            index.ids.clear();
+            index.deadlines.clear();
+        }
+        self.wake.notify_all();
+        if let Some(dir) = &self.dir
+            && let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "temporary response directory {} not removed: {error}",
+                dir.display()
+            );
+        }
+    }
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 /// Start `events` as a background job and return its `queued` Response;
