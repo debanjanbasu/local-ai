@@ -402,8 +402,9 @@ is 1.074x and the best measured result 1.29%.
 
 - `local-engine`: GGUF reader, tokenizer, inference, caching, speculation, API.
 - `local-ai`: `chat`, `bonsai`, and `serve` commands and HTTP server.
-- `local-services`: durable conversations, files, uploads and batches (SQLite)
-  and read-only workspace search; no model required.
+- `local-services`: durable conversations, files, uploads, batches and
+  lexical (BM25) vector stores (SQLite, Tantivy) and read-only workspace
+  search; no model required.
 - `local-metal`, `shaders`: Metal dispatch code, kernels, and GPU tests.
 - `tools`: Kaggle staging and installation helpers and tests.
 - `docs/BONSAI.md`: technical reference and measurements.

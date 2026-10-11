@@ -1,8 +1,8 @@
 # local-services
 
 Durable native services shared by the `local-ai` server and native Rust
-callers: Conversations, Files and Uploads, Batches, and a read-only repository
-Workspace. Nothing here loads or needs a model, and nothing reaches the
+callers: Conversations, Files and Uploads, Batches, Vector Stores (lexical),
+and a read-only repository Workspace. Nothing here loads or needs a model, and nothing reaches the
 network. Batches only queue and record lines; the server's worker generates
 them on the one loaded model.
 
@@ -12,7 +12,8 @@ There is one fixed implementation per job, not a set of optional backends:
 | --- | --- |
 | Durable state | One bundled SQLite database through [`rusqlite` 0.40.2](https://docs.rs/rusqlite/0.40.2/rusqlite/) (`bundled` feature, no other features) |
 | File bytes | Owner-only blob files beside the database, tracked by SQLite rows |
-| Ranked repository search | A fresh in-RAM [Tantivy 0.26.2](https://docs.rs/tantivy/0.26.2/tantivy/) index built for each call (default features off) |
+| Ranked repository search | A fresh in-RAM [Tantivy 0.26.2](https://docs.rs/tantivy/0.26.2/tantivy/) index built for each call (default features off; `mmap` and `stemmer` on) |
+| Vector store search | One persistent Tantivy index beside the database, derived from it (BM25, no embeddings) |
 | Exact or regex matches | ripgrep's [`grep-searcher` 0.1.17](https://docs.rs/grep-searcher/0.1.17/grep_searcher/) and [`grep-regex` 0.1.14](https://docs.rs/grep-regex/0.1.14/grep_regex/) |
 | Discovery walk | [`ignore` 0.4.33](https://docs.rs/ignore/0.4.33/ignore/) (`.gitignore`, `.ignore`, `.git/info/exclude`) |
 | Rooted file access | [`cap-std` 4.0.3](https://docs.rs/cap-std/4.0.3/cap_std/fs/struct.Dir.html) `Dir` handles |
@@ -177,6 +178,65 @@ file that was committed is reused by an interrupted finish and is never
 recreated after deletion or expiry. Expiry and cancellation are observed at
 line boundaries.
 
+## Vector Stores
+
+`vector_stores` implements `OpenAI`'s Vector Stores objects (stores, store
+files, file batches, file content, search) over the Files API. The full
+contract, limits and semantics are the module docs; the essentials:
+
+- **Ranking is lexical BM25, not embeddings.** Tantivy, `k1 = 1.2`,
+  `b = 0.75`, statistics over all stores' chunks; Unicode words, lowercased,
+  ASCII-folded, English Porter-2 stemming. Scores are `s / (1 + s)` of the BM25
+  score `s`: in `[0, 1)`, ordered like BM25 within one query, not calibrated
+  and not comparable across queries. `rewrite_query: true` and the
+  `default-2024-11-15` ranker are refused; `auto` and `none` are plain BM25.
+  Pooled Bonsai hidden states were measured as embeddings and rejected (see
+  [docs/BONSAI.md](../docs/BONSAI.md#tried-and-rejected)).
+- **Lifecycle.** Attaching a live File (any purpose) answers `in_progress`;
+  the indexer reads UTF-8 text (BOM dropped; NUL or invalid UTF-8 is
+  `unsupported_file`; over 16 MiB, empty, or over 50,000 chunks is
+  `invalid_file`) and the file ends `completed`, `failed` or, after its
+  batch is cancelled, `cancelled`. Chunk sizes (`auto` = 800/400,
+  `static` = 100 to 4,096 with overlap at most half) count whitespace words,
+  not model tokens. Deleting the source File removes it from every store.
+- **Expiry.** `expires_after` (`last_active_at`, 1 to 365 days); an expired
+  store reads as `expired` and refuses search and attachments with a
+  conflict. Searches record activity at most once a minute per store.
+- **Filters.** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `and`, `or`
+  over file attributes (at most 16 per file), bounded in depth and size.
+
+`VectorIndex::open(&store)` owns the index (an exclusive lock file; a second
+process gets a conflict) and is the native search API (`search`, used by a
+`file_search` tool); `VectorStoreIndexer` is the event-driven worker thread
+(woken by `notify`, never polling) that calls `collect_garbage` and
+`index_next`.
+
+### Index consistency
+
+SQLite is the source of truth (rows, parsed text, chunk byte ranges); the
+Tantivy index holds postings only, one document per chunk keyed by
+attachment and ordinal. Because the two cannot share a transaction, one
+invariant is kept instead: every chunk of a completed file has its document,
+and any other document belongs to an attachment in the
+`vector_store_index_garbage` outbox.
+
+1. Indexing lists the attachments in the outbox, commits their documents to
+   Tantivy (up to 64 files or 8 MiB of text per commit), then marks them
+   `completed`, inserts their chunks and clears their outbox entries in one
+   SQLite transaction. A crash in between leaves them `in_progress` (redone,
+   replacing their documents) with their documents queued for removal.
+2. Deleting files, stores or source Files commits the SQLite deletion; a
+   trigger queues each removed attachment, and the indexer deletes its
+   documents before clearing the entry.
+3. Search admits only attachments `completed` in its SQLite snapshot, so
+   queued documents never surface.
+4. Opening collects the outbox, then compares live documents with chunk rows
+   and rebuilds the index from the stored text on any mismatch, or when the
+   index is missing, unreadable or of another schema.
+
+Tests simulate each crash point, a lost index, an unreadable `meta.json` and
+a document planted outside the protocol.
+
 ## Workspace
 
 `Workspace::open(root)` gives synchronous, read-only access to one directory
@@ -254,8 +314,9 @@ the one Tantivy path instead.
 The following are not part of this crate:
 
 - Encryption at rest.
-- A background sweeper or poller.
-- A persistent search index, embeddings or vector stores.
+- A background sweeper or poller (the vector store indexer runs only when
+  notified).
+- Embeddings or semantic (vector) search; vector stores are lexical.
 - Physical purge of deleted conversations.
 - Compaction.
 - Model training.
