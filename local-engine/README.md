@@ -42,7 +42,50 @@ inform this division:
 The engine keeps no conversation or file records (only its prompt caches). A
 harness that wants durable conversations, files, or bounded read-only
 repository search (ranked, exact or regex) can call the model-free [`local-services`](../local-services/README.md) crate, which the
-server also uses. Compaction remains the harness's job.
+server also uses. Deciding when and what to compact remains the harness's job;
+the engine only phrases and renders the summary generation (see
+[Compaction and reasoning summaries](#compaction-and-reasoning-summaries)).
+
+### Compaction and reasoning summaries
+
+Both are ordinary generations of the one loaded checkpoint, with thinking off,
+so the summary is the generation's visible content and never its raw
+reasoning. `local_engine::compaction` owns only the model-facing half:
+
+- `compaction_request(history, tools, session)` renders `history` exactly as
+  the conversation's own turns are, then a fixed checkpoint instruction asking
+  for goals, decisions, exact identifiers and results, tool outcomes and every
+  unresolved item. Pass the conversation's tools and session: the prompt then
+  shares the conversation's rendered prefix, so the prompt cache can serve it
+  (tools are rendered with `ToolChoice::None`, so no call can be made).
+- `summary_message(summary)` is how a compacted summary is rendered back: one
+  `user` message under a fixed `[Context compacted]` header, in place of the
+  turns it replaced.
+- `reasoning_summary_request(reasoning, SummaryDetail)` quotes a generation's
+  raw reasoning and asks for an `auto` (one paragraph, at most 320 tokens),
+  `concise` (one to three sentences, 160) or `detailed` (900) summary.
+
+The session half is model-free, in `local_services::compaction`: `plan`
+chooses which items to summarize and which to keep verbatim, `should_compact`
+decides from a token count, an optional threshold, the output reservation and
+the context, and a prompt is rendered from the latest `compaction` item, whose
+`Compacted` payload carries the summary and the kept items. A cut never falls
+between a `function_call` and its `function_call_output` or inside an
+assistant turn, so pending calls and everything after them are kept; the
+leading system message and the latest user message are always kept verbatim;
+the newest items are kept up to a token budget measured with
+`count_chat_tokens`. A harness counts, plans, runs `compaction_request` on the
+engine, collects `Event::Content`, and replaces the summarized items.
+
+Cost and risk: a compaction pass prefills the summarized history (served from
+the prompt cache when the conversation's own last turn left it there, prefilled
+again otherwise) and decodes up to 2,048 summary tokens; a reasoning summary
+prefills the reasoning once more and decodes up to its budget, after the
+answer. Both are queued like any request. A summary is lossy: details the model
+leaves out (an exact error string, a file it read) are gone from the prompt,
+and a wrong summary is believed by later turns. Only the kept items are exact,
+so keep the budget generous for work that depends on verbatim history, and
+keep the original items (the server's stores do) when they may be needed again.
 
 ### Counting prompt tokens
 
@@ -337,7 +380,10 @@ show what each flag changes:
   sent on every reasoning request by default. The server refuses that `include`
   unless it was started with `--reasoning-key`; with a key it is honoured, but
   this configuration was not re-checked against Oh My Pi with it enabled.
-- `supportsReasoningSummary: false` stops `reasoning.summary: "auto"`.
+- `supportsReasoningSummary: false` stops `reasoning.summary: "auto"`. The
+  server now honours it, but by a second generation after every reasoning
+  answer (see [Compaction and reasoning summaries](#compaction-and-reasoning-summaries)),
+  so keep it off unless the summaries are wanted.
 - `reasoningDisableMode: none-effort` makes `--thinking off` send
   `reasoning.effort: "none"`. The default sends the lowest listed effort,
   `xhigh`, so turning thinking off would silently keep it on.
