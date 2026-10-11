@@ -1638,6 +1638,27 @@ transposing K and alternative split sizes also lost. Single-row attention
 retained about 74% of its latency with K/V loads removed in an ablation, so
 unused memory bandwidth alone does not establish recoverable decode speed.
 
+Causal Q8 prefill blocks (more than eight tokens) ending past 1,024 positions
+pack the same way: `bo_attn_tensor_rows_q8` gives one threadgroup four
+consecutive tokens of one KV head, so their 24 query rows share each
+dequantized K/V tile in one 24-row product, where `bo_attn_tensor_q8`
+dequantized every tile once per query head for an 8-row product. Per row the
+operands, causal limit, online softmax and division are unchanged, and all
+128 x 6,144 outputs are bitwise equal to the previous kernel at 0, 1K, 4K, 8K,
+32K and 128K prefixes. The workspace's gathered-query buffer grows from
+96 KiB to 3 MiB once its context exceeds 1,024. M4 Pro, 128-token block,
+GPU time per layer (median of five, two interleaved runs) and whole-model
+block time (best of three, two interleaved runs, synthetic cache):
+
+| Prefix | Attention, one layer | Whole 128-token block |
+| ---: | ---: | ---: |
+| 1,024 | 1,007 → 975 µs | not measured |
+| 8,192 | 7,438 → 6,948 µs | 1,073 → 1,064 ms |
+| 32,768 | 29,730 → 27,595 µs | 1,434 → 1,399 ms |
+| 131,072 | 125,681 → 112,402 µs | 2,982 → 2,785 ms |
+
+Short-prefix blocks (0 positions: 955 ms either way) keep the per-head kernel.
+
 Two- to four-row projections (speculative verify blocks, short prefill
 chunks, batched decode) then got cheaper with bit-identical outputs. Trits
 come from balanced prefixes, prefix(p) - (3^p - 1) / 2, whose offsets fold
