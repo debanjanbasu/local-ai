@@ -20,7 +20,7 @@ use local_services::compaction::should_compact;
 
 use super::response::{Protocol, error_response, error_status, json_response};
 use super::responses::{
-    Generate, PreparedResponses, Summarizer, compaction_resource, prepare_compact,
+    Generate, History, PreparedResponses, Summarizer, compaction_resource, prepare_compact,
     prepare_responses_conversing,
 };
 use super::{AppState, MAX_REQUEST_BYTES, request::GenerationRequest, services};
@@ -95,6 +95,23 @@ fn counter(
     }
 }
 
+/// Whether compacted `history` counts fewer prompt tokens, as `template`
+/// counts them, than the `tokens` the window it replaces counted.
+///
+/// A summary of a short history can outgrow the items it replaced; such a
+/// compaction is discarded rather than handed back as a longer prompt.
+async fn shrinks(
+    engine: &EngineHandle,
+    template: ChatRequest,
+    history: &History,
+    tokens: usize,
+) -> crate::Result<bool> {
+    let (engine, messages) = (engine.clone(), history.messages()?);
+    tokio::task::spawn_blocking(move || Ok(counter(engine, template)(messages)? < tokens))
+        .await
+        .map_err(|error| crate::Error::Generation(error.to_string()))?
+}
+
 /// Prepare a `POST /v1/responses` body for generation: parse and resolve it,
 /// compact it first when `context_management` says it is due, and attach the
 /// summarizer `reasoning.summary` needs.
@@ -146,12 +163,12 @@ async fn compact_if_due(
         ));
     };
     let (engine, context) = (state.engine.clone(), state.context);
-    let (mut prepared, pass) = tokio::task::spawn_blocking(move || {
+    let (mut prepared, pass, tokens) = tokio::task::spawn_blocking(move || {
         let count = counter(engine, prepared.request.clone());
         let tokens = count(prepared.request.messages.clone())?;
         let reserve = prepared.request.max_tokens;
         if !should_compact(tokens, threshold, reserve, context) {
-            return Ok((prepared, None));
+            return Ok((prepared, None, tokens));
         }
         let budget = threshold.unwrap_or_else(|| context.saturating_sub(reserve));
         let pass = prepared.history.compaction(
@@ -160,7 +177,7 @@ async fn compact_if_due(
             prepared.request.session.clone(),
             count,
         )?;
-        Ok::<_, crate::Error>((prepared, pass))
+        Ok::<_, crate::Error>((prepared, pass, tokens))
     })
     .await
     .map_err(|error| crate::Error::Generation(error.to_string()))??;
@@ -172,7 +189,11 @@ async fn compact_if_due(
     let _admitted = state.depth.admit();
     let (summary, _) = generate(&state.engine, pass.request.clone()).await?;
     let (item, history) = pass.finish(&summary, &prepared.history, &cipher, &state.model)?;
-    prepared.compacted(item, history)?;
+    // A compaction that does not shorten the prompt is discarded, like one
+    // with nothing to summarize.
+    if shrinks(&state.engine, prepared.request.clone(), &history, tokens).await? {
+        prepared.compacted(item, history)?;
+    }
     Ok(prepared)
 }
 
@@ -201,14 +222,14 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
 async fn compact(state: &AppState, body: Vec<u8>) -> crate::Result<serde_json::Value> {
     let (store, cipher) = (state.responses.clone(), state.cipher.clone());
     let (engine, model) = (state.engine.clone(), Arc::clone(&state.model));
-    let (prepared, pass) = tokio::task::spawn_blocking(move || {
+    let (prepared, pass, template, tokens) = tokio::task::spawn_blocking(move || {
         let prepared = prepare_compact(&body, store.as_ref(), cipher.as_ref(), &model)?;
         let template = local_engine::compaction::compaction_request(
             Vec::new(),
             Vec::new(),
             prepared.session.clone(),
         );
-        let count = counter(engine, template);
+        let count = counter(engine, template.clone());
         let tokens = count(prepared.history.messages()?)?;
         let pass = prepared.history.compaction(
             tokens / KEEP_DIVISOR,
@@ -216,7 +237,7 @@ async fn compact(state: &AppState, body: Vec<u8>) -> crate::Result<serde_json::V
             prepared.session.clone(),
             count,
         )?;
-        Ok::<_, crate::Error>((prepared, pass))
+        Ok::<_, crate::Error>((prepared, pass, template, tokens))
     })
     .await
     .map_err(|error| crate::Error::Generation(error.to_string()))??;
@@ -227,7 +248,13 @@ async fn compact(state: &AppState, body: Vec<u8>) -> crate::Result<serde_json::V
     let _admitted = state.depth.admit();
     let (summary, measured) = generate(&state.engine, pass.request.clone()).await?;
     let mut output = pass.kept().to_vec();
-    let (item, _) = pass.finish(&summary, &prepared.history, &prepared.cipher, &state.model)?;
+    let (item, history) =
+        pass.finish(&summary, &prepared.history, &prepared.cipher, &state.model)?;
+    if !shrinks(&state.engine, template, &history, tokens).await? {
+        // The summary outgrew what it replaced: the window comes back
+        // unchanged, with the usage the summary generation still cost.
+        return Ok(compaction_resource(&prepared.items, Some(&measured)));
+    }
     output.push(item);
     Ok(compaction_resource(&output, Some(&measured)))
 }

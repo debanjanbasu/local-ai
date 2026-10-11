@@ -649,7 +649,9 @@ newest items up to a quarter of that count verbatim, and summarizes the rest.
 `encrypted_content` is the summary *and* the kept items, sealed with the
 `--reasoning-key` cipher under its own domain and bound to the model and item
 ID. `usage` is the summary generation's. When nothing can be summarized the
-window comes back unchanged with zero usage. A cut never falls between a
+window comes back unchanged with zero usage; when the summary would not
+shorten the prompt (a short history can summarize longer than itself), the
+window also comes back unchanged, with the summary's usage, since it ran. A cut never falls between a
 `function_call` and its `function_call_output` or inside an assistant turn, so
 an unanswered call and everything after it are always kept; a leading system
 message and the latest user message are kept verbatim too.
@@ -666,7 +668,8 @@ store and the conversation keep every original item while the prompt shrinks.
 generation when the exact prompt count reaches `N`, or when the prompt leaves
 less than `max_output_tokens` (default 8,192) of the admitted context, which is
 the output space the harness reserves. The kept budget is a quarter of `N` (or
-of the context less that reservation). The compaction item is the Response's
+of the context less that reservation). A compaction that would not shorten the
+prompt is discarded and the request is generated uncompacted. The compaction item is the Response's
 first output item (`output_item.added`/`done` at index 0, right after
 `response.in_progress`); `usage` covers the answer's generation only. With
 `conversation` or `previous_response_id` the item is stored with the output, so
@@ -701,6 +704,37 @@ to its budget. Neither cost is in the Response's `usage`. Risk: a summary is
 lossy and is believed by every later turn; an exact string the model left out
 is gone from the prompt, and a mistaken summary is not detectable from it.
 Only kept items are exact.
+
+Live check (2026-10-11, Apple M4 Pro, the one Bonsai 27B checkpoint, MTP on,
+`--reasoning-key`, one bounded run). A 12-item agent history (developer
+instructions, two user turns, three tool call/result pairs, assistant notes)
+was asked, with tools disabled and thinking off, for six facts (failing test,
+file and line, root cause, release tag, currency and config owner, open
+work); the answer was checked for seven exact strings.
+
+| Window | Prompt tokens | Facts kept | Answer time |
+| --- | ---: | ---: | ---: |
+| Short history, uncompacted | 789 | 7/7 | 7.0 s |
+| Short history after `/responses/compact` | 789 (returned unchanged: the 313-token summary did not shorten it) | 7/7 | 0.8 s (cached) |
+| Long history (160-line tool log), uncompacted | 2,869 | 7/7 | 20.8 s |
+| Long history after `/responses/compact` (23.2 s, 2,376 in / 183 out) | 891 | 7/7 | 7.1 s |
+| Long history, `context_management` threshold 1,000 (compaction then answer) | 1,014 | 7/7 | 45.8 s total |
+
+Every compacted window kept the call/result pairs it kept whole, and the
+compaction item came first in the `context_management` output. Limits of
+this evidence: one task, one sample per row, facts the summary prompt asks
+for by kind, and a test log of filler that summarizes well; it shows the
+mechanism and its cost, not that information is preserved in general. One
+`context_management` answer listed an invented open item ("the short list had
+not been delivered"), an example of summary noise later turns believe.
+
+A streamed `reasoning: {effort: "xhigh", summary: "concise"}` request ("Is 391
+prime?") produced 280 reasoning tokens as `reasoning_text` deltas (0.68 s to
+7.84 s), the answer by 8.38 s, then the `reasoning_summary_part.added`, text
+deltas and `.done` events from 8.38 s to 9.54 s: the summary added 1.16 s to a
+9.54 s response. The item's `summary` held one `summary_text` part ("I checked
+divisibility by primes up to the square root of 391 and found it is divisible
+by 17. ...") and its content stayed the raw `reasoning_text`.
 
 ### Temporary background responses
 
