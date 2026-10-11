@@ -1,0 +1,608 @@
+{
+ "source": "openai-openapi pinned contract (components.schemas subset; descriptions stripped)",
+ "schemas": {
+  "DeleteVectorStoreFileResponse": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "deleted": {
+     "type": "boolean"
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "vector_store.file.deleted"
+     ]
+    }
+   },
+   "required": [
+    "id",
+    "object",
+    "deleted"
+   ]
+  },
+  "DeleteVectorStoreResponse": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "deleted": {
+     "type": "boolean"
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "vector_store.deleted"
+     ]
+    }
+   },
+   "required": [
+    "id",
+    "object",
+    "deleted"
+   ]
+  },
+  "ListVectorStoreFilesResponse": {
+   "properties": {
+    "object": {
+     "type": "string"
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/VectorStoreFileObject"
+     }
+    },
+    "first_id": {
+     "type": "string"
+    },
+    "last_id": {
+     "type": "string"
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "first_id",
+    "last_id",
+    "has_more"
+   ]
+  },
+  "ListVectorStoresResponse": {
+   "properties": {
+    "object": {
+     "type": "string"
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/VectorStoreObject"
+     }
+    },
+    "first_id": {
+     "type": "string"
+    },
+    "last_id": {
+     "type": "string"
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "first_id",
+    "last_id",
+    "has_more"
+   ]
+  },
+  "Metadata": {
+   "anyOf": [
+    {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    },
+    {
+     "type": "null"
+    }
+   ]
+  },
+  "OtherChunkingStrategyResponseParam": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "other"
+     ]
+    }
+   },
+   "required": [
+    "type"
+   ]
+  },
+  "StaticChunkingStrategy": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "max_chunk_size_tokens": {
+     "type": "integer",
+     "minimum": 100,
+     "maximum": 4096
+    },
+    "chunk_overlap_tokens": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "max_chunk_size_tokens",
+    "chunk_overlap_tokens"
+   ]
+  },
+  "StaticChunkingStrategyResponseParam": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "static"
+     ]
+    },
+    "static": {
+     "$ref": "#/components/schemas/StaticChunkingStrategy"
+    }
+   },
+   "required": [
+    "type",
+    "static"
+   ]
+  },
+  "VectorStoreExpirationAfter": {
+   "type": "object",
+   "properties": {
+    "anchor": {
+     "type": "string",
+     "enum": [
+      "last_active_at"
+     ]
+    },
+    "days": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 365
+    }
+   },
+   "required": [
+    "anchor",
+    "days"
+   ]
+  },
+  "VectorStoreFileAttributes": {
+   "anyOf": [
+    {
+     "type": "object",
+     "maxProperties": 16,
+     "propertyNames": {
+      "type": "string",
+      "maxLength": 64
+     },
+     "additionalProperties": {
+      "oneOf": [
+       {
+        "type": "string",
+        "maxLength": 512
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "boolean"
+       }
+      ]
+     }
+    },
+    {
+     "type": "null"
+    }
+   ]
+  },
+  "VectorStoreFileBatchObject": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "vector_store.file_batch"
+     ]
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "vector_store_id": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "in_progress",
+      "completed",
+      "cancelled",
+      "failed"
+     ]
+    },
+    "file_counts": {
+     "type": "object",
+     "properties": {
+      "in_progress": {
+       "type": "integer"
+      },
+      "completed": {
+       "type": "integer"
+      },
+      "failed": {
+       "type": "integer"
+      },
+      "cancelled": {
+       "type": "integer"
+      },
+      "total": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "in_progress",
+      "completed",
+      "cancelled",
+      "failed",
+      "total"
+     ]
+    }
+   },
+   "required": [
+    "id",
+    "object",
+    "created_at",
+    "vector_store_id",
+    "status",
+    "file_counts"
+   ]
+  },
+  "VectorStoreFileContentResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "vector_store.file_content.page"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "type": {
+        "type": "string"
+       },
+       "text": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "has_more": {
+     "type": "boolean"
+    },
+    "next_page": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more",
+    "next_page"
+   ]
+  },
+  "VectorStoreFileObject": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "vector_store.file"
+     ]
+    },
+    "usage_bytes": {
+     "type": "integer"
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "vector_store_id": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "in_progress",
+      "completed",
+      "cancelled",
+      "failed"
+     ]
+    },
+    "last_error": {
+     "anyOf": [
+      {
+       "type": "object",
+       "properties": {
+        "code": {
+         "type": "string",
+         "enum": [
+          "server_error",
+          "unsupported_file",
+          "invalid_file"
+         ]
+        },
+        "message": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "code",
+        "message"
+       ]
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "chunking_strategy": {
+     "type": "object",
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/StaticChunkingStrategyResponseParam"
+      },
+      {
+       "$ref": "#/components/schemas/OtherChunkingStrategyResponseParam"
+      }
+     ]
+    },
+    "attributes": {
+     "$ref": "#/components/schemas/VectorStoreFileAttributes"
+    }
+   },
+   "required": [
+    "id",
+    "object",
+    "usage_bytes",
+    "created_at",
+    "vector_store_id",
+    "status",
+    "last_error"
+   ]
+  },
+  "VectorStoreObject": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "vector_store"
+     ]
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "name": {
+     "type": "string"
+    },
+    "usage_bytes": {
+     "type": "integer"
+    },
+    "file_counts": {
+     "type": "object",
+     "properties": {
+      "in_progress": {
+       "type": "integer"
+      },
+      "completed": {
+       "type": "integer"
+      },
+      "failed": {
+       "type": "integer"
+      },
+      "cancelled": {
+       "type": "integer"
+      },
+      "total": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "in_progress",
+      "completed",
+      "failed",
+      "cancelled",
+      "total"
+     ]
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "expired",
+      "in_progress",
+      "completed"
+     ]
+    },
+    "expires_after": {
+     "$ref": "#/components/schemas/VectorStoreExpirationAfter"
+    },
+    "expires_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_active_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "metadata": {
+     "$ref": "#/components/schemas/Metadata"
+    }
+   },
+   "required": [
+    "id",
+    "object",
+    "usage_bytes",
+    "created_at",
+    "status",
+    "last_active_at",
+    "name",
+    "file_counts",
+    "metadata"
+   ]
+  },
+  "VectorStoreSearchResultContentObject": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "text"
+     ]
+    },
+    "text": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type",
+    "text"
+   ]
+  },
+  "VectorStoreSearchResultItem": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "file_id": {
+     "type": "string"
+    },
+    "filename": {
+     "type": "string"
+    },
+    "score": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "attributes": {
+     "$ref": "#/components/schemas/VectorStoreFileAttributes"
+    },
+    "content": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/VectorStoreSearchResultContentObject"
+     }
+    }
+   },
+   "required": [
+    "file_id",
+    "filename",
+    "score",
+    "attributes",
+    "content"
+   ]
+  },
+  "VectorStoreSearchResultsPage": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "vector_store.search_results.page"
+     ]
+    },
+    "search_query": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minItems": 1
+     }
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/VectorStoreSearchResultItem"
+     }
+    },
+    "has_more": {
+     "type": "boolean"
+    },
+    "next_page": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "search_query",
+    "data",
+    "has_more",
+    "next_page"
+   ]
+  }
+ }
+}
