@@ -1658,6 +1658,16 @@ block time (best of three, two interleaved runs, synthetic cache):
 | 131,072 | 125,681 → 112,402 µs | 2,982 → 2,785 ms |
 
 Short-prefix blocks (0 positions: 955 ms either way) keep the per-head kernel.
+A greedy 13,239-token prompt (96 tokens, with and without MTP) produced
+identical token IDs on both kernels; its prefill rate moved only within noise
+(120.5-121.3 tok/s), since attention is a small share of blocks below 16K.
+Remaining headroom, from the same runs: the GPU was busy for 99.1-99.5% of
+wall time, so host encoding and synchronization cost under 1%; a cold 128-row
+block (955 ms, about 3.3 T multiply-adds per second over the 25.8 G ternary
+weights) runs near the 8x8 multiplies' measured 3.9 T peak; long-prefix
+prefill attention does 2.1e11 multiply-adds per layer at 128K in 112 ms
+(1.8 T/s), half that peak; per-tile dequantization and softmax are the likely
+remainder (not profiled per stage).
 
 Two- to four-row projections (speculative verify blocks, short prefill
 chunks, batched decode) then got cheaper with bit-identical outputs. Trits
