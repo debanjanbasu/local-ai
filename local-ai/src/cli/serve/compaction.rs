@@ -49,7 +49,10 @@ async fn generate(engine: &EngineHandle, request: ChatRequest) -> crate::Result<
             Event::Content(piece) => text.push_str(&piece),
             Event::Finished(stats) => return Ok((text, *stats)),
             Event::Error(message) => return Err(crate::Error::Generation(message)),
-            Event::Reasoning(_) | Event::ToolCall(_) | Event::TokenIds(_) => {}
+            Event::Reasoning(_)
+            | Event::ToolCall(_)
+            | Event::ToolOutput(_)
+            | Event::TokenIds(_) => {}
         }
     }
     Err(crate::Error::Generation(
@@ -73,7 +76,10 @@ fn blocking_generate(engine: EngineHandle) -> Generate {
                 }
                 Event::Finished(stats) => return Ok(*stats),
                 Event::Error(message) => return Err(crate::Error::Generation(message)),
-                Event::Reasoning(_) | Event::ToolCall(_) | Event::TokenIds(_) => {}
+                Event::Reasoning(_)
+                | Event::ToolCall(_)
+                | Event::ToolOutput(_)
+                | Event::TokenIds(_) => {}
             }
         }
         Err(crate::Error::Generation(
