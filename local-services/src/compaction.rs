@@ -14,7 +14,7 @@
 //!   cut falls while a call is unanswered, so an unanswered call (pending
 //!   work) is always kept verbatim, as is every item after it.
 //! - An assistant turn — reasoning, message and calls — is never cut inside.
-//! - A leading `system` or `developer` message (the standing task
+//! - The leading `system` and `developer` messages (the standing task
 //!   instructions) and the latest `user` message (the current request) are
 //!   always kept verbatim, as are the newest items up to a token budget.
 //! - Raw reasoning is only ever summarized as part of the history; it is
@@ -100,12 +100,15 @@ pub const fn should_compact(
     over || prompt_tokens.saturating_add(reserve) > context
 }
 
-/// The leading instruction message, if `items` starts with one: kept, and
-/// never the only thing summarized.
+/// How many leading instruction messages `items` starts with (Codex sends
+/// several): kept, and never the only thing summarized.
 fn head(items: &[Value]) -> usize {
-    usize::from(items.first().is_some_and(|item| {
-        kind(item) == "message" && matches!(role(item), Some("system" | "developer"))
-    }))
+    items
+        .iter()
+        .take_while(|item| {
+            kind(item) == "message" && matches!(role(item), Some("system" | "developer"))
+        })
+        .count()
 }
 
 /// Every index `cut` at which `items[..cut]` may be summarized and

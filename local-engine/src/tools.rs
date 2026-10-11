@@ -211,9 +211,11 @@ pub struct Turn<'a> {
 /// Render a conversation exactly as the pinned checkpoint template does with
 /// `add_generation_prompt=True` and `preserve_thinking` left at its default.
 ///
-/// `developer` is accepted as the first message and rendered in the `system`
+/// `developer` is accepted as a leading message and rendered in the `system`
 /// slot: the template has no developer role and only one leading instruction
-/// turn.
+/// turn, so consecutive leading `system`/`developer` messages (Codex sends
+/// several) are joined there in order, separated by a blank line. One leading
+/// message renders exactly as before.
 pub fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Result<String> {
     if turns.is_empty() {
         return invalid("no messages provided");
@@ -231,13 +233,21 @@ pub fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Res
         return invalid("no user query found in messages");
     }
     let turns = &order_results(turns)?;
-    let mut rendered = render_system(turns[0], thinking, tools);
+    let leading = turns
+        .iter()
+        .take_while(|turn| is_instruction(turn.role))
+        .count();
+    let system = leading_instructions(turns.get(..leading).unwrap_or_default());
+    let mut rendered = render_system(&system, thinking, tools);
     for (index, turn) in turns.iter().enumerate() {
         let content = turn.content.trim();
         match turn.role {
             role if is_instruction(role) => {
-                if index != 0 {
-                    return invalid(format!("{role} message must be first"));
+                if index >= leading {
+                    return invalid(format!(
+                        "{role} message must be first: instructions may only lead the \
+                         conversation"
+                    ));
                 }
             }
             "user" => {
@@ -286,14 +296,27 @@ pub fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Res
     Ok(rendered)
 }
 
-/// The leading system turn: reasoning instructions, tools and the first
-/// `system`/`developer` message, in the template's order.
-fn render_system(first: Turn<'_>, thinking: bool, tools: &ToolSet) -> String {
-    let system = if is_instruction(first.role) {
-        first.content.trim()
-    } else {
-        ""
-    };
+/// The text of the leading `system`/`developer` messages, which share the
+/// template's one system slot: each trimmed, empty ones skipped, joined in
+/// order by a blank line.
+fn leading_instructions(turns: &[Turn<'_>]) -> String {
+    let mut system = String::new();
+    for content in turns
+        .iter()
+        .map(|turn| turn.content.trim())
+        .filter(|content| !content.is_empty())
+    {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(content);
+    }
+    system
+}
+
+/// The leading system turn: reasoning instructions, tools and the leading
+/// `system`/`developer` text `system`, in the template's order.
+fn render_system(system: &str, thinking: bool, tools: &ToolSet) -> String {
     let mut rendered = String::new();
     if !tools.is_empty() {
         rendered.push_str("<|im_start|>system\n");
