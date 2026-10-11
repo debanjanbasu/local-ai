@@ -10,6 +10,7 @@
 pub mod batches;
 pub mod conversations;
 pub mod files;
+pub mod tools;
 pub mod workspace;
 
 pub use conversations::{

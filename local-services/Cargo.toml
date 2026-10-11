@@ -27,6 +27,23 @@ ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Hosted tools (`tools`): the sandboxed shell's child process, deadlines and
+# pipes; its `setrlimit`, `waitid` and process-group kill; one `sysctl`
+# process count; per-call scratch directories; and web fetch over HTTP/1.1
+# with TLS verified by the platform trust store. All but `tokio-rustls` are
+# already in the lock through the server.
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+rustix = { version = "1", features = ["process"] }
+libc = "0.2"
+tempfile = "3"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [dev-dependencies]
-tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
