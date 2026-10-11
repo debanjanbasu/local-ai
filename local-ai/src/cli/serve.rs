@@ -23,6 +23,7 @@ mod backpressure;
 mod batches;
 mod chunked;
 mod decisions;
+mod evals;
 mod http3;
 mod journal;
 mod options;
@@ -105,6 +106,7 @@ struct AppState {
     /// Native durable services, available automatically in the user's data directory.
     services: Option<Arc<services::Services>>,
     batches: Option<Arc<batches::Batches>>,
+    evals: Option<Arc<evals::Evals>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -163,6 +165,9 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     }
     if batches::matches(parts.uri.path()) {
         return batches::handle(&state, &parts, body).await;
+    }
+    if evals::matches(parts.uri.path()) {
+        return evals::handle(&state, &parts, body).await;
     }
     if parts.method == Method::GET && parts.uri.path() == "/health" {
         return json_response(
@@ -792,11 +797,14 @@ async fn run_async(args: Args) -> crate::Result<()> {
         decisions: decisions.clone(),
         services: Some(services),
         batches: None,
+        evals: None,
     };
     let address = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
     let batches = batches::Batches::start(&state)?;
     state.batches = Some(Arc::clone(&batches));
+    let evals = evals::Evals::start(&state, &batches)?;
+    state.evals = Some(Arc::clone(&evals));
     let h3_task = if let Some((cert, key)) = resources.tls {
         Some(tokio::spawn(serve_h3(address, state.clone(), cert, key)))
     } else {
@@ -818,9 +826,11 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let closing = Arc::clone(&background);
     let closing_decisions = decisions.clone();
     let closing_batches = Arc::clone(&batches);
+    let closing_evals = Arc::clone(&evals);
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown().await;
+            closing_evals.close();
             closing_batches.close();
             // Waiting decisions end at once, cancelling their engine work,
             // so they never hold up the drain.
@@ -831,7 +841,9 @@ async fn run_async(args: Args) -> crate::Result<()> {
         .map_err(crate::Error::Io);
     // Again, for a server that stopped without the signal; settling is idempotent.
     decisions::close(decisions.as_deref());
+    evals.close();
     batches.close();
+    evals.drained().await;
     batches.drained().await;
     let closing = Arc::clone(&background);
     let _ = tokio::task::spawn_blocking(move || closing.close()).await;

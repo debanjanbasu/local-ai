@@ -74,7 +74,8 @@ The server also always opens a durable native services store at
 blobs, in plaintext, with no flag and no alternative backend). It serves
 Conversations and their items, Responses `conversation` (appended once, and
 refused on a version conflict), streamed Files and Uploads (with optional
-MD5), and Batches for the three text endpoints. Batches run on one worker that
+MD5), Batches for the three text endpoints, and Evals whose model calls run as
+batches. Batches run on one worker that
 resumes unsettled lines after a restart. File expiry is enforced on access, and
 expired bytes are purged at startup. A background Response interrupted by a
 restart is still not resumed. The same crate offers native repository search
