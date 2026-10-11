@@ -118,3 +118,23 @@ verified by the macOS trust store. The body is capped at 256 KiB.
   interrupted by cancellation.
 - `sandbox-exec` is deprecated by Apple but still shipped and enforced; if it
   disappears, the shell fails closed (it cannot start).
+
+## Live check (2026-10-11, Apple M4 Pro, PTQ1 checkpoint)
+
+Server: `local-ai serve --tools-root SCRATCH --tools-shell` (no writes, no
+fetch), scratch root holding `notes.txt` (3 lines) and `docs/readme.md`.
+
+- Tool loop, one non-streaming Response (HTTP 200, 10.2 s): the model called
+  `local_fs_list`, `local_fs_read {"path":"notes.txt"}` and `shell` with
+  `["ls", "wc -l notes.txt docs/readme.md"]`; each ran (`shell_call_output`
+  with `exit_code` 0 and the real `ls`/`wc` output) and the final message gave
+  the correct line counts.
+- Streaming (HTTP 200): `response.shell_call_command.added/delta/done`,
+  `response.shell_call_output_content.done` and the output item events, in
+  order, for a `shell` call running `ls`.
+- Declaring `local_fs_write` or `local_web_fetch` on this server: 400 naming
+  the missing flag, before any generation.
+- Forced `local_fs_read {"path":"../outside/secret.txt"}`: the call's output
+  is `error: invalid arguments: ... must be a relative path that stays inside
+  the workspace` (status `incomplete`); the outside file's canary text
+  appears nowhere in the Response, and the model reported the refusal.
