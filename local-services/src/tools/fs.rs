@@ -287,6 +287,10 @@ fn check_target(
         Ok(seen) if seen.file_type().is_symlink() => Err(ToolError::Denied(format!(
             "{display} is a symlink, which is never followed"
         ))),
+        // Another name for the same file may live outside the root.
+        Ok(seen) if seen.is_file() && seen.nlink() > 1 => Err(ToolError::Denied(format!(
+            "{display} has other hard links, so writing it could change files outside the root"
+        ))),
         Ok(seen) if seen.is_file() => Ok(seen.len()),
         Ok(_) => Err(ToolError::Invalid(format!(
             "{display} is not a regular file"
