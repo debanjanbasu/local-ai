@@ -85,7 +85,15 @@ restart is still not resumed. The same crate offers native repository search
 `--reasoning-key FILE` adds
 AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
 reasoning is still returned and, with a store, still written, so it is neither
-encryption at rest nor hidden reasoning. `POST /v1/responses/input_tokens`
+encryption at rest nor hidden reasoning. The same key seals the `compaction`
+items of `POST /v1/responses/compact` and of Responses `context_management`
+compaction, which summarize older items with the same Bonsai model and keep
+the rest verbatim (never splitting a tool call from its result); without a key
+both are refused. `reasoning.summary` adds a short second generation that
+summarizes the raw reasoning, which itself stays `reasoning_text`. Both cost
+extra inference and a summary loses detail; see
+[docs/BONSAI.md](docs/BONSAI.md#compaction-and-reasoning-summaries).
+`POST /v1/responses/input_tokens`
 returns the exact templated prompt-token count without generating. This is a
 subset of the public OpenAI contract, not a drop-in Codex provider; the gaps
 are listed in [docs/BONSAI.md](docs/BONSAI.md#server-api).

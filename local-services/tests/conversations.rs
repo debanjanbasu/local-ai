@@ -117,6 +117,60 @@ fn conversations_persist_across_reopen_in_normalized_form() {
 }
 
 #[test]
+fn a_compacted_conversation_restarts_from_its_latest_compaction_item() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let root = scratch.path().join("services");
+    let compaction = json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "sealed"});
+    let conversation = {
+        let store = Store::open(&root).expect("store opens");
+        let conversation = store
+            .create_conversation(
+                &Metadata::new(),
+                vec![
+                    user("old"),
+                    json!({"type": "message", "role": "assistant", "content": "x"}),
+                ],
+            )
+            .expect("created");
+        store
+            .append_items(
+                &conversation.id,
+                Append {
+                    request_id: "resp_1".into(),
+                    expected_version: conversation.version,
+                    items: vec![compaction.clone(), user("new")],
+                },
+            )
+            .expect("appended");
+        // Sealed for its id, a compaction item cannot be stored without one.
+        let anonymous = json!({"type": "compaction", "encrypted_content": "sealed"});
+        assert!(matches!(
+            store.add_items(&conversation.id, vec![anonymous]),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            store.add_items(
+                &conversation.id,
+                vec![json!({"type": "compaction", "id": "cmp_2", "encrypted_content": "", })]
+            ),
+            Err(Error::InvalidArgument(_))
+        ));
+        conversation
+    };
+    let store = Store::open(&root).expect("store reopens");
+    let items: Vec<Value> = store
+        .conversation_history(&conversation.id)
+        .expect("history")
+        .items
+        .iter()
+        .map(|item| serde_json::to_value(item).expect("serializes"))
+        .collect();
+    assert_eq!(items.len(), 4, "every earlier item stays listable");
+    assert_eq!(items[2], compaction);
+    assert_eq!(local_services::compaction::latest(&items), Some(2));
+}
+
+#[test]
 fn metadata_is_bounded_and_replaced_on_update() {
     let (_scratch, store) = store();
     let too_many: Metadata = (0..17).map(|n| (format!("k{n}"), String::new())).collect();

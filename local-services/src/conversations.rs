@@ -2,9 +2,12 @@
 //!
 //! A conversation is an ordered, append-mostly list of items. Items are
 //! validated and normalized on the way in, against exactly the forms local
-//! generation implements (text messages, function calls and outputs, and
-//! reasoning); anything else, such as images or files, is refused rather than
-//! stored and silently ignored later.
+//! generation implements (text messages, function calls and outputs,
+//! reasoning, and the compaction items of [`crate::compaction`]); anything
+//! else, such as images or files, is refused rather than stored and silently
+//! ignored later. A prompt built from a conversation starts at its latest
+//! compaction item, so appending one compacts the conversation durably while
+//! every earlier item stays listable.
 //!
 //! Deleting a conversation marks it deleted (its items are kept, as the public
 //! contract specifies) and every later operation on it reports not found.
@@ -74,8 +77,8 @@ pub struct Item {
 }
 
 impl Item {
-    /// The item's `type`: `message`, `function_call`, `function_call_output`
-    /// or `reasoning`.
+    /// The item's `type`: `message`, `function_call`, `function_call_output`,
+    /// `reasoning` or `compaction`.
     #[must_use]
     pub fn kind(&self) -> &str {
         self.body
@@ -657,10 +660,25 @@ fn normalize_item(item: Value) -> Result<Item> {
             normalize_reasoning(&mut body, id.is_some())?;
             "rs_"
         }
+        crate::compaction::COMPACTION => {
+            // Sealed for its item id, so it cannot be stored under a new one.
+            only_keys(&body, &["encrypted_content", "created_by"])?;
+            required_string(&body, "encrypted_content", false)?;
+            if body
+                .get("created_by")
+                .is_some_and(|value| !value.is_string())
+            {
+                return Err(invalid("created_by must be a string"));
+            }
+            if id.is_none() {
+                return Err(invalid("a compaction item requires its original item id"));
+            }
+            "cmp_"
+        }
         other => {
             return Err(invalid(format!(
                 "item type {other:?} is not supported; only message, function_call, \
-                 function_call_output and reasoning items are"
+                 function_call_output, reasoning and compaction items are"
             )));
         }
     };
