@@ -12,7 +12,7 @@ class NeedleTest(unittest.TestCase):
         self.assertEqual(first, again)
         self.assertNotEqual(first, other)
         self.assertEqual(sorted((n.task, n.position) for n in first),
-                         sorted((t, p) for t in ("lookup", "fix") for p in ce.POSITIONS))
+                         sorted((t, p) for t in ("recall", "lookup", "fix") for p in ce.POSITIONS))
 
     def test_every_bug_template_is_detected_by_its_tests(self):
         for seed in range(6):
@@ -102,7 +102,7 @@ class RecordTest(unittest.TestCase):
             (out / "results.jsonl").write_text(json.dumps(row) + "\n")
             self.assertEqual(ce.done_keys(out / "results.jsonl"), {("8k", 0, "none", "lookup", needle.position)})
             table = ce.report(out)
-        self.assertIn("| 8k | none | 0 | 8,000–8,000 | 1/1 | - |", table)
+        self.assertIn("| 8k | none | 0 | 8,000–8,000 | - | 1/1 | - |", table)
 
 
 if __name__ == "__main__":

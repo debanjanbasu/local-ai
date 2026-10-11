@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Bounded long-context coding evaluation for `local-ai serve`.
 
-One seed fixes six coding tasks ("needles"): at each of three positions in a
-synthetic Python repository (start, middle, end) it plants
+One seed fixes nine coding questions ("needles"): at each of three positions
+in a synthetic Python repository (start, middle, end) it plants
 
 - `lookup`: a pricing function whose constants come from a config module;
   the question asks for its value at given arguments, while similarly named
   legacy decoys with other constants are scattered through the repository;
+- `recall`: the same production fee constant asked for directly, which
+  separates finding the code from the arithmetic `lookup` also needs;
 - `fix`: a function whose implementation contradicts its docstring; the
   answer must be the corrected line, which is substituted into the function
   and executed against hidden test cases.
 
 The context size only changes how much seeded filler surrounds the same
-needles, so a seed's short-context control (the six needles plus six filler
+needles, so a seed's short-context control (the same needles plus six filler
 files, about 3K tokens) asks exactly the same questions. The repository goes in the system message
 and each question in its own user turn, so every question after the first
 reuses the repository prefix from the server's prompt cache; the first
@@ -137,6 +139,15 @@ def make_needles(seed: int) -> list[Needle]:
             "Reply with only the integer.",
             str(expected),
         ))
+        # Pure retrieval of the same planted constant (no arithmetic): it
+        # separates finding the code from computing with it. No files of its
+        # own; the lookup needle plants them.
+        needles.append(Needle(
+            "recall", position, {},
+            f"What value does the configuration module imported by {service} assign to "
+            f"{topic.upper()}_FEE? Ignore the legacy modules. Reply with only the integer.",
+            str(fee),
+        ))
         stem, doc, args, lines, index, buggy, tests = bug
         name = f"{stem}_{tag}"
         body = list(lines)
@@ -249,7 +260,7 @@ def score_fix(needle: Needle, answer: str) -> tuple[bool, str]:
         assert source is not None
     unsafe = unsafe_construct(source)
     if unsafe:
-        return False, f"rejected unsafe answer: {unsafe}"
+        return False, unsafe if unsafe.startswith("SyntaxError") else f"rejected unsafe answer: {unsafe}"
     return run_isolated(needle, source)
 
 
@@ -327,7 +338,7 @@ def score_lookup(needle: Needle, answer: str) -> tuple[bool, str]:
 
 
 def score(needle: Needle, answer: str) -> tuple[bool, str]:
-    return score_fix(needle, answer) if needle.task == "fix" else score_lookup(needle, answer)
+    return score_fix(needle, answer) if needle.task == "fix" else score_lookup(needle, answer)  # lookup, recall
 
 
 # ---------------------------------------------------------------- running
@@ -423,8 +434,8 @@ def run_group(port: int, out: Path, size: str, seed: int, effort: str, concurren
 def report(out: Path) -> str:
     rows = [json.loads(x) for x in (out / "results.jsonl").read_text().splitlines()] if (out / "results.jsonl").exists() else []
     order = list(SIZES)
-    lines = ["| Size | Effort | Seeds | Prompt tokens | Lookup | Fix | Start | Middle | End | All | Cold prefill tok/s | Decode tok/s (median) | Median wall s |",
-             "| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |"]
+    lines = ["| Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All | Cold prefill tok/s | Decode tok/s (median) | Median wall s |",
+             "| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |"]
     groups: dict[tuple, list] = {}
     for row in rows:
         groups.setdefault((row["size"], row["effort"]), []).append(row)
@@ -444,7 +455,7 @@ def report(out: Path) -> str:
         wall = median([r["wall_seconds"] for r in items])
         lines.append(
             f"| {size} | {effort} | {seeds} | {min(prompts):,}–{max(prompts):,} | "
-            f"{frac([r for r in items if r['task'] == 'lookup'])} | {frac([r for r in items if r['task'] == 'fix'])} | "
+            + " | ".join(frac([r for r in items if r["task"] == t]) for t in ("recall", "lookup", "fix")) + " | "
             + " | ".join(frac([r for r in items if r["position"] == p]) for p in POSITIONS)
             + f" | {frac(items)} | {', '.join(f'{c:.0f}' for c in cold) or '-'} | "
             f"{decode if decode is not None else '-'} | {wall:.0f} |")
