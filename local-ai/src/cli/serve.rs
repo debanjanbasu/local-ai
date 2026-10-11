@@ -318,8 +318,8 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             .await;
         }
     };
-    let (stream, request, protocol) = prepared;
-    let tool_loop = match hosted_loop(&state, &protocol, &request) {
+    let (stream, mut request, protocol) = prepared;
+    let tool_loop = match hosted_loop(&state, &protocol, &mut request) {
         Ok(tool_loop) => tool_loop,
         Err(message) => {
             return error_response(StatusCode::BAD_REQUEST, &message, &state, &parts.headers).await;
@@ -449,7 +449,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 fn hosted_loop(
     state: &AppState,
     protocol: &Protocol,
-    request: &GenerationRequest,
+    request: &mut GenerationRequest,
 ) -> Result<Option<tool_loop::Loop>, String> {
     let (Protocol::Responses(echo), GenerationRequest::Chat(request)) = (protocol, request) else {
         return Ok(None);
@@ -462,6 +462,11 @@ fn hosted_loop(
         return Ok(None);
     };
     let engine = state.engine.clone();
+    // Every round renders the same growing conversation, so one prompt-cache
+    // affinity lets each round reuse the previous one's prefix.
+    request
+        .session
+        .get_or_insert_with(|| response::new_id("tools_"));
     Ok(Some(tool_loop::Loop {
         submit: Box::new(move |request| engine.chat(request)),
         request: request.clone(),
