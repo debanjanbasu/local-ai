@@ -50,8 +50,8 @@
 //! a job the full engine queue defers is retried each time a queue slot is
 //! released. A job continuing a conversation, or recorded without its
 //! request, is settled `failed` instead. Graceful shutdown is unchanged: it
-//! settles running jobs `failed`, so only an interrupted process leaves work
-//! to resume.
+//! settles running jobs `failed`, so only an interrupted process, or a
+//! resumption still waiting for a queue slot, leaves work to resume.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;

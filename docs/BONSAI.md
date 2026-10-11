@@ -370,7 +370,8 @@ job continuing a conversation, or one without its stored request, is marked
 `failed` instead.
 Graceful shutdown refuses new background requests (503), marks every
 unfinished job `failed`, cancels it and waits for the workers to release the
-engine before exiting. A job has no client to stall, so `--stall-timeout`
+engine before exiting; a resumption still waiting for a queue slot stays
+pending for the next server. A job has no client to stall, so `--stall-timeout`
 does not apply to it. Stored records still contain the raw reasoning in plain
 text; there is no encryption at rest.
 

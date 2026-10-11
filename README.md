@@ -44,7 +44,8 @@ store exists) the job lives in `--response-store`, and its record and event
 journal survive a restart. A job interrupted by a crash or `kill -9` is
 resumed when a server next opens the store: generation restarts from the
 stored request, and a streamed job's journal continues after a restart
-boundary that finishes the lost output items as `incomplete`. With `store: false` (the only choice without a store) it is kept
+boundary that finishes the items the lost generation left open (as
+`incomplete`). With `store: false` (the only choice without a store) it is kept
 temporarily in a private owner-only directory under the system temporary
 directory: retrievable, cancellable and resumable until 10 minutes after it
 ends, reported as `store: false`, never continued by `previous_response_id`,
