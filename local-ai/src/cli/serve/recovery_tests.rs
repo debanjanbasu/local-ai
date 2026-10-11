@@ -475,6 +475,38 @@ fn a_terminal_write_that_never_landed_is_regenerated() {
 }
 
 #[test]
+fn a_job_killed_after_its_terminal_record_is_never_regenerated() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let doc = streamed_doc(&body(true), &store, true);
+    let id = doc.id().to_owned();
+    let (_, stop) = stopper();
+    let (_, pump) = Arc::new(Background::default())
+        .admit(doc, script(regenerated()), stop, None)
+        .expect("admitted");
+    pump.run();
+    // The process died after the completed record was durable but before
+    // the end reached the journal.
+    let path = store.journal_file(&id).expect("path");
+    let mut lines = journal(&store, &id);
+    assert_eq!(lines.pop().expect("end")["type"], "response.completed");
+    let raw = std::fs::read_to_string(&path).expect("journal");
+    let kept: Vec<&str> = raw.lines().take(lines.len()).collect();
+    std::fs::write(&path, kept.join("\n") + "\n").expect("rewrite");
+    let store = scratch.open();
+    assert_eq!(store.resumable().expect("listed"), Vec::<String>::new());
+    let background = Arc::new(Background::default());
+    let engine = Engine::default();
+    assert_eq!(outcome(&background, &store, &id, &engine), "settled");
+    assert_eq!(engine.asked(), 0, "a durable end is never generated again");
+    let record = stored(&store, &id).expect("stored");
+    assert_eq!(record["status"], "completed");
+    let all = stream(&background, &store, &id, None);
+    assert_consistent(&all, &record);
+    assert_eq!(all[..lines.len()], lines[..]);
+}
+
+#[test]
 fn a_non_streamed_job_restarts_with_only_the_regenerated_output() {
     let scratch = Scratch::new();
     let steps = vec![prefill(), event(Event::Content("lost".into()))];
