@@ -424,6 +424,29 @@ fn compaction_keeps_tool_pairs_whole_and_replays_the_kept_items_faithfully() {
 }
 
 #[test]
+fn the_summary_follows_every_leading_instruction_message() {
+    let scratch = Scratch::new();
+    let cipher = scratch.cipher();
+    // Codex leads with more than one developer message.
+    let mut items = transcript();
+    items.insert(
+        1,
+        json!({"type":"message","role":"developer","content":"Use the sandbox."}),
+    );
+    let (output, _) = compact(&items, 3, "The summary.", &cipher);
+    let replay = prepare(&json!({"input":output}), None, Some(&cipher)).expect("valid");
+    let messages = &replay.request.messages;
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles[..3], ["developer", "developer", "user"], "{roles:?}");
+    assert!(messages[2].content.ends_with("The summary."));
+    local_engine::Engine::render_chat_with_tools(messages, false, &[])
+        .expect("renders with every instruction leading");
+}
+
+#[test]
 fn recompaction_folds_the_earlier_summary_in() {
     let scratch = Scratch::new();
     let cipher = scratch.cipher();
