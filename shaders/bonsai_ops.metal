@@ -1454,4 +1454,132 @@ BONSAI_ATTN_SPLIT_ROWS_Q8(2)
 BONSAI_ATTN_SPLIT_ROWS_Q8(3)
 BONSAI_ATTN_SPLIT_ROWS_Q8(4)
 
+
+// Causal Q8 prefill packed by KV head. bo_attn_tensor_q8 gives each query head
+// its own threadgroup, so the six query heads of a KV head dequantize every K/V
+// tile six times and each tile feeds an 8-row product. Here one threadgroup
+// owns TOKENS consecutive tokens of one KV head: their 6 * TOKENS query rows,
+// gathered by bo_attn_gather_rows with a `stride`-token layout, share each
+// dequantized tile in one (6 * TOKENS)-row product. Per row, the tile values,
+// score scale, causal limit, online softmax and final division are those of
+// bo_attn_tensor_q8, and the products are bitwise equal (checked against it at
+// 0 to 131,072-token prefixes). Row r is token first + r / 6. Rows of tokens
+// past the block's end repeat the last live token's visibility and are never
+// written; they read gathered rows that only feed their own outputs. The
+// output is ungated: quantized caches gate in bo_attn_unrotate.
+template <uint TOKENS>
+static inline void bonsai_attn_tensor_rows_q8_impl(
+    device float *query, device const uchar *key, device const uchar *value,
+    device float *output, uint position, uint tokens, uint stride,
+    uint group, uint tid, threadgroup half *tile, threadgroup float *scores,
+    threadgroup float *correction, threadgroup float *maximum, threadgroup float *denominator
+) {
+    constexpr int nq = 8, nk = 32, dimension = 256;
+    constexpr uint nt = (6 * TOKENS + 7) / 8;
+    constexpr int m = int(nq * nt);
+    const uint kv_head = group % 4, first = (group / 4) * TOKENS;
+    const uint live_tokens = min(TOKENS, tokens - first);
+    const uint first_prefix = position + first + 1, end = position + first + live_tokens;
+    const uint row = tid / 16, lane = tid % 16;
+    if (tid < uint(m)) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
+    device float *packed = query + (ulong(kv_head) * 6 * stride + first * 6) * dimension;
+    auto q = tensor(packed, dextents<int32_t, 2>(dimension, int(6 * TOKENS)),
+        array<int, 2>({1, dimension}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(m, nk, dimension, false, true, false),
+        execution_simdgroups<4>> qk;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(m, dimension, static_cast<int>(dynamic_extent),
+            false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> pv;
+    auto p_shape = tensor(scores, dextents<int32_t, 2>(nk, m), array<int, 2>({1, nk}));
+    auto v_shape = tensor(tile, dextents<int32_t, 2>(dimension, nk), array<int, 2>({1, dimension}));
+    auto acc = pv.template get_destination_cooperative_tensor<
+        decltype(p_shape), decltype(v_shape), float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+    for (uint start = 0; start < end; start += nk) {
+        const uint count = min(uint(nk), end - start);
+        bonsai_kv_tile<nk>(key, start, count, kv_head, tile, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto k = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
+        auto products = qk.template get_destination_cooperative_tensor<decltype(q), decltype(k), float>();
+        qk.run(q, k, products);
+        products.store(tensor(scores, dextents<int32_t, 2>(nk, m)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < nt; ++j) {
+            const uint r = 8 * j + row;
+            const uint prefix = min(first_prefix + r / 6, end);
+            const uint limit = prefix > start ? min(count, prefix - start) : 0;
+            threadgroup float *s = scores + j * nq * nk;
+            float peak = -INFINITY;
+            for (uint column = lane; column < uint(nk); column += 16) {
+                const uint i = row * nk + column;
+                const float score = column < limit ? s[i] * (1.0f / 16.0f) : -INFINITY;
+                s[i] = score;
+                peak = max(peak, score);
+            }
+            for (ushort mask = 8; mask != 0; mask >>= 1) peak = max(peak, simd_shuffle_xor(peak, mask));
+            const float next_maximum = max(maximum[r], peak);
+            const float old_scale = exp(maximum[r] - next_maximum);
+            float sum = 0.0f;
+            for (uint column = lane; column < uint(nk); column += 16) {
+                const uint i = row * nk + column;
+                const float weight = exp(s[i] - next_maximum);
+                s[i] = weight;
+                sum += weight;
+            }
+            for (ushort mask = 8; mask != 0; mask >>= 1) sum += simd_shuffle_xor(sum, mask);
+            if (lane == 0) {
+                correction[r] = old_scale;
+                maximum[r] = next_maximum;
+                denominator[r] = fma(denominator[r], old_scale, sum);
+            }
+        }
+        // K is dead once the scores exist; V replaces it after the softmax.
+        bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto v = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
+        #pragma clang loop unroll(full)
+        for (ushort i = 0; i < acc.get_capacity(); ++i) {
+            if (acc.is_valid_element(i)) acc[i] *= correction[acc.get_multidimensional_index(i)[1]];
+        }
+        auto probabilities = tensor(scores, dextents<int32_t, 2>(count, m), array<int, 2>({1, nk}));
+        pv.run(probabilities, v, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto index = acc.get_multidimensional_index(i);
+            const uint r = index[1];
+            if (r < 6 * live_tokens) {
+                const ulong o = (ulong(first + r / 6) * 24 + kv_head * 6 + r % 6) * dimension;
+                output[o + index[0]] = acc[i] / denominator[r];
+            }
+        }
+    }
+}
+
+// Four tokens (PREFILL_ROW_TOKENS in bonsai_ops.rs) fill three 8-row tiles
+// exactly; two, three, five, six and eight tokens per group, eight separate
+// 8-row products, and eight SIMD groups for eight or sixteen tokens measured
+// slower.
+kernel void bo_attn_tensor_rows_q8(
+    device float *query [[buffer(0)]], device const uchar *key [[buffer(1)]],
+    device const uchar *value [[buffer(2)]], device float *output [[buffer(3)]],
+    constant uint &position [[buffer(4)]], constant uint &tokens [[buffer(5)]],
+    constant uint &stride [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    constexpr uint tokens_per_group = 4, m = (6 * tokens_per_group + 7) / 8 * 8;
+    threadgroup half tile[32 * 256];
+    threadgroup float scores[m * 32], correction[m], maximum[m], denominator[m];
+    bonsai_attn_tensor_rows_q8_impl<tokens_per_group>(query, key, value, output, position,
+        tokens, stride, group, tid, tile, scores, correction, maximum, denominator);
+}
+
 #endif

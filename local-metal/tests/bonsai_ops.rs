@@ -1059,7 +1059,7 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
     let Some((ctx, ops)) = setup() else { return };
     let capacity = 65_537u32;
     let workspace = AttentionWorkspace::new(&ctx, capacity).expect("workspace");
-    let query_rows = 9usize;
+    let query_rows = 11usize;
     let query_data = (0..6144 * query_rows)
         .map(|i| signal(i, 19) * 1.7)
         .collect::<Vec<_>>();
@@ -1229,6 +1229,11 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
             (1100, 6, false),
             (1100, 7, true),
             (1100, 8, true),
+            // Head-packed prefill past 1,024 positions, with a partial last
+            // group of tokens (11 = 4 + 4 + 3) and a single-token tail.
+            (1014, 11, true),
+            (1086, 9, false),
+            (4093, 11, true),
         ] {
             output.as_mut_slice::<f32>().fill(f32::NAN);
             let mut batch = CommandBatch::new(&ctx).expect("batch");
