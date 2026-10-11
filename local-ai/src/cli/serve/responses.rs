@@ -188,6 +188,8 @@ pub(super) struct Echo {
     prompt_cache_key: Option<String>,
     safety_identifier: Option<String>,
     previous_response_id: Option<String>,
+    /// Seals each reasoning item's `encrypted_content`; set only when the
+    /// request's `include` asks for `reasoning.encrypted_content`.
     cipher: Option<Arc<ReasoningCipher>>,
     /// Where the final Response is persisted, when it is to be stored.
     persist: Option<Persist>,
@@ -355,6 +357,14 @@ fn present(value: Option<&Value>) -> bool {
 }
 
 impl ResponsesRequest {
+    /// Whether `include` asks for `reasoning.encrypted_content`.
+    fn includes_encrypted_reasoning(&self) -> bool {
+        self.include
+            .iter()
+            .flatten()
+            .any(|value| value == "reasoning.encrypted_content")
+    }
+
     /// Whether this is a background request kept only temporarily: `store`
     /// is `false`, explicitly or by default on a server without a store.
     fn temporary_background(&self, stored: bool) -> bool {
@@ -816,7 +826,13 @@ pub(super) fn prepare_responses_conversing(
         prompt_cache_key: request.prompt_cache_key.clone(),
         safety_identifier: request.safety_identifier.clone(),
         previous_response_id: request.previous_response_id.clone(),
-        cipher: cipher.cloned(),
+        // Reasoning is sealed only on request, as `OpenAI` does: a key on
+        // the server is not a request, and a client replaying an unrequested
+        // envelope without its item id would be refused. Stored and
+        // conversation history keep the plaintext, so nothing else needs it.
+        cipher: cipher
+            .filter(|_| request.includes_encrypted_reasoning())
+            .cloned(),
         // `reject_unsupported` has ensured a background response is stored,
         // durably or temporarily.
         background: request.background == Some(true) && persist.is_some(),
