@@ -2552,3 +2552,135 @@ decision feature parity and cache/FIFO/cancellation checks. The earlier 208
 HTTP regression checks passed again. The ten-minute expiry is tested with an
 injected clock, not a ten-minute live wait. No full OpenAI conformance or
 general coding-quality claim follows from these contract checks.
+
+### Coding clients and long-context coding quality
+
+`tools/client_compat.py` runs Codex CLI and Oh My Pi against `local-ai serve`
+through a recording proxy, in disposable scratch repositories with scratch
+`HOME`/`CODEX_HOME` (Oh My Pi inside a `sandbox-exec` write jail, Codex in its
+own `workspace-write` sandbox, no network). Each scenario records pass/fail,
+the first failing request/response, the server-log slice and the owning
+workstream. `tools/context_eval.py` measures seeded coding questions inside
+synthetic repositories of increasing size. Both are reruns, not fixtures:
+run them again after a merge and compare.
+
+```bash
+# client scenarios (≈10 GPU-minutes); Codex 0.162.1 installed under .amp/in/codex
+CODEX=$PWD/.amp/in/codex/node_modules/.bin/codex
+lockf -k /tmp/local-ai-gpu.lock python3 tools/client_compat.py --codex-bin "$CODEX" \
+    --timeout 420 --out .amp/in/artifacts/client-compat/<run>
+lockf -k /tmp/local-ai-gpu.lock python3 tools/client_compat.py --no-reasoning-key \
+    --scenarios omp-fix-xhigh --out .amp/in/artifacts/client-compat/<run>-nokey
+# long-context matrix; finished items are skipped, so split it into bounded runs
+lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes short,8k,32k
+lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes 128k --seeds 0 --efforts xhigh
+python3 tools/context_eval.py --report
+```
+
+#### Client baseline (2026-10-11, server at `d2cad1b`)
+
+Clients: Codex CLI 0.162.1 (npm `@openai/codex`, `wire_api = "responses"`,
+function tools only: web search, sub-agents, goals, apps, plugins, skills and
+the permissions/apps/collaboration developer text turned off) and Oh My Pi
+18.8.9 (the engine README's `models.yml`, tools `read,bash,edit,write,grep,glob`,
+`--thinking off|xhigh`). The server ran with `--reasoning-key` unless noted.
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| omp-fix (run tests, edit, rerun, summarize) | PASS | 5 requests, 56 s, tests pass, test file untouched |
+| omp-read + resumed second turn | PASS | `42`, then `7` after `--continue` |
+| omp-recover (missing file, then fallback) | PASS | `PERIWINKLE-42` after the failed read's tool result |
+| omp-fix-xhigh | **FAIL** | turn 2: 400 `encrypted reasoning requires its original unique item id`; without the key: 11× `response.failed` `invalid tool call: read: arguments: "i" is a required property` |
+| omp-cancel (SIGINT mid-stream) | PASS | client exited, upstream closed, follow-up 200 in 0.3 s |
+| codex-fix | PASS | 4 requests, 65 s |
+| codex-read + `exec resume --last` | PASS | `42`, then `7` |
+| codex-recover | PASS | `cat missing \|\| cat notes` in one call; the error reached the model |
+| codex-fix-xhigh | PASS | 6 requests, 81 s, 7 tool results, encrypted reasoning replayed |
+| codex-cancel | PASS | exited 0.1 s after SIGINT, follow-up 200 |
+| codex-default-config | **FAIL** | 400 `tool type "namespace" is not supported` (`multi_agent_v1`; `web_search` also sent) |
+| Codex with its default developer messages | **FAIL** | every request 400 `developer message must be first` |
+| http-reasoning-summary-auto | **FAIL** | 400 `reasoning.summary is not supported` |
+| http-custom-tool-apply-patch / local-shell / web-search / namespace | **FAIL** | 400 `tool type … is not supported` |
+| http-compact | **FAIL** | 404 on `/v1/responses/compact` |
+| http-multiple-developer-messages | **FAIL** | 400 `developer message must be first` |
+| http-encrypted-reasoning-unrequested | **FAIL** | `encrypted_content` returned without `include` |
+| http-encrypted-reasoning-replay, stream-disconnect, background-cancel, invalid-then-valid | PASS | replay answers `2.7.1`; follow-ups 200 |
+
+Gaps by owner:
+
+- **Protocol.** (1) Two leading `developer` messages (Codex sends base
+  instructions, then permissions/skills text) are refused; `tools.rs` allows
+  one leading instruction turn instead of merging consecutive ones.
+  (2) With `--reasoning-key`, every reasoning item carries `encrypted_content`
+  even when `include` does not ask for it; Oh My Pi (`includeEncryptedReasoning:
+  false`) replays such items without their `id`, and replay requires the id.
+  (3) A generated call to a non-strict function tool whose arguments miss a
+  required property fails the whole response (`response.failed`,
+  `server_error`) rather than returning the call for the client to reject or
+  constraining it; Oh My Pi retried the identical request ten times.
+- **Hosted/custom tools.** `custom` (freeform `apply_patch`), `local_shell`,
+  `web_search` and `namespace` tools; Codex's default configuration needs
+  `namespace` and `web_search`.
+- **Reasoning summaries / compaction.** `reasoning.summary` and
+  `/v1/responses/compact` are not implemented; the clients ran with summaries
+  off and never reached their compaction thresholds in these short tasks.
+- **Background recovery.** Cancellation of a running background response
+  passes; recovery after a restart is not exercised by this harness.
+
+Raw evidence: `.amp/in/artifacts/client-compat/run5` (Oh My Pi, HTTP),
+`run6` (Codex defaults for developer text), `run7` (Codex compat, new probes),
+`run7-nokey`; each has `results.json`, `summary.md`, `exchanges.jsonl` and
+`server.log`. The recovery scores above use the current rule (the failed read
+must reach the model as a tool result); `run5`/`run7` were scored with an
+earlier two-call rule.
+
+#### Long-context coding quality (2026-10-11, server at `d2cad1b`)
+
+Each seed plants nine questions in a synthetic Python repository: at the
+start, middle and end (4%, 50%, 94% of the prompt) a `recall` (state a
+production fee constant), a `lookup` (evaluate a pricing function whose
+constants live in a config module, with similarly named legacy decoys
+elsewhere) and a `fix` (return the one corrected line of a function that
+contradicts its docstring; the line is substituted and run against hidden
+tests in an isolated interpreter). The `short` control holds the same nine
+needles in about 1.7K tokens. The repository is the system message, each
+question its own user turn, greedy, non-streamed Chat Completions; the
+first question of each (size, seed, effort) group pays the cold prefill and
+the rest reuse it from the prompt cache (three in parallel). `none` allows 384
+output tokens, `xhigh` 4,096; no answer hit its limit. Seconds in the prefill
+column are the cold first request.
+
+| Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All | Cold prefill | Warm wall, median |
+| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: |
+| short | none | 0,1,2 | 1,593–1,808 | 9/9 | 3/9 | 8/9 | 7/9 | 7/9 | 6/9 | 20/27 | 112–130 tok/s | 1.8 s |
+| short | xhigh | 0,1,2 | 1,629–1,844 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | **27/27** | 112–130 tok/s | 9.1 s |
+| 8K | none | 0,1,2 | 8,636–8,758 | 9/9 | 4/9 | 6/9 | 4/9 | 9/9 | 6/9 | 19/27 | 111–124 tok/s (≈76 s) | 2.7 s |
+| 8K | xhigh | 0,1,2 | 8,672–8,794 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | **27/27** | 104–125 tok/s (≈80 s) | 12.4 s |
+| 32K | none | 0,1,2 | 32,380–32,759 | 9/9 | 7/9 | 6/9 | 7/9 | 9/9 | 6/9 | 22/27 | 106–107 tok/s (≈305 s) | 3.7 s |
+| 32K | xhigh | 0,1,2 | 32,416–32,795 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | **27/27** | 107 tok/s (≈305 s) | 16.2 s |
+| 128K | none | 0 | 127,931–127,943 | 3/3 | 0/3 | 2/3 | 1/3 | 2/3 | 2/3 | 5/9 | 67 tok/s (1,911 s) | 12.1 s |
+| 128K | xhigh | 0 | 127,967–127,979 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **9/9** | 66 tok/s (1,923 s) | 36.7 s |
+
+`xhigh` answered every question at every size, with 83–397 reasoning tokens
+(median 206) and no truncation; at 128K its follow-ups decoded at 19–24
+tok/s while three ran together. `none` retrieved every constant (recall
+9/9 at each size, 3/3 at 128K) but missed lookups, which need a two-step
+calculation (3–7 of 9 per size, 0/3 at 128K), and failed one fix needle
+consistently: for `sum_even` (`range(1, n)` should be `range(1, n + 1)`) it
+returned `total += 2 * (i + 1)`, a change to the wrong line that is also
+incorrect. Its failures appear in the short control too, so they are a
+reasoning-mode effect, not a context-length one; across the sizes measured
+no position (start/middle/end) failed under `xhigh`. Latency is dominated by
+cold prefill: about 115 tok/s to 8K, 107 at 32K and 66 at 128K, so a fresh
+128K repository costs 32 minutes before the first token. With the prefix
+cached, a 128K follow-up still took 11–29 s for a two-token `none` answer
+and 7–41 s for an `xhigh` one.
+
+Not measured: 64K and ~250K. A cold ~250K group would need well over an
+hour of prefill at the measured rate, so each (seed, effort) group exceeds a
+45-minute GPU lock hold and needs a longer dedicated window (or a host
+prompt-cache tier that survives restarts); the 2026-10-10 near-maximum probe
+above is the only 250K-class evidence. 128K has one seed per effort, so its
+rows show that 128K works, not a rate. Raw rows (answers, token counts,
+timings, cache hits) are in `.amp/in/artifacts/context-eval/results.jsonl`,
+the prompts in `prompts/`, and the run logs beside them.
