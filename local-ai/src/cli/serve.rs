@@ -34,6 +34,7 @@ mod resume;
 mod services;
 mod sse;
 mod store;
+mod vector_stores;
 
 #[cfg(test)]
 use self::request::message_text;
@@ -105,6 +106,7 @@ struct AppState {
     /// Native durable services, available automatically in the user's data directory.
     services: Option<Arc<services::Services>>,
     batches: Option<Arc<batches::Batches>>,
+    vector_stores: Option<Arc<vector_stores::VectorStores>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -174,10 +176,22 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         }
     }
     if services::matches(parts.uri.path()) {
-        return services::handle(&state, &parts, body).await;
+        let response = services::handle(&state, &parts, body).await;
+        if parts.method == Method::DELETE
+            && parts.uri.path().starts_with("/v1/files/")
+            && response.status().is_success()
+            && let Some(vector_stores) = &state.vector_stores
+        {
+            // The deleted File left every vector store; drop its documents.
+            vector_stores.notify();
+        }
+        return response;
     }
     if batches::matches(parts.uri.path()) {
         return batches::handle(&state, &parts, body).await;
+    }
+    if vector_stores::matches(parts.uri.path()) {
+        return vector_stores::handle(&state, &parts, body).await;
     }
     if parts.method == Method::GET && parts.uri.path() == "/health" {
         return json_response(
@@ -870,6 +884,20 @@ fn models_json(model: &str, context: usize, created: u64) -> serde_json::Value {
 #[allow(clippy::too_many_lines)]
 async fn run_async(args: Args) -> crate::Result<()> {
     let services = services::Services::open_default()?;
+    let vector_stores = match vector_stores::VectorStores::start(services.store()) {
+        Ok(vector_stores) => Some(vector_stores),
+        // Another server on this data directory owns the index: serve
+        // everything else.
+        Err(local_services::Error::Conflict(message)) => {
+            eprintln!("warning: vector stores are unavailable: {message}");
+            None
+        }
+        Err(error) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "cannot start vector stores: {error}"
+            )));
+        }
+    };
     let cipher = args
         .reasoning_key
         .as_ref()
@@ -931,6 +959,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         decisions: decisions.clone(),
         services: Some(services),
         batches: None,
+        vector_stores: vector_stores.clone(),
     };
     let address = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -976,6 +1005,10 @@ async fn run_async(args: Args) -> crate::Result<()> {
     decisions::close(decisions.as_deref());
     batches.close();
     batches.drained().await;
+    // The indexer finishes its current file; an unfinished one resumes on start.
+    if let Some(vector_stores) = vector_stores {
+        let _ = tokio::task::spawn_blocking(move || vector_stores.close()).await;
+    }
     let closing = Arc::clone(&background);
     let _ = tokio::task::spawn_blocking(move || closing.close()).await;
     // Each cancelled job still holds its engine slot and lease until the worker
