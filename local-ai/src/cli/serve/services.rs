@@ -803,7 +803,7 @@ fn multipart_failure(error: &MultipartError) -> Failure {
 
 /// Read a JSON body of at most [`MAX_REQUEST_BYTES`]: `None` when empty,
 /// otherwise one object with no repeated key anywhere.
-async fn read_json(body: Body) -> Result<Option<Map<String, Value>>, Failure> {
+pub(super) async fn read_json(body: Body) -> Result<Option<Map<String, Value>>, Failure> {
     let bytes = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
@@ -827,7 +827,7 @@ async fn read_json(body: Body) -> Result<Option<Map<String, Value>>, Failure> {
     }
 }
 
-fn typed<T: DeserializeOwned>(object: Map<String, Value>) -> Result<T, Failure> {
+pub(super) fn typed<T: DeserializeOwned>(object: Map<String, Value>) -> Result<T, Failure> {
     serde_json::from_value(Value::Object(object))
         .map_err(|error| bad_request(format!("invalid request body: {error}")))
 }
@@ -1096,7 +1096,7 @@ fn upload_failure(store: &Store, id: &str, error: Error) -> Failure {
 }
 
 /// The status a native error is answered with.
-fn failure(error: Error) -> Failure {
+pub(super) fn failure(error: Error) -> Failure {
     match error {
         Error::InvalidArgument(message) => (StatusCode::BAD_REQUEST, message),
         Error::NotFound(message) => (StatusCode::NOT_FOUND, message),
@@ -1115,19 +1115,19 @@ fn io_failure(error: &std::io::Error) -> Failure {
     )
 }
 
-fn bad_request(message: impl Into<String>) -> Failure {
+pub(super) fn bad_request(message: impl Into<String>) -> Failure {
     (StatusCode::BAD_REQUEST, message.into())
 }
 
-fn body_required() -> Failure {
+pub(super) fn body_required() -> Failure {
     bad_request("a JSON request body is required")
 }
 
-fn unavailable(message: &str) -> Failure {
+pub(super) fn unavailable(message: &str) -> Failure {
     (StatusCode::SERVICE_UNAVAILABLE, message.to_owned())
 }
 
-fn route_not_found() -> Failure {
+pub(super) fn route_not_found() -> Failure {
     (StatusCode::NOT_FOUND, "route not found".to_owned())
 }
 

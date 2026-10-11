@@ -20,7 +20,7 @@ ignore = "0.4.33"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 grep-matcher = "0.1.9"
-tantivy = { version = "=0.26.2", default-features = false }
+tantivy = { version = "=0.26.2", default-features = false, features = ["mmap", "stemmer"] }
 md5 = "0.8"
 # OS randomness for identifiers; already in the lock through rustls.
 ring = "0.17"

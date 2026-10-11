@@ -502,8 +502,8 @@ responses with cancellation and journal-based stream resumption, temporary
 JSON-object/JSON-schema output, tool calls constrained during decoding, and
 durable conversations, files, uploads and text-endpoint batches
 ([native services](#native-services)) are now implemented as described;
-compaction and
-vector stores still need server implementations; OpenAI-compatible Decisions needs
+lexical (BM25) vector stores are implemented too ([native services](#native-services));
+compaction still needs a server implementation; OpenAI-compatible Decisions needs
 a judgment head with evaluated confidence and refusal semantics; media,
 embedding, audio and moderation capabilities need suitable models or heads. Hosted tools,
 evals, fine-tuning and administrative APIs also need their own services. None
@@ -725,6 +725,23 @@ preparation and generation blocking tasks, never on runtime workers.
   lock gives one server ownership of a batch. A restart reclaims batches with
   free leases and resumes their unsettled lines. A line interrupted before
   settling is generated again. Result files have stable `batch_output` IDs.
+
+- **Vector Stores.** Stores, store files, file batches (create, retrieve,
+  cancel, list files), parsed file content and `search`, with the contract's
+  pagination, expiry, file status lifecycle, `auto`/`static` chunking,
+  attributes and filters. Ranking is **lexical BM25** over one persistent
+  Tantivy index derived from the SQLite rows, not embeddings (see
+  [Tried and rejected](#tried-and-rejected)); scores are `s / (1 + s)` of the
+  BM25 score, so `rewrite_query: true` and the `default-2024-11-15` ranker
+  are a 400. Attaching answers `in_progress` and wakes one indexer thread;
+  it never polls, and a restart resumes files left `in_progress`. A
+  garbage outbox keeps the index consistent with the database across
+  crashes and deletions; startup rebuilds an index that disagrees. One server
+  owns a data directory's index; a second server on the same directory
+  serves everything except vector stores. Details are in
+  [local-services/README.md](../local-services/README.md#vector-stores).
+  There is no `/v1/embeddings` route; the search and index design leave one
+  ranking step and one indexing step for a later embedding model.
 
 Resuming background Responses after a crash is the server's job (see
 [Server API](#server-api)), not these services'; batch
@@ -1955,6 +1972,25 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
 
+- Pooled Bonsai hidden states as retrieval embeddings (October 2026):
+  BEIR SciFact, all 300 test queries against a 1,000-document subset (the
+  283 relevant abstracts plus 717 random others, title and abstract,
+  truncated to 256 tokens). Each text was wrapped in a PromptEOL template
+  (`This passage : "…" means in one word:"`) and run through the
+  hidden-state capture path the judgment head uses (`capture_features`,
+  output-normalized 5120-wide rows). Cosine ranking of the mean over the
+  text's rows, mean-centered, scored nDCG@10 0.643 and Recall@100 0.951
+  (uncentered 0.649 and 0.944; the final-token row 0.574 to 0.594 and 0.907
+  to 0.934). The shipped Tantivy BM25 scored nDCG@10 0.811 and Recall@100
+  0.960 on the same documents and queries (0.692 and 0.925 on the full
+  5,183-document corpus). Reciprocal-rank fusion of the two (k = 60) lowered
+  nDCG@10 to 0.766 for Recall@100 0.987. Embedding also ran at 117–124
+  tokens/s on the GPU (about 0.5 documents/s, 34 minutes for the 1,000
+  documents), while BM25 indexed the same documents in 4.9 s and answered a
+  query in 7 ms. Neither quality nor throughput is competitive, so pooled
+  Bonsai states are not used as embeddings and vector store ranking stays
+  lexical; a dedicated embedding model is a separate question (the
+  vector store module docs describe where its ranking would plug in).
 - PTQ1 pipeline descriptor hints (32-thread maximum and the multiple-of-SIMD
   execution-width flag): outputs stayed bitwise identical, but timing shifts
   were within about 2% and moved with the repeated default control. No
