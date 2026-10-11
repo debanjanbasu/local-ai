@@ -268,7 +268,7 @@ fn usage_counts_reasoning_tokens_including_the_delimiter_not_text_chunks() {
 
 #[test]
 fn the_worker_reports_invalid_and_truncated_calls_without_finishing() {
-    let invalid = CALL.replace("city", "town");
+    let invalid = CALL.replace("get_weather", "get_forecast");
     let truncated = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar";
     for (output, stops) in [(invalid.as_str(), true), (truncated, false)] {
         let (mut delivery, _receiver) = delivery(Some(weather_tools()));
