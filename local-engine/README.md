@@ -72,7 +72,7 @@ the context, and a prompt is rendered from the latest `compaction` item, whose
 `Compacted` payload carries the summary and the kept items. A cut never falls
 between a `function_call` and its `function_call_output` or inside an
 assistant turn, so pending calls and everything after them are kept; the
-leading system message and the latest user message are always kept verbatim;
+leading system/developer messages and the latest user message are always kept verbatim;
 the newest items are kept up to a token budget measured with
 `count_chat_tokens`. A harness counts, plans, runs `compaction_request` on the
 engine, collects `Event::Content`, and replaces the summarized items.
@@ -215,10 +215,13 @@ Contract:
 - Reasoning is split off first; tool markup is recognised only in the answer,
   and only when `tools` is non-empty. Otherwise it is ordinary content.
 - `Event::ToolCall(ToolCall { id, name, arguments })` is emitted only once a
-  whole `<tool_call>` block has been generated, parsed and validated against
-  the tool's schema. Ordinary text still streams; only a possible `<tool_call>`
+  whole `<tool_call>` block has been generated and parsed, and, for a strict
+  tool, validated against its schema. A non-strict tool's schema guides the
+  model but is not enforced: its call is emitted with the arguments as
+  generated, for the harness or client to validate and answer with an error
+  result. Ordinary text still streams; only a possible `<tool_call>`
   prefix and trailing whitespace are held back. Partial calls are never emitted.
-- A malformed, unknown, schema-violating or EOS-truncated call ends the generation:
+- A malformed, unknown, strict-schema-violating or EOS-truncated call ends the generation:
   `EventStream` yields `Event::Error` and no `Event::Finished`; `Engine::chat_with`
   returns `Err`. Earlier valid calls in the same answer have already been emitted.
 - A token limit or cancellation instead discards an unfinished call and preserves
@@ -232,10 +235,13 @@ Contract:
   `tool` message per call with `tool_call_id`. Consecutive results render as one
   user turn of `<tool_response>` blocks, reordered by ID into call order because
   Bonsai's template has no model-visible IDs. Duplicate IDs, unanswered calls,
-  unmatched or repeated results, unknown tools, invalid arguments and invalid
-  schemas are rejected with `Error::InvalidArgument` before generation.
-- `developer` is accepted as the first message and fills the template's single
-  system slot, like `system`.
+  unmatched or repeated results, unknown tools, arguments that violate a strict
+  tool's schema and invalid schemas are rejected with `Error::InvalidArgument`
+  before generation; a non-strict call replays as it was generated.
+- `developer` is accepted like `system` and fills the template's single
+  system slot. Consecutive leading `system`/`developer` messages are joined
+  there in order, separated by a blank line; one renders exactly as before,
+  and an instruction message after the first non-instruction one is refused.
 - With the defaults (`ToolChoice::Auto`, `parallel_tool_calls: true`, no
   strict tool, `ResponseFormat::Text`) generation is unconstrained and the
   model decides whether to call. Any other setting is enforced by the

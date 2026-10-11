@@ -74,8 +74,9 @@ class ConfigTest(unittest.TestCase):
         self.assertFalse(any(compat["features"].values()))
         self.assertTrue(compat["sandbox_workspace_write"]["exclude_slash_tmp"])
         self.assertFalse(compat["sandbox_workspace_write"]["network_access"])
-        self.assertFalse(compat["include_permissions_instructions"])
-        self.assertFalse(compat["skills"]["include_instructions"])
+        # Codex's default developer messages are kept.
+        self.assertNotIn("include_permissions_instructions", compat)
+        self.assertNotIn("skills", compat)
         default = tomllib.loads(cc.codex_config(9999, "xhigh", compat=False))
         self.assertNotIn("features", default)
         self.assertEqual(default["model_reasoning_effort"], "xhigh")
