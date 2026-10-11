@@ -291,6 +291,28 @@ async fn write_and_edit_inside_the_root() {
         std::fs::read_to_string(root.path().join("notes/today.txt")).expect("read"),
         "zero two two\n"
     );
+    // A second name for a file (here inside the root, standing in for one
+    // outside it) makes it unwritable through the tools.
+    std::fs::hard_link(
+        root.path().join("notes/today.txt"),
+        root.path().join("alias.txt"),
+    )
+    .expect("hard link");
+    let error = tools
+        .run(
+            Request::Write {
+                path: "alias.txt".into(),
+                content: "changed\n".into(),
+            },
+            SECOND,
+        )
+        .await
+        .expect_err("refused");
+    assert!(matches!(error, ToolError::Denied(_)), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes/today.txt")).expect("read"),
+        "zero two two\n"
+    );
 }
 
 #[tokio::test]
@@ -441,6 +463,18 @@ async fn shell_writes_are_confined() {
     assert!(root.join("inside.txt").exists());
     assert!(!root.join(".git/inside.txt").exists());
     assert!(!outside.exists());
+    // A hard link would make a file outside the root writable through it.
+    let source = outer.path().join("source.txt");
+    std::fs::write(&source, "outside\n").expect("source");
+    let link = format!("ln '{}' hard.txt", source.display());
+    let run = runs(
+        writable
+            .run(sh(&[&link], None), 10 * SECOND)
+            .await
+            .expect("shell"),
+    );
+    assert_ne!(run[0].outcome, Outcome::Exit(0), "{:?}", run[0]);
+    assert!(!root.join("hard.txt").exists());
 }
 
 #[tokio::test]

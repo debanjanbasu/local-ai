@@ -70,7 +70,10 @@ capability handle on the root (`cap-std`), which cannot resolve outside it
 even if a component is swapped between check and open. Reads, listings and
 searches are bounded by the workspace limits and marked when truncated.
 Writes and edits need `--tools-allow-write`, create missing directories and
-are capped at 4 MiB; edits replace exactly one occurrence.
+are capped at 4 MiB; edits replace exactly one occurrence. A file with more
+than one hard link is never written (its other name may be outside the
+root), and the shell sandbox refuses to create a hard link to a file outside
+the root.
 
 **Shell** (`tools::shell`): `/bin/sh -c` under `sandbox-exec` with a
 deny-by-default profile: no network (`connect` fails with EPERM), no Mach
@@ -109,6 +112,8 @@ verified by the macOS trust store. The body is capped at 256 KiB.
 - The shell can read system directories (`/usr`, `/System`, `/private/etc`,
   ...), which any local user can read; it cannot read the home directory
   outside the root.
+- Reads do not check hard links: a hard link to an outside file that already
+  exists in the root (made by its owner, not by the tools) is readable.
 - Filesystem work is synchronous and bounded by size limits rather than
   interrupted by cancellation.
 - `sandbox-exec` is deprecated by Apple but still shipped and enforced; if it
