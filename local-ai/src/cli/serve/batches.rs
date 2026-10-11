@@ -170,6 +170,7 @@ impl Batches {
                 ..Control::default()
             }),
             wake: Condvar::new(),
+            observers: Mutex::default(),
         });
         let (done, finished) = watch::channel(false);
         let running = Arc::clone(&worker);
@@ -191,6 +192,26 @@ impl Batches {
     /// Idempotent; never blocks on the engine.
     pub(super) fn close(&self) {
         self.worker.close();
+    }
+
+    /// Ask the worker to scan for runnable batches (one was just created).
+    pub(super) fn notify(&self) {
+        self.worker.notify();
+    }
+
+    /// Interrupt the running line of `batch`, which was just cancelled in
+    /// the store, so it stops at once.
+    pub(super) fn interrupt(&self, batch: &str) {
+        self.worker.cancelled(batch);
+    }
+
+    /// Call `observer` each time the worker has finished with a batch.
+    pub(super) fn on_finish(&self, observer: Observer) {
+        self.worker
+            .observers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(observer);
     }
 
     /// Wait until the worker has let go of the engine, its lease and the
@@ -306,7 +327,12 @@ struct Worker {
     control: Mutex<Control>,
     /// Signalled on every change to `control`.
     wake: Condvar,
+    /// Told after each batch the worker has finished with.
+    observers: Mutex<Vec<Observer>>,
 }
+
+/// Called after the worker has finished with a batch.
+pub(super) type Observer = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct Control {
@@ -407,6 +433,14 @@ impl Worker {
                             );
                         }
                         self.lock().cancelled.remove(&id);
+                        let observers = self
+                            .observers
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone();
+                        for observer in observers {
+                            observer();
+                        }
                     }
                     // Another live server owns it.
                     Ok(None) => {}
@@ -670,7 +704,7 @@ fn failed(status: StatusCode, message: &str) -> LineOutcome {
     }
 }
 
-async fn read_json<T: DeserializeOwned>(body: Body) -> Result<T, Failure> {
+pub(super) async fn read_json<T: DeserializeOwned>(body: Body) -> Result<T, Failure> {
     let bytes = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
