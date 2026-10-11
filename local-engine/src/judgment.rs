@@ -60,6 +60,11 @@
 //! argmax and, for scores, the probability-weighted level index, together
 //! with the loaded head's own `calibration_scope` (or
 //! [`UNKNOWN_CALIBRATION_SCOPE`]) for what those probabilities are not.
+//!
+//! [`crate::Engine::capture_decision`] returns a [`DecisionCapture`]: the
+//! same rendering, tokens and FP16-rounded features a scored decision reads,
+//! before any head, so evaluation and calibration data come from the serving
+//! path (`judgment-capture`, `tools/judgment_calibrate.py`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -70,9 +75,9 @@ mod decision;
 
 pub(crate) use self::decision::PreparedDecision;
 pub use self::decision::{
-    DECISION_CAPTURE_ROWS, DECISION_RENDERER, DECISION_RENDERERS, Decision, DecisionKind,
-    DecisionProbability, DecisionRequest, DecisionValue, MAX_DECISION_OPTIONS, RenderedDecision,
-    UNKNOWN_CALIBRATION_SCOPE,
+    DECISION_CAPTURE_ROWS, DECISION_RENDERER, DECISION_RENDERERS, Decision, DecisionCapture,
+    DecisionKind, DecisionProbability, DecisionRequest, DecisionValue, MAX_DECISION_OPTIONS,
+    RenderedDecision, UNKNOWN_CALIBRATION_SCOPE,
 };
 
 /// The `format` metadata value the loader accepts.

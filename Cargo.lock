@@ -1465,6 +1465,7 @@ dependencies = [
  "bytes",
  "h3",
  "h3-quinn",
+ "half",
  "http-body-util",
  "jsonschema",
  "local-engine",

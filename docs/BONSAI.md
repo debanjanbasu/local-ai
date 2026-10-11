@@ -922,7 +922,11 @@ way. These waits are futures woken by the engine or by shutdown, not polling.
 `POST /v1/decisions` is always a 404 with an explanation. OpenAI's Decisions
 responses require a `confidence` on every choice and score answer and may
 answer with a `refusal`; the head produces neither, and a confidence could
-only be invented. The existing devtools-v1 head declares no renderer or
+only be invented. Calibrated confidence, a refusal threshold and a scope
+gate were fitted and tested against pre-registered criteria in
+[DECISIONS_EVALUATION.md](DECISIONS_EVALUATION.md): no head passed (for the
+devtools-v1 head, selective risk on new CodeReviewer projects and the
+out-of-scope feature gate failed), so the route stays refused. The existing devtools-v1 head declares no renderer or
 calibration scope, so the route reports `renderer_source: "assumed"` and an
 unknown calibration scope for it; as measured when it was evaluated, its
 probabilities are calibrated only for the two-option Yes/No code-diff
