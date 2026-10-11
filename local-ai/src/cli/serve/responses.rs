@@ -51,7 +51,23 @@
 //!   reasoning, before any answer, is `failed`.
 //! - Text only: image, file and audio parts fail.
 //! - `reasoning.effort` is `none` or `xhigh`, the checkpoint's only two modes,
-//!   and reasoning is returned as `reasoning_text` content, never a summary.
+//!   and raw reasoning is returned as `reasoning_text` content, never as a
+//!   summary. `reasoning.summary` (`auto`, `concise` or `detailed`) runs a
+//!   second, short generation of the same model after the first ends, which
+//!   summarizes the raw reasoning into the reasoning item's `summary` with
+//!   the `response.reasoning_summary_*` events; the item's `output_item.done`
+//!   waits for it. Not with `background`.
+//! - Compaction (`POST /v1/responses/compact`, and `context_management`
+//!   compaction here) summarizes older items with the same model and keeps
+//!   the rest verbatim (policy: [`local_services::compaction`]; prompts:
+//!   [`local_engine::compaction`]). The `compaction` item is sealed with the
+//!   `--reasoning-key` cipher, so both need one. A prompt is rendered from the
+//!   latest compaction item onward: the summary, then the items it kept, then
+//!   the items after it; anything before it is skipped. With
+//!   `context_management`, a prompt that reaches `compact_threshold`, or that
+//!   leaves less than `max_output_tokens` of the context, is compacted before
+//!   generation and the compaction item is the Response's first output item.
+//!   Not with `background`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,7 +76,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use local_engine::bonsai_model::StopReason;
+use local_engine::compaction::{
+    SummaryDetail, compaction_request, reasoning_summary_request, summary_message,
+};
 use local_engine::{ChatMessage, ChatRequest, Event, Sampling, Stats, ToolCall, ToolDefinition};
+use local_services::compaction::{COMPACTION, Compacted, latest, plan};
 use local_services::conversations::{MAX_APPEND_ITEMS, MAX_ID_CHARS};
 use local_services::{Append, Error as ServiceError, Store as ConversationStore};
 
@@ -174,6 +194,37 @@ pub(super) struct Echo {
     background: bool,
     /// The durable conversation this Response continues and is appended to.
     conversation: Option<Conversing>,
+    /// `reasoning.summary`: the detail the raw reasoning is summarized at.
+    summary: Option<SummaryDetail>,
+    /// What runs the summary generation; attached by the server.
+    summarizer: Option<Summarizer>,
+    /// The compaction item made before generation (`context_management`),
+    /// the Response's first output item.
+    compaction: Option<Value>,
+}
+
+/// Runs one generation of the loaded model to its end, handing each piece of
+/// visible content to the callback, and returns its measurements. The
+/// callback answers `false` when nobody is listening any more, which cancels
+/// the generation.
+///
+/// The server's runs it on the engine; tests substitute their own.
+pub(super) type Generate =
+    Arc<dyn Fn(ChatRequest, &mut dyn FnMut(&str) -> bool) -> crate::Result<Stats> + Send + Sync>;
+
+/// Delivers streaming events while a Response is still inside one engine
+/// event (the summary generation runs after the main one's last event), and
+/// answers `false` once the client is gone.
+pub(super) type Flush = Box<dyn FnMut(Vec<Value>) -> bool + Send>;
+
+/// The generation a Response summarizes its reasoning with.
+#[derive(Clone)]
+pub(super) struct Summarizer(pub(super) Generate);
+
+impl std::fmt::Debug for Summarizer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Summarizer")
+    }
 }
 
 /// A durable conversation a Response continues, and what it will append.
@@ -231,6 +282,16 @@ impl Echo {
     pub(super) const fn background(&self) -> bool {
         self.background
     }
+
+    /// Whether `reasoning.summary` asked for a summary generation.
+    pub(super) const fn summarizes(&self) -> bool {
+        self.summary.is_some()
+    }
+
+    /// Attach what runs the summary generation.
+    pub(super) fn set_summarizer(&mut self, summarizer: Summarizer) {
+        self.summarizer = Some(summarizer);
+    }
 }
 
 /// A Response that is to be stored, and the resolved input it answers.
@@ -249,10 +310,21 @@ struct Persist {
     request: Option<Value>,
 }
 
+/// A `context_management` compaction entry.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ContextCompaction {
+    /// `compact_threshold`: the prompt tokens that make compaction due.
+    pub(super) threshold: Option<usize>,
+}
+
 pub(super) struct PreparedResponses {
     pub(super) stream: bool,
     pub(super) request: ChatRequest,
     pub(super) echo: Echo,
+    /// `context_management` compaction, when requested.
+    pub(super) context_compaction: Option<ContextCompaction>,
+    /// The prompt's history, as rendered: what a compaction pass summarizes.
+    pub(super) history: History,
 }
 
 fn invalid(message: impl Into<String>) -> crate::Error {
@@ -286,6 +358,24 @@ impl ResponsesRequest {
         encrypted: bool,
         conversations: bool,
     ) -> crate::Result<()> {
+        let summarizes = self.reasoning.as_ref().is_some_and(|reasoning| {
+            reasoning.summary.is_some() || reasoning.generate_summary.is_some()
+        });
+        // Refused first: they cannot run in the background at all.
+        if self.background == Some(true) {
+            if present(self.context_management.as_ref()) {
+                return Err(unsupported(
+                    "context_management with background",
+                    "compaction runs before generation, as part of the request",
+                ));
+            }
+            if summarizes {
+                return Err(unsupported(
+                    "reasoning.summary with background",
+                    "the summary generation runs only for foreground responses",
+                ));
+            }
+        }
         if !stored && self.store == Some(true) {
             return Err(unsupported(
                 "store=true",
@@ -325,9 +415,15 @@ impl ResponsesRequest {
                  the earlier items in input",
             ));
         }
+        if present(self.context_management.as_ref()) && !encrypted {
+            return Err(unsupported(
+                "context_management",
+                "compaction items are sealed with --reasoning-key, which this server was started \
+                 without",
+            ));
+        }
         for (name, value) in [
             ("prompt", &self.prompt),
-            ("context_management", &self.context_management),
             ("prompt_cache_options", &self.prompt_cache_options),
             ("prompt_cache_retention", &self.prompt_cache_retention),
             ("moderation", &self.moderation),
@@ -395,17 +491,84 @@ impl ResponsesRequest {
     }
 }
 
+/// The detail `reasoning.summary` (or the deprecated `generate_summary`) asks
+/// the raw reasoning to be summarized at, if any.
+fn summary_detail(reasoning: Option<&Reasoning>) -> crate::Result<Option<SummaryDetail>> {
+    let Some(reasoning) = reasoning else {
+        return Ok(None);
+    };
+    let name = match (&reasoning.summary, &reasoning.generate_summary) {
+        (Some(summary), Some(generate)) if summary != generate => {
+            return Err(invalid(
+                "reasoning.summary and reasoning.generate_summary disagree; send only summary",
+            ));
+        }
+        (Some(name), _) | (None, Some(name)) => name,
+        (None, None) => return Ok(None),
+    };
+    SummaryDetail::parse(name).map(Some).ok_or_else(|| {
+        invalid(format!(
+            "reasoning.summary must be auto, concise or detailed, not {name:?}"
+        ))
+    })
+}
+
+/// The `context_management` entries: `None` when absent, else the one
+/// `compaction` entry.
+fn context_compaction(value: Option<&Value>) -> crate::Result<Option<ContextCompaction>> {
+    let entries = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(entries)) if !entries.is_empty() => entries,
+        Some(_) => {
+            return Err(invalid(
+                "context_management must be a non-empty array of entries",
+            ));
+        }
+    };
+    let [entry] = entries.as_slice() else {
+        return Err(invalid(
+            "context_management may hold one compaction entry, the only type there is",
+        ));
+    };
+    let entry = entry
+        .as_object()
+        .ok_or_else(|| invalid("a context_management entry must be an object"))?;
+    if let Some(key) = entry
+        .keys()
+        .find(|key| !matches!(key.as_str(), "type" | "compact_threshold"))
+    {
+        return Err(invalid(format!(
+            "unknown field context_management[0].{key}"
+        )));
+    }
+    match entry.get("type").and_then(Value::as_str) {
+        Some("compaction") => {}
+        Some(other) => {
+            return Err(unsupported(
+                &format!("context_management type {other:?}"),
+                "only compaction is implemented",
+            ));
+        }
+        None => return Err(invalid("context_management[0].type must be a string")),
+    }
+    match entry.get("compact_threshold") {
+        None | Some(Value::Null) => Ok(Some(ContextCompaction { threshold: None })),
+        Some(value) => match value.as_u64() {
+            Some(threshold) if threshold >= 1000 => Ok(Some(ContextCompaction {
+                threshold: Some(usize::try_from(threshold).unwrap_or(usize::MAX)),
+            })),
+            _ => Err(invalid(
+                "context_management[0].compact_threshold must be an integer of at least 1000",
+            )),
+        },
+    }
+}
+
 /// The effort to run at, refusing reasoning options this server cannot honour.
 fn reasoning_effort(reasoning: Option<&Reasoning>) -> crate::Result<Option<&str>> {
     let Some(reasoning) = reasoning else {
         return Ok(None);
     };
-    if reasoning.summary.is_some() || reasoning.generate_summary.is_some() {
-        return Err(unsupported(
-            "reasoning.summary",
-            "no summarizer runs; the model's reasoning is returned verbatim as reasoning_text",
-        ));
-    }
     if !matches!(
         reasoning.context.as_deref(),
         None | Some("auto" | "all_turns")
@@ -547,6 +710,8 @@ pub(super) fn prepare_responses_conversing(
     )?;
     let conversation_id = conversation_id(request.conversation.as_ref())?;
     let thinking = effective_thinking(reasoning_effort(request.reasoning.as_ref())?, thinking)?;
+    let summary = summary_detail(request.reasoning.as_ref())?;
+    let context_compaction = context_compaction(request.context_management.as_ref())?;
     let (choice, echoed_choice) = responses_tool_choice(request.tool_choice.as_ref())?;
     let mut echoed_tools = Vec::new();
     let mut tools = Vec::new();
@@ -591,36 +756,9 @@ pub(super) fn prepare_responses_conversing(
     } else {
         Vec::new()
     };
-    for item in &mut items {
-        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-            continue;
-        }
-        if let Some(encrypted) = item
-            .get("encrypted_content")
-            .filter(|value| !value.is_null())
-        {
-            let cipher = cipher
-                .ok_or_else(|| unsupported("encrypted reasoning", "requires --reasoning-key"))?;
-            let envelope = encrypted
-                .as_str()
-                .ok_or_else(|| invalid("encrypted_content must be a string"))?;
-            let id = item
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("encrypted reasoning requires its original item id"))?;
-            let text = cipher
-                .unseal(model, id, envelope)
-                .map_err(|error| invalid(error.to_string()))?;
-            // The authenticated payload is authoritative over any plaintext
-            // supplied alongside it. Keep the envelope in stored input items
-            // so pagination and subsequent stateless replay preserve it.
-            item["content"] = json!([{"type":"reasoning_text","text":text}]);
-        }
-    }
-    let messages = input_messages(
-        &Value::Array(items.clone()),
-        request.instructions.as_deref(),
-    )?;
+    open_reasoning(&mut items, cipher, model)?;
+    let history = History::resolve(&items, request.instructions.clone(), cipher, model)?;
+    let messages = history.messages()?;
     // Refused now, before generation, rather than when the append fails.
     let conversation = snapshot
         .map(|(conversations, id, version)| conversing(conversations, id, version, new_input))
@@ -653,6 +791,9 @@ pub(super) fn prepare_responses_conversing(
         background: request.background == Some(true) && persist.is_some(),
         persist,
         conversation,
+        summary,
+        summarizer: None,
+        compaction: None,
     };
     Ok(PreparedResponses {
         stream: request.stream.unwrap_or(false),
@@ -668,6 +809,335 @@ pub(super) fn prepare_responses_conversing(
             response_format,
         },
         echo,
+        context_compaction,
+        history,
+    })
+}
+
+/// Decrypt every encrypted reasoning item in `items` into its `content`.
+fn open_reasoning(
+    items: &mut [Value],
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<()> {
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        if let Some(encrypted) = item
+            .get("encrypted_content")
+            .filter(|value| !value.is_null())
+        {
+            let cipher = cipher
+                .ok_or_else(|| unsupported("encrypted reasoning", "requires --reasoning-key"))?;
+            let envelope = encrypted
+                .as_str()
+                .ok_or_else(|| invalid("encrypted_content must be a string"))?;
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("encrypted reasoning requires its original item id"))?;
+            let text = cipher
+                .unseal(model, id, envelope)
+                .map_err(|error| invalid(error.to_string()))?;
+            // The authenticated payload is authoritative over any plaintext
+            // supplied alongside it. Keep the envelope in stored input items
+            // so pagination and subsequent stateless replay preserve it.
+            item["content"] = json!([{"type":"reasoning_text","text":text}]);
+        }
+    }
+    Ok(())
+}
+
+/// What compaction item `item` stands for, opened with `cipher`.
+fn open_compaction(
+    item: &Value,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<Compacted> {
+    let cipher =
+        cipher.ok_or_else(|| unsupported("a compaction item", "requires --reasoning-key"))?;
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("a compaction item requires its original item id"))?;
+    let envelope = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("a compaction item requires encrypted_content"))?;
+    let payload = cipher
+        .unseal_compaction(model, id, envelope)
+        .map_err(|error| invalid(format!("compaction item {id}: {error}")))?;
+    serde_json::from_str(&payload)
+        .map_err(|error| invalid(format!("compaction item {id} is malformed: {error}")))
+}
+
+/// A prompt's history from its latest compaction item onward, as it is
+/// rendered.
+#[derive(Debug)]
+pub(super) struct History {
+    /// The latest compaction item's summary, rendered before `items`.
+    summary: Option<String>,
+    /// The items that compaction item kept, then every item after it; with
+    /// no compaction item, every item.
+    items: Vec<Value>,
+    instructions: Option<String>,
+}
+
+impl History {
+    /// Resolve `items` (reasoning already decrypted) from their latest
+    /// compaction item onward; items before it are not rendered.
+    fn resolve(
+        items: &[Value],
+        instructions: Option<String>,
+        cipher: Option<&Arc<ReasoningCipher>>,
+        model: &str,
+    ) -> crate::Result<Self> {
+        let Some(at) = latest(items) else {
+            return Ok(Self {
+                summary: None,
+                items: items.to_vec(),
+                instructions,
+            });
+        };
+        let compacted = open_compaction(&items[at], cipher, model)?;
+        let mut kept = compacted.items;
+        open_reasoning(&mut kept, cipher, model)?;
+        kept.extend_from_slice(items.get(at + 1..).unwrap_or_default());
+        Ok(Self {
+            summary: Some(compacted.summary),
+            items: kept,
+            instructions,
+        })
+    }
+
+    /// The whole history as chat messages.
+    pub(super) fn messages(&self) -> crate::Result<Vec<ChatMessage>> {
+        self.messages_of(&self.items)
+    }
+
+    /// The summary, if any, and then `items`, as chat messages, after the
+    /// instructions. The summary follows a leading system message, which the
+    /// template only takes first.
+    fn messages_of(&self, items: &[Value]) -> crate::Result<Vec<ChatMessage>> {
+        let mut messages =
+            input_messages(&Value::Array(items.to_vec()), self.instructions.as_deref())?;
+        if let Some(summary) = &self.summary {
+            let at = usize::from(
+                messages
+                    .first()
+                    .is_some_and(|first| matches!(first.role.as_str(), "system" | "developer")),
+            );
+            messages.insert(at, summary_message(summary));
+        }
+        Ok(messages)
+    }
+
+    /// Plan a compaction pass that keeps about `keep_tokens` of the newest
+    /// items verbatim, measuring with `count`; `None` when nothing can be
+    /// summarized. The summary request renders `tools` and uses `session`,
+    /// as the conversation's own turns do, so their cached prefix is reused.
+    pub(super) fn compaction(
+        &self,
+        keep_tokens: usize,
+        tools: Vec<ToolDefinition>,
+        session: Option<String>,
+        count: impl Fn(Vec<ChatMessage>) -> crate::Result<usize>,
+    ) -> crate::Result<Option<CompactionPass>> {
+        let planned = plan(&self.items, keep_tokens, |slice| {
+            count(input_messages(&Value::Array(slice.to_vec()), None)?)
+        })?;
+        let Some(planned) = planned else {
+            return Ok(None);
+        };
+        let history = self.messages_of(self.items.get(..planned.split).unwrap_or_default())?;
+        Ok(Some(CompactionPass {
+            request: compaction_request(history, tools, session),
+            kept: planned.kept,
+        }))
+    }
+}
+
+/// One planned compaction: the summary generation to run and the items the
+/// compaction item will keep verbatim.
+pub(super) struct CompactionPass {
+    pub(super) request: ChatRequest,
+    kept: Vec<Value>,
+}
+
+impl CompactionPass {
+    /// Seal the generated `summary` and the kept items into a compaction
+    /// item, returning it and the history it renders as in place of `from`.
+    pub(super) fn finish(
+        self,
+        summary: &str,
+        from: &History,
+        cipher: &ReasoningCipher,
+        model: &str,
+    ) -> crate::Result<(Value, History)> {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err(crate::Error::Generation(
+                "the compaction summary came back empty, so nothing was compacted".into(),
+            ));
+        }
+        let id = new_id("cmp_");
+        let compacted = Compacted {
+            summary: summary.to_owned(),
+            items: self.kept,
+        };
+        let payload = serde_json::to_string(&compacted)
+            .map_err(|error| crate::Error::Generation(error.to_string()))?;
+        let sealed = cipher
+            .seal_compaction(model, &id, &payload)
+            .map_err(|error| crate::Error::Generation(error.to_string()))?;
+        let item = json!({"type":COMPACTION,"id":id,"encrypted_content":sealed});
+        let history = History {
+            summary: Some(compacted.summary),
+            items: compacted.items,
+            instructions: from.instructions.clone(),
+        };
+        Ok((item, history))
+    }
+
+    /// The items the compaction item keeps, as a client sees them.
+    pub(super) fn kept(&self) -> &[Value] {
+        &self.kept
+    }
+}
+
+impl PreparedResponses {
+    /// Generate from compacted `history` instead, reporting compaction
+    /// `item` as the Response's first output item.
+    pub(super) fn compacted(&mut self, item: Value, history: History) -> crate::Result<()> {
+        self.request.messages = history.messages()?;
+        self.history = history;
+        self.echo.compaction = Some(item);
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactRequest {
+    /// Required by the contract; any value names the one loaded model.
+    #[allow(dead_code)]
+    model: Option<Value>,
+    input: Option<Value>,
+    previous_response_id: Option<String>,
+    instructions: Option<String>,
+    prompt_cache_key: Option<String>,
+    prompt_cache_retention: Option<Value>,
+    prompt_cache_options: Option<Value>,
+    service_tier: Option<String>,
+}
+
+/// A parsed `POST /v1/responses/compact`.
+pub(super) struct PreparedCompact {
+    pub(super) history: History,
+    /// The resolved input, returned as it is when nothing can be compacted.
+    pub(super) items: Vec<Value>,
+    pub(super) session: Option<String>,
+    pub(super) cipher: Arc<ReasoningCipher>,
+}
+
+/// Parse a `POST /v1/responses/compact` body, resolving
+/// `previous_response_id` against `store`. Blocks on the store.
+pub(super) fn prepare_compact(
+    body: &[u8],
+    store: Option<&Arc<ResponseStore>>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+    model: &str,
+) -> crate::Result<PreparedCompact> {
+    let request: CompactRequest = serde_json::from_slice(body)
+        .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
+    let cipher = cipher.ok_or_else(|| {
+        unsupported(
+            "compaction",
+            "compaction items are sealed with --reasoning-key, which this server was started \
+             without",
+        )
+    })?;
+    for (name, value) in [
+        ("prompt_cache_options", &request.prompt_cache_options),
+        ("prompt_cache_retention", &request.prompt_cache_retention),
+    ] {
+        if present(value.as_ref()) {
+            return Err(unsupported(name, "it needs a hosted OpenAI service"));
+        }
+    }
+    service_tier(request.service_tier.as_deref())?;
+    let mut items = match (&request.previous_response_id, store) {
+        (Some(id), Some(store)) => previous_history(store, id)?,
+        (Some(_), None) => {
+            return Err(unsupported(
+                "previous_response_id",
+                "this server was started without --response-store, so it keeps no responses; \
+                 send the earlier items in input instead",
+            ));
+        }
+        (None, _) => Vec::new(),
+    };
+    match (&request.input, request.previous_response_id.is_some()) {
+        (Some(input), _) if !input.is_null() => normalize_input(input, &mut items)?,
+        (_, true) => {}
+        _ => return Err(invalid("input is required")),
+    }
+    open_reasoning(&mut items, Some(cipher), model)?;
+    let history = History::resolve(&items, request.instructions, Some(cipher), model)?;
+    // Invalid items fail here, before any generation.
+    history.messages()?;
+    Ok(PreparedCompact {
+        history,
+        items,
+        session: request.prompt_cache_key,
+        cipher: Arc::clone(cipher),
+    })
+}
+
+/// `item`, a normalized input item, in the output form a `response.compaction`
+/// lists it in: messages carry a `status` and output text its `annotations`
+/// and `logprobs`. Both forms are accepted back as input.
+fn output_item(item: &Value) -> Value {
+    let mut item = item.clone();
+    if item.get("type").and_then(Value::as_str) == Some("message")
+        && let Some(fields) = item.as_object_mut()
+    {
+        fields.entry("status").or_insert_with(|| json!("completed"));
+        for part in fields
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object_mut)
+        {
+            if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                part.entry("annotations").or_insert_with(|| json!([]));
+                part.entry("logprobs").or_insert_with(|| json!([]));
+            }
+        }
+    }
+    item
+}
+
+/// The `response.compaction` object: the compacted window `output`, and the
+/// usage of the summary generation, if one ran.
+pub(super) fn compaction_resource(output: &[Value], stats: Option<&Stats>) -> Value {
+    let output: Vec<Value> = output.iter().map(output_item).collect();
+    let (input, cached, generated) = stats.map_or((0, 0, 0), |stats| {
+        let generation = &stats.generation;
+        (
+            generation.prompt_tokens,
+            generation.reused_prompt_tokens,
+            generation.generated_tokens,
+        )
+    });
+    json!({
+        "id":new_id("resp_"),
+        "object":"response.compaction",
+        "output":output,
+        "created_at":unix_now(),
+        "usage":{"input_tokens":input,"input_tokens_details":{"cached_tokens":cached,"cache_write_tokens":0},"output_tokens":generated,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":input+generated},
     })
 }
 
@@ -913,6 +1383,7 @@ fn conversation_input(item: &Value) -> crate::Result<()> {
             "encrypted_content",
             "status",
         ],
+        COMPACTION => &["id", "type", "encrypted_content", "created_by"],
         other => {
             return Err(unsupported(
                 &format!("input item type {other:?}"),
@@ -1077,6 +1548,7 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
             "reasoning" => "rs_",
             "function_call" => "fc_",
             "function_call_output" => "fco_",
+            COMPACTION => "cmp_",
             _ => "item_",
         };
         if kind == "message"
@@ -1119,6 +1591,11 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
                     "encrypted reasoning requires its original unique item id",
                 ));
             }
+            _ if kind == COMPACTION => {
+                return Err(invalid(
+                    "a compaction item requires its original unique item id",
+                ));
+            }
             _ => new_id(prefix),
         };
         seen.insert(id.clone());
@@ -1146,7 +1623,7 @@ fn input_messages(input: &Value, instructions: Option<&str>) -> crate::Result<Ve
         // The template takes one system message and only first, so the
         // instructions join a leading system message instead of preceding it.
         match messages.first_mut() {
-            Some(first) if first.role == "system" => {
+            Some(first) if matches!(first.role.as_str(), "system" | "developer") => {
                 first.content = format!("{instructions}\n\n{}", first.content);
             }
             _ => messages.insert(0, plain("system", instructions.to_owned(), None)),
@@ -1212,6 +1689,13 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
             return Err(unsupported(
                 "item_reference",
                 "item lookup is not implemented; send the item itself",
+            ));
+        }
+        // `History::resolve` renders the latest compaction item from its
+        // sealed content and skips everything before it, so none is left.
+        Some(COMPACTION) => {
+            return Err(invalid(
+                "a compaction item is only rendered from its sealed content",
             ));
         }
         Some(other) => {
@@ -1328,6 +1812,11 @@ pub(super) struct ResponsesState {
     output: Vec<Value>,
     open: Option<Open>,
     encryption_error: Option<String>,
+    /// The output index of the reasoning item whose `output_item.done` waits
+    /// for its summary.
+    deferred: Option<usize>,
+    /// Where summary events go as they are generated, when streaming.
+    flush: Option<Flush>,
 }
 
 impl ResponsesState {
@@ -1337,6 +1826,7 @@ impl ResponsesState {
             .strip_prefix("resp_")
             .unwrap_or(&reply.id)
             .to_owned();
+        let output = echo.compaction.iter().cloned().collect();
         Self {
             id: reply.id.clone(),
             stem,
@@ -1346,10 +1836,18 @@ impl ResponsesState {
             streaming,
             sequence: 0,
             events: Vec::new(),
-            output: Vec::new(),
+            output,
             open: None,
             encryption_error: None,
+            deferred: None,
+            flush: None,
         }
+    }
+
+    /// Deliver the reasoning summary's events through `flush` as they are
+    /// generated, instead of all at once when the summary ends.
+    pub(super) fn set_flush(&mut self, flush: Flush) {
+        self.flush = Some(flush);
     }
 
     /// Whether this Response materialises streaming events.
@@ -1573,6 +2071,17 @@ impl ResponsesState {
         self.emit("response.created", json!({"response":response}));
         let response = self.response("in_progress", None, None, None);
         self.emit("response.in_progress", json!({"response":response}));
+        // The compaction ran before generation, so its item is complete.
+        if let Some(item) = self.echo.compaction.clone() {
+            self.emit(
+                "response.output_item.added",
+                json!({"output_index":0,"item":item}),
+            );
+            self.emit(
+                "response.output_item.done",
+                json!({"output_index":0,"item":item}),
+            );
+        }
     }
 
     fn item_id(&self, prefix: &str) -> String {
@@ -1665,6 +2174,14 @@ impl ResponsesState {
                         Err(error) => self.encryption_error = Some(error.to_string()),
                     }
                 }
+                if self.echo.summary.is_some() {
+                    // Done only once its summary is, after generation ends.
+                    if let Some(slot) = self.output.get_mut(index) {
+                        *slot = item;
+                    }
+                    self.deferred = Some(index);
+                    return;
+                }
                 item
             }
             ItemKind::Message => {
@@ -1687,6 +2204,84 @@ impl ResponsesState {
         if let Some(slot) = self.output.get_mut(index) {
             *slot = item;
         }
+    }
+
+    /// Summarize the deferred reasoning item's raw reasoning with a second
+    /// generation, streaming it as its `summary`, then finish the item.
+    ///
+    /// Runs on the pump's blocking thread. The raw reasoning stays the
+    /// item's `reasoning_text` content; only the generated text is summary.
+    fn summarize(&mut self) -> Result<(), String> {
+        let (Some(index), Some(detail)) = (self.deferred, self.echo.summary) else {
+            return Ok(());
+        };
+        let Some(item) = self.output.get(index) else {
+            return Ok(());
+        };
+        let id = item["id"].as_str().unwrap_or_default().to_owned();
+        let reasoning = item["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let Some(Summarizer(generate)) = self.echo.summarizer.clone() else {
+            self.release(Vec::new());
+            return Err("reasoning.summary has no summarizer on this server".into());
+        };
+        self.emit(
+            "response.reasoning_summary_part.added",
+            json!({"item_id":id,"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+        );
+        let mut text = String::new();
+        let generated = generate(
+            reasoning_summary_request(&reasoning, detail),
+            &mut |piece: &str| {
+                text.push_str(piece);
+                self.emit(
+                    "response.reasoning_summary_text.delta",
+                    json!({"item_id":id,"output_index":index,"summary_index":0,"delta":piece}),
+                );
+                let events = std::mem::take(&mut self.events);
+                if let Some(flush) = self.flush.as_mut() {
+                    flush(events)
+                } else {
+                    self.events = events;
+                    true
+                }
+            },
+        );
+        if let Err(error) = generated {
+            self.release(Vec::new());
+            return Err(format!(
+                "the reasoning summary could not be generated: {error}"
+            ));
+        }
+        self.emit(
+            "response.reasoning_summary_text.done",
+            json!({"item_id":id,"output_index":index,"summary_index":0,"text":text}),
+        );
+        let part = json!({"type":"summary_text","text":text});
+        self.emit(
+            "response.reasoning_summary_part.done",
+            json!({"item_id":id,"output_index":index,"summary_index":0,"part":part}),
+        );
+        self.release(vec![part]);
+        Ok(())
+    }
+
+    /// Finish the deferred reasoning item, if any, with `summary`.
+    fn release(&mut self, summary: Vec<Value>) {
+        let Some(index) = self.deferred.take() else {
+            return;
+        };
+        let Some(slot) = self.output.get_mut(index) else {
+            return;
+        };
+        slot["summary"] = Value::Array(summary);
+        let item = slot.clone();
+        self.emit(
+            "response.output_item.done",
+            json!({"output_index":index,"item":item}),
+        );
     }
 
     /// A complete, validated call from the engine.
@@ -1762,6 +2357,11 @@ impl ResponsesState {
         if let Some(message) = self.encryption_error.take() {
             return self.fail(&message);
         }
+        if stats.stop_reason == StopReason::Cancelled {
+            self.release(Vec::new());
+        } else if let Err(message) = self.summarize() {
+            return self.fail(&message);
+        }
         let response = self.response(overall, incomplete.as_ref(), error.as_ref(), Some(stats));
         // A conversation's new items are appended, and a stored response is
         // on disk, before any client is told it finished, so what a client
@@ -1816,6 +2416,7 @@ impl ResponsesState {
     /// with any unfinished item marked `incomplete`.
     pub(super) fn cancelled(&mut self) -> Value {
         self.close("incomplete");
+        self.release(Vec::new());
         self.response("cancelled", None, None, None)
     }
 
@@ -1874,6 +2475,7 @@ impl ResponsesState {
 
     pub(super) fn fail(&mut self, message: &str) -> Value {
         self.close("incomplete");
+        self.release(Vec::new());
         self.emit(
             "error",
             json!({"code":"server_error","message":message,"param":null}),
@@ -1915,7 +2517,7 @@ impl ResponsesState {
             "output":output,
             "parallel_tool_calls":echo.parallel_tool_calls,
             "previous_response_id":echo.previous_response_id,
-            "reasoning":{"effort":echo.effort,"summary":null,"context":"all_turns"},
+            "reasoning":{"effort":echo.effort,"summary":echo.summary.map(SummaryDetail::name),"context":"all_turns"},
             // Only a response that reached the store says so. A failed
             // foreground one, including one whose write failed, was never
             // stored; a background one is stored in every state it reports.
@@ -1964,3 +2566,8 @@ pub(super) fn sse_frame(event: &Value) -> String {
 #[allow(clippy::expect_used)]
 #[path = "conversation_response_tests.rs"]
 mod conversation_response_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "compaction_tests.rs"]
+mod compaction_tests;
