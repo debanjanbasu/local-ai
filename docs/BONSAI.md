@@ -427,7 +427,8 @@ curl -sN 'localhost:8080/v1/responses/resp_…?stream=true&starting_after=7'
 random bytes in an owner-only file, created on first start without
 overwriting anything and reused across restarts; a symlink, a non-regular
 file, a file owned by another user, a file with group or other access, or a
-malformed key is refused at startup. Reasoning output items then carry an
+malformed key is refused at startup. Reasoning output items of a request whose
+`include` lists `reasoning.encrypted_content` then carry an
 AES-256-GCM envelope (fresh random nonce per item) whose associated data binds
 the envelope version, the model ID and the reasoning item's ID. A client may
 send the item back, with its original `id`, in a later stateless request; the
@@ -435,7 +436,10 @@ authenticated text replaces any plaintext beside it, and an altered envelope,
 one from another key, model or item, or an unknown version fails the request.
 `include: ["reasoning.encrypted_content"]` is accepted only with a key and is
 the only `include` value implemented; without a key it, and any
-`encrypted_content` input, are refused. Replay after a server restart and
+`encrypted_content` input, are refused. A request that does not ask for it gets
+no `encrypted_content` even when the server has a key (as with `OpenAI`); stored
+responses, conversations and `previous_response_id` replay the plaintext they
+keep, so they never need it. Replay after a server restart and
 tamper rejection are covered by tests.
 
 The key option is replay authentication, **not secrecy**: the raw reasoning is
@@ -703,7 +707,7 @@ It streams as `response.reasoning_summary_part.added`,
 `response.reasoning_summary_part.done`, then the reasoning item's
 `output_item.done` (withheld until then, so the answer's items finish first)
 with one `summary_text` part. The raw reasoning stays the item's
-`reasoning_text` content (and `encrypted_content`) and is never relabeled.
+`reasoning_text` content (and `encrypted_content`, when requested) and is never relabeled.
 `reasoning.summary` is echoed. A summary that cannot be generated fails the
 Response; a cancelled one gets none; with effort `none` nothing runs. Not with
 `background`. The summary runs on the stream's own pump and its deltas go out
