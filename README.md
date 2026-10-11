@@ -67,7 +67,8 @@ artifact's scope (the legacy devtools-v1 head: two-option Yes/No code-diff
 questions; the development-only hard-v1 heads: see
 [their results](local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)),
 and is not the OpenAI Decisions API; `POST /v1/decisions` is refused with an
-explanation.
+explanation, because no head passed the
+[pre-registered confidence and refusal evaluation](docs/DECISIONS_EVALUATION.md).
 
 The server also always opens a durable native services store at
 `~/Library/Application Support/local-ai/services` (owner-only SQLite plus file

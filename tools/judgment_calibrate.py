@@ -59,6 +59,7 @@ CV_FOLDS = 5
 ECE_BINS = 15
 COVERAGES = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
 LOCK = "/tmp/local-ai-gpu.lock"
+LOCK_HOLD_SECONDS = 1800
 
 CR_QUESTION = "Does this change need a reviewer comment?"
 CR_TASK = "codereviewer_needs_comment"
@@ -415,8 +416,8 @@ def capture(requests: Path, work: Path, binary: Path, chunk_rows: int,
                 child.unlink()
             target.rmdir()
         command = [str(binary), "--out", str(target), str(source)]
-        if lock:
-            command = ["lockf", "-k", lock] + command
+        if lock:  # one bounded lock hold per chunk
+            command = ["timeout", str(LOCK_HOLD_SECONDS), "lockf", "-k", lock] + command
         result = _run_chunk(runner, command, work / f"{name}.log")
         if result.returncode != 0:
             raise CalibrateError(f"{name} failed ({result.returncode}); see {name}.log")

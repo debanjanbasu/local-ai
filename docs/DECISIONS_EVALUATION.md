@@ -103,4 +103,151 @@ coding quality.
 
 ## Part 2: results
 
-(Appended after evaluation.)
+Recorded after evaluation; Part 1 above is unchanged. **Decision: no head
+passes, so `POST /v1/decisions` stays refused.** Only the tooling and these
+measurements ship.
+
+### Data and provenance
+
+Every feature row comes from the serving path (`Engine::capture_decision`
+via `judgment-capture`, binary SHA-256 `fef579b1a76bb8391cd2f2256f7999a72dd92817f00a95a4f426c106c8ad91ee`), one GPU-lock hold
+per chunk of at most 160 rows.
+
+| Set | Rows | Use | Source and hashes |
+| --- | ---: | --- | --- |
+| devtools-v1 stored features | 3,533 | `devtools`: CAL (calibration, 306), TEST (test, 234), train baseline; `hard-*`: OOD | Kev devtools-v1 as prepared for the head; manifest `5084534a…eb0db` (the head's own capture) |
+| hard-v1 stored features | 8,479 | `hard-*`: CAL-h / TEST-h (calibration split by `group_id` hash), train baseline; `devtools`: OOD (`*/noul` rows of calibration and validation) | manifest `dabe32c4…15d63` |
+| `cr-new` | 1,280 | `devtools`: CAL (480, 9 Kev-development projects), TEST (800, 15 Kev-test projects); `hard-*`: OOD | CodeReviewer `cls-valid`/`cls-test` (Zenodo 6900648, CC-BY-4.0, Li et al. 2022), permissive-licence projects only, every hunk Kev used excluded, label-balanced; requests `33765761…c8686`, features `7e5268c6…4f270` |
+| `kev-ood` | 450 | `devtools` and `hard-*`: OOD | Kev devtools-v1 development/test `prompt_injection`, `aegis_unsafe`, `flakeflagger_flaky` (150 each, label-balanced); requests `7534dba9…a7a1f`, features `29a40a42…4177a` |
+
+Integrity checks before scoring: the 16 devtools-v1 and 24 hard-v1 rows
+re-expressed as native requests recaptured **bit-identical** to the stored
+features (`judgment_calibrate.py parity`), with this binary and with the
+earlier one; every new manifest row matches its request id and order and has
+`positions × 5120` FP16 values. A capture run interrupted earlier (other
+binary, `kev-ood` 160 rows, no `cr-new` chunk finished) was discarded and
+everything recaptured with one binary; its finished chunk was bit-identical.
+No public data was fetched in this run (the Zenodo members, Kev manifests and
+licence table already on disk were re-verified by hash when the sets were
+built).
+
+### Deviations from Part 1
+
+- A debugging run before any TEST scoring used devtools-v1 *validation*
+  (checkpoint selection) in place of TEST, and scored the stored features
+  only. It touched no `cr-new` row and not the devtools-v1 test split.
+- `hard-s0` scope: Part 1 says "exact question text or template". Kev
+  hard-v1's calibration split uses held-out templates, so a scope of train
+  questions alone refused about two thirds of in-distribution rows. The
+  declarative scope used is the exact question texts and option counts of
+  train **plus CAL-h**. This was chosen after a preliminary run whose report
+  *did* contain TEST-h metrics (the same numbers as below), so it is not
+  blind; it changes only the declarative refusal rate, and the hard heads
+  fail A1–A5 regardless (their feature gate refuses no OOD row).
+- `devtools` OOD hard-v1 predicate rows: Part 1 names no partition; all
+  non-train `*/noul` rows (calibration and validation, 695) were used.
+- The `hard-*` OOD set is every devtools-side row (devtools-v1 calibration
+  and test, `cr-new`, `kev-ood`; 2,270 rows).
+
+### `devtools` head (`b3227ce4…`), the only candidate near acceptance
+
+Calibration selected on CAL by 5-fold grouped CV NLL: temperature 0.5208 vs
+Platt 0.5236, so temperature scaling, T = 1.7540 on raw logits. Refusal
+threshold τ = 0.7644 (CAL: 30.8% coverage, 6.2% risk, Wilson upper 9.97%).
+Feature gate: CAL 99th percentile, 3.644.
+
+| Split | Rows | Majority | Accuracy (Wilson 95%) | Raw NLL | Cal NLL | Raw ECE | Cal ECE | Cal Brier | AURC | Coverage@τ | Risk@τ (Wilson 95%) | Gate refused | Scope refused |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| CAL | 786 | 0.496 | 0.709 (0.676–0.739) | 0.5472 | 0.5204 | 0.0774 | 0.0297 | 0.1809 | 0.1465 | 0.308 | 0.062 (0.038–0.100) | 0.009 | 0.000 |
+| TEST | 1,034 | 0.501 | 0.699 (0.671–0.726) | 0.5923 | 0.5608 | 0.0764 | 0.0415 | 0.1951 | 0.1807 | 0.269 | 0.126 (0.092–0.170) | 0.004 | 0.000 |
+| OOD | 1,145 | 0.479 | 0.688 (0.661–0.714) | 0.9337 | 0.6978 | 0.1790 | 0.1041 | 0.2259 | 0.2455 | 0.574 | 0.272 (0.240–0.308) | 0.190 | 1.000 |
+
+Uniform NLL is 0.6931 throughout; Brier is binary `(p_yes − y)²`.
+
+| Split | Family | Rows | Majority | Accuracy | Cal ECE | Coverage@τ | Risk@τ |
+|---|---|---:|---:|---:|---:|---:|---:|
+| CAL | codereviewer_needs_comment | 636 | 0.500 | 0.654 | 0.0309 | 0.159 | 0.109 |
+| CAL | commitpackft_message | 150 | 0.480 | 0.940 | 0.0421 | 0.940 | 0.028 |
+| TEST | codereviewer_needs_comment | 918 | 0.500 | 0.666 (0.634–0.695) | 0.0467 | 0.185 | **0.200** (0.147–0.266) |
+| TEST | commitpackft_message | 116 | 0.509 | 0.966 (0.915–0.987) | 0.0218 | 0.931 | 0.009 |
+| OOD | aegis_unsafe | 150 | 0.500 | 0.780 | 0.0498 | 0.633 | 0.158 |
+| OOD | flakeflagger_flaky | 150 | 0.500 | 0.653 | 0.1500 | 0.267 | 0.325 |
+| OOD | prompt_injection | 150 | 0.500 | 0.647 | 0.1478 | 0.527 | 0.304 |
+| OOD | judge/noul | 314 | 0.503 | 0.608 | 0.2368 | 0.682 | 0.407 |
+| OOD | tradeoff/noul | 314 | 0.420 | 0.799 | 0.0416 | 0.615 | 0.124 |
+| OOD | probability/noul | 26 | 0.538 | 0.500 | 0.3723 | 0.692 | 0.444 |
+| OOD | temporal_numeric/noul | 41 | 0.463 | 0.512 | 0.3221 | 0.439 | 0.444 |
+
+Risk at fixed coverage (calibrated-confidence ranking):
+
+| Split | 100% | 90% | 80% | 70% | 60% | 50% | 40% | 30% | 20% | 10% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| CAL | 0.291 | 0.272 | 0.253 | 0.220 | 0.210 | 0.173 | 0.118 | 0.055 | 0.013 | 0.000 |
+| TEST | 0.301 | 0.288 | 0.273 | 0.243 | 0.229 | 0.211 | 0.193 | 0.161 | 0.053 | 0.000 |
+| OOD | 0.312 | 0.297 | 0.287 | 0.269 | 0.269 | 0.269 | 0.251 | 0.224 | 0.218 | 0.184 |
+
+| Criterion | Result | Evidence (TEST unless stated) |
+| --- | --- | --- |
+| A1 accuracy | pass | lower bound 0.671 ≥ 0.501 + 0.10; CodeReviewer 0.634 > 0.500, CommitPackFT 0.915 > 0.509 |
+| A2 calibration | pass | ECE 0.0415 ≤ 0.05; NLL 0.5608 < 0.6931; Brier 0.1951 ≤ 0.20 |
+| A3 selective risk | **fail** | risk 0.126 but Wilson upper 0.170 > 0.15 (coverage 0.269 ≥ 0.25) |
+| A4 no hidden family | **fail** | CodeReviewer risk 0.200 at coverage 0.185 (> 0.15 and > 5%); the pooled threshold is carried by CommitPackFT |
+| A5 scope | **fail** | declarative check refuses 100% of OOD and 0% of TEST, but the feature gate refuses only 19.0% of OOD (needs ≥ 80%); TEST 0.4% |
+| A6 integrity | not reached | the calibration artifact's head and content hashes are checked by the tool's tests; no server path loads it |
+
+The CAL-chosen threshold did not transfer to new CodeReviewer projects
+(CodeReviewer risk 0.109 on CAL, 0.200 on TEST): on code-review judgment the
+head's confidence ranks errors only weakly, and the head's query projection
+does not separate other Yes/No predicates (prompt injection, unsafe content,
+flaky tests, synthetic hard-v1) from in-scope ones. Only the declarative
+check, not the model, refuses out-of-scope questions.
+
+### `hard-*` heads (Kev hard-v1, development-only)
+
+Temperature scaling only (multi-class). TEST-h is half of hard-v1's
+calibration split; OOD is every devtools-side row.
+
+| Head | T | τ | TEST-h acc (Wilson 95%) | Majority | Cal NLL (uniform 1.276) | Cal ECE | Cal Brier | Coverage@τ / risk | Gate refused OOD / TEST | Result |
+|---|---:|---:|---|---:|---:|---:|---:|---|---|---|
+| `hard-s0` (`24971f5f…`) | 1.586 | none | 0.650 (0.619–0.680) | 0.321 | 0.866 | 0.0457 | 0.471 | 0 (all refused) | 0.000 / 0.015 | A1–A5 fail |
+| `hard-s1` (`11bf6f74…`) | 1.538 | none | 0.621 (0.589–0.652) | 0.321 | 0.885 | 0.0506 | 0.485 | 0 (all refused) | 0.000 / 0.018 | A1–A5 fail |
+| `hard-s2` (`657cde86…`) | 1.322 | 0.849 | 0.634 (0.603–0.665) | 0.321 | 0.865 | 0.0388 | 0.470 | 0.181 / 0.072 (upper 0.121) | 0.000 / 0.016 | A1–A5 fail (A3: coverage 18% < 25%) |
+
+A1 fails on `probability/noul` (8 TEST-h rows, 0.375) and
+`temporal_numeric/noul` (12 rows, 0.333) for every seed; multi-class Brier
+≈ 0.47 exceeds 0.40; for `hard-s0`/`hard-s1` no CAL-h threshold reaches a
+Wilson upper risk of 10% with 50 answered rows, so they would refuse
+everything. The declarative scope refuses 100% of OOD and 2.4% of TEST-h
+(question texts seen only in TEST-h); the feature gate refuses no OOD row.
+On devtools-side rows these heads score 0.583–0.606.
+
+### Refusal and out-of-scope semantics (as evaluated)
+
+A served answer would have been, per question: out of declared scope (the
+artifact's declarative check: kind, option set, question text or pattern,
+state framing, token limit) → `refusal`; feature-gate distance above the
+CAL 99th percentile → `refusal`; calibrated top-label confidence below τ →
+`refusal`; otherwise the answer with `confidence` (and, for predicates,
+calibrated `probability` of Yes). The evaluation shows the model-side parts
+of this (τ and the gate) do not hold on new data, so nothing is served.
+
+### Artifacts (not committed; in the evaluating worktree's `.scratch/`)
+
+| Item | SHA-256 |
+| --- | --- |
+| `tools/judgment_calibrate.py` used | `8ebc9a45731fa439e71844be8212c84f4b55a0bf53f427a30127e0cd8f6ac200` |
+| `devtools` scores / report / calibration artifact (content hash) | `0d1d18c6a299093f0972f20a15cf2b911b2adf831d99a5cdb40bacefd6bd9938` / `02fa2ff748c692bbe7f4955be887fa1fc2dbf5659db0078f30fec3c8f3586a07` / `7896ed60d739f24f56fd9c40b15ed8ad818d0ff189b22ad7fdeb825bda639113` |
+| `hard-s0` scores / report / artifact content | `8fe24cb188c2e00c5ea7f675985ab5b1dd5c75f7bb0d8bbf1f059d546a3cebaa` / `060fec6d0b0c74b72d707bbc38b51f0c61e223197e3d108136df78de1ed7256f` / `ff3b2d891261311df9fa4fa41a7bdd366cda2777693820953e99b16c2c45e219` |
+| `hard-s1` scores / report / artifact content | `83e1b21d9c7b16d069458bc4e046b9a73680c6c48593cb78eed8724ecbfe3905` / `18f6cb1b92de218efe45b0e68757b4cc9a61392b8c8d4c10e5b3d55e3018edff` / `65002dc19a6f85f3e2a2412f8fccb4f8afe9a12247392327b2b6b7a8bf2173a3` |
+| `hard-s2` scores / report / artifact content | `0cdc88b94295bc84714e6a37790d219ec6eaa8000caab56a68278ca013f21ed2` / `9edaa952852d08af371329b247978adb236ee6f1f93389462c0cf057f48bcf47` / `751825f2a6417a5fa9529eb317a7c68b0a7fdf0725354c2439f6d9486b714811` |
+
+Every calibration artifact records `acceptance.passed: false`.
+
+### Limitations
+
+One checkpoint and its existing heads; no head was retrained or re-selected.
+CodeReviewer labels ("needs a reviewer comment") are noisy, and TEST is
+dominated by them by design. hard-v1's locked test is unavailable, so TEST-h
+is half of a split whose temperature the exported head was fitted on (the
+refit starts from raw logits). TEST-h families with fewer than 15 rows make
+A1 fragile for the hard heads. None of this bears on MTP or coding quality.
