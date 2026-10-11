@@ -1,6 +1,50 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use super::Args;
+
+/// Default rounds of hosted tool calls one Response may run.
+const DEFAULT_TOOL_ITERATIONS: usize = 8;
+const MAX_TOOL_ITERATIONS: usize = 64;
+/// Default seconds one hosted call may run.
+const DEFAULT_TOOL_CALL_SECONDS: u64 = 20;
+const MAX_TOOL_CALL_SECONDS: u64 = 300;
+/// Default seconds all hosted calls of one Response may run together.
+const DEFAULT_TOOL_BUDGET_SECONDS: u64 = 120;
+const MAX_TOOL_BUDGET_SECONDS: u64 = 3600;
+
+/// Hosted tool permissions and bounds. The default grants nothing.
+#[derive(Debug)]
+pub(super) struct ToolArgs {
+    pub(super) root: Option<PathBuf>,
+    pub(super) write: bool,
+    pub(super) shell: bool,
+    pub(super) fetch_domains: Vec<String>,
+    pub(super) max_iterations: usize,
+    pub(super) call_timeout: Duration,
+    pub(super) budget: Duration,
+}
+
+impl Default for ToolArgs {
+    fn default() -> Self {
+        Self {
+            root: None,
+            write: false,
+            shell: false,
+            fetch_domains: Vec::new(),
+            max_iterations: DEFAULT_TOOL_ITERATIONS,
+            call_timeout: Duration::from_secs(DEFAULT_TOOL_CALL_SECONDS),
+            budget: Duration::from_secs(DEFAULT_TOOL_BUDGET_SECONDS),
+        }
+    }
+}
+
+impl ToolArgs {
+    /// Whether any hosted capability was granted.
+    pub(super) const fn any(&self) -> bool {
+        self.root.is_some() || !self.fetch_domains.is_empty()
+    }
+}
 
 /// Default seconds a client may stop taking frames before its generation is
 /// dropped.
@@ -51,6 +95,33 @@ pub(super) fn usage() {
          with this judgment head (probabilities only; no confidence or refusal; calibration \
          provenance comes from the artifact, unknown when absent; default: off)"
     );
+    eprintln!();
+    eprintln!("  Hosted tools (Responses API; default: none; see docs/TOOLS.md):");
+    eprintln!(
+        "  --tools-root DIR   Let requests list, read and search files under DIR \
+         (local_fs_list/read/search)"
+    );
+    eprintln!("  --tools-allow-write  Also allow writes and edits under DIR (local_fs_write/edit)");
+    eprintln!(
+        "  --tools-shell      Allow sandboxed shell commands in DIR (the shell tool): no \
+         network, writes only with --tools-allow-write"
+    );
+    eprintln!(
+        "  --tools-fetch-domain DOMAIN  Allow local_web_fetch to DOMAIN and its subdomains \
+         (repeatable; public addresses only)"
+    );
+    eprintln!(
+        "  --tools-max-iterations N  Rounds of hosted calls per response \
+         (default: {DEFAULT_TOOL_ITERATIONS})"
+    );
+    eprintln!(
+        "  --tools-call-timeout SECONDS  Deadline of one hosted call \
+         (default: {DEFAULT_TOOL_CALL_SECONDS})"
+    );
+    eprintln!(
+        "  --tools-budget SECONDS  Combined time of a response's hosted calls \
+         (default: {DEFAULT_TOOL_BUDGET_SECONDS})"
+    );
 }
 
 pub(super) fn parse(args: &[String]) -> Result<Args, String> {
@@ -63,6 +134,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         response_store: None,
         reasoning_key: None,
         decision_head: None,
+        tools: ToolArgs::default(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -72,6 +144,15 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         }
         if flag == "--no-thinking" {
             parsed.thinking = false;
+            index += 1;
+            continue;
+        }
+        if matches!(flag, "--tools-allow-write" | "--tools-shell") {
+            if flag == "--tools-shell" {
+                parsed.tools.shell = true;
+            } else {
+                parsed.tools.write = true;
+            }
             index += 1;
             continue;
         }
@@ -87,6 +168,11 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 | "--response-store"
                 | "--reasoning-key"
                 | "--experimental-decision-head"
+                | "--tools-root"
+                | "--tools-fetch-domain"
+                | "--tools-max-iterations"
+                | "--tools-call-timeout"
+                | "--tools-budget"
         ) {
             return Err(format!("unknown option: {flag}"));
         }
@@ -116,11 +202,49 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 }
                 parsed.response_store = Some(value.into());
             }
+            tools if tools.starts_with("--tools-") => tool_value(&mut parsed.tools, flag, value)?,
             _ => return Err(format!("unknown option: {flag}")),
         }
         index += 1;
     }
+    if (parsed.tools.write || parsed.tools.shell) && parsed.tools.root.is_none() {
+        return Err("--tools-allow-write and --tools-shell need --tools-root DIR".into());
+    }
     Ok(parsed)
+}
+
+/// Apply a hosted-tool flag that takes `value`.
+fn tool_value(tools: &mut ToolArgs, flag: &str, value: &str) -> Result<(), String> {
+    match flag {
+        "--tools-root" => {
+            if value.is_empty() {
+                return Err("--tools-root requires a directory".into());
+            }
+            tools.root = Some(value.into());
+        }
+        "--tools-fetch-domain" => tools.fetch_domains.push(value.to_owned()),
+        "--tools-max-iterations" => {
+            tools.max_iterations = bounded(flag, value, 1, MAX_TOOL_ITERATIONS as u64)? as usize;
+        }
+        "--tools-call-timeout" => {
+            tools.call_timeout =
+                Duration::from_secs(bounded(flag, value, 1, MAX_TOOL_CALL_SECONDS)?);
+        }
+        "--tools-budget" => {
+            tools.budget = Duration::from_secs(bounded(flag, value, 1, MAX_TOOL_BUDGET_SECONDS)?);
+        }
+        _ => return Err(format!("unknown option: {flag}")),
+    }
+    Ok(())
+}
+
+/// A whole number for `flag` between `min` and `max`.
+fn bounded(flag: &str, value: &str, min: u64, max: u64) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|number| (min..=max).contains(number))
+        .ok_or_else(|| format!("{flag} must be a whole number from {min} to {max}, not {value:?}"))
 }
 
 /// Parse a `--stall-timeout` value as whole seconds inside the useful range.

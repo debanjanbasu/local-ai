@@ -179,12 +179,30 @@ pub enum Event {
     /// instead ([`Event::Error`] on a stream, `Err` from the synchronous API)
     /// and no [`Event::Finished`].
     ToolCall(ToolCall),
+    /// The result of a call the caller executed itself, fed back by a
+    /// caller-driven tool loop through an [`EventRelay`]. The engine never
+    /// produces one.
+    ToolOutput(ToolOutput),
     /// Generated token IDs, emitted as a batch before [`Event::Finished`].
     TokenIds(Vec<u32>),
     /// Successful terminal event.
     Finished(Box<Stats>),
     /// Terminal worker error.
     Error(String),
+}
+
+/// A tool result produced outside the model, by the caller, for the call
+/// with [`ToolCall::id`] `call_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolOutput {
+    /// The call this answers.
+    pub call_id: String,
+    /// The called tool's name.
+    pub name: String,
+    /// What the model reads back.
+    pub content: String,
+    /// The caller's own structured record of the result.
+    pub detail: serde_json::Value,
 }
 
 /// A next-item wait that a prefill boundary can interrupt instead of an
@@ -373,7 +391,7 @@ impl Engine {
                 Event::Reasoning(piece) => reasoning.push_str(&piece),
                 Event::ToolCall(call) => tool_calls.push(call),
                 Event::TokenIds(ids) => token_ids = ids,
-                Event::Finished(_) | Event::Error(_) => {}
+                Event::ToolOutput(_) | Event::Finished(_) | Event::Error(_) => {}
             }
             ControlFlow::Continue(())
         })?;
@@ -855,7 +873,76 @@ pub struct EventStream {
     not_sync: std::marker::PhantomData<Cell<()>>,
 }
 
+/// The producing end of an [`EventStream`] fed by the caller rather than
+/// the engine worker, from [`EventStream::relay`].
+///
+/// A tool loop uses it to present several engine generations, and the tool
+/// results between them, as one stream: the consumer's cancellation (an
+/// explicit [`CancelHandle::cancel`] or dropping the stream) is observable
+/// here through [`Self::cancelled`], so the loop can stop its tools and the
+/// generation it is forwarding.
+pub struct EventRelay {
+    sender: async_mpsc::Sender<Delivered>,
+    cancel: CancelToken,
+}
+
+impl EventRelay {
+    /// Deliver `signal`, parking until the consumer has room. `false` when
+    /// the consumer has gone. Call from a thread that may block, never from
+    /// inside an async task.
+    #[must_use]
+    pub fn blocking_send(&self, signal: Signal) -> bool {
+        let delivered = match signal {
+            Signal::Event(event) => Delivered::Event(event),
+            Signal::Progress(progress) => Delivered::Progress(progress),
+        };
+        self.sender.blocking_send(delivered).is_ok()
+    }
+
+    /// [`Self::blocking_send`] for async callers.
+    #[must_use]
+    pub async fn send(&self, signal: Signal) -> bool {
+        let delivered = match signal {
+            Signal::Event(event) => Delivered::Event(event),
+            Signal::Progress(progress) => Delivered::Progress(progress),
+        };
+        self.sender.send(delivered).await.is_ok()
+    }
+
+    /// Whether the consumer cancelled or dropped the stream.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled() || self.sender.is_closed()
+    }
+
+    /// Resolve once the consumer cancels or drops the stream (dropping it
+    /// cancels).
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+}
+
 impl EventStream {
+    /// A stream whose items come from the returned [`EventRelay`] instead of
+    /// the engine. It ends when the relay is dropped.
+    #[must_use]
+    pub fn relay() -> (EventRelay, Self) {
+        let (sender, receiver) = async_mpsc::channel::<Delivered>(EVENT_BUFFER);
+        let cancel = CancelToken::new();
+        (
+            EventRelay {
+                sender,
+                cancel: cancel.clone(),
+            },
+            Self {
+                receiver,
+                progress: VecDeque::new(),
+                cancel,
+                not_sync: std::marker::PhantomData,
+            },
+        )
+    }
+
     /// Obtain an independently owned cancellation control.
     #[must_use]
     pub fn cancel_handle(&self) -> CancelHandle {

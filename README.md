@@ -59,6 +59,13 @@ may now accompany tools: the answer is then either calls or the document.
 Strict tools need closed schemas the engine can enforce exactly; anything else
 is refused with 400 rather than partly enforced.
 
+The Responses API also round-trips client-executed `custom` (text or regex
+grammar), `local_shell` and `apply_patch` tools, and can run hosted tools
+itself (sandboxed `shell`, `local_fs_*` file access, allowlisted
+`local_web_fetch`) in a server-side loop, but only when `serve` is started
+with explicit `--tools-*` permissions; by default none are available. The
+permission model, bounds and known gaps are in [docs/TOOLS.md](docs/TOOLS.md).
+
 `--experimental-decision-head FILE` opts in to
 `POST /v1/experimental/decisions`, which returns an explicitly loaded
 judgment head's option probabilities for text questions. It is experimental,

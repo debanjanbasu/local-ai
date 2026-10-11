@@ -366,7 +366,8 @@ impl Toolbox {
 }
 
 /// Why `capability` is refused, naming the server flag that would grant it.
-fn denial(capability: Capability) -> String {
+#[must_use]
+pub fn denial(capability: Capability) -> String {
     match capability {
         Capability::Read => "filesystem tools are disabled on this server (no --tools-root)".into(),
         Capability::Write => {
