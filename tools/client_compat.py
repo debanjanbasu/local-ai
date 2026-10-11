@@ -15,7 +15,12 @@ each run bounded:
     lockf -k /tmp/local-ai-gpu.lock tools/client_compat.py \\
         --codex-bin .scratch/codex/node_modules/.bin/codex
     tools/client_compat.py --list
-    tools/client_compat.py --scenarios http-custom-tool,omp-fix-bug
+    tools/client_compat.py --scenarios http-custom-tool,omp-fix
+    tools/client_compat.py --no-reasoning-key --scenarios omp-fix-xhigh
+
+`codex-*` scenarios use a function-tools-only Codex configuration (no web
+search, sub-agents, goals, apps, skills or permissions developer text);
+`codex-default-config` keeps Codex's defaults to show what they still need.
 
 Scenario kinds:
 
@@ -383,6 +388,11 @@ def client_env(home: Path, **extra: str) -> dict[str, str]:
 
 OMP_TOOLS = "read,bash,edit,write,grep,glob"
 CODEX_COMPAT_FEATURES = ["multi_agent", "goals", "view_image", "skill_search", "apps", "plugins"]
+CODEX_COMPAT_INSTRUCTIONS = [
+    "include_permissions_instructions",
+    "include_apps_instructions",
+    "include_collaboration_mode_instructions",
+]
 
 
 def codex_config(proxy_port: int, effort: str, compat: bool) -> str:
@@ -405,9 +415,14 @@ def codex_config(proxy_port: int, effort: str, compat: bool) -> str:
     ]
     if compat:
         lines.append('web_search = "disabled"')
+        # Codex otherwise sends permissions/apps/skills text as extra developer
+        # messages after its base instructions; the checkpoint template has a
+        # single leading instruction turn (see http-multiple-developer-messages).
+        lines.extend(f"{name} = false" for name in CODEX_COMPAT_INSTRUCTIONS)
         lines.append("")
         lines.append("[features]")
         lines.extend(f"{name} = false" for name in CODEX_COMPAT_FEATURES)
+        lines += ["", "[skills]", "include_instructions = false"]
     lines += tail
     lines += [
         "",
@@ -535,6 +550,7 @@ RECOVERY_PROMPT = (
     "Read the file docs/missing.md first. It may not exist; if reading it fails, read "
     "docs/notes.md instead. Reply with only the code word written in whichever file you could read."
 )
+RECOVERY_ERROR = re.compile(r"no such file|not found|ENOENT|does not exist|cannot (?:open|read)", re.IGNORECASE)
 CANCEL_PROMPT = (
     "Without using any tools, write a detailed 1500-word explanation of how TCP congestion "
     "control works, with numbered sections."
@@ -694,13 +710,26 @@ def client_scenario(kind: str, client: str, effort: str, compat: bool = True) ->
             result.task_ok = ok
             result.detail = f"answers={answers!r}, tool results={tool_results}"
         else:
-            result.task_ok = "PERIWINKLE" in answers[0] and tool_results >= 2
-            result.detail = f"answer={answers[0]!r}, tool results={tool_results}"
+            # The failed read must reach the model as a tool result; a client may
+            # recover in the same call (Codex: `cat missing || cat notes`).
+            error_seen = any(
+                RECOVERY_ERROR.search(json.dumps(o.get("output")))
+                for e in exchanges for o in function_outputs(e.get("request_body")))
+            result.task_ok = "PERIWINKLE" in answers[0] and error_seen
+            result.detail = f"answer={answers[0]!r}, tool results={tool_results}, error result seen={error_seen}"
         result.passed = result.protocol_ok and result.task_ok and code == 0
         if code != 0:
             result.detail += f"; client exit {code}"
 
     return run
+
+
+def signal_group(pid: int, signum: int) -> None:
+    """Signal a client's process group; it may already be gone (macOS: EPERM)."""
+    try:
+        os.killpg(pid, signum)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def cancel_run(ctx: Context, result: Result, client: str, effort: str, repo: Path, env: dict, log: Path) -> None:
@@ -714,13 +743,14 @@ def cancel_run(ctx: Context, result: Result, client: str, effort: str, repo: Pat
         streamed = ctx.recorder.first_chunk.wait(ctx.timeout)
         time.sleep(3)
         interrupted = time.monotonic()
-        os.killpg(process.pid, signal.SIGINT)
+        early_exit = process.poll()
+        signal_group(process.pid, signal.SIGINT)
         try:
             process.wait(20)
             exited = True
         except subprocess.TimeoutExpired:
             exited = False
-            os.killpg(process.pid, signal.SIGKILL)
+            signal_group(process.pid, signal.SIGKILL)
             process.wait()
     exit_seconds = time.monotonic() - interrupted
     # Give the proxy a moment to see the closed socket and record the exchange.
@@ -735,15 +765,20 @@ def cancel_run(ctx: Context, result: Result, client: str, effort: str, repo: Pat
     result.requests = len(exchanges)
     result.extra.update(
         streamed=streamed, client_exited=exited, exit_seconds=exit_seconds,
-        proxy_saw_disconnect=disconnected, followup=probe,
+        proxy_saw_disconnect=disconnected, followup=probe, exit_code_before_sigint=early_exit,
     )
-    result.protocol_ok = probe["ok"]
-    result.task_ok = streamed and exited and disconnected
+    result.failing_exchange = next((e for e in exchanges if exchange_failure(e)), None)
+    result.protocol_ok = probe["ok"] and result.failing_exchange is None
+    result.task_ok = streamed and exited and disconnected and early_exit is None
     result.passed = result.protocol_ok and result.task_ok
     result.detail = (
         f"streamed={streamed}, client exited after SIGINT={exited} ({exit_seconds:.1f}s), "
         f"upstream closed on disconnect={disconnected}, follow-up {probe['status']} in {probe['seconds']:.1f}s"
     )
+    if early_exit is not None:
+        result.detail += f"; client had already exited {early_exit} before SIGINT"
+    if result.failing_exchange:
+        result.detail += f"; {exchange_failure(result.failing_exchange)}"
 
 
 # ---------------------------------------------------------------- http probes
@@ -795,6 +830,15 @@ SHAPE_PROBES: dict[str, tuple[str, dict, str]] = {
     "http-namespace-tool": (
         "hosted-custom-tools",
         {**SIMPLE, "tools": [{"type": "namespace", "name": "multi_agent_v1", "description": "sub-agents", "tools": [EXEC_TOOL]}]},
+        "/v1/responses"),
+    # Codex 0.162 sends base instructions, then permissions/skills text, as two
+    # leading developer messages.
+    "http-multiple-developer-messages": (
+        "protocol",
+        {**SIMPLE, "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are a coding agent."}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Network access is restricted."}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply with the single word OK."}]}]},
         "/v1/responses"),
     "http-compact": (
         "compaction",
@@ -848,6 +892,26 @@ def encrypted_replay(ctx: Context, result: Result) -> None:
     result.task_ok = status2 == 200 and bool(encrypted) and "2.7.1" in answer
     result.passed = result.protocol_ok and result.task_ok
     result.detail = f"turn1 {status1} calls={len(calls)} encrypted={len(encrypted)}; turn2 {status2} answer={answer[:120]!r}"
+
+
+def encrypted_unrequested(ctx: Context, result: Result) -> None:
+    """Without `include`, reasoning items must not carry `encrypted_content`.
+
+    Oh My Pi with `includeEncryptedReasoning: false` replays such items without
+    their `id`, which the server then refuses (omp-fix-xhigh).
+    """
+    start = ctx.recorder.begin(result.name)
+    body = {"input": "What is 2+3? Reply with the number.", "reasoning": {"effort": "xhigh"},
+            "store": False, "max_output_tokens": 512, "temperature": 0}
+    status, response, seconds = post(ctx.proxy_port, "/v1/responses", body)
+    summarize_exchanges(result, ctx.recorder.since(start))
+    items = (response or {}).get("output", []) if isinstance(response, dict) else []
+    reasoning = [i for i in items if i.get("type") == "reasoning"]
+    sealed = [i for i in reasoning if i.get("encrypted_content")]
+    result.seconds = seconds
+    result.task_ok = status == 200 and bool(reasoning) and not sealed
+    result.passed = result.protocol_ok and result.task_ok
+    result.detail = f"HTTP {status}; reasoning items={len(reasoning)}, with encrypted_content={len(sealed)} (include absent)"
 
 
 def stream_disconnect(ctx: Context, result: Result) -> None:
@@ -935,6 +999,7 @@ def scenarios() -> list[Scenario]:
     for name, (owner, body, path) in SHAPE_PROBES.items():
         items.append(Scenario(name, "http", "-", owner, shape_probe(owner, body, path)))
     items.append(Scenario("http-encrypted-reasoning-replay", "http", "xhigh", "protocol", encrypted_replay))
+    items.append(Scenario("http-encrypted-reasoning-unrequested", "http", "xhigh", "protocol", encrypted_unrequested))
     items.append(Scenario("http-stream-disconnect", "http", "none", "protocol", stream_disconnect))
     items.append(Scenario("http-background-cancel", "http", "none", "background", background_cancel))
     items.append(Scenario("http-invalid-then-valid", "http", "none", "protocol", invalid_then_valid))
@@ -964,6 +1029,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=900.0, help="per client run, seconds")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument(
+        "--no-reasoning-key", action="store_true",
+        help="serve without --reasoning-key (Codex's include and the encrypted probes then fail)")
     args = parser.parse_args(argv)
 
     chosen = scenarios()
@@ -981,7 +1049,8 @@ def main(argv: list[str] | None = None) -> int:
     server = None
     if not args.no_serve:
         key = out / "reasoning.key"
-        server = LocalServer(args.server_bin, args.port, out / "server.log", ["--reasoning-key", str(key)])
+        extra = [] if args.no_reasoning_key else ["--reasoning-key", str(key)]
+        server = LocalServer(args.server_bin, args.port, out / "server.log", extra)
         server.start()
     recorder = Recorder(args.port, out / "exchanges.jsonl")
     results: list[Result] = []

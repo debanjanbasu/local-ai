@@ -41,9 +41,11 @@ import argparse
 import ast
 import concurrent.futures
 import json
+import os
 import random
 import re
 import resource
+import signal
 import subprocess
 import sys
 import tempfile
@@ -462,6 +464,17 @@ def report(out: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def stop_server_on_sigterm(server: LocalServer) -> None:
+    """A bounding `timeout` must not orphan the server: worker threads blocked
+    on long requests would keep `finally` from running, so stop it directly."""
+
+    def handler(signum, _frame):
+        server.stop()
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--server-bin", type=Path, default=ROOT / "target/release/local-ai")
@@ -496,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.no_serve:
             server = LocalServer(args.server_bin, args.port, args.out / "server.log", [])
+            stop_server_on_sigterm(server)
             server.start()
         for size in sizes:
             for seed in seeds:
