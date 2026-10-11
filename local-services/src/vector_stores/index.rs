@@ -217,9 +217,11 @@ impl VectorIndex {
         let files = searchable_files(&snapshot, store_id, request.filters.as_ref())?;
         let searcher = self.reader.searcher();
         let allowed: Box<dyn tantivy::query::Query> = Box::new(ConstScoreQuery::new(
-            Box::new(TermSetQuery::new(files.iter().map(|file| {
-                Term::from_field_text(self.fields.attach, &file.attach_id)
-            }))),
+            Box::new(TermSetQuery::new(
+                files
+                    .iter()
+                    .map(|file| Term::from_field_text(self.fields.attach, file)),
+            )),
             0.0,
         ));
         let mut best: BTreeMap<(String, u64), f64> = BTreeMap::new();
@@ -257,33 +259,29 @@ impl VectorIndex {
             .collect();
         hits.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         hits.truncate(plan.limit);
-        let by_attach: BTreeMap<&str, &super::Searchable> = files
-            .iter()
-            .map(|file| (file.attach_id.as_str(), file))
-            .collect();
         let mut data = Vec::with_capacity(hits.len());
         for ((attach_id, ordinal), score) in hits {
-            let Some(file) = by_attach.get(attach_id.as_str()) else {
-                continue;
-            };
-            let text: Option<Vec<u8>> = snapshot
+            let row: Option<(String, String, String, Vec<u8>)> = snapshot
                 .query_row(
-                    "SELECT substr(f.text, c.start + 1, c.end - c.start)
+                    "SELECT f.file_id, f.filename, f.attributes,
+                            substr(f.text, c.start + 1, c.end - c.start)
                      FROM vector_store_chunks c JOIN vector_store_files f
                        ON f.attach_id = c.attach_id
-                     WHERE c.attach_id = ?1 AND c.ordinal = ?2",
+                     WHERE c.attach_id = ?1 AND c.ordinal = ?2 AND f.status = 'completed'",
                     params![attach_id, signed(ordinal)?],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            // An index document always has its chunk row while its file is
-            // completed in this snapshot; a missing one is skipped, not shown.
-            let Some(text) = text else { continue };
+            // Every admitted document has its chunk row in this snapshot; a
+            // missing one would be skipped, never shown.
+            let Some((file_id, filename, attributes, text)) = row else {
+                continue;
+            };
             data.push(SearchResult {
-                file_id: file.file_id.clone(),
-                filename: file.filename.clone(),
+                file_id,
+                filename,
                 score,
-                attributes: file.attributes.clone(),
+                attributes: serde_json::from_str(&attributes)?,
                 content: vec![ContentPart {
                     kind: "text".to_owned(),
                     text: String::from_utf8(text).map_err(|_| corrupt("chunk text"))?,

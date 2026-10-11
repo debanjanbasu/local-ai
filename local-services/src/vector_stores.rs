@@ -1288,45 +1288,31 @@ fn writable_store(connection: &Connection, store_id: &str) -> Result<VectorStore
     Ok(store)
 }
 
-/// A completed file of a store, as search sees it.
-struct Searchable {
-    attach_id: String,
-    file_id: String,
-    filename: String,
-    attributes: Attributes,
-}
-
-/// The completed files of `store_id` that `filter` admits.
+/// The attachment IDs of the completed files of `store_id` that `filter`
+/// admits (attributes are only parsed when there is a filter).
 fn searchable_files(
     connection: &Connection,
     store_id: &str,
     filter: Option<&Filter>,
-) -> Result<Vec<Searchable>> {
+) -> Result<Vec<String>> {
     let mut statement = connection.prepare(
-        "SELECT attach_id, file_id, filename, attributes FROM vector_store_files
+        "SELECT attach_id, CASE WHEN ?2 THEN attributes END FROM vector_store_files
          WHERE store_id = ?1 AND status = 'completed'",
     )?;
     let rows = statement
-        .query_map([store_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get::<_, String>(3)?,
-            ))
+        .query_map(params![store_id, filter.is_some()], |row| {
+            Ok((row.get(0)?, row.get::<_, Option<String>>(1)?))
         })?
-        .collect::<rusqlite::Result<Vec<(String, String, String, String)>>>()?;
-    let mut files = Vec::new();
-    for (attach_id, file_id, filename, attributes) in rows {
-        let attributes: Attributes = serde_json::from_str(&attributes)?;
-        if filter.is_none_or(|filter| admits(filter, &attributes)) {
-            files.push(Searchable {
-                attach_id,
-                file_id,
-                filename,
-                attributes,
-            });
+        .collect::<rusqlite::Result<Vec<(String, Option<String>)>>>()?;
+    let mut files = Vec::with_capacity(rows.len());
+    for (attach_id, attributes) in rows {
+        if let (Some(filter), Some(attributes)) = (filter, attributes) {
+            let attributes: Attributes = serde_json::from_str(&attributes)?;
+            if !admits(filter, &attributes) {
+                continue;
+            }
         }
+        files.push(attach_id);
     }
     Ok(files)
 }
