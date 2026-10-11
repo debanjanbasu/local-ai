@@ -298,14 +298,7 @@ impl PreparedDecision {
                      score its features with JudgmentHead::score instead"
                 ))
             })?;
-        let rendered = request.render()?;
-        let (tokens, positions) =
-            tokenizer.encode_with_token_ends(&rendered.text, &rendered.byte_ends)?;
-        // Every added token is special, so skipping specials changes the
-        // decode exactly when the text spelled one.
-        if tokenizer.decode(&tokens, true)? != tokenizer.decode(&tokens, false)? {
-            return Err(invalid("text contains a special-token string"));
-        }
+        let (rendered, tokens, positions) = tokenize(tokenizer, request)?;
         Ok(Self {
             options: rendered.options,
             score: matches!(request.kind, DecisionKind::Score(_)),
@@ -355,12 +348,10 @@ impl PreparedDecision {
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        let Some(features) =
-            engine.capture_hidden(&self.tokens, &self.positions, DECISION_CAPTURE_ROWS, cancel)?
-        else {
+        let Some(features) = capture(engine, &self.tokens, &self.positions, cancel)? else {
             return Ok(None);
         };
-        let scores = score_features(head, features)?;
+        let scores = head.score(&features)?;
         self.assemble(Some(&scores)).map(Some)
     }
 
@@ -422,19 +413,98 @@ impl PreparedDecision {
     }
 }
 
-/// Round captured `features` through FP16, as the training features were
-/// stored, and score them.
+/// Render `request`, encode it once and resolve every endpoint to the exact
+/// token ending there; text spelling a special token is refused.
+fn tokenize(
+    tokenizer: &BonsaiTokenizer,
+    request: &DecisionRequest,
+) -> crate::Result<(RenderedDecision, Vec<u32>, Vec<usize>)> {
+    let rendered = request.render()?;
+    let (tokens, positions) =
+        tokenizer.encode_with_token_ends(&rendered.text, &rendered.byte_ends)?;
+    // Every added token is special, so skipping specials changes the
+    // decode exactly when the text spelled one.
+    if tokenizer.decode(&tokens, true)? != tokenizer.decode(&tokens, false)? {
+        return Err(invalid("text contains a special-token string"));
+    }
+    Ok((rendered, tokens, positions))
+}
+
+/// Capture the hidden after each of `positions` in
+/// [`DECISION_CAPTURE_ROWS`]-row blocks and round it through FP16, as the
+/// training features were stored. The one capture path of both scored
+/// decisions and [`DecisionCapture`]. `Ok(None)` when `cancel` tripped.
+fn capture(
+    engine: &mut BonsaiEngine,
+    tokens: &[u32],
+    positions: &[usize],
+    cancel: &CancelToken,
+) -> crate::Result<Option<Vec<f32>>> {
+    let Some(mut features) =
+        engine.capture_hidden(tokens, positions, DECISION_CAPTURE_ROWS, cancel)?
+    else {
+        return Ok(None);
+    };
+    crate::bonsai_native::capture::round_features_f16(&mut features)?;
+    Ok(Some(features))
+}
+
+/// Round `features` through FP16 and score them, as a captured decision is.
+#[cfg(test)]
 fn score_features(head: &JudgmentHead, mut features: Vec<f32>) -> crate::Result<JudgmentScores> {
     crate::bonsai_native::capture::round_features_f16(&mut features)?;
     head.score(&features)
+}
+
+/// A decision's head-independent capture: what a scored decision would read,
+/// before any head. See [`crate::Engine::capture_decision`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionCapture {
+    /// The native rendering: text, byte endpoints and options.
+    pub rendered: RenderedDecision,
+    /// Prompt token ids.
+    pub tokens: Vec<u32>,
+    /// Token index of each option endpoint, then the decision endpoint.
+    pub positions: Vec<usize>,
+    /// `positions.len()` rows of [`crate::bonsai::WIDTH`] FP16-rounded
+    /// values, option rows first and the decision row last: exactly the
+    /// features a scored decision passes to [`JudgmentHead::score`].
+    pub features: Vec<f32>,
+}
+
+impl DecisionCapture {
+    /// Render and tokenize `request` on the CPU, with every check a capture
+    /// makes before GPU work; [`features`](Self::features) stay empty. A
+    /// request with fewer than two options has no head features and is
+    /// refused. Use it to validate a batch before loading the model.
+    pub fn prepare(tokenizer: &BonsaiTokenizer, request: &DecisionRequest) -> crate::Result<Self> {
+        let (rendered, tokens, positions) = tokenize(tokenizer, request)?;
+        if rendered.options.len() < 2 {
+            return Err(invalid("capture needs at least two options"));
+        }
+        Ok(Self {
+            rendered,
+            tokens,
+            positions,
+            features: Vec::new(),
+        })
+    }
+
+    /// Capture on `engine`, which must have no active generation.
+    pub(crate) fn run(mut self, engine: &mut BonsaiEngine) -> crate::Result<Self> {
+        self.features = capture(engine, &self.tokens, &self.positions, &CancelToken::new())?
+            .ok_or_else(|| crate::Error::Generation("decision capture was cancelled".into()))?;
+        Ok(self)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::float_cmp)]
 mod tests {
     use super::{
-        DECISION_RENDERER, DecisionKind, DecisionRequest, DecisionValue, JudgmentHead,
-        MAX_DECISION_OPTIONS, PreparedDecision, UNKNOWN_CALIBRATION_SCOPE, score_features,
+        DECISION_RENDERER, DecisionCapture, DecisionKind, DecisionRequest, DecisionValue,
+        JudgmentHead, MAX_DECISION_OPTIONS, PreparedDecision, UNKNOWN_CALIBRATION_SCOPE,
+        score_features,
     };
     use crate::bonsai_tokenizer::BonsaiTokenizer;
 
@@ -703,6 +773,33 @@ mod tests {
                 .is_some_and(|e| e.contains("unknown-renderer")),
             "{error:?}"
         );
+        Ok(())
+    }
+
+    /// A head-independent capture prepares exactly the tokens and positions
+    /// a scored decision captures, needs no head, and refuses what a scored
+    /// decision would refuse.
+    #[test]
+    fn captures_prepare_the_scored_decisions_tokens() -> crate::Result<()> {
+        let tokenizer = BonsaiTokenizer::tiny_for_tests();
+        for kind in [
+            DecisionKind::Predicate,
+            DecisionKind::Choice(vec![DecisionValue::Bool(false), DecisionValue::Bool(true)]),
+            DecisionKind::Score(vec!["low".into(), "high".into()]),
+        ] {
+            let request = request(kind);
+            let capture = DecisionCapture::prepare(&tokenizer, &request)?;
+            let prepared = prepare(&request)?;
+            assert_eq!(capture.tokens, prepared.tokens);
+            assert_eq!(capture.positions, prepared.positions);
+            assert_eq!(capture.rendered, request.render()?);
+            assert_eq!(capture.features, Vec::<f32>::new());
+        }
+        let single = request(DecisionKind::Score(vec!["only".into()]));
+        assert!(DecisionCapture::prepare(&tokenizer, &single).is_err());
+        let mut special = request(DecisionKind::Predicate);
+        special.state.push_str("<|x|>");
+        assert!(DecisionCapture::prepare(&tokenizer, &special).is_err());
         Ok(())
     }
 

@@ -17,7 +17,7 @@ use crate::bonsai_model::{BonsaiEngine, BonsaiInfo, CancelToken, PromptCacheSour
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
 use crate::bonsai_tokenizer::BonsaiTokenizer;
-use crate::judgment::{Decision, DecisionRequest, JudgmentHead, PreparedDecision};
+use crate::judgment::{Decision, DecisionCapture, DecisionRequest, JudgmentHead, PreparedDecision};
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
 use crate::runtime::{EVENT_BUFFER, PrefillProgress};
 use crate::structured::{Grammar, ResponseFormat};
@@ -576,6 +576,23 @@ impl Engine {
         prepared
             .run(&mut self.inner, head, &CancelToken::new())?
             .ok_or_else(|| crate::Error::Generation("decision was cancelled".into()))
+    }
+
+    /// EXPERIMENTAL: the head-independent features of a decision, for
+    /// building evaluation and calibration data on the serving path.
+    ///
+    /// Renders, tokenizes and captures `request` exactly as
+    /// [`decide`](Self::decide) does before scoring (same renderer, endpoint
+    /// resolution, [`DECISION_CAPTURE_ROWS`](crate::judgment::DECISION_CAPTURE_ROWS)
+    /// blocks and FP16 rounding), so scoring
+    /// [`DecisionCapture::features`] with a head reproduces that head's
+    /// decision. Requests with fewer than two options are refused. Capture
+    /// overwrites one sequence buffer set, as [`decide`](Self::decide) does.
+    pub fn capture_decision(
+        &mut self,
+        request: &DecisionRequest,
+    ) -> crate::Result<DecisionCapture> {
+        DecisionCapture::prepare(self.inner.tokenizer(), request)?.run(&mut self.inner)
     }
 
     /// Move this engine to a dedicated worker thread.
