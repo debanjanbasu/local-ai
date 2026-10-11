@@ -719,6 +719,84 @@ fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
     assert!(replay(&follow).is_err());
 }
 
+#[test]
+fn reasoning_is_sealed_only_when_include_asks_for_it() {
+    use super::reasoning_crypto::ReasoningCipher;
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let cipher = Arc::new(ReasoningCipher::open(scratch.0.join("reasoning.key")).expect("cipher"));
+    let generate = |body: &Value| {
+        let prepared = prepare_responses_with(
+            body.to_string().as_bytes(),
+            true,
+            Some(&store),
+            Some(&cipher),
+            "m",
+        )
+        .expect("request");
+        let reply = Reply::new(Protocol::Responses(Arc::new(prepared.echo)), "m".into());
+        let Protocol::Responses(echo) = &reply.protocol else {
+            unreachable!("responses reply")
+        };
+        let mut state = ResponsesState::new(&reply, Arc::clone(echo), true);
+        state.start();
+        let mut terminal = Value::Null;
+        for event in [
+            Event::Reasoning("Think first.".into()),
+            Event::Content("OK".into()),
+            Event::Finished(stats(StopReason::Eos)),
+        ] {
+            if let Some(done) = state.event(event) {
+                terminal = done;
+            }
+        }
+        (terminal, state.take_events())
+    };
+    // A key on the server is not a request: without the include, no item,
+    // streamed or final, carries encrypted_content.
+    let (response, events) = generate(&json!({"input":"hi"}));
+    let reasoning = response["output"][0].clone();
+    assert_eq!(reasoning["type"], "reasoning");
+    assert!(reasoning.get("encrypted_content").is_none(), "{reasoning}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["item"].get("encrypted_content").is_none()),
+        "{events:?}"
+    );
+    // The stateful paths replay the plaintext they kept.
+    let id = response["id"].as_str().expect("id");
+    let follow = json!({"previous_response_id":id,"input":"continue"});
+    let prepared = prepare_responses_with(
+        follow.to_string().as_bytes(),
+        true,
+        Some(&store),
+        Some(&cipher),
+        "m",
+    )
+    .expect("continuation");
+    assert_eq!(
+        prepared.request.messages[1].reasoning_content.as_deref(),
+        Some("Think first.")
+    );
+    // A client that replays the item without its id is accepted.
+    let mut replayed = reasoning;
+    replayed.as_object_mut().expect("item").remove("id");
+    let stateless = json!({"input":[{"role":"user","content":"hi"},replayed,
+        response["output"][1],{"role":"user","content":"continue"}],"store":false});
+    prepare_responses_with(
+        stateless.to_string().as_bytes(),
+        true,
+        Some(&store),
+        Some(&cipher),
+        "m",
+    )
+    .expect("replay without ids");
+    // Asked for, it is sealed.
+    let (response, _) = generate(&json!({"input":"hi","include":["reasoning.encrypted_content"]}));
+    assert!(response["output"][0]["encrypted_content"].is_string());
+}
+
 /// A stored Response object with the fields recovery reads and must keep.
 fn record(id: &str, background: bool, status: &str) -> Value {
     json!({
