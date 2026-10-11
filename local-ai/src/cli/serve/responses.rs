@@ -575,6 +575,12 @@ pub(super) fn prepare_responses_conversing(
         tools.push(definition);
     }
     tool_policy(&tools, &choice)?;
+    if conversation_id.is_some() && kinds.reports_other_items() {
+        return Err(unsupported(
+            "custom, shell, local_shell and apply_patch tools with conversation",
+            "the conversation store keeps only message, reasoning and function call items",
+        ));
+    }
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let (response_format, text_format) =
         responses_text_format(request.text.as_ref().and_then(|text| text.format.as_ref()))?;

@@ -181,6 +181,17 @@ impl Kinds {
         }
     }
 
+    /// Whether a declared tool reports calls as items other than
+    /// `function_call`/`function_call_output`.
+    pub(super) fn reports_other_items(&self) -> bool {
+        self.0.values().any(|kind| {
+            matches!(
+                kind,
+                Kind::Custom | Kind::LocalShell | Kind::ApplyPatch | Kind::Hosted(Hosted::Shell)
+            )
+        })
+    }
+
     /// Every hosted operation declared.
     pub(super) fn all_hosted(&self) -> impl Iterator<Item = Hosted> + '_ {
         self.0.values().filter_map(|kind| match kind {

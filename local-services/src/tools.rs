@@ -317,25 +317,26 @@ impl Toolbox {
         if timeout.is_zero() {
             return Err(ToolError::TimedOut(timeout));
         }
+        if let Request::Shell {
+            commands,
+            timeout: asked,
+            max_output_bytes,
+        } = request
+        {
+            // The shell enforces its own deadlines, killing the process group
+            // and keeping the output so far, so it is not cut off from outside.
+            let root = self.root_path()?;
+            let policy = shell::Policy::new(root, self.inner.permissions.write, &self.inner.limits);
+            let per_command = asked.map_or(timeout, |asked| asked.min(timeout));
+            let cap = max_output_bytes.map_or(self.inner.limits.max_output_bytes, |asked| {
+                asked.clamp(1, self.inner.limits.max_output_bytes)
+            });
+            return shell::run_all(&policy, &commands, per_command, timeout, cap)
+                .await
+                .map(Output::Shell);
+        }
         let work = async {
             match request {
-                Request::Shell {
-                    commands,
-                    timeout: asked,
-                    max_output_bytes,
-                } => {
-                    let root = self.root_path()?;
-                    let policy =
-                        shell::Policy::new(root, self.inner.permissions.write, &self.inner.limits);
-                    let per_command = asked.map_or(timeout, |asked| asked.min(timeout));
-                    let cap = max_output_bytes
-                        .map_or(self.inner.limits.max_output_bytes, |asked| {
-                            asked.clamp(1, self.inner.limits.max_output_bytes)
-                        });
-                    shell::run_all(&policy, &commands, per_command, timeout, cap)
-                        .await
-                        .map(Output::Shell)
-                }
                 Request::Fetch { url } => {
                     fetch::fetch(
                         &url,
