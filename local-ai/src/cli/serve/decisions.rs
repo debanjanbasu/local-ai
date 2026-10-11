@@ -16,6 +16,10 @@
 //! even those probabilities are not. A
 //! `confidence` here could only be invented, so `/v1/decisions` is refused
 //! with an explanation and this route answers in its own shape instead.
+//! Calibrated confidence, a refusal threshold and a scope gate were fitted
+//! and tested against pre-registered criteria (`docs/DECISIONS_EVALUATION.md`);
+//! no head passed (the selective risk and the out-of-scope gate did not hold
+//! on held-out and out-of-domain rows), so the refusal stands.
 //!
 //! # The bridge
 //!
@@ -588,9 +592,10 @@ pub(super) fn response_json(model: &str, answered: Answered) -> Value {
 pub(super) fn openai_refusal() -> String {
     format!(
         "{OPENAI_ROUTE} is not implemented: OpenAI Decisions answers carry a confidence and may \
-         be refusals, which this server's experimental judgment head does not produce. Start the \
-         server with {FLAG} FILE and use POST {ROUTE}, which returns the head's probabilities \
-         only"
+         be refusals, which this server's experimental judgment head does not produce reliably \
+         (no head passed the pre-registered confidence and refusal evaluation in \
+         docs/DECISIONS_EVALUATION.md). Start the server with {FLAG} FILE and use POST {ROUTE}, \
+         which returns the head's probabilities only"
     )
 }
 

@@ -250,7 +250,7 @@ class OrchestrationTest(unittest.TestCase):
             work = tmp / "work"
             first = jc.capture(requests, work, Path("bin"), 2, max_chunks=2, runner=runner)
             self.assertEqual(first, {"chunks": 3, "ran": 2, "remaining": 1})
-            self.assertEqual(calls[0][:3], ["lockf", "-k", jc.LOCK])
+            self.assertEqual(calls[0][:5], ["timeout", "1800", "lockf", "-k", jc.LOCK])
             second = jc.capture(requests, work, Path("bin"), 2, runner=runner)
             self.assertEqual(second, {"chunks": 3, "ran": 1, "remaining": 0})
             self.assertEqual(len(calls), 3)

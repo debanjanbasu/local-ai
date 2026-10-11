@@ -597,6 +597,7 @@ fn the_flag_is_explicit_and_the_openai_route_explains_itself() {
         "/v1/decisions",
         "confidence",
         "refusals",
+        "docs/DECISIONS_EVALUATION.md",
         FLAG,
         super::ROUTE,
     ] {
