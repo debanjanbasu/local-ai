@@ -56,27 +56,45 @@ use self::checkpoints::{CachedCheckpoint, PromptPrefill, SessionSnapshot};
 /// work in flight". A poll always lands between dispatches, where the K/V cache
 /// and the position cursor hold the exact state of the last committed chunk or
 /// round.
+///
+/// Work that runs outside the engine for the same request (a hosted tool
+/// between generations) waits on [`Self::cancelled`] instead of polling.
 #[derive(Clone, Default)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl CancelToken {
     /// A fresh token: not cancelled.
     pub fn new() -> Self {
-        Self {
-            flag: Arc::new(AtomicBool::new(false)),
-        }
+        Self::default()
     }
 
     /// Request cancellation. Idempotent, and observed by every clone.
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     /// Whether [`Self::cancel`] has been called on this token or any clone.
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolve once [`Self::cancel`] has been called on any clone.
+    pub async fn cancelled(&self) {
+        let mut notified = std::pin::pin!(self.notify.notified());
+        loop {
+            // Registered before the flag is read, so a `cancel` between the
+            // two still wakes this wait.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.as_mut().await;
+            notified.set(self.notify.notified());
+        }
     }
 }
 

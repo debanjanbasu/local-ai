@@ -205,7 +205,7 @@ fn completion_frames(reply: &Reply, event: Event) -> Vec<String> {
         ],
         Event::Error(error) => vec![error_frame(&error)],
         // A raw completion renders no tools, so the engine cannot report a call.
-        Event::TokenIds(_) | Event::ToolCall(_) => Vec::new(),
+        Event::TokenIds(_) | Event::ToolCall(_) | Event::ToolOutput(_) => Vec::new(),
     }
 }
 
@@ -239,7 +239,8 @@ fn chat_frames(
             return frames;
         }
         Event::Error(error) => return vec![error_frame(&error)],
-        Event::TokenIds(_) => return Vec::new(),
+        // Hosted tool results only run in the Responses loop.
+        Event::TokenIds(_) | Event::ToolOutput(_) => return Vec::new(),
     };
     if !*announced {
         *announced = true;

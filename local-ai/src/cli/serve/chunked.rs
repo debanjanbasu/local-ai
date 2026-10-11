@@ -384,7 +384,8 @@ pub(super) fn absorb(body: &mut Body, signal: Signal) -> Flow {
             due(body)
         }
         // Token IDs are not part of this document.
-        Signal::Event(Event::TokenIds(_)) => Flow::Keep,
+        // Hosted tool results only run in the Responses loop.
+        Signal::Event(Event::TokenIds(_) | Event::ToolOutput(_)) => Flow::Keep,
         Signal::Event(Event::ToolCall(call)) => {
             // A raw completion renders no tools, so only a chat can see one.
             if let Document::Chat { calls } = &mut body.document {
