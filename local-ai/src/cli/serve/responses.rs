@@ -33,8 +33,11 @@
 //!   version the prompt was built from, before its terminal state is
 //!   reported; if that append fails the Response fails instead. Failed and
 //!   cancelled Responses append nothing.
-//! - Function tools only; built-in, MCP and custom tools need hosted
-//!   services this server lacks. `tool_choice` (`auto`, `none`, `required` or
+//! - Function, `custom`, `local_shell` and `apply_patch` tools are returned
+//!   for the client to run; with server permission, `shell` and the
+//!   `local_fs_*`/`local_web_fetch` functions run here, in the loop of
+//!   [`super::tool_loop`] (see `docs/TOOLS.md`). Other built-in and MCP tools
+//!   need hosted services this server lacks. `tool_choice` (`auto`, `none`, `required` or
 //!   `{"type":"function","name"}`), `parallel_tool_calls` and a tool's
 //!   `strict` map onto the engine's native tool grammar, which enforces them
 //!   on every sampled token, and are echoed back as accepted (`strict` as
@@ -102,8 +105,7 @@ struct ResponsesRequest {
     input: Option<Value>,
     instructions: Option<String>,
     max_output_tokens: Option<usize>,
-    /// Bounds built-in tool calls, of which this server makes none.
-    #[allow(dead_code)]
+    /// Bounds the hosted tool calls this server runs for the Response.
     max_tool_calls: Option<u64>,
     metadata: Option<Value>,
     /// Opaque client telemetry (Codex extension), never model input or stored.
@@ -201,6 +203,10 @@ pub(super) struct Echo {
     /// The compaction item made before generation (`context_management`),
     /// the Response's first output item.
     compaction: Option<Value>,
+    /// Who executes each declared tool that is not a plain function.
+    kinds: super::hosted::Kinds,
+    /// `max_tool_calls`: hosted calls this Response may run.
+    max_tool_calls: Option<u64>,
 }
 
 /// Runs one generation of the loaded model to its end, handing each piece of
@@ -291,6 +297,15 @@ impl Echo {
     /// Attach what runs the summary generation.
     pub(super) fn set_summarizer(&mut self, summarizer: Summarizer) {
         self.summarizer = Some(summarizer);
+    }
+
+    /// Who executes each declared tool.
+    pub(super) const fn kinds(&self) -> &super::hosted::Kinds {
+        &self.kinds
+    }
+
+    pub(super) const fn max_tool_calls(&self) -> Option<u64> {
+        self.max_tool_calls
     }
 }
 
@@ -712,15 +727,31 @@ pub(super) fn prepare_responses_conversing(
     let thinking = effective_thinking(reasoning_effort(request.reasoning.as_ref())?, thinking)?;
     let summary = summary_detail(request.reasoning.as_ref())?;
     let context_compaction = context_compaction(request.context_management.as_ref())?;
-    let (choice, echoed_choice) = responses_tool_choice(request.tool_choice.as_ref())?;
+    let (choice, echoed_choice) = match super::hosted::tool_choice(request.tool_choice.as_ref()) {
+        Some(choice) => choice?,
+        None => responses_tool_choice(request.tool_choice.as_ref())?,
+    };
     let mut echoed_tools = Vec::new();
     let mut tools = Vec::new();
+    let mut kinds = super::hosted::Kinds::default();
     for tool in request.tools.as_deref().unwrap_or_default() {
+        if let Some((definition, kind, echo)) = super::hosted::tool(tool)? {
+            kinds.insert(&definition.name, kind);
+            echoed_tools.push(echo);
+            tools.push(definition);
+            continue;
+        }
         let definition = function_tool(tool)?;
         echoed_tools.push(json!({"type":"function","name":definition.name,"description":definition.description,"parameters":definition.parameters,"strict":definition.strict}));
         tools.push(definition);
     }
     tool_policy(&tools, &choice)?;
+    if conversation_id.is_some() && kinds.reports_other_items() {
+        return Err(unsupported(
+            "custom, shell, local_shell and apply_patch tools with conversation",
+            "the conversation store keeps only message, reasoning and function call items",
+        ));
+    }
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let (response_format, text_format) =
         responses_text_format(request.text.as_ref().and_then(|text| text.format.as_ref()))?;
@@ -794,6 +825,8 @@ pub(super) fn prepare_responses_conversing(
         summary,
         summarizer: None,
         compaction: None,
+        kinds,
+        max_tool_calls: request.max_tool_calls,
     };
     Ok(PreparedResponses {
         stream: request.stream.unwrap_or(false),
@@ -1194,6 +1227,15 @@ pub(super) fn prepare_resumed(
     let bytes = serde_json::to_vec(&body).map_err(|error| invalid(error.to_string()))?;
     let mut prepared =
         prepare_responses_conversing(&bytes, thinking, Some(store), None, None, cipher, model)?;
+    if prepared.echo.kinds().all_hosted().next().is_some() {
+        // Regenerating would run its hosted calls again, and a shell command
+        // or file write may already have taken effect before the restart.
+        return Err(unsupported(
+            "resuming",
+            "a response that declares hosted tools is not regenerated, since its tool calls \
+             could run twice",
+        ));
+    }
     prepared.echo.previous_response_id = response
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -1425,7 +1467,8 @@ fn function_tool(tool: &Value) -> crate::Result<ToolDefinition> {
     if kind != "function" {
         return Err(unsupported(
             &format!("tool type {kind:?}"),
-            "only function tools run here; built-in, MCP and custom tools need hosted services",
+            "only function, custom, local_shell, apply_patch and (with server permission) shell \
+             tools run here; other built-in and MCP tools need hosted services",
         ));
     }
     let name = tool
@@ -1698,12 +1741,22 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
                 "a compaction item is only rendered from its sealed content",
             ));
         }
-        Some(other) => {
-            return Err(unsupported(
-                &format!("input item type {other:?}"),
-                "only messages, reasoning, function_call and function_call_output are accepted",
-            ));
-        }
+        Some(other) => match super::hosted::input_item(other, item) {
+            Some(converted) => match converted? {
+                super::hosted::Input::Call(call) => turn.calls.push(call),
+                super::hosted::Input::Output { call_id, content } => {
+                    flush(turn, messages);
+                    messages.push(plain("tool", content, Some(call_id)));
+                }
+            },
+            None => {
+                return Err(unsupported(
+                    &format!("input item type {other:?}"),
+                    "only messages, reasoning, and function, custom, shell, local_shell and \
+                     apply_patch calls and their outputs are accepted",
+                ));
+            }
+        },
     }
     Ok(())
 }
@@ -2293,7 +2346,12 @@ impl ResponsesState {
     fn call(&mut self, call: &ToolCall) {
         self.close("completed");
         let index = self.output.len();
-        let id = self.item_id("fc");
+        let kind = self.echo.kinds.kind(&call.name);
+        let id = self.item_id(super::hosted::call_prefix(kind));
+        if let Some(rendered) = super::hosted::call_item(kind, &id, index, call) {
+            self.push_rendered(rendered);
+            return;
+        }
         let arguments = arguments_text(call);
         self.emit(
             "response.output_item.added",
@@ -2315,6 +2373,23 @@ impl ResponsesState {
         self.output.push(item);
     }
 
+    /// A hosted call's result, produced by this server between generations.
+    fn tool_output(&mut self, output: &local_engine::ToolOutput) {
+        self.close("completed");
+        let index = self.output.len();
+        let kind = self.echo.kinds.kind(&output.name);
+        let id = self.item_id(super::hosted::output_prefix(kind));
+        let rendered = super::hosted::output_item(kind, &id, index, output);
+        self.push_rendered(rendered);
+    }
+
+    fn push_rendered(&mut self, rendered: super::hosted::Rendered) {
+        for (kind, fields) in rendered.events {
+            self.emit(kind, fields);
+        }
+        self.output.push(rendered.item);
+    }
+
     /// Fold one engine event in. Returns the final Response on a terminal
     /// event: `Finished`, or `Error` once generation had started.
     pub(super) fn event(&mut self, event: Event) -> Option<Value> {
@@ -2322,6 +2397,7 @@ impl ResponsesState {
             Event::Reasoning(piece) => self.text(ItemKind::Reasoning, &piece),
             Event::Content(piece) => self.text(ItemKind::Message, &piece),
             Event::ToolCall(call) => self.call(&call),
+            Event::ToolOutput(output) => self.tool_output(&output),
             Event::TokenIds(_) => {}
             Event::Finished(stats) => return Some(self.finish(&stats)),
             Event::Error(message) => return Some(self.fail(&message)),

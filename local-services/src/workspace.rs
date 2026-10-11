@@ -1291,7 +1291,7 @@ fn clamp(requested: Option<usize>, hard: usize, name: &str) -> Result<usize> {
 
 /// Normalise a caller-supplied workspace-relative path, rejecting absolute
 /// paths, `..`, NUL bytes and any `.git` component.
-fn relative_path(input: &str, allow_root: bool) -> Result<PathBuf> {
+pub(crate) fn relative_path(input: &str, allow_root: bool) -> Result<PathBuf> {
     if input.contains('\0') {
         return Err(Error::InvalidArgument(
             "path must not contain NUL bytes".to_owned(),

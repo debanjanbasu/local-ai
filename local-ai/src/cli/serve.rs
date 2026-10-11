@@ -25,6 +25,7 @@ mod chunked;
 mod compaction;
 mod decisions;
 mod evals;
+mod hosted;
 mod http3;
 mod journal;
 mod options;
@@ -36,6 +37,7 @@ mod resume;
 mod services;
 mod sse;
 mod store;
+mod tool_loop;
 mod vector_stores;
 
 #[cfg(test)]
@@ -76,6 +78,8 @@ struct Args {
     /// `--experimental-decision-head`: the judgment head that enables
     /// `POST /v1/experimental/decisions`. `None` serves no decisions.
     decision_head: Option<PathBuf>,
+    /// Hosted tool permissions and bounds; none by default.
+    tools: options::ToolArgs,
 }
 
 #[derive(Clone)]
@@ -110,6 +114,8 @@ struct AppState {
     batches: Option<Arc<batches::Batches>>,
     vector_stores: Option<Arc<vector_stores::VectorStores>>,
     evals: Option<Arc<evals::Evals>>,
+    /// Hosted tools this server may run for Responses; `None` grants none.
+    tools: Option<Arc<tool_loop::Tools>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -355,7 +361,13 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             .await;
         }
     };
-    let (stream, request, protocol) = prepared;
+    let (stream, mut request, protocol) = prepared;
+    let tool_loop = match hosted_loop(&state, &protocol, &mut request) {
+        Ok(tool_loop) => tool_loop,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, &message, &state, &parts.headers).await;
+        }
+    };
     let background = matches!(&protocol, Protocol::Responses(echo) if echo.background());
     if background && state.background.closing() {
         return error_response(
@@ -384,7 +396,10 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         )))
     });
     let events = match events {
-        Ok(events) => events,
+        Ok(events) => match tool_loop {
+            Some(tool_loop) => tool_loop::start(tool_loop, events),
+            None => events,
+        },
         Err(error) => {
             if matches!(error, crate::Error::QueueFull) {
                 return queue_full_response(&state, &parts.headers).await;
@@ -470,6 +485,39 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             }
         }
     }
+}
+
+/// The tool loop for a Response that declared hosted tools, refusing one
+/// whose tools this server was not permitted to run.
+fn hosted_loop(
+    state: &AppState,
+    protocol: &Protocol,
+    request: &mut GenerationRequest,
+) -> Result<Option<tool_loop::Loop>, String> {
+    let (Protocol::Responses(echo), GenerationRequest::Chat(request)) = (protocol, request) else {
+        return Ok(None);
+    };
+    if echo.kinds().all_hosted().next().is_none() {
+        return Ok(None);
+    }
+    tool_loop::check(state.tools.as_deref(), echo.kinds())?;
+    let Some(tools) = &state.tools else {
+        return Ok(None);
+    };
+    let engine = state.engine.clone();
+    // Every round renders the same growing conversation, so one prompt-cache
+    // affinity lets each round reuse the previous one's prefix.
+    request
+        .session
+        .get_or_insert_with(|| response::new_id("tools_"));
+    Ok(Some(tool_loop::Loop {
+        submit: Box::new(move |request| engine.chat(request)),
+        request: request.clone(),
+        toolbox: tools.toolbox.clone(),
+        kinds: echo.kinds().clone(),
+        bounds: tools.bounds,
+        max_calls: echo.max_tool_calls(),
+    }))
 }
 
 /// A `text/event-stream` response whose frames arrive on `frames`.
@@ -934,6 +982,9 @@ async fn run_async(args: Args) -> crate::Result<()> {
             })
         })
         .transpose()?;
+    // Hosted tools are opened before the model loads too, so a bad root or
+    // domain fails in milliseconds; nothing is granted without a flag.
+    let tools = open_tools(&args.tools)?;
     // Also before the model loads: a wrong head fails in milliseconds.
     let decisions = decisions::Decisions::start(args.decision_head.as_deref())?;
     // Background `store: false` Responses are kept only in a private store of
@@ -975,6 +1026,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         batches: None,
         vector_stores: vector_stores.clone(),
         evals: None,
+        tools,
     };
     let address = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -1044,6 +1096,43 @@ async fn run_async(args: Args) -> crate::Result<()> {
         task.abort();
     }
     served
+}
+
+/// The hosted tools `args` grant, or `None` when they grant nothing.
+fn open_tools(args: &options::ToolArgs) -> crate::Result<Option<Arc<tool_loop::Tools>>> {
+    if !args.any() {
+        return Ok(None);
+    }
+    let toolbox = local_services::tools::Toolbox::new(
+        local_services::tools::Permissions {
+            root: args.root.clone(),
+            write: args.write,
+            shell: args.shell,
+            fetch_domains: args.fetch_domains.clone(),
+        },
+        local_services::tools::Limits {
+            call_timeout: args.call_timeout,
+            ..local_services::tools::Limits::default()
+        },
+    )
+    .map_err(|error| crate::Error::InvalidArgument(format!("hosted tools: {error}")))?;
+    eprintln!(
+        "hosted tools enabled: root={} write={} shell={} fetch={:?}",
+        toolbox
+            .root()
+            .map_or_else(|| "none".to_owned(), |root| root.display().to_string()),
+        toolbox.permissions().write,
+        toolbox.permissions().shell,
+        toolbox.permissions().fetch_domains
+    );
+    Ok(Some(Arc::new(tool_loop::Tools {
+        toolbox,
+        bounds: tool_loop::Bounds {
+            max_iterations: args.max_iterations,
+            budget: args.budget,
+            call_timeout: args.call_timeout,
+        },
+    })))
 }
 
 async fn shutdown() {
