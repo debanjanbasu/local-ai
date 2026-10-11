@@ -25,7 +25,11 @@
 //!   what live subscribers were shown. Their streams then close without an
 //!   end, since its sequence numbers are not known; once the writer is gone a
 //!   reader numbers the end after the lines actually on disk, so every
-//!   sequence number a client has seen keeps naming the same event.
+//!   sequence number a client has seen keeps naming the same event;
+//! - a job resumed after a crash keeps its journal, cut to its last whole
+//!   event, and continues it with a restart boundary that finishes the items
+//!   the lost generation left open, before the regenerated output (see
+//!   [`super::background::Background::resume`]). Nothing on disk is rewritten.
 //!
 //! Each batch of events is written with one `write` and flushed with
 //! `fsync` before any subscriber is told it exists, so a frame a client has

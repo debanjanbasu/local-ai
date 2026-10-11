@@ -592,7 +592,8 @@ fn a_store_failure_never_advertises_completion_and_recovery_ends_the_stream() {
     assert_eq!(status(&store, &id), "queued");
     drained(&background);
     let restarted = scratch.open();
-    assert_eq!(status(&restarted, &id), "failed");
+    assert_eq!(status(&restarted, &id), "queued", "left for resumption");
+    // A server that does not resume it fails it when it is streamed.
     let replay = collect(open(&Background::default(), &restarted, &id, None));
     assert_eq!(
         kinds(&replay),
