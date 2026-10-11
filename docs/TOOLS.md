@@ -58,6 +58,14 @@ cancellation) runs nothing. Cancelling the Response (disconnect,
 `POST /v1/responses/{id}/cancel`, shutdown) stops the running tool.
 
 Hosted tools are only for the Responses API; Chat Completions is unchanged.
+A background Response that declares hosted tools runs the same loop, but if a
+crash or restart interrupts it, it is marked `failed` rather than regenerated:
+regenerating could run a shell command or file write a second time.
+
+A plain (non-strict) `function` tool's schema is not enforced: a call whose
+arguments miss it (for example, without a required property) is returned to
+the client as generated, for the client to reject in its
+`function_call_output`, rather than failing the Response.
 
 ## Permission model and its limits
 

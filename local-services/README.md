@@ -1,10 +1,14 @@
 # local-services
 
 Durable native services shared by the `local-ai` server and native Rust
-callers: Conversations, Files and Uploads, Batches, Vector Stores (lexical),
-and a read-only repository Workspace. Nothing here loads or needs a model, and nothing reaches the
-network. Batches only queue and record lines; the server's worker generates
-them on the one loaded model.
+callers: Conversations, Files and Uploads, Batches, Evals, Vector Stores
+(lexical), conversation compaction planning, sandboxed hosted tool executors
+(`tools`: workspace files, shell, allowlisted web fetch; see
+[docs/TOOLS.md](../docs/TOOLS.md)) and a read-only repository Workspace.
+Nothing here loads or needs a model. Only the web fetch tool reaches the
+network, and only for domains the server was started with. Batches only queue
+and record lines, and an eval's model calls are batch lines; the server's
+worker generates them on the one loaded model.
 
 There is one fixed implementation per job, not a set of optional backends:
 
@@ -321,7 +325,8 @@ The following are not part of this crate:
   notified).
 - Embeddings or semantic (vector) search; vector stores are lexical.
 - Physical purge of deleted conversations.
-- Compaction.
+- Compaction's summary generation: `compaction` decides when to compact and
+  what is kept verbatim; the server runs the model and seals the item.
 - Model training.
 - Coding-quality benchmarks.
 - Any change to the model.

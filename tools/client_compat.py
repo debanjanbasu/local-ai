@@ -19,7 +19,8 @@ each run bounded:
     tools/client_compat.py --no-reasoning-key --scenarios omp-fix-xhigh
 
 `codex-*` scenarios use a function-tools-only Codex configuration (no web
-search, sub-agents, goals, apps, skills or permissions developer text);
+search, sub-agents, goals, apps or plugins; Codex's default developer
+messages are kept);
 `codex-default-config` keeps Codex's defaults to show what they still need.
 
 Scenario kinds:
@@ -388,13 +389,6 @@ def client_env(home: Path, **extra: str) -> dict[str, str]:
 
 OMP_TOOLS = "read,bash,edit,write,grep,glob"
 CODEX_COMPAT_FEATURES = ["multi_agent", "goals", "view_image", "skill_search", "apps", "plugins"]
-CODEX_COMPAT_INSTRUCTIONS = [
-    "include_permissions_instructions",
-    "include_apps_instructions",
-    "include_collaboration_mode_instructions",
-]
-
-
 def codex_config(proxy_port: int, effort: str, compat: bool) -> str:
     """config.toml for a scratch CODEX_HOME. `compat` keeps only function tools."""
     lines = [
@@ -415,14 +409,13 @@ def codex_config(proxy_port: int, effort: str, compat: bool) -> str:
     ]
     if compat:
         lines.append('web_search = "disabled"')
-        # Codex otherwise sends permissions/apps/skills text as extra developer
-        # messages after its base instructions; the checkpoint template has a
-        # single leading instruction turn (see http-multiple-developer-messages).
-        lines.extend(f"{name} = false" for name in CODEX_COMPAT_INSTRUCTIONS)
+        # Codex's default developer text (base instructions, then permissions
+        # and skills as further developer messages) is kept: the server joins
+        # consecutive leading instruction messages (see
+        # http-multiple-developer-messages).
         lines.append("")
         lines.append("[features]")
         lines.extend(f"{name} = false" for name in CODEX_COMPAT_FEATURES)
-        lines += ["", "[skills]", "include_instructions = false"]
     lines += tail
     lines += [
         "",
