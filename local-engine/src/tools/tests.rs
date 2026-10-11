@@ -238,11 +238,19 @@ fn tool(parameters: Value) -> ToolDefinition {
     }
 }
 
+/// Parse one call to non-strict `definition`, which returns its arguments as
+/// generated, then hold them to its schema as a strict tool or the client
+/// would.
 fn single_call(definition: ToolDefinition, parameters: &str) -> Result<Value, String> {
     let block = format!("<tool_call>\n<function=f>\n{parameters}</function>\n</tool_call>");
+    let set = ToolSet::new(std::slice::from_ref(&definition)).expect("tools");
     match parse(&[definition], &[&block]) {
         (events, None) => match events.as_slice() {
-            [Event::ToolCall(call)] => Ok(call.arguments.clone()),
+            [Event::ToolCall(call)] => {
+                let tool = set.get("f").expect("declared");
+                super::validate_arguments(tool, &call.arguments)?;
+                Ok(call.arguments.clone())
+            }
             other => panic!("unexpected events {other:?}"),
         },
         (_, Some(failure)) => Err(failure),
@@ -276,18 +284,6 @@ fn enforces_pattern_unique_items_and_dependent_required() {
             "{parameters:?} was accepted"
         );
     }
-    // Replayed history is held to the same schema.
-    let set = tools(&[definition]);
-    let calls = [call("a", "f", json!({"code":"abc"}))];
-    let turns = [
-        turn("user", "go"),
-        Turn {
-            tool_calls: &calls,
-            ..turn("assistant", "")
-        },
-        result("a", "x"),
-    ];
-    assert!(render(&turns, true, &set).is_err());
 }
 
 #[test]
@@ -325,7 +321,6 @@ fn rejects_unpaired_duplicate_and_invalid_tool_history() {
         call("a", "get_weather", json!({"city":"Rome"})),
     ];
     let unknown = [call("a", "search", json!({}))];
-    let bad_arguments = [call("a", "get_weather", json!({"days":2}))];
     let not_object = [call("a", "get_weather", json!("city"))];
     let assistant = |calls| Turn {
         tool_calls: calls,
@@ -358,10 +353,6 @@ fn rejects_unpaired_duplicate_and_invalid_tool_history() {
         (
             "unknown tool",
             vec![user, assistant(&unknown), result("a", "x")],
-        ),
-        (
-            "bad arguments",
-            vec![user, assistant(&bad_arguments), result("a", "x")],
         ),
         (
             "non-object arguments",
@@ -498,8 +489,6 @@ fn parsed_calls_render_back_to_the_generated_text() {
 fn malformed_invalid_and_truncated_calls_never_become_events() {
     let cases = [
         "<tool_call>\n<function=unknown>\n</function>\n</tool_call>",
-        "<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
-        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\nthree\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</tool_call>",
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
@@ -573,4 +562,52 @@ fn consecutive_leading_instructions_share_the_system_slot_in_order() {
     ] {
         assert!(render(&turns, true, &none).is_err());
     }
+}
+
+fn strict_weather() -> ToolDefinition {
+    ToolDefinition {
+        parameters: json!({"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city","days"],"additionalProperties":false}),
+        strict: true,
+        ..weather()
+    }
+}
+
+#[test]
+fn a_non_strict_call_that_misses_its_schema_is_returned_as_generated() {
+    for (block, arguments) in [
+        (
+            "<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+            json!({"days":3}),
+        ),
+        (
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\nthree\n</parameter>\n</function>\n</tool_call>",
+            json!({"city":"Paris","days":"three"}),
+        ),
+    ] {
+        let (events, failure) = parse(&[weather()], &[block]);
+        assert_eq!(failure, None, "{block:?}");
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, arguments);
+    }
+    // The client reports the error back by replaying the call with its result.
+    let replayed = [call("a", "get_weather", json!({"days":2}))];
+    let turns = [
+        turn("user", "go"),
+        Turn {
+            tool_calls: &replayed,
+            ..turn("assistant", "")
+        },
+        result("a", "error: city is required"),
+    ];
+    render(&turns, true, &tools(&[weather()])).expect("non-strict replay");
+    // A strict tool's schema is the contract: a violating replay is refused.
+    assert!(render(&turns, true, &tools(&[strict_weather()])).is_err());
 }

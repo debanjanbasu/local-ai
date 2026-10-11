@@ -459,7 +459,8 @@ fn auto_free_text_never_contains_the_trigger_outside_a_call() {
         .expect("non-strict call body");
         assert!(allows(&mut text, EOS));
     }
-    // A non-strict body is framed but its arguments are checked afterwards.
+    // A non-strict body is framed, and its arguments are the client's to
+    // check: one that misses the schema is still returned as generated.
     let tokenizer = special_tags();
     let tools = [weather(false)];
     let mut grammar = constrained(&tools, &ToolChoice::Required, false);
@@ -469,7 +470,8 @@ fn auto_free_text_never_contains_the_trigger_outside_a_call() {
     );
     feed(&mut grammar, &ids).expect("framed call");
     let text = tokenizer.decode(&ids, false).expect("decode");
-    assert!(parse(&tools, &text).is_err());
+    let (calls, _) = parse(&tools, &text).expect("returned as generated");
+    assert_eq!(calls[0].arguments, serde_json::json!({"town":"Paris"}));
     // But it must still name a configured tool and close `</function>`.
     let mut grammar = constrained(&tools, &ToolChoice::Required, false);
     feed(&mut grammar, &[OPEN]).expect("open");

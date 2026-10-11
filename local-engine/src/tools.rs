@@ -78,8 +78,10 @@ pub struct ToolDefinition {
     /// `enum`/`const`/`pattern`/`minLength`/`maxLength`, or any JSON value
     /// whose schema the grammar engine supports. Anything else fails the
     /// request before generation with the reason, rather than being enforced
-    /// partially. Not shown to the model. Defaults to `false`: arguments are
-    /// only validated once the call is complete.
+    /// partially. Not shown to the model. Defaults to `false`: the schema
+    /// guides the model but is not enforced, and a call is returned with its
+    /// arguments as generated for the client to validate (a malformed call
+    /// layout or an unknown tool still fails).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strict: bool,
 }
@@ -357,7 +359,7 @@ fn is_instruction(role: &str) -> bool {
 ///
 /// Every assistant call must be answered by exactly one `tool` message before
 /// the next non-tool message, IDs are unique across the conversation, and a
-/// call to a configured tool must satisfy its schema.
+/// call to a configured strict tool must satisfy its schema.
 fn validate_history(turns: &[Turn<'_>], tools: &ToolSet) -> crate::Result<()> {
     let mut seen = HashSet::new();
     let mut pending: Vec<&str> = Vec::new();
@@ -399,12 +401,17 @@ fn validate_history(turns: &[Turn<'_>], tools: &ToolSet) -> crate::Result<()> {
                                 call.id, call.name
                             ));
                         };
-                        validate_arguments(tool, &call.arguments).map_err(|error| {
-                            crate::Error::InvalidArgument(format!(
-                                "tool call {:?}: {error}",
-                                call.id
-                            ))
-                        })?;
+                        // A non-strict call is replayed as it was generated,
+                        // even when it missed the schema and its result is
+                        // the client's error report.
+                        if tool.strict.is_some() {
+                            validate_arguments(tool, &call.arguments).map_err(|error| {
+                                crate::Error::InvalidArgument(format!(
+                                    "tool call {:?}: {error}",
+                                    call.id
+                                ))
+                            })?;
+                        }
                     }
                     pending.push(&call.id);
                 }
@@ -961,7 +968,15 @@ fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
     // Preserve canonical argument strings for every adapter even when a
     // dependency enables serde_json's preserve_order feature.
     arguments.sort_all_objects();
-    validate_arguments(tool, &arguments).map_err(|error| format!("{name}: {error}"))?;
+    // A non-strict tool's schema guides the model but binds nobody: the call
+    // goes to the client as generated, and the client validates it and
+    // reports any error back as the call's result. Failing the whole
+    // response instead leaves a client nothing to correct (Oh My Pi retried
+    // the identical request until it gave up). Only a strict tool promises
+    // arguments that satisfy its schema.
+    if tool.strict.is_some() {
+        validate_arguments(tool, &arguments).map_err(|error| format!("{name}: {error}"))?;
+    }
     Ok(ToolCall {
         id: next_call_id(),
         name: name.to_owned(),
