@@ -22,11 +22,14 @@
 //! so its writer holds a [`ResponseLease`]: an exclusive advisory lock on an
 //! owner-only `.{id}.lock` sidecar, taken before the first save and released
 //! after the terminal one. Sidecars are never unlinked, so every process
-//! always locks the same inode. When a store opens, a background record still
-//! `queued` or `in_progress` whose lease is free has lost its writer to a
-//! crash or restart; it is marked `failed` rather than resumed. A record whose
-//! lease is held belongs to a live server sharing the directory and is left
-//! alone.
+//! always locks the same inode. A background record still `queued` or
+//! `in_progress` whose lease is free has lost its writer to a crash or
+//! restart. While it is pending, a durable background record also keeps the
+//! request it was created from (`request`), and a server resumes it from that
+//! (see [`super::background::Background::resume`]); one without it (written
+//! by an older server, or continuing a conversation) is marked `failed` when
+//! a store opens. A record whose lease is held belongs to a live server
+//! sharing the directory and is left alone.
 //!
 //! A background Response created with `stream: true` also has an owner-only
 //! `.{id}.events` journal of the events it published (see [`super::journal`]).
@@ -57,9 +60,13 @@ const LOCK_SUFFIX: &str = ".lock";
 /// Suffix of a streamed response's event journal, `.{id}.events`.
 const JOURNAL_SUFFIX: &str = ".events";
 
-/// The error a recovered background Response reports.
-const INTERRUPTED_MESSAGE: &str = "the server stopped before this background response finished; \
-     interrupted execution is not resumed";
+/// The error a background Response that could not be resumed reports,
+/// before why.
+const INTERRUPTED_MESSAGE: &str =
+    "the server stopped before this background response finished, and it could not be resumed";
+
+/// Why a record without its request cannot be resumed.
+pub(super) const NO_REQUEST: &str = "its record keeps no request to regenerate it from";
 
 #[derive(Debug)]
 pub(super) struct ResponseStore {
@@ -80,6 +87,9 @@ pub(super) struct ResponseLease {
 pub(super) struct StoredResponse {
     pub(super) response: Value,
     pub(super) input_items: Vec<Value>,
+    /// The request body a pending durable background Response is regenerated
+    /// from after a restart; `None` once it has ended, and for every other.
+    pub(super) request: Option<Value>,
 }
 
 impl StoredResponse {
@@ -165,9 +175,11 @@ impl ResponseStore {
         }
     }
 
-    /// Mark every background response left `queued` or `in_progress` by a
-    /// writer that no longer holds its lease as `failed`, and remove journals
-    /// whose record is gone and whose lease is free.
+    /// Settle every background response left `queued` or `in_progress` by a
+    /// writer that no longer holds its lease and that cannot be resumed (its
+    /// record keeps no request), and remove journals whose record is gone and
+    /// whose lease is free. A resumable one is left pending for a server to
+    /// resume.
     ///
     /// Records that cannot be read are skipped: they are not this pass's to
     /// judge, and `load` reports them to whoever asks for them.
@@ -187,30 +199,74 @@ impl ResponseStore {
             let Some(id) = name.strip_suffix(".json") else {
                 continue;
             };
-            if valid_id(id) && matches!(self.load(id), Ok(Some(stored)) if interrupted(&stored)) {
+            if valid_id(id)
+                && matches!(self.load(id), Ok(Some(stored)) if interrupted(&stored) && stored.request.is_none())
+            {
                 self.recover(id)?;
             }
         }
         Ok(())
     }
 
-    /// Settle response `id` if its writer is gone: `Ok(false)` when another
-    /// writer holds its lease, so it is still being generated.
-    ///
-    /// A pending record whose journal already ends the stream adopts that end,
-    /// because it was published; otherwise it becomes `failed`, and the events
-    /// saying so are appended to its journal after the record is written.
+    /// The IDs of every background response still `queued` or `in_progress`
+    /// whose record keeps the request to resume it from, oldest first. Their
+    /// leases are not checked: whoever resumes one takes it.
+    pub(super) fn resumable(&self) -> std::io::Result<Vec<String>> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let name = entry?.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            if valid_id(id)
+                && let Ok(Some(stored)) = self.load(id)
+                && interrupted(&stored)
+                && stored.request.is_some()
+            {
+                let created = stored.response.get("created_at").and_then(Value::as_u64);
+                found.push((created.unwrap_or_default(), id.to_owned()));
+            }
+        }
+        found.sort();
+        Ok(found.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// Settle response `id` as not resumed if its writer is gone: `Ok(false)`
+    /// when another writer holds its lease, so it is still being generated.
     pub(super) fn recover(&self, id: &str) -> std::io::Result<bool> {
-        let Some(_lease) = self.lease(id)? else {
+        let Some(lease) = self.lease(id)? else {
             return Ok(false);
         };
+        let resumable = matches!(self.load(id), Ok(Some(stored)) if stored.request.is_some());
+        let reason = if resumable {
+            "it was not resumed"
+        } else {
+            NO_REQUEST
+        };
+        self.settle_interrupted(&lease, id, reason)?;
+        Ok(true)
+    }
+
+    /// Settle response `id`, whose writer is gone, under `_lease`, which the
+    /// caller holds: nothing when it is no longer pending.
+    ///
+    /// A pending record whose journal already ends the stream adopts that end,
+    /// because it was published; otherwise it becomes `failed` because of
+    /// `reason`, and the events saying so are appended to its journal after
+    /// the record is written.
+    pub(super) fn settle_interrupted(
+        &self,
+        _lease: &ResponseLease,
+        id: &str,
+        reason: &str,
+    ) -> std::io::Result<()> {
         // Re-read under the lease: the writer may have finished between the
         // caller's read and taking the lock.
         let Ok(Some(mut stored)) = self.load(id) else {
-            return Ok(true);
+            return Ok(());
         };
         if !interrupted(&stored) {
-            return Ok(true);
+            return Ok(());
         }
         let mut journal = self.open_journal(id).unwrap_or_else(|error| {
             eprintln!("response {id}: event journal unreadable: {error}");
@@ -236,7 +292,7 @@ impl ResponseStore {
             response.insert("completed_at".into(), Value::Null);
             response.insert(
                 "error".into(),
-                json!({"code":"server_error","message":INTERRUPTED_MESSAGE}),
+                json!({"code":"server_error","message":format!("{INTERRUPTED_MESSAGE}: {reason}")}),
             );
         }
         self.save(&stored.response, &stored.input_items)?;
@@ -250,7 +306,7 @@ impl ResponseStore {
                 eprintln!("response {id}: event journal not reconciled: {error}");
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Append the events that end `response` to its journal, unless it has
@@ -265,6 +321,18 @@ impl ResponseStore {
         self.extend_journal(id, &reader, terminal_events(response))
     }
 
+    /// Continue the journal of response `id` after the last whole event
+    /// `reader` has read, cutting off anything after it. The caller holds the
+    /// lease.
+    pub(super) fn reopen_journal(
+        &self,
+        id: &str,
+        reader: &JournalReader,
+    ) -> std::io::Result<JournalWriter> {
+        let path = self.journal_path(id).ok_or_else(|| invalid_id(id))?;
+        JournalWriter::resume(&path, reader)
+    }
+
     /// Cut the journal `reader` has read to its last whole event and append
     /// `events` after it.
     fn extend_journal(
@@ -273,8 +341,7 @@ impl ResponseStore {
         reader: &JournalReader,
         events: Vec<Value>,
     ) -> std::io::Result<()> {
-        let path = self.journal_path(id).ok_or_else(|| invalid_id(id))?;
-        let mut writer = JournalWriter::resume(&path, reader)?;
+        let mut writer = self.reopen_journal(id, reader)?;
         writer.append(events)?;
         writer.sync()
     }
@@ -335,14 +402,28 @@ impl ResponseStore {
 
     /// Persist `response` and its resolved input, durably, before returning.
     pub(super) fn save(&self, response: &Value, input_items: &[Value]) -> std::io::Result<()> {
+        self.save_with(response, input_items, None)
+    }
+
+    /// [`Self::save`], keeping `request` in the record as well: the body a
+    /// pending background Response is regenerated from after a restart.
+    pub(super) fn save_with(
+        &self,
+        response: &Value,
+        input_items: &[Value],
+        request: Option<&Value>,
+    ) -> std::io::Result<()> {
         let id = response.get("id").and_then(Value::as_str).unwrap_or("");
         let path = self.path(id).ok_or_else(|| invalid_id(id))?;
-        let record = json!({
+        let mut record = json!({
             "object":"local_ai.stored_response",
             "version":RECORD_VERSION,
             "response":response,
             "input_items":input_items,
         });
+        if let Some(request) = request {
+            record["request"] = request.clone();
+        }
         let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         let temporary = self
             .dir
@@ -376,6 +457,7 @@ impl ResponseStore {
         let version = record.get("version").and_then(Value::as_u64);
         let response = record.get_mut("response").map(Value::take);
         let input_items = record.get_mut("input_items").map(Value::take);
+        let request = record.get_mut("request").map(Value::take);
         match (version, response, input_items) {
             (Some(RECORD_VERSION), Some(response), Some(Value::Array(input_items)))
                 if response.get("id").and_then(Value::as_str) == Some(id) =>
@@ -383,6 +465,7 @@ impl ResponseStore {
                 Ok(Some(StoredResponse {
                     response,
                     input_items,
+                    request,
                 }))
             }
             _ => Err(std::io::Error::new(

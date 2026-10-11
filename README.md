@@ -41,8 +41,11 @@ streams journaled events that
 sequence number. A disconnected or stalled stream does not cancel the job;
 `POST /v1/responses/{id}/cancel` does. With `store: true` (the default once a
 store exists) the job lives in `--response-store`, and its record and event
-journal survive a restart, though an interrupted job is marked `failed`, never
-resumed. With `store: false` (the only choice without a store) it is kept
+journal survive a restart. A job interrupted by a crash or `kill -9` is
+resumed when a server next opens the store: generation restarts from the
+stored request, and a streamed job's journal continues after a restart
+boundary that finishes the items the lost generation left open (as
+`incomplete`). With `store: false` (the only choice without a store) it is kept
 temporarily in a private owner-only directory under the system temporary
 directory: retrievable, cancellable and resumable until 10 minutes after it
 ends, reported as `store: false`, never continued by `previous_response_id`,
@@ -76,8 +79,7 @@ Conversations and their items, Responses `conversation` (appended once, and
 refused on a version conflict), streamed Files and Uploads (with optional
 MD5), and Batches for the three text endpoints. Batches run on one worker that
 resumes unsettled lines after a restart. File expiry is enforced on access, and
-expired bytes are purged at startup. A background Response interrupted by a
-restart is still not resumed. The same crate offers native repository search
+expired bytes are purged at startup. The same crate offers native repository search
 (ranked, exact or regex) with no HTTP route. See
 [local-services/README.md](local-services/README.md) and
 [docs/BONSAI.md](docs/BONSAI.md#native-services).

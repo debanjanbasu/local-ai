@@ -354,11 +354,24 @@ background response this server is running deletes the record and cancels the
 work, and the worker never writes it back. Each job holds an advisory lease on
 an owner-only `.{id}.lock` sidecar in the store; cancel or delete of a
 response still pending under another live server's lease is refused with 409.
-At startup, a pending background record whose lease is free lost its writer to
-a crash or restart and is marked `failed`; interrupted work is never resumed.
+A pending background record whose lease is free lost its writer to a crash or
+`kill -9`. While pending, a durable record keeps the request it was created
+from, and the server resumes it at startup (before serving), when a client
+retrieves it after another server sharing the store died, and, for jobs a full
+engine queue deferred, whenever a queue slot is released. Generation state is
+not checkpointed, so the job restarts from its original request with its
+original ID; a streamed job first continues its journal with a restart
+boundary that finishes every output item the lost generation opened (as
+`incomplete`, with the text it had), and the regenerated items follow at the
+next output index, so no journaled event is repeated or contradicted and the
+final Response holds every item its stream announced. Only one server can
+resume a job (the lease), a cancel or delete before the restart wins, and a
+job continuing a conversation, or one without its stored request, is marked
+`failed` instead.
 Graceful shutdown refuses new background requests (503), marks every
 unfinished job `failed`, cancels it and waits for the workers to release the
-engine before exiting. A job has no client to stall, so `--stall-timeout`
+engine before exiting; a resumption still waiting for a queue slot stays
+pending for the next server. A job has no client to stall, so `--stall-timeout`
 does not apply to it. Stored records still contain the raw reasoning in plain
 text; there is no encryption at rest.
 
@@ -489,7 +502,7 @@ responses with cancellation and journal-based stream resumption, temporary
 JSON-object/JSON-schema output, tool calls constrained during decoding, and
 durable conversations, files, uploads and text-endpoint batches
 ([native services](#native-services)) are now implemented as described;
-compaction, resuming a background Response interrupted by a restart and
+compaction and
 vector stores still need server implementations; OpenAI-compatible Decisions needs
 a judgment head with evaluated confidence and refusal semantics; media,
 embedding, audio and moderation capabilities need suitable models or heads. Hosted tools,
@@ -713,8 +726,9 @@ preparation and generation blocking tasks, never on runtime workers.
   free leases and resumes their unsettled lines. A line interrupted before
   settling is generated again. Result files have stable `batch_output` IDs.
 
-These services do not resume background Responses after a crash or restart.
-Batch resumption is a separate mechanism. They also provide no compaction,
+Resuming background Responses after a crash is the server's job (see
+[Server API](#server-api)), not these services'; batch
+resumption is a separate mechanism. They also provide no compaction,
 training or change to the model.
 
 ### Experimental decisions

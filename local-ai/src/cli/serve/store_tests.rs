@@ -774,7 +774,7 @@ fn a_held_lease_excludes_other_stores_and_protects_an_active_job() {
 }
 
 #[test]
-fn an_abandoned_background_job_is_failed_on_open_but_not_resumed() {
+fn an_abandoned_background_job_without_its_request_is_failed_on_open() {
     let scratch = Scratch::new();
     let store = scratch.open();
     for (id, status) in [("resp_queued", "queued"), ("resp_running", "in_progress")] {
@@ -789,8 +789,8 @@ fn an_abandoned_background_job_is_failed_on_open_but_not_resumed() {
         expected["status"] = json!("failed");
         expected["error"] = json!({
             "code":"server_error",
-            "message":"the server stopped before this background response finished; \
-                interrupted execution is not resumed",
+            "message":"the server stopped before this background response finished, and it \
+                could not be resumed: its record keeps no request to regenerate it from",
         });
         assert_eq!(stored.response, expected, "{status}");
         assert_eq!(stored.input_items, input());

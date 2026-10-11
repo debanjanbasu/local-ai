@@ -71,7 +71,7 @@ use super::request::{
     service_tier, session, tool_call, tool_policy,
 };
 use super::response::{Reply, arguments_text, new_id, unix_now};
-use super::store::ResponseStore;
+use super::store::{ResponseStore, StoredResponse};
 use crate::GenerateParams;
 
 #[derive(Deserialize)]
@@ -241,6 +241,12 @@ struct Persist {
     /// A `background` `store: false` Response: `store` is this server's
     /// private temporary store, which expires it after it ends.
     temporary: Option<Arc<Temporary>>,
+    /// The request body of a durable background Response, kept in its record
+    /// while it is pending so a restarted server can regenerate it (see
+    /// [`super::background::Background::resume`]). `None` for everything
+    /// else, including one continuing a conversation, which is never
+    /// regenerated because its append cannot be repeated with new output.
+    request: Option<Value>,
 }
 
 pub(super) struct PreparedResponses {
@@ -619,7 +625,12 @@ pub(super) fn prepare_responses_conversing(
     let conversation = snapshot
         .map(|(conversations, id, version)| conversing(conversations, id, version, new_input))
         .transpose()?;
-    let persist = persist(&request, store, temporary, items);
+    let mut persist = persist(&request, store, temporary, items);
+    if let Some(persist) = persist.as_mut().filter(|persist| {
+        request.background == Some(true) && persist.temporary.is_none() && conversation.is_none()
+    }) {
+        persist.request = serde_json::from_slice(body).ok();
+    }
     let params = request.params();
     let echo = Echo {
         instructions: request.instructions.clone(),
@@ -660,6 +671,89 @@ pub(super) fn prepare_responses_conversing(
     })
 }
 
+/// Rebuild the generation of the pending background Response `stored` from
+/// the request body its record keeps, for a server resuming it after a
+/// restart.
+///
+/// The same request is prepared again, except that its input is the
+/// resolved input already in the record (so a `previous_response_id` deleted
+/// since is not read again) and its effort is the one the Response reports,
+/// whatever this server's default (`thinking`), which must still allow it.
+/// The Response keeps its ID, creation time
+/// and model; the record keeps `request`, so a later restart can do the same.
+/// Blocks on nothing but decryption.
+pub(super) fn prepare_resumed(
+    stored: &StoredResponse,
+    request: &Value,
+    thinking: bool,
+    store: &Arc<ResponseStore>,
+    cipher: Option<&Arc<ReasoningCipher>>,
+) -> crate::Result<(ChatRequest, Reply)> {
+    let response = &stored.response;
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("the stored response names no model"))?;
+    let mut body = request.clone();
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| invalid("the stored request is not an object"))?;
+    if object
+        .get("conversation")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(unsupported(
+            "resuming",
+            "a response continuing a conversation is not regenerated",
+        ));
+    }
+    object.remove("previous_response_id");
+    object.insert("input".into(), Value::Array(stored.input_items.clone()));
+    let effort = response
+        .pointer("/reasoning/effort")
+        .cloned()
+        .unwrap_or(Value::Null);
+    match object.get_mut("reasoning").and_then(Value::as_object_mut) {
+        Some(reasoning) => {
+            reasoning.insert("effort".into(), effort);
+        }
+        None => {
+            object.insert("reasoning".into(), json!({"effort":effort}));
+        }
+    }
+    let bytes = serde_json::to_vec(&body).map_err(|error| invalid(error.to_string()))?;
+    let mut prepared =
+        prepare_responses_conversing(&bytes, thinking, Some(store), None, None, cipher, model)?;
+    prepared.echo.previous_response_id = response
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match prepared.echo.persist.as_mut() {
+        Some(persist) if prepared.echo.background && persist.temporary.is_none() => {
+            persist.request = Some(request.clone());
+        }
+        _ => {
+            return Err(invalid(
+                "the stored request is not a stored background request",
+            ));
+        }
+    }
+    let reply = Reply {
+        protocol: super::response::Protocol::Responses(Arc::new(prepared.echo)),
+        id: response
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        created: response
+            .get("created_at")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        model: model.into(),
+    };
+    Ok((prepared.request, reply))
+}
+
 /// Where the Response to `request` is to be kept, with its resolved input
 /// `items`, if anywhere.
 ///
@@ -677,6 +771,7 @@ fn persist(
             store: Arc::clone(temporary.store()),
             input_items: items,
             temporary: Some(Arc::clone(temporary)),
+            request: None,
         }),
         None => store
             .filter(|_| request.store.unwrap_or(true))
@@ -684,6 +779,7 @@ fn persist(
                 store: Arc::clone(store),
                 input_items: items,
                 temporary: None,
+                request: None,
             }),
     }
 }
@@ -1194,6 +1290,17 @@ enum ItemKind {
     Message,
 }
 
+/// An output item a journal opened and a lost generation never finished,
+/// with what the journal says of it (see [`ResponsesState::resume_from`]).
+#[derive(Default)]
+struct Unfinished {
+    item: Value,
+    text: String,
+    part_added: bool,
+    text_done: bool,
+    part_done: bool,
+}
+
 /// The output item text is currently being written into.
 struct Open {
     kind: ItemKind,
@@ -1283,6 +1390,154 @@ impl ResponsesState {
     pub(super) fn started(&mut self) {
         let response = self.snapshot("in_progress");
         self.emit("response.in_progress", json!({"response":response}));
+    }
+
+    /// Take over the stream `journaled` began before a restart lost its
+    /// generation: the restart boundary of a resumed background Response.
+    ///
+    /// Items the journal finished are kept as they were. Each one it left
+    /// open is finished here with exactly the events it lacks: `incomplete`,
+    /// with the text it had, or `completed` when its text had already been
+    /// finished. The regenerated output then continues after them, at the
+    /// next output index, so no index or item ID is reused and every event a
+    /// client has seen stays true. Returns whether the journal had announced
+    /// `response.in_progress`.
+    pub(super) fn resume_from(&mut self, journaled: &[Value]) -> bool {
+        let mut started = false;
+        let mut open = std::collections::BTreeMap::<usize, Unfinished>::new();
+        for event in journaled {
+            let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "response.in_progress" {
+                started = true;
+            }
+            let Some(index) = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+            else {
+                continue;
+            };
+            if kind == "response.output_item.added" {
+                if self.output.len() <= index {
+                    self.output.resize(index + 1, Value::Null);
+                }
+                let Some(item) = event.get("item").filter(|item| item.is_object()).cloned() else {
+                    continue;
+                };
+                open.insert(
+                    index,
+                    Unfinished {
+                        item,
+                        ..Unfinished::default()
+                    },
+                );
+                continue;
+            }
+            if kind == "response.output_item.done" {
+                if let Some(slot) = self.output.get_mut(index) {
+                    *slot = event.get("item").cloned().unwrap_or(Value::Null);
+                }
+                open.remove(&index);
+                continue;
+            }
+            let Some(unfinished) = open.get_mut(&index) else {
+                continue;
+            };
+            match kind {
+                "response.content_part.added" => unfinished.part_added = true,
+                "response.reasoning_text.delta"
+                | "response.output_text.delta"
+                | "response.function_call_arguments.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        unfinished.text.push_str(delta);
+                    }
+                }
+                "response.reasoning_text.done"
+                | "response.output_text.done"
+                | "response.function_call_arguments.done" => unfinished.text_done = true,
+                "response.content_part.done" => unfinished.part_done = true,
+                _ => {}
+            }
+        }
+        for (index, unfinished) in open {
+            self.finish_interrupted(index, unfinished);
+        }
+        started
+    }
+
+    /// Finish the item at `index` that a lost generation left `unfinished`,
+    /// emitting only the events its journal lacks.
+    fn finish_interrupted(&mut self, index: usize, unfinished: Unfinished) {
+        let mut item = unfinished.item;
+        let id = item.get("id").cloned().unwrap_or(Value::Null);
+        let status = if unfinished.text_done {
+            "completed"
+        } else {
+            "incomplete"
+        };
+        let text = unfinished.text;
+        let (part, done) = match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => (
+                Some(json!({"type":"reasoning_text","text":text})),
+                "response.reasoning_text.done",
+            ),
+            Some("message") => (
+                Some(json!({"type":"output_text","text":text,"annotations":[],"logprobs":[]})),
+                "response.output_text.done",
+            ),
+            Some("function_call") => (None, "response.function_call_arguments.done"),
+            _ => (None, ""),
+        };
+        if let Some(part) = &part {
+            if !unfinished.part_added {
+                let mut empty = part.clone();
+                empty["text"] = json!("");
+                self.emit(
+                    "response.content_part.added",
+                    json!({"item_id":id,"output_index":index,"content_index":0,"part":empty}),
+                );
+            }
+            if !unfinished.text_done {
+                let mut fields =
+                    json!({"item_id":id,"output_index":index,"content_index":0,"text":text});
+                if done == "response.output_text.done" {
+                    fields["logprobs"] = json!([]);
+                }
+                self.emit(done, fields);
+            }
+            if !unfinished.part_done {
+                self.emit(
+                    "response.content_part.done",
+                    json!({"item_id":id,"output_index":index,"content_index":0,"part":part}),
+                );
+            }
+            item["content"] = json!([part]);
+        } else if done == "response.function_call_arguments.done" {
+            if !unfinished.text_done {
+                self.emit(
+                    done,
+                    json!({"item_id":id,"output_index":index,"arguments":text}),
+                );
+            }
+            item["arguments"] = json!(text);
+        }
+        item["status"] = json!(status);
+        if part.is_some()
+            && item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && let (Some(cipher), Some(id)) = (&self.echo.cipher, id.as_str())
+        {
+            match cipher.seal(&self.model, id, &text) {
+                Ok(envelope) => item["encrypted_content"] = json!(envelope),
+                Err(error) => self.encryption_error = Some(error.to_string()),
+            }
+        }
+        self.emit(
+            "response.output_item.done",
+            json!({"output_index":index,"item":item}),
+        );
+        if let Some(slot) = self.output.get_mut(index) {
+            *slot = item;
+        }
     }
 
     /// Withdraw the events announcing the end that was just folded in —
@@ -1575,12 +1830,17 @@ impl ResponsesState {
         let persist = self.echo.persist.as_ref().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "response is not stored")
         })?;
-        let ended = matches!(
-            response.get("status").and_then(Value::as_str),
-            Some("completed" | "incomplete")
-        );
+        let status = response.get("status").and_then(Value::as_str);
+        let ended = matches!(status, Some("completed" | "incomplete"));
+        // A pending record keeps the request it can be regenerated from.
+        let request = persist
+            .request
+            .as_ref()
+            .filter(|_| matches!(status, Some("queued" | "in_progress")));
         let Some(conversing) = self.echo.conversation.as_ref().filter(|_| ended) else {
-            return persist.store.save(response, &persist.input_items);
+            return persist
+                .store
+                .save_with(response, &persist.input_items, request);
         };
         conversing.append(response).map_err(std::io::Error::other)?;
         persist
