@@ -726,8 +726,9 @@ preparation and generation blocking tasks, never on runtime workers.
   free leases and resumes their unsettled lines. A line interrupted before
   settling is generated again. Result files have stable `batch_output` IDs.
 
-These services do not resume background Responses after a crash or restart.
-Batch resumption is a separate mechanism. They also provide no compaction,
+Resuming background Responses after a crash is the server's job (see
+[Server API](#server-api)), not these services'; batch
+resumption is a separate mechanism. They also provide no compaction,
 training or change to the model.
 
 ### Experimental decisions

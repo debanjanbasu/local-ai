@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 
 use serde_json::{Value, json};
 
@@ -25,6 +25,15 @@ use super::resume::{Subscription, subscribe};
 use super::store::ResponseStore;
 
 const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Held for writing while a test spawns a process. A child holds a copy of
+/// every descriptor until it execs, so a lease another test drops meanwhile
+/// would still look held to the resumption that follows.
+static SPAWNING: RwLock<()> = RwLock::new(());
+
+fn no_spawns() -> RwLockReadGuard<'static, ()> {
+    SPAWNING.read().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn body(stream: bool) -> Value {
     json!({"input":"hi","instructions":"be brief","background":true,"stream":stream,"max_output_tokens":64})
@@ -235,6 +244,7 @@ fn assert_consistent(events: &[Value], record: &Value) {
 
 #[test]
 fn a_job_killed_while_queued_is_regenerated_from_its_request() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let id = crashed(&scratch.open(), true, Vec::new(), 0);
     // The restarted server's store leaves it pending, with its request.
@@ -300,6 +310,7 @@ fn a_job_killed_while_queued_is_regenerated_from_its_request() {
 
 #[test]
 fn a_job_killed_during_prefill_resumes_in_progress_without_a_second_announcement() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let id = crashed(&scratch.open(), true, vec![prefill()], 1);
     let store = scratch.open();
@@ -321,6 +332,7 @@ fn a_job_killed_during_prefill_resumes_in_progress_without_a_second_announcement
 
 #[test]
 fn a_job_killed_mid_generation_finishes_the_lost_items_at_the_restart_boundary() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let steps = vec![
         prefill(),
@@ -384,6 +396,7 @@ fn a_job_killed_mid_generation_finishes_the_lost_items_at_the_restart_boundary()
 
 #[test]
 fn a_job_killed_twice_keeps_one_consistent_stream_and_its_request() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let steps = vec![prefill(), event(Event::Content("one".into()))];
     let id = crashed(&scratch.open(), true, steps, 2);
@@ -433,6 +446,7 @@ fn a_job_killed_twice_keeps_one_consistent_stream_and_its_request() {
 #[cfg(unix)]
 #[test]
 fn a_terminal_write_that_never_landed_is_regenerated() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let store = scratch.open();
     let background = Arc::new(Background::default());
@@ -476,6 +490,7 @@ fn a_terminal_write_that_never_landed_is_regenerated() {
 
 #[test]
 fn a_job_killed_after_its_terminal_record_is_never_regenerated() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let store = scratch.open();
     let doc = streamed_doc(&body(true), &store, true);
@@ -508,6 +523,7 @@ fn a_job_killed_after_its_terminal_record_is_never_regenerated() {
 
 #[test]
 fn a_non_streamed_job_restarts_with_only_the_regenerated_output() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let steps = vec![prefill(), event(Event::Content("lost".into()))];
     let id = crashed(&scratch.open(), false, steps, 2);
@@ -529,6 +545,7 @@ fn a_non_streamed_job_restarts_with_only_the_regenerated_output() {
 
 #[test]
 fn a_held_lease_is_never_resumed_and_exactly_one_server_resumes_after_it() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let id = crashed(&scratch.open(), true, vec![prefill()], 1);
     let store = scratch.open();
@@ -572,6 +589,8 @@ fn another_process_holding_the_lease_is_never_resumed() {
     let id = crashed(&scratch.open(), true, vec![prefill()], 1);
     let store = scratch.open();
     let sidecar = scratch.0.join(format!(".{id}.lock"));
+    // `spawn` returns once the child has exec'd, dropping its copies.
+    let spawning = SPAWNING.write().unwrap_or_else(PoisonError::into_inner);
     let mut holder = Command::new("/usr/bin/lockf")
         .arg("-k")
         .arg(&sidecar)
@@ -580,6 +599,7 @@ fn another_process_holding_the_lease_is_never_resumed() {
         .stdout(Stdio::piped())
         .spawn()
         .expect("lockf runs");
+    drop(spawning);
     let mut line = String::new();
     BufReader::new(holder.stdout.take().expect("stdout"))
         .read_line(&mut line)
@@ -602,6 +622,7 @@ fn another_process_holding_the_lease_is_never_resumed() {
 
 #[test]
 fn a_torn_journal_is_cut_to_its_last_whole_event_and_continued() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let steps = vec![prefill(), event(Event::Content("Hi".into()))];
     let id = crashed(&scratch.open(), true, steps, 2);
@@ -638,6 +659,24 @@ fn a_torn_journal_is_cut_to_its_last_whole_event_and_continued() {
         ]
     );
 
+    // A whole but corrupt line ends the readable journal just as a torn one
+    // does: it and everything after it are cut, and the stream continues.
+    let steps = vec![prefill(), event(Event::Content("Hi".into()))];
+    let id = crashed(&store, true, steps, 2);
+    let store = scratch.open();
+    let path = store.journal_file(&id).expect("path");
+    let kept = journal(&store, &id);
+    let mut text = std::fs::read_to_string(&path).expect("journal");
+    text.push_str("not json\n{\"type\":\"response.output_text.delta\"}\n");
+    std::fs::write(&path, text).expect("rewrite");
+    let background = Arc::new(Background::default());
+    resume(&background, &store, &id, &Engine::default()).run();
+    let record = stored(&store, &id).expect("stored");
+    let all = stream(&background, &store, &id, None);
+    assert_consistent(&all, &record);
+    assert_eq!(all[..kept.len()], kept[..]);
+    assert_eq!(record["output"][0]["content"][0]["text"], "Hi");
+
     // A corrupt record is skipped by the listing and refused, never resumed.
     std::fs::write(scratch.0.join("resp_corrupt.json"), b"{\"trunc").expect("planted");
     let listed = scratch.open().resumable().expect("listed");
@@ -646,6 +685,7 @@ fn a_torn_journal_is_cut_to_its_last_whole_event_and_continued() {
 
 #[test]
 fn cancellation_before_or_after_a_restart_wins_over_resumption() {
+    let _spawns = no_spawns();
     // Cancelled while orphaned: nothing is generated.
     let scratch = Scratch::new();
     let id = crashed(&scratch.open(), true, vec![prefill()], 1);
@@ -716,6 +756,7 @@ fn cancellation_before_or_after_a_restart_wins_over_resumption() {
 
 #[test]
 fn a_full_queue_defers_without_writing_twice_and_unresumable_jobs_fail() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let steps = vec![prefill(), event(Event::Content("Hi".into()))];
     let id = crashed(&scratch.open(), true, steps, 2);
@@ -783,6 +824,7 @@ fn a_full_queue_defers_without_writing_twice_and_unresumable_jobs_fail() {
 
 #[test]
 fn shutdown_defers_resumption_and_temporary_jobs_are_never_resumable() {
+    let _spawns = no_spawns();
     // A temporary job keeps no request: nothing about it is durable.
     let temporary_dir = Scratch::new();
     let (temporary, _) = manual_temporary(&temporary_dir);
@@ -823,6 +865,7 @@ fn shutdown_defers_resumption_and_temporary_jobs_are_never_resumable() {
 
 #[test]
 fn a_continuation_resumes_from_its_stored_history_even_after_its_parent_is_deleted() {
+    let _spawns = no_spawns();
     let scratch = Scratch::new();
     let store = scratch.open();
     let parent = json!({
