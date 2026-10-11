@@ -907,3 +907,34 @@ fn a_continuation_resumes_from_its_stored_history_even_after_its_parent_is_delet
     assert_eq!(record.response["previous_response_id"], "resp_parent");
     assert_eq!(record.input_items.len(), 3, "history kept");
 }
+
+#[test]
+fn a_job_that_declares_hosted_tools_fails_rather_than_run_its_calls_twice() {
+    let _spawns = no_spawns();
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let mut request = body(true);
+    request["tools"] = json!([{"type":"function","name":"local_fs_read"}]);
+    let doc = streamed_doc(&request, &store, true);
+    let id = doc.id().to_owned();
+    let (_, stop) = stopper();
+    let (_, pump) = Arc::new(Background::default())
+        .admit(doc, script(vec![prefill()]), stop, None)
+        .expect("admitted");
+    pump.crash_after(1);
+    let store = scratch.open();
+    let engine = Engine::default();
+    assert_eq!(
+        outcome(&Arc::new(Background::default()), &store, &id, &engine),
+        "settled"
+    );
+    assert_eq!(engine.asked(), 0, "nothing is regenerated");
+    let failed = stored(&store, &id).expect("stored");
+    assert_eq!(failed["status"], "failed");
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("declares hosted tools")
+    );
+}

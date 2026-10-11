@@ -12,6 +12,7 @@ pub mod compaction;
 pub mod conversations;
 pub mod evals;
 pub mod files;
+pub mod tools;
 pub mod vector_stores;
 pub mod workspace;
 
