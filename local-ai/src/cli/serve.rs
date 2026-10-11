@@ -22,6 +22,7 @@ mod background;
 mod backpressure;
 mod batches;
 mod chunked;
+mod compaction;
 mod decisions;
 mod http3;
 mod journal;
@@ -182,6 +183,9 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         )
         .await;
     }
+    if parts.method == Method::POST && parts.uri.path() == compaction::ROUTE {
+        return compaction::handle(&state, &parts.headers, body).await;
+    }
     if parts.method == Method::POST && parts.uri.path() == decisions::ROUTE {
         return decisions::handle(&state, &parts.headers, body).await;
     }
@@ -283,23 +287,28 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             }
         };
     }
-    let prepared = tokio::task::spawn_blocking(move || {
-        prepare_retaining(
-            api,
-            &body,
-            thinking,
-            (store.as_ref(), temporary.as_ref()),
-            services.as_deref().map(services::Services::store),
-            cipher.as_ref(),
-            &model,
-        )
-    })
-    .await
-    .unwrap_or_else(|error| {
-        Err(crate::Error::Generation(format!(
-            "request preparation failed: {error}"
-        )))
-    });
+    let prepared = if matches!(api, Api::Responses) {
+        // Compaction and reasoning summaries run engine work of their own.
+        compaction::prepare_responses(&state, body).await
+    } else {
+        tokio::task::spawn_blocking(move || {
+            prepare_retaining(
+                api,
+                &body,
+                thinking,
+                (store.as_ref(), temporary.as_ref()),
+                services.as_deref().map(services::Services::store),
+                cipher.as_ref(),
+                &model,
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(crate::Error::Generation(format!(
+                "request preparation failed: {error}"
+            )))
+        })
+    };
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {

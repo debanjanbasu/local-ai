@@ -650,8 +650,8 @@ fn responses_reject_what_they_cannot_honour() {
             "reasoning effort",
         ),
         (
-            json!({"input":"hi","reasoning":{"summary":"auto"}}),
-            "reasoning.summary",
+            json!({"input":"hi","reasoning":{"summary":"verbose"}}),
+            "reasoning.summary must be auto, concise or detailed",
         ),
         (
             json!({"input":"hi","include":["reasoning.encrypted_content"]}),
@@ -1057,16 +1057,16 @@ fn responses_accept_an_oh_my_pi_read_and_tool_result_turn() {
     assert_eq!(result.tool_call_id.as_deref(), Some("call_1"));
     assert!(result.content.contains("println!(\"hello\")"));
 
-    // Without those flags Oh My Pi asks for semantics this server lacks, and
-    // the request fails instead of being answered as if they were honoured.
+    // Without --reasoning-key, encrypted reasoning is a semantic this server
+    // lacks, and the request fails instead of being answered as if honoured.
     let mut encrypted = first.clone();
     encrypted["include"] = json!(["reasoning.encrypted_content"]);
+    let error = responses_error(&encrypted);
+    assert!(error.contains("include"), "{error:?}");
+    // A reasoning summary is a second generation after the first.
     let mut summary = first;
     summary["reasoning"]["summary"] = json!("auto");
-    for (body, needle) in [(encrypted, "include"), (summary, "reasoning.summary")] {
-        let error = responses_error(&body);
-        assert!(error.contains(needle), "{error:?}");
-    }
+    assert_eq!(responses_error(&summary), "");
 }
 
 #[test]

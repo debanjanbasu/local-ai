@@ -8,6 +8,7 @@
 //! module only provides the hardened connection and the shared vocabulary.
 
 pub mod batches;
+pub mod compaction;
 pub mod conversations;
 pub mod files;
 pub mod workspace;

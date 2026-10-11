@@ -178,6 +178,7 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST` | `/v1/completions` | raw completion |
 | `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
+| `POST` | `/v1/responses/compact` | compact a window with the loaded model (`--reasoning-key` only; [compaction](#compaction-and-reasoning-summaries)) |
 | `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored or temporary background response, or (`GET ?stream=true`) resume a streamed background response |
 | `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored or temporary background response |
 | `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
@@ -489,8 +490,9 @@ responses with cancellation and journal-based stream resumption, temporary
 JSON-object/JSON-schema output, tool calls constrained during decoding, and
 durable conversations, files, uploads and text-endpoint batches
 ([native services](#native-services)) are now implemented as described;
-compaction, resuming a background Response interrupted by a restart and
-vector stores still need server implementations; OpenAI-compatible Decisions needs
+compaction and reasoning summaries are implemented with the loaded model
+([below](#compaction-and-reasoning-summaries)); resuming a background Response
+interrupted by a restart and vector stores still need server implementations; OpenAI-compatible Decisions needs
 a judgment head with evaluated confidence and refusal semantics; media,
 embedding, audio and moderation capabilities need suitable models or heads. Hosted tools,
 evals, fine-tuning and administrative APIs also need their own services. None
@@ -504,8 +506,10 @@ creation accepts that field as an optional string-to-string map, matching
 It is opaque tracking data: discarded, not echoed or persisted, and never
 used for prompts, sampling or cache-session selection. It is distinct from
 the public `metadata` field, which is retained on the response. With
-`--reasoning-key` the encrypted-content request is honoured. Reasoning
-summaries and hosted tools remain unsupported, strict tools are accepted only
+`--reasoning-key` the encrypted-content request is honoured, and so are
+reasoning summaries and `/responses/compact`, each at the cost of an extra
+generation ([below](#compaction-and-reasoning-summaries)); neither has been
+exercised with Codex itself. Hosted tools remain unsupported, strict tools are accepted only
 when their schemas can be enforced exactly, and the constrained tool settings
 have not been exercised with Codex, so this server is
 **not a drop-in Codex provider**. Codex handles raw `reasoning_text` and
@@ -627,6 +631,76 @@ that detection. What it does now bound on this path is a request going
 undeliverable for longer than the budget, which a body that exists on the wire
 makes observable and a buffered body could not be at all. That buffered body is
 what one measured vanished client cost: 706 seconds of engine time.
+
+### Compaction and reasoning summaries
+
+Both run on the one loaded checkpoint as ordinary, queued generations with
+thinking off; no second model exists. The policy (when to compact, what is
+kept) is model-free in `local_services::compaction`; the summary prompts and
+the rendering of a summary belong to `local_engine::compaction`; the server
+only adapts them ([engine contract](../local-engine/README.md#compaction-and-reasoning-summaries)).
+
+`POST /v1/responses/compact` takes `model`, `input`, `previous_response_id`,
+`instructions` and `prompt_cache_key` (`prompt_cache_options` and
+`prompt_cache_retention` are refused, `service_tier` as elsewhere) and returns
+a `response.compaction` object. It counts the resolved window, keeps the
+newest items up to a quarter of that count verbatim, and summarizes the rest.
+`output` is the kept items, then one `compaction` item whose
+`encrypted_content` is the summary *and* the kept items, sealed with the
+`--reasoning-key` cipher under its own domain and bound to the model and item
+ID. `usage` is the summary generation's. When nothing can be summarized the
+window comes back unchanged with zero usage. A cut never falls between a
+`function_call` and its `function_call_output` or inside an assistant turn, so
+an unanswered call and everything after it are always kept; a leading system
+message and the latest user message are kept verbatim too.
+
+A compaction item is accepted as input anywhere (Responses, input-token
+counting, conversations, stored history). A prompt is rendered from the latest
+compaction item: the kept leading system message, then its summary as one
+`user` message under a `[Context compacted]` header, then its kept items, then
+everything after it. Items before it are skipped, so the client, the response
+store and the conversation keep every original item while the prompt shrinks.
+
+`context_management: [{"type":"compaction","compact_threshold":N}]` on
+`POST /v1/responses` (one entry, `N` at least 1000 or null) compacts before
+generation when the exact prompt count reaches `N`, or when the prompt leaves
+less than `max_output_tokens` (default 8,192) of the admitted context, which is
+the output space the harness reserves. The kept budget is a quarter of `N` (or
+of the context less that reservation). The compaction item is the Response's
+first output item (`output_item.added`/`done` at index 0, right after
+`response.in_progress`); `usage` covers the answer's generation only. With
+`conversation` or `previous_response_id` the item is stored with the output, so
+the compacted window persists across restarts. Not with `background`.
+`compaction_trigger` input items are refused.
+
+Without `--reasoning-key` both are refused rather than returning the summary
+in a field named `encrypted_content`: the item carries the conversation's
+content, the contract calls it encrypted, and plaintext under that name would
+mislead.
+
+`reasoning.summary` (`auto`, `concise` or `detailed`; the deprecated
+`generate_summary` likewise) runs after the answer's generation ends: the raw
+reasoning is quoted to the model, which writes the summary as visible content.
+It streams as `response.reasoning_summary_part.added`,
+`response.reasoning_summary_text.delta`, `.done` and
+`response.reasoning_summary_part.done`, then the reasoning item's
+`output_item.done` (withheld until then, so the answer's items finish first)
+with one `summary_text` part. The raw reasoning stays the item's
+`reasoning_text` content (and `encrypted_content`) and is never relabeled.
+`reasoning.summary` is echoed. A summary that cannot be generated fails the
+Response; a cancelled one gets none; with effort `none` nothing runs. Not with
+`background`. The summary runs on the stream's own pump and its deltas go out
+as they are generated, under the same stall budget; a client that disconnects
+cancels it. Its output budget is 160, 320 or 900 tokens by detail.
+
+Cost: a compaction prefills the summarized history again unless the prompt
+cache still holds it (the summary request renders the conversation's own
+tools and session to share that prefix) and decodes up to 2,048 tokens; a
+reasoning summary prefills the reasoning plus about 70 tokens and decodes up
+to its budget. Neither cost is in the Response's `usage`. Risk: a summary is
+lossy and is believed by every later turn; an exact string the model left out
+is gone from the prompt, and a mistaken summary is not detectable from it.
+Only kept items are exact.
 
 ### Temporary background responses
 

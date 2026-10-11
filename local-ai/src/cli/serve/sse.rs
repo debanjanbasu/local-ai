@@ -47,7 +47,15 @@ pub(super) async fn start_stream(
     let (sender, receiver) = mpsc::channel(1);
     // Detached, because this function returns the receiver and the pump owns
     // the only `EventStream`; the receiver is what ends the pump.
-    let frames = Frames::new(reply);
+    let mut frames = Frames::new(reply);
+    if let Frames::Responses(state) = &mut frames {
+        // A reasoning summary is generated after the main generation's last
+        // event; its frames go out as they are made, on the same terms.
+        let sender = sender.clone();
+        state.set_flush(Box::new(move |events| {
+            deliver(&sender, events.iter().map(sse_frame).collect(), stall)
+        }));
+    }
     tokio::task::spawn_blocking(move || {
         pump(first, events, frames, sender, admitted, stall);
     });
