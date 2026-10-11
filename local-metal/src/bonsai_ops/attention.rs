@@ -1,8 +1,9 @@
 use super::{
     AttentionKernel, AttentionWorkspace, BonsaiOps, CommandBatch, KV_HEADS, KvLayout,
-    MAX_PREFILL_TOKENS, MetalBuffer, Q_HEADS, ROW_BLOCK_MIN_PREFIX, ROW_BLOCK_TOKENS, SPLIT,
-    SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_ROWS,
-    SPLIT_TENSOR_SHORT, arg, need, no_alias, sequence_bytes, tensor_split_tokens,
+    MAX_PREFILL_TOKENS, MetalBuffer, PREFILL_ROW_TOKENS, PREFILL_ROWS_MIN_END, Q_HEADS,
+    ROW_BLOCK_MIN_PREFIX, ROW_BLOCK_TOKENS, SPLIT, SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX,
+    SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_ROWS, SPLIT_TENSOR_SHORT, arg, need, no_alias,
+    sequence_bytes, tensor_split_tokens,
 };
 
 impl BonsaiOps {
@@ -376,6 +377,36 @@ impl BonsaiOps {
                 &[],
                 groups,
                 self.attention_kernel.threads(),
+            );
+        } else if let Some(pipeline) = self.tensor_rows
+            && layout == KvLayout::Q8
+            && end > PREFILL_ROWS_MIN_END
+        {
+            let stride = tokens.next_multiple_of(PREFILL_ROW_TOKENS);
+            need(&workspace.gathered, (stride * Q_HEADS * 256) as usize * 4)?;
+            self.go(
+                b,
+                pipeline,
+                &[(q, 0), (&workspace.gathered, 0)],
+                &[stride],
+                &[],
+                (tokens * Q_HEADS) as usize,
+                256,
+            );
+            // `bo_attn_tensor_rows_q8` follows the gather and three split kernels.
+            self.go(
+                b,
+                pipeline + 4,
+                &[
+                    (&workspace.gathered, 0),
+                    (k_cache, 0),
+                    (v_cache, 0),
+                    (out, 0),
+                ],
+                &[position, tokens, stride],
+                &[],
+                (KV_HEADS * tokens.div_ceil(PREFILL_ROW_TOKENS)) as usize,
+                128,
             );
         } else if let Some(split) = self.quantized_tensor(layout) {
             self.go(

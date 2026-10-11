@@ -1638,6 +1638,37 @@ transposing K and alternative split sizes also lost. Single-row attention
 retained about 74% of its latency with K/V loads removed in an ablation, so
 unused memory bandwidth alone does not establish recoverable decode speed.
 
+Causal Q8 prefill blocks (more than eight tokens) ending past 1,024 positions
+pack the same way: `bo_attn_tensor_rows_q8` gives one threadgroup four
+consecutive tokens of one KV head, so their 24 query rows share each
+dequantized K/V tile in one 24-row product, where `bo_attn_tensor_q8`
+dequantized every tile once per query head for an 8-row product. Per row the
+operands, causal limit, online softmax and division are unchanged, and all
+128 x 6,144 outputs are bitwise equal to the previous kernel at 0, 1K, 4K, 8K,
+32K and 128K prefixes. The workspace's gathered-query buffer grows from
+96 KiB to 3 MiB once its context exceeds 1,024. M4 Pro, 128-token block,
+GPU time per layer (median of five, two interleaved runs) and whole-model
+block time (best of three, two interleaved runs, synthetic cache):
+
+| Prefix | Attention, one layer | Whole 128-token block |
+| ---: | ---: | ---: |
+| 1,024 | 1,007 → 975 µs | not measured |
+| 8,192 | 7,438 → 6,948 µs | 1,073 → 1,064 ms |
+| 32,768 | 29,730 → 27,595 µs | 1,434 → 1,399 ms |
+| 131,072 | 125,681 → 112,402 µs | 2,982 → 2,785 ms |
+
+Short-prefix blocks (0 positions: 955 ms either way) keep the per-head kernel.
+A greedy 13,239-token prompt (96 tokens, with and without MTP) produced
+identical token IDs on both kernels; its prefill rate moved only within noise
+(120.5-121.3 tok/s), since attention is a small share of blocks below 16K.
+Remaining headroom, from the same runs: the GPU was busy for 99.1-99.5% of
+wall time, so host encoding and synchronization cost under 1%; a cold 128-row
+block (955 ms, about 3.3 T multiply-adds per second over the 25.8 G ternary
+weights) runs near the 8x8 multiplies' measured 3.9 T peak; long-prefix
+prefill attention does 2.1e11 multiply-adds per layer at 128K in 112 ms
+(1.8 T/s), half that peak; per-tile dequantization and softmax are the likely
+remainder (not profiled per stage).
+
 Two- to four-row projections (speculative verify blocks, short prefill
 chunks, batched decode) then got cheaper with bit-identical outputs. Trits
 come from balanced prefixes, prefix(p) - (3^p - 1) / 2, whose offsets fold

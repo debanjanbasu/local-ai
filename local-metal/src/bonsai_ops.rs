@@ -62,6 +62,12 @@ const SPLIT_HEADS: u32 = 2;
 const ROW_BLOCK_TOKENS: u32 = 8;
 const ROW_BLOCK_MIN_PREFIX: u32 = 1024;
 const SPLIT_TENSOR_ROWS: u32 = 4;
+/// Causal tensor Q8 blocks ending past this many cache positions pack the six
+/// query heads of `PREFILL_ROW_TOKENS` tokens per KV head into one threadgroup
+/// (`bo_attn_tensor_rows_q8`); shorter ones keep one threadgroup per query head.
+const PREFILL_ROWS_MIN_END: u32 = 1024;
+/// Must match `tokens_per_group` in the shader's `bo_attn_tensor_rows_q8`.
+const PREFILL_ROW_TOKENS: u32 = 4;
 
 /// Full-attention prefill operands; all variants keep F32 softmax statistics,
 /// accumulation and output, F16 KV storage, and the same F32 decode path.
@@ -142,7 +148,13 @@ impl AttentionWorkspace {
             .checked_mul(Q_HEADS as usize)
             .and_then(|n| n.checked_mul(258 * 4))
             .ok_or_else(|| arg("workspace size overflow"))?;
-        let gather_bytes = (SPLIT_TENSOR_ROWS * Q_HEADS * HEAD_DIM) as usize * 4;
+        // Long-prefix prefill gathers a whole block's query rows by KV head.
+        let gather_rows = if max_context > PREFILL_ROWS_MIN_END {
+            MAX_PREFILL_TOKENS.next_multiple_of(PREFILL_ROW_TOKENS)
+        } else {
+            SPLIT_TENSOR_ROWS
+        };
+        let gather_bytes = (gather_rows * Q_HEADS * HEAD_DIM) as usize * 4;
         Ok(Self {
             partials: MetalBuffer::empty(context.device(), partial_bytes)?,
             gathered: MetalBuffer::empty(context.device(), gather_bytes)?,
@@ -354,6 +366,7 @@ impl BonsaiOps {
                 "bo_attn_split_tensor_rows_q8_2",
                 "bo_attn_split_tensor_rows_q8_3",
                 "bo_attn_split_tensor_rows_q8_4",
+                "bo_attn_tensor_rows_q8",
             ]
         } else {
             &[]
