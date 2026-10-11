@@ -191,7 +191,10 @@ contract, limits and semantics are the module docs; the essentials:
   and not comparable across queries. `rewrite_query: true` and the
   `default-2024-11-15` ranker are refused; `auto` and `none` are plain BM25.
   Pooled Bonsai hidden states were measured as embeddings and rejected (see
-  [docs/BONSAI.md](../docs/BONSAI.md#tried-and-rejected)).
+  [docs/BONSAI.md](../docs/BONSAI.md#tried-and-rejected)); the module docs
+  ("Adding embedding ranking") describe where a dedicated embedding model's
+  vectors would be written (`index_next`, under the same outbox) and ranked
+  (the single ranking step of `search`, over the same chunk keys).
 - **Lifecycle.** Attaching a live File (any purpose) answers `in_progress`;
   the indexer reads UTF-8 text (BOM dropped; NUL or invalid UTF-8 is
   `unsupported_file`; over 16 MiB, empty, or over 50,000 chunks is

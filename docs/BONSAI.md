@@ -728,7 +728,8 @@ preparation and generation blocking tasks, never on runtime workers.
   owns a data directory's index; a second server on the same directory
   serves everything except vector stores. Details are in
   [local-services/README.md](../local-services/README.md#vector-stores).
-  There is no `/v1/embeddings` route.
+  There is no `/v1/embeddings` route; the search and index design leave one
+  ranking step and one indexing step for a later embedding model.
 
 These services do not resume background Responses after a crash or restart.
 Batch resumption is a separate mechanism. They also provide no compaction,
@@ -1942,8 +1943,10 @@ their own entry, not with current rates.
   nDCG@10 to 0.766 for Recall@100 0.987. Embedding also ran at 117–124
   tokens/s on the GPU (about 0.5 documents/s, 34 minutes for the 1,000
   documents), while BM25 indexed the same documents in 4.9 s and answered a
-  query in 7 ms. Neither quality nor throughput is competitive, so there is
-  no `/v1/embeddings` route and vector store ranking stays lexical.
+  query in 7 ms. Neither quality nor throughput is competitive, so pooled
+  Bonsai states are not used as embeddings and vector store ranking stays
+  lexical; a dedicated embedding model is a separate question (the
+  vector store module docs describe where its ranking would plug in).
 - PTQ1 pipeline descriptor hints (32-thread maximum and the multiple-of-SIMD
   execution-width flag): outputs stayed bitwise identical, but timing shifts
   were within about 2% and moved with the repeated default control. No

@@ -161,7 +161,16 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         }
     }
     if services::matches(parts.uri.path()) {
-        return services::handle(&state, &parts, body).await;
+        let response = services::handle(&state, &parts, body).await;
+        if parts.method == Method::DELETE
+            && parts.uri.path().starts_with("/v1/files/")
+            && response.status().is_success()
+            && let Some(vector_stores) = &state.vector_stores
+        {
+            // The deleted File left every vector store; drop its documents.
+            vector_stores.notify();
+        }
+        return response;
     }
     if batches::matches(parts.uri.path()) {
         return batches::handle(&state, &parts, body).await;

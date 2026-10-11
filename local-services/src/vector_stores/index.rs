@@ -215,48 +215,8 @@ impl VectorIndex {
             touch(&writer, store_id)?;
         }
         let files = searchable_files(&snapshot, store_id, request.filters.as_ref())?;
-        let searcher = self.reader.searcher();
-        let allowed: Box<dyn tantivy::query::Query> = Box::new(ConstScoreQuery::new(
-            Box::new(TermSetQuery::new(
-                files
-                    .iter()
-                    .map(|file| Term::from_field_text(self.fields.attach, file)),
-            )),
-            0.0,
-        ));
-        let mut best: BTreeMap<(String, u64), f64> = BTreeMap::new();
-        for query in &plan.queries {
-            let words = self.words(query)?;
-            if words.is_empty() || files.is_empty() {
-                continue;
-            }
-            let any_word = BooleanQuery::new(
-                words
-                    .iter()
-                    .map(|word| {
-                        let term = Term::from_field_text(self.fields.text, word);
-                        let query: Box<dyn tantivy::query::Query> =
-                            Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
-                        (Occur::Should, query)
-                    })
-                    .collect(),
-            );
-            let query = BooleanQuery::new(vec![
-                (Occur::Must, allowed.box_clone()),
-                (Occur::Must, Box::new(any_word)),
-            ]);
-            let top = TopDocs::with_limit(plan.limit).order_by_score();
-            for (score, address) in searcher.search(&query, &top).map_err(index_error)? {
-                let key = self.chunk_key(&searcher, address)?;
-                let reported = normalize(score);
-                let entry = best.entry(key).or_insert(reported);
-                *entry = entry.max(reported);
-            }
-        }
-        let mut hits: Vec<((String, u64), f64)> = best
-            .into_iter()
-            .filter(|(_, score)| *score >= plan.threshold)
-            .collect();
+        let mut hits = self.rank_lexical(&plan, &files)?;
+        hits.retain(|(_, score)| *score >= plan.threshold);
         hits.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         hits.truncate(plan.limit);
         let mut data = Vec::with_capacity(hits.len());
@@ -294,6 +254,59 @@ impl VectorIndex {
             has_more: false,
             next_page: None,
         })
+    }
+
+    /// The BM25 hits among the chunks of the admitted attachments `files`:
+    /// at most `plan.limit` per query, each chunk once with its best
+    /// reported score, unordered.
+    ///
+    /// This is the only ranking step of [`Self::search`]: validation, the
+    /// store and filter snapshot, the threshold, ordering and reading chunk
+    /// text around it work on chunk keys (attachment, ordinal) and scores,
+    /// whatever produced them.
+    fn rank_lexical(&self, plan: &SearchPlan, files: &[String]) -> Result<Vec<(ChunkKey, f64)>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut best: BTreeMap<ChunkKey, f64> = BTreeMap::new();
+        let searcher = self.reader.searcher();
+        let allowed: Box<dyn tantivy::query::Query> = Box::new(ConstScoreQuery::new(
+            Box::new(TermSetQuery::new(
+                files
+                    .iter()
+                    .map(|file| Term::from_field_text(self.fields.attach, file)),
+            )),
+            0.0,
+        ));
+        for query in &plan.queries {
+            let words = self.words(query)?;
+            if words.is_empty() {
+                continue;
+            }
+            let any_word = BooleanQuery::new(
+                words
+                    .iter()
+                    .map(|word| {
+                        let term = Term::from_field_text(self.fields.text, word);
+                        let query: Box<dyn tantivy::query::Query> =
+                            Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                        (Occur::Should, query)
+                    })
+                    .collect(),
+            );
+            let query = BooleanQuery::new(vec![
+                (Occur::Must, allowed.box_clone()),
+                (Occur::Must, Box::new(any_word)),
+            ]);
+            let top = TopDocs::with_limit(plan.limit).order_by_score();
+            for (score, address) in searcher.search(&query, &top).map_err(index_error)? {
+                let key = self.chunk_key(&searcher, address)?;
+                let reported = normalize(score);
+                let entry = best.entry(key).or_insert(reported);
+                *entry = entry.max(reported);
+            }
+        }
+        Ok(best.into_iter().collect())
     }
 
     /// Index the oldest files still `in_progress` (at most
@@ -543,11 +556,7 @@ impl VectorIndex {
         Ok(words)
     }
 
-    fn chunk_key(
-        &self,
-        searcher: &tantivy::Searcher,
-        address: DocAddress,
-    ) -> Result<(String, u64)> {
+    fn chunk_key(&self, searcher: &tantivy::Searcher, address: DocAddress) -> Result<ChunkKey> {
         let document: TantivyDocument = searcher.doc(address).map_err(index_error)?;
         let attach = document
             .get_first(self.fields.attach)
@@ -560,6 +569,10 @@ impl VectorIndex {
         Ok((attach.to_owned(), ordinal))
     }
 }
+
+/// A chunk's identity in the index and the database: its attachment and
+/// its ordinal in the attachment's file.
+type ChunkKey = (String, u64);
 
 /// A validated search request.
 struct SearchPlan {
