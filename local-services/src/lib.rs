@@ -10,6 +10,7 @@
 pub mod batches;
 pub mod conversations;
 pub mod files;
+pub mod vector_stores;
 pub mod workspace;
 
 pub use conversations::{
@@ -86,6 +87,7 @@ impl Store {
         conversations::initialize(&mut connection)?;
         files::initialize(&mut connection)?;
         batches::initialize(&mut connection)?;
+        vector_stores::initialize(&mut connection)?;
         Ok(store)
     }
 
