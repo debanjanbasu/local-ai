@@ -35,3 +35,8 @@ ring = "0.17"
 rustix = { version = "1", features = ["fs", "process"] }
 rustls-pemfile = "2"
 zstd = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+# Checks the Evals API objects against the pinned OpenAI schemas; the
+# engine's version, offline.
+jsonschema = { version = "0.58.6", default-features = false }
