@@ -20,7 +20,9 @@
 //! `version (1 byte) || nonce (12 bytes) || ciphertext || tag (16 bytes)`.
 //! Associated data: `DOMAIN || version || len(model_id) || model_id ||
 //! len(item_id) || item_id`, lengths as big-endian `u64`, so distinct
-//! `(model_id, item_id)` pairs never share an encoding.
+//! `(model_id, item_id)` pairs never share an encoding. Compaction items'
+//! payloads use the same layout under their own `DOMAIN`, so neither kind of
+//! envelope opens as the other.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -39,6 +41,9 @@ use rustix::io::Errno;
 const VERSION: u8 = 1;
 /// Domain separation for the associated data.
 const DOMAIN: &[u8] = b"local-ai/reasoning-envelope";
+/// Domain separation for compaction envelopes, so a reasoning envelope never
+/// opens as a compaction item or the other way round.
+const COMPACTION_DOMAIN: &[u8] = b"local-ai/compaction-envelope";
 /// Raw AES-256 key length.
 const KEY_LEN: usize = 32;
 /// AES-GCM authentication tag length.
@@ -208,6 +213,33 @@ impl ReasoningCipher {
     /// opaque base64url envelope. Every call uses a fresh random nonce, so
     /// sealing the same text twice yields different envelopes.
     pub fn seal(&self, model_id: &str, item_id: &str, reasoning: &str) -> Result<String> {
+        self.seal_in(DOMAIN, model_id, item_id, reasoning)
+    }
+
+    /// [`seal`](Self::seal) for a compaction item's serialized payload, in a
+    /// separate domain.
+    pub fn seal_compaction(&self, model_id: &str, item_id: &str, payload: &str) -> Result<String> {
+        self.seal_in(COMPACTION_DOMAIN, model_id, item_id, payload)
+    }
+
+    /// [`unseal`](Self::unseal) for an envelope from
+    /// [`seal_compaction`](Self::seal_compaction).
+    pub fn unseal_compaction(
+        &self,
+        model_id: &str,
+        item_id: &str,
+        envelope: &str,
+    ) -> Result<String> {
+        self.unseal_in(COMPACTION_DOMAIN, model_id, item_id, envelope)
+    }
+
+    fn seal_in(
+        &self,
+        domain: &[u8],
+        model_id: &str,
+        item_id: &str,
+        reasoning: &str,
+    ) -> Result<String> {
         if reasoning.len() > MAX_REASONING_BYTES {
             return Err(ReasoningCryptoError::PayloadTooLarge);
         }
@@ -215,7 +247,7 @@ impl ReasoningCipher {
         self.rng
             .fill(&mut nonce)
             .map_err(|_| ReasoningCryptoError::Randomness)?;
-        let aad = associated_data(VERSION, model_id, item_id);
+        let aad = associated_data(domain, VERSION, model_id, item_id);
         let mut sealed = Vec::with_capacity(HEADER_LEN + reasoning.len() + TAG_LEN);
         sealed.push(VERSION);
         sealed.extend_from_slice(&nonce);
@@ -236,6 +268,16 @@ impl ReasoningCipher {
     /// unaltered, was sealed with this key, and was sealed for exactly this
     /// `model_id` and `item_id`.
     pub fn unseal(&self, model_id: &str, item_id: &str, envelope: &str) -> Result<String> {
+        self.unseal_in(DOMAIN, model_id, item_id, envelope)
+    }
+
+    fn unseal_in(
+        &self,
+        domain: &[u8],
+        model_id: &str,
+        item_id: &str,
+        envelope: &str,
+    ) -> Result<String> {
         if envelope.len() > MAX_ENVELOPE_CHARS {
             return Err(ReasoningCryptoError::MalformedEnvelope);
         }
@@ -253,7 +295,7 @@ impl ReasoningCipher {
         }
         let mut nonce = [0_u8; NONCE_LEN];
         nonce.copy_from_slice(&sealed[1..HEADER_LEN]);
-        let aad = associated_data(version, model_id, item_id);
+        let aad = associated_data(domain, version, model_id, item_id);
         let plaintext = self
             .key
             .open_in_place(
@@ -268,9 +310,9 @@ impl ReasoningCipher {
 }
 
 /// The associated data binding an envelope to its version, model and item.
-fn associated_data(version: u8, model_id: &str, item_id: &str) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(DOMAIN.len() + 1 + 16 + model_id.len() + item_id.len());
-    aad.extend_from_slice(DOMAIN);
+fn associated_data(domain: &[u8], version: u8, model_id: &str, item_id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(domain.len() + 1 + 16 + model_id.len() + item_id.len());
+    aad.extend_from_slice(domain);
     aad.push(version);
     for part in [model_id, item_id] {
         aad.extend_from_slice(&(part.len() as u64).to_be_bytes());
@@ -533,6 +575,27 @@ mod tests {
         assert_eq!(
             reopened.unseal(MODEL, ITEM, &envelope).expect("unseals"),
             reasoning
+        );
+    }
+
+    #[test]
+    fn compaction_and_reasoning_envelopes_never_open_as_each_other() {
+        let scratch = Scratch::new();
+        let cipher = open(&scratch.key());
+        let compaction = cipher.seal_compaction(MODEL, ITEM, "{}").expect("seals");
+        assert_eq!(
+            cipher
+                .unseal_compaction(MODEL, ITEM, &compaction)
+                .expect("unseals"),
+            "{}"
+        );
+        assert!(cipher.unseal(MODEL, ITEM, &compaction).is_err());
+        let reasoning = cipher.seal(MODEL, ITEM, "{}").expect("seals");
+        assert!(cipher.unseal_compaction(MODEL, ITEM, &reasoning).is_err());
+        assert!(
+            cipher
+                .unseal_compaction(MODEL, "other", &compaction)
+                .is_err()
         );
     }
 
