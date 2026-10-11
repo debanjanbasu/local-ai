@@ -368,8 +368,11 @@ boundary that finishes every output item the lost generation opened (as
 next output index, so no journaled event is repeated or contradicted and the
 final Response holds every item its stream announced. Only one server can
 resume a job (the lease), a cancel or delete before the restart wins, and a
-job continuing a conversation, or one without its stored request, is marked
-`failed` instead.
+job continuing a conversation, one that declares hosted tools (regenerating
+could run a shell command or file write twice), or one without its stored
+request, is marked `failed` instead. `context_management` and
+`reasoning.summary` are refused with `background` when the request is made,
+so neither is ever resumed.
 Graceful shutdown refuses new background requests (503), marks every
 unfinished job `failed`, cancels it and waits for the workers to release the
 engine before exiting; a resumption still waiting for a queue slot stays
@@ -476,8 +479,9 @@ or charged cache-write tier.
 This is **not the full OpenAI platform contract**. Schema keywords
 llguidance cannot enforce exactly, strict tool schemas the native grammar
 cannot enforce exactly (including any without `"additionalProperties": false`),
-`allowed_tools` and non-function tool choices, built-in/hosted
-tools, reasoning summaries, `include` values other than
+`allowed_tools`, built-in tools other than those of
+[docs/TOOLS.md](TOOLS.md) (`web_search`, `namespace`, MCP and the like),
+`include` values other than
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
 `truncation:auto`, log-probabilities, images and audio are rejected.
 `tool_choice` `auto`, `none`, `required` and a named function,
@@ -512,9 +516,12 @@ lexical (BM25) vector stores are implemented too ([native services](#native-serv
 compaction and reasoning summaries are implemented with the loaded model
 ([below](#compaction-and-reasoning-summaries)); OpenAI-compatible Decisions needs
 a judgment head with evaluated confidence and refusal semantics; media,
-embedding, audio and moderation capabilities need suitable models or heads. Hosted tools,
-evals, fine-tuning and administrative APIs also need their own services. None
-is implemented by merely accepting its request fields.
+embedding, audio and moderation capabilities need suitable models or heads.
+Evals run on the batch worker ([native services](#native-services)), and
+client-executed `custom`/`local_shell`/`apply_patch` tools and opt-in
+sandboxed hosted tools are described in [docs/TOOLS.md](TOOLS.md); other
+built-in tools, fine-tuning and administrative APIs still need their own
+services. None is implemented by merely accepting its request fields.
 
 [Codex at 4aa94dc](https://github.com/openai/codex/tree/4aa94dce270de668eff6e2fa8585c82385e84455)
 uses stateless Responses, requests `reasoning.encrypted_content`, and sends
@@ -527,10 +534,13 @@ the public `metadata` field, which is retained on the response. With
 `--reasoning-key` the encrypted-content request is honoured, and so are
 reasoning summaries and `/responses/compact`, each at the cost of an extra
 generation ([below](#compaction-and-reasoning-summaries)); neither has been
-exercised with Codex itself. Hosted tools remain unsupported, strict tools are accepted only
-when their schemas can be enforced exactly, and the constrained tool settings
-have not been exercised with Codex, so this server is
-**not a drop-in Codex provider**. Codex handles raw `reasoning_text` and
+exercised with Codex itself. Codex's `custom` `apply_patch` and `local_shell`
+tools are round-tripped for the client to run, and several leading developer
+messages are joined into the template's one system turn; `web_search`,
+`namespace` (sub-agents) and other hosted OpenAI tools are refused, strict
+tools are accepted only when their schemas can be enforced exactly, and the
+constrained tool settings have not been exercised with Codex, so this server
+is **not a drop-in Codex provider** with Codex's default configuration. Codex handles raw `reasoning_text` and
 summary events separately; raw reasoning is not relabeled as a summary.
 The Oh My Pi example in the engine README configures that client to use only
 implemented capabilities.
@@ -872,8 +882,9 @@ preparation and generation blocking tasks, never on runtime workers.
 
 Resuming background Responses after a crash is the server's job (see
 [Server API](#server-api)), not these services'; batch
-resumption is a separate mechanism. They also provide no compaction,
-training or change to the model.
+resumption is a separate mechanism. Compaction's policy (when to compact,
+what is kept) lives here; its summary generation is the server's. They
+provide no training or change to the model.
 
 ### Experimental decisions
 
@@ -2637,6 +2648,39 @@ Raw evidence: `.amp/in/artifacts/client-compat/run5` (Oh My Pi, HTTP),
 `server.log`. The recovery scores above use the current rule (the failed read
 must reach the model as a tool result); `run5`/`run7` were scored with an
 earlier two-call rule.
+
+**Re-run after merging the parallel work and the three protocol fixes**
+(main at 6ac7dec, 2026-10-12; Codex CLI 0.162.1, Oh My Pi 18.9.1; one bounded
+run of the previously failing and newly implemented scenarios, about 10
+GPU-minutes). The `codex-*` configuration now keeps Codex's default developer
+messages (only web search, sub-agents, goals, apps, plugins and the like stay
+off), so those scenarios exercise the multi-developer-message path.
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| omp-read + resumed second turn | PASS | `42`, then `7` |
+| omp-fix-xhigh (with `--reasoning-key`) | PASS | 7 requests, 80 s, tests pass, test file untouched |
+| omp-fix-xhigh (no key) | PASS | tests pass, 6 tool results |
+| codex-fix (default developer messages) | PASS | 8 requests, 101 s |
+| codex-read + `exec resume --last` (default developer messages) | PASS | `42`, then `7` |
+| codex-fix-xhigh (default developer messages) | PASS | 6 requests, 87 s |
+| codex-default-config | **FAIL** | 400 `tool type "namespace" is not supported` (sub-agents; still a hosted OpenAI tool) |
+| http-multiple-developer-messages | PASS | 200 |
+| http-encrypted-reasoning-unrequested | PASS | no `encrypted_content` without `include` |
+| http-encrypted-reasoning-replay | PASS | replay answers `2.7.1` |
+| http-reasoning-summary-auto | PASS | 200 |
+| http-local-shell-tool | PASS | 200 |
+| http-compact | PASS | 200 `response.compaction` |
+| http-custom-tool-apply-patch | **FAIL** | 400 `tool name "apply_patch" is reserved`; the probe sends Codex's freeform `apply_patch` as a `custom` tool with a `lark` grammar, and `lark` grammars are refused as well ([docs/TOOLS.md](TOOLS.md)) |
+
+Protocol gaps (1)–(3) above are fixed: consecutive leading instruction
+messages are joined into the system turn, `encrypted_content` is emitted only
+when `include` asks for it, and a non-strict function call that misses its
+schema is returned as generated for the client to reject (covered by unit
+tests; no such call occurred in this re-run). Still open: `namespace` and
+`web_search` tools for Codex's default configuration, and Codex's `lark`
+freeform `apply_patch` declaration. Evidence:
+`.amp/in/artifacts/client-compat/merged-main` and `merged-main-nokey`.
 
 #### Long-context coding quality (2026-10-11, server at `d2cad1b`)
 
