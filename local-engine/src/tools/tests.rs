@@ -530,3 +530,47 @@ fn partial_tags_and_text_after_calls_stay_content() {
         .collect::<String>();
     assert_eq!(text, "a <tools> b\n");
 }
+
+#[test]
+fn consecutive_leading_instructions_share_the_system_slot_in_order() {
+    let none = ToolSet::default();
+    let with_tools = tools(&[weather()]);
+    for (thinking, set) in [(true, &none), (false, &none), (true, &with_tools)] {
+        let merged = render(
+            &[
+                turn("system", "Be exact."),
+                turn("developer", " Use metric units. "),
+                turn("developer", ""),
+                turn("user", "Hi"),
+            ],
+            thinking,
+            set,
+        )
+        .expect("consecutive leading instructions");
+        let single = render(
+            &[
+                turn("system", "Be exact.\n\nUse metric units."),
+                turn("user", "Hi"),
+            ],
+            thinking,
+            set,
+        )
+        .expect("single instruction");
+        assert_eq!(merged, single);
+    }
+    // An instruction after the conversation began still has nowhere to go.
+    for turns in [
+        [
+            turn("developer", "A"),
+            turn("user", "Hi"),
+            turn("developer", "B"),
+        ],
+        [
+            turn("user", "Hi"),
+            turn("developer", "A"),
+            turn("developer", "B"),
+        ],
+    ] {
+        assert!(render(&turns, true, &none).is_err());
+    }
+}

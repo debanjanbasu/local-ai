@@ -950,17 +950,16 @@ impl History {
     }
 
     /// The summary, if any, and then `items`, as chat messages, after the
-    /// instructions. The summary follows a leading system message, which the
-    /// template only takes first.
+    /// instructions. The summary follows the leading system and developer
+    /// messages, which the template only takes first.
     fn messages_of(&self, items: &[Value]) -> crate::Result<Vec<ChatMessage>> {
         let mut messages =
             input_messages(&Value::Array(items.to_vec()), self.instructions.as_deref())?;
         if let Some(summary) = &self.summary {
-            let at = usize::from(
-                messages
-                    .first()
-                    .is_some_and(|first| matches!(first.role.as_str(), "system" | "developer")),
-            );
+            let at = messages
+                .iter()
+                .take_while(|message| matches!(message.role.as_str(), "system" | "developer"))
+                .count();
             messages.insert(at, summary_message(summary));
         }
         Ok(messages)
