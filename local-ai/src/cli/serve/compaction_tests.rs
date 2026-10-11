@@ -237,9 +237,11 @@ fn summarizer(pieces: &'static [&'static str], seen: Arc<Mutex<Vec<ChatRequest>>
     Summarizer(generate)
 }
 
-/// One token per rendered message: enough to drive the budget.
-#[allow(clippy::unnecessary_wraps, clippy::needless_pass_by_value)]
+/// One token per rendered message: enough to drive the budget. What is
+/// counted must render as a prompt, as the engine's count requires.
+#[allow(clippy::needless_pass_by_value)]
 fn by_messages(messages: Vec<ChatMessage>) -> crate::Result<usize> {
+    local_engine::Engine::render_chat_with_tools(&messages, false, &[])?;
     Ok(messages.len())
 }
 

@@ -143,12 +143,14 @@ fn cuts(items: &[Value]) -> Vec<usize> {
     cuts
 }
 
-/// Plan one compaction of `items`: the earliest cut whose kept tail counts
+/// Plan one compaction of `items`: the earliest cut whose kept items count
 /// at most `keep_tokens` by `count`, or the latest cut when none does.
 ///
-/// `count` measures the prompt tokens of an item slice; it is called a
-/// logarithmic number of times. `None` when nothing can be summarized: no
-/// cut leaves more than the leading instructions behind it.
+/// `count` measures the prompt tokens of the items a cut would keep (the
+/// leading instructions, the latest user message and the tail, so always a
+/// renderable prompt when `items` is one); it is called a logarithmic number
+/// of times. `None` when nothing can be summarized: no cut leaves more than
+/// the leading instructions behind it.
 pub fn plan<E>(
     items: &[Value],
     keep_tokens: usize,
@@ -156,12 +158,24 @@ pub fn plan<E>(
 ) -> Result<Option<Plan>, E> {
     let head = head(items);
     let cuts: Vec<usize> = cuts(items).into_iter().filter(|cut| *cut > head).collect();
+    let latest_user = items
+        .iter()
+        .rposition(|item| kind(item) == "message" && role(item) == Some("user"));
+    let kept = |split: usize| {
+        let mut kept: Vec<Value> = items.get(..head).unwrap_or_default().to_vec();
+        if let Some(user) = latest_user.filter(|user| *user < split)
+            && let Some(item) = items.get(user)
+        {
+            kept.push(item.clone());
+        }
+        kept.extend_from_slice(items.get(split..).unwrap_or_default());
+        kept
+    };
     let (mut low, mut high) = (0, cuts.len());
-    // The first cut whose tail fits; tails shrink as the cut moves later.
+    // The first cut whose kept items fit; they shrink as the cut moves later.
     while low < high {
         let middle = low + (high - low) / 2;
-        let tail = items.get(cuts[middle]..).unwrap_or_default();
-        if count(tail)? <= keep_tokens {
+        if count(&kept(cuts[middle]))? <= keep_tokens {
             high = middle;
         } else {
             low = middle + 1;
@@ -170,17 +184,10 @@ pub fn plan<E>(
     let Some(&split) = cuts.get(low).or_else(|| cuts.last()) else {
         return Ok(None);
     };
-    let mut kept: Vec<Value> = items.get(..head).unwrap_or_default().to_vec();
-    let latest_user = items
-        .iter()
-        .rposition(|item| kind(item) == "message" && role(item) == Some("user"));
-    if let Some(user) = latest_user.filter(|user| *user < split)
-        && let Some(item) = items.get(user)
-    {
-        kept.push(item.clone());
-    }
-    kept.extend_from_slice(items.get(split..).unwrap_or_default());
-    Ok(Some(Plan { split, kept }))
+    Ok(Some(Plan {
+        split,
+        kept: kept(split),
+    }))
 }
 
 #[cfg(test)]
@@ -278,7 +285,7 @@ mod tests {
             output("2"),
             assistant("step 3"),
         ];
-        let plan = plan(&items, 1, by_items).unwrap().unwrap();
+        let plan = plan(&items, 3, by_items).unwrap().unwrap();
         assert_eq!(plan.split, 8);
         assert_eq!(plan.kept, vec![system, user("task"), assistant("step 3")]);
     }
