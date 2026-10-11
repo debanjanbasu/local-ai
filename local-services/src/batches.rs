@@ -775,6 +775,38 @@ impl Store {
         Ok(Some(ending))
     }
 
+    /// The newest batch whose metadata maps `key` to `value`, if any: how a
+    /// service that creates batches finds one it created before a crash.
+    pub(crate) fn find_batch(&self, key: &str, value: &str) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT id FROM batches WHERE json_extract(metadata, ?1) = ?2
+                 ORDER BY seq DESC LIMIT 1",
+                params![format!("$.\"{key}\""), value],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The `custom_id` and result record of every settled line of batch
+    /// `id`, in input order.
+    pub(crate) fn batch_results(&self, id: &str) -> Result<Vec<(String, Value)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT custom_id, result FROM batch_lines
+             WHERE batch_id = ?1 AND state != 'pending' AND result IS NOT NULL ORDER BY line",
+        )?;
+        let rows = statement
+            .query_map([id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(custom_id, result)| Ok((custom_id, serde_json::from_str(&result)?)))
+            .collect()
+    }
+
     /// Refuse a lease another store (another root) granted.
     fn check_lease(&self, lease: &BatchLease) -> Result<()> {
         if Arc::ptr_eq(&self.root, &lease.root) || self.root == lease.root {
@@ -1187,7 +1219,7 @@ fn load(connection: &Connection, id: &str) -> Result<Batch> {
         .into_batch()
 }
 
-fn validate_metadata(metadata: &Metadata) -> Result<()> {
+pub(crate) fn validate_metadata(metadata: &Metadata) -> Result<()> {
     if metadata.len() > MAX_METADATA_PAIRS {
         return Err(invalid(format!(
             "metadata may hold at most {MAX_METADATA_PAIRS} pairs"
@@ -1220,7 +1252,7 @@ fn validate_id(id: &str) -> Result<()> {
 
 /// Create `path` owner-only if needed; refuse a symlink, a non-directory or
 /// one anyone else may use.
-fn private_dir(path: &Path) -> Result<()> {
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Err(error) if error.kind() != ErrorKind::AlreadyExists => return Err(error.into()),
@@ -1238,7 +1270,7 @@ fn private_dir(path: &Path) -> Result<()> {
 
 /// Open (creating owner-only) a lock file, refusing a symlink or a file that
 /// is not the one checked.
-fn private_file(path: &Path) -> Result<File> {
+pub(crate) fn private_file(path: &Path) -> Result<File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(refused(path));

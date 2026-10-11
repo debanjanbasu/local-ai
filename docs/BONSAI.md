@@ -185,6 +185,7 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST`, `GET`, `DELETE` | `/v1/files[/{id}[/content]]` | streamed multipart files |
 | `POST` | `/v1/uploads[/{id}/parts\|complete\|cancel]` | multipart uploads with optional MD5 |
 | `POST`, `GET` | `/v1/batches[/{id}[/cancel]]` | batches of the three text endpoints on the loaded model |
+| `POST`, `GET`, `DELETE` | `/v1/evals[/{id}[/runs[/{run_id}[/cancel\|/output_items[/{item_id}]]]]]` | evals of the loaded model, run through batches |
 | `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
 | `POST` | `/v1/decisions` | always 404, explaining why OpenAI Decisions is not implemented |
 
@@ -725,6 +726,20 @@ preparation and generation blocking tasks, never on runtime workers.
   lock gives one server ownership of a batch. A restart reclaims batches with
   free leases and resumes their unsettled lines. A line interrupted before
   settling is generated again. Result files have stable `batch_output` IDs.
+- **Evals.** An eval has a `custom` data source config and testing criteria;
+  a run reads `jsonl`, `completions` or `responses` data sources from inline
+  `file_content` or an uploaded file (`file_id`), snapshotted at creation.
+  Every model call of a run (sampling, then `label_model` and `score_model`
+  grading, constrained to `{"result": ...}`) is a line of an ordinary batch,
+  so runs share the batch worker's queue, restart resumption and
+  cancellation; an eval worker advances runs at startup, on create or cancel
+  and when the batch worker finishes a batch, without polling. `string_check`
+  and the `text_similarity` metrics `fuzzy_match`, `bleu`, `gleu`, `rouge_1`
+  to `rouge_5` and `rouge_l` are computed to match `rapidfuzz`, `nltk` and
+  `rouge-score`. Refused: `python` graders (no sandbox), `multi` (not an eval
+  criterion), `cosine` (no validated embeddings), `meteor` (no WordNet), model
+  graders or sampling naming another model, and `logs`/`stored_completions`
+  sources.
 
 - **Vector Stores.** Stores, store files, file batches (create, retrieve,
   cancel, list files), parsed file content and `search`, with the contract's
