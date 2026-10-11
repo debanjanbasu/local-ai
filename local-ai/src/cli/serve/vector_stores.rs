@@ -113,6 +113,12 @@ impl VectorStores {
         self.indexer.close();
     }
 
+    /// Wake the indexer after a change outside this adapter (deleting a
+    /// File removes it from every store and queues its index documents).
+    pub(super) fn notify(&self) {
+        self.indexer.notify();
+    }
+
     /// Block until the indexer has caught up with every attach so far.
     #[cfg(test)]
     pub(super) fn wait_idle(&self) {

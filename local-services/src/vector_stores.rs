@@ -6,11 +6,12 @@
 //! The API shape is `OpenAI`'s, but ranking is BM25 over a persistent
 //! [Tantivy](tantivy) index ([`VectorIndex`]; Unicode words, lowercased,
 //! folded to ASCII, English Porter-2 stemming). No embedding model is
-//! involved: pooled hidden states of the server's one Bonsai checkpoint were
-//! measured as retrieval embeddings and lost to BM25 while costing orders of
-//! magnitude more compute (see `docs/BONSAI.md`), so they are not used.
-//! Search therefore matches words, not meaning: a query with no word (after
-//! stemming) in common with a chunk never finds it.
+//! involved, so search matches words, not meaning: a query with no word
+//! (after stemming) in common with a chunk never finds it. Pooled hidden
+//! states of the server's Bonsai checkpoint were measured as retrieval
+//! embeddings and lost to BM25 (see `docs/BONSAI.md`); a dedicated embedding
+//! model would rank through the seam described under "Adding embedding
+//! ranking" below.
 //!
 //! # Files and chunks
 //!
@@ -83,6 +84,27 @@
 //! queries or rerank); the rankers `auto` and `none` both mean plain BM25.
 //! Results are chunk-level, one item per chunk, at most `max_num_results`
 //! (1 to 50), never paged.
+//!
+//! # Adding embedding ranking
+//!
+//! Nothing here computes embeddings, but the design leaves one place for
+//! each piece an embedding ranker would need:
+//!
+//! * **Identity.** A chunk is (attachment, ordinal); its text is a byte
+//!   range of the file text in the database. Embeddings would be keyed the
+//!   same way, so search results, filters and content need no change.
+//! * **Writing.** [`VectorIndex::index_next`] is the one place chunks are
+//!   produced and committed; vectors would be computed and written there,
+//!   under the same outbox protocol (the outbox entry already covers every
+//!   piece of derived data of an attachment until its confirming
+//!   transaction), and removed by [`VectorIndex::collect_garbage`].
+//! * **Ranking.** [`VectorIndex::search`] validates the request, takes one
+//!   database snapshot, resolves the store and its admitted (completed,
+//!   filtered) attachments, and hands only those to one ranking step that
+//!   returns scored chunk keys; the threshold, ordering, truncation and
+//!   reading chunk text are independent of how the scores were made. The
+//!   options it refuses today (`rewrite_query`, the `default-2024-11-15`
+//!   ranker) are refused in one validation step.
 //!
 //! # Attribute filters
 //!
@@ -652,7 +674,7 @@ pub struct RankingOptions {
     pub score_threshold: f64,
 }
 
-/// Input for [`Store::search_vector_store`], the body of
+/// Input for [`VectorIndex::search`], the body of
 /// `POST /vector_stores/{id}/search`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
