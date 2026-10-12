@@ -480,7 +480,8 @@ This is **not the full OpenAI platform contract**. Schema keywords
 llguidance cannot enforce exactly, strict tool schemas the native grammar
 cannot enforce exactly (including any without `"additionalProperties": false`),
 `allowed_tools`, built-in tools other than those of
-[docs/TOOLS.md](TOOLS.md) (`web_search`, `namespace`, MCP and the like),
+[docs/TOOLS.md](TOOLS.md) (MCP, `file_search` and the like; `web_search` is
+accepted but never offered to the model, which cannot search here),
 `include` values other than
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
 `truncation:auto`, log-probabilities, images and audio are rejected.
@@ -534,13 +535,15 @@ the public `metadata` field, which is retained on the response. With
 `--reasoning-key` the encrypted-content request is honoured, and so are
 reasoning summaries and `/responses/compact`, each at the cost of an extra
 generation ([below](#compaction-and-reasoning-summaries)); neither has been
-exercised with Codex itself. Codex's `custom` `apply_patch` and `local_shell`
+exercised with Codex itself. Codex's `custom` `apply_patch` (its Lark
+grammar enforced during decoding), `local_shell` and `namespace` (sub-agent)
 tools are round-tripped for the client to run, and several leading developer
-messages are joined into the template's one system turn; `web_search`,
-`namespace` (sub-agents) and other hosted OpenAI tools are refused, strict
-tools are accepted only when their schemas can be enforced exactly, and the
-constrained tool settings have not been exercised with Codex, so this server
-is **not a drop-in Codex provider** with Codex's default configuration. Codex handles raw `reasoning_text` and
+messages are joined into the template's one system turn; `web_search` is
+accepted but never offered to the model (no search provider), other hosted
+OpenAI tools are refused, and strict tools are accepted only when their
+schemas can be enforced exactly. Codex's default configuration is accepted
+(see the client results below), but with no web search and only this one
+local model it is not equivalent to Codex on OpenAI. Codex handles raw `reasoning_text` and
 summary events separately; raw reasoning is not relabeled as a summary.
 The Oh My Pi example in the engine README configures that client to use only
 implemented capabilities.
@@ -2681,6 +2684,33 @@ tests; no such call occurred in this re-run). Still open: `namespace` and
 `web_search` tools for Codex's default configuration, and Codex's `lark`
 freeform `apply_patch` declaration. Evidence:
 `.amp/in/artifacts/client-compat/merged-main` and `merged-main-nokey`.
+
+**Codex's default configuration** (branch `par-codextools` at c668412,
+2026-10-12; Codex CLI 0.162.1; `tools/client_compat.py --codex-default-config`,
+so every `codex-*` scenario sent Codex's default tools: `exec_command` and
+friends, the `multi_agent_v1` sub-agent `namespace`, goals and `web_search`).
+`namespace` tools are now offered as `NAMESPACE.NAME` functions and reported
+with their `namespace`; `web_search` is accepted but never offered (no search
+provider, so the model is never told it can search and no `web_search_call`
+is reported); `custom` tools take Lark grammars with a regular language,
+which covers Codex's freeform `apply_patch` grammar verbatim
+([docs/TOOLS.md](TOOLS.md)).
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| codex-fix (default config) | PASS | 5 requests, 113 s, tests pass, test file untouched |
+| codex-read + `exec resume --last` (default config) | PASS | `42`, then `7` |
+| codex-fix-xhigh (default config) | PASS | 8 requests, 146 s, 8 tool results |
+| codex-default-config | PASS | `42`, then `7` |
+| http-custom-tool-apply-patch | PASS | Codex's grammar, call forced: `*** Begin Patch\n*** Add File: "hello.txt"\n+hi\n*** End Patch` (the grammar admits the quoted file name; it constrains form, not judgment) |
+| http-namespace-tool / http-web-search-tool | PASS | 200 |
+
+The model never chose a sub-agent tool in these tasks, so a namespaced call
+has been exercised by unit tests only. Codex declares its freeform
+`apply_patch` only for catalog models marked freeform, so the Codex runs above
+edited files through `exec_command`; the probe sends Codex's declaration
+itself. Evidence: `.amp/in/artifacts/client-compat/codextools` in that
+worktree.
 
 #### Long-context coding quality (2026-10-11, server at `d2cad1b`)
 

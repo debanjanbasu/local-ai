@@ -1479,8 +1479,9 @@ fn function_tool(tool: &Value) -> crate::Result<ToolDefinition> {
     if kind != "function" {
         return Err(unsupported(
             &format!("tool type {kind:?}"),
-            "only function, custom, local_shell, apply_patch and (with server permission) shell \
-             tools run here; other built-in and MCP tools need hosted services",
+            "only function, custom, namespace, local_shell, apply_patch and (with server \
+             permission) shell tools run here, and web_search is accepted but never offered; \
+             other built-in and MCP tools need hosted services",
         ));
     }
     let name = tool
