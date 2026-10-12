@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -135,6 +138,24 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(ce.cold_prefill([first, warm], stages), (250_000, 4_200.0))
         self.assertIsNone(ce.cold_prefill([first, warm], stages[:1]))  # a prefix nobody measured
         self.assertIsNone(ce.cold_prefill([warm], []))
+
+
+class StopTest(unittest.TestCase):
+    def test_server_is_interrupted_before_it_is_terminated(self):
+        # The server finishes its prompt-cache writes only on SIGINT.
+        child = (
+            "import signal, sys, time\n"
+            "signal.signal(signal.SIGINT, lambda *_: (print('interrupted', flush=True), sys.exit(0)))\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        server = ce.LocalServer(Path(sys.executable), 0, Path(os.devnull), [])
+        server.process = subprocess.Popen([sys.executable, "-c", child], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(server.process.stdout.readline().strip(), "ready")
+        ce.stop_server(server, 10)
+        self.assertEqual(server.process.stdout.read().strip(), "interrupted")
+        self.assertEqual(server.process.returncode, 0)
+        server.process.stdout.close()
 
 
 class StageTest(unittest.TestCase):
