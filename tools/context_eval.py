@@ -465,13 +465,37 @@ def stage_prefix(system: str, effort: str, tokens: int) -> str:
     return rendered[: at + 1]
 
 
+def prompt_cache_dir() -> Path:
+    """Where `local-ai serve`, started with this process's HOME, keeps disk snapshots."""
+    return Path(os.environ["HOME"]) / "Library/Caches/local-ai/prompt-cache"
+
+
+def wait_for_snapshot(root: Path, tokens: int, deadline: float = 600.0, interval: float = 2.0) -> str | None:
+    """The committed disk snapshot of `tokens` prompt tokens, once it exists.
+
+    The server writes it in the background after answering and reports the
+    commit nowhere but the file system (`<tokens>-<digest>.bpc`, renamed into
+    place when complete), so this polls the directory, bounded by `deadline`.
+    Stopping the server before then would drop a queued write.
+    """
+    started = time.monotonic()
+    while True:
+        found = sorted(root.glob(f"*/{tokens}-*.bpc"))
+        if found:
+            return str(found[0])
+        if time.monotonic() - started >= deadline:
+            print(f"no {tokens}-token snapshot under {root} after {deadline:.0f}s", flush=True)
+            return None
+        time.sleep(interval)
+
+
 def run_stage(port: int, out: Path, size: str, seed: int, effort: str, tokens: int) -> None:
     results, stages = out / "results.jsonl", out / "stages.jsonl"
     if any(k[:3] == (size, seed, effort) for k in done_keys(results)):
         return  # the group's questions have started; its prompt is cached past any stage
     finished = [json.loads(x) for x in stages.read_text().splitlines()] if stages.exists() else []
     if any((r["size"], r["seed"], r["effort"], r["stage_tokens"]) == (size, seed, effort, tokens)
-           and r["status"] == 200 for r in finished):
+           and r["status"] == 200 and r.get("snapshot") for r in finished):
         return
     system, _ = build_context(seed, size, make_needles(seed))
     prompt = stage_prefix(system, effort, tokens)
@@ -484,8 +508,10 @@ def run_stage(port: int, out: Path, size: str, seed: int, effort: str, tokens: i
         "error": payload.get("error"), "prompt_chars": len(prompt), "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens") or 0, "cache_source": details.get("cache_source"),
         "prefill_seconds": timings.get("prefill_seconds") or 0, "wall_seconds": payload["_wall_seconds"],
-        "finished_at": time.time(),
     }
+    if row["status"] == 200:
+        row["snapshot"] = wait_for_snapshot(prompt_cache_dir(), (row["prompt_tokens"] or 1) - 1)
+    row["finished_at"] = time.time()
     with stages.open("a") as handle:
         handle.write(json.dumps(row) + "\n")
     print(f"{size:>5} seed{seed} {effort:5} stage {tokens}: HTTP {row['status']} prompt={row['prompt_tokens']} "
@@ -586,12 +612,27 @@ def report(out: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def stop_server(server: LocalServer, grace: float) -> None:
+    """Stop `local-ai serve` with SIGINT, its graceful shutdown, which drops
+    the engine and so finishes queued prompt-cache disk writes; SIGTERM ends
+    the process at once and loses them (a staged prefix among them). After
+    `grace` seconds fall back to `LocalServer.stop` (SIGTERM, then SIGKILL)."""
+    process = server.process
+    if process and process.poll() is None:
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(grace)
+        except subprocess.TimeoutExpired:
+            pass
+    server.stop()
+
+
 def stop_server_on_sigterm(server: LocalServer) -> None:
     """A bounding `timeout` must not orphan the server: worker threads blocked
     on long requests would keep `finally` from running, so stop it directly."""
 
     def handler(signum, _frame):
-        server.stop()
+        stop_server(server, 30)
         os._exit(128 + signum)
 
     signal.signal(signal.SIGTERM, handler)
@@ -644,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
                         run_group(args.port, args.out, size, seed, effort, args.concurrency)
     finally:
         if server:
-            server.stop()
+            stop_server(server, 300)
     print(report(args.out), end="")
     return 0
 
