@@ -899,6 +899,21 @@ kernel void bo_attn_split_tensor(
     }
 }
 
+// Four int8 codes (one little-endian word) times an F16 scale, each rounded
+// once to half: bitwise half(float(code) * float(scale)), checked for every
+// code against every finite and non-finite scale. The code enters as the
+// exact half 1024 + (code + 128) by OR-ing the biased byte into the mantissa
+// (integer-to-float conversion is quarter rate), then 1152 is subtracted
+// exactly; the float product of an 8-bit code and an 11-bit significand is
+// exact, so the half multiply's single rounding is that conversion's.
+static inline half4 bonsai_q8_dequant4(uint word, half scale) {
+    const uint biased = word ^ 0x80808080u;
+    const half2 even = as_type<half2>((biased & 0x00FF00FFu) | 0x64006400u) - half2(1152.0h);
+    const half2 odd = as_type<half2>(((biased >> 8) & 0x00FF00FFu) | 0x64006400u) - half2(1152.0h);
+    const half2 low = even * scale, high = odd * scale;
+    return half4(low.x, high.x, low.y, high.y);
+}
+
 // Bytes per cached token row of a quantized format.
 // Dequantize `count` (<= NK) tokens of one KV head from a Q8 cache into a half
 // tile of NK x 256, eight values per thread step: one 8-byte load of int8s and
@@ -924,12 +939,9 @@ static inline void bonsai_kv_tile(
     }
     for (uint j = 0; j < per_thread; ++j) {
         const uint chunk = tid + j * 128, offset = (chunk / 32) * 256 + (chunk % 32) * 8;
-        const float scale = float(scales[j]);
-        const float4 low = float4(as_type<char4>(codes[j].x));
-        const float4 high = float4(as_type<char4>(codes[j].y));
         threadgroup half4 *out = reinterpret_cast<threadgroup half4 *>(tile + offset);
-        out[0] = half4(low * scale);
-        out[1] = half4(high * scale);
+        out[0] = bonsai_q8_dequant4(codes[j].x, scales[j]);
+        out[1] = bonsai_q8_dequant4(codes[j].y, scales[j]);
     }
 }
 
