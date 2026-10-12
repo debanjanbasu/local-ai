@@ -29,6 +29,8 @@ split over several bounded runs of the shared GPU lock:
 
     lockf -k /tmp/local-ai-gpu.lock tools/context_eval.py --sizes 8k --seeds 0,1,2
     lockf -k /tmp/local-ai-gpu.lock tools/context_eval.py --sizes 32k --seeds 0,1
+    HOME=$PWD/.scratch/home-250k-s0 lockf -k /tmp/local-ai-gpu.lock \
+        tools/context_eval.py --sizes 250k --seeds 0 --efforts xhigh --stage-tokens 120000
     tools/context_eval.py --report            # tables from the JSONL, no server
     tools/context_eval.py --dry-run --sizes 8k  # write prompts, no server
 
@@ -351,8 +353,12 @@ def chat(port: int, system: str, question: str, effort: str, seed: int) -> dict:
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": question}],
         "reasoning_effort": effort, "temperature": 0, "seed": seed, "max_tokens": MAX_TOKENS[effort],
     }
+    return post(port, "/v1/chat/completions", body)
+
+
+def post(port: int, path: str, body: dict) -> dict:
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"}
+        f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(), {"Content-Type": "application/json"}
     )
     started = time.monotonic()
     try:
@@ -394,14 +400,96 @@ def record(size: str, seed: int, effort: str, needle: Needle, payload: dict, con
     }
 
 
-def done_keys(path: Path) -> set[tuple]:
+def key(row: dict) -> tuple:
+    return (row["size"], row["seed"], row["effort"], row["task"], row["position"])
+
+
+def infrastructure_error(row: dict) -> bool:
+    """An HTTP failure says nothing about the model; the item is asked again."""
+    return row["why"].startswith("HTTP ")
+
+
+def load_rows(path: Path) -> list[dict]:
+    """One row per item: its last answered attempt, else its last attempt."""
     if not path.exists():
-        return set()
-    keys = set()
+        return []
+    rows: dict[tuple, dict] = {}
     for line in path.read_text().splitlines():
         row = json.loads(line)
-        keys.add((row["size"], row["seed"], row["effort"], row["task"], row["position"]))
-    return keys
+        previous = rows.get(key(row))
+        if previous is None or infrastructure_error(previous) or not infrastructure_error(row):
+            rows[key(row)] = row
+    return list(rows.values())
+
+
+def done_keys(path: Path) -> set[tuple]:
+    return {key(row) for row in load_rows(path) if not infrastructure_error(row)}
+
+
+# ---------------------------------------------------------------- staged prefill
+#
+# A cold ~250K group prefills for well over one bounded GPU-lock hold, and a
+# request cut short by the end of a hold leaves nothing in the prompt cache.
+# Staging prefills a token-exact prefix of the group's rendered chat prompt as
+# a raw completion instead: its request-tail snapshot (prompt minus its last
+# token) goes to the disk tier, the next hold's server restores it and extends
+# it, and the group's first chat question restores the longest stage. A disk
+# snapshot larger than the automatic budget is still kept while it is the only
+# one, so each group needs its own prompt-cache directory (run the server with
+# its own HOME) or a later snapshot evicts the stage.
+
+# The template's xhigh instruction (local-engine/src/bonsai_tokenizer.rs),
+# placed ahead of the system message; `none` adds no system text.
+REASONING_INSTRUCTION = (
+    "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+    "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer."
+)
+
+
+def rendered_system(system: str, effort: str) -> str:
+    """The rendered chat prompt up to the end of the system message's text."""
+    if effort == "none":
+        return f"<|im_start|>system\n{system}"
+    if effort == "xhigh":
+        return f"<|im_start|>system\n{REASONING_INSTRUCTION}\n\n{system}"
+    raise ValueError(f"staging supports efforts none and xhigh, not {effort}")
+
+
+def stage_prefix(system: str, effort: str, tokens: int) -> str:
+    """About `tokens` of the rendered prompt, cut just before a `FILE` header
+    so the cut text tokenizes as a prefix of the whole prompt."""
+    rendered = rendered_system(system, effort)
+    at = rendered.find("\nFILE ", int(tokens * CHARS_PER_TOKEN))
+    if at < 0:
+        raise ValueError(f"no file boundary after {tokens} tokens in a {len(rendered):,}-character prompt")
+    return rendered[: at + 1]
+
+
+def run_stage(port: int, out: Path, size: str, seed: int, effort: str, tokens: int) -> None:
+    results, stages = out / "results.jsonl", out / "stages.jsonl"
+    if any(k[:3] == (size, seed, effort) for k in done_keys(results)):
+        return  # the group's questions have started; its prompt is cached past any stage
+    finished = [json.loads(x) for x in stages.read_text().splitlines()] if stages.exists() else []
+    if any((r["size"], r["seed"], r["effort"], r["stage_tokens"]) == (size, seed, effort, tokens)
+           and r["status"] == 200 for r in finished):
+        return
+    system, _ = build_context(seed, size, make_needles(seed))
+    prompt = stage_prefix(system, effort, tokens)
+    payload = post(port, "/v1/completions", {"prompt": prompt, "max_tokens": 1, "temperature": 0, "seed": seed})
+    usage = payload.get("usage") or {}
+    timings = payload.get("timings") or {}
+    details = usage.get("prompt_tokens_details") or {}
+    row = {
+        "size": size, "seed": seed, "effort": effort, "stage_tokens": tokens, "status": payload["_status"],
+        "error": payload.get("error"), "prompt_chars": len(prompt), "prompt_tokens": usage.get("prompt_tokens"),
+        "cached_tokens": details.get("cached_tokens") or 0, "cache_source": details.get("cache_source"),
+        "prefill_seconds": timings.get("prefill_seconds") or 0, "wall_seconds": payload["_wall_seconds"],
+        "finished_at": time.time(),
+    }
+    with stages.open("a") as handle:
+        handle.write(json.dumps(row) + "\n")
+    print(f"{size:>5} seed{seed} {effort:5} stage {tokens}: HTTP {row['status']} prompt={row['prompt_tokens']} "
+          f"cached={row['cached_tokens']} ({row['cache_source']}) prefill={row['prefill_seconds']:.0f}s", flush=True)
 
 
 def run_group(port: int, out: Path, size: str, seed: int, effort: str, concurrency: int) -> None:
@@ -433,10 +521,35 @@ def run_group(port: int, out: Path, size: str, seed: int, effort: str, concurren
         list(pool.map(lambda job: run(job, width), jobs[1:]))
 
 
+def wilson(passed: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval of a pass rate."""
+    if not total:
+        return 0.0, 1.0
+    p = passed / total
+    centre = (p + z * z / (2 * total)) / (1 + z * z / total)
+    half = z * ((p * (1 - p) / total + z * z / (4 * total * total)) ** 0.5) / (1 + z * z / total)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def cold_prefill(items: list[dict], stages: list[dict]) -> tuple[int, float] | None:
+    """(prompt tokens, seconds) of one group's whole prefill: its staged
+    prefixes plus the first question's own prefill, or None when it reused a
+    prompt cache it did not build (a rerun after the questions started)."""
+    first = max(items, key=lambda r: r["prompt_tokens"] - r["cached_tokens"])
+    staged = sum(s["prefill_seconds"] for s in stages if s["status"] == 200)
+    covered = max([s["prompt_tokens"] or 0 for s in stages if s["status"] == 200], default=0)
+    if first["prompt_tokens"] - first["cached_tokens"] <= 1000 or first["cached_tokens"] > covered + 1000:
+        return None
+    return first["prompt_tokens"], staged + first["prefill_seconds"]
+
+
 def report(out: Path) -> str:
-    rows = [json.loads(x) for x in (out / "results.jsonl").read_text().splitlines()] if (out / "results.jsonl").exists() else []
+    rows = [r for r in load_rows(out / "results.jsonl") if not infrastructure_error(r)]
+    stage_path = out / "stages.jsonl"
+    stages = [json.loads(x) for x in stage_path.read_text().splitlines()] if stage_path.exists() else []
     order = list(SIZES)
-    lines = ["| Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All | Cold prefill tok/s | Decode tok/s (median) | Median wall s |",
+    lines = [("| Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All (95% CI) "
+              "| Cold prefill tok/s (s) | Warm decode tok/s, median | Warm wall s, median |"),
              "| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |"]
     groups: dict[tuple, list] = {}
     for row in rows:
@@ -450,17 +563,26 @@ def report(out: Path) -> str:
         return values[len(values) // 2] if values else None
 
     for (size, effort), items in sorted(groups.items(), key=lambda kv: (order.index(kv[0][0]), kv[0][1])):
-        seeds = ",".join(str(s) for s in sorted({r["seed"] for r in items}))
+        seed_list = sorted({r["seed"] for r in items})
         prompts = [r["prompt_tokens"] for r in items]
-        cold = [r["prefill_tok_s"] for r in items if r["prompt_tokens"] - r["cached_tokens"] > 1000]
-        decode = median([r["decode_tok_s"] for r in items])
-        wall = median([r["wall_seconds"] for r in items])
+        colds = []
+        for seed in seed_list:
+            group = [r for r in items if r["seed"] == seed]
+            staged = [s for s in stages if (s["size"], s["seed"], s["effort"]) == (size, seed, effort)]
+            cold = cold_prefill(group, staged)
+            if cold:
+                colds.append(f"{cold[0] / cold[1]:.0f} ({cold[1]:,.0f}{', staged' if staged else ''})")
+        warm = [r for r in items if r["prompt_tokens"] - r["cached_tokens"] <= 1000]
+        decode = median([r["decode_tok_s"] for r in warm])
+        wall = median([r["wall_seconds"] for r in warm])
+        passed = sum(r["passed"] for r in items)
+        low, high = wilson(passed, len(items))
         lines.append(
-            f"| {size} | {effort} | {seeds} | {min(prompts):,}–{max(prompts):,} | "
+            f"| {size} | {effort} | {','.join(map(str, seed_list))} | {min(prompts):,}–{max(prompts):,} | "
             + " | ".join(frac([r for r in items if r["task"] == t]) for t in ("recall", "lookup", "fix")) + " | "
             + " | ".join(frac([r for r in items if r["position"] == p]) for p in POSITIONS)
-            + f" | {frac(items)} | {', '.join(f'{c:.0f}' for c in cold) or '-'} | "
-            f"{decode if decode is not None else '-'} | {wall:.0f} |")
+            + f" | {frac(items)} ({low:.0%}–{high:.0%}) | {'; '.join(colds) or '-'} | "
+            f"{decode if decode is not None else '-'} | {f'{wall:.1f}' if wall is not None else '-'} |")
     return "\n".join(lines) + "\n"
 
 
@@ -485,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--efforts", default="none,xhigh")
     parser.add_argument("--concurrency", type=int, default=3, help="parallel follow-up questions per group")
     parser.add_argument("--out", type=Path, default=ROOT / ".scratch/artifacts/context-eval")
+    parser.add_argument("--stage-tokens", type=int, default=0,
+                        help="only prefill this many tokens of each group's prompt as a staged prefix (see run_stage)")
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -514,7 +638,10 @@ def main(argv: list[str] | None = None) -> int:
         for size in sizes:
             for seed in seeds:
                 for effort in efforts:
-                    run_group(args.port, args.out, size, seed, effort, args.concurrency)
+                    if args.stage_tokens:
+                        run_stage(args.port, args.out, size, seed, effort, args.stage_tokens)
+                    else:
+                        run_group(args.port, args.out, size, seed, effort, args.concurrency)
     finally:
         if server:
             server.stop()
