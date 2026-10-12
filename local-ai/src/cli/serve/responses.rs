@@ -59,7 +59,7 @@
 //!   second, short generation of the same model after the first ends, which
 //!   summarizes the raw reasoning into the reasoning item's `summary` with
 //!   the `response.reasoning_summary_*` events; the item's `output_item.done`
-//!   waits for it. Not with `background`.
+//!   waits for it. A background job journals each piece as it is generated.
 //! - Compaction (`POST /v1/responses/compact`, and `context_management`
 //!   compaction here) summarizes older items with the same model and keeps
 //!   the rest verbatim (policy: [`local_services::compaction`]; prompts:
@@ -69,8 +69,10 @@
 //!   the items after it; anything before it is skipped. With
 //!   `context_management`, a prompt that reaches `compact_threshold`, or that
 //!   leaves less than `max_output_tokens` of the context, is compacted before
-//!   generation and the compaction item is the Response's first output item.
-//!   Not with `background`.
+//!   generation and the compaction item is the Response's first output item;
+//!   for `background`, before the job is admitted, and a resumed job reuses
+//!   the item its record holds. Both extra generations' tokens are added to
+//!   `usage` (see [`Spent`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
