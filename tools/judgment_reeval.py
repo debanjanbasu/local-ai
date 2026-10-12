@@ -701,7 +701,10 @@ def verify_calibration_artifact(artifact: dict, head_sha256: str, gate_sha256: s
 
 
 def markdown(report: dict, title: str) -> str:
-    text = jc.markdown(dict(report, calibration=report["calibration"],
+    flat_cv = {f"{family}/{method}": value
+               for family, methods in report["cross_validated_nll"].items()
+               for method, value in methods.items()}
+    text = jc.markdown(dict(report, cross_validated_nll=flat_cv,
                             threshold=report["thresholds"]), title)
     lines = ["", "| Split | Group | Rows | Accuracy | Coverage@τ | Risk@τ |",
              "|---|---|---:|---:|---:|---:|"]

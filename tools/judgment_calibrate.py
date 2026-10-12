@@ -394,9 +394,14 @@ EX_OSERR = 71
 
 
 def capture(requests: Path, work: Path, binary: Path, chunk_rows: int,
-            max_chunks: int | None = None, lock: str | None = LOCK, runner=subprocess.run) -> dict:
+            max_chunks: int | None = None, lock: str | None = LOCK, runner=subprocess.run,
+            lock_wait: int | None = None) -> dict:
     """Capture `requests` in chunks with `judgment-capture`, one bounded GPU-lock hold
-    per chunk; a chunk is skipped once its `.done.json` exists, so runs resume."""
+    per chunk; a chunk is skipped once its `.done.json` exists, so runs resume.
+
+    `timeout` bounds waiting plus running; `lock_wait` (`lockf -t`) additionally
+    gives up a chunk that waited that long for the shared lock *before* it starts,
+    so a long queue fails the chunk cleanly instead of killing it mid-run."""
     work.mkdir(parents=True, exist_ok=True)
     chunks = chunk_requests(requests, chunk_rows)
     binary_sha256 = sha256_file(binary) if binary.is_file() else None
@@ -417,7 +422,8 @@ def capture(requests: Path, work: Path, binary: Path, chunk_rows: int,
             target.rmdir()
         command = [str(binary), "--out", str(target), str(source)]
         if lock:  # one bounded lock hold per chunk
-            command = ["timeout", str(LOCK_HOLD_SECONDS), "lockf", "-k", lock] + command
+            wait = [] if lock_wait is None else ["-t", str(lock_wait)]
+            command = ["timeout", str(LOCK_HOLD_SECONDS), "lockf", "-k", *wait, lock] + command
         result = _run_chunk(runner, command, work / f"{name}.log")
         if result.returncode != 0:
             raise CalibrateError(f"{name} failed ({result.returncode}); see {name}.log")
@@ -1087,6 +1093,9 @@ def main(argv=None) -> int:
     p.add_argument("--binary", type=Path, default=Path("target/release/judgment-capture"))
     p.add_argument("--chunk-rows", type=int, default=32)
     p.add_argument("--max-chunks", type=int)
+    p.add_argument("--lock-wait", type=int,
+                   help="seconds a chunk may wait for the GPU lock before it is given up "
+                        "(lockf -t); must leave time to run within the 1800 s timeout")
     p.add_argument("--merge", type=Path, help="merge finished chunks into this directory")
     p = sub.add_parser("score")
     p.add_argument("--head", type=Path, required=True)
@@ -1120,7 +1129,8 @@ def main(argv=None) -> int:
     elif args.command == "rerender":
         result = rerender(args.rows, args.out, args.sample, args.set)
     elif args.command == "capture":
-        result = capture(args.requests, args.work, args.binary, args.chunk_rows, args.max_chunks)
+        result = capture(args.requests, args.work, args.binary, args.chunk_rows, args.max_chunks,
+                         lock_wait=args.lock_wait)
         if args.merge and not result["remaining"]:
             result["merged"] = merge(args.work, args.merge)
     elif args.command == "score":
