@@ -395,3 +395,16 @@ declared family, A5 on `ood2`. One `judgment_reeval.py evaluate` run fits on
 CAL and scores TEST and OOD once; nothing is refitted after. If any
 criterion fails, `/v1/decisions` stays refused. Nothing here bears on MTP or
 coding quality.
+
+#### Frozen before scoring (appended to 3a, nothing above edited)
+
+- `devtools-v2` head (`judgment_train.py`, frozen config, CPU torch):
+  `34d0708873125c09aa59f444d7c40e64ac2af8b81ca989c7970ace9e67c83b81`; epoch 8
+  of 40 by validation NLL (0.4173 on 250 validation rows). Training directory
+  manifest `a1b7fa3a…85b2cc` (4,001 rows: train 3,338 = 1,472 CodeReviewer +
+  1,866 CommitPackFT; validation 250; trainer bookkeeping 413), assembled with
+  the role file above from the stored devtools-v1 features and the finished
+  `cr-v2`/`cm-v2` capture chunks holding their train/validation rows (the
+  same rows, in the same order, as the merged directories).
+- Gate: `9a5a4eb811822e4d1c64dde6006b9d92f7f0d5ebeb757d8b99e113e7d21f4fb1`
+  (64 components, fitted on the 3,338 training rows only).
