@@ -1484,7 +1484,8 @@ static inline void bonsai_attn_tensor_rows_q8_impl(
     device float *query, device const uchar *key, device const uchar *value,
     device float *output, uint position, uint tokens, uint stride,
     uint group, uint tid, threadgroup half *tile, threadgroup float *scores,
-    threadgroup float *correction, threadgroup float *maximum, threadgroup float *denominator
+    threadgroup float *correction, threadgroup float *maximum, threadgroup float *denominator,
+    threadgroup uint *rescaled
 ) {
     constexpr int nq = 8, nk = 32, dimension = 256;
     constexpr uint nt = (6 * TOKENS + 7) / 8;
@@ -1514,6 +1515,8 @@ static inline void bonsai_attn_tensor_rows_q8_impl(
     }
     for (uint start = 0; start < end; start += nk) {
         const uint count = min(uint(nk), end - start);
+        // Ordered after the previous tile's read by its closing barrier.
+        if (tid == 0) rescaled[0] = 0;
         bonsai_kv_tile<nk>(key, start, count, kv_head, tile, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto k = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
@@ -1526,38 +1529,46 @@ static inline void bonsai_attn_tensor_rows_q8_impl(
             const uint r = 8 * j + row;
             const uint prefix = min(first_prefix + r / 6, end);
             const uint limit = prefix > start ? min(count, prefix - start) : 0;
+            // Each lane owns columns lane and lane + 16, written out in the
+            // loop order of bonsai_attn_rows_softmax (same values and sums):
+            // with the loops, skipping the rescale below gained 1%, not 4-5%.
             threadgroup float *s = scores + j * nq * nk;
-            float peak = -INFINITY;
-            for (uint column = lane; column < uint(nk); column += 16) {
-                const uint i = row * nk + column;
-                const float score = column < limit ? s[i] * (1.0f / 16.0f) : -INFINITY;
-                s[i] = score;
-                peak = max(peak, score);
-            }
+            const uint i0 = row * nk + lane, i1 = i0 + 16;
+            const float s0 = lane < limit ? s[i0] * (1.0f / 16.0f) : -INFINITY;
+            s[i0] = s0;
+            const float s1 = lane + 16 < limit ? s[i1] * (1.0f / 16.0f) : -INFINITY;
+            s[i1] = s1;
+            float peak = max(max(-INFINITY, s0), s1);
             for (ushort mask = 8; mask != 0; mask >>= 1) peak = max(peak, simd_shuffle_xor(peak, mask));
             const float next_maximum = max(maximum[r], peak);
             const float old_scale = exp(maximum[r] - next_maximum);
             float sum = 0.0f;
-            for (uint column = lane; column < uint(nk); column += 16) {
-                const uint i = row * nk + column;
-                const float weight = exp(s[i] - next_maximum);
-                s[i] = weight;
-                sum += weight;
-            }
+            const float w0 = exp(s[i0] - next_maximum);
+            s[i0] = w0;
+            sum += w0;
+            const float w1 = exp(s[i1] - next_maximum);
+            s[i1] = w1;
+            sum += w1;
             for (ushort mask = 8; mask != 0; mask >>= 1) sum += simd_shuffle_xor(sum, mask);
             if (lane == 0) {
                 correction[r] = old_scale;
                 maximum[r] = next_maximum;
                 denominator[r] = fma(denominator[r], old_scale, sum);
+                if (old_scale != 1.0f) rescaled[0] = 1;
             }
         }
         // K is dead once the scores exist; V replaces it after the softmax.
         bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto v = tensor(tile, dextents<int32_t, 2>(dimension, count), array<int, 2>({1, dimension}));
-        #pragma clang loop unroll(full)
-        for (ushort i = 0; i < acc.get_capacity(); ++i) {
-            if (acc.is_valid_element(i)) acc[i] *= correction[acc.get_multidimensional_index(i)[1]];
+        // Once every row's running maximum holds, each correction is exactly
+        // 1 and multiplying by it is the identity: at long prefixes almost
+        // every tile skips the per-element correction loads and multiplies.
+        if (rescaled[0] != 0) {
+            #pragma clang loop unroll(full)
+            for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                if (acc.is_valid_element(i)) acc[i] *= correction[acc.get_multidimensional_index(i)[1]];
+            }
         }
         auto probabilities = tensor(scores, dextents<int32_t, 2>(count, m), array<int, 2>({1, nk}));
         pv.run(probabilities, v, acc);
@@ -1590,8 +1601,9 @@ kernel void bo_attn_tensor_rows_q8(
     constexpr uint tokens_per_group = 4, m = (6 * tokens_per_group + 7) / 8 * 8;
     threadgroup half tile[32 * 256];
     threadgroup float scores[m * 32], correction[m], maximum[m], denominator[m];
+    threadgroup uint rescaled[1];
     bonsai_attn_tensor_rows_q8_impl<tokens_per_group>(query, key, value, output, position,
-        tokens, stride, group, tid, tile, scores, correction, maximum, denominator);
+        tokens, stride, group, tid, tile, scores, correction, maximum, denominator, rescaled);
 }
 
 #endif
