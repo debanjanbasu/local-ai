@@ -281,10 +281,15 @@ Weights are not included. The runtime validates these pinned files:
 | --- | ---: | --- | --- |
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` | always |
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | for MTP speculation |
+| `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | for `POST /v1/embeddings` |
+| `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
 
 The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
 not: without it speculation falls back to suffix lookup alone and the startup
-policy says why.
+policy says why. The EmbeddingGemma 2 text encoder is optional too: it is
+converted from the Kaggle checkpoint by `tools/convert_embeddinggemma2.py`, and
+when installed the server adds `POST /v1/embeddings`
+([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)).
 
 The GGUF repository is pinned. Its head has moved past `6ed5e12b`, so keep the
 pin rather than tracking the branch.
@@ -427,6 +432,8 @@ is 1.074x and the best measured result 1.29%.
 - `local-metal`, `shaders`: Metal dispatch code, kernels, and GPU tests.
 - `tools`: Kaggle staging and installation helpers and tests.
 - `docs/BONSAI.md`: technical reference and measurements.
+- `docs/EMBEDDINGS.md`: the optional native EmbeddingGemma 2 text encoder
+  and `POST /v1/embeddings`.
 
 ## Verification
 
