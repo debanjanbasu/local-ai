@@ -155,6 +155,21 @@ class HardV1JobTests(unittest.TestCase):
                     kj.stage_hard_v1_job("o/s", Path(tmp) / "bad", hf_secret=bad)
             self.assertFalse((Path(tmp) / "bad").exists())
 
+    def test_public_data_stage_is_private_cpu_internet_and_pins_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = kj.stage_public_data_job("owner/public-data", Path(tmp) / "stage")
+            script = (out / "convert.py").read_text(encoding="utf-8")
+            metadata = json.loads((out / "kernel-metadata.json").read_text())
+            compile(script, "convert.py", "exec")
+            self.assertTrue(metadata["is_private"])
+            self.assertFalse(metadata["enable_gpu"])
+            self.assertTrue(metadata["enable_internet"])
+            self.assertEqual(metadata["dataset_sources"], [])
+            self.assertIn(kj.ZENODO_CR_SHA256, script)
+            self.assertIn(kj.COMMITPACK[1], script)
+            self.assertNotIn("secret", script.lower())
+            self.assertIn("import shutil\n", script)
+
     def test_cpu_requirements_drop_only_the_cuda_stack(self) -> None:
         exported = "numpy==2.5.3\ntorch==2.8.0 ; sys_platform == 'linux'\ntriton==3.4.0\n" \
                    "nvidia-cublas-cu12==12.8.4.1\ntorchvision-extra==1\n"

@@ -409,6 +409,169 @@ def stage_hard_v1_job(kernel: str, output: Path, *, hf_secret: str = "HF_TOKEN",
     return staged
 
 
+# ---------------------------------------------------------------------------
+# public data fetch for the decisions re-evaluation (CPU, internet, no secret)
+# ---------------------------------------------------------------------------
+
+ZENODO_CR_URL = "https://zenodo.org/records/6900648/files/Diff_Quality_Estimation.zip?download=1"
+ZENODO_CR_SHA256 = "86d054de47741cb358c8a17ab55b6191356fc63e44010c864dd790481f41fff5"
+ZENODO_CR_MEMBERS = {
+    "cls-valid.jsonl": "ca2725be072cb37c92979e83835d7b0b73f3631a102fc644b94d1ca84f87ad33",
+    "cls-test.jsonl": "de62a2cea9f6d746b658266af5fa45debaa0f8e442c35f7a2849cf1c547d5d9c",
+}
+COMMITPACK = ("bigcode/commitpackft", "fc56fe33c030c6daa414c2b112c932b8eed085e6")
+# Kev devtools-v1's 12 languages plus languages Kev never sampled (diversity).
+COMMITPACK_LANGS = ("python", "javascript", "typescript", "java", "go", "rust", "c", "c++",
+                    "c#", "ruby", "php", "shell", "kotlin", "swift", "scala", "haskell",
+                    "lua", "perl", "dart", "elixir")
+PERMISSIVE = ("mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc", "cc0-1.0",
+              "unlicense")
+PUBLIC_OUTPUT = "public-data"
+
+PUBLIC_JOB = r"""
+import difflib
+import gzip
+import hashlib
+import shutil
+import time
+import zipfile
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+out = Path("/kaggle/working") / OUTPUT_NAME
+out.mkdir(parents=True, exist_ok=True)
+scratch = Path("/tmp/public-data")
+scratch.mkdir(parents=True, exist_ok=True)
+summary = {"errors": [], "zenodo": {}, "commitpackft": {}}
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 22), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download(url, path, attempts=5):
+    # Bounded retries with a fixed backoff: a plain HTTP download has no event to wait on.
+    for attempt in range(attempts):
+        try:
+            with urlopen(Request(url, headers={"User-Agent": "local-ai-decisions"}),
+                         timeout=600) as response, open(path, "wb") as handle:
+                while True:
+                    block = response.read(1 << 22)
+                    if not block:
+                        return
+                    handle.write(block)
+        except OSError:
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(30)
+
+
+def gzip_copy(source, target):
+    with open(source, "rb") as src, gzip.GzipFile(target, "wb", mtime=0) as dst:
+        for block in iter(lambda: src.read(1 << 22), b""):
+            dst.write(block)
+
+
+archive = scratch / "zenodo.zip"
+download(ZENODO_CR_URL, archive)
+summary["zenodo"]["sha256"] = sha256_file(archive)
+if summary["zenodo"]["sha256"] != ZENODO_CR_SHA256:
+    summary["errors"].append("zenodo archive sha256 mismatch")
+else:
+    with zipfile.ZipFile(archive) as bundle:
+        summary["zenodo"]["names"] = [(i.filename, i.file_size) for i in bundle.infolist()]
+        for name, expected in sorted(ZENODO_CR_MEMBERS.items()):
+            matches = [i for i in bundle.infolist() if i.filename.split("/")[-1] == name]
+            if len(matches) != 1:
+                summary["errors"].append(name + ": not exactly one member")
+                continue
+            target = scratch / name
+            with bundle.open(matches[0]) as src, open(target, "wb") as dst:
+                for block in iter(lambda: src.read(1 << 22), b""):
+                    dst.write(block)
+            digest = sha256_file(target)
+            summary["zenodo"][name] = digest
+            if digest != expected:
+                summary["errors"].append(name + ": sha256 mismatch")
+                continue
+            gzip_copy(target, out / (name + ".gz"))
+            target.unlink()
+archive.unlink()
+
+from huggingface_hub import hf_hub_download, list_repo_files  # noqa: E402
+
+files = set(list_repo_files(COMMITPACK[0], repo_type="dataset", revision=COMMITPACK[1]))
+for lang in COMMITPACK_LANGS:
+    name = "data/" + lang + "/data.jsonl"
+    if name not in files:
+        summary["commitpackft"][lang] = {"missing": True}
+        continue
+    path = Path(hf_hub_download(COMMITPACK[0], name, repo_type="dataset",
+                                revision=COMMITPACK[1], cache_dir=str(scratch / "hf")))
+    counts = {"rows": 0, "licence_dropped": 0, "no_change": 0, "diff_size_dropped": 0, "kept": 0}
+    target = out / ("commitpackft-" + lang.replace("+", "p").replace("#", "sharp") + ".jsonl.gz")
+    with gzip.GzipFile(target, "wb", mtime=0) as dst:
+        for n, line in enumerate(path.read_text(encoding="utf-8").split("\n")):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            counts["rows"] += 1
+            if r["license"] not in PERMISSIVE:
+                counts["licence_dropped"] += 1
+                continue
+            if r["old_contents"] == r["new_contents"]:
+                counts["no_change"] += 1
+                continue
+            diff = "\n".join(difflib.unified_diff(
+                r["old_contents"].split("\n"), r["new_contents"].split("\n"),
+                "a/" + r["old_file"], "b/" + r["new_file"], n=3, lineterm=""))
+            dl = diff.split("\n")
+            if not diff or len(diff) > 8000 or len(dl) > 240 or max(map(len, dl)) > 400:
+                counts["diff_size_dropped"] += 1
+                continue
+            counts["kept"] += 1
+            dst.write((json.dumps({
+                "lang": lang, "row": n, "commit": r["commit"], "subject": r["subject"],
+                "repos": r["repos"], "license": r["license"], "old_file": r["old_file"],
+                "new_file": r["new_file"], "diff": diff}, ensure_ascii=False) + "\n").encode())
+    counts["source_sha256"] = sha256_file(path)
+    counts["output_sha256"] = sha256_file(target)
+    summary["commitpackft"][lang] = counts
+    shutil.rmtree(scratch / "hf", ignore_errors=True)
+for path in sorted(out.glob("*.gz")):
+    summary.setdefault("outputs", {})[path.name] = sha256_file(path)
+summary["job_source_sha256"] = SOURCE_SHA256
+(out / "public-data.json").write_text(json.dumps(summary, indent=1, sort_keys=True) + "\n")
+print(json.dumps({k: v for k, v in summary.items() if k != "zenodo"}, sort_keys=True), flush=True)
+if summary["errors"]:
+    raise RuntimeError("; ".join(summary["errors"]))
+"""
+
+
+def stage_public_data_job(kernel: str, output: Path) -> Path:
+    """Write a private CPU kernel that fetches the pinned public sources the decisions
+    re-evaluation needs (Zenodo 6900648 CodeReviewer cls-valid/cls-test, CommitPackFT
+    rows of permissive repositories with Kev's diff rendering and size limits) and
+    writes them, hash-checked, to `/kaggle/working/public-data`. No secret is read."""
+    from kaggle_staging import stage_script
+
+    bindings = {"ZENODO_CR_URL": ZENODO_CR_URL, "ZENODO_CR_SHA256": ZENODO_CR_SHA256,
+                "ZENODO_CR_MEMBERS": ZENODO_CR_MEMBERS, "COMMITPACK": COMMITPACK,
+                "COMMITPACK_LANGS": COMMITPACK_LANGS, "PERMISSIVE": PERMISSIVE,
+                "OUTPUT_NAME": PUBLIC_OUTPUT}
+    staged = stage_script(kernel, output, bindings, PUBLIC_JOB, (), gpu=False)
+    path = staged / "kernel-metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata["enable_internet"] = True
+    metadata["dataset_sources"] = []
+    path.write_text(json.dumps(metadata, indent=2) + "\n")
+    return staged
+
+
 def main(argv=None) -> None:
     from judgment_train import DEFAULT_CONFIG
 
@@ -423,6 +586,9 @@ def main(argv=None) -> None:
     parser.add_argument("--development", action="store_true",
                         help="development-only training: train/validation/calibration, "
                              "refuse test rows, report validation (not a held-out test)")
+    parser.add_argument("--fetch-public-data", action="store_true",
+                        help="stage the CPU public-data fetch job (Zenodo CodeReviewer, "
+                             "CommitPackFT) for the decisions re-evaluation instead")
     parser.add_argument("--regenerate-hard-v1", action="store_true",
                         help="stage the CPU hard-v1 train regeneration job instead")
     parser.add_argument("--hf-secret", default="HF_TOKEN",
@@ -432,6 +598,9 @@ def main(argv=None) -> None:
     for key, value in DEFAULT_CONFIG.items():
         parser.add_argument("--" + key.replace("_", "-"), type=type(value), default=value)
     args = parser.parse_args(argv)
+    if args.fetch_public_data:
+        print(stage_public_data_job(args.kernel, args.output))
+        return
     if args.regenerate_hard_v1:
         if args.dataset or args.features_subdir:
             parser.error("--regenerate-hard-v1 takes no features dataset")
