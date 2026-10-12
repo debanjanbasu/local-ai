@@ -104,6 +104,57 @@ class RecordTest(unittest.TestCase):
             table = ce.report(out)
         self.assertIn("| 8k | none | 0 | 8,000–8,000 | - | 1/1 | - |", table)
 
+    def test_http_failures_are_retried_and_not_scored(self):
+        needle = next(n for n in ce.make_needles(0) if n.task == "recall")
+        ok = {"_status": 200, "_wall_seconds": 1.0, "choices": [{"message": {"content": needle.expected}}],
+              "usage": {"prompt_tokens": 100}}
+        failed = ce.record("short", 0, "none", needle, {"_status": 503, "error": {"message": "busy"}}, 1, {})
+        passed = ce.record("short", 0, "none", needle, ok, 1, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.jsonl"
+            path.write_text(json.dumps(failed) + "\n")
+            self.assertEqual(ce.done_keys(path), set())
+            self.assertNotIn("| short |", ce.report(Path(tmp)))
+            path.write_text(json.dumps(failed) + "\n" + json.dumps(passed) + "\n" + json.dumps(failed) + "\n")
+            self.assertEqual([r["passed"] for r in ce.load_rows(path)], [True])
+            self.assertIn("| short | none | 0 | 100–100 | 1/1 |", ce.report(Path(tmp)))
+
+    def test_wilson_interval(self):
+        low, high = ce.wilson(27, 27)
+        self.assertAlmostEqual(low, 0.875, places=3)
+        self.assertEqual(high, 1.0)
+        low, high = ce.wilson(5, 9)
+        self.assertLess(low, 5 / 9)
+        self.assertGreater(high, 5 / 9)
+
+    def test_staged_prefill_adds_up_every_stage(self):
+        first = {"prompt_tokens": 250_000, "cached_tokens": 195_000, "prefill_seconds": 1_000.0}
+        warm = {"prompt_tokens": 250_010, "cached_tokens": 249_990, "prefill_seconds": 2.0}
+        stages = [{"status": 200, "prompt_tokens": 120_000, "prefill_seconds": 1_500.0},
+                  {"status": 200, "prompt_tokens": 195_001, "prefill_seconds": 1_700.0}]
+        self.assertEqual(ce.cold_prefill([first, warm], stages), (250_000, 4_200.0))
+        self.assertIsNone(ce.cold_prefill([first, warm], stages[:1]))  # a prefix nobody measured
+        self.assertIsNone(ce.cold_prefill([warm], []))
+
+
+class StageTest(unittest.TestCase):
+    def test_reasoning_instruction_matches_the_engine_template(self):
+        source = (ce.ROOT / "local-engine/src/bonsai_tokenizer.rs").read_text()
+        self.assertIn(f'DEFAULT_REASONING_INSTRUCTION: &str = "{ce.REASONING_INSTRUCTION}";', source)
+
+    def test_stage_prefix_ends_at_a_file_boundary_of_the_rendered_prompt(self):
+        system, _ = ce.build_context(1, "8k", ce.make_needles(1))
+        for effort in ("none", "xhigh"):
+            rendered = ce.rendered_system(system, effort)
+            prefix = ce.stage_prefix(system, effort, 4_000)
+            self.assertTrue(rendered.startswith(prefix))
+            self.assertTrue(rendered[len(prefix):].startswith("FILE "))
+            self.assertGreaterEqual(len(prefix), 4_000 * ce.CHARS_PER_TOKEN)
+        self.assertTrue(ce.rendered_system(system, "xhigh").startswith(
+            f"<|im_start|>system\n{ce.REASONING_INSTRUCTION}\n\nYou are answering"))
+        with self.assertRaises(ValueError):
+            ce.stage_prefix(system, "none", 100_000)
+
 
 if __name__ == "__main__":
     unittest.main()
