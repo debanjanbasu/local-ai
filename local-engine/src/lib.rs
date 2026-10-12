@@ -34,6 +34,7 @@ pub use api::{
 };
 pub use error::Error;
 pub use structured::ResponseFormat;
+pub use tools::grammar::{LARK_KEYWORD, check_lark_grammar};
 pub use tools::{ToolCall, ToolChoice, ToolDefinition};
 
 pub type Result<T> = std::result::Result<T, Error>;

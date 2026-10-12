@@ -207,6 +207,14 @@ fn build_factory(
     let mut factory = ParserFactory::new_simple(&env).map_err(|error| error.to_string())?;
     factory.quiet();
     factory.limits_mut().verbose_errors = false;
+    // Ten times llguidance's default (about 140 ms instead of 14 ms before a
+    // mask computation gives up): a custom tool's Lark grammar is a raw value
+    // intersected with the delimiters it may not contain, and checking that
+    // such a lexer state can still match costs more than the default allows
+    // at a few early states of Codex's `apply_patch` grammar (about 4 ms in
+    // practice). Cheaper grammars are unaffected; the bound only matters
+    // when a grammar would otherwise fail.
+    factory.limits_mut().step_lexer_fuel = 2_000_000;
     Ok(Arc::new(factory))
 }
 

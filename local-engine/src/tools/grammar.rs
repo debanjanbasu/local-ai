@@ -89,6 +89,20 @@ const ANNOTATIONS: &[&str] = &[
     "writeOnly",
 ];
 
+/// A string-schema keyword: a Lark grammar the whole raw value must match.
+///
+/// This is how a `custom` tool's `lark` format reaches the engine. The grammar
+/// must have a regular language (see [`lark`]); otherwise the tool is refused.
+pub const LARK_KEYWORD: &str = "x-local-ai-lark";
+
+mod lark;
+
+/// Check that a Lark grammar can be enforced as [`LARK_KEYWORD`], or say
+/// exactly why not.
+pub fn check_lark_grammar(grammar: &str) -> Result<(), String> {
+    lark::to_regex(grammar).map(drop)
+}
+
 /// How a strict tool's arguments are spelled and read back.
 #[derive(Debug)]
 pub struct StrictTool {
@@ -541,7 +555,7 @@ fn raw_constraints(
     for key in map.keys() {
         if !matches!(
             key.as_str(),
-            "type" | "enum" | "const" | "pattern" | "minLength" | "maxLength"
+            "type" | "enum" | "const" | "pattern" | "minLength" | "maxLength" | LARK_KEYWORD
         ) && !ANNOTATIONS.contains(&key.as_str())
         {
             return Err(format!(
@@ -574,6 +588,13 @@ fn raw_constraints(
     if let Some(pattern) = map.get("pattern") {
         let pattern = pattern.as_str().ok_or("\"pattern\" must be a string")?;
         constraints.push(search_pattern(pattern)?);
+    }
+    if let Some(grammar) = map.get(LARK_KEYWORD) {
+        let grammar = grammar
+            .as_str()
+            .ok_or_else(|| format!("{LARK_KEYWORD:?} must be a string"))?;
+        constraints
+            .push(lark::to_regex(grammar).map_err(|error| format!("lark grammar: {error}"))?);
     }
     let bound = |key: &str| -> Result<Option<u64>, String> {
         match map.get(key) {

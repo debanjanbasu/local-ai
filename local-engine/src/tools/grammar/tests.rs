@@ -963,3 +963,137 @@ fn a_strict_tool_without_parameters_takes_an_empty_call_only() {
     feed(&mut grammar, &[OPEN]).expect("open");
     assert!(feed_text(&mut grammar, &tokenizer, "\n<function=ping>\n<parameter=x>").is_err());
 }
+
+/// Codex 0.162.1's freeform `apply_patch` grammar, verbatim from the CLI.
+const CODEX_APPLY_PATCH: &str = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+"#;
+
+fn lark_tool(name: &str, grammar: &str) -> ToolDefinition {
+    tool(
+        name,
+        json!({
+            "type": "object",
+            "properties": {"input": {"type": "string", super::LARK_KEYWORD: grammar}},
+            "required": ["input"],
+            "additionalProperties": false
+        }),
+        true,
+    )
+}
+
+#[test]
+fn codex_apply_patch_lark_grammar_admits_valid_patches_only() {
+    let tokenizer = special_tags();
+    let tools = [lark_tool("apply_patch", CODEX_APPLY_PATCH)];
+    let header = "\n<function=apply_patch>\n<parameter=input>\n";
+    let valid = [
+        "*** Begin Patch\n*** Update File: calc.py\n@@ def add(a, b):\n-    return a - b\n+    return a + b\n*** End Patch",
+        "*** Begin Patch\n*** Add File: docs/new.md\n+# Title\n+\n+body </parameter text\n*** Delete File: old.txt\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: a.py\n*** Move to: b.py\n@@\n x = 1\n-y = 2\n+y = 3\n*** End of File\n*** End Patch",
+    ];
+    for patch in valid {
+        let mut grammar = constrained(&tools, &ToolChoice::Required, false);
+        let body = format!("{header}{patch}\n</parameter>\n</function>\n");
+        let ids = call_ids(&tokenizer, &body);
+        feed(&mut grammar, &ids).unwrap_or_else(|error| panic!("{patch:?}: {error}"));
+        feed(&mut grammar, &[EOS]).expect("end");
+        let text = tokenizer.decode(&ids, false).expect("decode");
+        let (calls, _) = parse(&tools, &text).unwrap_or_else(|error| panic!("{text:?}: {error}"));
+        assert_eq!(calls[0].arguments, json!({"input": patch}));
+    }
+    // Each invalid patch is refused at the first token that leaves the
+    // grammar, so it can never be generated.
+    for (prefix, next) in [
+        ("", "diff --git"),
+        ("*** Begin Patch\n", "*** End Patch"),
+        ("*** Begin Patch\n*** Add File: x\n", "*** End Patch"),
+        ("*** Begin Patch\n*** Update File: x\n", "?bad line"),
+        ("*** Begin Patch\n*** Frobnicate File: x\n", ""),
+        (
+            "*** Begin Patch\n*** Add File: x\n+a\n*** End Patch",
+            "\ntrailing",
+        ),
+        ("*** Begin Patch\n*** Add File: x\n+a\n", "</tool_call>"),
+        ("*** Begin Patch\n*** Add File: x\n+a </parameter", ">"),
+    ] {
+        let mut grammar = constrained(&tools, &ToolChoice::Required, false);
+        feed(&mut grammar, &[OPEN]).expect("open");
+        let accepted = feed_text(&mut grammar, &tokenizer, &format!("{header}{prefix}"));
+        let refused = accepted.is_err()
+            || feed_text(&mut grammar, &tokenizer, next).is_err()
+            || feed_text(&mut grammar, &tokenizer, "\n</parameter>").is_err();
+        assert!(refused, "{prefix:?} + {next:?} was admitted");
+    }
+    // A patch may not end before its hunk and end marker.
+    let mut grammar = constrained(&tools, &ToolChoice::Required, false);
+    feed(&mut grammar, &[OPEN]).expect("open");
+    feed_text(
+        &mut grammar,
+        &tokenizer,
+        &format!("{header}*** Begin Patch\n"),
+    )
+    .expect("begin");
+    assert!(feed_text(&mut grammar, &tokenizer, "\n</parameter>").is_err());
+}
+
+#[test]
+fn lark_grammars_translate_or_are_refused_with_the_reason() {
+    let schema = |grammar: &str| {
+        json!({
+            "type": "object",
+            "properties": {"input": {"type": "string", super::LARK_KEYWORD: grammar}},
+            "required": ["input"],
+            "additionalProperties": false
+        })
+    };
+    for grammar in [
+        CODEX_APPLY_PATCH,
+        "start: \"*** Begin Patch\" /(.|\\n)*/ \"*** End Patch\"",
+        "?start: greeting\n    | farewell\ngreeting: \"hi\"i NAME\nfarewell.2: [\"bye\"] DIGIT ~ 2..3\nNAME: (\"a\"..\"z\")+\n%import common (DIGIT, WS)\n// comment\n",
+    ] {
+        super::classify(&schema(grammar)).unwrap_or_else(|error| panic!("{grammar}: {error}"));
+    }
+    for (grammar, reason) in [
+        ("start: \"(\" start \")\" | \"x\"", "recursive"),
+        (
+            "start: WORD\n%import common.WORD\n%ignore \" \"",
+            "%ignore is not supported",
+        ),
+        ("start: /(?=a)a/", "only (?:...) groups"),
+        ("start: /^a$/", "anchors"),
+        ("start: /(a)\\1/", "backreferences"),
+        (
+            "start: X\n%import common.ESCAPED_STRING -> X",
+            "common.ESCAPED_STRING",
+        ),
+        ("start: X\n%import other.X", "only the common module"),
+        ("start: a", "a is used but not defined"),
+        ("begin: \"x\"", "no start rule"),
+        ("start: _sep{\"a\"}", "templates"),
+        ("start: A\nA: b\nb: \"x\"", "terminal A refers to rule b"),
+        ("start: /a/m", "regex flag 'm'"),
+        ("start: X\n%declare X", "%declare is not supported"),
+    ] {
+        let error = super::classify(&schema(grammar)).expect_err(grammar);
+        assert!(error.contains(reason), "{grammar}: {error}");
+        assert!(error.contains("lark grammar"), "{grammar}: {error}");
+    }
+}
