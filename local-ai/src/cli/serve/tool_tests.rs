@@ -260,6 +260,7 @@ fn fake_loop(
         kinds: prepared.echo.kinds().clone(),
         bounds,
         max_calls: None,
+        before_tools: None,
     };
     (tool_loop, first, submitted)
 }
