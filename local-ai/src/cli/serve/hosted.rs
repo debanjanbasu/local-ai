@@ -8,7 +8,8 @@
 //! | request tool                          | executed by | output items                               |
 //! |---------------------------------------|-------------|--------------------------------------------|
 //! | `function`                            | client      | `function_call`                            |
-//! | `custom` (text or regex grammar)      | client      | `custom_tool_call`                         |
+//! | `custom` (text, regex or Lark grammar) | client     | `custom_tool_call`                         |
+//! | `namespace` of function/custom tools  | client      | `function_call`/`custom_tool_call` with `namespace` |
 //! | `local_shell`                         | client      | `local_shell_call`                         |
 //! | `apply_patch`                         | client      | `apply_patch_call`                         |
 //! | `shell` (local environment)           | this server | `shell_call` + `shell_call_output`         |
@@ -20,6 +21,17 @@
 //! the server produced for it. Hosted tools are only offered when the request
 //! asks for them *and* the server was started with the matching permission;
 //! otherwise the request is refused before generation.
+//!
+//! A `namespace` groups client function and custom tools; each member reaches
+//! the model as its own native function named `NAMESPACE.NAME`, and its calls
+//! are reported with the spec's `namespace` and the member's own `name`.
+//!
+//! `web_search` (and `web_search_preview`) is accepted and echoed but never
+//! offered to the model: this server has no search provider, so the model is
+//! not told it can search, cannot call a search tool and no `web_search_call`
+//! is ever reported. The spec leaves calling a declared tool to the model
+//! (`tool_choice: "auto"`); forcing a search (`tool_choice` of a web search
+//! type) or asking for search sources (`include`) is still refused.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -158,19 +170,51 @@ fn strict(name: &str, description: &str, parameters: Value) -> ToolDefinition {
     }
 }
 
-/// The kind of every declared tool that is not a plain client function.
+/// The kind of every declared tool that is not a plain client function, and
+/// the namespace and own name of every namespaced tool.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Kinds(HashMap<String, Kind>);
+pub(super) struct Kinds {
+    kinds: HashMap<String, Kind>,
+    namespaced: HashMap<String, (String, String)>,
+}
 
 impl Kinds {
     pub(super) fn insert(&mut self, name: &str, kind: Kind) {
         if kind != Kind::Function {
-            self.0.insert(name.to_owned(), kind);
+            self.kinds.insert(name.to_owned(), kind);
         }
     }
 
     pub(super) fn kind(&self, name: &str) -> Kind {
-        self.0.get(name).copied().unwrap_or(Kind::Function)
+        self.kinds.get(name).copied().unwrap_or(Kind::Function)
+    }
+
+    /// Report a call item of a namespaced tool with the spec's `namespace`
+    /// and the tool's own `name` instead of the model's qualified name.
+    pub(super) fn qualify(&self, item: &mut Value) {
+        let Some(object) = item.as_object_mut() else {
+            return;
+        };
+        let Some((namespace, name)) = object
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|qualified| self.namespaced.get(qualified))
+        else {
+            return;
+        };
+        let (namespace, name) = (namespace.clone(), name.clone());
+        object.insert("name".into(), Value::String(name));
+        object.insert("namespace".into(), Value::String(namespace));
+    }
+
+    /// [`Self::qualify`] for a rendered call and the events announcing it.
+    pub(super) fn qualify_rendered(&self, rendered: &mut Rendered) {
+        self.qualify(&mut rendered.item);
+        for (_, event) in &mut rendered.events {
+            if let Some(item) = event.get_mut("item") {
+                self.qualify(item);
+            }
+        }
     }
 
     /// The hosted operation `name` runs, if it is one.
@@ -184,17 +228,21 @@ impl Kinds {
     /// Whether a declared tool reports calls as items other than
     /// `function_call`/`function_call_output`.
     pub(super) fn reports_other_items(&self) -> bool {
-        self.0.values().any(|kind| {
-            matches!(
-                kind,
-                Kind::Custom | Kind::LocalShell | Kind::ApplyPatch | Kind::Hosted(Hosted::Shell)
-            )
-        })
+        !self.namespaced.is_empty()
+            || self.kinds.values().any(|kind| {
+                matches!(
+                    kind,
+                    Kind::Custom
+                        | Kind::LocalShell
+                        | Kind::ApplyPatch
+                        | Kind::Hosted(Hosted::Shell)
+                )
+            })
     }
 
     /// Every hosted operation declared.
     pub(super) fn all_hosted(&self) -> impl Iterator<Item = Hosted> + '_ {
-        self.0.values().filter_map(|kind| match kind {
+        self.kinds.values().filter_map(|kind| match kind {
             Kind::Hosted(hosted) => Some(*hosted),
             _ => None,
         })
@@ -214,6 +262,192 @@ fn only(tool: &Map<String, Value>, kind: &str, allowed: &[&str]) -> crate::Resul
                 "{kind} tool member {key:?} is not supported"
             )))
         })
+}
+
+/// The model's name for the tool `name` of `namespace`. A namespace name
+/// never contains `.`, so the split is unambiguous.
+pub(super) fn qualified(namespace: &str, name: &str) -> String {
+    format!("{namespace}.{name}")
+}
+
+/// The echoed form of a plain function tool.
+fn function_echo(definition: &ToolDefinition) -> Value {
+    json!({"type":"function","name":definition.name,"description":definition.description,"parameters":definition.parameters,"strict":definition.strict})
+}
+
+/// Add one native tool, refusing a name already declared.
+fn add(
+    tools: &mut Vec<ToolDefinition>,
+    kinds: &mut Kinds,
+    definition: ToolDefinition,
+    kind: Kind,
+) -> crate::Result<()> {
+    if tools.iter().any(|tool| tool.name == definition.name) {
+        return Err(invalid(format!(
+            "duplicate tool name {:?}",
+            definition.name
+        )));
+    }
+    kinds.insert(&definition.name, kind);
+    tools.push(definition);
+    Ok(())
+}
+
+/// Declare one request tool: add the native tools it offers the model to
+/// `tools` and `kinds`, and return the form the Response echoes. `function`
+/// parses a plain function tool.
+pub(super) fn declare(
+    tool: &Value,
+    function: impl Fn(&Value) -> crate::Result<ToolDefinition>,
+    tools: &mut Vec<ToolDefinition>,
+    kinds: &mut Kinds,
+) -> crate::Result<Value> {
+    let object = tool.as_object();
+    let kind = tool.get("type").and_then(Value::as_str).unwrap_or_default();
+    match (kind, object) {
+        ("namespace", Some(object)) => namespace(object, function, tools, kinds),
+        // Accepted, never offered to the model: see the module documentation.
+        ("web_search" | "web_search_2025_08_26", Some(object)) => {
+            only(
+                object,
+                kind,
+                &[
+                    "type",
+                    "external_web_access",
+                    "filters",
+                    "user_location",
+                    "search_context_size",
+                ],
+            )?;
+            Ok(tool.clone())
+        }
+        ("web_search_preview" | "web_search_preview_2025_03_11", Some(object)) => {
+            only(
+                object,
+                kind,
+                &[
+                    "type",
+                    "user_location",
+                    "search_context_size",
+                    "search_content_types",
+                ],
+            )?;
+            Ok(tool.clone())
+        }
+        _ => {
+            let (definition, kind, echo) = if let Some(found) = self::tool(tool)? {
+                found
+            } else {
+                let definition = function(tool)?;
+                let echo = function_echo(&definition);
+                (definition, Kind::Function, echo)
+            };
+            add(tools, kinds, definition, kind)?;
+            Ok(echo)
+        }
+    }
+}
+
+/// A `namespace` of client function and custom tools, each offered as
+/// `NAMESPACE.NAME` with the namespace's description before its own.
+fn namespace(
+    object: &Map<String, Value>,
+    function: impl Fn(&Value) -> crate::Result<ToolDefinition>,
+    tools: &mut Vec<ToolDefinition>,
+    kinds: &mut Kinds,
+) -> crate::Result<Value> {
+    only(
+        object,
+        "namespace",
+        &["type", "name", "description", "tools"],
+    )?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| {
+            (1..=64).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+        .ok_or_else(|| {
+            invalid("a namespace tool requires a name of 1 to 64 ASCII letters, digits, '_' or '-'")
+        })?;
+    let description = match object.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(invalid("namespace description must be a string")),
+    };
+    let members = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .filter(|members| !members.is_empty())
+        .ok_or_else(|| {
+            invalid(format!(
+                "namespace {name:?} requires a non-empty tools array"
+            ))
+        })?;
+    let mut echoes = Vec::with_capacity(members.len());
+    for member in members {
+        let member_type = member
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (mut definition, kind, echo) = match (member_type, member.as_object()) {
+            ("function", _) => {
+                let own = member
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if Hosted::from_function(own).is_some() {
+                    return Err(invalid(format!(
+                        "namespace {name:?} tool {own:?}: this server's hosted functions cannot \
+                         be namespaced"
+                    )));
+                }
+                let definition = function(member)?;
+                let echo = function_echo(&definition);
+                (definition, Kind::Function, echo)
+            }
+            ("custom", Some(member)) => custom(member)?,
+            _ => {
+                return Err(invalid(format!(
+                    "namespace {name:?} may only hold function and custom tools, not \
+                     {member_type:?}"
+                )));
+            }
+        };
+        let own = std::mem::take(&mut definition.name);
+        definition.name = qualified(name, &own);
+        if definition.name.len() > 64 {
+            return Err(invalid(format!(
+                "namespace {name:?} tool {own:?}: the model's name {:?} is longer than 64 \
+                 characters",
+                definition.name
+            )));
+        }
+        if let Some(prefix) = &description {
+            definition.description = Some(
+                definition
+                    .description
+                    .take()
+                    .map_or_else(|| prefix.clone(), |own| format!("{prefix}\n\n{own}")),
+            );
+        }
+        kinds
+            .namespaced
+            .insert(definition.name.clone(), (name.to_owned(), own));
+        add(tools, kinds, definition, kind)?;
+        echoes.push(echo);
+    }
+    let mut echo = Map::new();
+    echo.insert("type".into(), json!("namespace"));
+    echo.insert("name".into(), json!(name));
+    if let Some(description) = description {
+        echo.insert("description".into(), json!(description));
+    }
+    echo.insert("tools".into(), Value::Array(echoes));
+    Ok(Value::Object(echo))
 }
 
 /// A declared tool this module handles: its native definition, kind and the
@@ -306,8 +540,9 @@ fn object_schema_local_shell() -> Value {
     )
 }
 
-/// A `custom` tool: one freeform string `input`, constrained by a `regex`
-/// grammar when one is given. Lark grammars are refused.
+/// A `custom` tool: one freeform string `input`, constrained by its `regex`
+/// or `lark` grammar when one is given. A Lark grammar must have a regular
+/// language (see `local_engine::check_lark_grammar`).
 fn custom(object: &Map<String, Value>) -> crate::Result<(ToolDefinition, Kind, Value)> {
     only(object, "custom", &["type", "name", "description", "format"])?;
     let name = object
@@ -315,9 +550,10 @@ fn custom(object: &Map<String, Value>) -> crate::Result<(ToolDefinition, Kind, V
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("a custom tool requires a name"))?;
-    if Hosted::from_function(name).is_some()
-        || matches!(name, "shell" | "local_shell" | "apply_patch")
-    {
+    // Only the hosted function names are reserved: a custom tool named like a
+    // built-in tool type (Codex's freeform `apply_patch`) is the client's, and
+    // declaring both is refused as a duplicate name.
+    if Hosted::from_function(name).is_some() {
         return Err(invalid(format!("tool name {name:?} is reserved")));
     }
     let description = match object.get("description") {
@@ -342,11 +578,12 @@ fn custom(object: &Map<String, Value>) -> crate::Result<(ToolDefinition, Kind, V
                         input["pattern"] = json!(format!("^(?:{definition})$"));
                     }
                     Some("lark") => {
-                        return Err(crate::Error::InvalidArgument(
-                            "custom tool grammar syntax \"lark\" is not supported: only regex \
-                             grammars are translated into the engine's constrained decoding"
-                                .into(),
-                        ));
+                        // Enforced by the engine; checked now so an
+                        // unsupported grammar is refused with the reason.
+                        local_engine::check_lark_grammar(definition).map_err(|error| {
+                            invalid(format!("custom tool {name:?} lark grammar: {error}"))
+                        })?;
+                        input[local_engine::LARK_KEYWORD] = json!(definition);
                     }
                     _ => return Err(invalid("grammar syntax must be \"regex\" or \"lark\"")),
                 }
@@ -642,7 +879,10 @@ pub(super) fn input_item(kind: &str, item: &Value) -> Option<crate::Result<Input
         }
         "custom_tool_call" => {
             let name = match field("name") {
-                Ok(name) => name,
+                Ok(name) => match item.get("namespace").and_then(Value::as_str) {
+                    Some(namespace) => qualified(namespace, &name),
+                    None => name,
+                },
                 Err(error) => return Some(Err(error)),
             };
             let input = item
