@@ -88,6 +88,11 @@ fn blocking_generate(engine: EngineHandle) -> Generate {
     })
 }
 
+/// The engine-backed [`Summarizer`], for a new or a resumed Response.
+pub(super) fn summarizer(engine: EngineHandle) -> Summarizer {
+    Summarizer(blocking_generate(engine))
+}
+
 /// Count `messages` as `template` would be counted with them.
 fn counter(
     engine: EngineHandle,
@@ -146,8 +151,9 @@ pub(super) async fn prepare_responses(
         prepared = compact_if_due(state, prepared, entry.threshold).await?;
     }
     if prepared.echo.summarizes() {
-        let generate = blocking_generate(state.engine.clone());
-        prepared.echo.set_summarizer(Summarizer(generate));
+        prepared
+            .echo
+            .set_summarizer(summarizer(state.engine.clone()));
     }
     Ok((
         prepared.stream,
@@ -193,7 +199,10 @@ async fn compact_if_due(
         return Ok(prepared);
     };
     let _admitted = state.depth.admit();
-    let (summary, _) = generate(&state.engine, pass.request.clone()).await?;
+    let (summary, measured) = generate(&state.engine, pass.request.clone()).await?;
+    // It ran for this Response, so its tokens are in its usage even when
+    // its item is discarded below.
+    prepared.echo.spend(&measured);
     let (item, history) = pass.finish(&summary, &prepared.history, &cipher, &state.model)?;
     // A compaction that does not shorten the prompt is discarded, like one
     // with nothing to summarize.
