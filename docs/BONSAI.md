@@ -1842,6 +1842,77 @@ prefill attention does 2.1e11 multiply-adds per layer at 128K in 112 ms
 (1.8 T/s), half that peak; per-tile dequantization and softmax are the likely
 remainder (not profiled per stage).
 
+Profiled stage by stage afterwards (temporary kernel variants that each drop
+one stage, 128-token block, kernel GPU time, M4 Pro), dequantization and
+softmax turned out to be the smaller part. At 8K / 32K / 128K the kernel took
+6.9 / 27.7 / 112 ms; dropping the QK product saved 47%, the P.V product with
+its rescale 36%, per-tile dequantization 10-13% (of which only 2-5% came back
+when every tile was re-read from one cached position, so it is ALU and
+threadgroup stores rather than bandwidth: 17 KB of Q8 K/V per tile is about
+20 GB/s per core), and the softmax 6-7%. P.V alone runs at 2.8 T
+multiply-adds per second and QK alone at 1.8 T: each SIMD group owns a 24x8
+score tile over a 256-long reduction, three dependent accumulator chains,
+against 24x64 over 32 for P.V. Reading every Q row from one shared address,
+or Q as half, saved only 2-4%, so the Q operand's device reads are not the
+limit. Occupancy is set by threadgroup memory: 19.7 KB (a 16 KB half K/V tile
+plus 24 float score rows) admits four threadgroups per core (padding to
+23.8 KB leaves three, to 28 KB two), 80 on 20 cores, so a 128-token block's
+128 threadgroups run in 1.6 waves; sweeping the token count at 32K gave flat
+steps (16 groups 9.1 ms, 80 groups 15.9 ms, 128 groups 28.3 ms), about 10%
+lost to the partial second wave and a per-core throughput that grows only 9%
+from three resident groups to four.
+
+Two bitwise-preserving changes followed:
+
+- Q8 tiles dequantize with exact half arithmetic instead of quarter-rate
+  integer-to-float conversion (`bonsai_q8_dequant4`): the biased byte is
+  OR-ed into a half mantissa (1024 + code + 128), 1152 is subtracted exactly,
+  and one half multiply by the scale rounds the exact product once, as the
+  float product's conversion did. All 256 codes against all 65,536 scale bit
+  patterns give identical bits. This applies to every Q8 tensor kernel.
+- The head-packed prefill kernel skips the per-element accumulator rescale
+  when every row's correction in the tile is exactly 1 (the running maxima
+  did not move), since multiplying by 1 is the identity; a threadgroup flag
+  set by any row whose correction differs decides it. At long prefixes almost
+  every tile skips 48 threadgroup loads and multiplies per thread.
+
+All 128 x 6,144 outputs stay bitwise equal to the previous kernel's at 0, 1K,
+4K, 8K, 32K and 128K prefixes. Whole-model 128-token block, M4 Pro, synthetic
+Q8 cache, recurrent state reset before each block, kernels selected in one
+build, best of three interleaved samples:
+
+| Prefix | Before | Exact dequantization | Plus rescale skip |
+| ---: | ---: | ---: | ---: |
+| 0 | 957.7 ms | 954.9 ms | 955.7 ms |
+| 8,192 | 1,065.1 ms | 1,063.5 ms | 1,060.7 ms |
+| 32,768 | 1,398.5 ms | 1,392.7 ms | 1,369.3 ms (-2.1%) |
+| 131,072 | 2,762.4 ms | 2,737.8 ms | 2,632.1 ms (-4.7%) |
+
+Kernel time alone moved by -1 to -2% for the dequantization and a further
+-4 to -5% for the skip at 8K-128K (interleaved medians, about 3% run-to-run
+noise at 128K). The skip depends on finite scores: a block whose queries are
+non-finite rescales every tile, as before. A greedy 13,252-token prompt
+(96 tokens, cold isolated prompt caches) produced identical token IDs on the
+previous build and this one, with MTP (same acceptance, 46 drafts in 44
+rounds) and without speculation, and the two modes agree with each other;
+prefill moved from 120.8-121.1 to 121.9-122.6 tok/s, attention being a small
+share of blocks at 13K.
+
+Rejected, kernel time against the kernel of the time: issuing each tile's
+K/V loads one phase early (V during QK, the next K during P.V), +15-16%
+from the registers held across the products; one 8-row product per SIMD
+group with Q in a cooperative register tensor (three, four or six SIMD
+groups), 14-42% slower and not bitwise (the products' summation follows
+the operation's shape); a K·Qᵀ product, 1-2% faster but not bitwise; a
+transposed K tile, +50%; half-dimension tiles (QK accumulated over two
+128-wide halves and P.V into two 128-column accumulators, bitwise, 11.4 KB,
+seven groups per core so a block runs in one wave), +1-4% from twice the
+barriers and half-size products; P.V as two 16-key products, +30%; QK as
+two 16-key products, unchanged; softmax scores kept in registers, -1%
+alone but slower combined with the rescale skip. Split-K (flash-decoding)
+over the prefix would fill the partial wave but changes the summation order
+for at most the ~10% wave loss; it was not pursued.
+
 Two- to four-row projections (speculative verify blocks, short prefill
 chunks, batched decode) then got cheaper with bit-identical outputs. Trits
 come from balanced prefixes, prefix(p) - (3^p - 1) / 2, whose offsets fold
