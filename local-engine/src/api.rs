@@ -638,6 +638,8 @@ pub struct EngineHandle {
     sender: async_mpsc::Sender<Job>,
     /// The worker engine's tokenizer, shared so counting never queues a job.
     tokenizer: BonsaiTokenizer,
+    /// Decode activity the worker publishes for low-priority GPU users.
+    activity: Arc<crate::activity::EngineActivity>,
 }
 
 impl EngineHandle {
@@ -656,8 +658,21 @@ impl EngineHandle {
     fn new(engine: Engine) -> Self {
         let tokenizer = engine.inner.tokenizer().clone();
         let (sender, receiver) = async_mpsc::channel::<Job>(SERVE_QUEUE);
-        std::thread::spawn(move || Worker::new(engine, receiver).run());
-        Self { sender, tokenizer }
+        let activity = Arc::new(crate::activity::EngineActivity::default());
+        let published = Arc::clone(&activity);
+        std::thread::spawn(move || Worker::new(engine, receiver, published).run());
+        Self {
+            sender,
+            tokenizer,
+            activity,
+        }
+    }
+
+    /// Decode activity of this handle's worker, for scheduling low-priority
+    /// GPU work (embeddings) around running generations.
+    #[must_use]
+    pub fn activity(&self) -> Arc<crate::activity::EngineActivity> {
+        Arc::clone(&self.activity)
     }
 
     /// Count the prompt tokens `request` would prefill, exactly as

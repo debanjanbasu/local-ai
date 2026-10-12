@@ -200,16 +200,23 @@ pub(super) struct Worker {
     running: std::collections::HashMap<u64, Delivery>,
     /// Finished requests whose last events have not reached their channel.
     draining: Vec<Delivery>,
+    /// Published decode activity (see [`crate::activity`]).
+    activity: Arc<crate::activity::EngineActivity>,
 }
 
 impl Worker {
-    pub(super) fn new(engine: Engine, receiver: async_mpsc::Receiver<Job>) -> Self {
+    pub(super) fn new(
+        engine: Engine,
+        receiver: async_mpsc::Receiver<Job>,
+        activity: Arc<crate::activity::EngineActivity>,
+    ) -> Self {
         Self {
             engine,
             receiver,
             waiting: None,
             running: std::collections::HashMap::new(),
             draining: Vec::new(),
+            activity,
         }
     }
 
@@ -227,6 +234,7 @@ impl Worker {
             }
             self.admit_waiting();
             if !self.running.is_empty() {
+                self.activity.stepping();
                 // `step` calls one of the two at a time, never both at once.
                 let running = std::cell::RefCell::new(&mut self.running);
                 let finished = self.engine.inner.step(
@@ -248,6 +256,7 @@ impl Worker {
                         self.draining.push(delivery);
                     }
                 }
+                self.activity.stepped(!self.running.is_empty());
             }
             self.flush();
         }
@@ -430,6 +439,7 @@ mod tests {
         let handle = EngineHandle {
             sender,
             tokenizer: BonsaiTokenizer::tiny_for_tests(),
+            activity: Arc::default(),
         };
         (handle, receiver)
     }

@@ -108,6 +108,32 @@ tokenizer: they run on the calling thread, queue no job and never wait for
 running generations, so they work while the queue is full. Async callers should
 run long prompts on a blocking pool.
 
+## Text embeddings
+
+`embedding::EmbeddingModel` runs the optional `EmbeddingGemma` 2 text encoder
+natively on Metal (BF16 weights, F32 activations; install and measurements in
+[docs/EMBEDDINGS.md](../docs/EMBEDDINGS.md)). Inputs are embedded as given;
+`EmbeddingPrompt` formats the model card's query and document prompts, and
+`truncate_normalized` gives the Matryoshka widths 512, 256 and 128.
+
+```rust,no_run
+use std::path::Path;
+use local_engine::embedding::{EmbeddingModel, EmbeddingPrompt, installed_model};
+
+let dir = installed_model(Path::new("models")).expect("model not installed");
+let mut model = EmbeddingModel::open(&dir)?;
+let query = EmbeddingPrompt::Query { task: "search result" }.format("how do hash maps resize?");
+let document = EmbeddingPrompt::Document { title: None }.format("Open addressing doubles the table…");
+let vectors = model.embed_texts(&[&query, &document], &mut || Ok(()))?;
+let similarity: f32 = vectors[0].iter().zip(&vectors[1]).map(|(a, b)| a * b).sum();
+# let _ = similarity;
+# Ok::<(), local_engine::Error>(())
+```
+
+The last argument is called between short GPU submissions: a server passes
+`EngineHandle::activity()`'s `yield_to_decode` there so embedding work waits
+for running Bonsai decode steps instead of delaying them.
+
 ## Structured output
 
 `ChatRequest::response_format` and `CompletionRequest::response_format` take a
