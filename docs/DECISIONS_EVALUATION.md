@@ -251,3 +251,147 @@ dominated by them by design. hard-v1's locked test is unavailable, so TEST-h
 is half of a split whose temperature the exported head was fitted on (the
 refit starts from raw logits). TEST-h families with fewer than 15 rows make
 A1 fragile for the hard heads. None of this bears on MTP or coding quality.
+
+## Part 3: retrained head on fresh splits (protocol v2)
+
+Parts 1 and 2 are unchanged. Part 3 has the same shape: **3a was written and
+committed before any CAL, TEST or OOD row below was scored** (features may be
+captured before the commit; no head scores them before it). 3b records the
+results afterwards without editing 3a. Every split Part 2 scored (devtools-v1
+calibration/test, `cr-new`, `kev-ood`, hard-v1 `*/noul`) has been looked at,
+so none of it is CAL, TEST or OOD here: it may only train, select or develop.
+
+### 3a. Pre-registration (frozen before scoring)
+
+#### Integrity of the Part 2 inputs, recaptured
+
+- `kev-ood` requests rebuilt with `judgment_calibrate.py build-ood`:
+  `7534dba97bb3bfbf0138eeba8462be7da9df3d4677e098ee0a99322b9e4a7a1f`, as
+  documented. Recaptured through `judgment-capture` (binary
+  `f87a6f8b54c7f14d7c905ae33b058f3e2aa8d7f91e59d1654f54aca4d88e6104`, built from
+  this branch), 3 GPU-lock holds of 150 rows: features manifest
+  `29a40a425945ef4298a9e685039995911fdb17a1af0e38c8dc69622e80b4177a`, **identical
+  to the documented manifest**, so the pinned renderer and capture path are
+  unchanged.
+- Zenodo 6900648 fetched by a private, internet-enabled CPU Kaggle kernel
+  (`tools/kaggle_judgment_job.py --fetch-public-data`, staged `convert.py`
+  `27fa406b…0aad24`; nothing fetched from this machine): archive
+  `86d054de…41fff5`, `cls-valid.jsonl` `ca2725be…ad33`, `cls-test.jsonl`
+  `de62a2ce…d5d9c`, all the pinned values. `cr-new` requests rebuilt with
+  `build-codereviewer`: `337657614b9ae9ea3e78d38bde6c4eb6901ac6626d1fe06b62922e5a765c8686`,
+  as documented. `cr-new` features were **not** recaptured: capture runs at
+  ~110 prompt tokens/s (378,585 tokens, about an hour of shared GPU time), and
+  `kev-ood` already shows the capture path reproduces bit for bit.
+- The stored devtools-v1 and hard-v1 feature manifests still hash to
+  `5084534a…eb0db` and `dabe32c4…15d63`.
+
+#### Diagnosis of the Part 2 failures (from looked-at data only)
+
+- **A3/A4 are CodeReviewer.** Part 2's pooled τ (0.764) was fitted on a CAL of
+  636 CodeReviewer and 150 CommitPackFT rows. CommitPackFT is answered at 93%
+  coverage with ≈1% risk on any split; CodeReviewer was answered at 16–19%
+  coverage with 10.9% risk on CAL and 20.0% on TEST. One threshold cannot be
+  right for a 96%-accurate and a 66%-accurate family at once, and the pooled
+  CAL bound let the noisy family through.
+- **No single project drives it.** Re-scoring the stored devtools-v1
+  validation/test rows (22 Kev development/test projects; temperature refitted
+  on the stored calibration split) with the Part 2 head: CodeReviewer accuracy
+  per project ranges 0.30–0.90 and the rows answered at τ are spread thinly
+  (0–5 per project) with errors in most projects; CodeReviewer risk at τ was
+  0.132 on the stored calibration split (38 answered) and 0.333 on the stored
+  test split (30 answered). The head's CodeReviewer confidence ranks errors
+  weakly and inconsistently across projects; this is consistent with
+  CodeReviewer's noisy human label ("a reviewer commented"), not with one bad
+  project.
+- **Why the gate missed OOD.** The Part 2 gate is a diagonal Mahalanobis
+  distance on the head's 256-dim *query projection*, which training shapes to
+  rank the options of in-scope rows, not to describe the input; OOD queries
+  land inside the in-scope spread. Fitted on the stored calibration split alone
+  it refuses 69% of hard-v1 `*/noul`, 33% of `kev-ood` and 14% of CommitPackFT
+  change-type questions (same diffs, another question); fitted on Part 2's
+  wider CAL it refused 19%. On the raw `Decision:` hidden state, a PCA
+  (64 components, fitted on the devtools-v1 train rows) Mahalanobis distance
+  plus residual energy, thresholded at the stored calibration split's 99th
+  percentile, refuses **100%** of all three of those looked-at OOD sets while
+  refusing 1.7% of the stored test split. This was developed only on
+  looked-at data (`dev-ood`: 150 Kev *train* change-type rows, requests
+  `684d154f…db09`, captured for this purpose and used nowhere else).
+
+#### Candidate
+
+One new head, `devtools-v2`, trained by `tools/judgment_train.py` (unchanged)
+with the Part 2 head's frozen config (`epochs=40 lr=3e-5 weight_decay=0.01
+batch_size=64 seed=0 width=5120 head_dim=256`), weights on `train`, epoch by
+`validation` NLL, on CPU PyTorch. No second config or seed is tried; its
+sha256 is recorded in 3b. The trainer's own `calibration`/`test` splits are
+bookkeeping only (the exported temperature is ignored: calibration is refitted
+from raw logits on CAL). The Part 2 `devtools` head is scored on the same
+splits for reference only: it trained on Kev train projects, which include the
+v2 CAL/TEST projects, so it is not a candidate.
+
+Declared scope, unchanged from Part 2: two-option Yes/No code-diff
+predicates, CodeReviewer `needs_comment` (exact question) and CommitPackFT
+`message_match` (question pattern), states starting `Diff:` or
+`Context before hunk:`, at most 2048 prompt tokens.
+
+#### Data and roles (`tools/judgment_reeval.py`, seed `local-ai-decisions-v2`)
+
+All new requests are native predicate/choice renderings captured through
+`judgment-capture`. Sources: Zenodo 6900648 (CC-BY-4.0, Li et al. 2022),
+projects with permissive licences in Kev's licence table only; CommitPackFT
+(`bigcode/commitpackft@fc56fe33`, MIT, permissive per-row repository
+licences, fetched by the same Kaggle kernel; summary `36a9fe70…d9e23`), 20
+languages: Kev's 12 plus kotlin, swift, scala, haskell, lua, perl, dart and
+elixir, none of which Kev sampled.
+
+CodeReviewer project roles: Kev *development* projects (10) → `validation`;
+Kev *test* projects (16, Part 2's TEST) → `train`; Kev *train* projects plus
+the 6 permissive projects Kev never used are ordered by seeded hash: first 12
+→ **CAL**, next 20 → **TEST**, rest (98) → `train`. Every row of a CAL/TEST
+project is removed from training (including Kev's own rows, which trained the
+Part 2 head). New rows exclude every hunk Kev or `cr-new` used.
+
+CommitPackFT roles: repository components (union of each commit's
+repositories) that share no repository with any Kev devtools-v1 row, assigned
+by seeded component hash (70% train, 10% validation, 10% CAL, 10% TEST); one
+commit per component, languages round-robin; Kev's message-match construction
+(the negative shows another component's subject in the same language and
+role); labels balanced.
+
+| Set | Requests (SHA-256) | Rows | Role |
+| --- | --- | ---: | --- |
+| `cr2:cal` | `cr-v2` `f0c27860d3768648871296ffa69be3ff36a59b7847eff0fb179d2de3b297612a` | 400 | **CAL**, 11 projects with rows: LLK-scratch-blocks, ProteoWizard-pwiz, aws-amazon-ecs-agent, aws-aws-sdk-go, bitpay-bitcore, graphite-project-graphite-web, istio-tools, lucas-clemente-quic-go, openfoodfacts-openfoodfacts-androidapp, vavr-io-vavr, vimeo-psalm |
+| `cr2:test` | same file | 500 | **TEST**, 17 projects: AthenZ-athenz, Automattic-mongoose, Azure-autorest, DataDog-dd-trace-dotnet, NLog-NLog, OPAE-opae-sdk, aspnet-KestrelHttpServer, aws-copilot-cli, influxdata-flux, kubernetes-sigs-cluster-api-provider-aws, kythe-kythe, nats-io-nats-server, open-osrs-runelite, open-telemetry-opentelemetry-go, opencontainers-runc, realm-realm-js, thoughtbot-upcase |
+| `cr2:train` | same file | 400 | train (83 train-role projects) |
+| `cm2:cal` / `cm2:test` | `cm-v2` `e6748cf452b4c925d9b70d64d8bcb01f9d4f28a5edd6a59953a1f01f2a814c73` | 250 / 350 | **CAL** / **TEST** (new repository components, 20 languages) |
+| `cm2:train` / `cm2:validation` | same file | 400 / 100 | train / validation |
+| `ood2:ood` | `ood-v2` `e1ef6ff82bf5d6f81e7cab5f682095b6fc7e727e638a8bc0d07560c3d1e53eaa` | 500 | **OOD**: 100 each of `prompt_injection`, `aegis_unsafe`, `flakeflagger_flaky` (Kev development/test rows `kev-ood` did not select), when2call actions and CommitPackFT change types (Kev development/test choices); none scored before |
+| devtools-v1 stored features | manifest `5084534a…eb0db` | 3,533 | train (train and test splits), `validation` (development-project CodeReviewer), trainer bookkeeping; rows of CAL/TEST projects dropped |
+
+Training directory: `judgment_reeval.py assemble` with the role file
+`d262b6ba205f6f08af9d4151117ebc8aa2094dcaf0158c3bd790d47d7872fca1`:
+devtools-v1 train/test → train, calibration → trainer calibration,
+development CodeReviewer → validation, development CommitPackFT → trainer
+test, every `codereviewer/<CAL or TEST project>` group dropped; `cr2:train`
+and `cm2:train` → train; `cm2:validation` → validation. The train-majority
+baseline uses the training directory's `train` rows.
+
+#### Changes to the confidence and refusal procedure (criteria unchanged)
+
+1. Calibration **per declared family** (the family is known declaratively from
+   the question): temperature or Platt by 5-fold grouped CV NLL on that
+   family's CAL rows, refitted on all of them.
+2. Refusal threshold **per declared family**: Part 1's rule (smallest CAL
+   confidence with ≥ 50 answered CAL rows and Wilson 95% upper risk ≤ 0.10) on
+   that family's CAL rows; if none qualifies the family is refused outright.
+3. Feature gate: PCA of the **training** rows' raw `Decision:` hidden state
+   (64 components); distance = (Mahalanobis in the components + residual
+   energy / mean residual variance) / 5120; threshold = CAL 99th percentile.
+4. Declarative scope check unchanged (`DEVTOOLS_SCOPE`).
+
+Metrics, the train-majority baseline and criteria **A1–A6 are exactly Part
+1's**: A3 on the pooled TEST answers under the per-family thresholds, A4 per
+declared family, A5 on `ood2`. One `judgment_reeval.py evaluate` run fits on
+CAL and scores TEST and OOD once; nothing is refitted after. If any
+criterion fails, `/v1/decisions` stays refused. Nothing here bears on MTP or
+coding quality.
