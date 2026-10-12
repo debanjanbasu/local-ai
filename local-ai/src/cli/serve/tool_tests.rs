@@ -111,8 +111,36 @@ fn tool_types_become_strict_native_functions() {
 fn malformed_tool_declarations_are_refused() {
     for (tools, expected) in [
         (
-            r#"[{"type":"custom","name":"x","format":{"type":"grammar","syntax":"lark","definition":"start: \"a\""}}]"#,
-            "lark",
+            r#"[{"type":"custom","name":"x","format":{"type":"grammar","syntax":"lark","definition":"start: \"(\" start \")\" | \"a\""}}]"#,
+            "custom tool \"x\" lark grammar: start is recursive",
+        ),
+        (
+            r#"[{"type":"custom","name":"x","format":{"type":"grammar","syntax":"lark","definition":"start: WORD\n%import common.WORD\n%ignore \" \""}}]"#,
+            "%ignore is not supported",
+        ),
+        (
+            r#"[{"type":"namespace","name":"ns","description":"d","tools":[{"type":"local_shell"}]}]"#,
+            "only hold function and custom tools",
+        ),
+        (
+            r#"[{"type":"namespace","name":"a.b","description":"d","tools":[{"type":"function","name":"f"}]}]"#,
+            "namespace tool requires a name",
+        ),
+        (
+            r#"[{"type":"namespace","name":"ns","description":"d","tools":[{"type":"function","name":"local_fs_read"}]}]"#,
+            "cannot be namespaced",
+        ),
+        (
+            r#"[{"type":"namespace","name":"ns","tools":[]}]"#,
+            "non-empty",
+        ),
+        (
+            r#"[{"type":"web_search","external_web_access":false,"engine":"x"}]"#,
+            "member \"engine\" is not supported",
+        ),
+        (
+            r#"[{"type":"custom","name":"apply_patch"},{"type":"apply_patch"}]"#,
+            "duplicate tool name \"apply_patch\"",
         ),
         (
             r#"[{"type":"function","name":"local_fs_read","parameters":{"type":"object"}}]"#,
@@ -122,7 +150,7 @@ fn malformed_tool_declarations_are_refused() {
             r#"[{"type":"shell","environment":{"type":"container_auto"}}]"#,
             "local",
         ),
-        (r#"[{"type":"custom","name":"shell"}]"#, "reserved"),
+        (r#"[{"type":"custom","name":"local_fs_read"}]"#, "reserved"),
         (r#"[{"type":"custom"}]"#, "name"),
     ] {
         let body =
@@ -595,4 +623,162 @@ fn hosted_tools_are_opt_in_server_flags() {
     assert!(parsed.tools.any() && parsed.tools.shell && !parsed.tools.write);
     assert_eq!(parsed.tools.fetch_domains, ["example.com"]);
     assert_eq!(parsed.tools.call_timeout, Duration::from_secs(5));
+}
+
+/// Codex 0.162.1's freeform `apply_patch` grammar, verbatim from the CLI.
+const CODEX_APPLY_PATCH: &str = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+"#;
+
+/// The tool shapes Codex 0.162.1 sends with its default configuration (as
+/// recorded by `tools/client_compat.py`), trimmed to one tool of each kind,
+/// plus its freeform `apply_patch`.
+fn codex_default_tools() -> Value {
+    json!([
+        {"type":"function","name":"exec_command","description":"Runs a command in a PTY.","strict":false,"parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"],"additionalProperties":false}},
+        {"type":"namespace","name":"multi_agent_v1","description":"Tools for spawning and managing sub-agents.","tools":[
+            {"type":"function","name":"close_agent","description":"Close an agent.","strict":false,"parameters":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}},
+            {"type":"function","name":"spawn_agent","description":"Spawn a sub-agent.","strict":false,"parameters":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}}
+        ]},
+        {"type":"web_search","external_web_access":false},
+        {"type":"custom","name":"apply_patch","description":"Use the `apply_patch` tool to edit files.","format":{"type":"grammar","syntax":"lark","definition":CODEX_APPLY_PATCH}}
+    ])
+}
+
+#[test]
+fn codex_default_tools_are_accepted_as_the_client_tools_they_are() {
+    let body = json!({"input":"hi","tools":codex_default_tools(),"tool_choice":"auto","parallel_tool_calls":true});
+    let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("prepared");
+    let request = &prepared.request;
+    let names: Vec<&str> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    // Namespaced tools are flattened under qualified names; web search is
+    // never offered to the model, which cannot search here.
+    assert_eq!(
+        names,
+        [
+            "exec_command",
+            "multi_agent_v1.close_agent",
+            "multi_agent_v1.spawn_agent",
+            "apply_patch"
+        ]
+    );
+    assert_eq!(
+        request.tools[2].description.as_deref(),
+        Some("Tools for spawning and managing sub-agents.\n\nSpawn a sub-agent.")
+    );
+    // The custom tool's Lark grammar reaches the engine's constrained decoding.
+    let patch = &request.tools[3];
+    assert!(patch.strict);
+    assert_eq!(
+        patch.parameters["properties"]["input"][local_engine::LARK_KEYWORD],
+        CODEX_APPLY_PATCH
+    );
+    let kinds = prepared.echo.kinds();
+    assert_eq!(kinds.kind("apply_patch"), Kind::Custom);
+    assert_eq!(kinds.kind("multi_agent_v1.spawn_agent"), Kind::Function);
+    // The echo keeps the declarations as the client sent them.
+    let echo = Arc::new(prepared.echo);
+    let reply = Reply::new(Protocol::Responses(Arc::clone(&echo)), Arc::from("bonsai"));
+    let mut state = ResponsesState::new(&reply, Arc::clone(&echo), true);
+    state.start();
+    let patch_text = "*** Begin Patch\n*** Update File: calc.py\n@@\n-a\n+b\n*** End Patch";
+    state.event(Event::ToolCall(call(
+        "c1",
+        "multi_agent_v1.spawn_agent",
+        json!({"message":"look"}),
+    )));
+    state.event(Event::ToolCall(call(
+        "c2",
+        "apply_patch",
+        json!({"input":patch_text}),
+    )));
+    let response = state
+        .event(Event::Finished(stats(StopReason::Eos, 3)))
+        .expect("finished");
+    let tools = response["tools"].as_array().expect("tools");
+    assert_eq!(tools[1]["type"], "namespace");
+    assert_eq!(tools[1]["tools"][1]["name"], "spawn_agent");
+    assert_eq!(
+        tools[2],
+        json!({"type":"web_search","external_web_access":false})
+    );
+    let output = response["output"].as_array().expect("output");
+    assert_eq!(output[0]["type"], "function_call");
+    assert_eq!(output[0]["namespace"], "multi_agent_v1");
+    assert_eq!(output[0]["name"], "spawn_agent");
+    assert_eq!(output[1]["type"], "custom_tool_call");
+    assert_eq!(output[1]["name"], "apply_patch");
+    assert_eq!(output[1]["input"], patch_text);
+    assert!(output[1].get("namespace").is_none());
+    let events = state.take_events();
+    let added = events
+        .iter()
+        .find(|event| event["type"] == "response.output_item.added")
+        .expect("added");
+    assert_eq!(added["item"]["namespace"], "multi_agent_v1");
+    assert_eq!(added["item"]["name"], "spawn_agent");
+    assert!(output.iter().all(|item| item["type"] != "web_search_call"));
+
+    // Codex replays the calls with their namespace; the model reads them
+    // under the names it called.
+    let mut input = output.clone();
+    input.push(json!({"type":"function_call_output","call_id":"c1","output":"agent 7"}));
+    input.push(json!({"type":"custom_tool_call_output","call_id":"c2","output":"Done!"}));
+    let body = json!({"input":input,"tools":codex_default_tools()});
+    let next = prepare_responses(body.to_string().as_bytes(), true).expect("replayed");
+    let calls = &next.request.messages[0].tool_calls;
+    assert_eq!(calls[0].name, "multi_agent_v1.spawn_agent");
+    assert_eq!(calls[1].name, "apply_patch");
+    assert_eq!(calls[1].arguments, json!({"input":patch_text}));
+}
+
+#[test]
+fn web_search_is_never_forced_or_reported_as_searched() {
+    for (extra, needle) in [
+        (
+            json!({"tool_choice":{"type":"web_search"}}),
+            "tool_choice type \"web_search\" is not supported",
+        ),
+        (json!({"tool_choice":"required"}), "needs at least one tool"),
+        (
+            json!({"include":["web_search_call.action.sources"]}),
+            "include",
+        ),
+    ] {
+        let mut body = json!({"input":"hi","tools":[{"type":"web_search"}]});
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        let error = prepare_responses(body.to_string().as_bytes(), true)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(error.contains(needle), "{extra}: {error}");
+    }
+    let prepared = prepare(
+        r#"[{"type":"web_search_preview","search_context_size":"low"}]"#,
+        &json!({}),
+    );
+    assert_eq!(prepared.request.tools.len(), 0);
 }

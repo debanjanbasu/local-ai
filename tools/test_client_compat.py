@@ -81,6 +81,15 @@ class ConfigTest(unittest.TestCase):
         self.assertNotIn("features", default)
         self.assertEqual(default["model_reasoning_effort"], "xhigh")
 
+    def test_default_config_flag_drops_the_compat_config(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            ctx = cc.Context(Path(scratch), None, 1, 2, None, "codex", None, 60, codex_default=True)
+            _, base, env = cc.prepare_client(ctx, "codex", "codex-read", "none")
+            config = tomllib.loads((Path(env["CODEX_HOME"]) / "config.toml").read_text())
+            self.assertNotIn("features", config)
+            self.assertNotIn("web_search", config)
+            self.assertTrue(str(base).startswith(scratch))
+
     def test_omp_runs_in_write_jail(self):
         ctx = cc.Context(Path("/s"), None, 1, 2, None, None, "omp", 60)
         command = cc.client_command(ctx, "omp", "hi", "none", Path("/scratch/base/repo"))
