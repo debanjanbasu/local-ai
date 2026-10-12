@@ -603,9 +603,12 @@ fn context_management_is_parsed_strictly_and_needs_the_key() {
     }
     let message = error(&entry(json!([{"type":"compaction"}])), None);
     assert!(message.contains("--reasoning-key"), "{message}");
+    // Not refused for background (see `combos_tests`); without a store a
+    // background response is refused for that alone.
     let background =
         json!({"input":"hi","background":true,"context_management":[{"type":"compaction"}]});
-    assert!(error(&background, Some(&cipher)).contains("with background"));
+    let message = error(&background, Some(&cipher));
+    assert!(!message.contains("context_management"), "{message}");
 }
 
 #[test]
@@ -931,7 +934,8 @@ fn reasoning_summary_options_are_validated() {
         .contains("disagree")
     );
     let background = json!({"input":"hi","background":true,"reasoning":{"summary":"auto"}});
-    assert!(error(&background, None).contains("reasoning.summary with background"));
+    let message = error(&background, None);
+    assert!(!message.contains("reasoning.summary"), "{message}");
     let deprecated =
         prepare(&body(json!({"generate_summary":"concise"})), None, None).expect("valid");
     assert!(deprecated.echo.summarizes());

@@ -62,13 +62,13 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use local_engine::{ChatRequest, EventStream, Signal};
+use local_engine::{ChatRequest, Event, EventStream, Signal};
 
 use super::Admitted;
 use super::journal::{JournalWriter, terminal_events};
 use super::reasoning_crypto::ReasoningCipher;
 use super::response::{Protocol, Reply};
-use super::responses::{ResponsesState, prepare_resumed};
+use super::responses::{ResponsesState, Summarizer, prepare_resumed};
 use super::store::{NO_REQUEST, ResponseLease, ResponseStore};
 
 /// What a stopped server reports for a job it did not finish.
@@ -130,8 +130,21 @@ struct Job {
     state: Mutex<Inner>,
     /// Cooperatively cancels the native work.
     stop: Box<dyn Fn() + Send + Sync>,
+    /// Set, outside the state lock, by whoever is about to settle the job
+    /// while the pump may hold that lock for a reasoning summary: the
+    /// summary stops at its next piece and the job settles as this says.
+    interrupt: Mutex<Option<Interrupt>>,
     /// What subscribers clone to follow the journal; it never waits itself.
     watcher: watch::Receiver<Published>,
+}
+
+/// Why a running reasoning summary was stopped (see [`Job::interrupt`]).
+#[derive(Clone)]
+enum Interrupt {
+    /// `POST .../cancel`: the job settles `cancelled`.
+    Cancel,
+    /// Shutdown or deletion: the job settles `failed` saying this.
+    Fail(String),
 }
 
 struct Inner {
@@ -163,22 +176,7 @@ impl Inner {
     /// Append `events` to the journal and tell subscribers. Nothing without
     /// a journal. `Err` once the journal cannot be written.
     fn append(&mut self, events: Vec<Value>) -> Result<(), String> {
-        let Some(journal) = self.journal.as_mut() else {
-            return Ok(());
-        };
-        if let Err(error) = journal.append(events) {
-            if journal.torn() {
-                self.published
-                    .send_if_modified(|published| !std::mem::replace(&mut published.torn, true));
-            }
-            let message = format!("the response's events could not be stored: {error}");
-            eprintln!("background response {}: {message}", self.doc.id());
-            return Err(message);
-        }
-        let bytes = journal.bytes();
-        self.published
-            .send_modify(|published| published.bytes = bytes);
-        Ok(())
+        append(&mut self.journal, &self.published, self.doc.id(), events)
     }
 
     /// Journal the events the document has produced since the last call.
@@ -249,6 +247,30 @@ impl Inner {
     }
 }
 
+/// [`Inner::append`], on the fields it needs, so the pump can journal a
+/// reasoning summary's events while the document is generating it.
+fn append(
+    journal: &mut Option<JournalWriter>,
+    published: &watch::Sender<Published>,
+    id: &str,
+    events: Vec<Value>,
+) -> Result<(), String> {
+    let Some(journal) = journal.as_mut() else {
+        return Ok(());
+    };
+    if let Err(error) = journal.append(events) {
+        if journal.torn() {
+            published.send_if_modified(|published| !std::mem::replace(&mut published.torn, true));
+        }
+        let message = format!("the response's events could not be stored: {error}");
+        eprintln!("background response {id}: {message}");
+        return Err(message);
+    }
+    let bytes = journal.bytes();
+    published.send_modify(|published| published.bytes = bytes);
+    Ok(())
+}
+
 impl Job {
     fn new(
         doc: ResponsesState,
@@ -268,8 +290,25 @@ impl Job {
                 published,
             }),
             stop,
+            interrupt: Mutex::new(None),
             watcher,
         })
+    }
+
+    /// Ask a reasoning summary the pump may be running to stop, so the
+    /// state lock is released promptly. The first reason wins.
+    fn interrupt(&self, why: Interrupt) {
+        self.interrupt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(why);
+    }
+
+    fn interrupted(&self) -> Option<Interrupt> {
+        self.interrupt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -298,7 +337,7 @@ impl Job {
             inner.phase = Phase::InProgress;
         }
         let done = match signal {
-            Signal::Event(event) => inner.doc.event(event),
+            Signal::Event(event) => self.fold(&mut inner, event),
             Signal::Progress(_) => None,
         };
         let failed = match done {
@@ -317,8 +356,47 @@ impl Job {
         }
     }
 
+    /// Fold `event` in. A reasoning summary it starts journals each piece
+    /// as it is generated, and stops when the journal cannot be written or
+    /// the job is interrupted; the Response then ends as that says, rather
+    /// than as a failed summary.
+    fn fold(&self, inner: &mut Inner, event: Event) -> Option<Value> {
+        let Inner {
+            doc,
+            journal,
+            published,
+            ..
+        } = inner;
+        let id = doc.id().to_owned();
+        let mut lost = None;
+        let mut sink = |events: Vec<Value>| match append(journal, published, &id, events) {
+            Ok(()) => self.interrupted().is_none(),
+            Err(message) => {
+                lost = Some(message);
+                false
+            }
+        };
+        let done = doc.event_with(event, Some(&mut sink))?;
+        if done.get("status").and_then(Value::as_str) != Some("failed") {
+            return Some(done);
+        }
+        let ended = match (lost, self.interrupted()) {
+            (Some(message), _) | (None, Some(Interrupt::Fail(message))) => {
+                doc.retract_end();
+                doc.fail(&message)
+            }
+            (None, Some(Interrupt::Cancel)) => {
+                doc.retract_end();
+                doc.cancelled()
+            }
+            (None, None) => done,
+        };
+        Some(ended)
+    }
+
     /// Settle a job still pending as `failed` with `message`, and stop it.
     fn abandon(&self, message: &str) {
+        self.interrupt(Interrupt::Fail(message.to_owned()));
         let mut inner = self.lock();
         if inner.pending() {
             let failed = inner.doc.fail(message);
@@ -329,6 +407,7 @@ impl Job {
     }
 
     fn cancel(&self) -> Result<Option<Value>, Failure> {
+        self.interrupt(Interrupt::Cancel);
         let mut inner = self.lock();
         let settled = match &inner.phase {
             Phase::Settled(response) => return Ok(Some(response.clone())),
@@ -349,6 +428,7 @@ impl Job {
     }
 
     fn delete(&self, store: &ResponseStore, id: &str) -> Result<bool, Failure> {
+        self.interrupt(Interrupt::Fail("the response was deleted".into()));
         let mut inner = self.lock();
         if matches!(inner.phase, Phase::Deleted) {
             return Ok(false);
@@ -594,8 +674,10 @@ impl Background {
     /// read again; one that ended meanwhile, or whose journal already ends,
     /// is settled from that end; one that cannot be regenerated (no stored
     /// request, a conversation, a request this server refuses or an engine
-    /// error) is settled `failed`, saying why. `thinking` and `cipher` are
-    /// this server's, as for a new request. `submit` queues the request on
+    /// error) is settled `failed`, saying why. `thinking`, `cipher` and
+    /// `summarizer` (which runs a requested reasoning summary) are this
+    /// server's, as for a new request; `submit` also gets the rebuilt reply,
+    /// for a Response whose hosted tools need their loop. `submit` queues the request on
     /// the engine, returning the job's signals, its cancel and its queue slot;
     /// a full queue leaves the job pending ([`Resumed::Deferred`]). Blocks on
     /// the store.
@@ -603,8 +685,8 @@ impl Background {
         self: &Arc<Self>,
         store: &Arc<ResponseStore>,
         id: &str,
-        (thinking, cipher): (bool, Option<&Arc<ReasoningCipher>>),
-        submit: impl FnOnce(ChatRequest) -> crate::Result<(N, S, Option<Admitted>)>,
+        (thinking, cipher, summarizer): (bool, Option<&Arc<ReasoningCipher>>, Option<&Summarizer>),
+        submit: impl FnOnce(ChatRequest, &Reply) -> crate::Result<(N, S, Option<Admitted>)>,
     ) -> Result<Resumed, Failure>
     where
         N: FnMut() -> Option<Signal> + Send + 'static,
@@ -661,10 +743,11 @@ impl Background {
                 }
             }
         }
-        let (request, reply) = match prepare_resumed(&stored, request, thinking, store, cipher) {
-            Ok(prepared) => prepared,
-            Err(error) => return settle(&error.to_string()),
-        };
+        let (request, reply) =
+            match prepare_resumed(&stored, request, (thinking, summarizer), store, cipher) {
+                Ok(prepared) => prepared,
+                Err(error) => return settle(&error.to_string()),
+            };
         let Protocol::Responses(echo) = &reply.protocol else {
             return settle("it is not a Response");
         };
@@ -691,7 +774,7 @@ impl Background {
             }
             None => None,
         };
-        let (next, stop, admitted) = match submit(request) {
+        let (next, stop, admitted) = match submit(request, &reply) {
             Ok(submitted) => submitted,
             Err(crate::Error::QueueFull) => return Ok(Resumed::Deferred),
             Err(error) => return settle(&error.to_string()),
