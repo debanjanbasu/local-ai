@@ -18,6 +18,7 @@ use tokio_stream::StreamExt;
 use local_engine::{ChatMessage, ChatRequest, EngineHandle, Event, Stats};
 use local_services::compaction::should_compact;
 
+use super::admin::Meter;
 use super::response::{Protocol, error_response, error_status, json_response};
 use super::responses::{
     Generate, History, PreparedResponses, Summarizer, compaction_resource, prepare_compact,
@@ -62,7 +63,7 @@ async fn generate(engine: &EngineHandle, request: ChatRequest) -> crate::Result<
 
 /// The engine-backed [`Generate`]: blocks the calling thread (a pump's
 /// blocking-pool thread) until the generation ends.
-fn blocking_generate(engine: EngineHandle) -> Generate {
+fn blocking_generate(engine: EngineHandle, meter: Meter) -> Generate {
     Arc::new(move |request, piece| {
         // Leaving the loop early drops the stream, which cancels the run.
         for event in engine.chat(request)? {
@@ -74,7 +75,10 @@ fn blocking_generate(engine: EngineHandle) -> Generate {
                         ));
                     }
                 }
-                Event::Finished(stats) => return Ok(*stats),
+                Event::Finished(stats) => {
+                    meter.generation(&stats);
+                    return Ok(*stats);
+                }
                 Event::Error(message) => return Err(crate::Error::Generation(message)),
                 Event::Reasoning(_)
                 | Event::ToolCall(_)
@@ -88,9 +92,10 @@ fn blocking_generate(engine: EngineHandle) -> Generate {
     })
 }
 
-/// The engine-backed [`Summarizer`], for a new or a resumed Response.
-pub(super) fn summarizer(engine: EngineHandle) -> Summarizer {
-    Summarizer(blocking_generate(engine))
+/// The engine-backed [`Summarizer`], for a new or a resumed Response; each
+/// summary generation is recorded by `meter`.
+pub(super) fn summarizer(engine: EngineHandle, meter: Meter) -> Summarizer {
+    Summarizer(blocking_generate(engine, meter))
 }
 
 /// Count `messages` as `template` would be counted with them.
@@ -129,6 +134,7 @@ async fn shrinks(
 pub(super) async fn prepare_responses(
     state: &AppState,
     body: Vec<u8>,
+    meter: &Meter,
 ) -> crate::Result<(bool, local_engine::ChatRequest, Protocol)> {
     let (thinking, store) = (state.thinking, state.responses.clone());
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
@@ -148,12 +154,12 @@ pub(super) async fn prepare_responses(
     .await
     .map_err(|error| crate::Error::Generation(format!("request preparation failed: {error}")))??;
     if let Some(entry) = prepared.context_compaction {
-        prepared = compact_if_due(state, prepared, entry.threshold).await?;
+        prepared = compact_if_due(state, prepared, entry.threshold, meter).await?;
     }
     if prepared.echo.summarizes() {
         prepared
             .echo
-            .set_summarizer(summarizer(state.engine.clone()));
+            .set_summarizer(summarizer(state.engine.clone(), meter.clone()));
     }
     Ok((
         prepared.stream,
@@ -168,6 +174,7 @@ async fn compact_if_due(
     state: &AppState,
     prepared: PreparedResponses,
     threshold: Option<usize>,
+    meter: &Meter,
 ) -> crate::Result<PreparedResponses> {
     let Some(cipher) = state.cipher.clone() else {
         return Err(crate::Error::InvalidArgument(
@@ -200,6 +207,7 @@ async fn compact_if_due(
     };
     let _admitted = state.depth.admit();
     let (summary, measured) = generate(&state.engine, pass.request.clone()).await?;
+    meter.spawn_generation(&measured);
     // It ran for this Response, so its tokens are in its usage even when
     // its item is discarded below.
     prepared.echo.spend(&measured);
@@ -213,7 +221,12 @@ async fn compact_if_due(
 }
 
 /// `POST /v1/responses/compact`.
-pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+pub(super) async fn handle(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+    meter: &Meter,
+) -> Response {
     let body = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
         Ok(value) => value.to_bytes().to_vec(),
         Err(error) => {
@@ -226,7 +239,7 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
             return error_response(status, &message, state, headers).await;
         }
     };
-    match compact(state, body).await {
+    match compact(state, body, meter).await {
         Ok(resource) => json_response(StatusCode::OK, resource, state, headers).await,
         Err(error) => {
             error_response(error_status(&error), &error.to_string(), state, headers).await
@@ -234,7 +247,11 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
     }
 }
 
-async fn compact(state: &AppState, body: Vec<u8>) -> crate::Result<serde_json::Value> {
+async fn compact(
+    state: &AppState,
+    body: Vec<u8>,
+    meter: &Meter,
+) -> crate::Result<serde_json::Value> {
     let (store, cipher) = (state.responses.clone(), state.cipher.clone());
     let (engine, model) = (state.engine.clone(), Arc::clone(&state.model));
     let (prepared, pass, template, tokens) = tokio::task::spawn_blocking(move || {
@@ -262,6 +279,7 @@ async fn compact(state: &AppState, body: Vec<u8>) -> crate::Result<serde_json::V
     };
     let _admitted = state.depth.admit();
     let (summary, measured) = generate(&state.engine, pass.request.clone()).await?;
+    meter.spawn_generation(&measured);
     let mut output = pass.kept().to_vec();
     let (item, history) =
         pass.finish(&summary, &prepared.history, &prepared.cipher, &state.model)?;

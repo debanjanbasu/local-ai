@@ -232,9 +232,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
                 &state.model,
                 state.context,
                 state.created,
-                state.embeddings.is_some(),
-                state.speech.is_some(),
-                state.transcription.is_some(),
+                Installed::of(&state),
             ),
             &state,
             &parts.headers,
@@ -242,7 +240,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         .await;
     }
     if parts.method == Method::POST && parts.uri.path() == moderations::ROUTE {
-        return moderations::handle(&state, &parts.headers, body).await;
+        return moderations::handle(&state, &parts.headers, body, &caller).await;
     }
     if parts.method == Method::POST
         && matches!(
@@ -250,16 +248,17 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             transcription::TRANSCRIPTIONS | transcription::TRANSLATIONS
         )
     {
-        return transcription::handle(&state, &parts, body).await;
+        return transcription::handle(&state, &parts, body, &caller).await;
     }
     if parts.method == Method::POST && parts.uri.path() == embeddings::ROUTE {
         return embeddings::handle(&state, &parts.headers, body, &caller).await;
     }
     if parts.method == Method::POST && parts.uri.path() == speech::ROUTE {
-        return speech::handle(&state, &parts.headers, body).await;
+        return speech::handle(&state, &parts.headers, body, &caller).await;
     }
     if parts.method == Method::POST && parts.uri.path() == compaction::ROUTE {
-        return compaction::handle(&state, &parts.headers, body).await;
+        let meter = admin::Meter::completions(&state, &caller);
+        return compaction::handle(&state, &parts.headers, body, &meter).await;
     }
     if parts.method == Method::POST && parts.uri.path() == decisions::ROUTE {
         return decisions::handle(&state, &parts.headers, body).await;
@@ -353,7 +352,8 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     }
     let prepared = if matches!(api, Api::Responses) {
         // Compaction and reasoning summaries run engine work of their own.
-        compaction::prepare_responses(&state, body).await
+        compaction::prepare_responses(&state, body, &admin::Meter::completions(&state, &caller))
+            .await
     } else {
         tokio::task::spawn_blocking(move || {
             prepare_retaining(
@@ -782,7 +782,10 @@ fn resume_background(
     id: &str,
 ) -> Result<bool, Failure> {
     let (engine, depth) = (state.engine.clone(), state.depth.clone());
-    let summarizer = compaction::summarizer(engine.clone());
+    // Resumed after a restart: the original caller is not stored, so the
+    // generations are recorded unattributed.
+    let meter = admin::Meter::completions(state, &admin::Caller::Anonymous);
+    let summarizer = compaction::summarizer(engine.clone(), meter);
     let resumed = state.background.resume(
         store,
         id,
@@ -794,10 +797,11 @@ fn resume_background(
                 Protocol::Chat { .. } => None,
             };
             let events = engine.chat(request)?;
-            let mut events = match tool_loop {
+            let events = match tool_loop {
                 Some(tool_loop) => tool_loop::start(tool_loop, events),
                 None => events,
             };
+            let mut events = admin::meter(state, &admin::Caller::Anonymous, events);
             let cancel = events.cancel_handle();
             // No deadline: the job has no client to stall, and a closed
             // channel is `None`.
@@ -995,8 +999,31 @@ fn stored_answer(
     }
 }
 
-/// `GET /v1/models`: the one loaded model and the context the engine admitted
-/// for it.
+/// Which optional models this server runs beside Bonsai (independent
+/// installs, so independent flags).
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
+struct Installed {
+    embeddings: bool,
+    moderation: bool,
+    speech: bool,
+    transcription: bool,
+}
+
+impl Installed {
+    const fn of(state: &AppState) -> Self {
+        Self {
+            embeddings: state.embeddings.is_some(),
+            moderation: state.moderations.is_some(),
+            speech: state.speech.is_some(),
+            transcription: state.transcription.is_some(),
+        }
+    }
+}
+
+/// `GET /v1/models`: the loaded Bonsai model with the context the engine
+/// admitted for it, then every installed optional model (each served by its
+/// own route).
 ///
 /// `context_length` (the name `OpenRouter` and LM Studio read) and
 /// `max_model_len` (vLLM's) are both the per-request admission limit from
@@ -1006,20 +1033,21 @@ fn models_json(
     model: &str,
     context: usize,
     created: u64,
-    embeddings: bool,
-    speech: bool,
-    transcription: bool,
+    installed: Installed,
 ) -> serde_json::Value {
     let mut data = vec![
         json!({"id":model,"object":"model","created":created,"owned_by":"local","context_length":context,"max_model_len":context}),
     ];
-    if embeddings {
+    if installed.embeddings {
         data.push(embeddings::model_json(created));
     }
-    if speech {
+    if installed.moderation {
+        data.push(moderations::model_json(created));
+    }
+    if installed.speech {
         data.push(speech::model_json(created));
     }
-    if transcription {
+    if installed.transcription {
         data.push(transcription::model_json(created));
     }
     json!({"object":"list","data":data})

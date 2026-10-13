@@ -45,7 +45,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use local_engine::{Event, EventStream, Signal};
+use local_engine::{Event, EventStream, Signal, Stats};
 use local_services::Error;
 use local_services::admin::usage::{
     DAY, UsageKind, UsageQuery, UsageRecord, bucket_spans, parse_width,
@@ -975,6 +975,72 @@ pub(super) fn record(state: &AppState, record: UsageRecord) {
     }
 }
 
+/// Where a generation that runs outside the request's own event stream
+/// (batch lines, eval runs, compaction and reasoning summaries) records its
+/// usage: the usage store and a record template, or nowhere while there is
+/// no store.
+#[derive(Clone, Default)]
+pub(super) struct Meter(Option<(Arc<Admin>, UsageRecord)>);
+
+impl Meter {
+    /// A `completions` meter of `caller`'s for the served model.
+    pub(super) fn completions(state: &AppState, caller: &Caller) -> Self {
+        Self::into_store(
+            state.auth.admin(),
+            caller.usage(UsageKind::Completions, &state.model),
+        )
+    }
+
+    /// `record` (counts zero) as the template written to `admin`.
+    pub(super) fn into_store(admin: Option<&Arc<Admin>>, record: UsageRecord) -> Self {
+        Self(admin.map(|admin| (Arc::clone(admin), record)))
+    }
+
+    /// Record one finished generation from its final measurements. Blocks on
+    /// the store: call it from a blocking context.
+    pub(super) fn generation(&self, stats: &Stats) {
+        if let Some((admin, template)) = &self.0 {
+            let mut record = template.clone();
+            let generation = &stats.generation;
+            record.input_tokens = count(generation.prompt_tokens);
+            record.input_cached_tokens = count(generation.reused_prompt_tokens);
+            record.output_tokens = count(generation.generated_tokens);
+            if let Err(error) = admin.record_usage(&record) {
+                eprintln!("warning: usage not recorded: {error}");
+            }
+        }
+    }
+
+    /// Record the template as it is (a request whose quantity was known when
+    /// the meter was made). Blocks on the store.
+    pub(super) fn write(&self) {
+        if let Some((admin, record)) = &self.0
+            && let Err(error) = admin.record_usage(record)
+        {
+            eprintln!("warning: usage not recorded: {error}");
+        }
+    }
+
+    /// Record the template completed by `fill`. Blocks on the store.
+    pub(super) fn write_with(&self, fill: impl FnOnce(&mut UsageRecord)) {
+        if let Some((admin, template)) = &self.0 {
+            let mut record = template.clone();
+            fill(&mut record);
+            if let Err(error) = admin.record_usage(&record) {
+                eprintln!("warning: usage not recorded: {error}");
+            }
+        }
+    }
+
+    /// [`Self::generation`] off the runtime.
+    pub(super) fn spawn_generation(&self, stats: &Stats) {
+        if self.0.is_some() {
+            let (meter, stats) = (self.clone(), stats.clone());
+            tokio::task::spawn_blocking(move || meter.generation(&stats));
+        }
+    }
+}
+
 /// `events` with its usage recorded, once it finishes, as a `completions`
 /// record of `caller`'s.
 ///
@@ -1034,6 +1100,46 @@ fn metered(admin: Arc<Admin>, record: UsageRecord, events: EventStream) -> Event
         canceller.abort();
     });
     stream
+}
+
+/// The usage of one request of a family measured in input tokens
+/// (`embeddings`, `moderations`).
+pub(super) fn token_usage(
+    caller: &Caller,
+    kind: UsageKind,
+    model: &str,
+    tokens: usize,
+) -> UsageRecord {
+    let mut record = caller.usage(kind, model);
+    record.input_tokens = count(tokens);
+    record
+}
+
+/// The `audio_speeches` usage of one speech request: the characters of its
+/// input.
+pub(super) fn speech_usage(caller: &Caller, model: &str, input: &str) -> UsageRecord {
+    let mut record = caller.usage(UsageKind::AudioSpeeches, model);
+    record.units = count(input.chars().count());
+    record
+}
+
+/// The `audio_transcriptions` usage of one transcription or translation:
+/// the seconds of audio it decoded, a started second counting as one.
+pub(super) fn transcription_usage(caller: &Caller, model: &str, seconds: f64) -> UsageRecord {
+    let mut record = caller.usage(UsageKind::AudioTranscriptions, model);
+    record.units = audio_seconds(seconds);
+    record
+}
+
+/// Seconds of audio as a usage column, a started second counting as one.
+pub(super) fn audio_seconds(seconds: f64) -> i64 {
+    if seconds.is_finite() && seconds > 0.0 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        let whole = seconds.ceil().min(i64::MAX as f64) as i64;
+        whole
+    } else {
+        0
+    }
 }
 
 /// A token count as a usage column.

@@ -10,10 +10,11 @@
 //! The request follows the pinned `CreateModerationRequest`. `input` is a
 //! string or an array of strings (one result each, at most [`MAX_INPUTS`]),
 //! or an array of multi-modal objects (one result for the whole array, its
-//! text parts joined by newlines). Image parts are refused with `400` until
-//! native image embeddings exist (the integration point: embed the image
-//! with the vision encoder and score it with heads trained on image
-//! embeddings; the text heads must not be reused on image vectors). `model`
+//! text parts joined by newlines). Image parts are refused with `400`: the
+//! native vision encoder can embed them, but no heads are trained and
+//! evaluated on image embeddings (the integration point: embed the image
+//! with the vision encoder and score it with such heads; the text heads must
+//! not be reused on image vectors). `model`
 //! may be omitted, [`MODERATION_MODEL_ID`], or one of the `OpenAI` moderation
 //! model names, which are accepted as aliases; the response always names
 //! [`MODERATION_MODEL_ID`].
@@ -42,6 +43,9 @@ use local_engine::moderation::{
     self, CATEGORIES, MODERATION_MODEL_ID, ModerationHeads, Scores, installed_heads,
 };
 
+use local_services::admin::usage::UsageKind;
+
+use super::admin::{self, Caller};
 use super::embeddings::{self, CancelOnDrop, Embeddings};
 use super::response::{error_response, json_response, new_id};
 use super::{AppState, MAX_REQUEST_BYTES};
@@ -61,6 +65,11 @@ const ALIASES: [&str; 4] = [
 /// Categories whose `categories` value may be `null` in the spec.
 const NULLABLE: [&str; 2] = ["illicit", "illicit/violent"];
 pub(super) const UNSCORED_HEADER: &str = "x-moderation-unscored-categories";
+
+/// `/v1/models` entry of the moderation model.
+pub(super) fn model_json(created: u64) -> Value {
+    json!({"id":MODERATION_MODEL_ID,"object":"model","created":created,"owned_by":"local"})
+}
 
 pub(super) struct Moderations {
     heads: ModerationHeads,
@@ -147,8 +156,8 @@ fn parse(body: &[u8]) -> Result<Vec<String>, String> {
                     },
                     Some("image_url") => {
                         return Err(
-                            "image inputs are not supported: this server has no native image \
-                                    embeddings yet, and its moderation heads score text only"
+                            "image inputs are not supported: the moderation heads are trained \
+                             and evaluated on text embeddings only"
                                 .into(),
                         );
                     }
@@ -220,7 +229,7 @@ fn score(
     service: &Moderations,
     texts: &[String],
     cancelled: &AtomicBool,
-) -> Result<Vec<Scores>, Failure> {
+) -> Result<(Vec<Scores>, usize), Failure> {
     service.embeddings.with_model(cancelled, |model, pace| {
         let mut windows = Vec::with_capacity(texts.len());
         let mut total = 0_usize;
@@ -244,18 +253,24 @@ fn score(
             .embed_ids(&flat, pace)
             .map_err(|error| Failure::Internal(error.to_string()))?;
         let mut start = 0;
-        Ok(windows
+        let scores = windows
             .iter()
             .map(|ids| {
                 let scores = service.heads.score(&vectors[start..start + ids.len()]);
                 start += ids.len();
                 scores
             })
-            .collect())
+            .collect();
+        Ok((scores, total))
     })
 }
 
-pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+pub(super) async fn handle(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+    caller: &Caller,
+) -> Response {
     let Some(service) = state.moderations.clone() else {
         return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
     };
@@ -297,7 +312,11 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
     })
     .await;
     match result {
-        Ok(Ok(results)) => {
+        Ok(Ok((results, tokens))) => {
+            admin::record(
+                state,
+                admin::token_usage(caller, UsageKind::Moderations, MODERATION_MODEL_ID, tokens),
+            );
             let mut response = json_response(
                 StatusCode::OK,
                 response_json(&service.heads, &results),

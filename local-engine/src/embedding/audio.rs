@@ -81,7 +81,6 @@ const EPSILON: f32 = 1e-6;
 const REL_POSITIONS: usize = 13;
 const MAX_DISTANCE: u32 = 11;
 
-
 /// Tower rows per pass and log-mel frames per pass (a 30 s clip is 750
 /// tokens from 2,999 frames).
 const TOWER_TOKENS: usize = 1088;
@@ -954,8 +953,10 @@ impl EmbeddingModel {
         clips: &[&[f32]],
         pace: &mut dyn FnMut() -> crate::Result<()>,
     ) -> crate::Result<Vec<Vec<f32>>> {
-        let inputs: Vec<Vec<MediaPart<'_>>> =
-            clips.iter().map(|clip| vec![MediaPart::Audio(clip)]).collect();
+        let inputs: Vec<Vec<MediaPart<'_>>> = clips
+            .iter()
+            .map(|clip| vec![MediaPart::Audio(clip)])
+            .collect();
         self.embed_multimodal(&inputs, pace)
     }
 }
