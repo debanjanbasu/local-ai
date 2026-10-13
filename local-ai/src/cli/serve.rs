@@ -28,6 +28,7 @@ mod evals;
 mod hosted;
 mod http3;
 mod journal;
+mod openai_decisions;
 mod options;
 mod reasoning_crypto;
 mod request;
@@ -78,6 +79,9 @@ struct Args {
     /// `--experimental-decision-head`: the judgment head that enables
     /// `POST /v1/experimental/decisions`. `None` serves no decisions.
     decision_head: Option<PathBuf>,
+    /// `--decisions-artifact`: the evaluated head, gate and calibration that
+    /// enable `POST /v1/decisions`. `None` refuses that route.
+    decisions_artifact: Option<PathBuf>,
     /// Hosted tool permissions and bounds; none by default.
     tools: options::ToolArgs,
 }
@@ -109,6 +113,9 @@ struct AppState {
     /// The opt-in experimental decision service; `None` without
     /// `--experimental-decision-head`.
     decisions: Option<Arc<decisions::Decisions>>,
+    /// The calibrated `POST /v1/decisions` service; `None` without
+    /// `--decisions-artifact`.
+    openai_decisions: Option<Arc<openai_decisions::OpenAiDecisions>>,
     /// Native durable services, available automatically in the user's data directory.
     services: Option<Arc<services::Services>>,
     batches: Option<Arc<batches::Batches>>,
@@ -229,14 +236,8 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     if parts.method == Method::POST && parts.uri.path() == decisions::ROUTE {
         return decisions::handle(&state, &parts.headers, body).await;
     }
-    if parts.method == Method::POST && parts.uri.path() == decisions::OPENAI_ROUTE {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            &decisions::openai_refusal(),
-            &state,
-            &parts.headers,
-        )
-        .await;
+    if parts.method == Method::POST && parts.uri.path() == openai_decisions::ROUTE {
+        return openai_decisions::handle(&state, &parts.headers, body).await;
     }
     // Authentication has already passed, so a stored response is never read or
     // deleted for a caller without the key.
@@ -987,6 +988,10 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let tools = open_tools(&args.tools)?;
     // Also before the model loads: a wrong head fails in milliseconds.
     let decisions = decisions::Decisions::start(args.decision_head.as_deref())?;
+    // The calibrated route's artifact is verified (hashes, acceptance, scope)
+    // before the model loads too.
+    let openai_decisions =
+        openai_decisions::OpenAiDecisions::start(args.decisions_artifact.as_deref())?;
     // Background `store: false` Responses are kept only in a private store of
     // this process; without one they are refused, and nothing else changes.
     let temporary = Temporary::create()
@@ -1022,6 +1027,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         background: Arc::default(),
         temporary: temporary.clone(),
         decisions: decisions.clone(),
+        openai_decisions: openai_decisions.clone(),
         services: Some(services),
         batches: None,
         vector_stores: vector_stores.clone(),
@@ -1058,6 +1064,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // while axum is still draining foreground connections.
     let closing = Arc::clone(&background);
     let closing_decisions = decisions.clone();
+    let closing_openai_decisions = openai_decisions.clone();
     let closing_batches = Arc::clone(&batches);
     let closing_evals = Arc::clone(&evals);
     let served = axum::serve(listener, app)
@@ -1068,12 +1075,14 @@ async fn run_async(args: Args) -> crate::Result<()> {
             // Waiting decisions end at once, cancelling their engine work,
             // so they never hold up the drain.
             decisions::close(closing_decisions.as_deref());
+            openai_decisions::close(closing_openai_decisions.as_deref());
             let _ = tokio::task::spawn_blocking(move || closing.close()).await;
         })
         .await
         .map_err(crate::Error::Io);
     // Again, for a server that stopped without the signal; settling is idempotent.
     decisions::close(decisions.as_deref());
+    openai_decisions::close(openai_decisions.as_deref());
     evals.close();
     batches.close();
     evals.drained().await;

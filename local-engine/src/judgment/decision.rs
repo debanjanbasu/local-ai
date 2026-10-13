@@ -166,6 +166,10 @@ pub struct Decision {
     /// The head's `calibration_scope` metadata, verbatim, or
     /// [`UNKNOWN_CALIBRATION_SCOPE`] when the artifact declares none.
     pub calibration_scope: String,
+    /// The FP16-rounded hidden state of the `Decision:` row the head scored
+    /// (`width` values), for an out-of-scope gate
+    /// ([`super::CalibratedHead::judge`]); empty when nothing was captured.
+    pub decide_row: Vec<f32>,
 }
 
 impl DecisionRequest {
@@ -352,7 +356,9 @@ impl PreparedDecision {
             return Ok(None);
         };
         let scores = head.score(&features)?;
-        self.assemble(Some(&scores)).map(Some)
+        let mut decision = self.assemble(Some(&scores))?;
+        decision.decide_row = features[features.len() - head.width()..].to_vec();
+        Ok(Some(decision))
     }
 
     /// The typed outcome from the head's `scores`, or the deterministic one
@@ -409,6 +415,7 @@ impl PreparedDecision {
             renderer: self.renderer,
             renderer_declared: self.renderer_declared,
             calibration_scope: self.calibration_scope.clone(),
+            decide_row: Vec::new(),
         })
     }
 }
