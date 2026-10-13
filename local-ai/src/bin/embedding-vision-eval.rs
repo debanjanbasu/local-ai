@@ -230,7 +230,7 @@ fn preprocess_gate(path: &str) -> Result<()> {
         let mut decode_diff = (0, 0);
         let decoded = probed
             .as_ref()
-            .map_err(|error| error.to_string())
+            .map_err(ToString::to_string)
             .and_then(|stream| {
                 if (stream.width, stream.height) == (width, height) {
                     video::decode_frames(&file, stream, &v.indices)
