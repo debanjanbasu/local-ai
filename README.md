@@ -320,19 +320,23 @@ Weights are not included. The runtime validates these pinned files:
 | `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | for image/video embeddings (Rust API) |
 | `models/kokoro-82m/kokoro-82m-f32.bin` | 354,146,560 | `aa3b5c769b9fdcc9eac3d6068352610183e45c20542f1232d629ead82c695928` | for `POST /v1/audio/speech` |
 | `models/moderation/moderation-heads.json` | 105,507 | `b74727bf58afce5adad11dc3aa903388ad550fffc9c38b099d14995fc760bdc4` | for `POST /v1/moderations` (with the encoder) |
+| `models/whisper-large-v3/whisper-large-v3-f16.bin` | 3,093,458,432 | `cce7ae83d4a15146f356a9f3bb5169b0fb42a86dc2e6a0c6cf932766e6d1cb53` | for `POST /v1/audio/transcriptions` and `/translations` |
+| `models/whisper-large-v3/tokenizer.json` | 2,480,617 | `6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca` | for `POST /v1/audio/transcriptions` and `/translations` |
 
 The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
 not: without it speculation falls back to suffix lookup alone and the startup
 policy says why. The EmbeddingGemma 2 text encoder is optional too: it is
 converted from the Kaggle checkpoint by `tools/convert_embeddinggemma2.py`, and
 when installed the server adds `POST /v1/embeddings`
-([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). So is Kokoro-82M text to speech:
-converted by `tools/convert_kokoro.py` from a Kaggle CPU job's download, it
-adds `POST /v1/audio/speech` ([docs/SPEECH.md](docs/SPEECH.md)).
-([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). With it, copying the committed moderation heads
-(`local-engine/assets/moderation/`) into `models/moderation/` adds
-`POST /v1/moderations` for the categories that passed evaluation
-([docs/MODERATION.md](docs/MODERATION.md)).
+([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). With it, copying the committed
+moderation heads (`local-engine/assets/moderation/`) into `models/moderation/`
+adds `POST /v1/moderations` for the categories that passed evaluation
+([docs/MODERATION.md](docs/MODERATION.md)). Kokoro-82M text to speech is
+optional too: converted by `tools/convert_kokoro.py` from a Kaggle CPU job's
+download, it adds `POST /v1/audio/speech` ([docs/SPEECH.md](docs/SPEECH.md)).
+So is Whisper large-v3: converted by `tools/convert_whisper.py`, it adds
+`POST /v1/audio/transcriptions` and `POST /v1/audio/translations`
+([docs/TRANSCRIPTION.md](docs/TRANSCRIPTION.md)).
 
 The GGUF repository is pinned. Its head has moved past `6ed5e12b`, so keep the
 pin rather than tracking the branch.
@@ -484,6 +488,8 @@ is 1.074x and the best measured result 1.29%.
   `POST /v1/audio/speech`.
 - `docs/MODERATION.md`: `POST /v1/moderations` heads, data, pre-registered
   criteria and results.
+- `docs/TRANSCRIPTION.md`: the optional native Whisper large-v3 speech model
+  and `POST /v1/audio/transcriptions` and `/translations`.
 
 ## Verification
 

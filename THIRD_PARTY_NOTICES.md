@@ -105,17 +105,52 @@ reads them from the user's download. Copyright (c) 2025 hexgrad. Licensed under
 the Apache License, Version 2.0 (<https://www.apache.org/licenses/LICENSE-2.0>);
 see `LICENSE-APACHE`.
 
-## Kokoro-82M and misaki (text to speech)
+## Whisper decoding and transcription logic
 
-`local-engine/src/speech/` and `shaders/kokoro.metal` reimplement, in Rust and
-Metal, the inference code of [hexgrad/kokoro](https://github.com/hexgrad/kokoro)
-0.9.4 (`kokoro/model.py`, `modules.py`, `istftnet.py`; Apache-2.0), itself
-adapted from [StyleTTS 2](https://github.com/yl4579/StyleTTS2) (MIT), and port
-the English grapheme-to-phoneme rules of [hexgrad/misaki](https://github.com/hexgrad/misaki)
-0.9.4 (`misaki/en.py`; Apache-2.0). Number words follow the forms of
-[num2words](https://github.com/savoirfairelinux/num2words) (LGPL-2.1; only its
-output conventions are reproduced, no code). The misaki lexicons and the
-Kokoro-82M weights and voices (Apache-2.0) are not included; the converter
-reads them from the user's download. Copyright (c) 2025 hexgrad. Licensed under
-the Apache License, Version 2.0 (<https://www.apache.org/licenses/LICENSE-2.0>);
-see `LICENSE-APACHE`.
+`local-engine/src/transcription/decode.rs` and the log-mel front end in
+`local-engine/src/transcription/mel.rs` port the decoding, timestamp-rule,
+temperature-fallback and long-form transcription logic and the spectrogram
+of [openai/whisper](https://github.com/openai/whisper) 20250625
+(`whisper/decoding.py`, `whisper/transcribe.py`, `whisper/audio.py`); the
+installed artifact embeds the package's `assets/mel_filters.npz`. The Whisper
+large-v3 weights the converter reads are released under the same licence.
+
+```text
+MIT License
+
+Copyright (c) 2022 OpenAI
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Symphonia
+
+Audio decoding for the transcription endpoints links
+[Symphonia](https://github.com/pdeljanov/Symphonia) 0.6.1 and its codec and
+format crates from crates.io, unmodified, under the Mozilla Public License 2.0
+(<https://mozilla.org/MPL/2.0/>); their source is available from crates.io and
+the repository above.
+
+## LibriSpeech test fixture
+
+`local-engine/tests/fixtures/librispeech-237-134493-0010.flac` is utterance
+237-134493-0010 of the LibriSpeech ASR corpus test-clean set (Panayotov, Chen,
+Povey and Khudanpur, <https://www.openslr.org/12>), licensed under CC BY 4.0
+(<https://creativecommons.org/licenses/by/4.0/>), unmodified.
+
