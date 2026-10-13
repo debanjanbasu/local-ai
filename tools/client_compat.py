@@ -21,7 +21,12 @@ each run bounded:
 `codex-*` scenarios use a function-tools-only Codex configuration (no web
 search, sub-agents, goals, apps or plugins; Codex's default developer
 messages are kept);
-`codex-default-config` keeps Codex's defaults to show what they still need.
+`codex-default-config` keeps Codex's defaults (sub-agent `namespace` tools,
+goals, `web_search`); `--codex-default-config` runs every `codex-*` scenario
+with the defaults. Codex declares its freeform `apply_patch` (a `custom` tool
+with a Lark grammar) only for models its catalog marks freeform, which this
+provider is not, so `http-custom-tool-apply-patch` sends that declaration
+itself, verbatim, and forces a call.
 
 Scenario kinds:
 
@@ -464,6 +469,8 @@ class Context:
     codex_bin: str | None
     omp_bin: str | None
     timeout: float
+    # Every codex-* scenario keeps Codex's default configuration.
+    codex_default: bool = False
 
 
 @dataclass
@@ -569,6 +576,7 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
     if client == "codex":
         codex_home = home / ".codex"
         codex_home.mkdir()
+        compat = compat and not ctx.codex_default
         (codex_home / "config.toml").write_text(codex_config(ctx.proxy_port, effort, compat))
         env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
     else:
@@ -800,11 +808,32 @@ def probe_request(port: int) -> dict:
 
 
 SIMPLE = {"input": "Reply with the single word OK.", "reasoning": {"effort": "none"}, "max_output_tokens": 16, "store": False}
+# Codex 0.162.1's freeform `apply_patch` grammar, verbatim from the CLI.
+CODEX_APPLY_PATCH_GRAMMAR = """start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+"""
 APPLY_PATCH_TOOL = {
     "type": "custom",
     "name": "apply_patch",
-    "description": "Apply a patch in the apply_patch format.",
-    "format": {"type": "grammar", "syntax": "lark", "definition": 'start: "*** Begin Patch" /(.|\\n)*/ "*** End Patch"'},
+    "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+    "format": {"type": "grammar", "syntax": "lark", "definition": CODEX_APPLY_PATCH_GRAMMAR},
 }
 EXEC_TOOL = {
     "type": "function",
@@ -816,7 +845,6 @@ SHAPE_PROBES: dict[str, tuple[str, dict, str]] = {
     # name: (owner if refused, body, path)
     "http-reasoning-summary-auto": (
         "reasoning-summaries", {**SIMPLE, "reasoning": {"effort": "xhigh", "summary": "auto"}, "max_output_tokens": 64}, "/v1/responses"),
-    "http-custom-tool-apply-patch": ("hosted-custom-tools", {**SIMPLE, "tools": [APPLY_PATCH_TOOL]}, "/v1/responses"),
     "http-local-shell-tool": ("hosted-custom-tools", {**SIMPLE, "tools": [{"type": "local_shell"}]}, "/v1/responses"),
     "http-web-search-tool": (
         "hosted-custom-tools", {**SIMPLE, "tools": [{"type": "web_search", "external_web_access": False}]}, "/v1/responses"),
@@ -855,6 +883,32 @@ def shape_probe(owner: str, body: dict, path: str) -> Callable[[Context, Result]
         result.detail = f"HTTP {status}: {json.dumps(response)[:300]}"
 
     return run
+
+
+def custom_apply_patch(ctx: Context, result: Result) -> None:
+    """Codex's freeform `apply_patch` declared and forced: the call's input is
+    generated under its Lark grammar, so it must be a well-formed patch."""
+    start = ctx.recorder.begin(result.name)
+    body = {
+        "input": "Create the file hello.txt containing the single line: hi",
+        "reasoning": {"effort": "none"},
+        "max_output_tokens": 256,
+        "store": False,
+        "tools": [APPLY_PATCH_TOOL],
+        "tool_choice": {"type": "custom", "name": "apply_patch"},
+    }
+    status, response, seconds = post(ctx.proxy_port, "/v1/responses", body)
+    summarize_exchanges(result, ctx.recorder.since(start))
+    result.seconds = seconds
+    calls = [item for item in (response or {}).get("output", []) if item.get("type") == "custom_tool_call"] \
+        if isinstance(response, dict) else []
+    patch = calls[0].get("input", "") if calls else ""
+    result.task_ok = (
+        status == 200 and bool(calls) and calls[0].get("name") == "apply_patch"
+        and patch.startswith("*** Begin Patch\n") and patch.rstrip("\n").endswith("*** End Patch"))
+    result.passed = result.protocol_ok and result.task_ok
+    result.detail = f"HTTP {status}: calls={len(calls)} input={patch[:160]!r}" if status == 200 \
+        else f"HTTP {status}: {json.dumps(response)[:300]}"
 
 
 def encrypted_replay(ctx: Context, result: Result) -> None:
@@ -991,6 +1045,7 @@ def scenarios() -> list[Scenario]:
         client_scenario("read", "codex", "none", compat=False), "codex"))
     for name, (owner, body, path) in SHAPE_PROBES.items():
         items.append(Scenario(name, "http", "-", owner, shape_probe(owner, body, path)))
+    items.append(Scenario("http-custom-tool-apply-patch", "http", "none", "hosted-custom-tools", custom_apply_patch))
     items.append(Scenario("http-encrypted-reasoning-replay", "http", "xhigh", "protocol", encrypted_replay))
     items.append(Scenario("http-encrypted-reasoning-unrequested", "http", "xhigh", "protocol", encrypted_unrequested))
     items.append(Scenario("http-stream-disconnect", "http", "none", "protocol", stream_disconnect))
@@ -1023,6 +1078,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--list", action="store_true")
     parser.add_argument(
+        "--codex-default-config", action="store_true",
+        help="run every codex-* scenario with Codex's default configuration (sub-agents, goals, web search)")
+    parser.add_argument(
         "--no-reasoning-key", action="store_true",
         help="serve without --reasoning-key (Codex's include and the encrypted probes then fail)")
     args = parser.parse_args(argv)
@@ -1049,7 +1107,9 @@ def main(argv: list[str] | None = None) -> int:
     results: list[Result] = []
     try:
         proxy_port = recorder.start()
-        ctx = Context(out, recorder, proxy_port, args.port, server, args.codex_bin, args.omp_bin, args.timeout)
+        ctx = Context(
+            out, recorder, proxy_port, args.port, server, args.codex_bin, args.omp_bin, args.timeout,
+            args.codex_default_config)
         for scenario in chosen:
             result = Result(scenario.name, scenario.client, scenario.effort, scenario.owner)
             binary = {"codex": args.codex_bin, "omp": args.omp_bin}.get(scenario.needs, "-")
