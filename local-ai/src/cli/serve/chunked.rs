@@ -13,7 +13,7 @@ use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, checked,
-    event_wait, finish_reason, usage_json,
+    event_wait, usage_json,
 };
 use super::responses::ResponsesState;
 
@@ -58,7 +58,7 @@ pub(super) const BODY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// A chat has two because the chat template emits reasoning *before* the answer
 /// and this body's order follows arrival: buffering reasoning instead would make
 /// a thinking request as silent as the buffered body this path replaces, since
-/// reasoning is most of a thinking generation. A completion has one.
+/// reasoning is most of a thinking generation.
 ///
 /// The order is the opposite of what a serialized map gives, and has to be.
 /// `serde_json`'s map is a `BTreeMap`, so a buffered body sorts `finish_reason`
@@ -66,13 +66,7 @@ pub(super) const BODY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// the strings first is the only order in which they can be written as they are
 /// produced. The reassembled document has the same members with the same values;
 /// only their order differs, which JSON does not attach meaning to.
-const fn members(chat: bool) -> &'static [&'static str] {
-    if chat {
-        &["reasoning_content", "content"]
-    } else {
-        &["text"]
-    }
-}
+const MEMBERS: [&str; 2] = ["reasoning_content", "content"];
 
 /// The bytes that open a streamed non-streaming body, first member named and its
 /// value left unopened.
@@ -88,20 +82,16 @@ const fn members(chat: bool) -> &'static [&'static str] {
 const fn stream_head(document: &Document) -> &'static str {
     match document {
         Document::Chat { .. } => "{\"choices\":[{\"index\":0,\"message\":{\"reasoning_content\":",
-        Document::Completion => "{\"choices\":[{\"index\":0,\"text\":",
         Document::Responses(_) => " ",
     }
 }
 
 /// What a non-streaming body is building.
 enum Document {
-    Completion,
     /// A chat completion. Tool calls are complete objects that only exist once
     /// the engine has validated them, so they are kept here and written in the
     /// tail, after the streamed strings, like every other end-dependent member.
-    Chat {
-        calls: Vec<ToolCall>,
-    },
+    Chat { calls: Vec<ToolCall> },
     /// A Response object.
     ///
     /// Its `output` is an array of items whose number, order and kinds are only
@@ -152,7 +142,7 @@ enum Codec {
 pub(super) struct Body {
     reply: Reply,
     document: Document,
-    /// How many of [`members`] have been declared. The head declares the first,
+    /// How many of [`MEMBERS`] have been declared. The head declares the first,
     /// so this starts at one.
     declared: usize,
     /// Whether the last declared member's string is open for more pieces.
@@ -180,7 +170,6 @@ impl Body {
         };
         let compressed = matches!(codec, Codec::Zstd(_));
         let document = match &reply.protocol {
-            Protocol::Completion => Document::Completion,
             Protocol::Chat { .. } => Document::Chat { calls: Vec::new() },
             Protocol::Responses(echo) => Document::Responses(Box::new(ResponsesState::new(
                 &reply,
@@ -224,9 +213,8 @@ impl Body {
 
     /// Write one content piece, naming and closing whatever came before it.
     ///
-    /// With thinking on, the member before `content` is the empty
-    /// `reasoning_content` of a model that did not reason; with thinking off there
-    /// is nothing before it and this only opens `text`.
+    /// The member before `content` is `reasoning_content`, closed as the empty
+    /// string when the model did not reason.
     fn content(&mut self, piece: &str) {
         self.declare_rest();
         self.piece(piece);
@@ -247,12 +235,11 @@ impl Body {
     /// Close the member the head left open and name the next, until every
     /// streamed member has been declared.
     fn declare_rest(&mut self) {
-        let members = members(self.reply.chat());
-        while self.declared < members.len() {
+        while self.declared < MEMBERS.len() {
             self.close_value();
             self.pending.push(b',');
             self.pending
-                .extend_from_slice(json_string(members[self.declared]).as_bytes());
+                .extend_from_slice(json_string(MEMBERS[self.declared]).as_bytes());
             self.pending.push(b':');
             self.declared += 1;
         }
@@ -275,7 +262,7 @@ impl Body {
         self.declare_rest();
         let calls = match &mut self.document {
             Document::Chat { calls } => std::mem::take(calls),
-            Document::Completion | Document::Responses(_) => Vec::new(),
+            Document::Responses(_) => Vec::new(),
         };
         if !self.open && !calls.is_empty() {
             // A turn that only called tools has no answer, which OpenAI spells
@@ -387,7 +374,7 @@ pub(super) fn absorb(body: &mut Body, signal: Signal) -> Flow {
         // Hosted tool results only run in the Responses loop.
         Signal::Event(Event::TokenIds(_) | Event::ToolOutput(_)) => Flow::Keep,
         Signal::Event(Event::ToolCall(call)) => {
-            // A raw completion renders no tools, so only a chat can see one.
+            // A Responses document took its events above; a chat keeps calls for its tail.
             if let Document::Chat { calls } = &mut body.document {
                 calls.push(call);
             }
@@ -455,37 +442,29 @@ fn absorb_response(body: &mut Body, signal: Signal) -> Flow {
 /// the generation has stopped.
 fn stream_tail(reply: &Reply, calls: &[ToolCall], stats: &Stats) -> Vec<u8> {
     let mut tail = Vec::new();
-    let chat = reply.chat();
-    let stop = json_string(if chat {
-        chat_finish_reason(stats.stop_reason, !calls.is_empty())
-    } else {
-        finish_reason(stats.stop_reason)
-    });
-    if chat {
-        if !calls.is_empty() {
-            let calls: Vec<Value> = calls
-                .iter()
-                .enumerate()
-                .map(|(index, call)| {
-                    let mut call = chat_tool_call(index, call);
-                    // `index` belongs to stream deltas; a message lists calls in order.
-                    if let Value::Object(map) = &mut call {
-                        map.remove("index");
-                    }
-                    call
-                })
-                .collect();
-            tail.extend_from_slice(b",\"tool_calls\":");
-            tail.extend_from_slice(&encode(&Value::Array(calls)));
-        }
-        // `message` is still open, and this brace is what ends it.
-        tail.extend_from_slice(b",\"role\":\"assistant\"}");
+    let stop = json_string(chat_finish_reason(stats.stop_reason, !calls.is_empty()));
+    if !calls.is_empty() {
+        let calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let mut call = chat_tool_call(index, call);
+                // `index` belongs to stream deltas; a message lists calls in order.
+                if let Value::Object(map) = &mut call {
+                    map.remove("index");
+                }
+                call
+            })
+            .collect();
+        tail.extend_from_slice(b",\"tool_calls\":");
+        tail.extend_from_slice(&encode(&Value::Array(calls)));
     }
+    // `message` is still open, and this brace is what ends it.
+    tail.extend_from_slice(b",\"role\":\"assistant\"}");
     tail.extend_from_slice(b",\"logprobs\":null");
     tail.extend_from_slice(b",\"finish_reason\":");
     tail.extend_from_slice(stop.as_bytes());
-    // The same two bytes close the choice and the array in either shape, which
-    // is what `stream_head` opened; the brace at the end closes the document.
+    // These two bytes close the choice and the array `stream_head` opened; the brace at the end closes the document.
     tail.extend_from_slice(b"}]");
     for (key, value) in trailer(reply, stats) {
         tail.push(b',');
@@ -507,14 +486,7 @@ fn trailer(reply: &Reply, stats: &Stats) -> Vec<(&'static str, Value)> {
         ("created", json!(reply.created)),
         ("id", json!(reply.id)),
         ("model", json!(reply.model.as_ref())),
-        (
-            "object",
-            json!(if reply.chat() {
-                "chat.completion"
-            } else {
-                "text_completion"
-            }),
-        ),
+        ("object", json!("chat.completion")),
         ("speculation", speculation_json(stats)),
         ("timings", timings_json(stats)),
         ("usage", usage_json(stats)),

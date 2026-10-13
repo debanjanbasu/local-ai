@@ -36,7 +36,12 @@
 //! 1. `sampling` (only `completions` and `responses` data sources): one
 //!    batch with a request per row, built from `input_messages` and
 //!    `sampling_params` (the spec's defaults: `temperature` 1, `top_p` 1,
-//!    `seed` 42; `max_completion_tokens` defaults to the server's 8192);
+//!    `seed` 42; `max_completion_tokens` defaults to the server's 8192). A
+//!    `completions` source samples through Chat Completions, which
+//!    deprecated `seed`: choosing one is refused, and its samples report
+//!    [`CHAT_COMPLETIONS_SEED`], the server's fixed seed;
+//!    `score_model` graders, which also run through Chat, refuse
+//!    `sampling_params.seed` likewise;
 //! 2. `grading`: one batch with a request per row and model grader;
 //! 3. `scoring`: every row is graded and the output items, result counts,
 //!    per-criterion results and usage are written in one transaction.
@@ -90,6 +95,7 @@ use crate::conversations::{Metadata, Order, Page};
 use crate::files::{CreateFile, FilePurpose};
 use crate::{Error, Result, Store, migrate, new_id, now};
 
+pub use definitions::CHAT_COMPLETIONS_SEED;
 use definitions::{Criterion, ItemSource, Row, invalid};
 pub use scoring::EvalApiError;
 use scoring::{StoredSample, Usage};

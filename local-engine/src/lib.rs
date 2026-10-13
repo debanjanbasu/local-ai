@@ -30,9 +30,8 @@ mod tools;
 
 mod error;
 pub use api::{
-    CancelHandle, ChatMessage, ChatOutput, ChatRequest, CompletionRequest, Engine, EngineHandle,
-    EngineInfo, Event, EventRelay, EventStream, PendingDecision, Plan, Sampling, Signal, Stats,
-    ToolOutput,
+    CancelHandle, ChatMessage, ChatOutput, ChatRequest, Engine, EngineHandle, EngineInfo, Event,
+    EventRelay, EventStream, PendingDecision, Plan, Sampling, Signal, Stats, ToolOutput,
 };
 pub use error::Error;
 pub use structured::ResponseFormat;
