@@ -128,7 +128,7 @@ struct Act<'a> {
 }
 
 impl<'a> Act<'a> {
-    fn new(buffer: &'a MetalBuffer, channels: usize, columns: usize) -> Self {
+    const fn new(buffer: &'a MetalBuffer, channels: usize, columns: usize) -> Self {
         Self {
             view: View::new(buffer, 0),
             channels: channels as u32,
@@ -138,7 +138,7 @@ impl<'a> Act<'a> {
     }
 
     /// Rows `start..start + channels` of this block.
-    fn rows(self, start: usize, channels: usize) -> Self {
+    const fn rows(self, start: usize, channels: usize) -> Self {
         Self {
             view: self.view.at(start * self.row as usize),
             channels: channels as u32,
@@ -200,8 +200,10 @@ impl Network {
             "bert.embeddings.position_embeddings.weight",
             &[MAX_IDS, BERT_EMBED],
         )?;
-        let token_type =
-            artifact.values("bert.embeddings.token_type_embeddings.weight", &[2, BERT_EMBED])?;
+        let token_type = artifact.values(
+            "bert.embeddings.token_type_embeddings.weight",
+            &[2, BERT_EMBED],
+        )?;
         let embed_norm = (
             artifact.values("bert.embeddings.LayerNorm.weight", &[BERT_EMBED])?,
             artifact.values("bert.embeddings.LayerNorm.bias", &[BERT_EMBED])?,
@@ -276,13 +278,16 @@ impl Network {
                 *gamma += 1.0;
             }
         }
-        Ok((MetalBuffer::from_slice(self.context.device(), &values)?, index))
+        Ok((
+            MetalBuffer::from_slice(self.context.device(), &values)?,
+            index,
+        ))
     }
 
     /// Convolution `y = conv(x)` over `columns` outputs (split by columns
     /// into bounded submissions). `weight` is `[cout, taps, cin]` (taps 1
     /// for a linear map, stored `[cout, cin]` when `linear`).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
     fn conv(
         &self,
         pacer: &mut Pacer<'_>,
@@ -324,12 +329,14 @@ impl Network {
             out_stride: 1,
             out_offset: 0,
             out_row: y.row,
-            flags: Conv::BIAS * u32::from(b.is_some()) | Conv::ACCUMULATE * u32::from(accumulate),
+            flags: (Conv::BIAS * u32::from(b.is_some()))
+                | (Conv::ACCUMULATE * u32::from(accumulate)),
             scale,
         };
         self.dispatch_conv(pacer, w, b, x.view, y.view, p)
     }
 
+    #[allow(clippy::many_single_char_names)]
     fn dispatch_conv(
         &self,
         pacer: &mut Pacer<'_>,
@@ -348,7 +355,7 @@ impl Network {
             let columns = step.min(p.columns - start);
             let mut piece = p;
             piece.columns = columns;
-            piece.in_offset = p.in_offset + start as i32 * p.in_stride;
+            piece.in_offset = p.in_offset + start.cast_signed() * p.in_stride;
             piece.out_offset = p.out_offset + start * p.out_stride;
             self.kernels.conv(&mut pacer.batch, w, b, x, y, piece)?;
             pacer.add(per_column * u64::from(columns))?;
@@ -420,7 +427,7 @@ impl Network {
     }
 
     /// `AdainResBlk1d` (`istftnet.py`): x `[cin, T]` to out `[cout, T or 2T]`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn adain_res_block(
         &self,
         pacer: &mut Pacer<'_>,
@@ -568,6 +575,7 @@ impl Network {
         t2: Act<'_>,
     ) -> crate::Result<()> {
         let c = x.channels as usize;
+        let kernel_i = i32::try_from(kernel).unwrap_or(1);
         for (i, dilation) in [1_i32, 3, 5].into_iter().enumerate() {
             let (scale, shift) = Self::style_view(styles, &format!("{prefix}.adain1.{i}"), c)?;
             self.kernels.instance_norm(
@@ -582,7 +590,7 @@ impl Network {
                 (x.row, t1.row),
                 Activation::Snake,
             )?;
-            let pad = dilation * (kernel as i32 - 1) / 2;
+            let pad = dilation * (kernel_i - 1) / 2;
             self.conv(
                 pacer,
                 &format!("{prefix}.convs1.{i}.weight"),
@@ -615,7 +623,7 @@ impl Network {
                 false,
                 t2,
                 kernel,
-                (1, 1, (kernel as i32 - 1) / 2),
+                (1, 1, (kernel_i - 1) / 2),
                 x,
                 true,
                 1.0,
@@ -626,7 +634,7 @@ impl Network {
 
     /// Synthesize one chunk: `ids` framed by the boundary id 0, `style` the
     /// voice pack row for the chunk's phoneme count (256 values).
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     pub(super) fn synthesize(
         &self,
         ids: &[u32],
@@ -749,8 +757,16 @@ impl Network {
                 BERT_EPS,
                 None,
             )?;
-            self.linear(&mut pacer, &format!("{layer}.ffn.weight"), true, a, f, false)?;
-            self.kernels.gelu(&mut pacer.batch, f.view, (BERT_FFN * t) as u32)?;
+            self.linear(
+                &mut pacer,
+                &format!("{layer}.ffn.weight"),
+                true,
+                a,
+                f,
+                false,
+            )?;
+            self.kernels
+                .gelu(&mut pacer.batch, f.view, (BERT_FFN * t) as u32)?;
             self.kernels.copy(
                 &mut pacer.batch,
                 a.view,
@@ -852,7 +868,11 @@ impl Network {
         let te_b = buffer(ctx, HIDDEN * t)?;
         let te_b = Act::new(&te_b, HIDDEN, t);
         for i in 0..3 {
-            let (src, dst) = if i % 2 == 0 { (te_a, te_b) } else { (te_b, te_a) };
+            let (src, dst) = if i % 2 == 0 {
+                (te_a, te_b)
+            } else {
+                (te_b, te_a)
+            };
             self.conv(
                 &mut pacer,
                 &format!("text_encoder.cnn.{i}.0.weight"),
@@ -1152,7 +1172,12 @@ impl Network {
             )?;
             // Transposed convolution, one dispatch per output phase.
             let x_act = Act::new(&bx, ch, len);
-            let (stride, pad, kernel) = if stage == 0 { (10, 5, 20) } else { (6, 3, 12) };
+            let (stride, pad, kernel) = if stage == 0 {
+                (10_usize, 5_i32, 20_usize)
+            } else {
+                (6, 3, 12)
+            };
+            let stride_i = if stage == 0 { 10_i32 } else { 6 };
             let out_offset_extra = u32::from(stage == 1);
             let up_len = x_prev.columns as usize * stride;
             let w = self.w(
@@ -1163,8 +1188,9 @@ impl Network {
             let per_phase = ch * (kernel / stride) * 2 * ch;
             for r in 0..stride {
                 // Outputs t = q * stride + r - pad for q >= q0 with t >= 0.
-                let q0 = ((pad as i32 - r as i32).max(0) + stride as i32 - 1) / stride as i32;
-                let first = q0 * stride as i32 + r as i32 - pad as i32;
+                let r_i = i32::try_from(r).unwrap_or(0);
+                let q0 = ((pad - r_i).max(0) + stride_i - 1) / stride_i;
+                let first = q0 * stride_i + r_i - pad;
                 if first < 0 || first as usize >= up_len {
                     continue;
                 }
@@ -1185,7 +1211,14 @@ impl Network {
                     flags: Conv::BIAS,
                     scale: 1.0,
                 };
-                self.dispatch_conv(&mut pacer, w.at(r * per_phase), Some(b), x_prev.view, x_act.view, p)?;
+                self.dispatch_conv(
+                    &mut pacer,
+                    w.at(r * per_phase),
+                    Some(b),
+                    x_prev.view,
+                    x_act.view,
+                    p,
+                )?;
             }
             if stage == 1 {
                 // Reflection pad (1, 0): column 0 = unpadded column 1.
@@ -1294,8 +1327,13 @@ impl Network {
         )?;
         let samples = 5 * (l1 - 1);
         let audio = buffer(ctx, samples)?;
-        self.kernels
-            .istft(&mut pacer.batch, post.view, View::new(&audio, 0), l1 as u32, post.row)?;
+        self.kernels.istft(
+            &mut pacer.batch,
+            post.view,
+            View::new(&audio, 0),
+            l1 as u32,
+            post.row,
+        )?;
         pacer.sync()?;
         tap(&mut taps, "decoder.generator.conv_post", post);
         let samples = audio.as_slice::<f32>()[..samples].to_vec();
