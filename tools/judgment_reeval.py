@@ -716,6 +716,91 @@ def markdown(report: dict, title: str) -> str:
     return text + "\n".join(lines) + "\n"
 
 
+# ---- offline decisions and HTTP parity --------------------------------------
+
+
+def calibrator_from_json(spec: dict) -> jc.Calibrator:
+    if spec["method"] == "platt":
+        return jc.Calibrator("platt", slope=spec["slope"], bias=spec["bias"])
+    return jc.Calibrator("temperature", temperature=spec["temperature"])
+
+
+def offline_decisions(records, artifact: dict) -> list[dict]:
+    """What a server holding `artifact` answers for each scored row: the declared
+    scope check, then (in scope) prompt length, gate, family threshold and confidence,
+    in that order, with the family's calibrated P(Yes)."""
+    families, scope = artifact["families"], artifact["scope"]
+    gate_threshold = artifact["gate"]["threshold"]
+    # The token limit refuses an in-scope question after rendering, as the server does.
+    unlimited = dict(scope, max_prompt_tokens=math.inf)
+    out = []
+    for r in records:
+        in_scope = (r["yes_index"] is not None and r["family"] in families
+                    and jc.in_declared_scope(r, unlimited))
+        entry = {"id": r["id"], "set": r["set"], "family": r["family"], "in_scope": in_scope}
+        if in_scope:
+            family = families[r["family"]]
+            probs = calibrator_from_json(family["calibration"]).probabilities(
+                r["raw"], r["yes_index"])
+            confidence = max(probs)
+            if r["prompt_tokens"] > scope["max_prompt_tokens"]:
+                refusal = "prompt_too_long"
+            elif not r["gate_distance"] <= gate_threshold:
+                refusal = "gate"
+            elif family["threshold"] is None:
+                refusal = "family_refused"
+            elif confidence < family["threshold"]:
+                refusal = "low_confidence"
+            else:
+                refusal = None
+            entry.update(p_yes=probs[r["yes_index"]], confidence=confidence,
+                         gate_distance=r["gate_distance"], refusal=refusal)
+        out.append(entry)
+    return out
+
+
+def http_parity(url: str, requests_path: Path, expected_path: Path, ids: list[str],
+                model: str = "bonsai", opener=None) -> dict:
+    """POST each request (one predicate) to a running server's /v1/decisions and
+    compare with the offline decision of the same row."""
+    import urllib.request
+    opener = opener or urllib.request.urlopen
+    requests = {}
+    for line in requests_path.read_text(encoding="utf-8").split("\n"):
+        if line:
+            row = json.loads(line)
+            requests[row["id"]] = row
+    expected = {}
+    for line in expected_path.read_text().split("\n"):
+        if line:
+            row = json.loads(line)
+            expected[row["id"]] = row
+    rows, mismatched = [], []
+    for row_id in ids:
+        request, want = requests[row_id], expected[row_id]
+        if request["kind"] == "predicate":
+            question = {"type": "predicate", "name": row_id, "instructions": request["question"]}
+        else:
+            question = {"type": "choice", "name": row_id, "instructions": request["question"],
+                        "choices": [{"value": v} for v in request["options"]]}
+        body = json.dumps({"model": model, "input": request["state"],
+                           "questions": [question]}).encode()
+        http = urllib.request.Request(url, data=body,
+                                      headers={"Content-Type": "application/json"})
+        with opener(http, timeout=600) as response:
+            answer = json.loads(response.read())["answers"][0]
+        answered = want.get("in_scope") and want.get("refusal") is None
+        ok = answer["name"] == row_id and (
+            (answered and answer["type"] == "predicate"
+             and abs(answer["probability"] - want["p_yes"]) <= 1e-6)
+            or (not answered and answer["type"] == "refusal"))
+        rows.append({"id": row_id, "answer": answer, "expected": want, "agree": ok})
+        if not ok:
+            mismatched.append(row_id)
+    return {"rows": len(rows), "agree": len(rows) - len(mismatched), "mismatched": mismatched,
+            "answered": sum(r["answer"]["type"] == "predicate" for r in rows), "details": rows}
+
+
 # ---- CLI --------------------------------------------------------------------
 
 
@@ -766,6 +851,18 @@ def main(argv=None) -> int:
     p.add_argument("--ood", action="append", default=[])
     p.add_argument("--title", default="Evaluation (protocol v2)")
     p.add_argument("--out", type=Path, required=True)
+    p = sub.add_parser("offline")
+    p.add_argument("--scores", type=Path, required=True)
+    p.add_argument("--artifact", type=Path, required=True, help="calibration.json")
+    p.add_argument("--head", type=Path, required=True)
+    p.add_argument("--gate", type=Path, required=True)
+    p.add_argument("--out", type=Path, required=True)
+    p = sub.add_parser("http-parity")
+    p.add_argument("--url", default="http://127.0.0.1:8114/v1/decisions")
+    p.add_argument("--requests", type=Path, required=True)
+    p.add_argument("--expected", type=Path, required=True)
+    p.add_argument("--ids", type=Path, required=True, help="one row id per line")
+    p.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.command == "build-codereviewer":
         result = build_codereviewer(args.zenodo_dir, args.kev_dir, args.licences, args.cr_new,
@@ -790,6 +887,23 @@ def main(argv=None) -> int:
             directory, _, texts = rest.partition(",")
             sources.append((name, Path(directory), Path(texts) if texts else None))
         result = score(args.head, args.gate, sources, args.out)
+    elif args.command == "offline":
+        summary = jc.check_scores(args.scores, args.head)
+        artifact = json.loads(args.artifact.read_text())
+        verify_calibration_artifact(artifact, jc.sha256_file(args.head), jc.sha256_file(args.gate))
+        if summary.get("gate_sha256") != artifact["gate_sha256"]:
+            raise ReevalError("scores were computed with a different gate")
+        rows = offline_decisions(jc.load_scores(args.scores), artifact)
+        payload = "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows)
+        args.out.write_text(payload)
+        result = {"rows": len(rows), "in_scope": sum(r["in_scope"] for r in rows),
+                  "answered": sum(r.get("refusal", "x") is None for r in rows),
+                  "sha256": hashlib.sha256(payload.encode()).hexdigest()}
+    elif args.command == "http-parity":
+        ids = [line for line in args.ids.read_text().split("\n") if line]
+        report = http_parity(args.url, args.requests, args.expected, ids)
+        args.out.write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")
+        result = {k: v for k, v in report.items() if k != "details"}
     else:
         summary = jc.check_scores(args.scores, args.head)
         if summary.get("gate_sha256") != jc.sha256_file(args.gate):

@@ -535,3 +535,55 @@ reach 10% selective risk on 50 rows.
 - `cr-new` features were not recaptured (request hash reproduced; `kev-ood`
   recapture was bit-identical).
 - Nothing here bears on MTP acceptance or coding quality.
+
+### 3c. A6 integrity and `POST /v1/decisions`
+
+**Decision: A1–A6 pass, so `POST /v1/decisions` is implemented, served only
+with `--decisions-artifact DIR`** (`head.safetensors`, `gate.safetensors`,
+`calibration.json`) and only within the declared scope. Without the flag the
+route stays a 404 with an explanation.
+
+- **Load-time validation** (`local_engine::judgment::CalibratedHead::open`):
+  the artifact's content hash over its canonical JSON (keys sorted, compact,
+  UTF-8, number text kept; parity with Python's `canonical_sha256` is a unit
+  test), the head and gate file hashes it pins (`head_sha256`, `gate_sha256`,
+  `gate.file_sha256`), `format` = `local-ai.judgment-calibration.v2`,
+  `acceptance.passed` = true, and a declared scope identical to the one the
+  server implements; any mismatch stops the server before the model loads.
+  Unit tests cover a sealed artifact and each refusal (tampered content, head,
+  gate, failed acceptance, other scope, missing family, other format), and
+  the HTTP layer's refusal of a failed artifact, a tampered head and a wrong
+  width.
+- **Offline parity:** Rust's judgment of every captured `cr-v2`, `cm-v2` and
+  `ood-v2` row from its stored features equals `judgment_reeval.py offline`
+  (Python, from the same features and artifact) on all 2,900 rows: same scope
+  decision, same answer or refusal reason, `P(Yes)`, confidence and gate
+  distance within 6.6e-15 relative (`offline_parity_with_the_python_evaluation`,
+  ignored test with paths in environment variables; offline decisions
+  `606a79ed…8ce2`).
+- **Native and HTTP parity** on 26 rows (6 CodeReviewer TEST, 2 gate-refused
+  CodeReviewer, 10 answered and 4 gate-refused CommitPackFT TEST, 4 OOD;
+  `parity-ids` seeded): `Engine::decide` on the loaded model with the
+  artifact's head, judged by `CalibratedHead::judge`, matches the offline
+  decisions (`P(Yes)` and gate distance within 1e-9, same refusals; 10
+  answered; `native_parity_with_the_offline_decisions`, one GPU-lock hold),
+  and the live server on port 8114 with `--decisions-artifact` answered the
+  same 26 requests identically (`judgment_reeval.py http-parity`: 26/26, 10
+  predicate answers with `probability` within 1e-6, 16 refusals; one hold).
+- Served end to end on TEST (scope check, token limit, gate, family
+  threshold): 339 of 850 rows answered (coverage 0.399), all CommitPackFT, 3
+  wrong (risk 0.009, Wilson upper 0.026); every CodeReviewer and every OOD
+  question refused.
+- Response shape is the pinned spec's: unit tests validate requests against
+  `DecisionRequest` and responses against `DecisionResponse`
+  (`local-ai/src/cli/serve/decisions_openapi_schemas.json`, extracted from the
+  pinned `openapi.json`). Predicate answers carry `probability` (calibrated
+  P(Yes)) and no `confidence`, as the spec defines them; the top-label
+  confidence decides refusal. Choice and score questions, message or image
+  inputs, and predicates outside the declared questions are answered
+  `{"type":"refusal","name"}` without GPU work.
+
+Artifact hashes (files not committed; produced in this worktree's `.amp/in/`):
+head `34d07088…c83b81`, gate `9a5a4eb8…4fb1`, `calibration.json` file
+`7e1100f9…a8ff` (content hash `7cf043ef…13a2`). Nothing here bears on MTP or
+coding quality; the served scope is commit-message match only.

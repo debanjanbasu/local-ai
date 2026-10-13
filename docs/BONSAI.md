@@ -188,7 +188,7 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST`, `GET` | `/v1/batches[/{id}[/cancel]]` | batches of the three text endpoints on the loaded model |
 | `POST`, `GET`, `DELETE` | `/v1/evals[/{id}[/runs[/{run_id}[/cancel\|/output_items[/{item_id}]]]]]` | evals of the loaded model, run through batches |
 | `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
-| `POST` | `/v1/decisions` | always 404, explaining why OpenAI Decisions is not implemented |
+| `POST` | `/v1/decisions` | calibrated, scope-gated decisions (`--decisions-artifact` only; 404 with an explanation otherwise) |
 
 Generation accepts `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
 `presence_penalty`, `frequency_penalty`, `seed`, and `stream`. Chat's
@@ -934,14 +934,28 @@ pending decision, which cancels it, queued or running; shutdown refuses new
 requests and ends waiting ones with 503, cancelling their decisions the same
 way. These waits are futures woken by the engine or by shutdown, not polling.
 
-`POST /v1/decisions` is always a 404 with an explanation. OpenAI's Decisions
+`POST /v1/experimental/decisions` is not the OpenAI Decisions API: OpenAI's
 responses require a `confidence` on every choice and score answer and may
-answer with a `refusal`; the head produces neither, and a confidence could
-only be invented. Calibrated confidence, a refusal threshold and a scope
-gate were fitted and tested against pre-registered criteria in
-[DECISIONS_EVALUATION.md](DECISIONS_EVALUATION.md): no head passed (for the
-devtools-v1 head, selective risk on new CodeReviewer projects and the
-out-of-scope feature gate failed), so the route stays refused. The existing devtools-v1 head declares no renderer or
+answer with a `refusal`, and this route's head produces neither.
+`POST /v1/decisions` is served separately, only with `--decisions-artifact DIR`
+(`head.safetensors`, `gate.safetensors`, `calibration.json`). At startup the
+server checks the artifact's canonical-JSON content hash, the head and gate
+file hashes it pins, that its pre-registered acceptance passed and that its
+declared scope is the one the server implements; any mismatch stops it before
+the model loads. A `predicate` question is answered only when it is one of the
+declared questions (CodeReviewer "Does this change need a reviewer comment?",
+CommitPackFT "Does this commit message describe this diff? Message: "…"")
+over a text input starting `Diff:` or `Context before hunk:`; it then runs one
+native decision, and is answered with the calibrated `probability` of Yes
+unless the prompt exceeds 2048 tokens, the gate (PCA Mahalanobis distance of
+the `Decision:` hidden state, fitted on training rows) puts it out of
+distribution, its family has no threshold (CodeReviewer: always refused) or
+its top-label confidence is below the family's threshold. Every other
+question, and every question about a message or image input, is answered
+`{"type":"refusal"}` without GPU work. Results and limits are in
+[DECISIONS_EVALUATION.md](DECISIONS_EVALUATION.md) part 3; in short only
+commit-message match is answered, which says nothing about code review or
+coding quality. The existing devtools-v1 head declares no renderer or
 calibration scope, so the route reports `renderer_source: "assumed"` and an
 unknown calibration scope for it; as measured when it was evaluated, its
 probabilities are calibrated only for the two-option Yes/No code-diff
