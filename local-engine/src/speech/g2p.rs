@@ -38,7 +38,7 @@ fn is_vowel(c: char) -> bool {
 
 /// One output token: the text it came from, its phonemes (`None` when
 /// unknown), and whether whitespace follows it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token {
     pub text: String,
     pub phonemes: Option<String>,
@@ -90,6 +90,12 @@ enum Entry {
     Tagged(HashMap<String, Option<String>>),
 }
 
+/// `s` without its last `drop` bytes (callers drop ASCII suffixes they
+/// matched with `ends_with`, so the cut is on a character boundary).
+fn head(s: &str, drop: usize) -> &str {
+    s.get(..s.len().saturating_sub(drop)).unwrap_or("")
+}
+
 fn lower(s: &str) -> String {
     s.to_lowercase()
 }
@@ -114,7 +120,7 @@ fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
-fn lexicon_char(c: char) -> bool {
+const fn lexicon_char(c: char) -> bool {
     c == '\'' || c == '-' || c.is_ascii_alphabetic()
 }
 
@@ -122,6 +128,8 @@ fn count(ps: &str, set: &str) -> bool {
     ps.chars().any(|c| set.contains(c))
 }
 
+// `misaki`'s stress levels are the exact values -2, -1, -0.5, 0, 0.5, 1 and 2.
+#[allow(clippy::float_cmp)]
 fn apply_stress(ps: &str, stress: Option<f32>) -> String {
     let Some(stress) = stress else {
         return ps.to_owned();
@@ -137,10 +145,10 @@ fn apply_stress(ps: &str, stress: Option<f32>) -> String {
             .map(|(i, c)| (i as f64, *c))
             .collect();
         for (i, c) in chars.iter().enumerate() {
-            if *c == PRIMARY || *c == SECONDARY {
-                if let Some(j) = (i..chars.len()).find(|j| is_vowel(chars[*j])) {
-                    keyed[i].0 = j as f64 - 0.5;
-                }
+            if (*c == PRIMARY || *c == SECONDARY)
+                && let Some(j) = (i..chars.len()).find(|j| is_vowel(chars[*j]))
+            {
+                keyed[i].0 = j as f64 - 0.5;
             }
         }
         keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -149,7 +157,8 @@ fn apply_stress(ps: &str, stress: Option<f32>) -> String {
     if stress < -1.0 {
         ps.replace([PRIMARY, SECONDARY], "")
     } else if stress == -1.0 || ((stress == 0.0 || stress == -0.5) && has_primary) {
-        ps.replace(SECONDARY, "").replace(PRIMARY, &SECONDARY.to_string())
+        ps.replace(SECONDARY, "")
+            .replace(PRIMARY, &SECONDARY.to_string())
     } else if (stress == 0.0 || stress == 0.5 || stress == 1.0) && !has_any {
         if !count(ps, VOWELS) {
             return ps.to_owned();
@@ -283,8 +292,8 @@ impl Lexicon {
             }
         }
         let ps = apply_stress(&ps, Some(0.0));
-        let out = match ps.rfind(SECONDARY) {
-            Some(at) => format!("{}{PRIMARY}{}", &ps[..at], &ps[at + SECONDARY.len_utf8()..]),
+        let out = match ps.rsplit_once(SECONDARY) {
+            Some((before, after)) => format!("{before}{PRIMARY}{after}"),
             None => ps,
         };
         (Some(out), Some(3))
@@ -309,13 +318,21 @@ impl Lexicon {
         let stripped = word.trim_matches('.');
         if stripped.contains('.')
             && is_alpha(&word.replace('.', ""))
-            && word.split('.').map(|p| p.chars().count()).max().unwrap_or(0) < 3
+            && word
+                .split('.')
+                .map(|p| p.chars().count())
+                .max()
+                .unwrap_or(0)
+                < 3
         {
             return self.get_nnp(word);
         }
         match word {
             "a" | "A" => {
-                return (Some(if tag == "DT" { "ɐ" } else { "ˈA" }.to_owned()), Some(4));
+                return (
+                    Some(if tag == "DT" { "ɐ" } else { "ˈA" }.to_owned()),
+                    Some(4),
+                );
             }
             "am" | "Am" | "AM" => {
                 if tag.starts_with("NN") {
@@ -402,50 +419,56 @@ impl Lexicon {
         rest == upper(&rest)
     }
 
-    fn lookup(&self, word: &str, tag: Option<&str>, stress: Option<f32>, ctx: Option<Context>) -> Lookup {
-        let mut word = word.to_owned();
-        let mut is_nnp = None;
-        if word == upper(&word) && !self.golds.contains_key(&word) {
-            word = lower(&word);
-            is_nnp = Some(tag == Some("NNP"));
-        }
+    fn lookup(
+        &self,
+        word: &str,
+        tag: Option<&str>,
+        stress: Option<f32>,
+        ctx: Option<Context>,
+    ) -> Lookup {
+        let all_caps = word == upper(word) && !self.golds.contains_key(word);
+        let word = if all_caps {
+            lower(word)
+        } else {
+            word.to_owned()
+        };
+        let is_nnp = all_caps.then_some(tag == Some("NNP"));
         let mut entry = self.golds.get(&word).cloned();
-        let mut rating = 4;
-        if entry.is_none() && is_nnp != Some(true) {
+        let rating = if entry.is_none() && is_nnp != Some(true) {
             entry = self.silvers.get(&word).cloned();
-            rating = 3;
-        }
+            3
+        } else {
+            4
+        };
         let ps = match entry {
             None => None,
             Some(Entry::Plain(s)) => Some(s),
             Some(Entry::Tagged(map)) => {
-                let key: Option<String> = if ctx.is_some_and(|c| c.future_vowel.is_none())
-                    && map.contains_key("None")
-                {
-                    Some("None".to_owned())
-                } else {
-                    match tag {
-                        Some(t) if map.contains_key(t) => Some(t.to_owned()),
-                        Some(t) => Some(parent_tag(t).to_owned()),
-                        None => None,
-                    }
-                };
-                match key.as_deref().and_then(|k| map.get(k)) {
-                    Some(value) => value.clone(),
-                    None => map.get("DEFAULT").cloned().flatten(),
-                }
+                let key: Option<String> =
+                    if ctx.is_some_and(|c| c.future_vowel.is_none()) && map.contains_key("None") {
+                        Some("None".to_owned())
+                    } else {
+                        match tag {
+                            Some(t) if map.contains_key(t) => Some(t.to_owned()),
+                            Some(t) => Some(parent_tag(t).to_owned()),
+                            None => None,
+                        }
+                    };
+                key.as_deref()
+                    .and_then(|k| map.get(k))
+                    .map_or_else(|| map.get("DEFAULT").cloned().flatten(), Clone::clone)
             }
         };
-        if ps.is_none() || (is_nnp == Some(true) && !ps.as_deref().unwrap_or("").contains(PRIMARY)) {
+        if ps.is_none() || (is_nnp == Some(true) && !ps.as_deref().unwrap_or("").contains(PRIMARY))
+        {
             let (nnp, r) = self.get_nnp(&word);
             if nnp.is_some() {
                 return (nnp, r);
             }
         }
-        match ps {
-            Some(ps) => (Some(apply_stress(&ps, stress)), Some(rating)),
-            None => (None, None),
-        }
+        ps.map_or((None, None), |ps| {
+            (Some(apply_stress(&ps, stress)), Some(rating))
+        })
     }
 
     fn suffix_s(&self, stem: Option<String>) -> Option<String> {
@@ -460,20 +483,26 @@ impl Lexicon {
         })
     }
 
-    fn stem_s(&self, word: &str, tag: Option<&str>, stress: Option<f32>, ctx: Option<Context>) -> Lookup {
+    fn stem_s(
+        &self,
+        word: &str,
+        tag: Option<&str>,
+        stress: Option<f32>,
+        ctx: Option<Context>,
+    ) -> Lookup {
         let n = word.chars().count();
         if n < 3 || !word.ends_with('s') {
             return (None, None);
         }
-        let stem = if !word.ends_with("ss") && self.is_known(&word[..word.len() - 1]) {
-            word[..word.len() - 1].to_owned()
+        let stem = if !word.ends_with("ss") && self.is_known(head(word, 1)) {
+            head(word, 1).to_owned()
         } else if (word.ends_with("'s")
             || (n > 4 && word.ends_with("es") && !word.ends_with("ies")))
-            && self.is_known(&word[..word.len() - 2])
+            && self.is_known(head(word, 2))
         {
-            word[..word.len() - 2].to_owned()
-        } else if n > 4 && word.ends_with("ies") && self.is_known(&format!("{}y", &word[..word.len() - 3])) {
-            format!("{}y", &word[..word.len() - 3])
+            head(word, 2).to_owned()
+        } else if n > 4 && word.ends_with("ies") && self.is_known(&format!("{}y", head(word, 3))) {
+            format!("{}y", head(word, 3))
         } else {
             return (None, None);
         };
@@ -500,19 +529,25 @@ impl Lexicon {
         })
     }
 
-    fn stem_ed(&self, word: &str, tag: Option<&str>, stress: Option<f32>, ctx: Option<Context>) -> Lookup {
+    fn stem_ed(
+        &self,
+        word: &str,
+        tag: Option<&str>,
+        stress: Option<f32>,
+        ctx: Option<Context>,
+    ) -> Lookup {
         let n = word.chars().count();
         if n < 4 || !word.ends_with('d') {
             return (None, None);
         }
-        let stem = if !word.ends_with("dd") && self.is_known(&word[..word.len() - 1]) {
-            &word[..word.len() - 1]
+        let stem = if !word.ends_with("dd") && self.is_known(head(word, 1)) {
+            head(word, 1)
         } else if n > 4
             && word.ends_with("ed")
             && !word.ends_with("eed")
-            && self.is_known(&word[..word.len() - 2])
+            && self.is_known(head(word, 2))
         {
-            &word[..word.len() - 2]
+            head(word, 2)
         } else {
             return (None, None);
         };
@@ -534,23 +569,31 @@ impl Lexicon {
         Some(stem + "ɪŋ")
     }
 
-    fn stem_ing(&self, word: &str, tag: Option<&str>, stress: Option<f32>, ctx: Option<Context>) -> Lookup {
+    fn stem_ing(
+        &self,
+        word: &str,
+        tag: Option<&str>,
+        stress: Option<f32>,
+        ctx: Option<Context>,
+    ) -> Lookup {
         let n = word.chars().count();
         if n < 5 || !word.ends_with("ing") {
             return (None, None);
         }
-        let base = &word[..word.len() - 3];
+        let base = head(word, 3);
         let doubled = {
             let b: Vec<char> = base.chars().collect();
-            (b.len() >= 2 && b[b.len() - 1] == b[b.len() - 2] && "bcdgklmnprstvxz".contains(b[b.len() - 1]))
+            (b.len() >= 2
+                && b[b.len() - 1] == b[b.len() - 2]
+                && "bcdgklmnprstvxz".contains(b[b.len() - 1]))
                 || word.ends_with("cking")
         };
         let stem = if n > 5 && self.is_known(base) {
             base.to_owned()
         } else if self.is_known(&format!("{base}e")) {
             format!("{base}e")
-        } else if n > 5 && doubled && self.is_known(&word[..word.len() - 4]) {
-            word[..word.len() - 4].to_owned()
+        } else if n > 5 && doubled && self.is_known(head(word, 4)) {
+            head(word, 4).to_owned()
         } else {
             return (None, None);
         };
@@ -584,11 +627,16 @@ impl Lexicon {
         if self.is_known(&word) {
             return self.lookup(&word, Some(tag), stress, Some(ctx));
         }
-        if word.ends_with("s'") && self.is_known(&format!("{}'s", &word[..word.len() - 2])) {
-            return self.lookup(&format!("{}'s", &word[..word.len() - 2]), Some(tag), stress, Some(ctx));
+        if word.ends_with("s'") && self.is_known(&format!("{}'s", head(&word, 2))) {
+            return self.lookup(
+                &format!("{}'s", head(&word, 2)),
+                Some(tag),
+                stress,
+                Some(ctx),
+            );
         }
-        if word.ends_with('\'') && self.is_known(&word[..word.len() - 1]) {
-            return self.lookup(&word[..word.len() - 1], Some(tag), stress, Some(ctx));
+        if word.ends_with('\'') && self.is_known(head(&word, 1)) {
+            return self.lookup(head(&word, 1), Some(tag), stress, Some(ctx));
         }
         let s = self.stem_s(&word, Some(tag), stress, Some(ctx));
         if s.0.is_some() {
@@ -629,9 +677,9 @@ impl Lexicon {
                 break;
             }
         }
-        w.chars()
-            .enumerate()
-            .all(|(i, c)| c.is_ascii_digit() || c == ',' || c == '.' || (is_head && i == 0 && c == '-'))
+        w.chars().enumerate().all(|(i, c)| {
+            c.is_ascii_digit() || c == ',' || c == '.' || (is_head && i == 0 && c == '-')
+        })
     }
 
     fn is_currency(word: &str) -> bool {
@@ -646,15 +694,32 @@ impl Lexicon {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn get_number(&self, word: &str, currency: Option<char>, is_head: bool, num_flags: &str) -> Lookup {
+    fn get_number(
+        &self,
+        word: &str,
+        currency: Option<char>,
+        is_head: bool,
+        num_flags: &str,
+    ) -> Lookup {
         let suffix_len = word
             .chars()
             .rev()
             .take_while(|c| c.is_ascii_lowercase() || *c == '\'')
             .count();
-        let split = word.len() - word.chars().rev().take(suffix_len).map(char::len_utf8).sum::<usize>();
-        let suffix = if suffix_len > 0 { Some(&word[split..]) } else { None };
-        let mut word = &word[..split];
+        let split = word.len()
+            - word
+                .chars()
+                .rev()
+                .take(suffix_len)
+                .map(char::len_utf8)
+                .sum::<usize>();
+        let (head_part, tail_part) = word.split_at_checked(split).unwrap_or((word, ""));
+        let suffix = if suffix_len > 0 {
+            Some(tail_part)
+        } else {
+            None
+        };
+        let mut word = head_part;
         let mut result: Vec<(String, u8)> = Vec::new();
         if let Some(rest) = word.strip_prefix('-') {
             if let (Some(p), Some(r)) = self.lookup("minus", None, None, None) {
@@ -669,7 +734,8 @@ impl Lexicon {
                 .collect();
             for (i, w) in splits.iter().enumerate() {
                 if *w != "and" || num_flags.contains('&') {
-                    if first && i == 0 && splits.len() > 1 && *w == "one" && num_flags.contains('a') {
+                    if first && i == 0 && splits.len() > 1 && *w == "one" && num_flags.contains('a')
+                    {
                         result.push(("ə".to_owned(), 4));
                     } else {
                         let stress = if *w == "point" { Some(-2.0) } else { None };
@@ -707,7 +773,7 @@ impl Lexicon {
                     }
                     extend(&digit(&chars[2].to_string()), false, &mut result);
                 } else {
-                    extend(&digit(&num[1..]), false, &mut result);
+                    extend(&digit(num.get(1..).unwrap_or("")), false, &mut result);
                 }
             } else {
                 extend(&digit(&num), true, &mut result);
@@ -729,14 +795,14 @@ impl Lexicon {
             }
         } else if matches!(currency, Some('$' | '£' | '€')) && Self::is_currency(word) {
             let units = match currency {
-                Some('$') => ("dollar", "cent"),
-                Some('£') => ("pound", "pence"),
-                _ => ("euro", "cent"),
+                Some('$') => ["dollar", "cent"],
+                Some('£') => ["pound", "pence"],
+                _ => ["euro", "cent"],
             };
             let cleaned = word.replace(',', "");
             let mut pairs: Vec<(u64, &str)> = cleaned
                 .split('.')
-                .zip([units.0, units.1])
+                .zip(units)
                 .map(|(n, u)| (n.parse::<u64>().unwrap_or(0), u))
                 .collect();
             if pairs.len() > 1 {
@@ -769,13 +835,14 @@ impl Lexicon {
                 digit(&word.replace(',', ""))
             } else {
                 let w = word.replace(',', "");
-                if let Some(frac) = w.strip_prefix('.') {
-                    let digits: Vec<String> =
-                        frac.chars().map(|c| digit(&c.to_string())).collect();
-                    format!("point {}", digits.join(" "))
-                } else {
-                    super::numbers::float_str(&w)
-                }
+                w.strip_prefix('.').map_or_else(
+                    || super::numbers::float_str(&w),
+                    |frac| {
+                        let digits: Vec<String> =
+                            frac.chars().map(|c| digit(&c.to_string())).collect();
+                        format!("point {}", digits.join(" "))
+                    },
+                )
             };
             extend(&text, true, &mut result);
         }
@@ -783,7 +850,11 @@ impl Lexicon {
             return (None, None);
         }
         let rating = result.iter().map(|(_, r)| *r).min();
-        let joined = result.into_iter().map(|(p, _)| p).collect::<Vec<_>>().join(" ");
+        let joined = result
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect::<Vec<_>>()
+            .join(" ");
         match suffix {
             Some("s" | "'s") => (self.suffix_s(Some(joined)), rating),
             Some("ed" | "'d") => (self.suffix_ed(Some(joined)), rating),
@@ -793,7 +864,11 @@ impl Lexicon {
     }
 
     fn call(&self, tk: &MToken, ctx: Context) -> Lookup {
-        let word = tk.alias.as_deref().unwrap_or(&tk.text).replace(['‘', '’'], "'");
+        let word = tk
+            .alias
+            .as_deref()
+            .unwrap_or(&tk.text)
+            .replace(['‘', '’'], "'");
         let stress = if word == lower(&word) {
             None
         } else if word == upper(&word) {
@@ -803,7 +878,13 @@ impl Lexicon {
         };
         let (ps, rating) = self.get_word(&word, &tk.tag, stress, ctx);
         if let Some(ps) = ps {
-            return (Some(apply_stress(&self.append_currency(ps, tk.currency), tk.stress)), rating);
+            return (
+                Some(apply_stress(
+                    &self.append_currency(ps, tk.currency),
+                    tk.stress,
+                )),
+                rating,
+            );
         }
         if Self::is_number(&word, tk.is_head) {
             let (ps, rating) = self.get_number(&word, tk.currency, tk.is_head, &tk.num_flags);
@@ -818,7 +899,10 @@ impl Lexicon {
     /// stand-in for `misaki`'s espeak-ng fallback.
     #[must_use]
     pub fn fallback(&self, word: &str) -> Option<String> {
-        let w: Vec<char> = lower(word).chars().filter(char::is_ascii_alphabetic).collect();
+        let w: Vec<char> = lower(word)
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .collect();
         if w.is_empty() {
             return None;
         }
@@ -840,7 +924,9 @@ impl Lexicon {
                 } else {
                     None
                 }
-                .or_else(|| letter_sound(&piece).map(|ps| (2 + 2 * (end - start) as u32, ps.to_owned())));
+                .or_else(|| {
+                    letter_sound(&piece).map(|ps| (2 + 2 * (end - start) as u32, ps.to_owned()))
+                });
                 if let Some((c, ps)) = option {
                     let total = cost + c;
                     if best[end].as_ref().is_none_or(|(b, _, _)| total < *b) {
@@ -888,62 +974,41 @@ fn letter_sound(piece: &str) -> Option<&'static str> {
     Some(match piece {
         "a" => "æ",
         "b" => "b",
-        "c" => "k",
-        "d" => "d",
+        "c" | "k" | "q" | "ck" => "k",
+        "d" | "dd" => "d",
         "e" => "ɛ",
-        "f" => "f",
+        "f" | "ph" | "ff" => "f",
         "g" => "ɡ",
         "h" => "h",
         "i" => "ɪ",
         "j" => "ʤ",
-        "k" => "k",
-        "l" => "l",
-        "m" => "m",
-        "n" => "n",
+        "l" | "ll" => "l",
+        "m" | "mm" => "m",
+        "n" | "nn" | "kn" => "n",
         "o" => "ɑ",
-        "p" => "p",
-        "q" => "k",
-        "r" => "ɹ",
-        "s" => "s",
-        "t" => "t",
+        "p" | "pp" => "p",
+        "r" | "rr" | "wr" => "ɹ",
+        "s" | "ss" => "s",
+        "t" | "tt" => "t",
         "u" => "ʌ",
         "v" => "v",
-        "w" => "w",
+        "w" | "wh" => "w",
         "x" => "ks",
-        "y" => "i",
+        "y" | "ee" | "ea" | "ie" | "ey" => "i",
         "z" => "z",
         "sh" => "ʃ",
         "ch" => "ʧ",
         "th" => "θ",
-        "ph" => "f",
-        "ck" => "k",
         "ng" => "ŋ",
         "qu" => "kw",
-        "ee" => "i",
-        "ea" => "i",
         "oo" => "u",
         "ou" => "W",
-        "ow" => "O",
+        "ow" | "oa" => "O",
         "ai" | "ay" => "A",
-        "oa" => "O",
-        "ie" => "i",
-        "ey" => "i",
         "er" => "əɹ",
         "ar" => "ɑɹ",
         "or" => "ɔɹ",
-        "ll" => "l",
-        "ss" => "s",
-        "tt" => "t",
-        "nn" => "n",
-        "mm" => "m",
-        "rr" => "ɹ",
-        "ff" => "f",
-        "dd" => "d",
-        "pp" => "p",
         "gh" => "",
-        "wh" => "w",
-        "kn" => "n",
-        "wr" => "ɹ",
         _ => return None,
     })
 }
@@ -966,11 +1031,15 @@ fn split_chunk(chunk: &str, lexicon: &Lexicon) -> Vec<String> {
     while let Some(c) = rest.chars().next() {
         if PREFIX.contains(c) && rest.chars().count() > 1 {
             // A leading apostrophe stays on lexicon words ("'em", "'Merica").
-            if (c == '\'' || c == '‘') && lexicon.golds.contains_key(rest.trim_end_matches(|c: char| SUFFIX.contains(c) && c != '\'')) {
+            if (c == '\'' || c == '‘')
+                && lexicon
+                    .golds
+                    .contains_key(rest.trim_end_matches(|c: char| SUFFIX.contains(c) && c != '\''))
+            {
                 break;
             }
             prefixes.push(c.to_string());
-            rest = &rest[c.len_utf8()..];
+            rest = rest.get(c.len_utf8()..).unwrap_or("");
         } else {
             break;
         }
@@ -979,7 +1048,7 @@ fn split_chunk(chunk: &str, lexicon: &Lexicon) -> Vec<String> {
     loop {
         if rest.ends_with("...") && rest.len() > 3 {
             suffixes.push("...".to_owned());
-            rest = &rest[..rest.len() - 3];
+            rest = head(rest, 3);
             continue;
         }
         let Some(c) = rest.chars().last() else { break };
@@ -1003,7 +1072,7 @@ fn split_chunk(chunk: &str, lexicon: &Lexicon) -> Vec<String> {
             }
         }
         suffixes.push(c.to_string());
-        rest = &rest[..rest.len() - c.len_utf8()];
+        rest = head(rest, c.len_utf8());
     }
     let mut out = prefixes;
     if !rest.is_empty() {
@@ -1048,9 +1117,12 @@ fn subtokenize(word: &str) -> Vec<String> {
             }
             if k < n && c[k].is_ascii_digit() {
                 while k < n {
-                    if c[k].is_ascii_digit() {
-                        k += 1;
-                    } else if sep(c[k]) && k + 1 < n && c[k + 1].is_ascii_digit() && c[k - 1].is_ascii_digit() {
+                    let digit = c[k].is_ascii_digit();
+                    let joined = sep(c[k])
+                        && k + 1 < n
+                        && c[k + 1].is_ascii_digit()
+                        && c[k - 1].is_ascii_digit();
+                    if digit || joined {
                         k += 1;
                     } else {
                         break;
@@ -1095,8 +1167,8 @@ fn subtokenize(word: &str) -> Vec<String> {
             }
             // camelCase: the shortest prefix ending in a lowercase letter
             // followed by an uppercase one.
-            let camel = (i..j.saturating_sub(1))
-                .find(|k| c[*k].is_lowercase() && c[k + 1].is_uppercase());
+            let camel =
+                (i..j.saturating_sub(1)).find(|k| c[*k].is_lowercase() && c[k + 1].is_uppercase());
             let end = camel.map_or(j, |k| k + 1);
             out.push(c[i..end].iter().collect());
             i = end;
@@ -1141,13 +1213,34 @@ fn punct_tag(text: &str, opening: bool) -> Option<&'static str> {
 }
 
 const MODALS: [&str; 24] = [
-    "to", "will", "would", "can", "could", "should", "shall", "may", "might", "must", "do",
-    "does", "did", "don't", "doesn't", "didn't", "won't", "can't", "cannot", "let's", "please",
-    "wouldn't", "couldn't", "shouldn't",
+    "to",
+    "will",
+    "would",
+    "can",
+    "could",
+    "should",
+    "shall",
+    "may",
+    "might",
+    "must",
+    "do",
+    "does",
+    "did",
+    "don't",
+    "doesn't",
+    "didn't",
+    "won't",
+    "can't",
+    "cannot",
+    "let's",
+    "please",
+    "wouldn't",
+    "couldn't",
+    "shouldn't",
 ];
 const DETERMINERS: [&str; 15] = [
-    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his", "her", "its",
-    "our", "their", "every",
+    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his", "her", "its", "our",
+    "their", "every",
 ];
 const PREPOSITIONS: [&str; 16] = [
     "of", "in", "at", "for", "on", "with", "by", "from", "about", "like", "after", "before",
@@ -1166,7 +1259,7 @@ fn tag_words(tokens: &mut [MToken]) {
         let text = tokens[i].text.clone();
         let opening = i == 0 || tokens[i - 1].whitespace;
         if let Some(tag) = punct_tag(&text, opening) {
-            tokens[i].tag = tag.to_owned();
+            tag.clone_into(&mut tokens[i].tag);
             if tag == "." {
                 sentence_start = true;
             }
@@ -1176,7 +1269,7 @@ fn tag_words(tokens: &mut [MToken]) {
             continue;
         }
         if text.chars().any(|c| c.is_ascii_digit()) && Lexicon::is_number(&text, true) {
-            tokens[i].tag = "CD".to_owned();
+            "CD".clone_into(&mut tokens[i].tag);
             previous = None;
             sentence_start = false;
             continue;
@@ -1186,12 +1279,20 @@ fn tag_words(tokens: &mut [MToken]) {
             .get(i + 1)
             .is_some_and(|t| t.text.chars().any(char::is_alphanumeric));
         let tag = if lw == "a" {
-            if text == "a" || next_is_word { "DT" } else { "NN" }
+            if text == "a" || next_is_word {
+                "DT"
+            } else {
+                "NN"
+            }
         } else if text == "I" {
             "PRP"
         } else if lw == "to" {
             "TO"
-        } else if ["in", "on", "at", "by", "of", "for", "with", "from", "vs", "vs."].contains(&lw.as_str()) {
+        } else if [
+            "in", "on", "at", "by", "of", "for", "with", "from", "vs", "vs.",
+        ]
+        .contains(&lw.as_str())
+        {
             "IN"
         } else if lw == "used" {
             "VBD"
@@ -1203,17 +1304,17 @@ fn tag_words(tokens: &mut [MToken]) {
                 .is_none_or(|t| punct_tag(&t.text, false).is_some());
             if lw == "that's"
                 || next_is_punct
-                || previous.as_deref().is_some_and(|p| PREPOSITIONS.contains(&p))
+                || previous
+                    .as_deref()
+                    .is_some_and(|p| PREPOSITIONS.contains(&p))
             {
                 "DT"
             } else {
                 "IN"
             }
-        } else if text.chars().count() > 1 && text == upper(&text) && is_alpha(&text) {
-            "NNP"
-        } else if !sentence_start
-            && text.chars().next().is_some_and(char::is_uppercase)
-            && is_alpha(&text)
+        } else if is_alpha(&text)
+            && ((text.chars().count() > 1 && text == upper(&text))
+                || (!sentence_start && text.chars().next().is_some_and(char::is_uppercase)))
         {
             "NNP"
         } else {
@@ -1225,7 +1326,7 @@ fn tag_words(tokens: &mut [MToken]) {
                 _ => "",
             }
         };
-        tokens[i].tag = tag.to_owned();
+        tag.clone_into(&mut tokens[i].tag);
         previous = Some(lw);
         sentence_start = false;
     }
@@ -1291,11 +1392,14 @@ fn merge(tokens: &[MToken], unk: Option<&str>) -> MToken {
     let mut stresses: Vec<f32> = tokens.iter().filter_map(|t| t.stress).collect();
     stresses.sort_by(f32::total_cmp);
     stresses.dedup();
-    let currencies: Vec<char> = tokens.iter().filter_map(|t| t.currency).collect();
     let phonemes = unk.map(|unk| {
         let mut ps = String::new();
         for t in tokens {
-            if t.prespace && !ps.is_empty() && !ps.ends_with(char::is_whitespace) && t.phonemes.as_deref().is_some_and(|p| !p.is_empty()) {
+            if t.prespace
+                && !ps.is_empty()
+                && !ps.ends_with(char::is_whitespace)
+                && t.phonemes.as_deref().is_some_and(|p| !p.is_empty())
+            {
                 ps.push(' ');
             }
             ps.push_str(t.phonemes.as_deref().unwrap_or(unk));
@@ -1305,7 +1409,18 @@ fn merge(tokens: &[MToken], unk: Option<&str>) -> MToken {
     let tag = tokens
         .iter()
         .rev()
-        .max_by_key(|t| t.text.chars().map(|c| if c.is_lowercase() || !c.is_alphabetic() { 1 } else { 2 }).sum::<usize>())
+        .max_by_key(|t| {
+            t.text
+                .chars()
+                .map(|c| {
+                    if c.is_lowercase() || !c.is_alphabetic() {
+                        1
+                    } else {
+                        2
+                    }
+                })
+                .sum::<usize>()
+        })
         .map(|t| t.tag.clone())
         .unwrap_or_default();
     let mut flags: Vec<char> = tokens.iter().flat_map(|t| t.num_flags.chars()).collect();
@@ -1318,8 +1433,12 @@ fn merge(tokens: &[MToken], unk: Option<&str>) -> MToken {
         is_head: tokens.first().is_none_or(|t| t.is_head),
         alias: None,
         phonemes,
-        stress: if stresses.len() == 1 { Some(stresses[0]) } else { None },
-        currency: currencies.into_iter().max(),
+        stress: if stresses.len() == 1 {
+            Some(stresses[0])
+        } else {
+            None
+        },
+        currency: tokens.iter().filter_map(|t| t.currency).max(),
         num_flags: flags.into_iter().collect(),
         prespace: tokens.first().is_some_and(|t| t.prespace),
         rating: tokens.iter().map(|t| t.rating).min().flatten(),
@@ -1377,7 +1496,10 @@ fn resolve_tokens(tokens: &mut [MToken]) {
     let last = tokens.len() - 1;
     for (i, tk) in tokens.iter_mut().enumerate() {
         if tk.phonemes.is_none() {
-            if i == last && tk.text.chars().count() == 1 && NON_QUOTE_PUNCTS.contains(tk.text.as_str()) {
+            if i == last
+                && tk.text.chars().count() == 1
+                && NON_QUOTE_PUNCTS.contains(tk.text.as_str())
+            {
                 tk.phonemes = Some(tk.text.clone());
                 tk.rating = Some(3);
             } else if tk.text.chars().all(|c| SUBTOKEN_JUNKS.contains(c)) {
@@ -1403,7 +1525,10 @@ fn resolve_tokens(tokens: &mut [MToken]) {
         .collect();
     if indices.len() == 2 && tokens[indices[0].2].text.chars().count() == 1 {
         let i = indices[1].2;
-        tokens[i].phonemes = tokens[i].phonemes.as_deref().map(|p| apply_stress(p, Some(-0.5)));
+        tokens[i].phonemes = tokens[i]
+            .phonemes
+            .as_deref()
+            .map(|p| apply_stress(p, Some(-0.5)));
         return;
     }
     let primaries = indices.iter().filter(|(b, _, _)| *b).count();
@@ -1413,7 +1538,10 @@ fn resolve_tokens(tokens: &mut [MToken]) {
     indices.sort_unstable();
     let half = indices.len() / 2;
     for (_, _, i) in indices.into_iter().take(half) {
-        tokens[i].phonemes = tokens[i].phonemes.as_deref().map(|p| apply_stress(p, Some(-0.5)));
+        tokens[i].phonemes = tokens[i]
+            .phonemes
+            .as_deref()
+            .map(|p| apply_stress(p, Some(-0.5)));
     }
 }
 
@@ -1442,7 +1570,8 @@ impl G2p {
         {
             return Some(us_to_gb(&ps));
         }
-        self.lexicon.fallback(tk.alias.as_deref().unwrap_or(&tk.text))
+        self.lexicon
+            .fallback(tk.alias.as_deref().unwrap_or(&tk.text))
     }
 
     #[must_use]
@@ -1465,7 +1594,7 @@ impl G2p {
                 j += 1;
             }
             let end = chars.get(j).map_or(text.len(), |c| c.0);
-            let pieces = split_chunk(&text[start..end], &self.lexicon);
+            let pieces = split_chunk(text.get(start..end).unwrap_or(""), &self.lexicon);
             let count = pieces.len();
             for (k, piece) in pieces.into_iter().enumerate() {
                 tokens.push(MToken::new(&piece, "", k + 1 == count && j < chars.len()));
@@ -1511,7 +1640,10 @@ impl G2p {
                 } else if tk.tag == ":" && (tk.text == "-" || tk.text == "–") {
                     tk.phonemes = Some("—".to_owned());
                     tk.rating = Some(3);
-                } else if ["." , ",", "-LRB-", "-RRB-", "``", "\"\"", "''", ":", "$", "#", "NFP"].contains(&tk.tag.as_str())
+                } else if [
+                    ".", ",", "-LRB-", "-RRB-", "``", "\"\"", "''", ":", "$", "#", "NFP",
+                ]
+                .contains(&tk.tag.as_str())
                     && !tk.text.chars().all(|c| c.is_ascii_alphabetic())
                 {
                     tk.phonemes = Some(match tk.tag.as_str() {
@@ -1531,8 +1663,16 @@ impl G2p {
                 } else if 0 < j
                     && j < len - 1
                     && tk.text == "2"
-                    && tks[j - 1].text.chars().last().is_some_and(char::is_alphabetic)
-                    && tks[j + 1].text.chars().next().is_some_and(char::is_alphabetic)
+                    && tks[j - 1]
+                        .text
+                        .chars()
+                        .last()
+                        .is_some_and(char::is_alphabetic)
+                    && tks[j + 1]
+                        .text
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphabetic)
                 {
                     tk.alias = Some("to".to_owned());
                 }

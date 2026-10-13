@@ -1,7 +1,7 @@
 //! Kernels of the Kokoro-82M speech synthesizer (`shaders/kokoro.metal`).
 //!
-//! Activations are F32 `[channels, time]` blocks with a row stride (PyTorch's
-//! layout for one sequence), so a producer can write straight into a channel
+//! Activations are F32 `[channels, time]` blocks with a row stride (the
+//! `PyTorch` layout for one sequence), so a producer can write straight into a channel
 //! slice of a concatenation. Every operation names its buffers as
 //! [`View`]s (buffer plus byte offset) and checks that the elements it will
 //! touch lie inside them.
@@ -57,7 +57,7 @@ impl<'a> View<'a> {
             .and_then(|bytes| usize::try_from(bytes).ok())
             .and_then(|bytes| bytes.checked_add(self.offset));
         match end {
-            Some(end) if end <= self.buffer.length() && self.offset % 4 == 0 => Ok(()),
+            Some(end) if end <= self.buffer.length() && self.offset.is_multiple_of(4) => Ok(()),
             _ => Err(arg("kokoro kernel view out of bounds")),
         }
     }
@@ -72,7 +72,8 @@ fn block(rows: u32, columns: u32, row: u32) -> u64 {
     }
 }
 
-/// One convolution as a gathered GEMM (see `kk_conv` in the shader):
+/// One convolution as a gathered GEMM (see `kk_conv` in the shader).
+///
 /// `y[co, col * out_stride + out_offset] (+)= scale * (bias[co] + sum
 /// w[co, tap, ci] x[ci, col * in_stride + tap * in_dil + in_offset])`, inputs
 /// outside `[0, in_len)` reading zero. Weights are `[cout][taps][cin]`.
@@ -162,7 +163,7 @@ fn dispatch(encoder: &Encoder, groups: (usize, usize), threads: (usize, usize)) 
     );
 }
 
-fn groups(count: u32, per: usize) -> usize {
+const fn groups(count: u32, per: usize) -> usize {
     (count as usize).div_ceil(per)
 }
 
@@ -254,6 +255,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short or an empty sequence.
+    #[allow(clippy::too_many_arguments)]
     pub fn lstm(
         &self,
         batch: &mut CommandBatch,
@@ -423,11 +425,7 @@ impl KokoroKernels {
         set(encoder, &scale, 5);
         set(encoder, &slope, 6);
         set(encoder, &u32::from(accumulate), 7);
-        dispatch(
-            encoder,
-            (groups(columns, 64), channels as usize),
-            (64, 1),
-        );
+        dispatch(encoder, (groups(columns, 64), channels as usize), (64, 1));
         batch.record_dispatch();
         Ok(())
     }
@@ -464,11 +462,7 @@ impl KokoroKernels {
         set(encoder, &columns, 3);
         set(encoder, &rows.0, 4);
         set(encoder, &rows.1, 5);
-        dispatch(
-            encoder,
-            (groups(columns, 64), channels as usize),
-            (64, 1),
-        );
+        dispatch(encoder, (groups(columns, 64), channels as usize), (64, 1));
         batch.record_dispatch();
         Ok(())
     }

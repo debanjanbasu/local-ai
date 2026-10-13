@@ -27,14 +27,20 @@
 //!   against `misaki` on `g2p.jsonl`.
 //! - `bench`: real-time factor of fixed sentences (best of three).
 
+// An offline measurement tool: plain float arithmetic and short math names.
+#![allow(
+    clippy::suboptimal_flops,
+    clippy::many_single_char_names,
+    clippy::type_complexity,
+    clippy::too_many_lines
+)]
+
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use local_engine::speech::{
-    Noise, SAMPLE_RATE, SpeechModel, Taps, encode, installed_model,
-};
+use local_engine::speech::{Noise, SAMPLE_RATE, SpeechModel, Taps, encode, installed_model};
 use serde::Deserialize;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -90,7 +96,9 @@ fn npz(path: &Path) -> Result<BTreeMap<String, (Vec<usize>, Vec<f32>)>> {
     let mut at = 0;
     while at + 30 <= bytes.len() && bytes[at..at + 4] == [0x50, 0x4b, 0x03, 0x04] {
         let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
-        let u32_at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+        let u32_at = |i: usize| {
+            u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize
+        };
         let mut size = u32_at(at + 18);
         let name_len = u16_at(at + 26);
         let extra_len = u16_at(at + 28);
@@ -156,7 +164,7 @@ fn snr(reference: &[f32], native: &[f32]) -> f64 {
     10.0 * (signal / noise.max(1e-20)).log10()
 }
 
-/// 80-bin log-mel power spectrogram (n_fft 1024, hop 256, Hann, 0-12 kHz,
+/// 80-bin log-mel power spectrogram (`n_fft` 1024, hop 256, Hann, 0-12 kHz,
 /// HTK mel scale), dB.
 fn log_mel(x: &[f32]) -> Vec<Vec<f64>> {
     const N: usize = 1024;
@@ -244,7 +252,10 @@ fn mel_distance(reference: &[f32], native: &[f32]) -> (f64, f64) {
             nb += py * py;
         }
     }
-    (diff / count.max(1) as f64, dot / (na.sqrt() * nb.sqrt()).max(1e-30))
+    (
+        diff / count.max(1) as f64,
+        dot / (na.sqrt() * nb.sqrt()).max(1e-30),
+    )
 }
 
 fn rel_err(reference: &[f32], native: &[f32]) -> f64 {
@@ -268,15 +279,18 @@ fn write_f32(path: &Path, samples: &[f32]) -> Result<()> {
 /// GPU half of `parity`: synthesize every fixture row three ways and write
 /// raw F32 outputs, intermediate activations and durations under `out`.
 fn synth(dir: &Path, out: &Path) -> Result<()> {
-    let manifest: Manifest =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("fixtures/manifest.json"))?)?;
+    let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(
+        dir.join("fixtures/manifest.json"),
+    )?)?;
     let model = open()?;
     let mut durations = BTreeMap::new();
     let started = Instant::now();
     for row in &manifest.rows {
         let key = format!("{:03}", row.index);
         let mut taps = Taps::new();
-        let want_taps = dir.join(format!("fixtures/intermediates/{key}.npz")).is_file();
+        let want_taps = dir
+            .join(format!("fixtures/intermediates/{key}.npz"))
+            .is_file();
         let zero = model.synthesize_phonemes(
             &row.phonemes,
             &row.voice,
@@ -313,7 +327,11 @@ fn synth(dir: &Path, out: &Path) -> Result<()> {
         write_f32(&out.join(format!("native-text/{key}.f32")), &text_audio)?;
         durations.insert(key, zero.durations);
     }
-    eprintln!("synthesized {} rows in {:.2?}", manifest.rows.len(), started.elapsed());
+    eprintln!(
+        "synthesized {} rows in {:.2?}",
+        manifest.rows.len(),
+        started.elapsed()
+    );
     std::fs::write(out.join("durations.json"), serde_json::to_vec(&durations)?)?;
     Ok(())
 }
@@ -322,8 +340,9 @@ fn synth(dir: &Path, out: &Path) -> Result<()> {
 /// write 16-bit WAVs of both for the ASR job.
 #[allow(clippy::too_many_lines)]
 fn compare(dir: &Path, out: &Path) -> Result<()> {
-    let manifest: Manifest =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("fixtures/manifest.json"))?)?;
+    let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(
+        dir.join("fixtures/manifest.json"),
+    )?)?;
     let durations: BTreeMap<String, Vec<u32>> =
         serde_json::from_slice(&std::fs::read(out.join("durations.json"))?)?;
     let dirs = models_g2p()?;
@@ -358,7 +377,10 @@ fn compare(dir: &Path, out: &Path) -> Result<()> {
             let s = snr(&reference, &native);
             stats.push((mad, cos, s, native.len(), reference.len()));
             write_wav(&out.join(format!("wav/native-{mode}/{key}.wav")), &native)?;
-            write_wav(&out.join(format!("wav/reference-{mode}/{key}.wav")), &reference)?;
+            write_wav(
+                &out.join(format!("wav/reference-{mode}/{key}.wav")),
+                &reference,
+            )?;
         }
         zero_stats.push((stats[0].0, stats[0].1, stats[0].2, dur_same));
         seed_stats.push((stats[1].0, stats[1].1));
@@ -367,14 +389,22 @@ fn compare(dir: &Path, out: &Path) -> Result<()> {
         let same = native_ps == [row.phonemes.clone()];
         g2p_same += usize::from(same);
         if !same {
-            println!("  {key} g2p differs:\n    ref    {}\n    native {}", row.phonemes, native_ps.join(" | "));
+            println!(
+                "  {key} g2p differs:\n    ref    {}\n    native {}",
+                row.phonemes,
+                native_ps.join(" | ")
+            );
         }
         let taps_dir = out.join(format!("taps/{key}"));
         if taps_dir.is_dir() {
             let reference_taps = npz(&dir.join(format!("fixtures/intermediates/{key}.npz")))?;
             for entry in std::fs::read_dir(&taps_dir)? {
                 let path = entry?.path();
-                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_owned();
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_owned();
                 let native = f32_file(&path)?;
                 let Some((shape, values)) = reference_taps.get(&name) else {
                     continue;
@@ -382,8 +412,12 @@ fn compare(dir: &Path, out: &Path) -> Result<()> {
                 // Token-major reference tensors [1, T, C] -> [C, T].
                 let token_major = matches!(
                     name.as_str(),
-                    "bert" | "bert_encoder" | "predictor.text_encoder" | "predictor.lstm"
-                        | "predictor.duration_proj" | "predictor.shared"
+                    "bert"
+                        | "bert_encoder"
+                        | "predictor.text_encoder"
+                        | "predictor.lstm"
+                        | "predictor.duration_proj"
+                        | "predictor.shared"
                 );
                 let values = if token_major && shape.len() == 3 {
                     let (t, c) = (shape[1], shape[2]);
@@ -398,35 +432,65 @@ fn compare(dir: &Path, out: &Path) -> Result<()> {
                     values.clone()
                 };
                 if values.len() == native.len() {
-                    println!("  {key} {name:32} rel_err {:.2e}", rel_err(&values, &native));
+                    println!(
+                        "  {key} {name:32} rel_err {:.2e}",
+                        rel_err(&values, &native)
+                    );
                 } else {
-                    println!("  {key} {name:32} size {} vs {}", native.len(), values.len());
+                    println!(
+                        "  {key} {name:32} size {} vs {}",
+                        native.len(),
+                        values.len()
+                    );
                 }
             }
         }
         println!(
             "{key} dur {} | zero MAD {:.3} dB cos {:.5} SNR {:.1} dB (len {} / {}) | seed MAD {:.3} cos {:.5} | text MAD {:.3} cos {:.5}",
             if dur_same { "same" } else { "DIFF" },
-            stats[0].0, stats[0].1, stats[0].2, stats[0].3, stats[0].4,
-            stats[1].0, stats[1].1, stats[2].0, stats[2].1,
+            stats[0].0,
+            stats[0].1,
+            stats[0].2,
+            stats[0].3,
+            stats[0].4,
+            stats[1].0,
+            stats[1].1,
+            stats[2].0,
+            stats[2].1,
         );
     }
-    std::fs::write(out.join("wav/texts.json"), serde_json::to_vec_pretty(&texts)?)?;
+    std::fs::write(
+        out.join("wav/texts.json"),
+        serde_json::to_vec_pretty(&texts)?,
+    )?;
     let n = manifest.rows.len();
     let summary = |name: &str, v: &[(f64, f64)]| {
         let mean_mad = v.iter().map(|x| x.0).sum::<f64>() / v.len().max(1) as f64;
         let max_mad = v.iter().map(|x| x.0).fold(0.0, f64::max);
         let mean_cos = v.iter().map(|x| x.1).sum::<f64>() / v.len().max(1) as f64;
         let min_cos = v.iter().map(|x| x.1).fold(1.0, f64::min);
-        println!("{name}: rows {}, log-mel MAD mean {mean_mad:.3} dB (max {max_mad:.3}), mel cosine mean {mean_cos:.5} (min {min_cos:.5})", v.len());
+        println!(
+            "{name}: rows {}, log-mel MAD mean {mean_mad:.3} dB (max {max_mad:.3}), mel cosine mean {mean_cos:.5} (min {min_cos:.5})",
+            v.len()
+        );
     };
-    println!("rows {n}; ids identical {same_ids}; durations identical {same_dur}; native G2P identical {g2p_same}");
-    let zero_same: Vec<(f64, f64)> = zero_stats.iter().filter(|x| x.3).map(|x| (x.0, x.1)).collect();
+    println!(
+        "rows {n}; ids identical {same_ids}; durations identical {same_dur}; native G2P identical {g2p_same}"
+    );
+    let zero_same: Vec<(f64, f64)> = zero_stats
+        .iter()
+        .filter(|x| x.3)
+        .map(|x| (x.0, x.1))
+        .collect();
     let mut snrs: Vec<f64> = zero_stats.iter().filter(|x| x.3).map(|x| x.2).collect();
     snrs.sort_by(f64::total_cmp);
     summary("zero (identical durations)", &zero_same);
     if !snrs.is_empty() {
-        println!("zero waveform SNR: median {:.1} dB, min {:.1} dB", snrs[snrs.len() / 2], snrs[0]);
+        println!(
+            "zero waveform SNR: median {:.1} dB, min {:.1} dB",
+            snrs[snrs.len() / 2],
+            snrs[0]
+        );
     }
     summary("seed", &seed_stats);
     summary("text", &text_stats);
@@ -449,7 +513,11 @@ impl G2pOnly {
     }
 
     fn chunks(&self, text: &str, voice: &str) -> Vec<String> {
-        let g2p = if voice.starts_with('b') { &self.british } else { &self.american };
+        let g2p = if voice.starts_with('b') {
+            &self.british
+        } else {
+            &self.american
+        };
         local_engine::speech::chunk_text(g2p, text, 510)
             .into_iter()
             .map(|c| c.phonemes)
@@ -462,7 +530,11 @@ fn models_g2p() -> Result<G2pOnly> {
         .ok_or("models/kokoro-82m is not installed (see docs/SPEECH.md)")?;
     let (american, british) = local_engine::speech::open_g2p(&dir)?;
     let vocab = local_engine::speech::open_vocab(&dir)?;
-    Ok(G2pOnly { american, british, vocab })
+    Ok(G2pOnly {
+        american,
+        british,
+        vocab,
+    })
 }
 
 fn g2p(dir: &Path) -> Result<()> {
@@ -483,7 +555,9 @@ fn g2p(dir: &Path) -> Result<()> {
         let native = g2p.phonemize(&row.text, false);
         let native = native.trim_end();
         let reference = row.phonemes.trim_end();
-        let entry = stats.entry((row.source.clone(), row.lang.clone())).or_default();
+        let entry = stats
+            .entry((row.source.clone(), row.lang.clone()))
+            .or_default();
         entry.0 += 1;
         entry.1 += usize::from(native == reference);
         let (rw, nw): (Vec<&str>, Vec<&str>) = (
@@ -496,7 +570,10 @@ fn g2p(dir: &Path) -> Result<()> {
         }
         if native != reference && shown < 40 {
             shown += 1;
-            println!("[{}] {}\n  ref    {reference}\n  native {native}", row.lang, row.text);
+            println!(
+                "[{}] {}\n  ref    {reference}\n  native {native}",
+                row.lang, row.text
+            );
         }
     }
     for ((source, lang), (n, same, words, same_words)) in stats {
@@ -544,11 +621,22 @@ fn bench(chunks: usize) -> Result<()> {
         let mut audio = 0.0;
         for _ in 0..3 {
             let started = Instant::now();
-            let usage = model.synthesize(&text, voice, 1.0, Noise::Seeded(0), &mut || Ok(()), &mut |_| Ok(()))?;
+            let usage = model.synthesize(
+                &text,
+                voice,
+                1.0,
+                Noise::Seeded(0),
+                &mut || Ok(()),
+                &mut |_| Ok(()),
+            )?;
             best = best.min(started.elapsed().as_secs_f64());
             audio = usage.samples as f64 / f64::from(SAMPLE_RATE);
         }
-        println!("{voice}: {audio:.2} s audio in {best:.3} s, RTF {:.4} ({:.0}x real time)", best / audio, audio / best);
+        println!(
+            "{voice}: {audio:.2} s audio in {best:.3} s, RTF {:.4} ({:.0}x real time)",
+            best / audio,
+            audio / best
+        );
     }
     Ok(())
 }

@@ -1,5 +1,6 @@
-//! Audio encoders for synthesized speech (mono, 24 kHz), all pure Rust
-//! under permissive licences: WAV and raw PCM here, FLAC with `flacenc`
+//! Audio encoders for synthesized speech (mono, 24 kHz).
+//!
+//! All are pure Rust under permissive licences: WAV and raw PCM here, FLAC with `flacenc`
 //! (Apache-2.0), MP3 with `rusty_mp3` (Apache-2.0), Opus with `rusty-opus`
 //! (BSD-3-Clause) in Ogg pages from the `ogg` crate (BSD-3-Clause). AAC has
 //! no permissive encoder available and is refused.
@@ -79,7 +80,10 @@ pub fn pcm16(samples: &[f32]) -> Vec<i16> {
 /// Raw little-endian 16-bit PCM bytes (`response_format: pcm`).
 #[must_use]
 pub fn pcm_bytes(samples: &[f32]) -> Vec<u8> {
-    pcm16(samples).iter().flat_map(|s| s.to_le_bytes()).collect()
+    pcm16(samples)
+        .iter()
+        .flat_map(|s| s.to_le_bytes())
+        .collect()
 }
 
 /// A 44-byte RIFF/WAVE header for mono 16-bit PCM. `data_bytes` of
@@ -272,8 +276,9 @@ impl StreamEncoder {
                     16,
                     self.sample_rate as usize,
                 );
-                let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
-                    .map_err(|e| failure("FLAC", e))?;
+                let stream =
+                    flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+                        .map_err(|e| failure("FLAC", e))?;
                 let mut sink = flacenc::bitsink::ByteSink::new();
                 stream.write(&mut sink).map_err(|e| failure("FLAC", e))?;
                 Ok(sink.as_slice().to_vec())
@@ -295,7 +300,10 @@ fn drain_mp3(encoder: &mut rusty_mp3::Mp3Encoder) -> Vec<u8> {
     while let Ok(packet) = encoder.next_packet() {
         // A Xing/Info header produced at the end cannot be prepended to a
         // stream already sent; players read the frames without it.
-        if packet.windows(4).any(|w| w == b"Xing" || w == b"Info") && packet.len() < 1500 && is_info_frame(&packet) {
+        if packet.windows(4).any(|w| w == b"Xing" || w == b"Info")
+            && packet.len() < 1500
+            && is_info_frame(&packet)
+        {
             continue;
         }
         out.extend_from_slice(&packet);
@@ -306,9 +314,11 @@ fn drain_mp3(encoder: &mut rusty_mp3::Mp3Encoder) -> Vec<u8> {
 /// Whether an MP3 frame is a Xing/Info metadata frame (tag right after the
 /// side information, MPEG-2 mono: 4 + 9 bytes).
 fn is_info_frame(packet: &[u8]) -> bool {
-    [13_usize, 21, 36]
-        .iter()
-        .any(|&at| packet.get(at..at + 4).is_some_and(|t| t == b"Xing" || t == b"Info"))
+    [13_usize, 21, 36].iter().any(|&at| {
+        packet
+            .get(at..at + 4)
+            .is_some_and(|t| t == b"Xing" || t == b"Info")
+    })
 }
 
 impl OpusState {
@@ -367,6 +377,7 @@ pub fn encode(samples: &[f32], format: Format, sample_rate: u32) -> crate::Resul
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -382,8 +393,14 @@ mod tests {
         let w = encode(&x, Format::Wav, 24_000).expect("wav");
         assert_eq!(&w[..4], b"RIFF");
         assert_eq!(w.len(), 44 + 2 * x.len());
-        assert_eq!(u32::from_le_bytes([w[40], w[41], w[42], w[43]]) as usize, 2 * x.len());
-        assert_eq!(encode(&x, Format::Pcm, 24_000).expect("pcm").len(), 2 * x.len());
+        assert_eq!(
+            u32::from_le_bytes([w[40], w[41], w[42], w[43]]) as usize,
+            2 * x.len()
+        );
+        assert_eq!(
+            encode(&x, Format::Pcm, 24_000).expect("pcm").len(),
+            2 * x.len()
+        );
     }
 
     #[test]
