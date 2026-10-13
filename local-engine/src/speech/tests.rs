@@ -43,7 +43,10 @@ fn voice_aliases_are_distinct() {
 
 #[test]
 fn split_half_cuts_at_a_space_near_the_middle() {
-    assert_eq!(split_half("ab cd ef gh"), ("ab cd".to_owned(), "ef gh".to_owned()));
+    assert_eq!(
+        split_half("ab cd ef gh"),
+        ("ab cd".to_owned(), "ef gh".to_owned())
+    );
 }
 
 #[derive(serde::Deserialize)]
@@ -88,7 +91,12 @@ fn native_g2p_matches_misaki_on_the_fixture_texts() {
     let fixture = reference();
     for row in &fixture.g2p {
         let g2p = if row.lang == "b" { &british } else { &american };
-        assert_eq!(g2p.phonemize(&row.text, false).trim_end(), row.phonemes, "{}", row.text);
+        assert_eq!(
+            g2p.phonemize(&row.text, false).trim_end(),
+            row.phonemes,
+            "{}",
+            row.text
+        );
     }
 }
 
@@ -104,10 +112,24 @@ fn native_durations_match_the_reference_fixture() {
     for row in &fixture.synthesis {
         assert_eq!(model.ids(&row.phonemes), row.input_ids, "{}", row.text);
         let out = model
-            .synthesize_phonemes(&row.phonemes, &row.voice, row.speed, Noise::Zero, &mut || Ok(()), None)
+            .synthesize_phonemes(
+                &row.phonemes,
+                &row.voice,
+                row.speed,
+                Noise::Zero,
+                &mut || Ok(()),
+                None,
+            )
             .expect("synthesis");
-        assert_eq!(out.samples.len(), 600 * out.durations.iter().sum::<u32>() as usize);
+        assert_eq!(
+            out.samples.len(),
+            600 * out.durations.iter().sum::<u32>() as usize
+        );
         same += usize::from(out.durations == row.pred_dur);
     }
-    assert!(same * 10 >= fixture.synthesis.len() * 9, "{same} of {} identical", fixture.synthesis.len());
+    assert!(
+        same * 10 >= fixture.synthesis.len() * 9,
+        "{same} of {} identical",
+        fixture.synthesis.len()
+    );
 }

@@ -3,7 +3,11 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_wrap,
     clippy::many_single_char_names,
-    clippy::suboptimal_flops
+    clippy::suboptimal_flops,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines
 )]
 
 use super::*;
@@ -47,7 +51,7 @@ fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
     }
 }
 
-/// CPU Conv1d: x [cin, t_in], w [cout, cin, k] (PyTorch layout).
+/// CPU `Conv1d`: x `[cin, t_in]`, w `[cout, cin, k]` (the `PyTorch` layout).
 #[allow(clippy::too_many_arguments)]
 fn conv_reference(
     x: &[f32],
@@ -70,7 +74,8 @@ fn conv_reference(
                 for tap in 0..k {
                     let src = (t * stride + tap * dilation) as isize - pad as isize;
                     if src >= 0 && (src as usize) < t_in {
-                        acc += f64::from(w[(o * cin + i) * k + tap]) * f64::from(x[i * t_in + src as usize]);
+                        acc += f64::from(w[(o * cin + i) * k + tap])
+                            * f64::from(x[i * t_in + src as usize]);
                     }
                 }
             }
@@ -99,7 +104,9 @@ fn conv_matches_reference_for_strides_dilations_and_ragged_tiles() {
         return;
     };
     for (cin, cout, k, t_in, stride, dilation, pad) in [
-        (37_usize, 45_usize, 3_usize, 71_usize, 1_usize, 1_usize, 1_usize),
+        (
+            37_usize, 45_usize, 3_usize, 71_usize, 1_usize, 1_usize, 1_usize,
+        ),
         (22, 33, 12, 120, 6, 1, 3),
         (40, 40, 7, 90, 1, 5, 15),
         (1, 1, 3, 50, 2, 1, 1),
@@ -166,7 +173,8 @@ fn transposed_conv_phases_match_reference() {
                 for j in 0..t_in {
                     let tap = t as isize + pad as isize - (j * s) as isize;
                     if (0..k as isize).contains(&tap) {
-                        acc += f64::from(w[(i * cout + o) * k + tap as usize]) * f64::from(x[i * t_in + j]);
+                        acc += f64::from(w[(i * cout + o) * k + tap as usize])
+                            * f64::from(x[i * t_in + j]);
                     }
                 }
             }
@@ -180,12 +188,17 @@ fn transposed_conv_phases_match_reference() {
         for o in 0..cout {
             for kk in 0..kp {
                 for i in 0..cin {
-                    phased[((r * cout + o) * kp + kk) * cin + i] = w[(i * cout + o) * k + r + kk * s];
+                    phased[((r * cout + o) * kp + kk) * cin + i] =
+                        w[(i * cout + o) * k + r + kk * s];
                 }
             }
         }
     }
-    let (xb, wb, bb) = (buffer(&context, &x), buffer(&context, &phased), buffer(&context, &b));
+    let (xb, wb, bb) = (
+        buffer(&context, &x),
+        buffer(&context, &phased),
+        buffer(&context, &b),
+    );
     let yb = MetalBuffer::empty(context.device(), expected.len() * 4).expect("y");
     let mut batch = CommandBatch::new(&context).expect("batch");
     for r in 0..s {
@@ -255,7 +268,12 @@ fn lstm_matches_reference_in_both_directions() {
                 })
                 .collect();
             for j in 0..h {
-                let (i, f, c, o) = (sigmoid(g[j]), sigmoid(g[h + j]), g[2 * h + j].tanh(), sigmoid(g[3 * h + j]));
+                let (i, f, c, o) = (
+                    sigmoid(g[j]),
+                    sigmoid(g[h + j]),
+                    g[2 * h + j].tanh(),
+                    sigmoid(g[3 * h + j]),
+                );
                 cs[j] = f * cs[j] + i * c;
                 hs[j] = o * cs[j].tanh();
                 expected[(d * h + j) * steps + t] = hs[j] as f32;
@@ -294,9 +312,14 @@ fn instance_norm_snake_and_istft_match_reference() {
     for c in 0..channels {
         let row = &x[c * columns..(c + 1) * columns];
         let mean = row.iter().map(|v| f64::from(*v)).sum::<f64>() / columns as f64;
-        let var = row.iter().map(|v| (f64::from(*v) - mean).powi(2)).sum::<f64>() / columns as f64;
+        let var = row
+            .iter()
+            .map(|v| (f64::from(*v) - mean).powi(2))
+            .sum::<f64>()
+            / columns as f64;
         for t in 0..columns {
-            let n = (f64::from(row[t]) - mean) / (var + 1e-5).sqrt() * f64::from(scale[c]) + f64::from(shift[c]);
+            let n = (f64::from(row[t]) - mean) / (var + 1e-5).sqrt() * f64::from(scale[c])
+                + f64::from(shift[c]);
             let a = f64::from(alpha[c]);
             expected[c * columns + t] = (n + (a * n).sin().powi(2) / a) as f32;
         }
@@ -329,11 +352,19 @@ fn instance_norm_snake_and_istft_match_reference() {
     let samples = 5 * (frames - 1);
     let audio = MetalBuffer::empty(context.device(), samples * 4).expect("audio");
     kernels
-        .istft(&mut batch, View::new(&hb2, 0), View::new(&audio, 0), frames as u32, frames as u32)
+        .istft(
+            &mut batch,
+            View::new(&hb2, 0),
+            View::new(&audio, 0),
+            frames as u32,
+            frames as u32,
+        )
         .expect("istft");
     batch.commit_and_wait().expect("gpu");
     close(&xb.as_slice::<f32>()[..x.len()], &expected, 1e-4);
-    let window: Vec<f64> = (0..20).map(|m| 0.5 - 0.5 * (std::f64::consts::TAU * m as f64 / 20.0).cos()).collect();
+    let window: Vec<f64> = (0..20)
+        .map(|m| 0.5 - 0.5 * (std::f64::consts::TAU * m as f64 / 20.0).cos())
+        .collect();
     let padded = samples + 20;
     let (mut acc, mut env) = (vec![0.0_f64; padded], vec![0.0_f64; padded]);
     for f in 0..frames {
@@ -345,7 +376,13 @@ fn instance_norm_snake_and_istft_match_reference() {
                 let (re, im) = (mag * phase.cos(), mag * phase.sin());
                 let angle = std::f64::consts::TAU * (k * m) as f64 / 20.0;
                 let weight = if k == 0 || k == 10 { 1.0 } else { 2.0 };
-                v += weight * (re * angle.cos() - if k == 0 || k == 10 { 0.0 } else { im * angle.sin() });
+                v += weight
+                    * (re * angle.cos()
+                        - if k == 0 || k == 10 {
+                            0.0
+                        } else {
+                            im * angle.sin()
+                        });
             }
             v /= 20.0;
             if f * 5 + m < padded {
@@ -354,6 +391,8 @@ fn instance_norm_snake_and_istft_match_reference() {
             }
         }
     }
-    let expected_audio: Vec<f32> = (0..samples).map(|n| (acc[n + 10] / env[n + 10]) as f32).collect();
+    let expected_audio: Vec<f32> = (0..samples)
+        .map(|n| (acc[n + 10] / env[n + 10]) as f32)
+        .collect();
     close(&audio.as_slice::<f32>()[..samples], &expected_audio, 1e-3);
 }

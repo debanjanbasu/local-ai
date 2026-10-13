@@ -1,6 +1,6 @@
 //! Native text-to-speech with Kokoro-82M (hexgrad, Apache-2.0) on Metal.
 //!
-//! Kokoro is a StyleTTS 2 / iSTFTNet model: PL-BERT and a prosody predictor
+//! Kokoro is a `StyleTTS` 2 / `iSTFTNet` model: PL-BERT and a prosody predictor
 //! turn phonemes and a 256-value voice style into durations, pitch and
 //! energy; a decoder and an iSTFTNet generator turn those into 24 kHz audio.
 //! Every weight keeps the checkpoint's F32 values; [`model`] runs it with
@@ -51,7 +51,7 @@ pub const MAX_CHUNK_PHONEMES: usize = 510;
 pub const SPEED_RANGE: (f32, f32) = (0.25, 4.0);
 
 /// The pinned API's built-in voice names, each mapped to a distinct
-/// Kokoro voice. These are Kokoro's voices, not OpenAI's: the names are
+/// Kokoro voice. These are Kokoro's voices, not `OpenAI`'s: the names are
 /// accepted so that clients written against the API work unchanged.
 pub const VOICE_ALIASES: [(&str, &str); 13] = [
     ("alloy", "af_alloy"),
@@ -88,8 +88,16 @@ pub fn open_g2p(dir: &Path) -> crate::Result<(G2p, G2p)> {
 }
 
 fn g2p_pair(artifact: &Artifact) -> crate::Result<(G2p, G2p)> {
-    let us = Arc::new(Lexicon::new(artifact.blob("us_gold")?, artifact.blob("us_silver")?, false)?);
-    let gb = Arc::new(Lexicon::new(artifact.blob("gb_gold")?, artifact.blob("gb_silver")?, true)?);
+    let us = Arc::new(Lexicon::new(
+        artifact.blob("us_gold")?,
+        artifact.blob("us_silver")?,
+        false,
+    )?);
+    let gb = Arc::new(Lexicon::new(
+        artifact.blob("gb_gold")?,
+        artifact.blob("gb_silver")?,
+        true,
+    )?);
     Ok((G2p::new(Arc::clone(&us)), G2p::with_alternate(gb, us)))
 }
 
@@ -143,8 +151,8 @@ pub struct Chunk {
 /// (wrap it in a mutex to share it).
 pub struct SpeechModel {
     network: model::Network,
-    american: G2p,
-    british: G2p,
+    american: Arc<G2p>,
+    british: Arc<G2p>,
     voices: BTreeMap<String, Vec<f32>>,
     vocab: HashMap<char, u32>,
 }
@@ -159,19 +167,30 @@ impl SpeechModel {
         let artifact = Artifact::open(&dir.join(SPEECH_ARTIFACT))?;
         let (american, british) = g2p_pair(&artifact)?;
         let mut voices = BTreeMap::new();
-        for name in artifact.voice_names().map(str::to_owned).collect::<Vec<_>>() {
-            if let Some(pack) = artifact.voice(&name) {
-                voices.insert(name, pack);
+        for name in artifact.voice_names() {
+            if let Some(pack) = artifact.voice(name) {
+                voices.insert(name.to_owned(), pack);
             }
         }
         let vocab = vocab_of(&artifact);
         Ok(Self {
             network: model::Network::open(artifact)?,
-            american,
-            british,
+            american: Arc::new(american),
+            british: Arc::new(british),
             voices,
             vocab,
         })
+    }
+
+    /// Voice resolution and phonemization without the network, for request
+    /// validation while a synthesis holds the model.
+    #[must_use]
+    pub fn catalog(&self) -> Catalog {
+        Catalog {
+            voices: self.voices.keys().cloned().collect(),
+            american: Arc::clone(&self.american),
+            british: Arc::clone(&self.british),
+        }
     }
 
     /// SHA-256 of the verified artifact payload.
@@ -311,12 +330,12 @@ impl SpeechModel {
         let mut pending: Vec<String> = chunks.into_iter().rev().map(|c| c.phonemes).collect();
         let mut index = 0_u64;
         while let Some(phonemes) = pending.pop() {
-            let seed = match noise {
+            let chunk_noise = match noise {
                 Noise::Zero => Noise::Zero,
-                Noise::Seeded(seed) => Noise::Seeded(seed.wrapping_add(index)),
+                Noise::Seeded(base) => Noise::Seeded(base.wrapping_add(index)),
             };
             index += 1;
-            match self.synthesize_phonemes(&phonemes, &voice, speed, seed, pace, None) {
+            match self.synthesize_phonemes(&phonemes, &voice, speed, chunk_noise, pace, None) {
                 Ok(out) => {
                     usage.phonemes += phonemes.chars().count();
                     usage.samples += out.samples.len();
@@ -331,6 +350,43 @@ impl SpeechModel {
             }
         }
         Ok(usage)
+    }
+}
+
+/// Voices and G2P of a loaded model, shareable across threads.
+#[derive(Clone)]
+pub struct Catalog {
+    voices: Vec<String>,
+    american: Arc<G2p>,
+    british: Arc<G2p>,
+}
+
+impl Catalog {
+    /// Kokoro voice ids, sorted.
+    #[must_use]
+    pub fn voices(&self) -> &[String] {
+        &self.voices
+    }
+
+    /// As [`SpeechModel::resolve_voice`].
+    #[must_use]
+    pub fn resolve_voice(&self, name: &str) -> Option<&str> {
+        let id = VOICE_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == name)
+            .map_or(name, |(_, id)| id);
+        self.voices.iter().find(|v| *v == id).map(String::as_str)
+    }
+
+    /// As [`SpeechModel::chunks`].
+    #[must_use]
+    pub fn chunks(&self, text: &str, voice: &str, limit: usize) -> Vec<Chunk> {
+        let g2p = if voice.starts_with('b') {
+            &self.british
+        } else {
+            &self.american
+        };
+        chunk_text(g2p, text, limit)
     }
 }
 
@@ -349,10 +405,10 @@ fn split_half(phonemes: &str) -> (String, String) {
         .min_by_key(|i| i.abs_diff(middle))
         .copied()
         .unwrap_or(middle);
-    (
-        phonemes[..at].trim().to_owned(),
-        phonemes[at..].trim().to_owned(),
-    )
+    // `at` is a space's byte index (or the middle, which split_at_checked
+    // refuses if it is not a character boundary).
+    let (a, b) = phonemes.split_at_checked(at).unwrap_or((phonemes, ""));
+    (a.trim().to_owned(), b.trim().to_owned())
 }
 
 fn tokens_to_ps(tokens: &[Token]) -> String {
@@ -380,10 +436,11 @@ fn tokens_to_text(tokens: &[Token]) -> String {
 /// `KPipeline.waterfall_last`: where to cut `tokens` so the rest fits.
 fn waterfall_last(tokens: &[Token], next_count: usize, limit: usize) -> usize {
     for set in ["!.?…", ":;", ",—"] {
-        let Some(mut z) = tokens
-            .iter()
-            .rposition(|t| t.phonemes.as_deref().is_some_and(|p| p.chars().count() == 1 && set.contains(p)))
-        else {
+        let Some(mut z) = tokens.iter().rposition(|t| {
+            t.phonemes
+                .as_deref()
+                .is_some_and(|p| p.chars().count() == 1 && set.contains(p))
+        }) else {
             continue;
         };
         z += 1;
@@ -447,4 +504,5 @@ fn chunk_tokens(tokens: &[Token], limit: usize) -> Vec<Chunk> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests;

@@ -274,7 +274,10 @@ fn check_config(config: &Config) -> crate::Result<()> {
         && net.resblock_dilation_sizes.iter().all(|d| d == &[1, 3, 5])
         && net.resblock_dilation_sizes.len() == 3
         && net.upsample_initial_channel == 512
-        && config.vocab.values().all(|id| (*id as usize) < config.n_token);
+        && config
+            .vocab
+            .values()
+            .all(|id| (*id as usize) < config.n_token);
     if ok {
         Ok(())
     } else {

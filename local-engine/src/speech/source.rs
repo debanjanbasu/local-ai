@@ -8,6 +8,10 @@
 //! `tanh`, and analysed by a 20-point STFT (hop 5, periodic Hann, centred
 //! with reflection padding) into 11 magnitudes and 11 phases per frame.
 
+// Multiplies and adds stay separate (no fused multiply-add) to follow the
+// reference's F32 rounding.
+#![allow(clippy::suboptimal_flops)]
+
 const SAMPLE_RATE: f32 = 24_000.0;
 /// Samples per F0 frame (generator upsampling 10 x 6 times the iSTFT hop 5).
 const UPSAMPLE: usize = 300;
@@ -52,7 +56,7 @@ impl Rng {
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
         let t = self.s[1] << 17;
         self.s[2] ^= self.s[0];
@@ -136,8 +140,8 @@ fn stft(x: &[f32]) -> Vec<f32> {
     let pad = N_FFT / 2;
     let at = |i: isize| -> f32 {
         // Reflection padding (no edge repeat).
-        let len = n as isize;
-        let mut j = i - pad as isize;
+        let len = n.cast_signed();
+        let mut j = i - pad.cast_signed();
         if j < 0 {
             j = -j;
         }
@@ -163,7 +167,7 @@ fn stft(x: &[f32]) -> Vec<f32> {
     let mut frame = [0.0_f32; N_FFT];
     for f in 0..frames {
         for (m, value) in frame.iter_mut().enumerate() {
-            *value = at((f * HOP + m) as isize) * window[m];
+            *value = at((f * HOP + m).cast_signed()) * window[m];
         }
         for k in 0..BINS {
             let mut re = 0.0_f32;

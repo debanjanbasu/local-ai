@@ -4,8 +4,25 @@
 //! follows `num2words` (British style) but commas are omitted.
 
 const ONES: [&str; 20] = [
-    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
     "nineteen",
 ];
 const TENS: [&str; 10] = [
@@ -27,7 +44,11 @@ fn below_thousand(n: u64) -> String {
     } else if rest % 10 == 0 {
         TENS[(rest / 10) as usize].to_owned()
     } else {
-        format!("{}-{}", TENS[(rest / 10) as usize], ONES[(rest % 10) as usize])
+        format!(
+            "{}-{}",
+            TENS[(rest / 10) as usize],
+            ONES[(rest % 10) as usize]
+        )
     };
     match (hundreds, rest) {
         (0, _) => tail,
@@ -64,7 +85,14 @@ pub fn cardinal(n: u64) -> String {
 #[must_use]
 pub fn cardinal_str(digits: &str) -> String {
     digits.parse::<u64>().map_or_else(
-        |_| digits.chars().filter_map(|c| c.to_digit(10)).map(|d| ONES[d as usize]).collect::<Vec<_>>().join(" "),
+        |_| {
+            digits
+                .chars()
+                .filter_map(|c| c.to_digit(10))
+                .map(|d| ONES[d as usize])
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
         cardinal,
     )
 }
@@ -73,10 +101,11 @@ pub fn cardinal_str(digits: &str) -> String {
 #[must_use]
 pub fn ordinal_str(digits: &str) -> String {
     let words = cardinal_str(digits);
-    let (head, last) = match words.rfind([' ', '-']) {
-        Some(at) => (&words[..=at], &words[at + 1..]),
-        None => ("", words.as_str()),
-    };
+    // Split after the last space or hyphen (both ASCII, so on a boundary).
+    let (head, last) = words
+        .rfind([' ', '-'])
+        .and_then(|at| words.split_at_checked(at + 1))
+        .unwrap_or(("", words.as_str()));
     let last = match last {
         "one" => "first".to_owned(),
         "two" => "second".to_owned(),
@@ -85,7 +114,7 @@ pub fn ordinal_str(digits: &str) -> String {
         "eight" => "eighth".to_owned(),
         "nine" => "ninth".to_owned(),
         "twelve" => "twelfth".to_owned(),
-        w if w.ends_with('y') => format!("{}ieth", &w[..w.len() - 1]),
+        w if w.ends_with('y') => format!("{}ieth", w.strip_suffix('y').unwrap_or(w)),
         w => format!("{w}th"),
     };
     format!("{head}{last}")

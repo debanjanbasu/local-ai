@@ -12,7 +12,7 @@
 //! - `input`: 1 to 4,096 characters of English text;
 //! - `voice`: a Kokoro voice id (`af_heart`, `bm_george`, …), one of the
 //!   pinned built-in names (`alloy`, `ash`, … `cedar`, each mapped to a
-//!   distinct Kokoro voice, see [`VOICE_ALIASES`]; they are not OpenAI's
+//!   distinct Kokoro voice, see [`VOICE_ALIASES`]; they are not `OpenAI`'s
 //!   voices), or a custom voice object `{"id": …}` naming either;
 //! - `instructions` is refused when non-empty: Kokoro has no instruction or
 //!   style-prompt input, so it could not honor one;
@@ -54,7 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use local_engine::activity::EngineActivity;
 use local_engine::speech::encode::{Format, StreamEncoder};
 use local_engine::speech::{
-    MAX_INPUT_CHARS, Noise, SAMPLE_RATE, SPEECH_MODEL_ID, SPEED_RANGE, SpeechModel,
+    Catalog, MAX_INPUT_CHARS, Noise, SAMPLE_RATE, SPEECH_MODEL_ID, SPEED_RANGE, SpeechModel,
     VOICE_ALIASES, installed_model,
 };
 
@@ -74,6 +74,7 @@ const FRAME_SAMPLES: usize = 600;
 
 pub(super) struct Speech {
     model: Arc<Mutex<SpeechModel>>,
+    catalog: Catalog,
     slots: Arc<Semaphore>,
     activity: Arc<EngineActivity>,
     requests: AtomicU64,
@@ -100,6 +101,7 @@ impl Speech {
             model.payload_sha256()
         );
         Ok(Some(Arc::new(Self {
+            catalog: model.catalog(),
             model: Arc::new(Mutex::new(model)),
             slots: Arc::new(Semaphore::new(MAX_PENDING)),
             activity,
@@ -151,7 +153,11 @@ fn parse(body: &[u8]) -> Result<Parsed, String> {
             "input holds more than {MAX_INPUT_CHARS} characters"
         ));
     }
-    if request.instructions.as_deref().is_some_and(|i| !i.trim().is_empty()) {
+    if request
+        .instructions
+        .as_deref()
+        .is_some_and(|i| !i.trim().is_empty())
+    {
         return Err(format!(
             "instructions are not supported: {SPEECH_MODEL_ID} has no instruction or style-prompt \
              input, so it cannot honor them; choose a voice and speed instead"
@@ -232,7 +238,7 @@ fn synthesize(
         Ok(())
     };
     let mut encoder = StreamEncoder::new(parsed.format, SAMPLE_RATE).map_err(|e| e.to_string())?;
-    let send = |bytes: Vec<u8>| -> local_engine::Result<()> {
+    let emit = |bytes: Vec<u8>| -> local_engine::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -250,12 +256,20 @@ fn synthesize(
         })
     };
     let usage = {
-        let mut sink = |samples: &[f32]| -> local_engine::Result<()> { send(encoder.push(samples)?) };
-        model.synthesize(&parsed.input, voice, parsed.speed, Noise::Seeded(seed), &mut pace, &mut sink)
+        let mut sink =
+            |samples: &[f32]| -> local_engine::Result<()> { emit(encoder.push(samples)?) };
+        model.synthesize(
+            &parsed.input,
+            voice,
+            parsed.speed,
+            Noise::Seeded(seed),
+            &mut pace,
+            &mut sink,
+        )
     }
     .map_err(|e| e.to_string())?;
     drop(model);
-    send(encoder.finish().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    emit(encoder.finish().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     if parsed.sse {
         let output = usage.samples / FRAME_SAMPLES;
         let done = sse_event(&json!({
@@ -324,21 +338,27 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
             return error_response(StatusCode::BAD_REQUEST, &message, state, headers).await;
         }
     };
-    let voice = {
-        let model = service.model.lock().unwrap_or_else(PoisonError::into_inner);
-        match model.resolve_voice(&parsed.voice) {
-            Some(voice) if model.chunks(&parsed.input, voice, 510).is_empty() => {
-                Err("the input has nothing to pronounce".to_owned())
-            }
-            Some(voice) => Ok(voice.to_owned()),
-            None => Err(format!(
-                "unknown voice {:?}: use a Kokoro voice id ({}) or one of {}",
-                parsed.voice,
-                model.voices().collect::<Vec<_>>().join(", "),
-                VOICE_ALIASES.iter().map(|(a, _)| *a).collect::<Vec<_>>().join(", ")
-            )),
+    // Validate on the blocking pool without the model lock (a running
+    // synthesis holds it), so bad requests fail fast with 400.
+    let catalog = service.catalog.clone();
+    let (input, requested) = (parsed.input.clone(), parsed.voice.clone());
+    let voice = tokio::task::spawn_blocking(move || match catalog.resolve_voice(&requested) {
+        Some(voice) if catalog.chunks(&input, voice, 510).is_empty() => {
+            Err("the input has nothing to pronounce".to_owned())
         }
-    };
+        Some(voice) => Ok(voice.to_owned()),
+        None => Err(format!(
+            "unknown voice {requested:?}: use a Kokoro voice id ({}) or one of {}",
+            catalog.voices().join(", "),
+            VOICE_ALIASES
+                .iter()
+                .map(|(a, _)| *a)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.to_string()));
     let voice = match voice {
         Ok(voice) => voice,
         Err(message) => {
@@ -435,10 +455,8 @@ mod tests {
         .expect("valid");
         assert_eq!(parsed.format, Format::Wav);
         assert!(parsed.sse);
-        let custom = parse(
-            br#"{"model":"kokoro-82m","input":"Hi.","voice":{"id":"bm_george"}}"#,
-        )
-        .expect("custom voice object");
+        let custom = parse(br#"{"model":"kokoro-82m","input":"Hi.","voice":{"id":"bm_george"}}"#)
+            .expect("custom voice object");
         assert_eq!(custom.voice, "bm_george");
         for bad in [
             r#","response_format":"aac""#,
