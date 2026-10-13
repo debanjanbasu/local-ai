@@ -99,6 +99,20 @@ expired bytes are purged at startup. The same crate offers native repository sea
 [local-services/README.md](local-services/README.md) and
 [docs/BONSAI.md](docs/BONSAI.md#native-services).
 
+Authentication is off by default: on `127.0.0.1` any local process, and any
+web page a local browser opens that can reach the port, may use the server
+(and `serve` warns when bound elsewhere without it). `local-ai admin
+create-key` creates the first admin API key, prints it once, and turns
+authentication on: every request then needs `Authorization: Bearer <key>`.
+Admin keys (`sk-admin-...`) authorize only the OpenAI Administration API
+(`/v1/organization/*`: admin keys, projects, service accounts and their
+project keys, audit logs, usage aggregated from records the server writes,
+and costs, always empty because nothing is billed); project keys
+(`sk-proj-...`) authorize everything else and attribute usage. Keys are
+stored only as salted HMAC-SHA-256 tags in the services store. Users,
+invites, rate limits, certificates, roles and spend controls are refused or
+minimal; see [docs/ADMIN.md](docs/ADMIN.md).
+
 `--reasoning-key FILE` adds
 AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
 reasoning is still returned and, with a store, still written, so it is neither

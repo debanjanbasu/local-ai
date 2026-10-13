@@ -76,7 +76,10 @@ pub(super) fn usage() {
     eprintln!();
     eprintln!("  --host IP          Bind address (default: 127.0.0.1)");
     eprintln!("  --port N           TCP/UDP port (default: 8080)");
-    eprintln!("  --api-key KEY      Require bearer authentication");
+    eprintln!(
+        "  --api-key KEY      Require bearer authentication; KEY authorizes every API but \
+         /v1/organization (admin keys: `local-ai admin create-key`, docs/ADMIN.md)"
+    );
     eprintln!("  --no-thinking      Disable thinking");
     eprintln!(
         "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \

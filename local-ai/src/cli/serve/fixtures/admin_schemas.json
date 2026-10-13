@@ -1,0 +1,3507 @@
+{
+ "source": "openai-openapi pinned contract (components.schemas subset for the Administration API; descriptions and examples stripped)",
+ "schemas": {
+  "AdminApiKey": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.admin_api_key"
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "name": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "redacted_value": {
+     "type": "string"
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "expires_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_used_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "owner": {
+     "type": "object",
+     "properties": {
+      "type": {
+       "type": "string"
+      },
+      "object": {
+       "type": "string"
+      },
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      },
+      "created_at": {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      "role": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "required": [
+    "object",
+    "redacted_value",
+    "created_at",
+    "expires_at",
+    "id",
+    "owner"
+   ]
+  },
+  "AdminApiKeyCreateResponse": {
+   "allOf": [
+    {
+     "$ref": "#/components/schemas/AdminApiKey"
+    },
+    {
+     "type": "object",
+     "properties": {
+      "value": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "value"
+     ]
+    }
+   ]
+  },
+  "AdminApiKeyDeleteResponse": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.admin_api_key.deleted"
+     ]
+    },
+    "deleted": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "id",
+    "object",
+    "deleted"
+   ]
+  },
+  "ApiKeyList": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "list"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/AdminApiKey"
+     }
+    },
+    "has_more": {
+     "type": "boolean"
+    },
+    "first_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more"
+   ]
+  },
+  "AuditLog": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "type": {
+     "$ref": "#/components/schemas/AuditLogEventType"
+    },
+    "effective_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "project": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      }
+     }
+    },
+    "actor": {
+     "anyOf": [
+      {
+       "$ref": "#/components/schemas/AuditLogActor"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "scopes": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "api_key.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {
+        "scopes": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "api_key.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "checkpoint.permission.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "project_id": {
+         "type": "string"
+        },
+        "fine_tuned_model_checkpoint": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "checkpoint.permission.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "external_key.registered": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object"
+      }
+     }
+    },
+    "external_key.removed": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "external_storage.registered": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "provider": {
+         "$ref": "#/components/schemas/provider"
+        },
+        "geography": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "external_storage.removed": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "group.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "group_name": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "group.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {
+        "group_name": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "group.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "scim.enabled": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "scim.disabled": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "invite.sent": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "email": {
+         "type": "string"
+        },
+        "role": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "invite.accepted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "invite.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "ip_allowlist.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      },
+      "allowed_ips": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "ip_allowlist.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "allowed_ips": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "ip_allowlist.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      },
+      "allowed_ips": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "ip_allowlist.config.activated": {
+     "type": "object",
+     "properties": {
+      "configs": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "id": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "ip_allowlist.config.deactivated": {
+     "type": "object",
+     "properties": {
+      "configs": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "id": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "login.succeeded": {
+     "type": "object"
+    },
+    "login.failed": {
+     "type": "object",
+     "properties": {
+      "error_code": {
+       "type": "string"
+      },
+      "error_message": {
+       "type": "string"
+      }
+     }
+    },
+    "logout.succeeded": {
+     "type": "object"
+    },
+    "logout.failed": {
+     "type": "object",
+     "properties": {
+      "error_code": {
+       "type": "string"
+      },
+      "error_message": {
+       "type": "string"
+      }
+     }
+    },
+    "organization.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "threads_ui_visibility": {
+         "type": "string"
+        },
+        "usage_dashboard_visibility": {
+         "type": "string"
+        },
+        "api_call_logging": {
+         "type": "string"
+        },
+        "api_call_logging_project_ids": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "project.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "name": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "project.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    },
+    "project.archived": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "project.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "rate_limit.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {
+        "max_requests_per_1_minute": {
+         "type": "integer"
+        },
+        "max_tokens_per_1_minute": {
+         "type": "integer"
+        },
+        "max_images_per_1_minute": {
+         "type": "integer"
+        },
+        "max_audio_megabytes_per_1_minute": {
+         "type": "integer"
+        },
+        "max_requests_per_1_day": {
+         "type": "integer"
+        },
+        "batch_1_day_max_input_tokens": {
+         "type": "integer"
+        }
+       }
+      }
+     }
+    },
+    "rate_limit.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "role.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "role_name": {
+       "type": "string"
+      },
+      "permissions": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "resource_type": {
+       "type": "string"
+      },
+      "resource_id": {
+       "type": "string"
+      }
+     }
+    },
+    "role.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {
+        "role_name": {
+         "type": "string"
+        },
+        "resource_id": {
+         "type": "string"
+        },
+        "resource_type": {
+         "type": "string"
+        },
+        "permissions_added": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "permissions_removed": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "metadata": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    },
+    "role.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "role.assignment.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "principal_id": {
+       "type": "string"
+      },
+      "principal_type": {
+       "type": "string"
+      },
+      "resource_id": {
+       "type": "string"
+      },
+      "resource_type": {
+       "type": "string"
+      }
+     }
+    },
+    "role.assignment.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "principal_id": {
+       "type": "string"
+      },
+      "principal_type": {
+       "type": "string"
+      },
+      "resource_id": {
+       "type": "string"
+      },
+      "resource_type": {
+       "type": "string"
+      }
+     }
+    },
+    "role.bound_to_resource": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "role_id": {
+       "type": "string"
+      },
+      "resource_id": {
+       "type": "string"
+      },
+      "resource_type": {
+       "type": "string"
+      },
+      "permissions": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "workspace_id": {
+       "type": "string"
+      },
+      "connector_id": {
+       "type": "string"
+      },
+      "connector_name": {
+       "type": "string"
+      },
+      "enabled": {
+       "type": "boolean"
+      },
+      "source": {
+       "type": "string",
+       "enum": [
+        "role_toggle",
+        "role_connector_update",
+        "role_delete",
+        "workspace_permissions",
+        "connector_publish"
+       ]
+      }
+     }
+    },
+    "role.unbound_from_resource": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "role_id": {
+       "type": "string"
+      },
+      "resource_id": {
+       "type": "string"
+      },
+      "resource_type": {
+       "type": "string"
+      },
+      "permissions": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "workspace_id": {
+       "type": "string"
+      },
+      "connector_id": {
+       "type": "string"
+      },
+      "connector_name": {
+       "type": "string"
+      },
+      "enabled": {
+       "type": "boolean"
+      },
+      "source": {
+       "type": "string",
+       "enum": [
+        "role_toggle",
+        "role_connector_update",
+        "role_delete",
+        "workspace_permissions",
+        "connector_publish"
+       ]
+      }
+     }
+    },
+    "service_account.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "role": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "service_account.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {
+        "role": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "service_account.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "workload_identity_provider.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object"
+      }
+     }
+    },
+    "workload_identity_provider.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object"
+      }
+     }
+    },
+    "workload_identity_provider.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      }
+     }
+    },
+    "workload_identity_provider_mapping.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "identity_provider_id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object"
+      }
+     }
+    },
+    "workload_identity_provider_mapping.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "identity_provider_id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object"
+      }
+     }
+    },
+    "workload_identity_provider_mapping.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "identity_provider_id": {
+       "type": "string"
+      },
+      "project_id": {
+       "type": "string"
+      },
+      "service_account_id": {
+       "type": "string"
+      }
+     }
+    },
+    "user.added": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "data": {
+       "type": "object",
+       "properties": {
+        "role": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "user.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "changes_requested": {
+       "type": "object",
+       "properties": {
+        "role": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "user.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     }
+    },
+    "certificate.created": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      }
+     }
+    },
+    "certificate.updated": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      }
+     }
+    },
+    "certificate.deleted": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string"
+      },
+      "name": {
+       "type": "string"
+      },
+      "certificate": {
+       "type": "string"
+      }
+     }
+    },
+    "certificates.activated": {
+     "type": "object",
+     "properties": {
+      "certificates": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "id": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "certificates.deactivated": {
+     "type": "object",
+     "properties": {
+      "certificates": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "id": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   "required": [
+    "id",
+    "type",
+    "effective_at"
+   ]
+  },
+  "AuditLogActor": {
+   "type": "object",
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "session",
+      "api_key"
+     ]
+    },
+    "session": {
+     "$ref": "#/components/schemas/AuditLogActorSession"
+    },
+    "api_key": {
+     "$ref": "#/components/schemas/AuditLogActorApiKey"
+    }
+   }
+  },
+  "AuditLogActorApiKey": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string",
+     "enum": [
+      "user",
+      "service_account"
+     ]
+    },
+    "user": {
+     "$ref": "#/components/schemas/AuditLogActorUser"
+    },
+    "service_account": {
+     "$ref": "#/components/schemas/AuditLogActorServiceAccount"
+    }
+   }
+  },
+  "AuditLogActorServiceAccount": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    }
+   }
+  },
+  "AuditLogActorSession": {
+   "type": "object",
+   "properties": {
+    "user": {
+     "$ref": "#/components/schemas/AuditLogActorUser"
+    },
+    "ip_address": {
+     "type": "string"
+    }
+   }
+  },
+  "AuditLogActorUser": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "email": {
+     "type": "string"
+    }
+   }
+  },
+  "AuditLogEventType": {
+   "type": "string",
+   "enum": [
+    "api_key.created",
+    "api_key.updated",
+    "api_key.deleted",
+    "certificate.created",
+    "certificate.updated",
+    "certificate.deleted",
+    "certificates.activated",
+    "certificates.deactivated",
+    "checkpoint.permission.created",
+    "checkpoint.permission.deleted",
+    "external_key.registered",
+    "external_key.removed",
+    "external_storage.registered",
+    "external_storage.removed",
+    "group.created",
+    "group.updated",
+    "group.deleted",
+    "invite.sent",
+    "invite.accepted",
+    "invite.deleted",
+    "ip_allowlist.created",
+    "ip_allowlist.updated",
+    "ip_allowlist.deleted",
+    "ip_allowlist.config.activated",
+    "ip_allowlist.config.deactivated",
+    "login.succeeded",
+    "login.failed",
+    "logout.succeeded",
+    "logout.failed",
+    "organization.updated",
+    "project.created",
+    "project.updated",
+    "project.archived",
+    "project.deleted",
+    "rate_limit.updated",
+    "rate_limit.deleted",
+    "resource.deleted",
+    "tunnel.created",
+    "tunnel.updated",
+    "tunnel.deleted",
+    "workload_identity_provider.created",
+    "workload_identity_provider.updated",
+    "workload_identity_provider.deleted",
+    "workload_identity_provider_mapping.created",
+    "workload_identity_provider_mapping.updated",
+    "workload_identity_provider_mapping.deleted",
+    "role.created",
+    "role.updated",
+    "role.deleted",
+    "role.assignment.created",
+    "role.assignment.deleted",
+    "role.bound_to_resource",
+    "role.unbound_from_resource",
+    "scim.enabled",
+    "scim.disabled",
+    "service_account.created",
+    "service_account.updated",
+    "service_account.deleted",
+    "user.added",
+    "user.updated",
+    "user.deleted",
+    "tenant.metadata.updated",
+    "tenant.microsoft_entra_mapping.upserted",
+    "tenant.microsoft_entra_mapping.deleted",
+    "tenant.workload_identity.provider.created",
+    "tenant.workload_identity.provider.updated",
+    "tenant.workload_identity.provider.archived",
+    "tenant.workload_identity.mapping.created",
+    "tenant.workload_identity.mapping.updated",
+    "tenant.workload_identity.mapping.archived",
+    "tenant.workload_identity.binding.created",
+    "tenant.workload_identity.principal.provisioned",
+    "tenant.workload_identity.access_token.issued",
+    "tenant.admin_api_key.created",
+    "tenant.admin_api_key.updated",
+    "tenant.admin_api_key.deleted",
+    "tenant.project_api_key.created",
+    "tenant.trusted_access.business_verification.started",
+    "tenant.trusted_access.application.submitted",
+    "tenant.chatgpt_access_token.revoked",
+    "tenant.migration.completed",
+    "tenant.sso.migrated",
+    "tenant.domains.migrated",
+    "tenant.sso_connection.created",
+    "tenant.sso_connection.updated",
+    "tenant.sso_connection.deleted",
+    "tenant.sso_connection.setup.started",
+    "tenant.policy.created",
+    "tenant.policy.updated",
+    "tenant.policy.deleted",
+    "tenant.policy.attached",
+    "tenant.policy.detached",
+    "tenant.principal_authentication_policy.resolved",
+    "tenant.scim.setup.started",
+    "tenant.scim.deletion.requested",
+    "tenant.scim.directory.created",
+    "tenant.product_access_policy.updated",
+    "tenant.resource_share_grant.created",
+    "tenant.resource_share_grant.updated",
+    "tenant.resource_share_grant.accepted",
+    "tenant.resource_share_grant.declined",
+    "tenant.resource_share_grant.revoked",
+    "tenant.resource_share_grant.deleted",
+    "tenant.service_account.updated",
+    "tenant.service_account.deleted",
+    "tenant.service_account.token.revoked",
+    "tenant.billing.overage_limit.updated",
+    "tenant.billing.alerts.updated",
+    "tenant.billing.info.updated",
+    "tenant.usage_limit.workspace.updated",
+    "tenant.usage_limit.group.updated",
+    "tenant.usage_limit.user.updated",
+    "tenant.usage_limit.increase_request.updated",
+    "tenant.usage_limit.increase_request.resolved",
+    "tenant.group.created",
+    "tenant.group.updated",
+    "tenant.group.deleted",
+    "tenant.group.member.added",
+    "tenant.group.member.removed",
+    "tenant.migration_rollout.status.updated",
+    "tenant.migration_rollout.tier.updated",
+    "tenant.role.metadata.updated",
+    "tenant.custom_role.created",
+    "tenant.custom_role.updated",
+    "tenant.custom_role.deleted",
+    "tenant.role_assignment.created",
+    "tenant.role_assignment.deleted",
+    "tenant.resource_role_assignment.created",
+    "tenant.resource_role_assignment.deleted",
+    "tenant.resource_access.updated",
+    "tenant.resource_access.deleted",
+    "tenant.ads_account.onboarding.redemption",
+    "tenant.session_policy.created",
+    "tenant.session_policy.updated",
+    "tenant.session_policy.deleted",
+    "tenant.session_revocation.started",
+    "tenant.third_party_app_policy.updated",
+    "tenant.user.added",
+    "tenant.user.updated",
+    "tenant.user.removed",
+    "tenant.user.looked_up",
+    "tenant.user.invited",
+    "tenant.membership.revoked",
+    "tenant.api_organization_invite.upserted",
+    "tenant.api_organization_invite.deleted",
+    "tenant.chatgpt_workspace_invite.upserted",
+    "tenant.membership.accepted",
+    "tenant.membership.declined",
+    "tenant.workspace_invite_email_settings.updated"
+   ]
+  },
+  "AwsExternalStorageProviderResponse": {
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "aws"
+     ],
+     "default": "aws"
+    },
+    "account_id": {
+     "type": "string"
+    },
+    "region": {
+     "type": "string"
+    },
+    "bucket": {
+     "type": "string"
+    },
+    "role_arn": {
+     "type": "string"
+    },
+    "external_id": {
+     "type": "string"
+    }
+   },
+   "type": "object",
+   "required": [
+    "type",
+    "account_id",
+    "region",
+    "bucket",
+    "role_arn",
+    "external_id"
+   ]
+  },
+  "AzureExternalStorageProviderResponse": {
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "azure"
+     ],
+     "default": "azure"
+    },
+    "tenant_id": {
+     "type": "string"
+    },
+    "subscription_id": {
+     "type": "string"
+    },
+    "resource_group": {
+     "type": "string"
+    },
+    "account_name": {
+     "type": "string"
+    },
+    "container": {
+     "type": "string"
+    },
+    "region": {
+     "type": "string"
+    }
+   },
+   "type": "object",
+   "required": [
+    "type",
+    "tenant_id",
+    "subscription_id",
+    "resource_group",
+    "account_name",
+    "container",
+    "region"
+   ]
+  },
+  "CostsResult": {
+   "type": "object",
+   "properties": {
+    "api_source": {
+     "anyOf": [
+      {
+       "type": "string",
+       "enum": [
+        "agents_api",
+        "unlabeled"
+       ]
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.costs.result"
+     ]
+    },
+    "amount": {
+     "type": "object",
+     "properties": {
+      "value": {
+       "type": "number"
+      },
+      "currency": {
+       "type": "string"
+      }
+     }
+    },
+    "line_item": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "quantity": {
+     "anyOf": [
+      {
+       "type": "number"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "quantity_unit": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "string",
+       "enum": [
+        "tokens",
+        "1000_tokens",
+        "duration_seconds",
+        "duration_minutes",
+        "duration_hours",
+        "gibibyte_hours",
+        "images",
+        "characters"
+       ]
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object"
+   ]
+  },
+  "Error": {
+   "type": "object",
+   "properties": {
+    "code": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "message": {
+     "type": "string"
+    },
+    "param": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "type": {
+     "type": "string"
+    },
+    "misalignment": {
+     "$ref": "#/components/schemas/MisalignmentErrorDetailsResource"
+    }
+   },
+   "required": [
+    "type",
+    "message",
+    "param",
+    "code"
+   ]
+  },
+  "ErrorResponse": {
+   "type": "object",
+   "properties": {
+    "error": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "required": [
+    "error"
+   ]
+  },
+  "GcpExternalStorageProviderResponse": {
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "gcp"
+     ],
+     "default": "gcp"
+    },
+    "bucket": {
+     "type": "string"
+    },
+    "workload_identity_project_number": {
+     "type": "string"
+    },
+    "workload_identity_pool_id": {
+     "type": "string"
+    },
+    "workload_identity_provider_id": {
+     "type": "string"
+    },
+    "region": {
+     "type": "string"
+    },
+    "audience": {
+     "type": "string"
+    }
+   },
+   "type": "object",
+   "required": [
+    "type",
+    "bucket",
+    "workload_identity_project_number",
+    "workload_identity_pool_id",
+    "workload_identity_provider_id",
+    "region",
+    "audience"
+   ]
+  },
+  "Invite": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.invite"
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "email": {
+     "type": "string"
+    },
+    "role": {
+     "type": "string",
+     "enum": [
+      "owner",
+      "reader"
+     ]
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "accepted",
+      "expired",
+      "pending"
+     ]
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "expires_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "accepted_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "projects": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string"
+       },
+       "role": {
+        "type": "string",
+        "enum": [
+         "member",
+         "owner"
+        ]
+       }
+      },
+      "required": [
+       "id",
+       "role"
+      ]
+     }
+    }
+   },
+   "required": [
+    "object",
+    "id",
+    "email",
+    "role",
+    "status",
+    "created_at",
+    "projects"
+   ]
+  },
+  "InviteListResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "list"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/Invite"
+     }
+    },
+    "first_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more"
+   ]
+  },
+  "ListAuditLogsResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "list"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/AuditLog"
+     }
+    },
+    "first_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more"
+   ]
+  },
+  "MisalignmentErrorDetailsResource": {
+   "properties": {
+    "review_target": {
+     "anyOf": [
+      {
+       "not": {
+        "pattern": "[^A-Za-z0-9._~:-]"
+       },
+       "type": "string",
+       "maxLength": 96,
+       "minLength": 1,
+       "pattern": "^[A-Za-z0-9._~:-]+$"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "error_type": {
+     "$ref": "#/components/schemas/_MisalignmentErrorType"
+    },
+    "detailed_explanation": {
+     "type": "string"
+    },
+    "steer": {
+     "$ref": "#/components/schemas/_MisalignmentSteer"
+    }
+   },
+   "type": "object",
+   "required": []
+  },
+  "OciExternalStorageProviderResponse": {
+   "properties": {
+    "type": {
+     "type": "string",
+     "enum": [
+      "oci"
+     ],
+     "default": "oci"
+    },
+    "tenancy_ocid": {
+     "type": "string"
+    },
+    "region": {
+     "type": "string"
+    },
+    "bucket": {
+     "type": "string"
+    }
+   },
+   "type": "object",
+   "required": [
+    "type",
+    "tenancy_ocid",
+    "region",
+    "bucket"
+   ]
+  },
+  "PermissionErrorResponse": {
+   "type": "object",
+   "properties": {
+    "error": {
+     "anyOf": [
+      {
+       "$ref": "#/components/schemas/Error"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    }
+   },
+   "required": [
+    "error"
+   ]
+  },
+  "Project": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project"
+     ]
+    },
+    "name": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "archived_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "status": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "external_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "residency": {
+     "$ref": "#/components/schemas/PublicProjectResidency"
+    }
+   },
+   "required": [
+    "id",
+    "object",
+    "created_at"
+   ]
+  },
+  "ProjectApiKey": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project.api_key"
+     ]
+    },
+    "redacted_value": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "expires_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_used_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "owner_project_access": {
+     "type": "string",
+     "enum": [
+      "active",
+      "inactive"
+     ]
+    },
+    "owner": {
+     "type": "object",
+     "properties": {
+      "type": {
+       "type": "string",
+       "enum": [
+        "user",
+        "service_account"
+       ]
+      },
+      "user": {
+       "$ref": "#/components/schemas/ProjectApiKeyOwnerUser"
+      },
+      "service_account": {
+       "$ref": "#/components/schemas/ProjectApiKeyOwnerServiceAccount"
+      }
+     }
+    }
+   },
+   "required": [
+    "object",
+    "redacted_value",
+    "name",
+    "created_at",
+    "last_used_at",
+    "id",
+    "owner_project_access",
+    "owner"
+   ]
+  },
+  "ProjectApiKeyDeleteResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project.api_key.deleted"
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "deleted": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "id",
+    "deleted"
+   ]
+  },
+  "ProjectApiKeyListResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "list"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/ProjectApiKey"
+     }
+    },
+    "first_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more"
+   ]
+  },
+  "ProjectApiKeyOwnerServiceAccount": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "role": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "id",
+    "name",
+    "created_at",
+    "role"
+   ]
+  },
+  "ProjectApiKeyOwnerUser": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "email": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "role": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "id",
+    "email",
+    "name",
+    "created_at",
+    "role"
+   ]
+  },
+  "ProjectListResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "list"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/Project"
+     }
+    },
+    "first_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more"
+   ]
+  },
+  "ProjectServiceAccount": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project.service_account"
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "role": {
+     "type": "string",
+     "enum": [
+      "owner",
+      "member",
+      "none"
+     ]
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    }
+   },
+   "required": [
+    "object",
+    "id",
+    "name",
+    "role",
+    "created_at"
+   ]
+  },
+  "ProjectServiceAccountApiKey": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project.service_account.api_key"
+     ]
+    },
+    "value": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "expires_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "object",
+    "value",
+    "name",
+    "created_at",
+    "id"
+   ]
+  },
+  "ProjectServiceAccountCreateResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project.service_account"
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "role": {
+     "type": "string",
+     "enum": [
+      "member",
+      "none"
+     ]
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "api_key": {
+     "anyOf": [
+      {
+       "$ref": "#/components/schemas/ProjectServiceAccountApiKey"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "id",
+    "name",
+    "role",
+    "created_at",
+    "api_key"
+   ]
+  },
+  "ProjectServiceAccountDeleteResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project.service_account.deleted"
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "deleted": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "id",
+    "deleted"
+   ]
+  },
+  "ProjectServiceAccountListResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "list"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/ProjectServiceAccount"
+     }
+    },
+    "first_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more"
+   ]
+  },
+  "PublicProjectResidency": {
+   "type": "string",
+   "enum": [
+    "GLOBAL",
+    "US_STORAGE_PROCESSING",
+    "EU_STORAGE_PROCESSING",
+    "JP_STORAGE",
+    "KR_STORAGE",
+    "CA_STORAGE",
+    "SG_STORAGE",
+    "IN_STORAGE",
+    "AU_STORAGE",
+    "GB_STORAGE",
+    "AE_STORAGE",
+    "AE_STORAGE_PROCESSING"
+   ]
+  },
+  "ServiceAccountApiKeyBody": {
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.project.service_account.api_key"
+     ],
+     "default": "organization.project.service_account.api_key"
+    },
+    "value": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "created_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "expires_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "id": {
+     "type": "string"
+    }
+   },
+   "type": "object",
+   "required": [
+    "object",
+    "value",
+    "name",
+    "created_at",
+    "id"
+   ]
+  },
+  "UsageAudioSpeechesResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.audio_speeches.result"
+     ]
+    },
+    "characters": {
+     "type": "integer"
+    },
+    "num_model_requests": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "characters",
+    "num_model_requests"
+   ]
+  },
+  "UsageAudioTranscriptionsResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.audio_transcriptions.result"
+     ]
+    },
+    "seconds": {
+     "type": "integer",
+     "format": "int64"
+    },
+    "num_model_requests": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "seconds",
+    "num_model_requests"
+   ]
+  },
+  "UsageCodeInterpreterSessionsResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.code_interpreter_sessions.result"
+     ]
+    },
+    "num_sessions": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "num_sessions"
+   ]
+  },
+  "UsageCompletionsResult": {
+   "type": "object",
+   "properties": {
+    "api_source": {
+     "anyOf": [
+      {
+       "type": "string",
+       "enum": [
+        "agents_api",
+        "unlabeled"
+       ]
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.completions.result"
+     ]
+    },
+    "input_tokens": {
+     "type": "integer"
+    },
+    "input_cached_tokens": {
+     "type": "integer"
+    },
+    "input_cache_write_tokens": {
+     "type": "integer"
+    },
+    "input_cache_write_12h_tokens": {
+     "type": "integer"
+    },
+    "input_uncached_tokens": {
+     "type": "integer"
+    },
+    "output_tokens": {
+     "type": "integer"
+    },
+    "input_text_tokens": {
+     "type": "integer"
+    },
+    "output_text_tokens": {
+     "type": "integer"
+    },
+    "input_cached_text_tokens": {
+     "type": "integer"
+    },
+    "input_audio_tokens": {
+     "type": "integer"
+    },
+    "input_cached_audio_tokens": {
+     "type": "integer"
+    },
+    "output_audio_tokens": {
+     "type": "integer"
+    },
+    "input_image_tokens": {
+     "type": "integer"
+    },
+    "input_cached_image_tokens": {
+     "type": "integer"
+    },
+    "output_image_tokens": {
+     "type": "integer"
+    },
+    "num_model_requests": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "batch": {
+     "anyOf": [
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "service_tier": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "input_tokens",
+    "output_tokens",
+    "num_model_requests"
+   ]
+  },
+  "UsageEmbeddingsResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.embeddings.result"
+     ]
+    },
+    "input_tokens": {
+     "type": "integer"
+    },
+    "num_model_requests": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "input_tokens",
+    "num_model_requests"
+   ]
+  },
+  "UsageFileSearchCallsResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.file_searches.result"
+     ]
+    },
+    "num_requests": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "vector_store_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "num_requests"
+   ]
+  },
+  "UsageImagesResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.images.result"
+     ]
+    },
+    "images": {
+     "type": "integer"
+    },
+    "num_model_requests": {
+     "type": "integer"
+    },
+    "source": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "size": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "images",
+    "num_model_requests"
+   ]
+  },
+  "UsageModerationsResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.moderations.result"
+     ]
+    },
+    "input_tokens": {
+     "type": "integer"
+    },
+    "num_model_requests": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "input_tokens",
+    "num_model_requests"
+   ]
+  },
+  "UsageResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "page"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/UsageTimeBucket"
+     }
+    },
+    "has_more": {
+     "type": "boolean"
+    },
+    "next_page": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more",
+    "next_page"
+   ]
+  },
+  "UsageTimeBucket": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "bucket"
+     ]
+    },
+    "start_time": {
+     "type": "integer"
+    },
+    "end_time": {
+     "type": "integer"
+    },
+    "results": {
+     "type": "array",
+     "items": {
+      "oneOf": [
+       {
+        "$ref": "#/components/schemas/UsageCompletionsResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageEmbeddingsResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageModerationsResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageImagesResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageAudioSpeechesResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageAudioTranscriptionsResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageVectorStoresResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageCodeInterpreterSessionsResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageFileSearchCallsResult"
+       },
+       {
+        "$ref": "#/components/schemas/UsageWebSearchCallsResult"
+       },
+       {
+        "$ref": "#/components/schemas/CostsResult"
+       }
+      ],
+      "discriminator": {
+       "propertyName": "object"
+      }
+     }
+    }
+   },
+   "required": [
+    "object",
+    "start_time",
+    "end_time",
+    "results"
+   ]
+  },
+  "UsageVectorStoresResult": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.vector_stores.result"
+     ]
+    },
+    "usage_bytes": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "usage_bytes"
+   ]
+  },
+  "UsageWebSearchCallsResult": {
+   "type": "object",
+   "properties": {
+    "api_source": {
+     "anyOf": [
+      {
+       "type": "string",
+       "enum": [
+        "agents_api",
+        "unlabeled"
+       ]
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.usage.web_searches.result"
+     ]
+    },
+    "num_model_requests": {
+     "type": "integer"
+    },
+    "num_requests": {
+     "type": "integer"
+    },
+    "project_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "user_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "api_key_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "model": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "context_level": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "num_model_requests",
+    "num_requests"
+   ]
+  },
+  "User": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "organization.user"
+     ]
+    },
+    "id": {
+     "type": "string"
+    },
+    "name": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "email": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "role": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "added_at": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "is_default": {
+     "type": "boolean"
+    },
+    "created": {
+     "type": "integer",
+     "format": "unixtime"
+    },
+    "user": {
+     "type": "object",
+     "properties": {
+      "object": {
+       "type": "string",
+       "enum": [
+        "user"
+       ]
+      },
+      "id": {
+       "type": "string"
+      },
+      "email": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ]
+      },
+      "name": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ]
+      },
+      "picture": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ]
+      },
+      "enabled": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ]
+      },
+      "banned": {
+       "anyOf": [
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ]
+      },
+      "banned_at": {
+       "anyOf": [
+        {
+         "type": "integer",
+         "format": "unixtime"
+        },
+        {
+         "type": "null"
+        }
+       ]
+      }
+     },
+     "required": [
+      "object",
+      "id"
+     ]
+    },
+    "is_service_account": {
+     "type": "boolean"
+    },
+    "is_scale_tier_authorized_purchaser": {
+     "anyOf": [
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "is_scim_managed": {
+     "type": "boolean"
+    },
+    "api_key_last_used_at": {
+     "anyOf": [
+      {
+       "type": "integer",
+       "format": "unixtime"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "technical_level": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "developer_persona": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "projects": {
+     "anyOf": [
+      {
+       "type": "object",
+       "properties": {
+        "object": {
+         "type": "string",
+         "enum": [
+          "list"
+         ]
+        },
+        "data": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "properties": {
+           "id": {
+            "anyOf": [
+             {
+              "type": "string"
+             },
+             {
+              "type": "null"
+             }
+            ]
+           },
+           "name": {
+            "anyOf": [
+             {
+              "type": "string"
+             },
+             {
+              "type": "null"
+             }
+            ]
+           },
+           "role": {
+            "anyOf": [
+             {
+              "type": "string"
+             },
+             {
+              "type": "null"
+             }
+            ]
+           }
+          }
+         }
+        }
+       },
+       "required": [
+        "object",
+        "data"
+       ]
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "required": [
+    "object",
+    "id",
+    "added_at"
+   ]
+  },
+  "UserListResponse": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "enum": [
+      "list"
+     ]
+    },
+    "data": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/User"
+     }
+    },
+    "first_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "last_id": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "object",
+    "data",
+    "has_more"
+   ]
+  },
+  "_MisalignmentErrorType": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "string",
+     "enum": [
+      "potentially_unintended_data_transfer",
+      "potentially_unintended_data_access",
+      "potentially_unintended_destructive_activity",
+      "other"
+     ]
+    }
+   ]
+  },
+  "_MisalignmentSteer": {
+   "properties": {
+    "message": {
+     "type": "string"
+    }
+   },
+   "type": "object",
+   "required": [
+    "message"
+   ]
+  },
+  "provider": {
+   "oneOf": [
+    {
+     "$ref": "#/components/schemas/AwsExternalStorageProviderResponse"
+    },
+    {
+     "$ref": "#/components/schemas/AzureExternalStorageProviderResponse"
+    },
+    {
+     "$ref": "#/components/schemas/GcpExternalStorageProviderResponse"
+    },
+    {
+     "$ref": "#/components/schemas/OciExternalStorageProviderResponse"
+    }
+   ],
+   "discriminator": {
+    "propertyName": "type"
+   }
+  }
+ }
+}
