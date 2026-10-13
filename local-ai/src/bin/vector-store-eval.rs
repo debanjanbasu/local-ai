@@ -2,16 +2,20 @@
 //! hybrid rankings compared on the same store (see `docs/EMBEDDINGS.md`).
 //!
 //! ```text
-//! vector-store-eval SCRATCH_DIR TASK.json...
+//! vector-store-eval prepare SCRATCH_DIR TASK.json...   (no GPU)
+//! vector-store-eval measure SCRATCH_DIR TASK.json...   (loads the encoder)
 //! ```
 //!
-//! Each task (`{"task", "queries", "query_ids", "docs", "doc_ids",
-//! "qrels"}`, the retrieval fixtures of `embedding-eval`, prompts applied)
-//! becomes a fresh services store under `SCRATCH_DIR/<task>` (which must not
-//! exist): every distinct document text one File (`title\n\ntext`, the
-//! prompt removed) attached to one vector store with the default chunking,
-//! indexed and embedded by [`VectorIndex::index_next`] with the native
-//! encoder from `models/embeddinggemma2-text`. Queries are sent without
+//! `prepare` turns each task (`{"task", "queries", "query_ids", "docs",
+//! "doc_ids", "qrels"}`, the retrieval fixtures of `embedding-eval`, prompts
+//! applied) into a fresh services store under `SCRATCH_DIR/<task>` (which
+//! must not exist): every distinct document text one File (`title\n\ntext`,
+//! the prompt removed) attached to one vector store with the default
+//! chunking and indexed for BM25 by [`VectorIndex::index_next`] without an
+//! embedding model. `measure` opens it with the native encoder from
+//! `models/embeddinggemma2-text` and embeds every chunk through the
+//! backfill ([`VectorIndex::embed_next`], the path an existing store takes
+//! when the model is installed), then compares the rankings. Queries are sent without
 //! their prompt (the store adds its own) through
 //! [`VectorIndex::search_with`], 50 results each; results are reduced to
 //! distinct files in order and scored by nDCG@10 against the qrels, a file
@@ -127,8 +131,14 @@ fn ndcg10(ranked: &[&str], rels: &HashMap<String, f64>) -> f64 {
     if idcg > 0.0 { dcg / idcg } else { 0.0 }
 }
 
-#[allow(clippy::too_many_lines)]
-fn run(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result<()> {
+#[derive(serde::Serialize, Deserialize)]
+struct Prepared {
+    vector_store: String,
+    files: usize,
+    file_of_doc: HashMap<String, String>,
+}
+
+fn prepare(scratch: &Path, path: &str) -> Result<()> {
     let task: Task = serde_json::from_slice(&std::fs::read(path)?)?;
     let root = scratch.join(&task.name);
     if root.exists() {
@@ -138,7 +148,7 @@ fn run(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result
     // One File per distinct text; documents map to it.
     let started = Instant::now();
     let mut by_text: HashMap<&str, String> = HashMap::new();
-    let mut file_of_doc: HashMap<&str, String> = HashMap::new();
+    let mut file_of_doc: HashMap<String, String> = HashMap::new();
     let mut file_ids = Vec::new();
     for (doc_id, text) in task.doc_ids.iter().zip(&task.docs) {
         let file_id = if let Some(file_id) = by_text.get(text.as_str()) {
@@ -156,7 +166,7 @@ fn run(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result
             file_ids.push(file.id.clone());
             file.id
         };
-        file_of_doc.insert(doc_id, file_id);
+        file_of_doc.insert(doc_id.clone(), file_id);
     }
     let vector_store = store.create_vector_store(&CreateVectorStore {
         name: Some(task.name.clone()),
@@ -171,35 +181,52 @@ fn run(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result
             },
         )?;
     }
+    let index = VectorIndex::open(&store)?;
+    while index.index_next()? > 0 {}
     eprintln!(
-        "{}: {} documents as {} files in {:.1?}",
+        "{}: {} documents as {} files, indexed for BM25 in {:.1?}",
         task.name,
         task.docs.len(),
         file_ids.len(),
         started.elapsed()
     );
+    let prepared = Prepared {
+        vector_store: vector_store.id,
+        files: file_ids.len(),
+        file_of_doc,
+    };
+    std::fs::write(root.join("eval.json"), serde_json::to_vec(&prepared)?)?;
+    Ok(())
+}
+
+fn measure(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result<()> {
+    let task: Task = serde_json::from_slice(&std::fs::read(path)?)?;
+    let root = scratch.join(&task.name);
+    let prepared: Prepared = serde_json::from_slice(&std::fs::read(root.join("eval.json"))?)?;
+    let store = Store::open(&root)?;
     let index = VectorIndex::open(&store)?;
     index.set_embedder(Some(Arc::clone(embedder) as _));
     let started = Instant::now();
     let mut files = 0;
     loop {
-        match index.index_next()? {
+        match index.embed_next()? {
             0 => break,
             n => files += n,
         }
     }
     let chunks = index.check()?.chunks;
     eprintln!(
-        "{}: indexed and embedded {files} files ({chunks} chunks) in {:.1?}",
+        "{}: embedded {files} files ({chunks} chunks) through the backfill in {:.1?}",
         task.name,
         started.elapsed()
     );
+    let vector_store = prepared.vector_store;
     // Relevance per file: the best grade among its documents.
     let mut qrels: HashMap<&str, HashMap<String, f64>> = HashMap::new();
     for (qid, rels) in &task.qrels {
         let entry = qrels.entry(qid.as_str()).or_default();
         for (doc_id, grade) in rels {
-            if let Some(file_id) = file_of_doc.get(doc_id.as_str()) {
+            if let Some(file_id) = prepared.file_of_doc.get(doc_id.as_str()) {
                 let slot = entry.entry(file_id.clone()).or_insert(0.0);
                 *slot = slot.max(*grade);
             }
@@ -209,7 +236,7 @@ fn run(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result
         "| {} ({} queries, {} files, {chunks} chunks) | nDCG@10 | mean search ms |",
         task.name,
         task.queries.len(),
-        file_ids.len()
+        prepared.files
     );
     println!("| --- | ---: | ---: |");
     for (name, ranking) in RANKINGS {
@@ -225,7 +252,7 @@ fn run(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result
                 ranker: Ranker::Auto,
                 score_threshold: 0.0,
             });
-            let results = index.search_with(&vector_store.id, &request, ranking)?;
+            let results = index.search_with(&vector_store, &request, ranking)?;
             let mut ranked: Vec<&str> = Vec::new();
             for hit in &results.data {
                 if !ranked.contains(&hit.file_id.as_str()) {
@@ -248,9 +275,23 @@ fn run(scratch: &Path, path: &str, embedder: &Arc<ModelChunkEmbedder>) -> Result
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some((scratch, tasks)) = args.split_first().filter(|(_, tasks)| !tasks.is_empty()) else {
-        return Err("usage: vector-store-eval SCRATCH_DIR TASK.json...".into());
+    let usage = "usage: vector-store-eval prepare|measure SCRATCH_DIR TASK.json...";
+    let [mode, scratch, tasks @ ..] = args.as_slice() else {
+        return Err(usage.into());
     };
+    if tasks.is_empty() {
+        return Err(usage.into());
+    }
+    match mode.as_str() {
+        "prepare" => {
+            for task in tasks {
+                prepare(Path::new(scratch), task)?;
+            }
+            return Ok(());
+        }
+        "measure" => {}
+        _ => return Err(usage.into()),
+    }
     let dir = installed_model(Path::new("models"))
         .ok_or("models/embeddinggemma2-text is not installed (see docs/EMBEDDINGS.md)")?;
     let model = EmbeddingModel::open(&dir)?;
@@ -259,7 +300,7 @@ fn main() -> Result<()> {
         Arc::new(EngineActivity::default()),
     ));
     for task in tasks {
-        run(Path::new(scratch), task, &embedder)?;
+        measure(Path::new(scratch), task, &embedder)?;
     }
     Ok(())
 }

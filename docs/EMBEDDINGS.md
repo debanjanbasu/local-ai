@@ -113,6 +113,84 @@ therefore delayed by at most one short embedding submission; the wait has a
 requests are admitted (one running); more get `503` with `Retry-After`. A
 client that disconnects cancels its request at the next submission boundary.
 
+## Vector stores
+
+When the artifact is installed, the server's vector stores
+(`/v1/vector_stores`) embed every chunk as it is indexed and rank
+`ranker: auto` searches by the cosine similarity of chunk and query
+embeddings; `ranker: none` stays BM25, and without the artifact everything
+is BM25 exactly as before. The full contract is the
+`local_services::vector_stores` module docs ("Embeddings"); the essentials:
+
+- **Prompts:** chunks as `title: none | text: {chunk}`, queries as
+  `task: search result | query: {query}`, 768 dimensions. A chunk longer
+  than 2,048 tokens (chunks are counted in words; only large static chunk
+  sizes reach it) is embedded from its first 2,047 tokens and `<eos>`.
+- **Storage:** one F16 vector per chunk (1.5 KB) in the services database,
+  keyed like the chunk, written in the same transaction that completes the
+  file and deleted with the garbage outbox entry that removes its index
+  documents; each file records the vector space (model, weights digest,
+  width, prompts) of its vectors. Stores created before embeddings (schema
+  version 1) are migrated in place and **backfilled in the background** by
+  the indexer (on start and on every notification, never polling), as are
+  files indexed while the model was absent and every file after a model or
+  prompt change. While a store is partly embedded, `auto` uses the
+  reciprocal rank fusion below so unembedded files are still found by BM25.
+- **Priority:** indexing embeds outside the index lock, holds the shared
+  model for at most about 4,096 tokens at a time (an API embedding request
+  waits for at most one group) and yields to Bonsai decode steps between
+  command buffers exactly like `/v1/embeddings`; stopping the server stops
+  an embedding batch at its next submission.
+- **Search** is brute force over the admitted files' vectors, streamed
+  from the database; memory is bounded by the result count, time is linear
+  in the store's chunks.
+
+### Choosing the ranking
+
+`target/release/vector-store-eval` measures through the vector store search
+path itself: `prepare` stores each fixture corpus as Files in one vector
+store with the default chunking (800/400 words; documents as
+`title\n\ntext`, exact duplicate texts as one File) and indexes it for BM25
+without the model; `measure` loads the encoder, embeds the store through the
+backfill, and runs every query (without its prompt; the store adds its own)
+through `VectorIndex::search_with`, 50 results reduced to distinct Files,
+nDCG@10 against the qrels (a File holding several documents is relevant
+with their best grade, so duplicates do not tie). Under the shared GPU lock
+on this machine:
+
+| Ranking | SciFact | NFCorpus | CosQA | Mean |
+| --- | ---: | ---: | ---: | ---: |
+| BM25 (`none`) | 68.78 | 32.31 | 38.76 | 46.62 |
+| **Embeddings (`auto`)** | **84.54** | 35.37 | **81.10** | **67.00** |
+| RRF k = 60, text 1 : embedding 1 | 77.54 | 37.10 | 57.90 | 57.51 |
+| RRF k = 60, 1 : 2 | 80.46 | **37.21** | 62.34 | 60.00 |
+| RRF k = 60, 1 : 3 | 81.16 | 37.17 | 66.38 | 61.57 |
+| RRF k = 60, 2 : 1 | 75.29 | 36.57 | 52.19 | 54.68 |
+| RRF k = 20, 1 : 1 | 78.97 | 37.03 | 61.24 | 59.08 |
+
+SciFact: 300 queries, 5,183 Files (5,192 chunks); NFCorpus: 323 queries,
+3,593 Files (3,602 chunks); CosQA: 500 queries, 6,267 Files (6,267 chunks).
+CosQA's numbers are not comparable with the retrieval table above: there,
+exact duplicates (426 of the 500 relevant documents have them) tie and
+count against the ranking; here they are one File. The query prompt is
+`search result` for every set (the store cannot know a query is a fact
+check or a code search) and titles are part of the document text, so
+SciFact lands 0.65 below the run above with the fact-checking prompt and
+the title in the prompt.
+
+Embeddings alone win the mean by 5.4 points over the best fusion and by
+20.4 over BM25; every fusion loses to them on SciFact (by 3.4 or more) and
+CosQA (by 14.7 or more), and the best fusion wins NFCorpus by only 1.8. So
+`auto` is embeddings alone, with fusion only as the fallback for partly
+embedded stores. Its score is `max(cos, 0)`, a similarity `score_threshold`
+can meaningfully cut.
+
+Cost on this machine: embedding the corpora through the backfill took 234 s
+for SciFact (5,192 chunks), 184 s for NFCorpus (3,602) and 87 s for CosQA
+(6,267), 20–72 chunks/s on a GPU otherwise idle for this run; a 50-result
+search took 30–39 ms with BM25 and 30–36 ms with embeddings (query embedding
+included), 36–55 ms fused.
+
 ## Verification
 
 Reference fixtures were generated on Kaggle (CPU, FP32,
