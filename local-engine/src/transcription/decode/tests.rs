@@ -140,6 +140,7 @@ fn run(
         script,
         &tokenizer,
         &mel(content_frames),
+        false,
         &options,
         &[],
         &mut Rng::new(7),

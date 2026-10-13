@@ -345,6 +345,7 @@ impl TranscriptionModel {
             payload: self.artifact.payload(),
         };
         let mut work = Work::default();
+        let detected = options.language.is_none();
         let language = if let Some(language) = &options.language {
             tokens::language_code(language)
                 .ok_or_else(|| {
@@ -382,6 +383,7 @@ impl TranscriptionModel {
             &mut bound,
             tokenizer,
             &mel,
+            detected,
             &window_options,
             &initial_prompt,
             &mut rng,
