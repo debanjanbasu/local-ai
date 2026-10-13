@@ -7,6 +7,7 @@ pub mod draft;
 pub mod embedding;
 pub mod embedding_audio;
 pub mod embedding_vision;
+pub mod kokoro;
 pub mod sampling;
 pub mod shaders;
 
