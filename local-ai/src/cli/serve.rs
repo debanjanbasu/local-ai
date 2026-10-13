@@ -1067,6 +1067,9 @@ async fn run_async(args: Args) -> crate::Result<()> {
         Some(models_dir) => embeddings::Embeddings::start(models_dir, engine.activity())?,
         None => None,
     };
+    if let (Some(vector_stores), Some(embeddings)) = (&vector_stores, &embeddings) {
+        vector_stores.set_embedder(embeddings.chunk_embedder());
+    }
     let mut state = AppState {
         engine,
         model,
