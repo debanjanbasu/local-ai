@@ -207,11 +207,46 @@ gates above measure what remains audible.
 
 ### Throughput
 
-RTF_RESULT
+`speech-eval bench` (best of three, GPU otherwise idle, M4 Pro; the 151-
+character sentence of fixture 26, once and as six newline-separated chunks):
+
+| Voice | Audio | Wall time | RTF | × real time |
+| --- | ---: | ---: | ---: | ---: |
+| `af_heart` | 9.47 s | 0.225 s | 0.0237 | 42 |
+| `bm_george` | 10.53 s | 0.242 s | 0.0230 | 43 |
+| `af_heart`, 6 chunks | 56.85 s | 1.348 s | 0.0237 | 42 |
+| `bm_george`, 6 chunks | 63.15 s | 1.468 s | 0.0232 | 43 |
+
+Through the server (`pcm`, 1,864 characters, 121.8 s of audio): first bytes
+after 0.73 s, all after 2.91 s (RTF 0.024). All 90 fixture syntheses (3 modes
+× 30 rows) took 9.4 s. Load, including the payload hash: 0.4–1.4 s.
 
 ### Beside Bonsai decode
 
-DECODE_RESULT
+Server, `--no-thinking`, greedy, 300-token answers, a different prompt per
+request, conditions alternated over eight prompts; the load is a loop of
+`pcm` speech requests of 44 s of audio each (`.scratch/decode_bench.py`,
+under the shared GPU lock):
+
+| | Bonsai decode | Speech |
+| --- | ---: | ---: |
+| Alone | 37.60 tok/s (33.0–40.2) | 44 s of audio in 1.04–1.07 s (RTF 0.024) |
+| Together | 34.28 tok/s (33.1–35.9), **−8.8%** | 44 s of audio in 7.9–8.5 s while decoding (RTF 0.19) |
+
+Speech yields most of the GPU while a generation runs (it still runs five
+times faster than real time) and takes it back when decoding stops — the same
+trade as embeddings (−9.4%).
+
+End-to-end checks on the same server (`.scratch/e2e_speech.py`): every
+supported format decodes with the expected magic and content type, the
+default is `mp3`, `aac`, non-empty `instructions`, unknown voices, other
+models, speed outside 0.25–4, unknown fields, empty and over-long inputs are
+`400` with a reason; aliases and `{"id": …}` voices work; speed 0.5 vs 2.0
+changes the length 3.7×; `sse` streams `speech.audio.delta` events and one
+`speech.audio.done` with usage; a long input streams its first chunk after
+25% of the total time; dropping a long request lets the next one start in
+0.06 s (cancelled at the next submission); seven concurrent long requests get
+four `200` and three `503` with `Retry-After`.
 
 ### Samples and how to rerun
 
