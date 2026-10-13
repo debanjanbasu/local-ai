@@ -27,7 +27,7 @@ const MAX_HEADER: u64 = 1 << 20;
 struct Header {
     format: String,
     version: u32,
-    config: Config,
+    config: serde_json::Value,
     tensors: BTreeMap<String, RawTensor>,
     payload_length: u64,
     payload_sha256: String,
@@ -112,12 +112,25 @@ pub(super) struct Artifact {
 
 impl Artifact {
     pub(super) fn open(path: &Path) -> crate::Result<Self> {
+        let (artifact, config) = Self::open_format(path, *MAGIC, FORMAT, VERSION)?;
+        check_config(&serde_json::from_value(config)?)?;
+        Ok(artifact)
+    }
+
+    /// Open and verify an artifact of any format in this container layout,
+    /// returning its (unchecked) `config` header object.
+    pub(super) fn open_format(
+        path: &Path,
+        magic: [u8; 8],
+        format: &str,
+        version: u32,
+    ) -> crate::Result<(Self, serde_json::Value)> {
         let file = File::open(path)?;
         // SAFETY: the file is opened read-only and treated as immutable; the
         // installation is never rewritten in place (new installs are new files).
         #[allow(unsafe_code)]
         let map = unsafe { Mmap::map(&file)? };
-        if map.len() < 16 || &map[..8] != MAGIC {
+        if map.len() < 16 || map[..8] != magic {
             return Err(invalid("bad magic"));
         }
         let header_length =
@@ -127,13 +140,12 @@ impl Artifact {
         }
         let payload_start = 16 + header_length as usize;
         let header: Header = serde_json::from_slice(&map[16..payload_start])?;
-        if header.format != FORMAT || header.version != VERSION {
+        if header.format != format || header.version != version {
             return Err(invalid(format!(
-                "format {} v{} is not {FORMAT} v{VERSION}",
+                "format {} v{} is not {format} v{version}",
                 header.format, header.version
             )));
         }
-        check_config(&header.config)?;
         let payload = &map[payload_start..];
         if payload.len() as u64 != header.payload_length {
             return Err(invalid("payload length differs from the header"));
@@ -174,12 +186,15 @@ impl Artifact {
                 },
             );
         }
-        Ok(Self {
-            map,
-            payload_start,
-            tensors,
-            payload_sha256: header.payload_sha256,
-        })
+        Ok((
+            Self {
+                map,
+                payload_start,
+                tensors,
+                payload_sha256: header.payload_sha256,
+            },
+            header.config,
+        ))
     }
 
     pub(super) fn payload(&self) -> &[u8] {
