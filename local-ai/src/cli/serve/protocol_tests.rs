@@ -13,18 +13,14 @@ use local_engine::{
 };
 
 use super::chunked::{Body, Flow, absorb};
-use super::request::{GenerationRequest, prepare_generation};
+use super::request::prepare_generation;
 use super::response::{Protocol, Reply};
 use super::responses::{ResponsesState, prepare_responses};
 use super::sse::Frames;
 use super::{models_json, prepare};
 
 fn chat_request(body: &Value, thinking: bool) -> crate::Result<ChatRequest> {
-    let prepared = prepare_generation(body.to_string().as_bytes(), true, thinking)?;
-    match prepared.request {
-        GenerationRequest::Chat(request) => Ok(request),
-        GenerationRequest::Completion(_) => Err(crate::Error::InvalidArgument("not chat".into())),
-    }
+    Ok(prepare_generation(body.to_string().as_bytes(), thinking)?.request)
 }
 
 fn chat_error(body: &Value) -> String {
@@ -85,14 +81,12 @@ fn chat_parses_tools_history_and_nullable_content() {
             {"type":"function","function":{"name":"time","strict":false}}
         ],
         "tool_choice":"auto",
-        "max_tokens":10,
         "max_completion_tokens":20,
         "prompt_cache_key":"cache",
-        "session_id":"session",
-        "user":"user"
+        "safety_identifier":"user-1"
     });
     let request = chat_request(&body, true).expect("valid chat request");
-    assert_eq!(request.max_tokens, 20, "max_completion_tokens wins");
+    assert_eq!(request.max_tokens, 20);
     assert_eq!(request.session.as_deref(), Some("cache"));
     assert_eq!(request.tools.len(), 2);
     assert_eq!(request.tools[0].description.as_deref(), Some("Look up"));
@@ -111,22 +105,53 @@ fn chat_parses_tools_history_and_nullable_content() {
 }
 
 #[test]
-fn chat_session_falls_back_through_session_id_then_user() {
-    let base = |extra: Value| {
-        let mut body = json!({"messages":[user()]});
-        if let (Value::Object(body), Value::Object(extra)) = (&mut body, extra) {
-            body.extend(extra);
-        }
-        chat_request(&body, true).expect("valid").session
-    };
+fn chat_session_is_prompt_cache_key_alone() {
+    let request =
+        chat_request(&json!({"messages":[user()],"prompt_cache_key":"k"}), true).expect("valid");
+    assert_eq!(request.session.as_deref(), Some("k"));
     assert_eq!(
-        base(json!({"session_id":"s","user":"u"})).as_deref(),
-        Some("s")
+        chat_request(&json!({"messages":[user()]}), true)
+            .expect("valid")
+            .session,
+        None
     );
-    assert_eq!(base(json!({"user":"u"})).as_deref(), Some("u"));
-    assert_eq!(base(json!({})), None);
-    let request = chat_request(&json!({"messages":[user()],"max_tokens":7}), true).expect("valid");
-    assert_eq!(request.max_tokens, 7);
+}
+
+/// Every member the specification deprecates (and this server's own
+/// superseded `session_id`) is refused by name with its replacement, while
+/// `null`, which sets nothing, is accepted.
+#[test]
+fn chat_refuses_deprecated_parameters() {
+    for (member, value, instead) in [
+        ("max_tokens", json!(7), "max_completion_tokens"),
+        ("seed", json!(3), "fixed seed"),
+        ("user", json!("u"), "prompt_cache_key"),
+        ("functions", json!([{"name":"f"}]), "use tools"),
+        ("function_call", json!("auto"), "use tool_choice"),
+        ("prompt_cache_retention", json!("24h"), "automatic"),
+        ("session_id", json!("s"), "prompt_cache_key"),
+    ] {
+        let mut body = json!({"messages":[user()]});
+        body[member] = value;
+        let error = chat_error(&body);
+        assert!(
+            error.contains(&format!("{member} is deprecated")) && error.contains(instead),
+            "{member}: {error}"
+        );
+        body[member] = Value::Null;
+        assert!(
+            chat_request(&body, true).is_ok(),
+            "{member}: null is accepted"
+        );
+    }
+    let error = chat_error(&json!({"messages":[
+        user(),
+        {"role":"assistant","content":null,"function_call":{"name":"f","arguments":"{}"}}
+    ]}));
+    assert!(
+        error.contains("messages[].function_call is deprecated") && error.contains("tool_calls"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -285,7 +310,8 @@ fn chat_rejects_options_it_cannot_honour() {
         (json!({"n":2}), "n is not supported"),
         (json!({"stop":["\n"]}), "stop"),
         (json!({"logprobs":true}), "logprobs"),
-        (json!({"functions":[{"name":"f"}]}), "functions"),
+        (json!({"logprobs":5}), "logprobs must be a boolean"),
+        (json!({"logit_bias":{"1":2}}), "logit_bias"),
         (json!({"service_tier":"flex"}), "service_tier"),
         (json!({"store":true}), "store"),
         (json!({"verbosity":"high"}), "verbosity"),
@@ -318,45 +344,6 @@ fn chat_history_errors_are_reported_before_generation() {
     assert!(chat_error(&orphan).contains("tool_call_id"));
     let user_null = json!({"messages":[{"role":"user","content":null}]});
     assert!(chat_error(&user_null).contains("text"));
-}
-
-#[test]
-fn raw_completions_reject_options_they_cannot_honour() {
-    for (extra, needle) in [
-        (json!({"stop":["x"]}), "stop"),
-        (json!({"n":2}), "n is not supported"),
-        (json!({"logprobs":0}), "logprobs is not supported"),
-        (json!({"logprobs":5}), "logprobs is not supported"),
-        (json!({"logprobs":false}), "logprobs must be"),
-        (json!({"logit_bias":{"1":2}}), "logit_bias"),
-        (json!({"best_of":2}), "best_of"),
-        (json!({"echo":true}), "echo"),
-        (json!({"suffix":"tail"}), "suffix"),
-        (
-            json!({"stream_options":{"include_usage":true}}),
-            "include_usage",
-        ),
-    ] {
-        let mut body = json!({"prompt":"hi"});
-        body.as_object_mut()
-            .expect("object")
-            .extend(extra.as_object().expect("object").clone());
-        let error = prepare_generation(body.to_string().as_bytes(), false, true)
-            .err()
-            .expect("unsupported option")
-            .to_string();
-        assert!(error.contains(needle), "{body}: {error}");
-    }
-    let body = json!({"prompt":"hi","stop":null,"n":1,"best_of":1,"echo":false,
-        "suffix":null,"logprobs":null,"max_tokens":3,"stream":true});
-    let prepared = prepare_generation(body.to_string().as_bytes(), false, true).expect("valid");
-    assert!(prepared.stream);
-    assert!(!prepared.include_usage);
-    let GenerationRequest::Completion(request) = prepared.request else {
-        unreachable!("completion")
-    };
-    assert_eq!(request.max_tokens, 3);
-    assert_eq!(request.prompt, "hi");
 }
 
 fn chat_reply(include_usage: bool) -> Reply {
@@ -449,24 +436,13 @@ fn chat_stream_reports_length_even_after_a_call_and_omits_usage_unless_asked() {
 }
 
 #[test]
-fn completion_stream_is_unchanged_apart_from_its_identity() {
-    let reply = Reply {
-        protocol: Protocol::Completion,
-        id: "cmpl-1".into(),
-        created: 1,
-        model: "m".into(),
-    };
-    let mut frames = Frames::new(reply);
-    let (out, _) = frames.event(Event::Content("hi".into()));
-    let chunk = parse_data(&out[0]);
-    assert_eq!(chunk["object"], "text_completion");
-    assert_eq!(chunk["choices"][0]["text"], "hi");
-    assert_eq!(chunk["choices"][0].get("logprobs"), Some(&Value::Null));
-    let (out, terminal) = frames.event(Event::Finished(stats(StopReason::Eos)));
-    assert!(terminal);
-    assert_eq!(parse_data(&out[0])["choices"][0]["finish_reason"], "stop");
-    assert_eq!(out[1], "data: [DONE]\n\n");
-    let mut failed = Frames::new(Reply::new(Protocol::Completion, "m".into()));
+fn chat_stream_error_is_one_terminal_server_error_frame() {
+    let mut failed = Frames::new(Reply::new(
+        Protocol::Chat {
+            include_usage: false,
+        },
+        "m".into(),
+    ));
     let (out, terminal) = failed.event(Event::Error("failed".into()));
     assert!(terminal);
     assert_eq!(
@@ -620,6 +596,39 @@ fn responses_string_input_is_one_user_message_and_instructions_lead() {
     );
 }
 
+/// The members the specification deprecates on `POST /v1/responses` (and
+/// the superseded `session_id`) are refused by name with their replacement.
+#[test]
+fn responses_refuse_deprecated_parameters() {
+    for (member, value, instead) in [
+        ("user", json!("u"), "prompt_cache_key"),
+        ("truncation", json!("disabled"), "never drops input"),
+        ("truncation", json!("auto"), "never drops input"),
+        ("prompt_cache_retention", json!("24h"), "automatic"),
+        ("session_id", json!("s"), "prompt_cache_key"),
+    ] {
+        let mut body = json!({"input":"hi"});
+        body[member] = value;
+        let error = responses_error(&body);
+        assert!(
+            error.contains(&format!("{member} is deprecated")) && error.contains(instead),
+            "{member}: {error}"
+        );
+    }
+    let error = responses_error(&json!({"input":"hi","reasoning":{"generate_summary":"auto"}}));
+    assert!(
+        error.contains("reasoning.generate_summary is deprecated")
+            && error.contains("reasoning.summary"),
+        "{error}"
+    );
+    let mut frames = Frames::new(responses_reply(&json!({"input":"hi"})));
+    let _ = frames.start();
+    let (out, _) = frames.event(Event::Finished(stats(StopReason::Eos)));
+    let response = &sse_events(&out).last().expect("terminal").clone()["response"];
+    assert!(response.get("user").is_none(), "{response}");
+    assert_eq!(response["truncation"], "disabled");
+}
+
 #[test]
 fn responses_reject_what_they_cannot_honour() {
     for (body, needle) in [
@@ -657,7 +666,6 @@ fn responses_reject_what_they_cannot_honour() {
             json!({"input":"hi","include":["reasoning.encrypted_content"]}),
             "include",
         ),
-        (json!({"input":"hi","truncation":"auto"}), "truncation"),
         (json!({"input":"hi","frobnicate":1}), "unknown field"),
         (
             json!({"input":"hi","client_metadata":{"turn_id":42}}),
@@ -687,7 +695,7 @@ fn responses_reject_what_they_cannot_honour() {
     }
     // Explicit nulls and defaults are accepted.
     let accepted = json!({"input":"hi","store":false,"previous_response_id":null,
-        "background":false,"truncation":"disabled","include":[],"text":{"format":{"type":"text"}},
+        "background":false,"include":[],"text":{"format":{"type":"text"}},
         "tool_choice":"auto","parallel_tool_calls":true,"service_tier":"default",
         "reasoning":{"effort":"xhigh","summary":null},"conversation":null,"client_metadata":null});
     assert!(prepare_responses(accepted.to_string().as_bytes(), true).is_ok());
@@ -1070,6 +1078,32 @@ fn responses_accept_an_oh_my_pi_read_and_tool_result_turn() {
 }
 
 #[test]
+fn only_current_generation_apis_are_routed() {
+    use axum::http::Method;
+    assert!(matches!(
+        super::generation_api(&Method::POST, "/v1/chat/completions"),
+        Some(super::Api::Chat)
+    ));
+    for path in ["/v1/responses", "/v1/responses/input_tokens"] {
+        assert!(matches!(
+            super::generation_api(&Method::POST, path),
+            Some(super::Api::Responses)
+        ));
+    }
+    // The legacy Completions API is a 404 like any unknown route.
+    for (method, path) in [
+        (Method::POST, "/v1/completions"),
+        (Method::GET, "/v1/completions"),
+        (Method::POST, "/v1/engines/local/completions"),
+    ] {
+        assert!(
+            super::generation_api(&method, path).is_none(),
+            "{method} {path}"
+        );
+    }
+}
+
+#[test]
 fn route_preparation_maps_each_api_to_its_protocol() {
     let (stream, request, protocol) = prepare(
         super::Api::Responses,
@@ -1081,7 +1115,7 @@ fn route_preparation_maps_each_api_to_its_protocol() {
     )
     .expect("ok");
     assert!(stream);
-    assert!(matches!(request, GenerationRequest::Chat(_)));
+    assert_eq!(request.messages.len(), 1);
     assert!(matches!(protocol, Protocol::Responses(_)));
     let (_, _, protocol) = prepare(
         super::Api::Chat,
@@ -1098,17 +1132,6 @@ fn route_preparation_maps_each_api_to_its_protocol() {
             include_usage: true
         }
     ));
-    let (_, request, protocol) = prepare(
-        super::Api::Completion,
-        br#"{"prompt":"x"}"#,
-        true,
-        None,
-        None,
-        "m",
-    )
-    .expect("ok");
-    assert!(matches!(request, GenerationRequest::Completion(_)));
-    assert!(matches!(protocol, Protocol::Completion));
 }
 
 #[test]
@@ -1127,11 +1150,6 @@ fn reply_ids_are_prefixed_and_unique() {
     );
     assert!(a.id.starts_with("chatcmpl-") && a.id.len() == "chatcmpl-".len() + 32);
     assert_ne!(a.id, b.id);
-    assert!(
-        Reply::new(Protocol::Completion, "m".into())
-            .id
-            .starts_with("cmpl-")
-    );
 }
 
 #[test]
@@ -1284,27 +1302,6 @@ fn structured_formats_combine_with_tools_and_every_choice() {
 }
 
 #[test]
-fn legacy_completions_refuse_tools() {
-    for extra in [
-        json!({"tools":[{"type":"function","function":{"name":"f"}}]}),
-        json!({"tool_choice":"none"}),
-        json!({"parallel_tool_calls":false}),
-    ] {
-        let mut body = json!({"prompt":"hi"});
-        if let (Value::Object(body), Value::Object(extra)) = (&mut body, extra) {
-            body.extend(extra);
-        }
-        let error = prepare_generation(body.to_string().as_bytes(), false, true)
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
-        assert!(error.contains("not legacy Completions"), "{body}: {error}");
-    }
-    let defaults = json!({"prompt":"hi","tools":[],"tool_choice":null,"parallel_tool_calls":true});
-    assert!(prepare_generation(defaults.to_string().as_bytes(), false, true).is_ok());
-}
-
-#[test]
 fn responses_tool_policy_maps_onto_the_engine_and_is_echoed_as_accepted() {
     let terminal = |body: &Value| {
         let mut frames = Frames::new(responses_reply(body));
@@ -1415,29 +1412,6 @@ fn responses_tool_choice_shape_is_exact_and_checked_against_tools() {
     }
     let error = responses_error(&json!({"input":"hi","parallel_tool_calls":"no"}));
     assert!(error.contains("invalid JSON request"), "{error}");
-}
-
-#[test]
-fn legacy_completions_keep_refusing_structured_formats() {
-    for format in [
-        json!({"type":"json_object"}),
-        json!({"type":"json_schema","json_schema":{"name":"x","schema":schema()}}),
-    ] {
-        let body = json!({"prompt":"hi","response_format":format});
-        let error = prepare_generation(body.to_string().as_bytes(), false, true)
-            .err()
-            .expect("refused")
-            .to_string();
-        assert!(error.contains("not legacy Completions"), "{error}");
-    }
-    for format in [json!({"type":"text"}), Value::Null] {
-        let body = json!({"prompt":"hi","response_format":format});
-        let prepared = prepare_generation(body.to_string().as_bytes(), false, true).expect("text");
-        let GenerationRequest::Completion(request) = prepared.request else {
-            unreachable!("completion")
-        };
-        assert_eq!(request.response_format, ResponseFormat::Text);
-    }
 }
 
 #[test]

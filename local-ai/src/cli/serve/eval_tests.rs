@@ -13,12 +13,11 @@ use axum::http::{Method, Request, StatusCode};
 use serde_json::{Map, Value, json};
 
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
-use local_engine::{Event, GenerationStats, Signal, Stats};
+use local_engine::{ChatRequest, Event, GenerationStats, Signal, Stats};
 use local_services::Store;
 
 use super::super::QueueDepth;
 use super::super::batches::{Batches, Config, Generation, Submit};
-use super::super::request::GenerationRequest;
 use super::{Evals, matches};
 
 const MODEL: &str = "local";
@@ -61,15 +60,12 @@ fn stats() -> Stats {
     }
 }
 
-fn prompt(request: &GenerationRequest) -> String {
-    match request {
-        GenerationRequest::Chat(chat) => chat
-            .messages
-            .last()
-            .map(|message| message.content.clone())
-            .unwrap_or_default(),
-        GenerationRequest::Completion(completion) => completion.prompt.clone(),
-    }
+fn prompt(request: &ChatRequest) -> String {
+    request
+        .messages
+        .last()
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
 }
 
 fn answer(text: String) -> Generation {
@@ -112,24 +108,22 @@ fn blocked() -> Generation {
 fn fake(blocking: bool) -> (Submit, mpsc::Receiver<()>) {
     let (started, receiver) = mpsc::channel();
     let started = Mutex::new(started);
-    let submit: Submit = Arc::new(
-        move |request: GenerationRequest| -> crate::Result<Generation> {
-            let text = prompt(&request);
-            if let Some(rest) = text.strip_prefix("Rate ") {
-                let score = if rest.starts_with("5 ") { 1 } else { 8 };
-                return Ok(answer(format!("{{\"result\": {score}}}")));
+    let submit: Submit = Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
+        let text = prompt(&request);
+        if let Some(rest) = text.strip_prefix("Rate ") {
+            let score = if rest.starts_with("5 ") { 1 } else { 8 };
+            return Ok(answer(format!("{{\"result\": {score}}}")));
+        }
+        Ok(match text.as_str() {
+            "block=" if blocking => {
+                let _ = started.lock().expect("started").send(());
+                blocked()
             }
-            Ok(match text.as_str() {
-                "block=" if blocking => {
-                    let _ = started.lock().expect("started").send(());
-                    blocked()
-                }
-                "1+1=" => answer("2".into()),
-                "2+2=" => answer("5".into()),
-                _ => answer("6".into()),
-            })
-        },
-    );
+            "1+1=" => answer("2".into()),
+            "2+2=" => answer("5".into()),
+            _ => answer("6".into()),
+        })
+    });
     (submit, receiver)
 }
 
@@ -660,4 +654,15 @@ async fn a_restarted_server_resumes_an_interrupted_run() {
         2
     );
     restarted.stop().await;
+}
+
+/// Chat Completions takes no `seed` (the specification deprecates it), so a
+/// sample generated through it reports the seed every Chat request samples
+/// with: the engine's default.
+#[test]
+fn chat_sampled_evals_report_the_seed_chat_completions_samples_with() {
+    assert_eq!(
+        u64::try_from(local_services::evals::CHAT_COMPLETIONS_SEED).expect("non-negative"),
+        crate::GenerateParams::default().seed
+    );
 }

@@ -36,7 +36,10 @@ Scenario kinds:
   `protocol_ok` requires that no proxied exchange failed.
 - `http-*`: direct protocol probes of request shapes those clients send
   (hosted and custom tools, reasoning summaries, compaction, encrypted
-  reasoning replay, disconnect and background cancellation).
+  reasoning replay, disconnect and background cancellation), and
+  `http-legacy-apis-refused`: the legacy Completions route is a 404 and
+  deprecated request members are 400s, since only current OpenAI APIs are
+  served.
 
 Each result names the workstream that owns a failure, so a rerun after a
 merge shows which gaps closed. Output: `results.json`, `summary.md`,
@@ -1020,6 +1023,32 @@ def invalid_then_valid(ctx: Context, result: Result) -> None:
     result.detail = f"invalid effort -> {bad} {json.dumps(body)[:200]}; valid -> {good}"
 
 
+# The server serves only current OpenAI APIs: the legacy Completions route is
+# not found, and members the specification deprecates are invalid requests.
+LEGACY_REFUSALS: list[tuple[str, dict, int]] = [
+    ("/v1/completions", {"model": MODEL_ID, "prompt": "Say OK.", "max_tokens": 4}, 404),
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say OK."}], "max_tokens": 4}, 400),
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say OK."}],
+                              "functions": [{"name": "f", "parameters": {"type": "object"}}]}, 400),
+    ("/v1/responses", {**SIMPLE, "user": "u"}, 400),
+]
+
+
+def legacy_apis_refused(ctx: Context, result: Result) -> None:
+    start = ctx.recorder.begin(result.name)
+    statuses = [post(ctx.proxy_port, path, body)[0] for path, body, _ in LEGACY_REFUSALS]
+    good, _, seconds = post(ctx.proxy_port, "/v1/responses", SIMPLE)
+    exchanges = ctx.recorder.since(start)
+    result.requests = len(exchanges)
+    result.seconds = seconds
+    result.protocol_ok = good == 200
+    result.task_ok = statuses == [expected for _, _, expected in LEGACY_REFUSALS]
+    result.passed = result.protocol_ok and result.task_ok
+    result.detail = "; ".join(
+        f"{path} -> {status}" for (path, _, _), status in zip(LEGACY_REFUSALS, statuses, strict=True)
+    ) + f"; current -> {good}"
+
+
 # ---------------------------------------------------------------- registry
 
 
@@ -1051,6 +1080,7 @@ def scenarios() -> list[Scenario]:
     items.append(Scenario("http-stream-disconnect", "http", "none", "protocol", stream_disconnect))
     items.append(Scenario("http-background-cancel", "http", "none", "background", background_cancel))
     items.append(Scenario("http-invalid-then-valid", "http", "none", "protocol", invalid_then_valid))
+    items.append(Scenario("http-legacy-apis-refused", "http", "-", "protocol", legacy_apis_refused))
     return items
 
 

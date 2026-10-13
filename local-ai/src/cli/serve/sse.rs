@@ -8,9 +8,7 @@ use local_engine::{Event, EventStream};
 
 use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
-use super::response::{
-    Protocol, Reply, chat_finish_reason, chat_tool_call, checked, finish_reason, usage_json,
-};
+use super::response::{Protocol, Reply, chat_finish_reason, chat_tool_call, checked, usage_json};
 use super::responses::{ResponsesState, sse_frame};
 
 /// Start a streaming response and hand the frame receiver to axum.
@@ -135,7 +133,6 @@ fn deliver(
 /// announces the role once, and a Responses stream is a lifecycle of numbered
 /// item events rather than one frame per token.
 pub(super) enum Frames {
-    Completion(Reply),
     Chat {
         reply: Reply,
         include_usage: bool,
@@ -150,7 +147,6 @@ pub(super) enum Frames {
 impl Frames {
     pub(super) fn new(reply: Reply) -> Self {
         match reply.protocol.clone() {
-            Protocol::Completion => Self::Completion(reply),
             Protocol::Chat { include_usage } => Self::Chat {
                 reply,
                 include_usage,
@@ -164,14 +160,14 @@ impl Frames {
     }
 
     /// Frames sent before the first engine event: the Responses `created` and
-    /// `in_progress` pair, and nothing for the older APIs.
+    /// `in_progress` pair, and nothing for Chat Completions.
     pub(super) fn start(&mut self) -> Vec<String> {
         match self {
             Self::Responses(state) => {
                 state.start();
                 state.take_events().iter().map(sse_frame).collect()
             }
-            Self::Completion(_) | Self::Chat { .. } => Vec::new(),
+            Self::Chat { .. } => Vec::new(),
         }
     }
 
@@ -179,7 +175,6 @@ impl Frames {
     pub(super) fn event(&mut self, event: Event) -> (Vec<String>, bool) {
         let terminal = matches!(event, Event::Finished(_) | Event::Error(_));
         let frames = match self {
-            Self::Completion(reply) => completion_frames(reply, checked(event)),
             Self::Chat {
                 reply,
                 include_usage,
@@ -201,20 +196,6 @@ fn data(value: &Value) -> String {
 
 fn error_frame(error: &str) -> String {
     data(&json!({"error":{"message":error,"type":"server_error","code":null,"param":null}}))
-}
-
-fn completion_frames(reply: &Reply, event: Event) -> Vec<String> {
-    let chunk = |text: &str, finish: Option<&str>| json!({"id":reply.id,"object":"text_completion","created":reply.created,"model":reply.model.as_ref(),"choices":[{"index":0,"text":text,"logprobs":null,"finish_reason":finish}]});
-    match event {
-        Event::Content(piece) | Event::Reasoning(piece) => vec![data(&chunk(&piece, None))],
-        Event::Finished(stats) => vec![
-            data(&chunk("", Some(finish_reason(stats.stop_reason)))),
-            "data: [DONE]\n\n".to_owned(),
-        ],
-        Event::Error(error) => vec![error_frame(&error)],
-        // A raw completion renders no tools, so the engine cannot report a call.
-        Event::TokenIds(_) | Event::ToolCall(_) | Event::ToolOutput(_) => Vec::new(),
-    }
 }
 
 fn chat_frames(

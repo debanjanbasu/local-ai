@@ -10,6 +10,13 @@ network, and only for domains the server was started with. Batches only queue
 and record lines, and an eval's model calls are batch lines; the server's
 worker generates them on the one loaded model.
 
+These services follow the current OpenAI APIs only: batches target
+`/v1/responses` or `/v1/chat/completions`, never the legacy `/v1/completions`;
+evals refuse the deprecated `stored_completions` config and, for generations
+that run through Chat Completions (`completions` data sources and
+`score_model` graders), the deprecated `seed`
+([supported OpenAI APIs](../docs/BONSAI.md#supported-openai-apis)).
+
 There is one fixed implementation per job, not a set of optional backends:
 
 | Job | Implementation |
@@ -159,7 +166,9 @@ anything. A file is at most 50,000 lines of up to 2 MiB each. Every line is
 `{custom_id, method: "POST", url, body}` with a unique `custom_id` (512
 characters at most), the batch's endpoint, one shared `body.model` that must
 be the caller's installed model, and neither `stream` nor `background`. Only
-`/v1/responses`, `/v1/chat/completions` and `/v1/completions` are accepted, and
+`/v1/responses` and `/v1/chat/completions` are accepted; the legacy
+`/v1/completions` is refused (a batch stored before it was removed reads back
+as `Endpoint::RetiredCompletions`, and the server fails its pending lines).
 `completion_window` must be `24h`. A valid batch is created `in_progress`.
 There is no asynchronous `validating` phase.
 

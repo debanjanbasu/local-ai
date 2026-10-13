@@ -26,9 +26,9 @@ use tokenizers::Tokenizer;
 ///
 /// For a chat request with `thinking`, reasoning stays unconstrained and the
 /// format applies from the token after the closing `</think>`; without
-/// thinking, and for raw completions, it applies from the first generated
-/// token. With tools, the native tool grammar carries the format as the
-/// final-answer branch beside the call branch.
+/// thinking, it applies from the first generated token. With tools, the
+/// native tool grammar carries the format as the final-answer branch beside
+/// the call branch.
 ///
 /// Generation ends at end-of-sequence only once the answer is a complete
 /// document the schema accepts. A token limit or cancellation still stops it
