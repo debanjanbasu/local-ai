@@ -220,24 +220,16 @@ const STREAM_HEAD_CHAT: &str = "{\"choices\":[{\"index\":0,\"message\":{\"reason
 /// is an independent statement of the contract instead of a restatement of the
 /// code under test. Every measurement is left at its default, which is why the
 /// numbers here are all zero.
-fn expected(chat: bool, content: &str, reasoning: &str) -> Value {
-    let choice = if chat {
-        json!({"index":0,"message":{"content":content,"reasoning_content":reasoning,"role":"assistant"},"logprobs":null,"finish_reason":"stop"})
-    } else {
-        json!({"index":0,"text":content,"logprobs":null,"finish_reason":"stop"})
-    };
-    json!({"choices":[choice],"created":0,"id":"local","model":"local","object":if chat {"chat.completion"} else {"text_completion"},"speculation":{"batched_tokens":0,"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
+fn expected(content: &str, reasoning: &str) -> Value {
+    let choice = json!({"index":0,"message":{"content":content,"reasoning_content":reasoning,"role":"assistant"},"logprobs":null,"finish_reason":"stop"});
+    json!({"choices":[choice],"created":0,"id":"local","model":"local","object":"chat.completion","speculation":{"batched_tokens":0,"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
 }
 
 /// A response identity fixed for comparison against `expected`.
-fn reply(chat: bool) -> Reply {
+fn reply() -> Reply {
     Reply {
-        protocol: if chat {
-            Protocol::Chat {
-                include_usage: false,
-            }
-        } else {
-            Protocol::Completion
+        protocol: Protocol::Chat {
+            include_usage: false,
         },
         id: "local".into(),
         created: 0,
@@ -259,8 +251,8 @@ fn stats() -> Stats {
 }
 
 /// Fold signals through a body exactly as the pump does, and collect the frames.
-fn frames(signals: Vec<Signal>, chat: bool, zstd: bool) -> Vec<Vec<u8>> {
-    let (mut body, compressed) = Body::open(reply(chat), zstd);
+fn frames(signals: Vec<Signal>, zstd: bool) -> Vec<Vec<u8>> {
+    let (mut body, compressed) = Body::open(reply(), zstd);
     // The response may only claim a transfer encoding that is really in use.
     assert_eq!(
         compressed, zstd,
@@ -283,7 +275,7 @@ fn frames(signals: Vec<Signal>, chat: bool, zstd: bool) -> Vec<Vec<u8>> {
 }
 #[test]
 fn only_finished_closes_the_document() {
-    let (mut body, _) = Body::open(reply(true), false);
+    let (mut body, _) = Body::open(reply(), false);
     // Token IDs are a streaming frame, not a member of this document, and
     // reasoning is held back because this body's order puts it after the answer.
     assert_eq!(
@@ -323,7 +315,7 @@ fn a_prefill_boundary_is_written_as_whitespace_outside_the_answer() {
             chunks,
         })
     });
-    let frames = frames(ticks.collect(), true, false);
+    let frames = frames(ticks.collect(), false);
     // The head goes out on its own, then one frame per boundary.
     assert_eq!(frames.len(), 4, "{frames:?}");
     assert_eq!(frames[0], STREAM_HEAD_CHAT.as_bytes());
@@ -338,14 +330,14 @@ fn a_prefill_boundary_is_written_as_whitespace_outside_the_answer() {
 
 #[test]
 fn streamed_body_reassembles_to_the_buffered_document() {
-    for chat in [true, false] {
+    for reasoned in [true, false] {
         let mut signals = vec![Signal::Progress(PrefillProgress {
             tokens: 0,
             chunks: 1,
         })];
-        // Reasoning is a chat-only event: a raw completion is generated with
-        // `EventSplitter::new(false)`, so it never emits one.
-        if chat {
+        // Without thinking the model reasons not at all, and the reasoning
+        // member is closed as the empty string.
+        if reasoned {
             signals.push(Signal::Event(Event::Reasoning("Because.".into())));
         }
         signals.extend([
@@ -354,14 +346,11 @@ fn streamed_body_reassembles_to_the_buffered_document() {
             Signal::Event(Event::TokenIds(vec![7, 8])),
             Signal::Event(Event::Finished(Box::new(stats()))),
         ]);
-        let frames = frames(signals, chat, false);
+        let frames = frames(signals, false);
         let body = frames.concat();
         let streamed: Value = serde_json::from_slice(&body).expect("streamed body is valid JSON");
-        assert_eq!(
-            streamed,
-            expected(chat, "Hello, world", "Because."),
-            "{chat}"
-        );
+        let reasoning = if reasoned { "Because." } else { "" };
+        assert_eq!(streamed, expected("Hello, world", reasoning), "{reasoned}");
     }
 }
 
@@ -381,9 +370,9 @@ fn streamed_body_escapes_what_json_has_to_escape() {
         .map(|piece| Signal::Event(Event::Content((*piece).into())))
         .chain([Signal::Event(Event::Finished(Box::new(stats())))])
         .collect();
-    let body = frames(signals, true, false).concat();
+    let body = frames(signals, false).concat();
     let streamed: Value = serde_json::from_slice(&body).expect("valid JSON");
-    assert_eq!(streamed, expected(true, &pieces.concat(), ""));
+    assert_eq!(streamed, expected(&pieces.concat(), ""));
     // The control character itself must be escaped away, not passed through.
     assert!(!body.contains(&0x07_u8), "raw bell byte in the body");
     // A backslash in the content is doubled on the wire and restored by the parse.
@@ -399,11 +388,10 @@ fn an_empty_answer_still_produces_a_complete_document() {
     // an answer of zero pieces has to have it written by the tail instead.
     let frames = frames(
         vec![Signal::Event(Event::Finished(Box::new(stats())))],
-        true,
         false,
     );
     let streamed: Value = serde_json::from_slice(&frames.concat()).expect("valid JSON");
-    assert_eq!(streamed, expected(true, "", ""));
+    assert_eq!(streamed, expected("", ""));
 }
 
 #[test]
@@ -416,7 +404,7 @@ fn a_full_frame_is_written_without_waiting_for_the_interval() {
         .map(|_| Signal::Event(Event::Content(piece.clone())))
         .chain([Signal::Event(Event::Finished(Box::new(stats())))])
         .collect();
-    let frames = frames(signals, true, false);
+    let frames = frames(signals, false);
     // The head the pump writes before it waits for anything, twelve body frames
     // of 8 KiB, and the tail that closes the document.
     assert_eq!(frames.len(), 14, "{} frames", frames.len());
@@ -429,7 +417,7 @@ fn a_full_frame_is_written_without_waiting_for_the_interval() {
         );
     }
     let streamed: Value = serde_json::from_slice(&frames.concat()).expect("valid JSON");
-    assert_eq!(streamed, expected(true, &piece.repeat(96), ""));
+    assert_eq!(streamed, expected(&piece.repeat(96), ""));
 }
 
 #[test]
@@ -439,7 +427,7 @@ fn the_interval_writes_a_frame_that_fills_no_byte_bound() {
     // is 150 s at the 2.6 tok/s measured here. This is the bound that makes the
     // write fail while the abandoned generation can still be dropped.
     let piece = "y".repeat(16);
-    let (mut body, _) = Body::open(reply(true), false);
+    let (mut body, _) = Body::open(reply(), false);
     let mut written = Vec::new();
     // The head the pump writes before it waits for anything.
     written.extend(body.take(false).map(|frame| frame.to_vec()));
@@ -470,7 +458,7 @@ fn the_interval_writes_a_frame_that_fills_no_byte_bound() {
     );
     assert_eq!(written.len(), 4, "{written:?}");
     let streamed: Value = serde_json::from_slice(&written.concat()).expect("valid JSON");
-    assert_eq!(streamed, expected(true, &piece.repeat(4), ""));
+    assert_eq!(streamed, expected(&piece.repeat(4), ""));
 }
 
 #[test]
@@ -482,7 +470,6 @@ fn an_error_after_the_body_started_stops_the_body_instead_of_completing_it() {
             Signal::Event(Event::Content("partial ".repeat(4096))),
             Signal::Event(Event::Error("metal said no".into())),
         ],
-        true,
         false,
     );
     // The head and one body frame, then nothing: the status line is long gone by
@@ -508,8 +495,8 @@ fn a_zstd_body_streams_frames_and_reassembles_to_the_same_document() {
         vec![Signal::Event(Event::Finished(Box::new(stats())))],
     ]
     .concat();
-    let plain = frames(signals.clone(), true, false);
-    let compressed = frames(signals, true, true);
+    let plain = frames(signals.clone(), false);
+    let compressed = frames(signals, true);
     // The head goes out compressed before any text exists, which is the whole
     // reason the encoder is flushed rather than left to buffer a whole block.
     assert!(compressed.len() >= 3, "{compressed:?}");
@@ -541,18 +528,16 @@ fn serve_real_bonsai_validates_before_streaming_and_preserves_history() {
         "/../models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
     );
     let handle = Engine::open_model(path).expect("open engine").into_handle();
+    let user = json!([{"role":"user","content":"hello"}]);
     for body in [
-        json!({"prompt":"", "stream":true, "max_tokens":0}),
-        json!({"prompt":"hello", "stream":true, "temperature":-1}),
-        json!({"prompt":"hello", "stream":true, "max_tokens":usize::MAX}),
+        json!({"messages":[{"role":"user","content":""}], "stream":true, "max_completion_tokens":0}),
+        json!({"messages":user, "stream":true, "temperature":-1}),
+        json!({"messages":user, "stream":true, "max_completion_tokens":usize::MAX}),
     ] {
         let prepared =
-            prepare_generation(body.to_string().as_bytes(), false, true).expect("parse request");
-        let GenerationRequest::Completion(request) = prepared.request else {
-            unreachable!("completion request")
-        };
+            prepare_generation(body.to_string().as_bytes(), true).expect("parse request");
         assert!(matches!(
-            handle.complete(request).expect("queue").next(),
+            handle.chat(prepared.request).expect("queue").next(),
             Some(Event::Error(_))
         ));
     }
@@ -560,12 +545,10 @@ fn serve_real_bonsai_validates_before_streaming_and_preserves_history() {
             {"role":"user","content":"First"},
             {"role":"assistant","content":"Answer","reasoning_content":"prior reasoning"},
             {"role":"user","content":"Second"}
-        ], "max_tokens":0});
-    let prepared =
-        prepare_generation(body.to_string().as_bytes(), true, true).expect("prepare history");
-    let GenerationRequest::Chat(request) = prepared.request else {
-        unreachable!("chat request")
-    };
+        ], "max_completion_tokens":0});
+    let request = prepare_generation(body.to_string().as_bytes(), true)
+        .expect("prepare history")
+        .request;
     assert!(
         handle
             .chat(request)

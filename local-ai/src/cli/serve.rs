@@ -14,7 +14,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
-use local_engine::{Engine, EngineHandle};
+use local_engine::{ChatRequest, Engine, EngineHandle};
 
 use crate::resources::Resources;
 
@@ -54,7 +54,7 @@ use self::chunked::start_chunked;
 use self::http3::serve_h3;
 use self::options::{parse, usage};
 use self::reasoning_crypto::ReasoningCipher;
-use self::request::{GenerationRequest, prepare_generation};
+use self::request::prepare_generation;
 use self::response::{
     Protocol, Reply, add_alt_svc, error_response, error_status, error_status_message,
     json_response, queue_full_response, wants_zstd,
@@ -267,19 +267,14 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     }
     let count_tokens =
         parts.method == Method::POST && parts.uri.path() == "/v1/responses/input_tokens";
-    let api = match (parts.method, parts.uri.path()) {
-        (Method::POST, "/v1/chat/completions") => Api::Chat,
-        (Method::POST, "/v1/completions") => Api::Completion,
-        (Method::POST, "/v1/responses" | "/v1/responses/input_tokens") => Api::Responses,
-        _ => {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                "route not found",
-                &state,
-                &parts.headers,
-            )
-            .await;
-        }
+    let Some(api) = generation_api(&parts.method, parts.uri.path()) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "route not found",
+            &state,
+            &parts.headers,
+        )
+        .await;
     };
     let body = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
         Ok(value) => value.to_bytes().to_vec(),
@@ -397,16 +392,13 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     // grammar tables), so it runs on the blocking pool, never on a runtime
     // worker. A dropped request drops the stream, which cancels the job.
     let engine = state.engine.clone();
-    let events = tokio::task::spawn_blocking(move || match request {
-        GenerationRequest::Chat(request) => engine.chat(request),
-        GenerationRequest::Completion(request) => engine.complete(request),
-    })
-    .await
-    .unwrap_or_else(|error| {
-        Err(crate::Error::Generation(format!(
-            "request submission failed: {error}"
-        )))
-    });
+    let events = tokio::task::spawn_blocking(move || engine.chat(request))
+        .await
+        .unwrap_or_else(|error| {
+            Err(crate::Error::Generation(format!(
+                "request submission failed: {error}"
+            )))
+        });
     let events = match events {
         Ok(events) => match tool_loop {
             Some(tool_loop) => tool_loop::start(tool_loop, events),
@@ -504,10 +496,9 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 fn hosted_loop(
     state: &AppState,
     reply: &Reply,
-    request: &mut GenerationRequest,
+    request: &mut ChatRequest,
 ) -> Result<Option<tool_loop::Loop>, String> {
-    let (Protocol::Responses(echo), GenerationRequest::Chat(request)) = (&reply.protocol, request)
-    else {
+    let Protocol::Responses(echo) = &reply.protocol else {
         return Ok(None);
     };
     responses_loop(state, echo, &reply.id, request)
@@ -521,7 +512,7 @@ fn responses_loop(
     state: &AppState,
     echo: &responses::Echo,
     id: &str,
-    request: &mut local_engine::ChatRequest,
+    request: &mut ChatRequest,
 ) -> Result<Option<tool_loop::Loop>, String> {
     if echo.kinds().all_hosted().next().is_none() {
         return Ok(None);
@@ -621,9 +612,19 @@ async fn stream_events(
 
 #[derive(Clone, Copy)]
 enum Api {
-    Completion,
     Chat,
     Responses,
+}
+
+/// The generation API `method` and `path` name, or `None` for any other
+/// route, which is a 404. Only current `OpenAI` APIs are served: the legacy
+/// Completions API (`POST /v1/completions`) is deliberately absent.
+fn generation_api(method: &Method, path: &str) -> Option<Api> {
+    match (method, path) {
+        (&Method::POST, "/v1/chat/completions") => Some(Api::Chat),
+        (&Method::POST, "/v1/responses" | "/v1/responses/input_tokens") => Some(Api::Responses),
+        _ => None,
+    }
 }
 
 /// [`prepare_retaining`] on a server with no temporary store.
@@ -635,7 +636,7 @@ fn prepare(
     store: Option<&Arc<ResponseStore>>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
-) -> crate::Result<(bool, GenerationRequest, Protocol)> {
+) -> crate::Result<(bool, ChatRequest, Protocol)> {
     prepare_retaining(api, body, thinking, (store, None), None, cipher, model)
 }
 
@@ -649,17 +650,12 @@ fn prepare_retaining(
     conversations: Option<&local_services::Store>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
-) -> crate::Result<(bool, GenerationRequest, Protocol)> {
+) -> crate::Result<(bool, ChatRequest, Protocol)> {
     match api {
-        Api::Completion | Api::Chat => {
-            let chat = matches!(api, Api::Chat);
-            let prepared = prepare_generation(body, chat, thinking)?;
-            let protocol = if chat {
-                Protocol::Chat {
-                    include_usage: prepared.include_usage,
-                }
-            } else {
-                Protocol::Completion
+        Api::Chat => {
+            let prepared = prepare_generation(body, thinking)?;
+            let protocol = Protocol::Chat {
+                include_usage: prepared.include_usage,
             };
             Ok((prepared.stream, prepared.request, protocol))
         }
@@ -675,7 +671,7 @@ fn prepare_retaining(
             )?;
             Ok((
                 prepared.stream,
-                GenerationRequest::Chat(prepared.request),
+                prepared.request,
                 Protocol::Responses(Arc::new(prepared.echo)),
             ))
         }
@@ -774,7 +770,7 @@ fn resume_background(
             let tool_loop = match &reply.protocol {
                 Protocol::Responses(echo) => responses_loop(state, echo, &reply.id, &mut request)
                     .map_err(crate::Error::InvalidArgument)?,
-                _ => None,
+                Protocol::Chat { .. } => None,
             };
             let events = engine.chat(request)?;
             let mut events = match tool_loop {

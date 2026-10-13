@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
-use super::{Delivered, Engine, Event, EventSplitter, Job, Stats, encode_prompt, prepare_chat};
+use super::{
+    ChatJob, Delivered, Engine, Event, EventSplitter, Job, Stats, encode_prompt, prepare_chat,
+};
 use crate::GenerateParams;
 use crate::bonsai_model::CancelToken;
 use crate::judgment::{Decision, JudgmentHead, PreparedDecision};
@@ -344,26 +346,24 @@ impl Worker {
     fn prepare(&self, job: Job) -> Option<Pending> {
         let (prompt, max_tokens, sampling, session, thinking, grammar, events, cancel) = match job {
             Job::Decision(job) => return Some(Pending::Decision(job)),
-            Job::Chat(request, grammar, events, cancel) => (
-                prepare_chat(&request),
-                request.max_tokens,
-                request.sampling,
-                request.session,
-                request.thinking,
-                grammar,
-                events,
-                cancel,
-            ),
-            Job::Completion(request, grammar, events, cancel) => (
-                Ok((request.prompt, None)),
-                request.max_tokens,
-                request.sampling,
-                request.session,
-                false,
-                grammar,
-                events,
-                cancel,
-            ),
+            Job::Chat(job) => {
+                let ChatJob {
+                    request,
+                    grammar,
+                    events,
+                    cancel,
+                } = *job;
+                (
+                    prepare_chat(&request),
+                    request.max_tokens,
+                    request.sampling,
+                    request.session,
+                    request.thinking,
+                    grammar,
+                    events,
+                    cancel,
+                )
+            }
         };
         let tokenizer = self.engine.inner.tokenizer();
         let ids =
@@ -455,7 +455,7 @@ mod tests {
     fn decision(job: Job) -> super::DecisionJob {
         match job {
             Job::Decision(job) => *job,
-            _ => panic!("not a decision job"),
+            Job::Chat(_) => panic!("not a decision job"),
         }
     }
 

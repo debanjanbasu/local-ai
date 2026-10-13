@@ -14,6 +14,16 @@ use crate::{Error, Result};
 const DEFAULT_TEMPERATURE: f64 = 1.0;
 const DEFAULT_TOP_P: f64 = 1.0;
 const DEFAULT_SEED: i64 = 42;
+/// The seed every Chat Completions request is sampled with on this server.
+///
+/// The server refuses Chat's deprecated `seed` member, so a sample generated
+/// through Chat Completions reports this one. It equals the engine's default
+/// sampling seed (`local-ai`'s tests check that).
+pub const CHAT_COMPLETIONS_SEED: i64 = 0x5eed_5eed_cafe_f00d;
+/// Why a `seed` cannot be chosen for a generation that runs through Chat
+/// Completions.
+const CHAT_SEED_REFUSED: &str = "is not supported: this server runs it through Chat Completions, \
+     which deprecated seed, so it samples with the server's fixed seed";
 /// The server's own default output limit, sent explicitly so a sample
 /// reports the limit it ran with.
 pub const DEFAULT_MAX_COMPLETION_TOKENS: u64 = 8_192;
@@ -233,6 +243,23 @@ pub struct GraderSampling {
     reasoning_effort: Option<String>,
 }
 
+impl GraderSampling {
+    /// Refuse what a grader, which runs through Chat Completions, cannot use.
+    fn check(&self) -> Result<()> {
+        if self.seed.is_some() {
+            return Err(invalid(format!(
+                "sampling_params.seed of a score_model grader {CHAT_SEED_REFUSED}"
+            )));
+        }
+        if self.max_completions_tokens == Some(0) {
+            return Err(invalid(
+                "sampling_params.max_completions_tokens must be at least 1",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One testing criterion, as stored and as the `Eval` object shows it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -402,14 +429,8 @@ impl Criterion {
                 if !pass_threshold.is_finite() {
                     return Err(invalid("pass_threshold must be a finite number"));
                 }
-                if sampling_params
-                    .as_ref()
-                    .and_then(|params| params.max_completions_tokens)
-                    == Some(0)
-                {
-                    return Err(invalid(
-                        "sampling_params.max_completions_tokens must be at least 1",
-                    ));
+                if let Some(params) = sampling_params {
+                    params.check()?;
                 }
             }
         }
@@ -543,7 +564,6 @@ impl Criterion {
                         body.insert(key.to_owned(), value);
                     }
                 };
-                put("seed", params.seed.map(Value::from));
                 put("top_p", params.top_p.map(Value::from));
                 put("temperature", params.temperature.map(Value::from));
                 put(
@@ -797,6 +817,12 @@ pub fn parse_run_source(value: &Value, installed_model: &str) -> Result<RunSourc
             source,
         } => {
             let params = sampling_params.unwrap_or_default();
+            if params.seed.is_some() {
+                return Err(invalid(format!(
+                    "data_source.sampling_params.seed of a completions data source \
+                     {CHAT_SEED_REFUSED}; use a responses data source to choose one"
+                )));
+            }
             let mut extra = Map::new();
             if let Some(format) = params.response_format {
                 extra.insert("response_format".into(), format);
@@ -807,7 +833,7 @@ pub fn parse_run_source(value: &Value, installed_model: &str) -> Result<RunSourc
             let common = (
                 params.temperature,
                 params.top_p,
-                params.seed,
+                Some(CHAT_COMPLETIONS_SEED),
                 params.max_completion_tokens,
                 params.reasoning_effort,
             );
@@ -963,9 +989,9 @@ impl Sampler {
         body.insert("model".into(), Value::from(self.model.as_str()));
         body.insert("temperature".into(), Value::from(self.temperature));
         body.insert("top_p".into(), Value::from(self.top_p));
-        body.insert("seed".into(), Value::from(self.seed));
         match self.endpoint {
             Endpoint::Responses => {
+                body.insert("seed".into(), Value::from(self.seed));
                 body.insert("input".into(), messages);
                 body.insert("max_output_tokens".into(), Value::from(self.max_tokens));
                 body.insert("store".into(), Value::Bool(false));
@@ -973,7 +999,7 @@ impl Sampler {
                     body.insert("reasoning".into(), json!({"effort": effort}));
                 }
             }
-            Endpoint::ChatCompletions | Endpoint::Completions => {
+            Endpoint::ChatCompletions | Endpoint::RetiredCompletions => {
                 body.insert("messages".into(), messages);
                 body.insert("max_completion_tokens".into(), Value::from(self.max_tokens));
                 if let Some(effort) = &self.reasoning_effort {
@@ -1026,6 +1052,11 @@ mod tests {
                 "loaded model",
             ),
             (
+                json!({"type": "score_model", "name": "s", "model": MODEL, "pass_threshold": 0.5,
+                       "sampling_params": {"seed": 7}, "input": [{"role": "user", "content": "rate"}]}),
+                "deprecated seed",
+            ),
+            (
                 json!({"type": "label_model", "name": "l", "model": MODEL, "labels": ["a"],
                        "passing_labels": ["b"], "input": [{"role": "user", "content": "x"}]}),
                 "subset",
@@ -1055,7 +1086,7 @@ mod tests {
     #[test]
     fn criteria_round_trip_in_their_public_shape() {
         let value = json!({"type": "score_model", "name": "s", "model": MODEL, "range": [1.0, 5.0],
-                           "pass_threshold": 3.0, "sampling_params": {"seed": 7},
+                           "pass_threshold": 3.0, "sampling_params": {"temperature": 0.5},
                            "input": [{"role": "system", "content": "rate"},
                                      {"role": "user", "content": [{"type": "input_text", "text": "{{item.q}}"}]}]});
         let parsed = criterion(&value).expect("accepted");
@@ -1069,7 +1100,9 @@ mod tests {
             .expect("model grader")
             .expect("renders");
         assert_eq!(messages[1].content, "why?");
-        assert_eq!(body["seed"], 7);
+        assert_eq!(body["temperature"], 0.5);
+        // Graders run through Chat Completions, which deprecated `seed`.
+        assert!(!body.contains_key("seed"));
         assert_eq!(
             body["response_format"]["json_schema"]["schema"]["properties"]["result"],
             json!({"type": "number", "minimum": 1.0, "maximum": 5.0})
@@ -1110,9 +1143,30 @@ mod tests {
         assert_eq!(
             Value::Object(body),
             json!({"model": MODEL, "messages": [{"role": "user", "content": "Say hi"}],
-                   "temperature": 1.0, "top_p": 1.0, "seed": 42, "max_completion_tokens": 8192})
+                   "temperature": 1.0, "top_p": 1.0, "max_completion_tokens": 8192})
         );
         assert_eq!(input[0].content, "Say hi");
+        assert_eq!(sampler.params().seed, CHAT_COMPLETIONS_SEED);
+        let source = parse_run_source(
+            &json!({"type": "responses",
+                    "input_messages": {"type": "template",
+                                       "template": [{"role": "user", "content": "Say {{item.word}}"}]},
+                    "source": {"type": "file_content", "content": [{"item": {"word": "hi"}}]}}),
+            MODEL,
+        )
+        .expect("accepted");
+        let sampler = source.sampler.expect("samples");
+        let (body, _) = sampler.request(&json!({"word": "hi"})).expect("renders");
+        assert_eq!(body["seed"], 42, "Responses takes the spec's default seed");
+        let error = parse_run_source(
+            &json!({"type": "completions", "sampling_params": {"seed": 7},
+                    "input_messages": {"type": "template", "template": [{"role": "user", "content": "x"}]},
+                    "source": {"type": "file_content", "content": []}}),
+            MODEL,
+        )
+        .expect_err("a Chat seed is refused")
+        .to_string();
+        assert!(error.contains("deprecated seed"), "{error}");
         for refused in [
             json!({"type": "completions", "model": "gpt-4o",
                    "input_messages": {"type": "template", "template": [{"role": "user", "content": "x"}]},

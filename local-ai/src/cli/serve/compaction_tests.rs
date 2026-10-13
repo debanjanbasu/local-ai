@@ -531,7 +531,7 @@ fn compaction_needs_the_key_and_an_authentic_sealed_item() {
         ),
         (
             json!({"input":"hi","prompt_cache_retention":"24h"}),
-            "prompt_cache_retention",
+            "prompt_cache_retention is deprecated",
         ),
     ] {
         let message = prepare_compact(body.to_string().as_bytes(), None, Some(&cipher), "m")
@@ -926,19 +926,22 @@ fn summary_failure_fails_and_cancellation_skips_the_summary() {
 fn reasoning_summary_options_are_validated() {
     let body = |reasoning: Value| json!({"input":"hi","reasoning":reasoning});
     assert!(error(&body(json!({"summary":"verbose"})), None).contains("auto, concise or detailed"));
-    assert!(
-        error(
-            &body(json!({"summary":"auto","generate_summary":"detailed"})),
-            None
-        )
-        .contains("disagree")
-    );
+    // `generate_summary` is deprecated: refused even when it agrees.
+    for reasoning in [
+        json!({"summary":"auto","generate_summary":"detailed"}),
+        json!({"generate_summary":"concise"}),
+    ] {
+        let message = error(&body(reasoning), None);
+        assert!(
+            message.contains("reasoning.generate_summary is deprecated"),
+            "{message}"
+        );
+    }
     let background = json!({"input":"hi","background":true,"reasoning":{"summary":"auto"}});
     let message = error(&background, None);
     assert!(!message.contains("reasoning.summary"), "{message}");
-    let deprecated =
-        prepare(&body(json!({"generate_summary":"concise"})), None, None).expect("valid");
-    assert!(deprecated.echo.summarizes());
+    let current = prepare(&body(json!({"summary":"concise"})), None, None).expect("valid");
+    assert!(current.echo.summarizes());
     // With reasoning off there is nothing to summarize and nothing runs.
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut prepared = summarized("none", "auto", true);
