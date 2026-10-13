@@ -3,6 +3,7 @@
 pub mod activity;
 mod api;
 pub mod runtime;
+pub mod speech;
 
 pub mod bonsai;
 #[doc(hidden)]
