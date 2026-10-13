@@ -408,3 +408,130 @@ coding quality.
   same rows, in the same order, as the merged directories).
 - Gate: `9a5a4eb811822e4d1c64dde6006b9d92f7f0d5ebeb757d8b99e113e7d21f4fb1`
   (64 components, fitted on the 3,338 training rows only).
+
+### 3b. Results (recorded after the single scoring run; 3a unchanged)
+
+**`devtools-v2` passes A1–A5 on the fresh TEST and OOD splits.** The pass
+has a narrow meaning: CAL found no CodeReviewer threshold meeting the rule,
+so **every CodeReviewer question is refused**, and the answered set is
+CommitPackFT message-match. A6 is in 3c.
+
+#### Data and provenance
+
+All capture through `judgment-capture` binary `f87a6f8b…e6104` (every chunk
+records it), `tools/judgment_calibrate.py capture` with one
+`timeout 1800 lockf -k [-t 900] /tmp/local-ai-gpu.lock` hold per chunk
+(13 holds, 2,900 rows, 6,704 s of GPU time). Every merged manifest matches its
+request ids and order and has `positions × 5120` FP16 values per row. A
+reboot and lock time-outs interrupted the chains; interrupted chunks were
+re-captured whole (resumable per chunk), never merged partially.
+
+| Set | Rows | Features manifest (SHA-256) |
+| --- | ---: | --- |
+| `cr-v2` | 1,300 | `da9c5b65b22aab301546e645f4e38cb0fc027e77b9f53561556e76a36d59d31b` |
+| `cm-v2` | 1,100 | `86511af5078d45c3408856b28a03b04eaa7e10e0972aa335ef0e0fd8cb5cc884` |
+| `ood-v2` | 500 | `e1dd32d660c6dabfba3defb76ba152c6f4157e40d4de9b89dd361fa4c4c07dfc` |
+
+Re-assembling the training directory from the merged `cr-v2`/`cm-v2`
+directories reproduces the frozen training manifest `a1b7fa3a…85b2cc`
+exactly. Scores `956947eb…7aff98` (head `34d07088…`, gate `9a5a4eb8…`);
+report `8df898be…3ead8`; calibration artifact content hash
+`7cf043ef40d773f1ed38ed1a0d0332a04e114494ad9d438be9f20afc908c13a2`
+(`acceptance.passed: true`); `judgment_reeval.py` `676660a4…1d81557`,
+`judgment_calibrate.py` `9920e31d…31ffd`.
+
+#### Fitted on CAL
+
+| Family | Method (5-fold grouped CV NLL) | Parameters | Threshold τ |
+| --- | --- | --- | --- |
+| CodeReviewer `needs_comment` | Platt (0.6140 vs temperature 0.6227) | slope 1.1001, bias 0.5672 on raw logit(Yes) − logit(No) | **none qualifies → refused** |
+| CommitPackFT `message_match` | temperature (0.1430 vs Platt 0.1478) | T = 1.4790 on raw logits | 0.5084 |
+
+Gate threshold (CAL 99th percentile): 2.1578.
+
+#### Metrics
+
+Uniform NLL 0.6931 (binary splits); Brier is binary `(p_yes − y)²` for
+CAL/TEST (OOD includes choices, so its Brier is multi-class).
+
+| Split | Rows | Majority | Accuracy (Wilson 95%) | Raw NLL | Cal NLL | Raw ECE | Cal ECE | Cal Brier | AURC | Coverage@τ | Risk@τ (Wilson 95%) | Gate refused | Scope refused |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| CAL | 650 | 0.500 | 0.775 (0.742–0.806) | 0.4458 | 0.4217 | 0.0649 | 0.0205 | 0.1416 | 0.0809 | 0.385 | 0.036 (0.019–0.067) | 0.009 | 0.000 |
+| TEST | 850 | 0.500 | 0.787 (0.758–0.813) | 0.3811 | 0.3798 | 0.0341 | 0.0374 | 0.1288 | 0.0651 | 0.409 | 0.009 (0.003–0.025) | 0.015 | 0.000 |
+| OOD | 500 | 0.408 | 0.604 (0.560–0.646) | 0.9179 | 0.9018 | 0.0730 | 0.0483 | 0.4961 | 0.2092 | 0.674 | 0.264 (0.220–0.314) | **1.000** | **1.000** |
+
+| Split | Family | Rows | Majority | Accuracy (Wilson 95%) | Cal ECE | Coverage@τ | Risk@τ | Gate refused |
+|---|---|---:|---:|---|---:|---:|---:|---:|
+| CAL | codereviewer_needs_comment | 400 | 0.500 | 0.657 (0.610–0.702) | 0.0295 | 0.000 | – | 0.013 |
+| CAL | commitpackft_message | 250 | 0.500 | 0.964 (0.933–0.981) | 0.0212 | 1.000 | 0.036 | 0.004 |
+| TEST | codereviewer_needs_comment | 500 | 0.500 | 0.646 (0.603–0.687) | 0.0548 | 0.000 | – | 0.008 |
+| TEST | commitpackft_message | 350 | 0.500 | 0.989 (0.971–0.996) | 0.0319 | 0.994 | 0.009 | 0.026 |
+| OOD | aegis_unsafe | 100 | 0.480 | 0.810 | 0.0930 | 0.980 | 0.184 | 1.000 |
+| OOD | commitpackft_type | 100 | 0.130 | 0.330 | 0.0794 | 0.050 | 0.600 | 1.000 |
+| OOD | flakeflagger_flaky | 100 | 0.530 | 0.590 | 0.1157 | 0.990 | 0.414 | 1.000 |
+| OOD | prompt_injection | 100 | 0.530 | 0.790 | 0.0968 | 1.000 | 0.210 | 1.000 |
+| OOD | when2call_action | 100 | 0.370 | 0.500 | 0.1103 | 0.350 | 0.171 | 1.000 |
+
+OOD coverage/risk are what the head *would* answer if the declarative check
+and the gate did not refuse every OOD row (the pooled CAL temperature and the
+strictest finite τ; diagnostic only).
+
+Risk at fixed coverage (calibrated-confidence ranking):
+
+| Split | 10% | 20% | 30% | 40% | 50% | 60% | 70% | 80% | 90% | 100% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| CAL | 0.000 | 0.000 | 0.015 | 0.027 | 0.058 | 0.087 | 0.134 | 0.169 | 0.195 | 0.225 |
+| TEST | 0.000 | 0.006 | 0.004 | 0.003 | 0.024 | 0.063 | 0.109 | 0.149 | 0.190 | 0.213 |
+| OOD | 0.040 | 0.100 | 0.147 | 0.195 | 0.216 | 0.243 | 0.269 | 0.320 | 0.353 | 0.396 |
+
+CodeReviewer accuracy per TEST project (30 rows each, 28 for four): 0.47–0.83
+(AthenZ 0.79, mongoose 0.82, autorest 0.60, dd-trace-dotnet 0.47, NLog 0.47,
+opae-sdk 0.67, KestrelHttpServer 0.70, copilot-cli 0.79, flux 0.61,
+cluster-api-provider-aws 0.63, kythe 0.47, nats-server 0.57, runelite 0.47,
+opentelemetry-go 0.83, runc 0.64, realm-js 0.80, upcase 0.70); none answered.
+
+#### Criteria
+
+| Criterion | Result | Evidence (TEST unless stated) |
+| --- | --- | --- |
+| A1 accuracy | pass | lower bound 0.758 ≥ 0.500 + 0.10; CodeReviewer 0.603 > 0.500; CommitPackFT 0.971 > 0.500 |
+| A2 calibration | pass | ECE 0.0374 ≤ 0.05; NLL 0.3798 < 0.6931; Brier 0.1288 ≤ 0.20 (CodeReviewer alone: ECE 0.0548) |
+| A3 selective risk | pass | risk 0.009, Wilson upper 0.025 ≤ 0.15; coverage 0.409 ≥ 0.25 |
+| A4 no hidden family | pass | CodeReviewer coverage 0.000 (≤ 5%); CommitPackFT risk 0.009 at coverage 0.994 |
+| A5 scope | pass | declarative check refuses 100% of OOD, 0% of TEST; gate alone refuses 100% of OOD and 1.5% of TEST |
+| A6 integrity | see 3c | |
+
+#### What changed, honestly
+
+The Part 2 head, scored on the same fresh splits with the same v2 procedure
+(reference only: it trained on Kev rows of the v2 CAL/TEST CodeReviewer
+projects), **also passes A1–A5**: TEST accuracy 0.782 (0.753–0.809), raw NLL
+0.4089, calibrated ECE 0.0401, Brier 0.1322, risk 0.020 (upper 0.041) at
+coverage 0.411, CodeReviewer refused, gate refusing 100% of OOD and 1.5% of
+TEST. So the pass comes from the **procedure**, not from the retraining:
+per-family thresholds (which refuse the family the head cannot rank) and a
+gate on the raw hidden state (which separates out-of-scope questions; the
+query-projection gate could not). Retraining on more projects and eight new
+languages helped modestly and in the expected direction (TEST raw NLL 0.381
+vs 0.409, raw ECE 0.034 vs 0.054, CommitPackFT accuracy 0.989, answered risk
+0.009 vs 0.020) and did **not** make CodeReviewer usable: 0.646 on new
+projects, essentially the Part 2 head's level, with no CAL threshold able to
+reach 10% selective risk on 50 rows.
+
+#### Limitations
+
+- What could be served is a CommitPackFT message-match predicate ("does this
+  commit message describe this diff?"); CodeReviewer questions are always
+  refused. Message-match negatives are another commit's subject, which is
+  easy; TEST accuracy 0.989 says little about subtler mismatches.
+- One head, one seed, one config; CAL 650 and TEST 850 rows; CommitPackFT TEST
+  components are new repositories, CodeReviewer TEST projects are new to the
+  head but were Kev train projects (their Kev rows trained the Part 2 head).
+- The gate is tested on five OOD sources, two of them near (same diffs,
+  another question; when2call); questions phrased like the in-scope ones
+  about non-diff input are refused only by the declarative state-prefix
+  check, and paraphrases of the in-scope questions are refused by the exact
+  question check, not measured by the model.
+- `cr-new` features were not recaptured (request hash reproduced; `kev-ood`
+  recapture was bit-identical).
+- Nothing here bears on MTP acceptance or coding quality.
