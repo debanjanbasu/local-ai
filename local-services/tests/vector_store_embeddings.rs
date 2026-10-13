@@ -184,6 +184,11 @@ fn assert_vectors_match_chunks(store: &Store) {
     assert_eq!(matched, embedded_chunks);
 }
 
+fn cosine(query: &str, document: &str) -> f64 {
+    let (left, right) = (Fake::vector(query), Fake::vector(document));
+    f64::from(left.iter().zip(&right).map(|(a, b)| a * b).sum::<f32>())
+}
+
 fn search(index: &VectorIndex, id: &str, query: &str, ranker: Ranker) -> Vec<(String, f64)> {
     let mut request = SearchRequest::new(query);
     request.ranking_options = Some(RankingOptions {
@@ -236,7 +241,7 @@ fn without_a_model_search_is_plain_bm25() {
 }
 
 #[test]
-fn files_are_embedded_with_their_index_and_ranked_hybrid() {
+fn files_are_embedded_with_their_index_and_ranked_by_meaning() {
     let root = TempRoot::new();
     let fake = Fake::new("fake/1");
     let (store, index) = root.open(Some(&fake));
@@ -256,34 +261,37 @@ fn files_are_embedded_with_their_index_and_ranked_hybrid() {
     assert_eq!(index.embed_next().unwrap(), 0);
 
     // "automobile" shares no word with any chunk: BM25 (ranker none) finds
-    // nothing, the hybrid ranking (auto) finds the car manual first.
+    // nothing; the embedding ranking (auto) finds the car manual first,
+    // scored by its cosine similarity.
     assert!(search(&index, &id, "automobile", Ranker::None).is_empty());
-    let hybrid = search(&index, &id, "automobile", Ranker::Auto);
-    assert_eq!(hybrid[0].0, alpha);
-    // Found by one ranking only, first: half the best fused score.
-    assert!((hybrid[0].1 - 0.5).abs() < 1e-9, "{hybrid:?}");
-    // First in both rankings: the fused score is exactly 1.
-    let both = search(&index, &id, "car repair", Ranker::Auto);
-    assert_eq!(both[0].0, alpha);
-    assert!((both[0].1 - 1.0).abs() < 1e-9, "{both:?}");
-    assert!(both.iter().all(|(_, score)| (0.0..=1.0).contains(score)));
-    // The threshold applies to the reported (fused) score.
+    let dense = search(&index, &id, "automobile", Ranker::Auto);
+    assert_eq!(dense[0].0, alpha);
+    assert!(
+        (dense[0].1 - cosine("automobile", "car repair manual")).abs() < 1e-2,
+        "{dense:?}"
+    );
+    assert!(dense.iter().all(|(_, score)| (0.0..=1.0).contains(score)));
+    let exact = search(&index, &id, "car repair manual", Ranker::Auto);
+    assert!((exact[0].1 - 1.0).abs() < 1e-3, "{exact:?}");
+    // The threshold applies to the reported (cosine) score.
     let mut request = SearchRequest::new("automobile");
     request.ranking_options = Some(RankingOptions {
         ranker: Ranker::Auto,
-        score_threshold: 0.6,
+        score_threshold: (dense[0].1 + 0.01).min(1.0),
     });
     assert!(index.search(&id, &request).unwrap().data.is_empty());
-    // Dense alone reports the cosine.
-    let dense = index
-        .search_with(
-            &id,
-            &SearchRequest::new("car repair manual"),
-            Ranking::Dense,
-        )
+    // The reference fusion: half the best score when first in one ranking
+    // only, exactly 1 when first in both.
+    let fused = index
+        .search_with(&id, &SearchRequest::new("automobile"), Ranking::HYBRID)
         .unwrap();
-    assert_eq!(dense.data[0].file_id, alpha);
-    assert!((dense.data[0].score - 1.0).abs() < 1e-3);
+    assert_eq!(fused.data[0].file_id, alpha);
+    assert!((fused.data[0].score - 0.5).abs() < 1e-9);
+    let both = index
+        .search_with(&id, &SearchRequest::new("car repair"), Ranking::HYBRID)
+        .unwrap();
+    assert_eq!(both.data[0].file_id, alpha);
+    assert!((both.data[0].score - 1.0).abs() < 1e-9);
     // Filters and the store boundary hold for the dense ranking too.
     let other = vector_store(&store, &[&beta]);
     index_all(&index);
@@ -553,7 +561,11 @@ fn embedding_failures_leave_files_searchable_and_retry_later() {
         FileStatus::Completed
     );
     assert_eq!(vectors(&store), 0);
-    assert_eq!(search(&index, &id, "car", Ranker::Auto)[0].0, alpha);
+    // Not embedded: auto falls back to the fusion, which finds it through
+    // BM25 (first there, absent from the dense ranking: score 0.5).
+    let found = search(&index, &id, "car", Ranker::Auto);
+    assert_eq!(found[0].0, alpha);
+    assert!((found[0].1 - 0.5).abs() < 1e-9, "{found:?}");
     assert!(index.embed_next().is_err());
     fake.fail.store(false, Ordering::SeqCst);
     assert_eq!(index.embed_next().unwrap(), 1);

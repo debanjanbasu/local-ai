@@ -97,7 +97,7 @@ pub enum Ranking {
     /// without an embedding model).
     Lexical,
     /// Cosine similarity of the query and chunk embeddings only, scores
-    /// `max(cos, 0)`.
+    /// `max(cos, 0)` (the ranker `auto` with an embedding model).
     Dense,
     /// Weighted reciprocal rank fusion of the BM25 and cosine rankings
     /// ([`FUSION_DEPTH`] candidates each), scores normalized to `(0, 1]`.
@@ -109,8 +109,14 @@ pub enum Ranking {
 }
 
 impl Ranking {
-    /// What `auto` means when an embedding model is installed (chosen by
-    /// measurement; see `docs/EMBEDDINGS.md`).
+    /// What `auto` means when an embedding model is installed: the dense
+    /// ranking, chosen by measurement over BM25 and every fusion measured
+    /// (`docs/EMBEDDINGS.md`, "Vector stores").
+    pub const AUTO: Self = Self::Dense;
+
+    /// Equal-weight reciprocal rank fusion with `k` = [`RRF_K`]: the
+    /// reference hybrid ranking of the measurements, available through
+    /// [`VectorIndex::search_with`].
     pub const HYBRID: Self = Self::Fused {
         k: RRF_K,
         text_weight: 1.0,
@@ -243,7 +249,7 @@ impl VectorIndex {
     /// Install (or remove) the embedding model. From then on files are
     /// embedded as they are indexed, completed files without vectors in its
     /// space are embedded by [`Self::embed_next`] (the indexer's backfill;
-    /// notify it after this call), and `auto` searches are hybrid.
+    /// notify it after this call), and `auto` searches rank by embeddings.
     pub fn set_embedder(&self, embedder: Option<Arc<dyn ChunkEmbedder>>) {
         *self
             .embedder
@@ -271,10 +277,16 @@ impl VectorIndex {
     pub fn search(&self, store_id: &str, request: &SearchRequest) -> Result<SearchResults> {
         let plan = SearchPlan::new(request)?;
         let ranking = match plan.ranker {
-            Ranker::Auto if self.embedder().is_some() => Ranking::HYBRID,
+            Ranker::Auto if self.embedder().is_some() => Ranking::AUTO,
             _ => Ranking::Lexical,
         };
-        self.search_planned(store_id, request, &plan, ranking)
+        self.search_planned(
+            store_id,
+            request,
+            &plan,
+            ranking,
+            plan.ranker == Ranker::Auto,
+        )
     }
 
     /// [`Self::search`] with an explicit ranking, whatever the request's
@@ -293,15 +305,19 @@ impl VectorIndex {
         ranking: Ranking,
     ) -> Result<SearchResults> {
         let plan = SearchPlan::new(request)?;
-        self.search_planned(store_id, request, &plan, ranking)
+        self.search_planned(store_id, request, &plan, ranking, false)
     }
 
+    /// Search with `ranking`; with `auto`, a dense ranking over admitted
+    /// files of which some have no vectors yet becomes [`Ranking::HYBRID`],
+    /// which finds those through BM25.
     fn search_planned(
         &self,
         store_id: &str,
         request: &SearchRequest,
         plan: &SearchPlan,
-        ranking: Ranking,
+        mut ranking: Ranking,
+        auto: bool,
     ) -> Result<SearchResults> {
         // Queries are embedded first, outside the database snapshot.
         let dense = match ranking {
@@ -331,41 +347,15 @@ impl VectorIndex {
             touch(&writer, store_id)?;
         }
         let files = searchable_files(&snapshot, store_id, request.filters.as_ref())?;
-        let mut hits = match (ranking, &dense) {
-            (Ranking::Dense, Some((space, vectors))) => {
-                let lists = rank_dense(&snapshot, store_id, &files, space, vectors, plan.limit)?;
-                best_per_chunk(
-                    lists
-                        .into_iter()
-                        .flatten()
-                        .map(|(key, cosine)| (key, f64::from(cosine).max(0.0))),
-                )
-            }
-            (
-                Ranking::Fused {
-                    k,
-                    text_weight,
-                    embedding_weight,
-                },
-                Some((space, vectors)),
-            ) => {
-                let dense_lists =
-                    rank_dense(&snapshot, store_id, &files, space, vectors, FUSION_DEPTH)?;
-                let mut fused = Vec::new();
-                for (query, dense_list) in plan.queries.iter().zip(dense_lists) {
-                    let lexical = self.lexical_hits(query, &files, FUSION_DEPTH)?;
-                    fused.extend(fuse(
-                        &lexical,
-                        &dense_list,
-                        k,
-                        text_weight,
-                        embedding_weight,
-                    ));
-                }
-                best_per_chunk(fused)
-            }
-            _ => self.rank_lexical(plan, &files)?,
+        let embedded = match &dense {
+            Some((space, _)) => embedded_files(&snapshot, store_id, space)?,
+            None => HashSet::new(),
         };
+        if auto && ranking == Ranking::Dense && files.iter().any(|file| !embedded.contains(file)) {
+            ranking = Ranking::HYBRID;
+        }
+        let queries = dense.as_ref().map(|(_, vectors)| vectors.as_slice());
+        let mut hits = self.rank(&snapshot, plan, &files, &embedded, ranking, queries)?;
         hits.retain(|(_, score)| *score >= plan.threshold);
         hits.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         hits.truncate(plan.limit);
@@ -403,6 +393,53 @@ impl VectorIndex {
             data,
             has_more: false,
             next_page: None,
+        })
+    }
+
+    /// Score the chunks of `files` with `ranking` (`queries`: the query
+    /// embeddings, for the rankings that use them), each chunk once.
+    fn rank(
+        &self,
+        snapshot: &rusqlite::Connection,
+        plan: &SearchPlan,
+        files: &[String],
+        embedded: &HashSet<String>,
+        ranking: Ranking,
+        queries: Option<&[Vec<f32>]>,
+    ) -> Result<Vec<(ChunkKey, f64)>> {
+        Ok(match (ranking, queries) {
+            (Ranking::Dense, Some(vectors)) => {
+                let lists = rank_dense(snapshot, files, embedded, vectors, plan.limit)?;
+                best_per_chunk(
+                    lists
+                        .into_iter()
+                        .flatten()
+                        .map(|(key, cosine)| (key, f64::from(cosine).max(0.0))),
+                )
+            }
+            (
+                Ranking::Fused {
+                    k,
+                    text_weight,
+                    embedding_weight,
+                },
+                Some(vectors),
+            ) => {
+                let dense_lists = rank_dense(snapshot, files, embedded, vectors, FUSION_DEPTH)?;
+                let mut fused = Vec::new();
+                for (query, dense_list) in plan.queries.iter().zip(dense_lists) {
+                    let lexical = self.lexical_hits(query, files, FUSION_DEPTH)?;
+                    fused.extend(fuse(
+                        &lexical,
+                        &dense_list,
+                        k,
+                        text_weight,
+                        embedding_weight,
+                    ));
+                }
+                best_per_chunk(fused)
+            }
+            _ => self.rank_lexical(plan, files)?,
         })
     }
 
@@ -923,9 +960,8 @@ impl SearchPlan {
         let options = request.ranking_options.unwrap_or_default();
         if options.ranker == Ranker::Default20241115 {
             return Err(invalid(
-                "ranker default-2024-11-15 is not available; use auto (hybrid BM25 and \
-                 embedding search when an embedding model is installed, BM25 otherwise) or none \
-                 (BM25 only)",
+                "ranker default-2024-11-15 is not available; use auto (embedding search when \
+                 an embedding model is installed, BM25 otherwise) or none (BM25 only)",
             ));
         }
         if !(0.0..=1.0).contains(&options.score_threshold) {
@@ -986,17 +1022,32 @@ fn fuse(
         .collect()
 }
 
+/// The completed attachments of `store_id` whose vectors are in `space`.
+fn embedded_files(
+    snapshot: &rusqlite::Connection,
+    store_id: &str,
+    space: &str,
+) -> Result<HashSet<String>> {
+    let mut statement = snapshot.prepare(
+        "SELECT attach_id FROM vector_store_files
+         WHERE store_id = ?1 AND status = 'completed' AND embedding_space = ?2",
+    )?;
+    let files = statement
+        .query_map(params![store_id, space], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(files)
+}
+
 /// For each query vector, the best `depth` chunks of `files` by cosine
-/// similarity (best first), among the files whose vectors are in `space`.
+/// similarity (best first), among the `embedded` ones.
 ///
 /// Brute force: every stored vector of those files is read once (streamed
 /// from the database, never all in memory) and compared with every query;
 /// memory is `depth` hits per query.
 fn rank_dense(
     snapshot: &rusqlite::Connection,
-    store_id: &str,
     files: &[String],
-    space: &str,
+    embedded: &HashSet<String>,
     queries: &[Vec<f32>],
     depth: usize,
 ) -> Result<Vec<Vec<(ChunkKey, f32)>>> {
@@ -1004,15 +1055,6 @@ fn rank_dense(
     if files.is_empty() || queries.is_empty() {
         return Ok(tops);
     }
-    let embedded: HashSet<String> = {
-        let mut statement = snapshot.prepare(
-            "SELECT attach_id FROM vector_store_files
-             WHERE store_id = ?1 AND status = 'completed' AND embedding_space = ?2",
-        )?;
-        statement
-            .query_map(params![store_id, space], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
     let width = queries[0].len();
     let mut vector = vec![0.0_f32; width];
     let mut statement = snapshot
