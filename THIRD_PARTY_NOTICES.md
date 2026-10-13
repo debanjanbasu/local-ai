@@ -89,3 +89,33 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE
 ```
+
+## Kokoro-82M and misaki (text to speech)
+
+`local-engine/src/speech/` and `shaders/kokoro.metal` reimplement, in Rust and
+Metal, the inference code of [hexgrad/kokoro](https://github.com/hexgrad/kokoro)
+0.9.4 (`kokoro/model.py`, `modules.py`, `istftnet.py`; Apache-2.0), itself
+adapted from [StyleTTS 2](https://github.com/yl4579/StyleTTS2) (MIT), and port
+the English grapheme-to-phoneme rules of [hexgrad/misaki](https://github.com/hexgrad/misaki)
+0.9.4 (`misaki/en.py`; Apache-2.0). Number words follow the forms of
+[num2words](https://github.com/savoirfairelinux/num2words) (LGPL-2.1; only its
+output conventions are reproduced, no code). The misaki lexicons and the
+Kokoro-82M weights and voices (Apache-2.0) are not included; the converter
+reads them from the user's download. Copyright (c) 2025 hexgrad. Licensed under
+the Apache License, Version 2.0 (<https://www.apache.org/licenses/LICENSE-2.0>);
+see `LICENSE-APACHE`.
+
+## Kokoro-82M and misaki (text to speech)
+
+`local-engine/src/speech/` and `shaders/kokoro.metal` reimplement, in Rust and
+Metal, the inference code of [hexgrad/kokoro](https://github.com/hexgrad/kokoro)
+0.9.4 (`kokoro/model.py`, `modules.py`, `istftnet.py`; Apache-2.0), itself
+adapted from [StyleTTS 2](https://github.com/yl4579/StyleTTS2) (MIT), and port
+the English grapheme-to-phoneme rules of [hexgrad/misaki](https://github.com/hexgrad/misaki)
+0.9.4 (`misaki/en.py`; Apache-2.0). Number words follow the forms of
+[num2words](https://github.com/savoirfairelinux/num2words) (LGPL-2.1; only its
+output conventions are reproduced, no code). The misaki lexicons and the
+Kokoro-82M weights and voices (Apache-2.0) are not included; the converter
+reads them from the user's download. Copyright (c) 2025 hexgrad. Licensed under
+the Apache License, Version 2.0 (<https://www.apache.org/licenses/LICENSE-2.0>);
+see `LICENSE-APACHE`.
