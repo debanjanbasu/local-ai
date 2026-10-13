@@ -134,6 +134,26 @@ The last argument is called between short GPU submissions: a server passes
 `EngineHandle::activity()`'s `yield_to_decode` there so embedding work waits
 for running Bonsai decode steps instead of delaying them.
 
+With the optional vision artifact installed beside it, the same model embeds
+images and video into the same space (preprocessing identical to the
+reference processor; video files need `ffmpeg`/`ffprobe`):
+
+```rust,no_run
+# use std::path::Path;
+# use local_engine::embedding::{EmbeddingModel, installed_model};
+use local_engine::embedding::{MediaPart, prepare_image};
+use local_engine::embedding::vision::video::decode_video_file;
+
+# let dir = installed_model(Path::new("models")).expect("model not installed");
+# let mut model = EmbeddingModel::open(&dir)?;
+let image = prepare_image(&std::fs::read("photo.jpg")?)?;
+let photo = model.embed_image(&image, &mut || Ok(()))?;
+let clip = model.embed_video(&decode_video_file(Path::new("clip.mp4"))?, &mut || Ok(()))?;
+let mixed = model.embed_multimodal(&[vec![MediaPart::Text("Trail shoes. "), MediaPart::Image(&image)]], &mut || Ok(()))?;
+# let _ = (photo, clip, mixed);
+# Ok::<(), local_engine::Error>(())
+```
+
 ## Structured output
 
 `ChatRequest::response_format` and `CompletionRequest::response_format` take a

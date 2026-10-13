@@ -5,7 +5,10 @@ The server can embed text natively with Google's **EmbeddingGemma 2**
 encoders; 271 M on the text path), on Metal, beside the Bonsai checkpoint. It
 is optional and opt-in by installation: install the artifact below and
 `POST /v1/embeddings` appears; without it nothing changes and the route is
-`404`. Only the text path (text and code) is native today; see
+`404`. Text and code are served over HTTP; **images and video** are native
+through the Rust API once the optional vision artifact is installed (see
+[Images and video](#images-and-video); OpenAI's embeddings API has no media
+input, so there is no HTTP surface for them). Audio: see
 [Multimodal plan](#multimodal-plan).
 
 ## Install
@@ -177,22 +180,188 @@ Embedding yields most of the GPU while a generation runs and takes it back when 
 The machine was shared during this run (load average 10–18 from other work), so treat the
 absolute rates as indicative; the alternation shares that load between both conditions.
 
+## Images and video
+
+Image and video embeddings run natively in the same 768-d space, through the
+Rust API only (see [Why no HTTP surface](#why-no-http-surface)). They need the
+optional **vision artifact** next to the text install:
+
+```bash
+python3 tools/convert_embeddinggemma2_vision.py --source cache/embeddinggemma-2
+```
+
+| File | Bytes | SHA256 |
+| --- | ---: | --- |
+| `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` |
+
+It also writes `manifest-vision.json`. The converter is standard library
+only, checks `model.safetensors` and `config.json` against the same pins as
+the text converter and its own output against the pinned SHA-256. The engine
+verifies the payload hash when it loads the encoder (lazily, on the first
+media input; 335 MB more GPU memory). Without the file, media inputs are
+refused and nothing else changes.
+
+### What runs
+
+- **Preprocessing** (`local_engine::embedding::vision::preprocess`), matching
+  transformers 5.19.0 `Gemma4ImageProcessor` / `EmbeddingGemma2VideoProcessor`
+  (torchvision backend) exactly:
+  - decode to 8-bit RGB: JPEG with libjpeg-turbo's decoder (the `mozjpeg`
+    crate, the decoder Pillow and torchvision use), PNG, GIF, BMP and WebP
+    with the `image` crate; alpha dropped, grey replicated, **no EXIF
+    rotation** (the reference applies none either);
+  - aspect-preserving resize to the largest size with both sides multiples
+    of 48 (patch 16 × pooling 3) holding at most 9 × budget patches (budget
+    280 soft tokens per image, 140 per video frame; 70/560/1120 accepted),
+    small images scaled up; torch's antialiased bicubic `uint8` kernel
+    reproduced exactly (Keys a = −0.5, int16 fixed-point weights, horizontal
+    then vertical pass, rounded and clamped to `uint8` after each);
+  - rescale `f32(u8) × f32(1/255)`; 16×16×3 patches (row, column, channel) in
+    raster order with `(x, y)` positions. The number of soft tokens is
+    `(h/48)·(w/48)` (≤ 280; e.g. 260–272 for photos).
+- **Video:** 1 frame per second of stream time (`floor(i · fps)` for
+  `i < floor(duration)`), then at most 32 frames chosen uniformly
+  (`numpy.linspace`), 140-token budget per frame. Each frame becomes
+  `<|image>` + soft tokens + `<image|>` in the sequence.
+  - Frame sequences: `prepare_video(frames, timing)` takes decoded RGB frames
+    (all of them, with the stream's frame count, rate and duration; without a
+    rate every frame is kept, then the 32-frame cap applies, as the
+    reference does for decoded arrays).
+  - Files: `vision::video::decode_video_file(path)`. There is no maintained
+    pure-Rust H.264/HEVC/VP9 decoder, so this **requires `ffmpeg` and
+    `ffprobe` on `PATH`** (an external dependency of this one function). It
+    mirrors torchcodec's exact mode: a packet scan for the frame count,
+    duration and rate; for 8-bit 4:2:0 streams the raw YUV planes come from
+    `ffmpeg` and are converted to RGB in Rust with swscale's fixed-point
+    `yuv2rgb` arithmetic and the stream's colour matrix (what the reference's
+    `sws_scale` computed); other pixel formats use `ffmpeg`'s RGB conversion.
+- **Encoder** (`shaders/embedding_vision.metal`, `local-metal/src/embedding_vision.rs`):
+  the 16-layer `gemma4_vision` tower — input projection of `2·(pixel − 0.5)`,
+  learned x/y position table, per layer RMSNorm → q/k/v (q/k RMSNorm with
+  scale, v without) → axial RoPE θ 100 (the first 32 dims of each 64-dim head
+  rotate by x, the last 32 by y) → bidirectional attention within each image
+  or frame (scale 1.0) → o → post-norm residual, then the gated GELU-tanh MLP
+  3072 with pre/post norms — 3×3 average pooling by patch position in F32,
+  × √768, `embed_vision` (RMSNorm without scale, 768→512). BF16 GEMM, RMSNorm,
+  residual, RoPE and gated GELU reuse the text kernels; new kernels add the
+  position table, the pooling and a head-dim-64 simdgroup-matrix flash
+  attention. BF16 weights (the checkpoint's values), F32 activations.
+- **Sequence:** `<bos>`, then the parts in order (text tokens; per image or
+  frame `<|image>`, one slot per soft token, `<image|>`), `<eos>`; the soft
+  tokens replace the placeholder embeddings (they are not scaled by √512, and
+  the per-layer embeddings are computed from them, as in the reference); then
+  the shared text encoder, mean pooling over every token, 512→768, L2. Up to
+  8,192 tokens (a 32-frame video at 130–140 tokens per frame is about 4,500).
+
+### Rust API
+
+```rust
+use local_engine::embedding::{EmbeddingModel, MediaPart, prepare_image, prepare_video};
+use local_engine::embedding::vision::video::decode_video_file;
+
+let mut model = EmbeddingModel::open(&dir)?;          // dir = models/embeddinggemma2-text
+assert!(model.supports_vision());
+let image = prepare_image(&std::fs::read("photo.jpg")?)?;
+let a = model.embed_image(&image, &mut || Ok(()))?;   // 768-d, normalized
+let frames = decode_video_file(Path::new("clip.mp4"))?; // needs ffmpeg/ffprobe
+let b = model.embed_video(&frames, &mut || Ok(()))?;
+// Interleaved text and media in one embedding (no prompt for media, per the card):
+let c = model.embed_multimodal(&[vec![MediaPart::Text("Trail shoes. "), MediaPart::Image(&image)]], &mut || Ok(()))?;
+```
+
+`truncate_normalized` gives the Matryoshka widths as for text (the research
+run measured 512-d as near-lossless for images and video and 128-d as a
+4–8 point loss). The `pace` hook runs after every vision layer (one command
+buffer per layer: about 15 ms of GPU time for a 2,520-patch image) and every
+text-encoder submission, so a caller can yield to Bonsai decoding or cancel.
+
+### Why no HTTP surface
+
+OpenAI's `POST /v1/embeddings` (`CreateEmbeddingRequest`, current reference)
+accepts only text and token arrays, and no other OpenAI endpoint returns
+embeddings of images or video. Adding media fields there would be a
+non-standard extension clients cannot discover, so the server does not: image
+and video embeddings are native-only until a spec mechanism exists. The
+placeholder token ids stay refused on `/v1/embeddings`.
+
+### Verification
+
+Reference fixtures were generated on a Kaggle CPU kernel
+(`eg2-vis-fixtures`; transformers 5.19.0, sentence-transformers 6.1.0,
+torchvision 0.26, torchcodec 0.11, Pillow 12.3, FP32, the pinned model
+files), feeding **file paths** to sentence-transformers so the reference
+covers decode → embedding: 67 images (56 Flickr30k test photos and 11
+synthetic edge cases: 7×5 PNG scaled up, 1600×90 and 70×1300 extremes,
+greyscale, RGBA, palette, 3000×2000, EXIF-rotated, already-on-grid 768×768,
+progressive, 4:4:4) and 6 videos (5 MSR-VTT test clips, H.264, 12–22 s, and a
+40 s MPEG-4 Part 2 clip that triggers the 32-frame cap). For each: the
+decoded pixels the processor received, its `pixel_values` and positions, the
+token ids and the normalized embedding. `target/release/embedding-vision-eval`
+runs the gates; the committed fixture
+`local-engine/tests/fixtures/vision/` (two synthetic images, their
+pixel-value digests and embeddings) backs a unit test (preprocessing, always
+run) and an ignored real-model test.
+
+Results on this machine (M4 Pro, 20-core GPU, under the shared GPU lock):
+
+| Gate | Threshold | Result |
+| --- | --- | --- |
+| Resize + patches from the reference's decoded pixels, 67 images | identical | **67/67 identical** |
+| Decoder (file → RGB) vs the pixels the reference received | identical | **67/67 identical** (JPEG via libjpeg-turbo, PNG via `image`) |
+| Whole pipeline file → `pixel_values`, 67 images | identical | **67/67 identical**; token layouts 67/67 identical |
+| Video frame indices (1 fps, 32-frame cap), 6 videos | identical | **6/6 identical** (stream facts identical to torchcodec's) |
+| Video resize + patches from the reference's frames | identical | **6/6 identical** |
+| Video file → RGB frames (`ffmpeg` + Rust `yuv2rgb`) | identical | **5/6 identical** (H.264); the MPEG-4 Part 2 clip: 4 values off by ≤ 2 over 32 frames |
+| Image embedding cosine to FP32 reference, 67 images | mean ≥ 0.9995, min ≥ 0.999 | **mean 1.000000, min 0.999999** (reference patches and native pipeline alike) |
+| Video embedding cosine, 6 videos (12–32 frames, 1,586–4,226 tokens) | same | **mean 1.000000, min 0.999999** (reference frames and native `ffmpeg` pipeline alike) |
+
+Flickr30k 1K (Karpathy test: 1,000 images, 5,000 captions; captions with
+`task: search result | query: ` for text→image and `title: none | text: `
+for image→text, as in the research run; exact cosine search):
+
+| Direction | Kaggle FP32 R@1/5/10 (mean) | Native BF16 R@1/5/10 (mean) | Δ mean R |
+| --- | --- | --- | ---: |
+| text → image | 86.4 / 97.5 / 98.7 (94.2) | 86.4 / 97.5 / 98.7 (94.19) | 0.0 |
+| image → text | 94.2 / 99.7 / 100.0 (98.0) | 94.2 / 99.7 / 100.0 (97.97) | 0.0 |
+
+Throughput (GPU otherwise idle):
+
+| Workload | Result |
+| --- | --- |
+| Images (500×461 photo, 272 soft tokens), 16 per call, best of 3 | 4.19 s: **3.82 images/s** (262 ms each: vision tower ≈ 0.76 TFLOP per image, plus the decoder) |
+| Flickr30k corpus, 8 images per call, file decode included | 3.69 images/s |
+| Decode + preprocess on the CPU (same photo) | 7.2 ms per image |
+| Video, 32 frames × 130 tokens (4,226-token sequence) | 5.0 s (6.4 frames/s); 12 frames: 1.5 s |
+
+### Precision
+
+BF16 weights with F32 activations, like the text path. The research run found
+int8 per-row vision weights retrieval-lossless (+0.0 mean R), but the text
+path's int8 artifact already failed the per-input parity gate (worst cosine
+0.9976) and every image passes through that same decoder, so int8 was not
+pursued for the vision tower; ternary vision weights cost 6–9 mean R (§4b of
+the research results) and are not used.
+
+### Limits
+
+- EXIF orientation is not applied (as in the reference); rotate images first
+  if their pixels are stored sideways.
+- Video file decoding needs `ffmpeg`/`ffprobe`; codecs that are not
+  bit-exact by specification (e.g. MPEG-4 Part 2) can differ from the
+  reference by a level or two in a few pixels; non-4:2:0 or high-bit-depth
+  streams use `ffmpeg`'s RGB conversion (a few levels off the reference).
+- CMYK JPEGs fall back to the `image` crate's conversion (Pillow's differs).
+- One media request at a time per model (the model is not internally
+  synchronized), no HTTP route, no batching across callers.
+
 ## Multimodal plan
 
-The image, audio and video encoders are not native yet. Each feeds soft tokens
-into the same text encoder implemented here (placeholder ids 258880, 258881,
-258884 are refused today), so adding a modality means its encoder and its
+Images and video are native (above). Every modality feeds soft tokens into
+the same text encoder (the placeholder ids 258880, 258881 and 258884 stay
+refused as token-id input), so adding one means its encoder and its
 preprocessing, with no change to the text path:
 
-1. **Vision** (16 layers, width 768, 12 × 64 heads, MLP 3072, 2-D learned
-   positions and axial RoPE θ 100, 3×3 pooling to 280 tokens per image or 140
-   per video frame, `embed_vision` RMSNorm → 768→512): BF16 GEMM and RMSNorm
-   reuse these kernels; new kernels for patchify, the position-table gather,
-   axial RoPE and the pooling. Preprocessing: rescale to [0, 1] with no
-   mean/std, 16-px patches, pooling in F32. Gate: Flickr30k 1K within 0.5 mean
-   R@1/5/10 of the Kaggle FP32 run (t2i 86.4 / 97.5 / 98.7).
-2. **Video:** the vision encoder at 1 frame/s, at most 32 frames.
-3. **Audio** (12-layer Conformer, width 1024, 128-bin log-mel at 16 kHz):
+1. **Audio** (12-layer Conformer, width 1024, 128-bin log-mel at 16 kHz):
    needs a mel front end, chunked local attention with relative positions,
    a depthwise causal convolution and clipped linears; the Kaggle AudioCaps
    baseline itself looked low (t2a R@1 8%) and should be understood first.
