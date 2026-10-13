@@ -1136,7 +1136,7 @@ fn reply_ids_are_prefixed_and_unique() {
 
 #[test]
 fn models_report_the_admitted_context() {
-    let models = models_json("bonsai", 32768, 1234, false);
+    let models = models_json("bonsai", 32768, 1234, false, false);
     assert_eq!(models["data"][0]["id"], "bonsai");
     assert_eq!(models["data"][0]["created"], 1234);
     assert_eq!(models["data"][0]["context_length"], 32768);

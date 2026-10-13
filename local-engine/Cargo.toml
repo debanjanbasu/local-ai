@@ -32,6 +32,13 @@ thiserror.workspace = true
 sha2.workspace = true
 tokenizers.workspace = true
 tokio = { version = "1", features = ["rt", "sync"] }
+# Speech input (`speech::audio`): pure-Rust demuxers and decoders for the
+# formats the OpenAI audio endpoints accept (no Opus decoder exists).
+symphonia = { version = "0.6.1", default-features = false, features = ["flac", "mp3", "pcm", "wav", "isomp4", "aac", "alac", "ogg", "vorbis", "mkv"] }
+# The log-mel front end's 400-point FFT.
+rustfft = "6.4"
+# zlib itself (not a re-implementation) for Whisper's compression-ratio test.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
 
 [dev-dependencies]
 tempfile = "3"
