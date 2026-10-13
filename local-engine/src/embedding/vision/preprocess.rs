@@ -3,7 +3,10 @@
 //! `EmbeddingGemma2VideoProcessor`, torchvision backend) exactly.
 //!
 //! 1. Decode to 8-bit RGB (alpha dropped, grey replicated; no EXIF rotation,
-//!    as `torchvision.io.decode_image` and `PIL.Image.open` do).
+//!    as `torchvision.io.decode_image` and `PIL.Image.open` do). JPEG goes
+//!    through libjpeg-turbo's decoder (the `mozjpeg` crate), the decoder
+//!    Pillow and torchvision use, so the pixels are identical; other formats
+//!    through the `image` crate.
 //! 2. Aspect-preserving resize to the largest size whose sides are multiples
 //!    of 48 (patch 16 x pooling 3) and that holds at most `soft_tokens * 9`
 //!    patches, with torch's antialiased bicubic `uint8` kernel (Keys a = -0.5,
@@ -103,6 +106,43 @@ impl ImagePatches {
     }
 }
 
+/// Decode a baseline, progressive or arithmetic-coded JPEG with
+/// libjpeg-turbo (islow IDCT, fancy upsampling: the library defaults Pillow
+/// and torchvision use). `Ok(None)` for CMYK/YCCK, left to [`image`].
+fn decode_jpeg(bytes: &[u8]) -> crate::Result<Option<RgbImage>> {
+    let decoded =
+        std::panic::catch_unwind(|| -> std::io::Result<Option<(usize, usize, Vec<u8>)>> {
+            let decompress = mozjpeg::Decompress::new_mem(bytes)?;
+            let (width, height) = decompress.size();
+            if width.max(height) > MAX_IMAGE_SIDE as usize {
+                return Err(std::io::Error::other(format!(
+                    "{width}x{height} exceeds {MAX_IMAGE_SIDE} pixels per side"
+                )));
+            }
+            if matches!(
+                decompress.color_space(),
+                mozjpeg::ColorSpace::JCS_CMYK | mozjpeg::ColorSpace::JCS_YCCK
+            ) {
+                return Ok(None);
+            }
+            let mut started = decompress.rgb()?;
+            let pixels = started.read_scanlines::<u8>()?;
+            started.finish()?;
+            Ok(Some((width, height, pixels)))
+        });
+    match decoded {
+        Ok(Ok(Some((width, height, pixels)))) => RgbImage::new(width, height, pixels).map(Some),
+        Ok(Ok(None)) => Ok(None),
+        Ok(Err(error)) => Err(Error::InvalidArgument(format!("image: JPEG: {error}"))),
+        Err(payload) => Err(Error::InvalidArgument(format!(
+            "image: JPEG: {}",
+            payload
+                .downcast_ref::<String>()
+                .map_or("undecodable data", String::as_str)
+        ))),
+    }
+}
+
 /// Decode an encoded image (JPEG, PNG, GIF, BMP or WebP; the first frame of
 /// an animation) to 8-bit RGB.
 ///
@@ -111,6 +151,11 @@ impl ImagePatches {
 /// [`Error::InvalidArgument`] for undecodable data or a side over
 /// [`MAX_IMAGE_SIDE`].
 pub fn decode_image(bytes: &[u8]) -> crate::Result<RgbImage> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        && let Some(image) = decode_jpeg(bytes)?
+    {
+        return Ok(image);
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| Error::InvalidArgument(format!("image: {error}")))?;

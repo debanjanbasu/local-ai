@@ -80,4 +80,92 @@ fn unsupported_budgets_and_bad_buffers_are_refused() {
     assert!(patchify(&image, 100).is_err());
     assert!(RgbImage::new(4, 4, vec![0; 47]).is_err());
     assert!(decode_image(b"not an image").is_err());
+    // A JPEG signature with a corrupt header is an error, not an abort.
+    assert!(decode_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', 0xFF, 0xC0]).is_err());
+}
+
+#[derive(serde::Deserialize)]
+struct Reference {
+    images: Vec<ReferenceImage>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReferenceImage {
+    file: String,
+    columns: usize,
+    rows: usize,
+    pixel_values_u8_sha256: String,
+    ids_len: usize,
+    embedding: Vec<f32>,
+}
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vision");
+
+fn reference() -> Reference {
+    serde_json::from_str(
+        &std::fs::read_to_string(format!("{FIXTURES}/reference.json")).expect("fixture"),
+    )
+    .expect("reference")
+}
+
+/// The committed images decode and preprocess to exactly the reference
+/// processor's pixel values (transformers 5.19.0 `Gemma4ImageProcessor`,
+/// fed the same files): a PNG upscaled from 7x5 and a 1600x90 JPEG (4:2:0,
+/// libjpeg-turbo decode) downscaled to a 210 x 9 patch grid.
+#[test]
+fn committed_images_preprocess_exactly_like_the_reference() {
+    use sha2::{Digest as _, Sha256};
+    for image in reference().images {
+        let bytes = std::fs::read(format!("{FIXTURES}/{}", image.file)).expect("image");
+        let patches = super::prepare_image(&bytes).expect("prepare");
+        assert_eq!(
+            (patches.columns, patches.rows),
+            (image.columns, image.rows),
+            "{}",
+            image.file
+        );
+        assert_eq!(patches.soft_tokens() + 4, image.ids_len);
+        let quantized: Vec<u8> = patches
+            .values
+            .iter()
+            .map(|v| (v * 255.0).round() as u8)
+            .collect();
+        assert!(
+            patches
+                .values
+                .iter()
+                .zip(&quantized)
+                .all(|(v, q)| v.to_bits() == (f32::from(*q) * RESCALE).to_bits())
+        );
+        let digest = Sha256::digest(&quantized)
+            .iter()
+            .fold(String::new(), |mut out, b| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{b:02x}");
+                out
+            });
+        assert_eq!(digest, image.pixel_values_u8_sha256, "{}", image.file);
+    }
+}
+
+/// Native image embeddings of the committed images against the FP32
+/// reference (the parity gate: cosine ≥ 0.999 each).
+#[test]
+#[ignore = "requires the installed embedding model with the vision artifact"]
+fn native_image_embeddings_match_the_reference_fixture() {
+    use crate::embedding::{EmbeddingModel, installed_model};
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let dir = installed_model(&std::path::Path::new(root).join("models")).expect("installed model");
+    let mut model = EmbeddingModel::open(&dir).expect("open");
+    for image in reference().images {
+        let bytes = std::fs::read(format!("{FIXTURES}/{}", image.file)).expect("image");
+        let patches = super::prepare_image(&bytes).expect("prepare");
+        let native = model.embed_image(&patches, &mut || Ok(())).expect("embed");
+        let cosine: f32 = native
+            .iter()
+            .zip(&image.embedding)
+            .map(|(a, b)| a * b)
+            .sum();
+        assert!(cosine >= 0.999, "{}: cosine {cosine}", image.file);
+    }
 }
