@@ -24,6 +24,7 @@
 //! work from delaying concurrent decoding (see [`EmbeddingModel::embed_ids`]).
 
 mod artifact;
+mod audio;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +38,10 @@ use tokenizers::Tokenizer;
 
 use crate::Error;
 use artifact::Artifact;
+pub use audio::{
+    AUDIO_ARTIFACT, FeatureExtractor, LogMel, MAX_AUDIO_TOKENS, MAX_SAMPLES, MEL_BINS, SAMPLE_RATE,
+    audio_tokens, decode_audio, frame_counts, to_mono_16k, validate_clip,
+};
 
 /// Installation directory name inside a models directory (the one that holds
 /// the Bonsai checkpoint's own folder, e.g. `models/`).
@@ -224,6 +229,8 @@ pub struct EmbeddingModel {
     layers: Vec<LayerWeights>,
     projection: Vec<f32>,
     workspace: Workspace,
+    /// The optional audio encoder ([`Self::load_audio`]).
+    audio: Option<audio::AudioTower>,
 }
 
 // SAFETY: Metal devices, queues, pipelines and buffers may be transferred
@@ -319,6 +326,7 @@ impl EmbeddingModel {
             layers,
             projection,
             workspace,
+            audio: None,
         })
     }
 
@@ -441,32 +449,58 @@ impl EmbeddingModel {
         pace: &mut dyn FnMut() -> crate::Result<()>,
     ) -> crate::Result<Vec<Vec<f32>>> {
         let tokens: usize = inputs.iter().map(Vec::len).sum();
-        let count = tokens as u32;
-        // Token embeddings on the CPU from the mapped BF16 table (x sqrt(512)).
-        let scale = (HIDDEN as f32).sqrt();
-        let payload = self.artifact.payload();
         let mut x0 = Vec::with_capacity(tokens * HIDDEN);
+        for &id in inputs.iter().flatten() {
+            self.push_token_embedding(&mut x0, id);
+        }
+        let lengths: Vec<usize> = inputs.iter().map(Vec::len).collect();
+        self.pass_embedded(&x0, &lengths, pace)
+    }
+
+    /// Append token `id`'s input embedding (the mapped BF16 table row x
+    /// sqrt(512), on the CPU) to `x0`.
+    fn push_token_embedding(&self, x0: &mut Vec<f32>, id: u32) {
+        let scale = (HIDDEN as f32).sqrt();
+        let row = &self.artifact.payload()[self.table + id as usize * HIDDEN * 2..][..HIDDEN * 2];
+        x0.extend(
+            row.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16) * scale),
+        );
+    }
+
+    /// One encoder pass over packed input embeddings `x0` (`[tokens, 512]`)
+    /// of sequences of `lengths` tokens; one embedding per sequence.
+    #[allow(clippy::too_many_lines)]
+    fn pass_embedded(
+        &self,
+        x0: &[f32],
+        lengths: &[usize],
+        pace: &mut dyn FnMut() -> crate::Result<()>,
+    ) -> crate::Result<Vec<Vec<f32>>> {
+        let tokens: usize = lengths.iter().sum();
+        if tokens == 0 || tokens > WORKSPACE_TOKENS || x0.len() != tokens * HIDDEN {
+            return Err(Error::InvalidArgument(
+                "embedding pass is empty, too long or misshapen".into(),
+            ));
+        }
+        let count = tokens as u32;
+        let scale = (HIDDEN as f32).sqrt();
         let mut positions = Vec::with_capacity(tokens);
         let mut bounds = Vec::with_capacity(tokens * 2);
         let mut first = 0_u32;
-        for ids in inputs {
-            let end = first + ids.len() as u32;
-            for (position, &id) in ids.iter().enumerate() {
-                let row = &payload[self.table + id as usize * HIDDEN * 2..][..HIDDEN * 2];
-                x0.extend(
-                    row.as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16) * scale),
-                );
+        for &length in lengths {
+            let end = first + length as u32;
+            for position in 0..length {
                 positions.push(position as u32);
                 bounds.extend([first, end]);
             }
             first = end;
         }
         let ws = &self.workspace;
-        ws.input.copy_from_bytes(bytemuck::cast_slice(&x0), 0);
-        ws.hidden.copy_from_bytes(bytemuck::cast_slice(&x0), 0);
+        ws.input.copy_from_bytes(bytemuck::cast_slice(x0), 0);
+        ws.hidden.copy_from_bytes(bytemuck::cast_slice(x0), 0);
         ws.positions
             .copy_from_bytes(bytemuck::cast_slice(&positions), 0);
         ws.bounds.copy_from_bytes(bytemuck::cast_slice(&bounds), 0);
@@ -690,11 +724,11 @@ impl EmbeddingModel {
         )?;
         batch.commit_and_wait()?;
         let normed = &ws.normed.as_slice::<f32>()[..tokens * HIDDEN];
-        let mut out = Vec::with_capacity(inputs.len());
+        let mut out = Vec::with_capacity(lengths.len());
         let mut row = 0;
-        for ids in inputs {
+        for &length in lengths {
             let mut mean = vec![0.0_f64; HIDDEN];
-            for token in row..row + ids.len() {
+            for token in row..row + length {
                 for (m, v) in mean
                     .iter_mut()
                     .zip(&normed[token * HIDDEN..(token + 1) * HIDDEN])
@@ -702,8 +736,8 @@ impl EmbeddingModel {
                     *m += f64::from(*v);
                 }
             }
-            row += ids.len();
-            let n = ids.len() as f64;
+            row += length;
+            let n = length as f64;
             let mean: Vec<f32> = mean.iter().map(|m| (m / n) as f32).collect();
             let mut embedding: Vec<f32> = self
                 .projection

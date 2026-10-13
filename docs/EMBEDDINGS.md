@@ -193,6 +193,5 @@ preprocessing, with no change to the text path:
    R@1/5/10 of the Kaggle FP32 run (t2i 86.4 / 97.5 / 98.7).
 2. **Video:** the vision encoder at 1 frame/s, at most 32 frames.
 3. **Audio** (12-layer Conformer, width 1024, 128-bin log-mel at 16 kHz):
-   needs a mel front end, chunked local attention with relative positions,
-   a depthwise causal convolution and clipped linears; the Kaggle AudioCaps
-   baseline itself looked low (t2a R@1 8%) and should be understood first.
+   native through the Rust API (`EmbeddingModel::load_audio` /
+   `embed_audio`); see [EMBEDDINGS_AUDIO.md](EMBEDDINGS_AUDIO.md).
