@@ -3,12 +3,13 @@
 //!
 //! See the parent module docs ("Index and consistency") for the protocol.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
+use half::f16;
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::directory::MmapDirectory;
@@ -28,10 +29,10 @@ use tantivy::{
 };
 
 use super::{
-    ContentPart, DEFAULT_NUM_RESULTS, IndexCheck, MAX_NUM_RESULTS, MAX_QUERIES, MAX_QUERY_CHARS,
-    Query, Ranker, SearchRequest, SearchResult, SearchResults, check_chars, corrupt, count,
-    invalid, next_pending, searchable_files, signed, touch, unsigned, validate_filter,
-    writable_store,
+    ChunkEmbedder, ContentPart, DEFAULT_NUM_RESULTS, IndexCheck, MAX_NUM_RESULTS, MAX_QUERIES,
+    MAX_QUERY_CHARS, Query, Ranker, SearchRequest, SearchResult, SearchResults, check_chars,
+    corrupt, count, invalid, next_pending, searchable_files, signed, touch, unsigned,
+    validate_filter, writable_store,
 };
 use crate::{Error, Result, Store};
 
@@ -55,6 +56,19 @@ pub const INDEX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub const ACTIVITY_GRANULARITY_SECONDS: u64 = 60;
 /// Garbage entries removed per index commit.
 const GARBAGE_BATCH: usize = 1_000;
+/// With an embedder, text bytes after which an indexing or backfill batch
+/// stops taking files (one file may exceed it): about 250,000 tokens, under
+/// a minute of embedding on an idle GPU.
+pub const EMBED_BATCH_BYTES: usize = 1024 * 1024;
+/// Chunks handed to the embedder per call; their vectors are stored as F16
+/// at once, so a file's vectors cost 2 bytes per dimension in memory until
+/// its confirming transaction (at most [`super::MAX_FILE_CHUNKS`] × 1.5 KB
+/// at 768 dimensions, 77 MB).
+const EMBED_GROUP_CHUNKS: usize = 64;
+/// Reciprocal rank fusion constant `k` (Cormack et al. 2009's 60).
+pub const RRF_K: f64 = 60.0;
+/// Candidates taken from each ranking (per query) before fusion.
+pub const FUSION_DEPTH: usize = 100;
 
 /// The persistent ranked index of every store's chunks, and the native
 /// search API (`file_search` calls [`Self::search`]).
@@ -72,6 +86,36 @@ pub struct VectorIndex {
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
     fields: Fields,
+    /// The embedding model, when installed (see [`Self::set_embedder`]).
+    embedder: RwLock<Option<Arc<dyn ChunkEmbedder>>>,
+}
+
+/// How [`VectorIndex::search_with`] ranks chunks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Ranking {
+    /// BM25 only, scores `s / (1 + s)` (the ranker `none`, and `auto`
+    /// without an embedding model).
+    Lexical,
+    /// Cosine similarity of the query and chunk embeddings only, scores
+    /// `max(cos, 0)`.
+    Dense,
+    /// Weighted reciprocal rank fusion of the BM25 and cosine rankings
+    /// ([`FUSION_DEPTH`] candidates each), scores normalized to `(0, 1]`.
+    Fused {
+        k: f64,
+        text_weight: f64,
+        embedding_weight: f64,
+    },
+}
+
+impl Ranking {
+    /// What `auto` means when an embedding model is installed (chosen by
+    /// measurement; see `docs/EMBEDDINGS.md`).
+    pub const HYBRID: Self = Self::Fused {
+        k: RRF_K,
+        text_weight: 1.0,
+        embedding_weight: 1.0,
+    };
 }
 
 impl std::fmt::Debug for VectorIndex {
@@ -176,6 +220,7 @@ impl VectorIndex {
             reader,
             writer: Mutex::new(writer),
             fields,
+            embedder: RwLock::new(None),
         };
         let check = opened.check()?;
         if check.rebuilt {
@@ -185,7 +230,32 @@ impl VectorIndex {
                 check.chunks
             );
         }
+        if check.vectors_repaired > 0 {
+            eprintln!(
+                "warning: {} vector store files or vector rows disagreed with their chunks; their \
+                 vectors were dropped and are embedded again",
+                check.vectors_repaired
+            );
+        }
         Ok(opened)
+    }
+
+    /// Install (or remove) the embedding model. From then on files are
+    /// embedded as they are indexed, completed files without vectors in its
+    /// space are embedded by [`Self::embed_next`] (the indexer's backfill;
+    /// notify it after this call), and `auto` searches are hybrid.
+    pub fn set_embedder(&self, embedder: Option<Arc<dyn ChunkEmbedder>>) {
+        *self
+            .embedder
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = embedder;
+    }
+
+    fn embedder(&self) -> Option<Arc<dyn ChunkEmbedder>> {
+        self.embedder
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The store this index belongs to.
@@ -200,6 +270,52 @@ impl VectorIndex {
     /// This is the native search a `file_search` tool calls.
     pub fn search(&self, store_id: &str, request: &SearchRequest) -> Result<SearchResults> {
         let plan = SearchPlan::new(request)?;
+        let ranking = match plan.ranker {
+            Ranker::Auto if self.embedder().is_some() => Ranking::HYBRID,
+            _ => Ranking::Lexical,
+        };
+        self.search_planned(store_id, request, &plan, ranking)
+    }
+
+    /// [`Self::search`] with an explicit ranking, whatever the request's
+    /// `ranker` (validated all the same). For measuring the rankings
+    /// against each other through the one search path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search`]; [`Error::Conflict`] for [`Ranking::Dense`] or
+    /// [`Ranking::Fused`] without an embedding model.
+    #[doc(hidden)]
+    pub fn search_with(
+        &self,
+        store_id: &str,
+        request: &SearchRequest,
+        ranking: Ranking,
+    ) -> Result<SearchResults> {
+        let plan = SearchPlan::new(request)?;
+        self.search_planned(store_id, request, &plan, ranking)
+    }
+
+    fn search_planned(
+        &self,
+        store_id: &str,
+        request: &SearchRequest,
+        plan: &SearchPlan,
+        ranking: Ranking,
+    ) -> Result<SearchResults> {
+        // Queries are embedded first, outside the database snapshot.
+        let dense = match ranking {
+            Ranking::Lexical => None,
+            Ranking::Dense | Ranking::Fused { .. } => {
+                let embedder = self.embedder().ok_or_else(|| {
+                    Error::Conflict("no embedding model is installed on this server".to_owned())
+                })?;
+                let queries: Vec<&str> = plan.queries.iter().map(String::as_str).collect();
+                let vectors = embedder.embed_queries(&queries)?;
+                check_vectors(&vectors, queries.len(), embedder.dimensions())?;
+                Some((embedder.space().to_owned(), vectors))
+            }
+        };
         let mut connection = self.store.connection()?;
         // One database snapshot for the store, its searchable files and
         // their text.
@@ -215,7 +331,41 @@ impl VectorIndex {
             touch(&writer, store_id)?;
         }
         let files = searchable_files(&snapshot, store_id, request.filters.as_ref())?;
-        let mut hits = self.rank_lexical(&plan, &files)?;
+        let mut hits = match (ranking, &dense) {
+            (Ranking::Dense, Some((space, vectors))) => {
+                let lists = rank_dense(&snapshot, store_id, &files, space, vectors, plan.limit)?;
+                best_per_chunk(
+                    lists
+                        .into_iter()
+                        .flatten()
+                        .map(|(key, cosine)| (key, f64::from(cosine).max(0.0))),
+                )
+            }
+            (
+                Ranking::Fused {
+                    k,
+                    text_weight,
+                    embedding_weight,
+                },
+                Some((space, vectors)),
+            ) => {
+                let dense_lists =
+                    rank_dense(&snapshot, store_id, &files, space, vectors, FUSION_DEPTH)?;
+                let mut fused = Vec::new();
+                for (query, dense_list) in plan.queries.iter().zip(dense_lists) {
+                    let lexical = self.lexical_hits(query, &files, FUSION_DEPTH)?;
+                    fused.extend(fuse(
+                        &lexical,
+                        &dense_list,
+                        k,
+                        text_weight,
+                        embedding_weight,
+                    ));
+                }
+                best_per_chunk(fused)
+            }
+            _ => self.rank_lexical(plan, &files)?,
+        };
         hits.retain(|(_, score)| *score >= plan.threshold);
         hits.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
         hits.truncate(plan.limit);
@@ -249,7 +399,7 @@ impl VectorIndex {
             });
         }
         Ok(SearchResults {
-            search_query: plan.queries,
+            search_query: plan.queries.clone(),
             data,
             has_more: false,
             next_page: None,
@@ -260,15 +410,35 @@ impl VectorIndex {
     /// at most `plan.limit` per query, each chunk once with its best
     /// reported score, unordered.
     ///
-    /// This is the only ranking step of [`Self::search`]: validation, the
+    /// The rankings (this one, the dense one and their fusion) are the only
+    /// step of [`Self::search`] that differs between them: validation, the
     /// store and filter snapshot, the threshold, ordering and reading chunk
-    /// text around it work on chunk keys (attachment, ordinal) and scores,
-    /// whatever produced them.
+    /// text work on chunk keys (attachment, ordinal) and scores, whatever
+    /// produced them.
     fn rank_lexical(&self, plan: &SearchPlan, files: &[String]) -> Result<Vec<(ChunkKey, f64)>> {
+        let mut hits = Vec::new();
+        for query in &plan.queries {
+            let top = self.lexical_hits(query, files, plan.limit)?;
+            hits.extend(top.into_iter().map(|(key, score)| (key, normalize(score))));
+        }
+        Ok(best_per_chunk(hits))
+    }
+
+    /// The best `limit` BM25 hits of one query among the chunks of `files`,
+    /// best first, with raw BM25 scores.
+    fn lexical_hits(
+        &self,
+        query: &str,
+        files: &[String],
+        limit: usize,
+    ) -> Result<Vec<(ChunkKey, f32)>> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let mut best: BTreeMap<ChunkKey, f64> = BTreeMap::new();
+        let words = self.words(query)?;
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
         let searcher = self.reader.searcher();
         let allowed: Box<dyn tantivy::query::Query> = Box::new(ConstScoreQuery::new(
             Box::new(TermSetQuery::new(
@@ -278,70 +448,91 @@ impl VectorIndex {
             )),
             0.0,
         ));
-        for query in &plan.queries {
-            let words = self.words(query)?;
-            if words.is_empty() {
-                continue;
-            }
-            let any_word = BooleanQuery::new(
-                words
-                    .iter()
-                    .map(|word| {
-                        let term = Term::from_field_text(self.fields.text, word);
-                        let query: Box<dyn tantivy::query::Query> =
-                            Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
-                        (Occur::Should, query)
-                    })
-                    .collect(),
-            );
-            let query = BooleanQuery::new(vec![
-                (Occur::Must, allowed.box_clone()),
-                (Occur::Must, Box::new(any_word)),
-            ]);
-            let top = TopDocs::with_limit(plan.limit).order_by_score();
-            for (score, address) in searcher.search(&query, &top).map_err(index_error)? {
-                let key = self.chunk_key(&searcher, address)?;
-                let reported = normalize(score);
-                let entry = best.entry(key).or_insert(reported);
-                *entry = entry.max(reported);
-            }
-        }
-        Ok(best.into_iter().collect())
+        let any_word = BooleanQuery::new(
+            words
+                .iter()
+                .map(|word| {
+                    let term = Term::from_field_text(self.fields.text, word);
+                    let query: Box<dyn tantivy::query::Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                    (Occur::Should, query)
+                })
+                .collect(),
+        );
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, allowed),
+            (Occur::Must, Box::new(any_word)),
+        ]);
+        let top = TopDocs::with_limit(limit).order_by_score();
+        searcher
+            .search(&query, &top)
+            .map_err(index_error)?
+            .into_iter()
+            .map(|(score, address)| Ok((self.chunk_key(&searcher, address)?, score)))
+            .collect()
     }
 
     /// Index the oldest files still `in_progress` (at most
     /// [`INDEX_BATCH_FILES`], stopping once their text reaches
-    /// [`INDEX_BATCH_BYTES`]); how many were processed, 0 when none was
-    /// waiting.
+    /// [`INDEX_BATCH_BYTES`], or [`EMBED_BATCH_BYTES`] with an embedding
+    /// model); how many were processed, 0 when none was waiting.
     ///
-    /// Order: record the attachments in the garbage outbox, write and commit
-    /// their index documents, then, in one database transaction, mark each
-    /// `completed`, insert its chunk rows and remove it from the outbox. A
-    /// crash between the steps leaves documents the outbox removes; a file
-    /// deleted, cancelled or re-attached meanwhile keeps its outbox entry.
-    // The writer lock spans the whole protocol: the outbox entries, the
-    // index commit and the confirming transaction must not interleave with
-    // another indexing run or a collection.
-    #[allow(clippy::significant_drop_tightening)]
+    /// Order: parse the files and, with an embedding model, embed their
+    /// chunks (no lock held: this is the slow part); then, under the writer
+    /// lock, keep the files still `in_progress`, record them in the garbage
+    /// outbox, write and commit their index documents, then, in one
+    /// database transaction, mark each `completed`, insert its chunk rows
+    /// and vectors and remove it from the outbox. A crash between the steps
+    /// leaves documents the outbox removes; a file deleted, cancelled or
+    /// re-attached meanwhile keeps its outbox entry.
     pub fn index_next(&self) -> Result<usize> {
-        let mut writer = self.lock();
+        self.index_batch(&|| false)
+    }
+
+    /// [`Self::index_next`], abandoning the batch (an error, files left
+    /// `in_progress`) when `stop()` turns true while embedding.
+    // The writer lock spans the whole write protocol: the outbox entries,
+    // the index commit and the confirming transaction must not interleave
+    // with another indexing run or a collection.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    pub(crate) fn index_batch(&self, stop: &dyn Fn() -> bool) -> Result<usize> {
+        let embedder = self.embedder();
+        let budget = if embedder.is_some() {
+            EMBED_BATCH_BYTES
+        } else {
+            INDEX_BATCH_BYTES
+        };
         let pending = next_pending(&self.store.connection()?, INDEX_BATCH_FILES)?;
         let mut parsed = Vec::new();
         let mut failed = Vec::new();
         let mut bytes = 0;
         for file in pending {
-            if bytes >= INDEX_BATCH_BYTES {
+            if bytes >= budget {
                 break;
             }
             match self.store.parse_source(&file) {
                 Ok((text, ranges)) => {
                     bytes += text.len();
-                    parsed.push((file, text, ranges));
+                    parsed.push((file, text, ranges, None));
                 }
                 Err(error) => failed.push((file, error)),
             }
         }
         let processed = parsed.len() + failed.len();
+        if let Some(embedder) = &embedder {
+            for (file, text, ranges, vectors) in &mut parsed {
+                match embed_chunks(embedder.as_ref(), text, ranges, stop) {
+                    Ok(encoded) => *vectors = Some((embedder.space().to_owned(), encoded)),
+                    Err(error) if stop() => return Err(error),
+                    // Indexed for BM25 now; the backfill retries the vectors.
+                    Err(error) => eprintln!(
+                        "warning: embedding vector store file {} failed ({error}); it is \
+                         searchable by keywords until its vectors are computed",
+                        file.file_id
+                    ),
+                }
+            }
+        }
         let mut connection = self.store.connection()?;
         if !failed.is_empty() {
             let transaction =
@@ -359,15 +550,34 @@ impl VectorIndex {
         if parsed.is_empty() {
             return Ok(processed);
         }
+        let mut writer = self.lock();
+        // Files only leave `in_progress` for `completed` under this lock, so
+        // a file still in progress now cannot be completed by anyone else
+        // before the confirming transaction below.
+        {
+            let mut still = connection.prepare(
+                "SELECT 1 FROM vector_store_files WHERE attach_id = ?1 AND status = 'in_progress'",
+            )?;
+            let mut kept = Vec::with_capacity(parsed.len());
+            for entry in parsed {
+                if still.exists([&entry.0.attach_id])? {
+                    kept.push(entry);
+                }
+            }
+            parsed = kept;
+        }
+        if parsed.is_empty() {
+            return Ok(processed);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (file, _, _) in &parsed {
+        for (file, _, _, _) in &parsed {
             transaction.execute(
                 "INSERT OR IGNORE INTO vector_store_index_garbage (attach_id) VALUES (?1)",
                 [&file.attach_id],
             )?;
         }
         transaction.commit()?;
-        for (file, text, ranges) in &parsed {
+        for (file, text, ranges, _) in &parsed {
             writer.delete_term(Term::from_field_text(self.fields.attach, &file.attach_id));
             for (ordinal, &(start, end)) in ranges.iter().enumerate() {
                 let part = text
@@ -386,7 +596,8 @@ impl VectorIndex {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut complete = transaction.prepare(
-                "UPDATE vector_store_files SET status = 'completed', usage_bytes = ?2, text = ?3
+                "UPDATE vector_store_files SET status = 'completed', usage_bytes = ?2, text = ?3,
+                                               embedding_space = ?4
                  WHERE attach_id = ?1 AND status = 'in_progress'",
             )?;
             let mut insert = transaction.prepare(
@@ -395,11 +606,12 @@ impl VectorIndex {
             )?;
             let mut confirm = transaction
                 .prepare("DELETE FROM vector_store_index_garbage WHERE attach_id = ?1")?;
-            for (file, text, ranges) in &parsed {
+            for (file, text, ranges, vectors) in &parsed {
                 let changed = complete.execute(params![
                     file.attach_id,
                     signed(count(text.len()))?,
-                    text.as_bytes()
+                    text.as_bytes(),
+                    vectors.as_ref().map(|(space, _)| space.as_str()),
                 ])?;
                 if changed == 0 {
                     continue;
@@ -412,8 +624,102 @@ impl VectorIndex {
                         signed(count(end))?
                     ])?;
                 }
+                if let Some((_, encoded)) = vectors {
+                    store_vectors(&transaction, &file.attach_id, encoded)?;
+                }
                 confirm.execute([&file.attach_id])?;
             }
+        }
+        transaction.commit()?;
+        Ok(processed)
+    }
+
+    /// Embed the oldest completed files whose vectors are missing or in
+    /// another space than the installed embedding model's (at most
+    /// [`INDEX_BATCH_FILES`], stopping once their text reaches
+    /// [`EMBED_BATCH_BYTES`]); how many were embedded, 0 when none was
+    /// waiting or no model is installed.
+    ///
+    /// This is the backfill of stores indexed before embeddings (or while
+    /// the model was absent). Each file's vectors replace its old ones and
+    /// its `embedding_space` is set in one database transaction, only if
+    /// it is still the same completed attachment; nothing else changes, so
+    /// a crash at any point leaves the file as it was (embedded again on
+    /// the next run).
+    pub fn embed_next(&self) -> Result<usize> {
+        self.embed_batch(&|| false)
+    }
+
+    /// [`Self::embed_next`], abandoning the batch (an error, nothing
+    /// written) when `stop()` turns true.
+    pub(crate) fn embed_batch(&self, stop: &dyn Fn() -> bool) -> Result<usize> {
+        let Some(embedder) = self.embedder() else {
+            return Ok(0);
+        };
+        let space = embedder.space();
+        let mut connection = self.store.connection()?;
+        let candidates: Vec<(String, i64)> = {
+            let mut statement = connection.prepare(
+                "SELECT attach_id, length(text) FROM vector_store_files
+                 WHERE status = 'completed' AND (embedding_space IS NULL OR embedding_space != ?1)
+                 ORDER BY seq LIMIT ?2",
+            )?;
+            statement
+                .query_map(params![space, signed(count(INDEX_BATCH_FILES))?], |row| {
+                    Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0)))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut done = Vec::new();
+        let mut bytes = 0_usize;
+        for (attach_id, length) in candidates {
+            if bytes >= EMBED_BATCH_BYTES {
+                break;
+            }
+            bytes += usize::try_from(length).unwrap_or(0);
+            let snapshot = connection.transaction()?;
+            let text: Option<Vec<u8>> = snapshot
+                .query_row(
+                    "SELECT text FROM vector_store_files WHERE attach_id = ?1",
+                    [&attach_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let ranges = chunk_ranges(&snapshot, &attach_id)?;
+            drop(snapshot);
+            let Some(text) = text else { continue };
+            let text = String::from_utf8(text).map_err(|_| corrupt("vector store file text"))?;
+            let encoded = embed_chunks(embedder.as_ref(), &text, &ranges, stop)?;
+            done.push((attach_id, ranges.len(), encoded));
+        }
+        let processed = done.len();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (attach_id, chunks, encoded) in &done {
+            // Still the same completed attachment, with the chunks embedded.
+            let current: Option<i64> = transaction
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM vector_store_chunks c
+                             WHERE c.attach_id = f.attach_id)
+                     FROM vector_store_files f
+                     WHERE f.attach_id = ?1 AND f.status = 'completed'
+                       AND (f.embedding_space IS NULL OR f.embedding_space != ?2)",
+                    params![attach_id, space],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current != Some(signed(count(*chunks))?) {
+                continue;
+            }
+            transaction.execute(
+                "DELETE FROM vector_store_embeddings WHERE attach_id = ?1",
+                [attach_id],
+            )?;
+            store_vectors(&transaction, attach_id, encoded)?;
+            transaction.execute(
+                "UPDATE vector_store_files SET embedding_space = ?2 WHERE attach_id = ?1",
+                params![attach_id, space],
+            )?;
         }
         transaction.commit()?;
         Ok(processed)
@@ -458,10 +764,13 @@ impl VectorIndex {
         if !consistent {
             self.rebuild(&mut writer, &snapshot)?;
         }
+        drop(snapshot);
+        let vectors_repaired = repair_vectors(&mut connection)?;
         Ok(IndexCheck {
             chunks,
             collected,
             rebuilt: !consistent,
+            vectors_repaired,
         })
     }
 
@@ -490,6 +799,12 @@ impl VectorIndex {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for attach_id in &batch {
+                // Vectors go with the outbox entry, atomically: an outbox
+                // entry covers every piece of an attachment's derived data.
+                transaction.execute(
+                    "DELETE FROM vector_store_embeddings WHERE attach_id = ?1",
+                    [attach_id],
+                )?;
                 transaction.execute(
                     "DELETE FROM vector_store_index_garbage WHERE attach_id = ?1",
                     [attach_id],
@@ -579,6 +894,7 @@ struct SearchPlan {
     queries: Vec<String>,
     limit: usize,
     threshold: f64,
+    ranker: Ranker,
 }
 
 impl SearchPlan {
@@ -595,8 +911,7 @@ impl SearchPlan {
         }
         if request.rewrite_query {
             return Err(invalid(
-                "rewrite_query is not supported: this server ranks with lexical BM25 and has \
-                 no query rewriter",
+                "rewrite_query is not supported: this server has no query rewriter",
             ));
         }
         let limit = request.max_num_results.unwrap_or(DEFAULT_NUM_RESULTS);
@@ -608,8 +923,9 @@ impl SearchPlan {
         let options = request.ranking_options.unwrap_or_default();
         if options.ranker == Ranker::Default20241115 {
             return Err(invalid(
-                "ranker default-2024-11-15 is not available; use auto or none (both are plain \
-                 BM25 here)",
+                "ranker default-2024-11-15 is not available; use auto (hybrid BM25 and \
+                 embedding search when an embedding model is installed, BM25 otherwise) or none \
+                 (BM25 only)",
             ));
         }
         if !(0.0..=1.0).contains(&options.score_threshold) {
@@ -624,6 +940,7 @@ impl SearchPlan {
             queries,
             limit: usize::try_from(limit).unwrap_or(usize::MAX),
             threshold: options.score_threshold,
+            ranker: options.ranker,
         })
     }
 }
@@ -632,6 +949,251 @@ impl SearchPlan {
 fn normalize(score: f32) -> f64 {
     let score = f64::from(score).max(0.0);
     score / (1.0 + score)
+}
+
+/// Each chunk once, with its best score.
+fn best_per_chunk(hits: impl IntoIterator<Item = (ChunkKey, f64)>) -> Vec<(ChunkKey, f64)> {
+    let mut best: BTreeMap<ChunkKey, f64> = BTreeMap::new();
+    for (key, score) in hits {
+        let entry = best.entry(key).or_insert(score);
+        *entry = entry.max(score);
+    }
+    best.into_iter().collect()
+}
+
+/// Weighted reciprocal rank fusion of one query's BM25 and cosine rankings
+/// (each best first): `Σ wᵢ / (k + rankᵢ)` with 1-based ranks, divided by
+/// its largest possible value `(w_text + w_embedding) / (k + 1)`, so a chunk
+/// ranked first by both scores 1.
+fn fuse(
+    lexical: &[(ChunkKey, f32)],
+    dense: &[(ChunkKey, f32)],
+    k: f64,
+    text_weight: f64,
+    embedding_weight: f64,
+) -> Vec<(ChunkKey, f64)> {
+    let mut fused: BTreeMap<ChunkKey, f64> = BTreeMap::new();
+    for (list, weight) in [(lexical, text_weight), (dense, embedding_weight)] {
+        for (rank, (key, _)) in list.iter().enumerate() {
+            let rank = f64::from(u32::try_from(rank).unwrap_or(u32::MAX)) + 1.0;
+            *fused.entry(key.clone()).or_insert(0.0) += weight / (k + rank);
+        }
+    }
+    let best = (text_weight + embedding_weight) / (k + 1.0);
+    fused
+        .into_iter()
+        .map(|(key, score)| (key, if best > 0.0 { score / best } else { 0.0 }))
+        .collect()
+}
+
+/// For each query vector, the best `depth` chunks of `files` by cosine
+/// similarity (best first), among the files whose vectors are in `space`.
+///
+/// Brute force: every stored vector of those files is read once (streamed
+/// from the database, never all in memory) and compared with every query;
+/// memory is `depth` hits per query.
+fn rank_dense(
+    snapshot: &rusqlite::Connection,
+    store_id: &str,
+    files: &[String],
+    space: &str,
+    queries: &[Vec<f32>],
+    depth: usize,
+) -> Result<Vec<Vec<(ChunkKey, f32)>>> {
+    let mut tops: Vec<Vec<(ChunkKey, f32)>> = vec![Vec::new(); queries.len()];
+    if files.is_empty() || queries.is_empty() {
+        return Ok(tops);
+    }
+    let embedded: HashSet<String> = {
+        let mut statement = snapshot.prepare(
+            "SELECT attach_id FROM vector_store_files
+             WHERE store_id = ?1 AND status = 'completed' AND embedding_space = ?2",
+        )?;
+        statement
+            .query_map(params![store_id, space], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let width = queries[0].len();
+    let mut vector = vec![0.0_f32; width];
+    let mut statement = snapshot
+        .prepare("SELECT ordinal, vector FROM vector_store_embeddings WHERE attach_id = ?1")?;
+    for attach_id in files.iter().filter(|file| embedded.contains(*file)) {
+        let mut rows = statement.query([attach_id])?;
+        while let Some(row) = rows.next()? {
+            let ordinal = unsigned(row.get(0)?)?;
+            let bytes = row
+                .get_ref(1)?
+                .as_blob()
+                .map_err(|_| corrupt("chunk vector"))?;
+            if !decode(bytes, &mut vector) {
+                return Err(corrupt("chunk vector"));
+            }
+            for (query, top) in queries.iter().zip(&mut tops) {
+                let cosine: f32 = query.iter().zip(&vector).map(|(a, b)| a * b).sum();
+                top.push(((attach_id.clone(), ordinal), cosine));
+                if top.len() >= depth.saturating_mul(4).max(64) {
+                    keep_best(top, depth);
+                }
+            }
+        }
+    }
+    for top in &mut tops {
+        keep_best(top, depth);
+    }
+    Ok(tops)
+}
+
+/// Sort hits best first (ties by chunk key) and keep `depth`.
+fn keep_best(hits: &mut Vec<(ChunkKey, f32)>, depth: usize) {
+    let order = |left: &(ChunkKey, f32), right: &(ChunkKey, f32)| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    if hits.len() > depth && depth > 0 {
+        hits.select_nth_unstable_by(depth - 1, order);
+    }
+    hits.truncate(depth);
+    hits.sort_by(order);
+}
+
+/// Refuse embedder output of the wrong shape.
+fn check_vectors(vectors: &[Vec<f32>], expected: usize, width: usize) -> Result<()> {
+    if vectors.len() != expected || vectors.iter().any(|vector| vector.len() != width) {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "the embedding model returned {} vectors for {expected} inputs, or a width other \
+             than {width}",
+            vectors.len()
+        ))));
+    }
+    Ok(())
+}
+
+/// Embed the chunks `ranges` of `text` with the document prompt, a group at
+/// a time, as stored vectors (F16, little-endian).
+fn embed_chunks(
+    embedder: &dyn ChunkEmbedder,
+    text: &str,
+    ranges: &[(usize, usize)],
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<Vec<u8>>> {
+    let mut encoded = Vec::with_capacity(ranges.len());
+    for group in ranges.chunks(EMBED_GROUP_CHUNKS) {
+        let parts = group
+            .iter()
+            .map(|&(start, end)| {
+                text.get(start..end)
+                    .ok_or_else(|| corrupt("chunk boundary"))
+            })
+            .collect::<Result<Vec<&str>>>()?;
+        let vectors = embedder.embed_documents(&parts, stop)?;
+        check_vectors(&vectors, parts.len(), embedder.dimensions())?;
+        encoded.extend(vectors.iter().map(|vector| encode(vector)));
+    }
+    Ok(encoded)
+}
+
+/// The chunk byte ranges of an attachment, by ordinal.
+fn chunk_ranges(connection: &rusqlite::Connection, attach_id: &str) -> Result<Vec<(usize, usize)>> {
+    let mut statement = connection.prepare(
+        "SELECT start, end FROM vector_store_chunks WHERE attach_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement
+        .query_map([attach_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(start, end)| {
+            Ok((
+                usize::try_from(start).map_err(|_| corrupt("chunk boundary"))?,
+                usize::try_from(end).map_err(|_| corrupt("chunk boundary"))?,
+            ))
+        })
+        .collect()
+}
+
+/// Insert an attachment's vectors, ordinal by ordinal.
+fn store_vectors(
+    transaction: &rusqlite::Transaction<'_>,
+    attach_id: &str,
+    encoded: &[Vec<u8>],
+) -> Result<()> {
+    let mut insert = transaction.prepare(
+        "INSERT INTO vector_store_embeddings (attach_id, ordinal, vector) VALUES (?1, ?2, ?3)",
+    )?;
+    for (ordinal, vector) in encoded.iter().enumerate() {
+        insert.execute(params![attach_id, signed(count(ordinal))?, vector])?;
+    }
+    Ok(())
+}
+
+/// Restore the vector invariant (see the parent module docs): drop vector
+/// rows that belong neither to a completed, embedded file nor to an
+/// attachment awaiting collection, and the vectors of embedded files whose
+/// rows do not match their chunks one to one (those are embedded again).
+/// How many files and stray rows were repaired.
+fn repair_vectors(connection: &mut rusqlite::Connection) -> Result<u64> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stray = transaction.execute(
+        "DELETE FROM vector_store_embeddings
+         WHERE attach_id NOT IN (SELECT attach_id FROM vector_store_index_garbage)
+           AND attach_id NOT IN (SELECT attach_id FROM vector_store_files
+                                 WHERE status = 'completed' AND embedding_space IS NOT NULL)",
+        [],
+    )?;
+    let mismatched: Vec<String> = {
+        let mut statement = transaction.prepare(
+            "SELECT f.attach_id FROM vector_store_files f
+             WHERE f.status = 'completed' AND f.embedding_space IS NOT NULL
+               AND ((SELECT COUNT(*) FROM vector_store_chunks c WHERE c.attach_id = f.attach_id)
+                    != (SELECT COUNT(*) FROM vector_store_embeddings e
+                        JOIN vector_store_chunks c
+                          ON c.attach_id = e.attach_id AND c.ordinal = e.ordinal
+                        WHERE e.attach_id = f.attach_id)
+                    OR (SELECT COUNT(DISTINCT length(e.vector)) FROM vector_store_embeddings e
+                        WHERE e.attach_id = f.attach_id) != 1
+                    OR EXISTS (SELECT 1 FROM vector_store_embeddings e
+                               WHERE e.attach_id = f.attach_id
+                                 AND e.ordinal NOT IN (SELECT ordinal FROM vector_store_chunks c
+                                                       WHERE c.attach_id = f.attach_id)))",
+        )?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for attach_id in &mismatched {
+        transaction.execute(
+            "DELETE FROM vector_store_embeddings WHERE attach_id = ?1",
+            [attach_id],
+        )?;
+        transaction.execute(
+            "UPDATE vector_store_files SET embedding_space = NULL WHERE attach_id = ?1",
+            [attach_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(count(stray) + count(mismatched.len()))
+}
+
+/// A vector as stored: F16, little-endian.
+fn encode(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| f16::from_f32(*value).to_le_bytes())
+        .collect()
+}
+
+/// Decode a stored vector into `out`; false if the width differs.
+fn decode(bytes: &[u8], out: &mut [f32]) -> bool {
+    if bytes.len() != out.len() * 2 {
+        return false;
+    }
+    for (value, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *value = f16::from_le_bytes(*pair).to_f32();
+    }
+    true
 }
 
 /// Up to `limit` attachments of the garbage outbox.
