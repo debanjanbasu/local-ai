@@ -1,10 +1,10 @@
 //! Reference checks and throughput for the native Whisper large-v3 model
-//! (see `docs/SPEECH.md`).
+//! (see `docs/TRANSCRIPTION.md`).
 //!
 //! ```text
-//! speech-eval parity DIR
-//! speech-eval transcribe MANIFEST.json OUT.jsonl
-//! speech-eval bench AUDIO
+//! transcription-eval parity DIR
+//! transcription-eval transcribe MANIFEST.json OUT.jsonl
+//! transcription-eval bench AUDIO
 //! ```
 //!
 //! The model loads from `models/whisper-large-v3` under the working
@@ -26,8 +26,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use local_engine::speech::{
-    Pace, SpeechModel, Task, Temperature, TranscribeOptions, audio, installed_model,
+use local_engine::transcription::{
+    Pace, Task, Temperature, TranscribeOptions, TranscriptionModel, audio, installed_model,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -36,11 +36,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const PADDING: usize = 480_000;
 
-fn open() -> Result<SpeechModel> {
+fn open() -> Result<TranscriptionModel> {
     let dir = installed_model(Path::new("models"))
-        .ok_or("models/whisper-large-v3 is not installed (see docs/SPEECH.md)")?;
+        .ok_or("models/whisper-large-v3 is not installed (see docs/TRANSCRIPTION.md)")?;
     let started = Instant::now();
-    let model = SpeechModel::open(&dir)?;
+    let model = TranscriptionModel::open(&dir)?;
     eprintln!("loaded {} in {:.2?}", dir.display(), started.elapsed());
     Ok(model)
 }
@@ -394,6 +394,8 @@ fn main() -> Result<()> {
             transcribe(Path::new(manifest), Path::new(out))
         }
         [mode, file] if mode == "bench" => bench(Path::new(file)),
-        _ => Err("usage: speech-eval parity DIR | transcribe MANIFEST OUT | bench AUDIO".into()),
+        _ => Err(
+            "usage: transcription-eval parity DIR | transcribe MANIFEST OUT | bench AUDIO".into(),
+        ),
     }
 }

@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::speech::tokens::{LANGUAGES, SpecialTokens, WhisperTokenizer};
+use crate::transcription::tokens::{LANGUAGES, SpecialTokens, WhisperTokenizer};
 
 const EOT: u32 = 50_257;
 const SOT: u32 = 50_258;

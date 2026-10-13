@@ -10,7 +10,7 @@
 //!
 //! The model is optional and opt-in by installation: it exists only when
 //! `models/whisper-large-v3/` holds the artifact written by
-//! `tools/convert_whisper.py` and its `tokenizer.json` (see `docs/SPEECH.md`).
+//! `tools/convert_whisper.py` and its `tokenizer.json` (see `docs/TRANSCRIPTION.md`).
 //! Audio files are decoded by [`audio`].
 
 mod artifact;
@@ -30,11 +30,11 @@ use model::{Bound, WhisperGpu};
 use tokens::WhisperTokenizer;
 
 /// Installation directory name inside a models directory.
-pub const SPEECH_MODEL_DIR: &str = "whisper-large-v3";
-/// Artifact file name inside [`SPEECH_MODEL_DIR`].
-pub const SPEECH_ARTIFACT: &str = "whisper-large-v3-f16.bin";
+pub const TRANSCRIPTION_MODEL_DIR: &str = "whisper-large-v3";
+/// Artifact file name inside [`TRANSCRIPTION_MODEL_DIR`].
+pub const TRANSCRIPTION_ARTIFACT: &str = "whisper-large-v3-f16.bin";
 /// Model id reported by the API.
-pub const SPEECH_MODEL_ID: &str = "whisper-large-v3";
+pub const TRANSCRIPTION_MODEL_ID: &str = "whisper-large-v3";
 /// Input sample rate.
 pub const SAMPLE_RATE: u32 = audio::SAMPLE_RATE;
 
@@ -51,8 +51,9 @@ const FFN: usize = 5120;
 /// tokenizer are there.
 #[must_use]
 pub fn installed_model(models_dir: &Path) -> Option<PathBuf> {
-    let dir = models_dir.join(SPEECH_MODEL_DIR);
-    (dir.join(SPEECH_ARTIFACT).is_file() && dir.join("tokenizer.json").is_file()).then_some(dir)
+    let dir = models_dir.join(TRANSCRIPTION_MODEL_DIR);
+    (dir.join(TRANSCRIPTION_ARTIFACT).is_file() && dir.join("tokenizer.json").is_file())
+        .then_some(dir)
 }
 
 /// Transcribe in the spoken language, or translate into English.
@@ -156,14 +157,14 @@ pub struct Pace<'a> {
 }
 
 /// The loaded model. Not internally synchronized: one call at a time.
-pub struct SpeechModel {
+pub struct TranscriptionModel {
     gpu: WhisperGpu,
     artifact: Artifact,
     tokenizer: WhisperTokenizer,
     filters: MelFilters,
 }
 
-impl SpeechModel {
+impl TranscriptionModel {
     /// Load and verify an installation directory (artifact + tokenizer).
     ///
     /// # Errors
@@ -171,7 +172,7 @@ impl SpeechModel {
     /// Fails when a file is missing, the artifact does not verify, or Metal
     /// cannot be set up.
     pub fn open(dir: &Path) -> crate::Result<Self> {
-        let artifact = Artifact::open(&dir.join(SPEECH_ARTIFACT))?;
+        let artifact = Artifact::open(&dir.join(TRANSCRIPTION_ARTIFACT))?;
         let tokenizer =
             WhisperTokenizer::open(&dir.join("tokenizer.json"), artifact.tokens.clone())?;
         let filters = artifact.f32_values("mel_filters", N_MELS, mel::FFT_BINS)?;
