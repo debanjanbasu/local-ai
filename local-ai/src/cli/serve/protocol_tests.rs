@@ -634,7 +634,7 @@ fn responses_reject_what_they_cannot_honour() {
         ),
         (json!({"input":"hi","background":true}), "background"),
         (
-            json!({"input":"hi","tools":[{"type":"web_search"}]}),
+            json!({"input":"hi","tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]}),
             "tool type",
         ),
         (
