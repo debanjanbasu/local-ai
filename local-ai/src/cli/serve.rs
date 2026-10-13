@@ -29,6 +29,7 @@ mod evals;
 mod hosted;
 mod http3;
 mod journal;
+mod moderations;
 mod openai_decisions;
 mod options;
 mod reasoning_crypto;
@@ -126,6 +127,8 @@ struct AppState {
     tools: Option<Arc<tool_loop::Tools>>,
     /// Native text embeddings, when the embedding model is installed.
     embeddings: Option<Arc<embeddings::Embeddings>>,
+    /// `POST /v1/moderations`, when the moderation artifact is installed too.
+    moderations: Option<Arc<moderations::Moderations>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -237,6 +240,9 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             &parts.headers,
         )
         .await;
+    }
+    if parts.method == Method::POST && parts.uri.path() == moderations::ROUTE {
+        return moderations::handle(&state, &parts.headers, body).await;
     }
     if parts.method == Method::POST && parts.uri.path() == embeddings::ROUTE {
         return embeddings::handle(&state, &parts.headers, body).await;
@@ -1063,8 +1069,13 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let context = engine.info().model.context;
     let engine = engine.into_handle();
     // Beside the Bonsai model's own folder: `models/embeddinggemma2-text`.
-    let embeddings = match resources.model.parent().and_then(std::path::Path::parent) {
+    let models_dir = resources.model.parent().and_then(std::path::Path::parent);
+    let embeddings = match models_dir {
         Some(models_dir) => embeddings::Embeddings::start(models_dir, engine.activity())?,
+        None => None,
+    };
+    let moderations = match models_dir {
+        Some(models_dir) => moderations::Moderations::start(models_dir, embeddings.as_ref())?,
         None => None,
     };
     let mut state = AppState {
@@ -1092,6 +1103,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         evals: None,
         tools,
         embeddings,
+        moderations,
     };
     let address = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
