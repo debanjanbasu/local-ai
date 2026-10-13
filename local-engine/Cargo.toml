@@ -16,6 +16,9 @@ local-metal = { path = "../local-metal" }
 bytemuck.workspace = true
 futures-core = "0.3"
 half.workspace = true
+# Image decoding for the optional EmbeddingGemma 2 vision encoder. No default
+# features: no rayon pool, only the formats the embedding API accepts.
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 # Tool argument schemas. No default features: no HTTP or file `$ref`
 # retrieval (and no `idna`), so validation never leaves the process.
 jsonschema = { version = "0.58.6", default-features = false }
