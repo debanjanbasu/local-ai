@@ -51,8 +51,8 @@ struct Resampler {
     step: f64,
     /// Filter half-width in input samples.
     half_width: f64,
-    cutoff: f64,
-    /// Kaiser window over [-1, 1] sampled at `TABLE` points per side.
+    /// The windowed-sinc kernel at distances `0, 1/RESOLUTION, …,
+    /// half_width` (input samples), interpolated linearly.
     table: Vec<f64>,
     input: Vec<f64>,
     /// Absolute index of `input[0]`.
@@ -61,7 +61,8 @@ struct Resampler {
     next: u64,
 }
 
-const TABLE: usize = 4096;
+/// Kernel table points per input sample.
+const RESOLUTION: f64 = 512.0;
 const ZERO_CROSSINGS: f64 = 16.0;
 const KAISER_BETA: f64 = 9.0;
 /// Pass band as a fraction of the lower Nyquist rate (`FFmpeg`'s default).
@@ -87,16 +88,27 @@ impl Resampler {
         let cutoff = CUTOFF * (1.0 / step).min(1.0);
         let half_width = ZERO_CROSSINGS / cutoff;
         let norm = bessel_i0(KAISER_BETA);
-        let table = (0..=TABLE)
+        let points = (half_width * RESOLUTION).ceil() as usize + 2;
+        let table = (0..points)
             .map(|i| {
-                let x = i as f64 / TABLE as f64;
-                bessel_i0(KAISER_BETA * x.mul_add(-x, 1.0).max(0.0).sqrt()) / norm
+                let distance = i as f64 / RESOLUTION;
+                let x = distance / half_width;
+                if x >= 1.0 {
+                    return 0.0;
+                }
+                let window = bessel_i0(KAISER_BETA * x.mul_add(-x, 1.0).max(0.0).sqrt()) / norm;
+                let arg = std::f64::consts::PI * cutoff * distance;
+                let sinc = if arg.abs() < 1e-12 {
+                    1.0
+                } else {
+                    arg.sin() / arg
+                };
+                cutoff * sinc * window
             })
             .collect();
         Self {
             step,
             half_width,
-            cutoff,
             table,
             input: Vec::new(),
             base: 0,
@@ -105,22 +117,13 @@ impl Resampler {
     }
 
     fn kernel(&self, distance: f64) -> f64 {
-        let x = distance.abs() / self.half_width;
-        if x >= 1.0 {
+        let position = distance.abs() * RESOLUTION;
+        let index = position as usize;
+        if index + 1 >= self.table.len() {
             return 0.0;
         }
-        let position = x * TABLE as f64;
-        let index = position as usize;
         let frac = position - index as f64;
-        let next = self.table[(index + 1).min(TABLE)];
-        let window = (next - self.table[index]).mul_add(frac, self.table[index]);
-        let arg = std::f64::consts::PI * self.cutoff * distance;
-        let sinc = if arg.abs() < 1e-12 {
-            1.0
-        } else {
-            arg.sin() / arg
-        };
-        self.cutoff * sinc * window
+        (self.table[index + 1] - self.table[index]).mul_add(frac, self.table[index])
     }
 
     /// Outputs computable from the buffered input; `flush` treats the input
