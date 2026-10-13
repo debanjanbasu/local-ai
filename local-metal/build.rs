@@ -19,6 +19,7 @@ fn main() {
         "sampling.metal",
         "draft.metal",
         "embedding.metal",
+        "kokoro.metal",
     ];
 
     let mut air_files = Vec::new();

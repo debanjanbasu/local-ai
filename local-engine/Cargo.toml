@@ -23,7 +23,12 @@ jsonschema = { version = "0.58.6", default-features = false }
 # (remote/file `$ref` retrieval), no rayon thread pool. The Lark front end
 # builds the native tool-call grammar.
 llguidance = { version = "=1.9.1", default-features = false, features = ["lark"] }
+# Speech output encoders (pure Rust, permissive; see docs/SPEECH.md).
+flacenc = { version = "0.5.1", default-features = false }
 memmap2 = "0.9"
+ogg = "0.9.2"
+rusty_mp3 = "1.0.0"
+rusty-opus = "1.0.1"
 objc2 = "0.6"
 objc2-metal = { version = "0.3", features = ["MTLBuffer", "MTLDevice"] }
 serde.workspace = true
