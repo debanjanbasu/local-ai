@@ -1,17 +1,21 @@
 //! Vector stores: `OpenAI`-compatible, durable collections of parsed files
-//! with ranked **lexical** search.
+//! with ranked **lexical** search, and **semantic** (embedding) search when
+//! an embedding model is installed.
 //!
 //! # What "vector store" means here
 //!
-//! The API shape is `OpenAI`'s, but ranking is BM25 over a persistent
+//! The API shape is `OpenAI`'s. Lexical ranking is BM25 over a persistent
 //! [Tantivy](tantivy) index ([`VectorIndex`]; Unicode words, lowercased,
-//! folded to ASCII, English Porter-2 stemming). No embedding model is
-//! involved, so search matches words, not meaning: a query with no word
-//! (after stemming) in common with a chunk never finds it. Pooled hidden
-//! states of the server's Bonsai checkpoint were measured as retrieval
-//! embeddings and lost to BM25 (see `docs/BONSAI.md`); a dedicated embedding
-//! model would rank through the seam described under "Adding embedding
-//! ranking" below.
+//! folded to ASCII, English Porter-2 stemming), which matches words, not
+//! meaning: a query with no word (after stemming) in common with a chunk
+//! never finds it lexically. With an embedding model installed
+//! ([`VectorIndex::set_embedder`], a [`ChunkEmbedder`]; the server uses the
+//! native `EmbeddingGemma` 2 text encoder when its artifact is present),
+//! every chunk is also embedded and searches rank chunks by the cosine
+//! similarity of their embeddings to the query's (see "Embeddings").
+//! Without one, nothing here computes embeddings and search is BM25 exactly. (Pooled
+//! hidden states of the server's Bonsai checkpoint were measured as
+//! retrieval embeddings and lost to BM25; see `docs/BONSAI.md`.)
 //!
 //! # Files and chunks
 //!
@@ -79,32 +83,101 @@
 //! BM25 score `s` (larger is better, never negative) is reported as
 //! `s / (1 + s)`: in `[0, 1)`, monotonic in BM25 within one query, **not** a
 //! calibrated similarity and not comparable across queries.
-//! `score_threshold` applies to that value. `rewrite_query: true` and the
-//! named `default-2024-11-15` reranker are refused (nothing here can rewrite
-//! queries or rerank); the rankers `auto` and `none` both mean plain BM25.
+//!
+//! `ranking_options` (the pinned `VectorStoreSearchRequest` defines only
+//! `ranker` and `score_threshold`; anything else, such as the `file_search`
+//! tool's `hybrid_search` weights, is an unknown field and refused):
+//!
+//! * `ranker: auto` (the default) is the embedding ranking when an
+//!   embedding model is installed and BM25 otherwise; `ranker: none` is
+//!   always BM25 alone (no query embedding, no GPU work: the low-latency
+//!   choice the spec describes); the named `default-2024-11-15` reranker is
+//!   refused, as is `rewrite_query: true` (nothing here can rerank with a
+//!   trained model or rewrite queries).
+//! * `score_threshold` (0 to 1) applies to the reported score of the
+//!   ranking used: `s / (1 + s)` for BM25, `max(cos, 0)` for embeddings,
+//!   the normalized fusion score while a store is partly embedded (below).
+//!
 //! Results are chunk-level, one item per chunk, at most `max_num_results`
 //! (1 to 50), never paged.
 //!
-//! # Adding embedding ranking
+//! # Embeddings
 //!
-//! Nothing here computes embeddings, but the design leaves one place for
-//! each piece an embedding ranker would need:
+//! **Ranking.** With an embedding model, `auto` ranks the admitted chunks
+//! by the cosine similarity of their embedding to the query's
+//! ([`Ranking::AUTO`]); the reported score is `max(cos, 0)`, a similarity
+//! (comparable across queries, unlike BM25's). This was chosen by
+//! measurement through this search path on `SciFact`, `NFCorpus` and
+//! `CosQA` (`docs/EMBEDDINGS.md`, "Vector stores"): embeddings alone beat
+//! BM25 on all three and beat every weighted reciprocal rank fusion of the
+//! two that was measured on `SciFact` and `CosQA` by wide margins, losing
+//! only on `NFCorpus`, by less than two points. The fusion
+//! ([`Ranking::Fused`], [`Ranking::HYBRID`]) stays available to
+//! [`VectorIndex::search_with`] for such measurements; no request field
+//! selects it (the pinned request has no fusion weights). A dense ranking
+//! always returns the nearest chunks, however far, so a query no chunk is
+//! about still gets results (with low scores; `score_threshold` cuts them).
+//! While some admitted file has no vectors in the current space yet (the
+//! backfill is running, or embedding it failed), `auto` uses
+//! [`Ranking::HYBRID`] instead, so that file is still found through BM25:
+//! equal-weight reciprocal rank fusion of the two rankings, its score
+//! normalized to `(0, 1]` (1 for a chunk first in both, 0.5 for one first in
+//! one ranking and absent from the other), rank-based rather than a
+//! similarity.
 //!
-//! * **Identity.** A chunk is (attachment, ordinal); its text is a byte
-//!   range of the file text in the database. Embeddings would be keyed the
-//!   same way, so search results, filters and content need no change.
-//! * **Writing.** [`VectorIndex::index_next`] is the one place chunks are
-//!   produced and committed; vectors would be computed and written there,
-//!   under the same outbox protocol (the outbox entry already covers every
-//!   piece of derived data of an attachment until its confirming
-//!   transaction), and removed by [`VectorIndex::collect_garbage`].
-//! * **Ranking.** [`VectorIndex::search`] validates the request, takes one
-//!   database snapshot, resolves the store and its admitted (completed,
-//!   filtered) attachments, and hands only those to one ranking step that
-//!   returns scored chunk keys; the threshold, ordering, truncation and
-//!   reading chunk text are independent of how the scores were made. The
-//!   options it refuses today (`rewrite_query`, the `default-2024-11-15`
-//!   ranker) are refused in one validation step.
+//! **Prompts.** The model's prompts are the [`ChunkEmbedder`]'s job: the
+//! server's embeds chunks with the model card's document prompt (no title)
+//! and queries with its `search result` query prompt.
+//!
+//! **Storage.** Vectors live in the database (`vector_store_embeddings`,
+//! one row per chunk, keyed like the chunk by attachment and ordinal, F16:
+//! 1.5 KB per chunk at 768 dimensions), next to the chunk rows, so they
+//! share the database's durability. A completed file's `embedding_space`
+//! names the vector space of its vectors ([`ChunkEmbedder::space`]: model,
+//! weights, width and prompts) or is NULL when it has none. The invariant
+//! extends the index's: **every chunk of a completed file with an
+//! `embedding_space` has exactly one vector; every other vector row belongs
+//! to an attachment listed in the garbage outbox.**
+//!
+//! * Indexing ([`VectorIndex::index_next`]) embeds a file's chunks before
+//!   taking the index lock, then inserts the vectors and sets the space in
+//!   the same confirming transaction that marks the file `completed`, so a
+//!   crash anywhere leaves either nothing or everything. If embedding fails
+//!   (other than by being stopped), the file still completes, searchable by
+//!   BM25, and the backfill embeds it later.
+//! * Collecting garbage deletes an attachment's vectors in the transaction
+//!   that clears its outbox entry, after its index documents are gone.
+//! * The **backfill** ([`VectorIndex::embed_next`], run by the indexer after
+//!   indexing, on start and on every notification, never polling) embeds
+//!   completed files without vectors in the current space: stores indexed
+//!   before embeddings existed (schema version 2 added the table and
+//!   column; existing files migrate with no vectors), files completed while
+//!   the model was absent or failed, and every file after a model or prompt
+//!   change. Each batch replaces a file's vectors and sets its space in one
+//!   transaction, only if it is still the same completed attachment. A new
+//!   attachment interrupts the backfill after the current batch, so new
+//!   files are indexed first.
+//! * Opening the index ([`VectorIndex::check`]) deletes vector rows outside
+//!   the invariant and drops the vectors of any embedded file whose rows do
+//!   not match its chunks one to one (the backfill embeds it again).
+//!
+//! **Priority and limits.** Embedding happens off the index lock and, in
+//! the server, at low priority: the embedder yields to Bonsai decode steps
+//! between short GPU submissions and holds the shared model for only a few
+//! thousand tokens at a time; closing the indexer stops an embedding batch
+//! at its next submission (its files stay as they were). With a model,
+//! indexing batches stop taking files after [`EMBED_BATCH_BYTES`] of text.
+//! A file's vectors are held in memory (F16) until its confirming
+//! transaction: at most [`MAX_FILE_CHUNKS`] × 1.5 KB = 77 MB. Search is
+//! brute force: it streams every vector of the admitted files from the
+//! database once, comparing each with every query, keeping
+//! `max_num_results` (or [`FUSION_DEPTH`]) candidates per query in memory,
+//! so memory is bounded whatever the store's size, but time is linear in
+//! its chunks; there is no approximate index. Measured on Apple Silicon
+//! with 3,600 to 6,300 chunks, a 50-result embedding search took 30 to 36
+//! ms including the query's embedding, about what BM25 took; a store with
+//! a hundred times more chunks reads a hundred times more vectors (1.5 GB
+//! per million chunks) on every search.
 //!
 //! # Attribute filters
 //!
@@ -140,7 +213,10 @@ use crate::{Error, Result, Store, migrate, new_id, now};
 
 mod index;
 
-pub use index::{ACTIVITY_GRANULARITY_SECONDS, INDEX_BATCH_BYTES, INDEX_BATCH_FILES, VectorIndex};
+pub use index::{
+    ACTIVITY_GRANULARITY_SECONDS, EMBED_BATCH_BYTES, FUSION_DEPTH, INDEX_BATCH_BYTES,
+    INDEX_BATCH_FILES, RRF_K, Ranking, VectorIndex,
+};
 
 /// Largest source file the indexer reads.
 pub const MAX_INDEXED_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -194,11 +270,12 @@ const BATCH_PREFIX: &str = "vsfb_";
 const ATTACH_PREFIX: &str = "vsfa_";
 const DAY_SECONDS: u64 = 86_400;
 
-/// Version 1. Chunk text is sliced from the file's stored `text` by byte
+/// Version 1 (version 2 adds embeddings). Chunk text is sliced from the file's stored `text` by byte
 /// range; the ranked index itself is the Tantivy directory of [`index`].
 /// `vector_store_index_garbage` is the outbox of attachments whose index
 /// documents may have to be removed (see the module docs).
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
 CREATE TABLE vector_stores (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -255,7 +332,23 @@ END;
 CREATE TRIGGER vector_store_files_source_deleted AFTER DELETE ON files BEGIN
     DELETE FROM vector_store_files WHERE file_id = OLD.id;
 END;
-"];
+",
+    // Version 2: chunk embeddings (see "Embeddings" in the module docs).
+    // `embedding_space` names the vector space a completed file's vectors
+    // are in (NULL: none yet). Vector rows have no foreign key: like index
+    // documents, those of a removed attachment are deleted lazily through
+    // the garbage outbox.
+    "
+ALTER TABLE vector_store_files ADD COLUMN embedding_space TEXT;
+CREATE INDEX vector_store_files_embedding ON vector_store_files (status, embedding_space, seq);
+CREATE TABLE vector_store_embeddings (
+    attach_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    vector BLOB NOT NULL
+) STRICT;
+CREATE UNIQUE INDEX vector_store_embeddings_chunk ON vector_store_embeddings (attach_id, ordinal);
+",
+];
 
 const STORE_COLUMNS: &str = "id, name, metadata, created_at, last_active_at, expires_after_days";
 const FILE_COLUMNS: &str = "file_id, store_id, created_at, status, error_code, error_message, \
@@ -270,6 +363,36 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
 /// File attributes: at most [`MAX_ATTRIBUTES`] keys, each value a string,
 /// a finite number or a boolean.
 pub type Attributes = Map<String, Value>;
+
+/// A text embedding model for chunks and queries.
+///
+/// See "Embeddings" in the module docs. The implementation owns the prompts: documents and queries
+/// are passed raw and formatted with the model's document and query
+/// templates. Vectors must be L2-normalized and [`Self::dimensions`] wide.
+pub trait ChunkEmbedder: Send + Sync {
+    /// Names the vector space: the model, its weights, the width and the
+    /// prompts. Vectors stored under another name are re-embedded.
+    fn space(&self) -> &str;
+
+    /// The width of every vector.
+    fn dimensions(&self) -> usize;
+
+    /// Embed chunk texts with the document prompt, in order. Background
+    /// work: it should yield to foreground GPU work and fail soon after
+    /// `stop()` turns true.
+    ///
+    /// # Errors
+    ///
+    /// Any failure, including being stopped.
+    fn embed_documents(&self, texts: &[&str], stop: &dyn Fn() -> bool) -> Result<Vec<Vec<f32>>>;
+
+    /// Embed search queries with the query prompt, in order.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn embed_queries(&self, queries: &[&str]) -> Result<Vec<Vec<f32>>>;
+}
 
 /// `expires_after`: the only anchor is `last_active_at`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,8 +778,11 @@ pub enum Filter {
 /// A named reranker.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ranker {
+    /// BM25 alone, always.
     #[serde(rename = "none")]
     None,
+    /// Embedding (cosine) ranking when an embedding model is installed;
+    /// BM25 otherwise.
     #[default]
     #[serde(rename = "auto")]
     Auto,
@@ -710,7 +836,8 @@ impl SearchRequest {
 pub struct SearchResult {
     pub file_id: String,
     pub filename: String,
-    /// `s / (1 + s)` of the BM25 score `s` (see the module docs).
+    /// In `[0, 1]`: `s / (1 + s)` of the BM25 score `s`, or `max(cos, 0)`
+    /// of the embedding ranking (see the module docs).
     pub score: f64,
     pub attributes: Attributes,
     pub content: Vec<ContentPart>,
@@ -735,6 +862,10 @@ pub struct IndexCheck {
     pub collected: u64,
     /// Whether the index disagreed with the chunk table and was rebuilt.
     pub rebuilt: bool,
+    /// Completed files whose stored vectors disagreed with their chunks
+    /// (dropped, to be embedded again) plus vector rows of unknown
+    /// attachments removed.
+    pub vectors_repaired: u64,
 }
 
 /// A parsed file (its text and chunk byte ranges), or why it failed.
@@ -1931,13 +2062,37 @@ fn run_indexer(index: &VectorIndex, shared: &Shared) {
                 "warning: removing deleted vector store files from the index failed: {error}"
             );
         }
-        while !shared.lock().stopping {
-            match index.index_next() {
+        let stop = || shared.lock().stopping;
+        while !stop() {
+            match index.index_batch(&stop) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(error) => {
                     // Left in progress; the next notification or start retries.
-                    eprintln!("warning: vector store indexing stopped: {error}");
+                    if !stop() {
+                        eprintln!("warning: vector store indexing stopped: {error}");
+                    }
+                    break;
+                }
+            }
+        }
+        // Then embed completed files that lack vectors (stores created before
+        // embeddings, or while the model was absent), a batch at a time; a
+        // new request ends the run after the batch, so newly attached files
+        // are indexed first and the backfill resumes after them.
+        let interrupted = || {
+            let signals = shared.lock();
+            signals.stopping || signals.requested != target
+        };
+        while !interrupted() {
+            match index.embed_batch(&stop) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    // Still unembedded; the next notification or start retries.
+                    if !stop() {
+                        eprintln!("warning: vector store embedding backfill stopped: {error}");
+                    }
                     break;
                 }
             }

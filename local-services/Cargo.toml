@@ -26,6 +26,7 @@ md5 = "0.8"
 jsonschema = { version = "0.58.6", default-features = false }
 # OS randomness for identifiers; already in the lock through rustls.
 ring = "0.17"
+half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

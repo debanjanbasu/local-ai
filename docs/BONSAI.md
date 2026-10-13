@@ -922,9 +922,13 @@ preparation and generation blocking tasks, never on runtime workers.
   cancel, list files), parsed file content and `search`, with the contract's
   pagination, expiry, file status lifecycle, `auto`/`static` chunking,
   attributes and filters. Ranking is **lexical BM25** over one persistent
-  Tantivy index derived from the SQLite rows, not embeddings (see
-  [Tried and rejected](#tried-and-rejected)); scores are `s / (1 + s)` of the
-  BM25 score, so `rewrite_query: true` and the `default-2024-11-15` ranker
+  Tantivy index derived from the SQLite rows (scores `s / (1 + s)` of the
+  BM25 score) or, when the EmbeddingGemma 2 artifact is installed,
+  **semantic** for `ranker: auto`: cosine similarity of chunk and query
+  embeddings, which beat BM25 and its fusion with embeddings in the
+  measurements (see [EMBEDDINGS.md](EMBEDDINGS.md#vector-stores));
+  `ranker: none` stays BM25.
+  `rewrite_query: true` and the `default-2024-11-15` ranker
   are a 400. Attaching answers `in_progress` and wakes one indexer thread;
   it never polls, and a restart resumes files left `in_progress`. A
   garbage outbox keeps the index consistent with the database across
@@ -932,8 +936,8 @@ preparation and generation blocking tasks, never on runtime workers.
   owns a data directory's index; a second server on the same directory
   serves everything except vector stores. Details are in
   [local-services/README.md](../local-services/README.md#vector-stores).
-  There is no `/v1/embeddings` route; the search and index design leave one
-  ranking step and one indexing step for a later embedding model.
+  Vectors are stored in SQLite under the same outbox protocol and backfilled
+  in the background for stores indexed before the model was installed.
 
 Resuming background Responses after a crash is the server's job (see
 [Server API](#server-api)), not these services'; batch
