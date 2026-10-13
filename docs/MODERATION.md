@@ -203,6 +203,20 @@ The artifact (`local-engine/assets/moderation/moderation-heads.json`,
 the heads, the full evaluation, the training settings and the provenance
 hashes.
 
+## Live check
+
+Server on port 8129 with the installed artifact (one GPU-lock hold, 41 texts:
+30 from the OpenAI 2022 set, 10 benign sentences including the empty string,
+one 1,200-token benign text that takes 3 windows): startup logged the artifact
+SHA-256 and the six scored categories; the batch response, five single-string
+responses and the error responses validate against the pinned
+`CreateModerationResponse` / `ErrorResponse`; scores through HTTP equal the
+native `moderation-embed score` scores exactly (maximum difference 0, no flag
+differs), and single-string, batch and multi-modal text requests agree
+bitwise. 16 of the 30 OpenAI-set samples and none of the 11 benign texts were
+flagged. Image parts and unknown models get `400`; `/v1/embeddings` still
+answers. The unscored-categories header listed the seven unscored categories.
+
 ## Limitations
 
 - Six of thirteen categories are scored; the other seven are reported as
@@ -211,5 +225,9 @@ hashes.
   are assumed negative for illicit, illicit/violent and self-harm.
 - English only in practice (both training sources are English).
 - Text only; image inputs are refused.
+- The illicit head reacts to the *form* of a how-to request: the benign "How
+  do I bake sourdough bread at home?" scored 0.30 against its 0.387
+  threshold (not flagged). Aegis's criminal-planning prompts are mostly
+  requests, which this reflects.
 - One threshold per category, chosen for precision 0.80 on the calibration
   split; precision on the test split is 0.77–0.88.
