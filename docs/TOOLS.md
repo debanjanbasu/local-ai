@@ -11,13 +11,44 @@ in the next request (or with `previous_response_id`):
 | request tool | output item | client answers with |
 |---|---|---|
 | `function` | `function_call` | `function_call_output` |
-| `custom` (`format` text, or `grammar` with `syntax: "regex"`) | `custom_tool_call` | `custom_tool_call_output` |
+| `custom` (`format` text, or `grammar` with `syntax: "regex"` or `"lark"`) | `custom_tool_call` | `custom_tool_call_output` |
 | `local_shell` | `local_shell_call` | `local_shell_call_output` |
 | `apply_patch` | `apply_patch_call` | `apply_patch_call_output` |
+| `namespace` of `function`/`custom` tools | `function_call` / `custom_tool_call` with `namespace` | `function_call_output` / `custom_tool_call_output` |
 
 Each becomes a strict native function, so arguments are constrained while
 they are generated; a `regex` grammar constrains the custom tool's `input`
-the same way. `lark` grammars are refused (400). `tool_choice` accepts
+the same way. A `lark` grammar is enforced exactly when its language is
+regular: its rules and terminals are inlined into one regular expression (a
+recursive rule is refused), with `|`, groups, `[ ]`/`?`/`*`/`+`/`~ n..m`,
+string literals and `"a".."z"` ranges, `/regex/` terminals (flags `i`, `s`)
+and `%import common.NAME` for the common terminals (`LF`, `CR`, `NEWLINE`,
+`WS`, `WS_INLINE`, `DIGIT`, `HEXDIGIT`, `INT`, `SIGNED_INT`, `LETTER`,
+`LCASE_LETTER`, `UCASE_LETTER`, `WORD`, `CNAME`). Each terminal may match any
+string of its language (no longest-match lexing), aliases and priorities
+only shape a parse tree and are ignored, and everything else (`%ignore`,
+`%declare`, templates, other imports, regex anchors, lookarounds,
+backreferences) is refused with the reason (400). Codex's freeform
+`apply_patch` grammar is supported verbatim. A custom tool may be named like
+a built-in tool type (Codex's `apply_patch`); declaring one name twice is
+refused.
+
+A `namespace` groups client `function` and `custom` tools: each member is
+offered to the model as `NAMESPACE.NAME`, with the namespace description
+before its own, and its calls come back with `"namespace"` and the member's
+own `name` (Codex's sub-agent tools, `multi_agent_v1`, are such a namespace;
+Codex runs them, not this server). Calls replayed with a `namespace` are read
+back the same way. Namespaces cannot be combined with `conversation`.
+
+`web_search` and `web_search_preview` are accepted and echoed but never
+offered to the model: this server has no search provider, so the model is
+not told it can search and no `web_search_call` is ever reported; the
+declaration has no effect. The spec leaves calling a declared tool to the
+model, so this is a model that never searches, not a fake search. Forcing a
+search (`tool_choice` of a web search type, or `"required"` with no other
+tool) and `include: ["web_search_call.action.sources"]` are refused (400).
+
+`tool_choice` accepts
 `{"type":"custom","name":...}`, `{"type":"shell"}` and
 `{"type":"apply_patch"}` as well as the function forms.
 

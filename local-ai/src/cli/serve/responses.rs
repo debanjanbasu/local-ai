@@ -771,20 +771,17 @@ pub(super) fn prepare_responses_conversing(
     let mut tools = Vec::new();
     let mut kinds = super::hosted::Kinds::default();
     for tool in request.tools.as_deref().unwrap_or_default() {
-        if let Some((definition, kind, echo)) = super::hosted::tool(tool)? {
-            kinds.insert(&definition.name, kind);
-            echoed_tools.push(echo);
-            tools.push(definition);
-            continue;
-        }
-        let definition = function_tool(tool)?;
-        echoed_tools.push(json!({"type":"function","name":definition.name,"description":definition.description,"parameters":definition.parameters,"strict":definition.strict}));
-        tools.push(definition);
+        echoed_tools.push(super::hosted::declare(
+            tool,
+            function_tool,
+            &mut tools,
+            &mut kinds,
+        )?);
     }
     tool_policy(&tools, &choice)?;
     if conversation_id.is_some() && kinds.reports_other_items() {
         return Err(unsupported(
-            "custom, shell, local_shell and apply_patch tools with conversation",
+            "namespace, custom, shell, local_shell and apply_patch tools with conversation",
             "the conversation store keeps only message, reasoning and function call items",
         ));
     }
@@ -1538,8 +1535,9 @@ fn function_tool(tool: &Value) -> crate::Result<ToolDefinition> {
     if kind != "function" {
         return Err(unsupported(
             &format!("tool type {kind:?}"),
-            "only function, custom, local_shell, apply_patch and (with server permission) shell \
-             tools run here; other built-in and MCP tools need hosted services",
+            "only function, custom, namespace, local_shell, apply_patch and (with server \
+             permission) shell tools run here, and web_search is accepted but never offered; \
+             other built-in and MCP tools need hosted services",
         ));
     }
     let name = tool
@@ -1779,9 +1777,13 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
                     .and_then(Value::as_str)
                     .ok_or_else(|| invalid(format!("a function_call item requires {name}")))
             };
+            let name = match item.get("namespace").and_then(Value::as_str) {
+                Some(namespace) => super::hosted::qualified(namespace, field("name")?),
+                None => field("name")?.to_owned(),
+            };
             let call = tool_call(
                 field("call_id")?.to_owned(),
-                field("name")?.to_owned(),
+                name,
                 item.get("arguments").unwrap_or(&Value::Null),
             )?;
             turn.calls.push(call);
@@ -2536,14 +2538,17 @@ impl ResponsesState {
         let index = self.output.len();
         let kind = self.echo.kinds.kind(&call.name);
         let id = self.item_id(super::hosted::call_prefix(kind));
-        if let Some(rendered) = super::hosted::call_item(kind, &id, index, call) {
+        if let Some(mut rendered) = super::hosted::call_item(kind, &id, index, call) {
+            self.echo.kinds.qualify_rendered(&mut rendered);
             self.push_rendered(rendered);
             return;
         }
         let arguments = arguments_text(call);
+        let mut added = json!({"id":id,"type":"function_call","status":"in_progress","call_id":call.id,"name":call.name,"arguments":""});
+        self.echo.kinds.qualify(&mut added);
         self.emit(
             "response.output_item.added",
-            json!({"output_index":index,"item":{"id":id,"type":"function_call","status":"in_progress","call_id":call.id,"name":call.name,"arguments":""}}),
+            json!({"output_index":index,"item":added}),
         );
         self.emit(
             "response.function_call_arguments.delta",
@@ -2553,7 +2558,8 @@ impl ResponsesState {
             "response.function_call_arguments.done",
             json!({"item_id":id,"output_index":index,"arguments":arguments}),
         );
-        let item = json!({"id":id,"type":"function_call","status":"completed","call_id":call.id,"name":call.name,"arguments":arguments});
+        let mut item = json!({"id":id,"type":"function_call","status":"completed","call_id":call.id,"name":call.name,"arguments":arguments});
+        self.echo.kinds.qualify(&mut item);
         self.emit(
             "response.output_item.done",
             json!({"output_index":index,"item":item}),
