@@ -17,6 +17,7 @@
 //!   the agreement with `misaki` on a public-domain sample.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -1232,7 +1233,47 @@ fn tag_words(tokens: &mut [MToken]) {
 
 /// The `misaki` English G2P for one accent.
 pub struct G2p {
-    lexicon: Lexicon,
+    lexicon: Arc<Lexicon>,
+    /// For British: the American lexicon, consulted (and its phonemes mapped
+    /// to British symbols) for words the British lexicons lack, before the
+    /// segmentation fallback.
+    alternate: Option<Arc<Lexicon>>,
+}
+
+/// American lexicon phonemes in British symbols (the vowel and rhotic
+/// differences of `misaki`'s two phoneme sets).
+fn us_to_gb(ps: &str) -> String {
+    let chars: Vec<char> = ps.chars().collect();
+    let mut out = String::with_capacity(ps.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        let after = chars.get(i + 2).copied();
+        if next == Some('ɹ') && "ɜɑɔɛɪʊə".contains(c) && !after.is_some_and(is_vowel) {
+            out.push_str(match c {
+                'ɜ' => "ɜː",
+                'ɑ' => "ɑː",
+                'ɔ' => "ɔː",
+                'ɛ' => "ɛː",
+                'ɪ' => "ɪə",
+                'ʊ' => "ʊə",
+                _ => "ə",
+            });
+            i += 2;
+            continue;
+        }
+        out.push(match c {
+            'æ' => 'a',
+            'O' => 'Q',
+            'ɾ' => 't',
+            'ᵻ' => 'ɪ',
+            'ɑ' => 'ɒ',
+            other => other,
+        });
+        i += 1;
+    }
+    out
 }
 
 fn merge_texts(tokens: &[MToken]) -> String {
@@ -1378,12 +1419,34 @@ fn resolve_tokens(tokens: &mut [MToken]) {
 
 impl G2p {
     #[must_use]
-    pub const fn new(lexicon: Lexicon) -> Self {
-        Self { lexicon }
+    pub const fn new(lexicon: Arc<Lexicon>) -> Self {
+        Self {
+            lexicon,
+            alternate: None,
+        }
+    }
+
+    /// A G2P that consults `alternate` (the American lexicon, for a British
+    /// G2P) for words its own lexicons lack.
+    #[must_use]
+    pub const fn with_alternate(lexicon: Arc<Lexicon>, alternate: Arc<Lexicon>) -> Self {
+        Self {
+            lexicon,
+            alternate: Some(alternate),
+        }
+    }
+
+    fn unknown(&self, tk: &MToken, ctx: Context) -> Option<String> {
+        if let Some(alternate) = &self.alternate
+            && let (Some(ps), _) = alternate.call(tk, ctx)
+        {
+            return Some(us_to_gb(&ps));
+        }
+        self.lexicon.fallback(tk.alias.as_deref().unwrap_or(&tk.text))
     }
 
     #[must_use]
-    pub const fn british(&self) -> bool {
+    pub fn british(&self) -> bool {
         self.lexicon.british
     }
 
@@ -1513,7 +1576,7 @@ impl G2p {
                         tk.rating = rating;
                     }
                     if tk.phonemes.is_none() && fallback {
-                        tk.phonemes = self.lexicon.fallback(tk.alias.as_deref().unwrap_or(&tk.text));
+                        tk.phonemes = self.unknown(tk, ctx);
                     }
                     ctx = token_context(ctx, tk.phonemes.as_deref(), tk);
                 }
@@ -1563,7 +1626,7 @@ impl G2p {
                     }
                     if should_fallback {
                         let merged = merge(group, None);
-                        group[0].phonemes = self.lexicon.fallback(&merged.text);
+                        group[0].phonemes = self.unknown(&merged, ctx);
                         for x in &mut group[1..] {
                             x.phonemes = Some(String::new());
                         }

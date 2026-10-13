@@ -26,6 +26,7 @@ mod source;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::Error;
 use artifact::{Artifact, STYLE_WIDTH, VOICE_ROWS};
@@ -83,10 +84,13 @@ pub fn installed_model(models_dir: &Path) -> Option<PathBuf> {
 /// A missing or unverifiable artifact.
 pub fn open_g2p(dir: &Path) -> crate::Result<(G2p, G2p)> {
     let artifact = Artifact::open(&dir.join(SPEECH_ARTIFACT))?;
-    Ok((
-        G2p::new(Lexicon::new(artifact.blob("us_gold")?, artifact.blob("us_silver")?, false)?),
-        G2p::new(Lexicon::new(artifact.blob("gb_gold")?, artifact.blob("gb_silver")?, true)?),
-    ))
+    g2p_pair(&artifact)
+}
+
+fn g2p_pair(artifact: &Artifact) -> crate::Result<(G2p, G2p)> {
+    let us = Arc::new(Lexicon::new(artifact.blob("us_gold")?, artifact.blob("us_silver")?, false)?);
+    let gb = Arc::new(Lexicon::new(artifact.blob("gb_gold")?, artifact.blob("gb_silver")?, true)?);
+    Ok((G2p::new(Arc::clone(&us)), G2p::with_alternate(gb, us)))
 }
 
 /// The phoneme vocabulary of an installation (CPU only).
@@ -153,16 +157,7 @@ impl SpeechModel {
     /// A missing or unverifiable artifact, or a Metal failure.
     pub fn open(dir: &Path) -> crate::Result<Self> {
         let artifact = Artifact::open(&dir.join(SPEECH_ARTIFACT))?;
-        let american = G2p::new(Lexicon::new(
-            artifact.blob("us_gold")?,
-            artifact.blob("us_silver")?,
-            false,
-        )?);
-        let british = G2p::new(Lexicon::new(
-            artifact.blob("gb_gold")?,
-            artifact.blob("gb_silver")?,
-            true,
-        )?);
+        let (american, british) = g2p_pair(&artifact)?;
         let mut voices = BTreeMap::new();
         for name in artifact.voice_names().map(str::to_owned).collect::<Vec<_>>() {
             if let Some(pack) = artifact.voice(&name) {

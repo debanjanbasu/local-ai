@@ -559,6 +559,15 @@ fn main() -> Result<()> {
         Some("synth") if args.len() == 3 => synth(Path::new(&args[1]), &PathBuf::from(&args[2])),
         Some("compare") if args.len() == 3 => compare(Path::new(&args[1]), &PathBuf::from(&args[2])),
         Some("g2p") if args.len() == 2 => g2p(Path::new(&args[1])),
+        Some("phonemize") if args.len() >= 2 => {
+            // CPU only: native G2P with its fallback, American then British.
+            let g = models_g2p()?;
+            for text in &args[1..] {
+                println!("a: {}", g.american.phonemize(text, true));
+                println!("b: {}", g.british.phonemize(text, true));
+            }
+            Ok(())
+        }
         Some("encode") if args.len() == 3 => encode_all(Path::new(&args[1]), Path::new(&args[2])),
         Some("mel") if args.len() == 4 => {
             // REF.f32 OTHER.s16le LAG: log-mel distance of a decoded file.
