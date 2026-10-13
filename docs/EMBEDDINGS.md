@@ -8,8 +8,9 @@ is optional and opt-in by installation: install the artifact below and
 `404`. Text and code are served over HTTP; **images and video** are native
 through the Rust API once the optional vision artifact is installed (see
 [Images and video](#images-and-video); OpenAI's embeddings API has no media
-input, so there is no HTTP surface for them). Audio: see
-[Multimodal plan](#multimodal-plan).
+input, so there is no HTTP surface for them), and so is **audio** once the
+optional audio artifact is installed (see [EMBEDDINGS_AUDIO.md](EMBEDDINGS_AUDIO.md)
+and [Modalities](#modalities)).
 
 ## Install
 
@@ -437,14 +438,25 @@ the research results) and are not used.
 - One media request at a time per model (the model is not internally
   synchronized), no HTTP route, no batching across callers.
 
-## Multimodal plan
+## Modalities
 
-Images and video are native (above). Every modality feeds soft tokens into
-the same text encoder (the placeholder ids 258880, 258881 and 258884 stay
-refused as token-id input), so adding one means its encoder and its
-preprocessing, with no change to the text path:
+Text, images, video and audio are all native. Every modality feeds soft
+tokens into the same text encoder through one sequence assembly
+(`EmbeddingModel::embed_multimodal`, parts `MediaPart::Text`, `Image`,
+`Video` and `Audio`; the placeholder ids 258880, 258881 and 258884 stay
+refused as token-id input):
 
-1. **Audio** (12-layer Conformer, width 1024, 128-bin log-mel at 16 kHz):
-   needs a mel front end, chunked local attention with relative positions,
-   a depthwise causal convolution and clipped linears; the Kaggle AudioCaps
-   baseline itself looked low (t2a R@1 8%) and should be understood first.
+1. **Vision** (16 layers, width 768, 12 × 64 heads, MLP 3072, 2-D learned
+   positions and axial RoPE θ 100, 3×3 pooling to 280 tokens per image or 140
+   per video frame, `embed_vision` RMSNorm → 768→512): above.
+2. **Video:** the vision encoder at 1 frame/s, at most 32 frames: above.
+3. **Audio** (12-layer Conformer, width 1024, 128-bin log-mel at 16 kHz):
+   each clip is `<start_of_audio>` soft tokens `<end_of_audio>` in the
+   sequence; `EmbeddingModel::embed_audio` embeds audio-only inputs (the
+   reference's sequence, the one the parity gate measures). See
+   [EMBEDDINGS_AUDIO.md](EMBEDDINGS_AUDIO.md).
+
+Each media encoder artifact is optional and loads on the first input that
+needs it. Mixed inputs (text with images or audio) are laid out part by part
+in order; only single-modality media inputs are covered by the parity
+fixtures.
