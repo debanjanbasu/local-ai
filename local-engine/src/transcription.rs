@@ -18,6 +18,7 @@ pub mod audio;
 mod decode;
 pub mod mel;
 mod model;
+mod timing;
 pub mod tokens;
 
 use std::path::{Path, PathBuf};
@@ -89,6 +90,10 @@ pub struct TranscribeOptions {
     pub condition_on_previous_text: bool,
     /// Seed for sampling at temperatures above 0.
     pub seed: u64,
+    /// Word timestamps (the reference's `word_timestamps=True`: an extra
+    /// forced decode per window; it also moves each window's seek to the
+    /// last word's end).
+    pub word_timestamps: bool,
 }
 
 impl Default for TranscribeOptions {
@@ -100,6 +105,7 @@ impl Default for TranscribeOptions {
             temperature: Temperature::Fallback,
             condition_on_previous_text: true,
             seed: 0,
+            word_timestamps: false,
         }
     }
 }
@@ -121,6 +127,18 @@ pub struct Segment {
     pub avg_logprob: f64,
     pub compression_ratio: f64,
     pub no_speech_prob: f64,
+    /// Word timings when requested (text as the model wrote it, with its
+    /// leading space).
+    pub words: Vec<Word>,
+}
+
+/// One word with its time span (seconds) and mean token probability.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Word {
+    pub word: String,
+    pub start: f64,
+    pub end: f64,
+    pub probability: f64,
 }
 
 /// Work done for a transcript.
@@ -375,6 +393,8 @@ impl TranscriptionModel {
         let window_options = WindowOptions {
             task: options.task,
             language: language_token,
+            language_code: language.clone(),
+            word_timestamps: options.word_timestamps,
             temperature: options.temperature,
             condition_on_previous_text: options.condition_on_previous_text,
         };

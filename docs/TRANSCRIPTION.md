@@ -110,8 +110,15 @@ SHA-256 on every load.
   window is likely silent), the no-speech skip, and the long-form loop that
   seeks to the last complete timestamp pair, conditioning each window on the
   previous text. The compression ratio uses zlib itself (level 6), as the
-  reference does. Beam search, word timestamps and `clip_timestamps` are not
-  ported.
+  reference does. Beam search and `clip_timestamps` are not ported.
+- **Word timestamps** (`local_engine::transcription::timing`, from
+  `timing.py`): a forced decode of each window's text captures the
+  cross-attention queries of the ten alignment heads (layer/head pairs from
+  `generation_config.json`); their scores over the window's frames are
+  softmaxed, normalized per frame, median-filtered (width 7), averaged and
+  aligned by DTW (F32 costs, the reference's tie order); words split on
+  spaces (Unicode boundaries for zh/ja/th/lo/my/yue), punctuation merged,
+  and the reference's duration heuristics applied.
 
 ## API
 
@@ -127,7 +134,7 @@ SHA-256 on every load.
 | `prompt` | prepended as previous text (`<\|startofprev\|>`), last 223 tokens kept | same |
 | `temperature` | 0–1; 0 (default) = greedy with the fallback ladder | same |
 | `response_format` | `json` (text + duration usage), `text`, `srt`, `vtt`, `verbose_json` (task, language name, duration, segments) | same (`language` is `english`) |
-| `timestamp_granularities[]` | `segment` (with `verbose_json`); **`word` refused** | not in the schema |
+| `timestamp_granularities[]` | `segment` and `word` (with `verbose_json`; `words` holds `word`, `start`, `end`) | not in the schema |
 | `include[]` | `logprobs` (with `json` or `stream`): per text token, `token`, `logprob`, `bytes` | not in the schema |
 | `stream` | `true`: `transcript.text.delta` per finished 30-second window (whole segments), then `transcript.text.done` with token usage; `json`/`text` only | not in the schema |
 | `chunking_strategy`, `known_speaker_*`, `languages`, `keywords`, `diarized_json` | refused (`400`) | — |
@@ -192,3 +199,28 @@ Speed (`transcription-eval bench`, GPU otherwise idle):
 | Reference on the Kaggle CPU (4 cores, FP32) | RTF 4.2 |
 
 CONC_TBD
+
+## Limitations
+
+- Word timestamps follow the reference's `word_timestamps=True`, which also
+  moves each window's seek to the last word's end, so a request with words
+  can segment long audio differently from one without (as in the
+  reference). The hallucination-silence heuristics are not ported.
+- **Opus** (Ogg/WebM voice notes) is refused: there is no maintained pure-Rust
+  decoder. MP4/M4A edit lists are not read, so AAC encoder priming (typically
+  2,112 samples, 0.13 s) stays at the start of the audio and shifts
+  timestamps by that much (FFmpeg trims it); 16 kHz FLAC/WAV/MP3 input is
+  bit-exact with the reference.
+- Greedy decoding and temperature sampling only (no beam search, `best_of` 1:
+  the Python API's defaults). Sampling uses this server's own random numbers,
+  so sampled output is not reproducible against the reference.
+- Streaming deltas arrive per finished 30-second window (whole segments).
+- Whisper pads every window to 30 s, so a short clip costs a whole encoder
+  pass (about 1.1 s on this machine).
+- One request runs at a time; under Bonsai load transcription runs at low
+  priority (see above).
+- The audio-embedding work also decodes with Symphonia 0.6 and computes a
+  128-bin log-mel; the two front ends use different parameters (Whisper's
+  STFT here, Gemma's feature extractor there) and are kept in separate files,
+  but the decoding and resampling could be shared.
+
