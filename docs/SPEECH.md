@@ -169,7 +169,7 @@ Reference: the original `kokoro` 0.9.4 / `misaki` 0.9.4 on a Kaggle CPU kernel
 `tools/kaggle_kokoro_job.py --mode reference`, whose fixture outputs are all
 complete; its final ASR step failed for want of `torchaudio` and was rerun in
 the ASR job below, which resamples to 16 kHz itself) on 30 fixed fixtures:
-English sentences of 1 to 168 phonemes over 25 voices (American and British),
+English sentences of 5 to 166 phonemes over 26 voices (American and British),
 speeds 0.8, 1.0 and 1.25. For each the job recorded misaki's phonemes, the
 token ids, the predicted durations, three waveforms (deterministic: source
 noise and random phase zeroed; seeded: as users hear it; and the full
