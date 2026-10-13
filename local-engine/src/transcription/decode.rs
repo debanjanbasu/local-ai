@@ -393,12 +393,15 @@ fn new_segment(
 /// The reference's `transcribe()` with `clip_timestamps="0"`, no word
 /// timestamps and no hallucination-silence threshold. Returns the segments
 /// and the prompt-free text tokens; `on_segments` sees each window's
-/// segments as soon as they are final.
+/// segments as soon as they are final. `first_window_encoded`: the forward
+/// already holds the encoding of the full first window (`mel.window(0,
+/// 3000)`, as language detection leaves it).
 #[allow(clippy::too_many_arguments)]
 pub fn transcribe(
     forward: &mut dyn Forward,
     tokenizer: &WhisperTokenizer,
     mel: &LogMel,
+    first_window_encoded: bool,
     options: &WindowOptions,
     initial_prompt: &[u32],
     rng: &mut Rng,
@@ -416,8 +419,11 @@ pub fn transcribe(
         let time_offset = (seek * 160) as f64 / 16_000.0;
         let segment_size = WINDOW_FRAMES.min(content_frames - seek);
         let segment_duration = (segment_size * 160) as f64 / 16_000.0;
-        forward.encode(&mel.window(seek, segment_size), pace)?;
-        work.windows += 1;
+        // Language detection already encoded the first full window.
+        if !(seek == 0 && segment_size == WINDOW_FRAMES && first_window_encoded) {
+            forward.encode(&mel.window(seek, segment_size), pace)?;
+            work.windows += 1;
+        }
         let prompt = all_tokens[prompt_reset_since..].to_vec();
         let result = decode_with_fallback(forward, tokenizer, options, &prompt, rng, pace, work)?;
         let should_skip =
