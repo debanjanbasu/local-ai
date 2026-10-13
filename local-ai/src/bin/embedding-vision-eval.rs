@@ -228,7 +228,17 @@ fn preprocess_gate(path: &str) -> Result<()> {
         let valid = v.columns * v.rows * preprocess::PATCH_VALUES;
         let mut resize_diff = 0;
         let mut decode_diff = (0, 0);
-        let decoded = video::decode_frames(&file, width, height, &v.indices);
+        let decoded = probed
+            .as_ref()
+            .map_err(|error| error.to_string())
+            .and_then(|stream| {
+                if (stream.width, stream.height) == (width, height) {
+                    video::decode_frames(&file, stream, &v.indices)
+                        .map_err(|error| error.to_string())
+                } else {
+                    Err("frame size differs".into())
+                }
+            });
         for f in 0..frames {
             let reference = rgb_from_chw(&raw[f * plane..(f + 1) * plane], height, width)?;
             let patches = patchify(&reference, VIDEO_SOFT_TOKENS)?;
@@ -255,14 +265,14 @@ fn preprocess_gate(path: &str) -> Result<()> {
             if picked == v.indices { "exact" } else { "DIFF" },
             probed
                 .as_ref()
-                .map(|(t, _, _)| *t)
+                .map(|s| s.timing)
                 .map_err(ToString::to_string),
             v.frames,
             v.fps,
             v.duration,
             match &decoded {
                 Ok(_) => format!("{} diff, max {}", decode_diff.0, decode_diff.1),
-                Err(error) => error.to_string(),
+                Err(error) => error.clone(),
             }
         );
     }
