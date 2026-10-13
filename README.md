@@ -319,6 +319,7 @@ Weights are not included. The runtime validates these pinned files:
 | `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | for image/video embeddings (Rust API) |
 | `models/kokoro-82m/kokoro-82m-f32.bin` | 354,146,560 | `aa3b5c769b9fdcc9eac3d6068352610183e45c20542f1232d629ead82c695928` | for `POST /v1/audio/speech` |
+| `models/moderation/moderation-heads.json` | 105,507 | `b74727bf58afce5adad11dc3aa903388ad550fffc9c38b099d14995fc760bdc4` | for `POST /v1/moderations` (with the encoder) |
 
 The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
 not: without it speculation falls back to suffix lookup alone and the startup
@@ -328,6 +329,10 @@ when installed the server adds `POST /v1/embeddings`
 ([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). So is Kokoro-82M text to speech:
 converted by `tools/convert_kokoro.py` from a Kaggle CPU job's download, it
 adds `POST /v1/audio/speech` ([docs/SPEECH.md](docs/SPEECH.md)).
+([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). With it, copying the committed moderation heads
+(`local-engine/assets/moderation/`) into `models/moderation/` adds
+`POST /v1/moderations` for the categories that passed evaluation
+([docs/MODERATION.md](docs/MODERATION.md)).
 
 The GGUF repository is pinned. Its head has moved past `6ed5e12b`, so keep the
 pin rather than tracking the branch.
@@ -477,6 +482,8 @@ is 1.074x and the best measured result 1.29%.
   encoder (Rust API).
 - `docs/SPEECH.md`: the optional native Kokoro-82M text to speech and
   `POST /v1/audio/speech`.
+- `docs/MODERATION.md`: `POST /v1/moderations` heads, data, pre-registered
+  criteria and results.
 
 ## Verification
 
