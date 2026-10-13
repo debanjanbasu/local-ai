@@ -86,7 +86,12 @@ the reference to F32 rounding; it costs 136 MB more GPU memory than int8.
 - `encoding_format`: `float` (default) or `base64` (little-endian F32).
 - `dimensions`: 768 (default), 512, 256 or 128, the trained Matryoshka widths;
   the vector is truncated, then renormalized. Other values are refused.
-- `user`: accepted and ignored.
+- `user`: accepted and ignored (current on this endpoint; the specification
+  deprecates `user` only on Chat Completions and Responses).
+
+Like every route of the server, this is the current OpenAI API; legacy and
+deprecated APIs are not served
+([supported OpenAI APIs](BONSAI.md#supported-openai-apis)).
 
 Text is embedded exactly as sent. Retrieval quality depends on the model
 card's prompts, which the client adds: queries as
