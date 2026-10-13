@@ -17,7 +17,7 @@ use super::request::prepare_generation;
 use super::response::{Protocol, Reply};
 use super::responses::{ResponsesState, prepare_responses};
 use super::sse::Frames;
-use super::{models_json, prepare};
+use super::{Installed, models_json, prepare};
 
 fn chat_request(body: &Value, thinking: bool) -> crate::Result<ChatRequest> {
     Ok(prepare_generation(body.to_string().as_bytes(), thinking)?.request)
@@ -1154,11 +1154,44 @@ fn reply_ids_are_prefixed_and_unique() {
 
 #[test]
 fn models_report_the_admitted_context() {
-    let models = models_json("bonsai", 32768, 1234, false, false, false);
+    let models = models_json("bonsai", 32768, 1234, Installed::default());
     assert_eq!(models["data"][0]["id"], "bonsai");
     assert_eq!(models["data"][0]["created"], 1234);
     assert_eq!(models["data"][0]["context_length"], 32768);
     assert_eq!(models["data"][0]["max_model_len"], 32768);
+    assert_eq!(models["data"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn models_list_every_installed_model() {
+    let installed = Installed {
+        embeddings: true,
+        moderation: true,
+        speech: true,
+        transcription: true,
+    };
+    let models = models_json("bonsai", 32768, 1234, installed);
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .map(|model| model["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "bonsai",
+            "embeddinggemma-2",
+            "embeddinggemma-2-moderation-1",
+            "kokoro-82m",
+            "whisper-large-v3"
+        ]
+    );
+    for model in models["data"].as_array().expect("data") {
+        assert_eq!(model["object"], "model");
+        assert_eq!(model["created"], 1234);
+        assert_eq!(model["owned_by"], "local");
+    }
 }
 
 fn structured_stats(stop_reason: StopReason, complete: bool) -> Box<Stats> {

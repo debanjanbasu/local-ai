@@ -61,7 +61,6 @@ pub fn vision_installed(dir: &Path) -> bool {
     dir.join(VISION_ARTIFACT).is_file()
 }
 
-
 /// Decode and preprocess an encoded image file for the default budget of
 /// [`IMAGE_SOFT_TOKENS`].
 ///

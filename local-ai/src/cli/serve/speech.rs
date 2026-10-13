@@ -58,6 +58,7 @@ use local_engine::speech::{
     VOICE_ALIASES, installed_model,
 };
 
+use super::admin::{self, Caller, Meter};
 use super::response::{add_alt_svc, error_response, json_response};
 use super::{AppState, MAX_REQUEST_BYTES};
 
@@ -308,7 +309,12 @@ async fn busy(state: &AppState, headers: &HeaderMap) -> Response {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+pub(super) async fn handle(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+    caller: &Caller,
+) -> Response {
     let Some(service) = state.speech.clone() else {
         return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
     };
@@ -377,15 +383,21 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
         parsed.format.content_type()
     };
     let worker_cancelled = Arc::clone(&cancelled);
+    // Recorded once the whole input has been synthesized.
+    let meter = Meter::into_store(
+        state.auth.admin(),
+        admin::speech_usage(caller, SPEECH_MODEL_ID, &parsed.input),
+    );
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _guard = CancelOnDrop(Arc::clone(&worker_cancelled));
-        if let Err(message) =
-            synthesize(&service, &parsed, &voice, seed, &worker_cancelled, &sender)
-            && !worker_cancelled.load(Ordering::SeqCst)
-        {
-            eprintln!("speech request failed: {message}");
-            let _ = sender.blocking_send(Err(std::io::Error::other(message)));
+        match synthesize(&service, &parsed, &voice, seed, &worker_cancelled, &sender) {
+            Ok(()) => meter.write(),
+            Err(message) if !worker_cancelled.load(Ordering::SeqCst) => {
+                eprintln!("speech request failed: {message}");
+                let _ = sender.blocking_send(Err(std::io::Error::other(message)));
+            }
+            Err(_) => {}
         }
     });
     let mut response = Response::new(Body::from_stream(CancelStream {

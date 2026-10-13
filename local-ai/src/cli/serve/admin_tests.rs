@@ -83,7 +83,6 @@ const API_PATHS: &[&str] = &[
     "/v1/responses/input_tokens",
     "/v1/responses/compact",
     "/v1/chat/completions",
-    "/v1/completions",
     "/v1/embeddings",
     "/v1/conversations",
     "/v1/files",
@@ -95,6 +94,8 @@ const API_PATHS: &[&str] = &[
     "/v1/experimental/decisions",
     "/v1/moderations",
     "/v1/audio/speech",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
     "/v1/organizations",
 ];
 
@@ -855,4 +856,132 @@ async fn metering_forwards_every_event_and_records_the_finished_usage() {
     assert_eq!(results[0]["input_cached_tokens"], 4);
     assert_eq!(results[0]["output_tokens"], 2);
     assert_eq!(results[0]["num_model_requests"], 1);
+}
+
+/// Every result of `family` recorded in the last minute, one bucket.
+fn recent(admin: &Admin, family: &str) -> Vec<Value> {
+    let now = super::super::response::unix_now();
+    let page = expect(
+        admin,
+        Method::GET,
+        &format!(
+            "/usage/{family}?start_time={}&bucket_width=1d&group_by=project_id&group_by=model",
+            now - 60
+        ),
+        &Value::Null,
+        "UsageResponse",
+    );
+    page["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|bucket| bucket["results"].as_array().unwrap().clone())
+        .collect()
+}
+
+#[test]
+fn each_route_records_its_own_usage_family() {
+    let (_dir, admin) = open();
+    let caller = Caller::Project {
+        key_id: "key_p".into(),
+        project_id: "proj_p".into(),
+    };
+    let meter = |record| super::Meter::into_store(Some(&admin), record).write();
+    meter(super::token_usage(
+        &caller,
+        UsageKind::Embeddings,
+        "embeddinggemma-2",
+        7,
+    ));
+    meter(super::token_usage(
+        &caller,
+        UsageKind::Moderations,
+        "embeddinggemma-2-moderation-1",
+        12,
+    ));
+    // Characters, not bytes.
+    meter(super::speech_usage(&caller, "kokoro-82m", "Héllo wörld."));
+    // A transcription and a translation, a started second counting as one.
+    meter(super::transcription_usage(&caller, "whisper-large-v3", 2.2));
+    meter(super::transcription_usage(&caller, "whisper-large-v3", 0.4));
+
+    let embeddings = recent(&admin, "embeddings");
+    assert_eq!(embeddings.len(), 1);
+    assert_eq!(embeddings[0]["input_tokens"], 7);
+    assert_eq!(embeddings[0]["model"], "embeddinggemma-2");
+    assert_eq!(embeddings[0]["project_id"], "proj_p");
+    let moderations = recent(&admin, "moderations");
+    assert_eq!(moderations[0]["input_tokens"], 12);
+    assert_eq!(moderations[0]["num_model_requests"], 1);
+    assert_eq!(moderations[0]["model"], "embeddinggemma-2-moderation-1");
+    let speeches = recent(&admin, "audio_speeches");
+    assert_eq!(speeches[0]["characters"], 12);
+    assert_eq!(speeches[0]["model"], "kokoro-82m");
+    let transcriptions = recent(&admin, "audio_transcriptions");
+    assert_eq!(transcriptions[0]["seconds"], 4);
+    assert_eq!(transcriptions[0]["num_model_requests"], 2);
+    assert_eq!(recent(&admin, "completions"), Vec::<Value>::new());
+}
+
+#[test]
+fn out_of_band_generations_are_recorded_as_completions() {
+    let (_dir, admin) = open();
+    let caller = Caller::Project {
+        key_id: "key_p".into(),
+        project_id: "proj_p".into(),
+    };
+    // A compaction or reasoning summary of a project's request.
+    let mut summary = caller.usage(UsageKind::Completions, "bonsai");
+    summary.model = Some("bonsai".into());
+    let meter = super::Meter::into_store(Some(&admin), summary);
+    let Event::Finished(stats) = finished(30, 10, 5) else {
+        unreachable!()
+    };
+    meter.generation(&stats);
+    // A batch line (an eval run's included): unattributed, batch.
+    let mut line = UsageRecord::new(UsageKind::Completions);
+    line.model = Some("bonsai".into());
+    line.batch = true;
+    let submit: super::super::batches::Submit = Arc::new(|_request| {
+        let mut signals = vec![
+            Signal::Event(Event::Content("ok".into())),
+            Signal::Event(finished(8, 0, 2)),
+        ]
+        .into_iter();
+        Ok(super::super::batches::Generation {
+            next: Box::new(move |_| Ok(signals.next())),
+            cancel: Arc::new(|| {}),
+        })
+    });
+    let submit =
+        super::super::batches::metered_submit(submit, super::Meter::into_store(Some(&admin), line));
+    let request = local_engine::compaction::compaction_request(Vec::new(), Vec::new(), None);
+    let mut generation = submit(request).unwrap();
+    while let Ok(Some(_)) = (generation.next)(None) {}
+    // Without a store nothing is written and nothing fails.
+    super::Meter::default().generation(&stats);
+
+    let now = super::super::response::unix_now();
+    let page = expect(
+        &admin,
+        Method::GET,
+        &format!(
+            "/usage/completions?start_time={}&bucket_width=1d&group_by=batch&group_by=project_id",
+            now - 60
+        ),
+        &Value::Null,
+        "UsageResponse",
+    );
+    let mut results: Vec<Value> = page["data"][0]["results"].as_array().unwrap().clone();
+    results.sort_by_key(|result| result["batch"].as_bool());
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["batch"], false);
+    assert_eq!(results[0]["project_id"], "proj_p");
+    assert_eq!(results[0]["input_tokens"], 30);
+    assert_eq!(results[0]["input_cached_tokens"], 10);
+    assert_eq!(results[0]["output_tokens"], 5);
+    assert_eq!(results[1]["batch"], true);
+    assert_eq!(results[1]["project_id"], Value::Null);
+    assert_eq!(results[1]["input_tokens"], 8);
+    assert_eq!(results[1]["output_tokens"], 2);
 }

@@ -52,6 +52,7 @@ use local_engine::transcription::{
     TranscriptionModel, audio, installed_model,
 };
 
+use super::admin::{self, Caller, Meter};
 use super::response::{add_alt_svc, error_response, json_response};
 use super::{AppState, event_stream};
 
@@ -97,12 +98,12 @@ impl Transcriber {
         };
         let model = TranscriptionModel::open(&dir).map_err(|error| {
             crate::Error::InvalidArgument(format!(
-                "cannot load the speech model in {}: {error}",
+                "cannot load the transcription model in {}: {error}",
                 dir.display()
             ))
         })?;
         eprintln!(
-            "speech at POST {TRANSCRIPTIONS} and {TRANSLATIONS}: {TRANSCRIPTION_MODEL_ID} from {} (F16, \
+            "transcription at POST {TRANSCRIPTIONS} and {TRANSLATIONS}: {TRANSCRIPTION_MODEL_ID} from {} (F16, \
              payload sha256 {})",
             dir.display(),
             model.payload_sha256()
@@ -451,7 +452,7 @@ fn run(
     let mut pause = || {
         if cancelled.load(Ordering::SeqCst) {
             return Err(local_engine::Error::Generation(
-                "speech request cancelled".into(),
+                "transcription request cancelled".into(),
             ));
         }
         activity.yield_to_decode(DECODE_YIELD_LIMIT);
@@ -595,7 +596,7 @@ async fn busy(state: &AppState, headers: &HeaderMap) -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         json!({"error":{
             "message":format!(
-                "{MAX_PENDING} speech requests are already running or waiting; retry after \
+                "{MAX_PENDING} transcription requests are already running or waiting; retry after \
                  {RETRY_AFTER_SECONDS}s with your own backoff"
             ),
             "type":"server_error",
@@ -618,7 +619,12 @@ fn sse(value: &Value) -> Bytes {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Response {
+pub(super) async fn handle(
+    state: &AppState,
+    parts: &Parts,
+    body: Body,
+    caller: &Caller,
+) -> Response {
     let headers = &parts.headers;
     let Some(service) = state.transcription.clone() else {
         return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
@@ -640,7 +646,11 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
     };
     let cancelled = Arc::new(AtomicBool::new(false));
     if form.stream {
-        return stream(state, service, form, task, permit, cancelled);
+        let meter = Meter::into_store(
+            state.auth.admin(),
+            admin::transcription_usage(caller, TRANSCRIPTION_MODEL_ID, 0.0),
+        );
+        return stream(state, service, form, task, permit, cancelled, meter);
     }
     let guard = CancelOnDrop(Arc::clone(&cancelled));
     let worker = Arc::clone(&service);
@@ -687,6 +697,11 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
                 .await;
         }
     };
+    // Translations are counted in the same family, as the hosted API does.
+    admin::record(
+        state,
+        admin::transcription_usage(caller, TRANSCRIPTION_MODEL_ID, transcript.duration),
+    );
     match format {
         Format::Json => {
             let mut value = json!({"text":transcript.text.trim()});
@@ -729,6 +744,7 @@ fn stream(
     task: Task,
     permit: tokio::sync::OwnedSemaphorePermit,
     cancelled: Arc<AtomicBool>,
+    meter: Meter,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::task::spawn_blocking(move || {
@@ -758,6 +774,7 @@ fn stream(
         let result = run(&worker, &form, file, task, &cancelled, &mut on_segments);
         let frame = match result {
             Ok(transcript) => {
+                meter.write_with(|record| record.units = admin::audio_seconds(transcript.duration));
                 let text_tokens = transcript.usage.prompt_tokens;
                 let audio_tokens = transcript.usage.audio_windows * AUDIO_TOKENS_PER_WINDOW;
                 let mut event = json!({
