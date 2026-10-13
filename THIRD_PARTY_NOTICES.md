@@ -141,11 +141,124 @@ SOFTWARE.
 
 ## Symphonia
 
-Audio decoding for the transcription endpoints links
+Audio decoding for the transcription endpoints and for audio embeddings
+(`embedding::decode_audio`) links
 [Symphonia](https://github.com/pdeljanov/Symphonia) 0.6.1 and its codec and
 format crates from crates.io, unmodified, under the Mozilla Public License 2.0
 (<https://mozilla.org/MPL/2.0/>); their source is available from crates.io and
 the repository above.
+
+## libjpeg-turbo (image embeddings)
+
+JPEG decoding for image embeddings statically links libjpeg-turbo, built from
+source by the `mozjpeg-sys` crate (2.2) and used through `mozjpeg` (0.10),
+unmodified, under the IJG License, the Modified (3-clause) BSD License and the
+zlib License (<https://github.com/libjpeg-turbo/libjpeg-turbo/blob/main/LICENSE.md>).
+This software is based in part on the work of the Independent JPEG Group.
+
+## Media crates
+
+The media features link these crates from crates.io, unmodified, under the
+licences their authors chose (full texts in each crate's source):
+
+| Crate | Used for | Licence |
+| --- | --- | --- |
+| `image` 0.25 | image decoding (non-JPEG) for image embeddings | MIT OR Apache-2.0 |
+| `rubato` 5 | resampling to 16 kHz for audio embeddings | MIT OR Apache-2.0 |
+| `realfft` 3.5 | log-mel STFT for audio embeddings | MIT |
+| `rustfft` 6.4 | log-mel STFT for transcription | MIT OR Apache-2.0 |
+| `flate2` 1 with `libz-sys` (zlib) | Whisper's compression-ratio test | MIT OR Apache-2.0; zlib: zlib License |
+| `flacenc` 0.5 | FLAC speech output | Apache-2.0 |
+| `rusty_mp3` 1.0 | MP3 speech output | Apache-2.0 |
+| `rusty-opus` 1.0 | Opus speech output | BSD-3-Clause |
+| `ogg` 0.9 | Ogg container for Opus speech output | BSD-3-Clause |
+
+The BSD-3-Clause crates' notices, as their binary distributions require:
+
+`rusty-opus` 1.0.1:
+
+```text
+Copyright 2026 restsend.com
+
+Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
+                    Jean-Marc Valin, Timothy B. Terriberry,
+                    CSIRO, Gregory Maxwell, Mark Borgerding,
+                    Erik de Castro Lopo, Mozilla, Amazon
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of Internet Society, IETF or IETF Trust, nor the
+names of specific contributors, may be used to endorse or promote
+products derived from this software without specific prior written
+permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Opus is subject to the royalty-free patent licenses which are
+specified at:
+
+Xiph.Org Foundation:
+https://datatracker.ietf.org/ipr/1524/
+
+Microsoft Corporation:
+https://datatracker.ietf.org/ipr/1914/
+
+Broadcom Corporation:
+https://datatracker.ietf.org/ipr/1526/
+```
+
+`ogg` 0.9.2:
+
+```text
+Copyright (c) 2016-2017 est31 <MTest31@outlook.com> and contributors
+Copyright (c) 2002-2015 Xiph.org Foundation
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of the Xiph.org Foundation nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 ## LibriSpeech test fixture
 

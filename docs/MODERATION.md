@@ -34,10 +34,11 @@ artifact stops startup. Startup logs the scored categories.
 - `input`: a string or an array of strings (one result each, at most 256),
   or an array of multi-modal objects (one result for the whole array; its
   `text` parts are joined with newlines). **`image_url` parts are refused
-  with `400`** until native image embeddings land; the integration point is
-  `moderations.rs`: embed the image with the vision encoder and score it with
-  heads trained and evaluated on image embeddings (the text heads must not be
-  reused on image vectors). At most 300,000 tokens per request.
+  with `400`**: the native vision encoder now embeds images
+  ([EMBEDDINGS.md](EMBEDDINGS.md#images-and-video)), but no heads have been
+  trained and evaluated on image embeddings, and the text heads must not be
+  reused on image vectors; the integration point is `moderations.rs`. At most
+  300,000 tokens per request.
 - `model`: optional; `embeddinggemma-2-moderation-1`, or one of the OpenAI
   names (`omni-moderation-latest`, `omni-moderation-2024-09-26`,
   `text-moderation-latest`, `text-moderation-stable`) accepted as aliases so
@@ -224,7 +225,7 @@ answers. The unscored-categories header listed the seven unscored categories.
 - Label mapping is approximate (see the table above); Civil Comments rows
   are assumed negative for illicit, illicit/violent and self-harm.
 - English only in practice (both training sources are English).
-- Text only; image inputs are refused.
+- Text only; image inputs are refused (no image-trained heads).
 - The illicit head reacts to the *form* of a how-to request: the benign "How
   do I bake sourdough bread at home?" scored 0.30 against its 0.387
   threshold (not flagged). Aegis's criminal-planning prompts are mostly
