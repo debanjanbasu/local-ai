@@ -284,6 +284,8 @@ struct Item {
     task: String,
     language: Option<String>,
     prompt: Option<String>,
+    #[serde(default)]
+    words: bool,
 }
 
 fn transcribe(manifest: &Path, out: &Path) -> Result<()> {
@@ -311,6 +313,7 @@ fn transcribe(manifest: &Path, out: &Path) -> Result<()> {
             temperature: Temperature::Fixed(0.0),
             condition_on_previous_text: true,
             seed: 1,
+            word_timestamps: item.words,
         };
         let started = Instant::now();
         let transcript = model.transcribe(&samples, &options, &mut pace, &mut |_| Ok(()))?;
@@ -323,7 +326,9 @@ fn transcribe(manifest: &Path, out: &Path) -> Result<()> {
             .map(|s| {
                 json!({"seek":s.seek,"start":s.start,"end":s.end,"text":s.text,"tokens":s.tokens,
                             "avg_logprob":s.avg_logprob,"no_speech_prob":s.no_speech_prob,
-                            "temperature":s.temperature})
+                            "temperature":s.temperature,
+                            "words":s.words.iter().map(|w| json!({"word":w.word,"start":w.start,
+                                "end":w.end,"probability":w.probability})).collect::<Vec<_>>()})
             })
             .collect();
         let line = json!({"id":item.id,"text":transcript.text,"language":transcript.language,
