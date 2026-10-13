@@ -25,6 +25,7 @@ mod prompt_cache;
 #[allow(clippy::must_use_candidate)]
 pub mod resources;
 mod sampler;
+pub mod speech;
 mod structured;
 mod tools;
 
