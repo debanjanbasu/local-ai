@@ -317,6 +317,7 @@ Weights are not included. The runtime validates these pinned files:
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | for MTP speculation |
 | `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
+| `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | for image/video embeddings (Rust API) |
 
 The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
 not: without it speculation falls back to suffix lookup alone and the startup
