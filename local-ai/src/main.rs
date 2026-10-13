@@ -6,6 +6,7 @@ fn usage() {
     eprintln!("  chat       Run Bonsai 2 27B text inference with default settings");
     eprintln!("  bonsai     Run Bonsai 2 27B inference with backend, MTP and profiling options");
     eprintln!("  serve      Run the OpenAI-compatible server");
+    eprintln!("  admin      Manage authentication and admin API keys");
 }
 
 fn main() -> ExitCode {
@@ -18,6 +19,7 @@ fn main() -> ExitCode {
         "chat" => local_ai::cli::chat::main_with_args(rest),
         "bonsai" => local_ai::cli::bonsai::main_with_args(rest),
         "serve" => local_ai::cli::serve::main_with_args(rest),
+        "admin" => local_ai::cli::admin::main_with_args(rest),
         "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
