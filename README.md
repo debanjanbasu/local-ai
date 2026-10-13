@@ -76,9 +76,15 @@ has no confidence or refusal, carries only the calibration evaluated for that
 artifact's scope (the legacy devtools-v1 head: two-option Yes/No code-diff
 questions; the development-only hard-v1 heads: see
 [their results](local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)),
-and is not the OpenAI Decisions API; `POST /v1/decisions` is refused with an
-explanation, because no head passed the
-[pre-registered confidence and refusal evaluation](docs/DECISIONS_EVALUATION.md).
+and is not the OpenAI Decisions API. `POST /v1/decisions` is served only with
+`--decisions-artifact DIR`: a head, gate and calibration artifact that passed
+the [pre-registered confidence and refusal evaluation](docs/DECISIONS_EVALUATION.md)
+(part 3), verified by hash at startup. Its scope is narrow: CommitPackFT-style
+"does this commit message describe this diff?" predicates over a rendered diff
+are answered with a calibrated probability; CodeReviewer "needs a reviewer
+comment?" is always refused (no threshold met the target risk); every other
+question is answered `refusal`. Without the flag the route is a 404 with an
+explanation.
 
 The server also always opens a durable native services store at
 `~/Library/Application Support/local-ai/services` (owner-only SQLite plus file

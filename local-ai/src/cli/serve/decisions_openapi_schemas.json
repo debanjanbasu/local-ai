@@ -1,0 +1,757 @@
+{
+ "components": {
+  "schemas": {
+   "AnswerResource": {
+    "description": "A completed question always includes its name, including null when unnamed.",
+    "discriminator": {
+     "mapping": {
+      "choice": "#/components/schemas/AnswerResourceChoice",
+      "predicate": "#/components/schemas/AnswerResourcePredicate",
+      "refusal": "#/components/schemas/AnswerResourceRefusal",
+      "score": "#/components/schemas/AnswerResourceScore"
+     },
+     "propertyName": "type"
+    },
+    "oneOf": [
+     {
+      "$ref": "#/components/schemas/AnswerResourcePredicate"
+     },
+     {
+      "$ref": "#/components/schemas/AnswerResourceChoice"
+     },
+     {
+      "$ref": "#/components/schemas/AnswerResourceScore"
+     },
+     {
+      "$ref": "#/components/schemas/AnswerResourceRefusal"
+     }
+    ],
+    "x-oai-discriminator-values": [
+     "predicate",
+     "choice",
+     "score",
+     "refusal"
+    ]
+   },
+   "AnswerResourceChoice": {
+    "additionalProperties": false,
+    "properties": {
+     "choice": {
+      "$ref": "#/components/schemas/ChoiceValueResource"
+     },
+     "confidence": {
+      "type": "number"
+     },
+     "name": {
+      "minLength": 0,
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "probabilities": {
+      "items": {
+       "$ref": "#/components/schemas/ChoiceProbabilityResource"
+      },
+      "maxItems": 2000,
+      "minItems": 0,
+      "type": "array"
+     },
+     "type": {
+      "default": "choice",
+      "description": "The type of the object. Always `choice`.",
+      "enum": [
+       "choice"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "name",
+     "choice",
+     "probabilities",
+     "confidence"
+    ],
+    "type": "object"
+   },
+   "AnswerResourcePredicate": {
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "minLength": 0,
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "probability": {
+      "type": "number"
+     },
+     "type": {
+      "default": "predicate",
+      "description": "The type of the object. Always `predicate`.",
+      "enum": [
+       "predicate"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "name",
+     "probability"
+    ],
+    "type": "object"
+   },
+   "AnswerResourceRefusal": {
+    "additionalProperties": false,
+    "description": "The model declined to answer this question. Other questions in the same request can still receive answers.",
+    "properties": {
+     "name": {
+      "minLength": 0,
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "type": {
+      "default": "refusal",
+      "description": "The type of the object. Always `refusal`.",
+      "enum": [
+       "refusal"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "name"
+    ],
+    "type": "object"
+   },
+   "AnswerResourceScore": {
+    "additionalProperties": false,
+    "properties": {
+     "confidence": {
+      "type": "number"
+     },
+     "name": {
+      "minLength": 0,
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "probabilities": {
+      "items": {
+       "$ref": "#/components/schemas/ScoreProbabilityResource"
+      },
+      "maxItems": 2000,
+      "minItems": 0,
+      "type": "array"
+     },
+     "score": {
+      "type": "number"
+     },
+     "type": {
+      "default": "score",
+      "description": "The type of the object. Always `score`.",
+      "enum": [
+       "score"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "name",
+     "score",
+     "probabilities",
+     "confidence"
+    ],
+    "type": "object"
+   },
+   "ChoiceOptionParam": {
+    "additionalProperties": false,
+    "properties": {
+     "description": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "value": {
+      "$ref": "#/components/schemas/ChoiceValueParam"
+     }
+    },
+    "required": [
+     "value"
+    ],
+    "type": "object"
+   },
+   "ChoiceProbabilityResource": {
+    "additionalProperties": false,
+    "properties": {
+     "probability": {
+      "type": "number"
+     },
+     "value": {
+      "$ref": "#/components/schemas/ChoiceValueResource"
+     }
+    },
+    "required": [
+     "value",
+     "probability"
+    ],
+    "type": "object"
+   },
+   "ChoiceValueParam": {
+    "description": "Choice values are typed: a string and a boolean with the same text are distinct.",
+    "oneOf": [
+     {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     {
+      "type": "boolean"
+     }
+    ]
+   },
+   "ChoiceValueResource": {
+    "description": "Choice values are typed: a string and a boolean with the same text are distinct.",
+    "oneOf": [
+     {
+      "minLength": 0,
+      "type": "string"
+     },
+     {
+      "type": "boolean"
+     }
+    ]
+   },
+   "DecisionInput": {
+    "description": "The text or images to evaluate for every question. Provide a text string or user messages containing text and images. Images can be base64 data URLs or publicly accessible HTTP(S) URLs; at most 128 images are allowed across all messages in one request. Files, audio, tools, and item references are not supported.",
+    "oneOf": [
+     {
+      "maxLength": 10485760,
+      "minLength": 0,
+      "type": "string"
+     },
+     {
+      "items": {
+       "discriminator": {
+        "mapping": {
+         "message": "#/components/schemas/DecisionInputMessage"
+        },
+        "propertyName": "type"
+       },
+       "oneOf": [
+        {
+         "$ref": "#/components/schemas/DecisionInputMessage"
+        }
+       ],
+       "x-oai-default-discriminator-value": "message",
+       "x-oai-discriminator-values": [
+        "message"
+       ]
+      },
+      "maxItems": 131072,
+      "minItems": 0,
+      "type": "array"
+     }
+    ]
+   },
+   "DecisionInputContent": {
+    "description": "Text evidence or an ordered list of text and image parts.",
+    "oneOf": [
+     {
+      "maxLength": 10485760,
+      "minLength": 0,
+      "type": "string"
+     },
+     {
+      "$ref": "#/components/schemas/DecisionInputContentParts",
+      "title": "Parts"
+     }
+    ]
+   },
+   "DecisionInputContentParts": {
+    "items": {
+     "discriminator": {
+      "mapping": {
+       "input_image": "#/components/schemas/DecisionInputImage",
+       "input_text": "#/components/schemas/DecisionInputText"
+      },
+      "propertyName": "type"
+     },
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/DecisionInputText"
+      },
+      {
+       "$ref": "#/components/schemas/DecisionInputImage"
+      }
+     ],
+     "x-oai-discriminator-values": [
+      "input_text",
+      "input_image"
+     ]
+    },
+    "maxItems": 16384,
+    "minItems": 0,
+    "type": "array"
+   },
+   "DecisionInputImage": {
+    "additionalProperties": false,
+    "description": "An image provided as a base64 data URL or a publicly accessible HTTP(S) URL. File IDs are not supported.",
+    "properties": {
+     "detail": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/ImageDetailParam"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": "auto",
+      "description": "The image detail level, using the selected model's image profile. Defaults to auto."
+     },
+     "image_url": {
+      "description": "A base64-encoded image in a data URL or a publicly accessible HTTP(S) image URL.",
+      "maxLength": 1073741824,
+      "minLength": 0,
+      "pattern": "^(data:|https?://)",
+      "type": "string"
+     },
+     "type": {
+      "default": "input_image",
+      "enum": [
+       "input_image"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "image_url",
+     "type"
+    ],
+    "type": "object"
+   },
+   "DecisionInputMessage": {
+    "additionalProperties": false,
+    "description": "A user message containing text or images.",
+    "properties": {
+     "content": {
+      "$ref": "#/components/schemas/DecisionInputContent"
+     },
+     "role": {
+      "default": "user",
+      "enum": [
+       "user"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     },
+     "type": {
+      "default": "message",
+      "enum": [
+       "message"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "role",
+     "content"
+    ],
+    "type": "object"
+   },
+   "DecisionInputText": {
+    "additionalProperties": false,
+    "properties": {
+     "text": {
+      "maxLength": 10485760,
+      "minLength": 0,
+      "type": "string"
+     },
+     "type": {
+      "default": "input_text",
+      "enum": [
+       "input_text"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "text"
+    ],
+    "type": "object"
+   },
+   "DecisionRequest": {
+    "additionalProperties": false,
+    "properties": {
+     "input": {
+      "$ref": "#/components/schemas/DecisionInput"
+     },
+     "model": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "questions": {
+      "items": {
+       "$ref": "#/components/schemas/QuestionParam"
+      },
+      "maxItems": 200,
+      "minItems": 1,
+      "type": "array"
+     },
+     "safety_identifier": {
+      "description": "Opaque caller-provided end-user identifier, scoped by the verified org. Match Responses' limit; this is never the authenticated user identity.",
+      "maxLength": 128,
+      "minLength": 0,
+      "type": [
+       "string",
+       "null"
+      ]
+     }
+    },
+    "required": [
+     "model",
+     "input",
+     "questions"
+    ],
+    "type": "object"
+   },
+   "DecisionResponse": {
+    "additionalProperties": false,
+    "properties": {
+     "answers": {
+      "items": {
+       "$ref": "#/components/schemas/AnswerResource"
+      },
+      "maxItems": 2000,
+      "minItems": 0,
+      "type": "array"
+     },
+     "model": {
+      "minLength": 0,
+      "type": "string"
+     },
+     "usage": {
+      "$ref": "#/components/schemas/ResponseUsageResource"
+     }
+    },
+    "required": [
+     "model",
+     "answers",
+     "usage"
+    ],
+    "type": "object"
+   },
+   "ImageDetailParam": {
+    "enum": [
+     "low",
+     "high",
+     "auto",
+     "original"
+    ],
+    "type": "string"
+   },
+   "InputTokensDetailsResource": {
+    "additionalProperties": false,
+    "properties": {
+     "cache_write_tokens": {
+      "format": "int64",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": "integer"
+     },
+     "cached_tokens": {
+      "format": "int64",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": "integer"
+     }
+    },
+    "required": [
+     "cached_tokens",
+     "cache_write_tokens"
+    ],
+    "type": "object"
+   },
+   "OutputTokensDetailsResource": {
+    "additionalProperties": false,
+    "properties": {
+     "reasoning_tokens": {
+      "format": "int64",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": "integer"
+     }
+    },
+    "required": [
+     "reasoning_tokens"
+    ],
+    "type": "object"
+   },
+   "QuestionParam": {
+    "description": "A question about the request's input, with an optional correlation name.",
+    "discriminator": {
+     "mapping": {
+      "choice": "#/components/schemas/QuestionParamChoice",
+      "predicate": "#/components/schemas/QuestionParamPredicate",
+      "score": "#/components/schemas/QuestionParamScore"
+     },
+     "propertyName": "type"
+    },
+    "oneOf": [
+     {
+      "$ref": "#/components/schemas/QuestionParamPredicate"
+     },
+     {
+      "$ref": "#/components/schemas/QuestionParamChoice"
+     },
+     {
+      "$ref": "#/components/schemas/QuestionParamScore"
+     }
+    ],
+    "x-oai-discriminator-values": [
+     "predicate",
+     "choice",
+     "score"
+    ]
+   },
+   "QuestionParamChoice": {
+    "additionalProperties": false,
+    "description": "Choose from the supplied options based on the input.",
+    "properties": {
+     "choices": {
+      "description": "Provide between 2 and 255 choices. Each choice must be unique.",
+      "items": {
+       "$ref": "#/components/schemas/ChoiceOptionParam"
+      },
+      "maxItems": 255,
+      "minItems": 2,
+      "type": "array"
+     },
+     "instructions": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "name": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "type": {
+      "default": "choice",
+      "description": "The type of the object. Always `choice`.",
+      "enum": [
+       "choice"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "instructions",
+     "choices"
+    ],
+    "type": "object"
+   },
+   "QuestionParamPredicate": {
+    "additionalProperties": false,
+    "description": "Estimate how likely it is that a statement about the input is true.",
+    "properties": {
+     "instructions": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "name": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "type": {
+      "default": "predicate",
+      "description": "The type of the object. Always `predicate`.",
+      "enum": [
+       "predicate"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "instructions"
+    ],
+    "type": "object"
+   },
+   "QuestionParamScore": {
+    "additionalProperties": false,
+    "description": "Rate the input against the supplied ordered levels.",
+    "properties": {
+     "instructions": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "levels": {
+      "items": {
+       "$ref": "#/components/schemas/ScoreLevelParam"
+      },
+      "maxItems": 10,
+      "minItems": 2,
+      "type": "array"
+     },
+     "name": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "type": {
+      "default": "score",
+      "description": "The type of the object. Always `score`.",
+      "enum": [
+       "score"
+      ],
+      "type": "string",
+      "x-stainless-const": true
+     }
+    },
+    "required": [
+     "type",
+     "instructions",
+     "levels"
+    ],
+    "type": "object"
+   },
+   "ResponseUsageResource": {
+    "additionalProperties": false,
+    "properties": {
+     "input_tokens": {
+      "format": "int64",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": "integer"
+     },
+     "input_tokens_details": {
+      "$ref": "#/components/schemas/InputTokensDetailsResource"
+     },
+     "output_tokens": {
+      "format": "int64",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": "integer"
+     },
+     "output_tokens_details": {
+      "$ref": "#/components/schemas/OutputTokensDetailsResource"
+     },
+     "total_tokens": {
+      "format": "int64",
+      "maximum": 2147483647,
+      "minimum": -2147483648,
+      "type": "integer"
+     }
+    },
+    "required": [
+     "input_tokens",
+     "input_tokens_details",
+     "output_tokens",
+     "output_tokens_details",
+     "total_tokens"
+    ],
+    "type": "object"
+   },
+   "ScoreLevelParam": {
+    "additionalProperties": false,
+    "properties": {
+     "description": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     },
+     "label": {
+      "maxLength": 1048576,
+      "minLength": 0,
+      "type": "string"
+     }
+    },
+    "required": [
+     "label"
+    ],
+    "type": "object"
+   },
+   "ScoreProbabilityResource": {
+    "additionalProperties": false,
+    "properties": {
+     "label": {
+      "minLength": 0,
+      "type": "string"
+     },
+     "probability": {
+      "type": "number"
+     },
+     "value": {
+      "format": "int64",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "value",
+     "label",
+     "probability"
+    ],
+    "type": "object"
+   }
+  }
+ },
+ "x-source": {
+  "file": "openai-contract/openapi.json",
+  "schemas": [
+   "AnswerResource",
+   "AnswerResourceChoice",
+   "AnswerResourcePredicate",
+   "AnswerResourceRefusal",
+   "AnswerResourceScore",
+   "ChoiceOptionParam",
+   "ChoiceProbabilityResource",
+   "ChoiceValueParam",
+   "ChoiceValueResource",
+   "DecisionInput",
+   "DecisionInputContent",
+   "DecisionInputContentParts",
+   "DecisionInputImage",
+   "DecisionInputMessage",
+   "DecisionInputText",
+   "DecisionRequest",
+   "DecisionResponse",
+   "ImageDetailParam",
+   "InputTokensDetailsResource",
+   "OutputTokensDetailsResource",
+   "QuestionParam",
+   "QuestionParamChoice",
+   "QuestionParamPredicate",
+   "QuestionParamScore",
+   "ResponseUsageResource",
+   "ScoreLevelParam",
+   "ScoreProbabilityResource"
+  ],
+  "sha256": "17975b832308c380e4a365e20b37bb17de7e4e27cec3ba84c5be185bd9b400b6"
+ }
+}

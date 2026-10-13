@@ -64,6 +64,7 @@ fn decision(kind: &DecisionKind, probabilities: &[f64], tokens: usize) -> Decisi
         renderer: DECISION_RENDERER,
         renderer_declared: true,
         calibration_scope: SCOPE.into(),
+        decide_row: Vec::new(),
     }
 }
 

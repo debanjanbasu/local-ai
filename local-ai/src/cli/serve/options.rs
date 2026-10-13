@@ -95,6 +95,11 @@ pub(super) fn usage() {
          with this judgment head (probabilities only; no confidence or refusal; calibration \
          provenance comes from the artifact, unknown when absent; default: off)"
     );
+    eprintln!(
+        "  --decisions-artifact DIR  Serve POST /v1/decisions from an evaluated head, gate and \
+         calibration (head.safetensors, gate.safetensors, calibration.json; hashes, acceptance \
+         and scope verified at startup; calibrated probabilities and refusals; default: off)"
+    );
     eprintln!();
     eprintln!("  Hosted tools (Responses API; default: none; see docs/TOOLS.md):");
     eprintln!(
@@ -134,6 +139,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         response_store: None,
         reasoning_key: None,
         decision_head: None,
+        decisions_artifact: None,
         tools: ToolArgs::default(),
     };
     let mut index = 0;
@@ -168,6 +174,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 | "--response-store"
                 | "--reasoning-key"
                 | "--experimental-decision-head"
+                | "--decisions-artifact"
                 | "--tools-root"
                 | "--tools-fetch-domain"
                 | "--tools-max-iterations"
@@ -195,6 +202,12 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                     return Err("--experimental-decision-head requires a file path".into());
                 }
                 parsed.decision_head = Some(value.into());
+            }
+            "--decisions-artifact" => {
+                if value.is_empty() {
+                    return Err("--decisions-artifact requires a directory path".into());
+                }
+                parsed.decisions_artifact = Some(value.into());
             }
             "--response-store" => {
                 if value.is_empty() {
