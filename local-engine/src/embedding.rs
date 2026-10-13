@@ -19,6 +19,9 @@
 //! card's prompts, which [`EmbeddingPrompt`] formats: queries as
 //! `task: {task} | query: {text}`, documents as `title: {title} | text: {text}`.
 //!
+//! Images and video run through the optional vision encoder in [`vision`]
+//! and then this same text encoder.
+//!
 //! Work is split into short command buffers (a few layers each) with a
 //! caller-supplied pacing hook between them, so a server can keep embedding
 //! work from delaying concurrent decoding (see [`EmbeddingModel::embed_ids`]).
