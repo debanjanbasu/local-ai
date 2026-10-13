@@ -19,14 +19,18 @@
 //! card's prompts, which [`EmbeddingPrompt`] formats: queries as
 //! `task: {task} | query: {text}`, documents as `title: {title} | text: {text}`.
 //!
-//! Images and video run through the optional vision encoder in [`vision`]
-//! and then this same text encoder.
+//! Images and video (the optional vision encoder in [`vision`]) and audio
+//! (the optional audio encoder, [`EmbeddingModel::embed_audio`]) become soft
+//! tokens of one multimodal sequence ([`EmbeddingModel::embed_multimodal`])
+//! that runs through this same text encoder.
 //!
 //! Work is split into short command buffers (a few layers each) with a
 //! caller-supplied pacing hook between them, so a server can keep embedding
 //! work from delaying concurrent decoding (see [`EmbeddingModel::embed_ids`]).
 
 mod artifact;
+mod audio;
+mod multimodal;
 pub mod vision;
 
 use std::path::{Path, PathBuf};
@@ -41,7 +45,12 @@ use tokenizers::Tokenizer;
 
 use crate::Error;
 use artifact::Artifact;
-pub use vision::{MediaPart, prepare_image, prepare_video};
+pub use audio::{
+    AUDIO_ARTIFACT, FeatureExtractor, LogMel, MAX_AUDIO_TOKENS, MAX_SAMPLES, MEL_BINS, SAMPLE_RATE,
+    audio_tokens, decode_audio, frame_counts, to_mono_16k, validate_clip,
+};
+pub use multimodal::{MAX_MULTIMODAL_TOKENS, MediaPart};
+pub use vision::{prepare_image, prepare_video};
 
 /// Installation directory name inside a models directory (the one that holds
 /// the Bonsai checkpoint's own folder, e.g. `models/`).
@@ -230,9 +239,13 @@ pub struct EmbeddingModel {
     layers: Vec<LayerWeights>,
     projection: Vec<f32>,
     workspace: Workspace,
-    /// Install directory (the optional vision artifact loads from it lazily).
+    /// Install directory (the optional vision and audio artifacts load from
+    /// it on first use).
     dir: PathBuf,
     vision: Option<vision::VisionTower>,
+    /// The optional audio encoder (loaded on first use or by
+    /// [`Self::load_audio`]).
+    audio: Option<audio::AudioTower>,
 }
 
 // SAFETY: Metal devices, queues, pipelines and buffers may be transferred
@@ -330,6 +343,7 @@ impl EmbeddingModel {
             workspace,
             dir: dir.to_path_buf(),
             vision: None,
+            audio: None,
         })
     }
 
