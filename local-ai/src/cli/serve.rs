@@ -30,6 +30,7 @@ mod evals;
 mod hosted;
 mod http3;
 mod journal;
+mod moderations;
 mod openai_decisions;
 mod options;
 mod reasoning_crypto;
@@ -131,6 +132,8 @@ struct AppState {
     embeddings: Option<Arc<embeddings::Embeddings>>,
     /// Native text to speech, when the speech model is installed.
     speech: Option<Arc<speech::Speech>>,
+    /// `POST /v1/moderations`, when the moderation artifact is installed too.
+    moderations: Option<Arc<moderations::Moderations>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -233,6 +236,9 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             &parts.headers,
         )
         .await;
+    }
+    if parts.method == Method::POST && parts.uri.path() == moderations::ROUTE {
+        return moderations::handle(&state, &parts.headers, body).await;
     }
     if parts.method == Method::POST && parts.uri.path() == embeddings::ROUTE {
         return embeddings::handle(&state, &parts.headers, body, &caller).await;
@@ -1084,6 +1090,11 @@ async fn run_async(args: Args) -> crate::Result<()> {
         Some(models_dir) => speech::Speech::start(models_dir, engine.activity())?,
         None => None,
     };
+    // With the embedding model: `models/moderation`.
+    let moderations = match models_dir {
+        Some(models_dir) => moderations::Moderations::start(models_dir, embeddings.as_ref())?,
+        None => None,
+    };
     let mut state = AppState {
         engine,
         model,
@@ -1115,6 +1126,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         tools,
         embeddings,
         speech,
+        moderations,
     };
     let address = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;

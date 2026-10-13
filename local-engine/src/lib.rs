@@ -21,6 +21,7 @@ pub mod bonsai_tokenizer;
 pub mod compaction;
 pub mod embedding;
 pub mod judgment;
+pub mod moderation;
 mod prompt_cache;
 #[doc(hidden)]
 #[allow(clippy::must_use_candidate)]
