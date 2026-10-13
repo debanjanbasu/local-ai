@@ -508,7 +508,9 @@ fn a_sampling_run_generates_and_grades_through_batches() {
         wrong["sample"]["input"],
         json!([{"role": "user", "content": "2+2="}])
     );
-    assert_eq!(wrong["sample"]["seed"], 42);
+    // A completions source samples through Chat Completions, whose seed is
+    // deprecated: the sample reports the fixed one it ran with.
+    assert_eq!(wrong["sample"]["seed"], crate::evals::CHAT_COMPLETIONS_SEED);
     assert_eq!(wrong["results"][1]["score"], 1.0);
     assert_eq!(wrong["results"][1]["passed"], false);
     assert_eq!(

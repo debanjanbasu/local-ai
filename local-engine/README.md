@@ -18,6 +18,12 @@ and `sync`) for its event transport and on `futures-core` for the `Stream`
 implementation, and has no HTTP server dependency. See the repository
 [README](../README.md#library-use) and [technical reference](../docs/BONSAI.md).
 
+Generation is chat-shaped (`ChatRequest`): there is no raw-prompt completion
+API, as the server built on it serves only current `OpenAI` APIs (Chat
+Completions and Responses, no legacy Completions; see
+[supported APIs](../docs/BONSAI.md#supported-openai-apis)). The
+`local-ai bonsai --raw` command prefills raw text for measurements.
+
 ## Native agent integration
 
 The engine is the reusable Rust boundary. A future coding harness should call
@@ -89,23 +95,20 @@ keep the original items (the server's stores do) when they may be needed again.
 
 ### Counting prompt tokens
 
-`Engine::count_chat_tokens(&ChatRequest)` and
-`Engine::count_completion_tokens(&CompletionRequest)` return the exact number
-of prompt tokens generation would prefill. A chat request is validated,
+`Engine::count_chat_tokens(&ChatRequest)` returns the exact number of prompt
+tokens generation would prefill. The request is validated,
 rendered (messages, replayed tool calls and results, tool definitions and
 `thinking`) and tokenized, special tokens included, by the same code as
 `chat_with`, so the count equals `prompt_tokens` in the generation statistics,
 cached prefix included, and invalid prompt content fails with the error
-generation would return. A completion is tokenized as `complete` tokenizes it,
-without a template; an empty prompt counts zero although generation rejects it.
-`max_tokens`, `sampling`, `session`, `response_format`, `tool_choice`,
+generation would return. `max_tokens`, `sampling`, `session`, `response_format`, `tool_choice`,
 `parallel_tool_calls` and tool `strict` are ignored (none of them changes the
 prompt); no schema or tool grammar is compiled and the count is not checked
 against the context window.
 Counting is CPU-only and submits no GPU work.
-`EngineHandle` offers the same two methods against the worker's shared
-tokenizer: they run on the calling thread, queue no job and never wait for
-running generations, so they work while the queue is full. Async callers should
+`EngineHandle` offers the same method against the worker's shared
+tokenizer: it runs on the calling thread, queues no job and never waits for
+running generations, so it works while the queue is full. Async callers should
 run long prompts on a blocking pool.
 
 ## Text embeddings
@@ -136,21 +139,19 @@ for running Bonsai decode steps instead of delaying them.
 
 ## Structured output
 
-`ChatRequest::response_format` and `CompletionRequest::response_format` take a
-`ResponseFormat`: `Text` (default), `JsonObject` (`OpenAI` `json_object`) or
+`ChatRequest::response_format` takes a `ResponseFormat`: `Text` (default), `JsonObject` (`OpenAI` `json_object`) or
 `JsonSchema(schema)` (the `schema` of `OpenAI` `json_schema`; `name`,
 `description` and `strict` are not needed by the engine, and the schema is
 always enforced). The format is compiled with
 [llguidance](https://github.com/guidance-ai/llguidance) before the request is
-queued (`Engine::chat_with`/`complete`, `EngineHandle::chat`/`complete`), so
+queued (`Engine::chat_with`, `EngineHandle::chat`), so
 invalid or unsupported schemas fail with `Error::InvalidArgument` before any
 generation. Every target token selection (first token, plain decode, n-gram
 and MTP verification, batched rows) is masked to what the grammar allows;
 drafts stay unconstrained proposals that the masked target verifies.
 
 - With `thinking`, reasoning is unconstrained and the format applies from the
-  token after `</think>`; without it, and for raw completions, from the first
-  generated token, with no whitespace before the document.
+  token after `</think>`; without it, from the first generated token, with no whitespace before the document.
 - End-of-sequence is only selectable once the document is complete.
   `GenerationStats::response_format_complete` is `Some(true)` only then;
   a token limit or cancellation yields `Some(false)` and incomplete JSON.

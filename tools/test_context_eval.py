@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import context_eval as ce
 
@@ -175,6 +176,41 @@ class StageTest(unittest.TestCase):
             f"<|im_start|>system\n{ce.REASONING_INSTRUCTION}\n\nYou are answering"))
         with self.assertRaises(ValueError):
             ce.stage_prefix(system, "none", 100_000)
+
+    def test_a_stage_is_a_raw_cli_prefill_whose_tail_snapshot_is_recorded(self):
+        # A stand-in for `local-ai bonsai`: it checks it was asked for a raw,
+        # greedy one-token prefill of the staged prefix, writes the snapshot the
+        # engine would (the prompt minus its last token) and reports as JSON.
+        system, _ = ce.build_context(1, "8k", ce.make_needles(1))
+        prefix = ce.stage_prefix(system, "xhigh", 1_000)
+        fake = (
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "assert args[:6] == ['bonsai', '--raw', '--greedy', '--json', '--max-tokens', '1'], args\n"
+            "prompt = Path(args[args.index('--prompt-file') + 1]).read_text()\n"
+            f"assert prompt == {prefix!r}\n"
+            "root = Path(os.environ['HOME']) / 'Library/Caches/local-ai/prompt-cache/model'\n"
+            "root.mkdir(parents=True)\n"
+            "(root / '1022-abc.bpc').write_bytes(b'')\n"
+            "print('loading', file=sys.stderr)\n"
+            "print(json.dumps({'prompt_tokens': 1023, 'cached_tokens': 0, 'prefill_seconds': 4.0}))\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out, binary = Path(tmp), Path(tmp) / "local-ai"
+            binary.write_text(fake)
+            binary.chmod(0o755)
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                ce.run_stage(binary, out, "8k", 1, "xhigh", 1_000)
+            row = json.loads((out / "stages.jsonl").read_text())
+            self.assertEqual((row["status"], row["prompt_tokens"], row["prefill_seconds"]), (200, 1023, 4.0))
+            self.assertTrue(row["snapshot"].endswith("model/1022-abc.bpc"))
+            self.assertIn("loading", (out / "stage.log").read_text())
+            # A finished stage is not run again.
+            binary.write_text(f"#!{sys.executable}\nraise SystemExit(3)\n")
+            ce.run_stage(binary, out, "8k", 1, "xhigh", 1_000)
+            self.assertEqual(len((out / "stages.jsonl").read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":
