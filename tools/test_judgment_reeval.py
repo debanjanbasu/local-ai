@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import judgment_calibrate as jc
@@ -131,6 +132,77 @@ class EvaluateTest(unittest.TestCase):
         tampered["families"][jc.CR_TASK]["threshold"] = 0.0
         with self.assertRaises(jc.CalibrateError):
             jr.verify_calibration_artifact(tampered, "h" * 64, "g" * 64)
+
+
+class OfflineAndHttpParityTest(unittest.TestCase):
+    ARTIFACT: ClassVar[dict] = {
+        "families": {
+            jc.CR_TASK: {"calibration": {"method": "platt", "slope": 1.0, "bias": 0.0},
+                         "threshold": None},
+            jc.CM_TASK: {"calibration": {"method": "temperature", "temperature": 1.0},
+                         "threshold": 0.8}},
+        "gate": {"threshold": 1.0},
+        "scope": jc.DEVTOOLS_SCOPE,
+    }
+
+    def test_offline_decisions_apply_scope_gate_and_family_thresholds_in_order(self):
+        rows = [scored(0, jc.CM_TASK, 4.0, True, "a", gate=0.5),
+                scored(1, jc.CM_TASK, 0.2, True, "b", gate=0.5),
+                scored(2, jc.CM_TASK, 4.0, True, "c", gate=3.0),
+                scored(3, jc.CR_TASK, 4.0, True, "d", gate=0.5),
+                dict(scored(4, jc.CM_TASK, 4.0, True, "e"), prompt_tokens=4096),
+                dict(scored(5, "aegis_unsafe", 4.0, True, "f"), question_text="Unsafe?")]
+        out = jr.offline_decisions(rows, self.ARTIFACT)
+        self.assertEqual([r.get("refusal", "out") for r in out],
+                         [None, "low_confidence", "gate", "family_refused", "prompt_too_long",
+                          "out"])
+        self.assertAlmostEqual(out[0]["p_yes"], jc.sigmoid(4.0))
+        self.assertFalse(out[5]["in_scope"])
+
+    def test_http_parity_compares_answers_with_offline_decisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            requests = [{"id": "a", "state": "Diff:\n@@", "question": "q", "kind": "predicate"},
+                        {"id": "b", "state": "Diff:\n@@", "question": "q", "kind": "choice",
+                         "options": ["x", "y"]}]
+            expected = [{"id": "a", "in_scope": True, "refusal": None, "p_yes": 0.9},
+                        {"id": "b", "in_scope": False}]
+            (tmp / "r.jsonl").write_text("".join(json.dumps(r) + "\n" for r in requests))
+            (tmp / "e.jsonl").write_text("".join(json.dumps(r) + "\n" for r in expected))
+            sent = []
+
+            class Reply:
+                def __init__(self, body):
+                    self.body = body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return False
+
+                def read(self):
+                    return self.body
+
+            def opener(request, timeout):
+                body = json.loads(request.data)
+                sent.append(body)
+                question = body["questions"][0]
+                answer = ({"type": "predicate", "name": question["name"], "probability": 0.9}
+                          if question["type"] == "predicate"
+                          else {"type": "refusal", "name": question["name"]})
+                return Reply(json.dumps({"answers": [answer]}).encode())
+
+            report = jr.http_parity("http://x/v1/decisions", tmp / "r.jsonl", tmp / "e.jsonl",
+                                    ["a", "b"], opener=opener)
+            self.assertEqual((report["agree"], report["answered"]), (2, 1))
+            self.assertEqual(sent[1]["questions"][0]["choices"], [{"value": "x"},
+                                                                  {"value": "y"}])
+            expected[0]["p_yes"] = 0.5
+            (tmp / "e.jsonl").write_text("".join(json.dumps(r) + "\n" for r in expected))
+            report = jr.http_parity("http://x/v1/decisions", tmp / "r.jsonl", tmp / "e.jsonl",
+                                    ["a"], opener=opener)
+            self.assertEqual(report["mismatched"], ["a"])
 
 
 def write_features(directory, rows, width=jr.jt.WIDTH, value=None):
