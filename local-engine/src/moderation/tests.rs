@@ -112,7 +112,7 @@ fn malformed_artifacts_are_refused() {
     unknown["extra"] = json!(1);
     cases.push(unknown);
     for case in cases {
-        assert!(load(&case).is_err(), "{}", &case.to_string()[..120]);
+        assert!(load(&case).is_err(), "{case}");
     }
 }
 

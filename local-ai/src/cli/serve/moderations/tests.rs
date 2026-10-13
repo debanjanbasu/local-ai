@@ -51,7 +51,11 @@ fn heads() -> ModerationHeads {
     });
     let bytes = serde_json::to_vec(&artifact).expect("json");
     let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
-    let sha: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let sha = digest.as_ref().iter().fold(String::new(), |mut out, b| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+        out
+    });
     ModerationHeads::from_bytes(&bytes, &sha, PAYLOAD).expect("valid heads")
 }
 
