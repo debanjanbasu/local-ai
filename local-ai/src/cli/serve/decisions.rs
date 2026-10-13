@@ -10,16 +10,14 @@
 //! `AnswerResource` in the pinned `OpenAPI` spec, and the Decisions guide's
 //! "Interpret the answers") requires a `confidence` on every `choice` and
 //! `score` answer, separate from the probability distribution, and may answer
-//! a question with a `refusal`. The judgment head produces neither: it
-//! returns its softmax over the options and nothing else, and the loaded
-//! head's `calibration_scope` (or [`UNKNOWN_CALIBRATION_SCOPE`]) says what
-//! even those probabilities are not. A
-//! `confidence` here could only be invented, so `/v1/decisions` is refused
-//! with an explanation and this route answers in its own shape instead.
-//! Calibrated confidence, a refusal threshold and a scope gate were fitted
-//! and tested against pre-registered criteria (`docs/DECISIONS_EVALUATION.md`);
-//! no head passed (the selective risk and the out-of-scope gate did not hold
-//! on held-out and out-of-domain rows), so the refusal stands.
+//! a question with a `refusal`. This route's head returns its softmax over
+//! the options and nothing else, and the loaded head's `calibration_scope`
+//! (or [`UNKNOWN_CALIBRATION_SCOPE`]) says what even those probabilities are
+//! not. `POST /v1/decisions` is served separately
+//! ([`super::openai_decisions`], `--decisions-artifact DIR`) only from a head
+//! whose calibration, refusal thresholds and out-of-scope gate passed the
+//! pre-registered criteria (`docs/DECISIONS_EVALUATION.md` part 3), and only
+//! within that evaluated scope; this route answers in its own shape instead.
 //!
 //! # The bridge
 //!
@@ -588,14 +586,13 @@ pub(super) fn response_json(model: &str, answered: Answered) -> Value {
     })
 }
 
-/// Why `POST /v1/decisions` is not served.
+/// Why this route's head cannot answer `POST /v1/decisions`.
 pub(super) fn openai_refusal() -> String {
     format!(
-        "{OPENAI_ROUTE} is not implemented: OpenAI Decisions answers carry a confidence and may \
-         be refusals, which this server's experimental judgment head does not produce reliably \
-         (no head passed the pre-registered confidence and refusal evaluation in \
-         docs/DECISIONS_EVALUATION.md). Start the server with {FLAG} FILE and use POST {ROUTE}, \
-         which returns the head's probabilities only"
+        "OpenAI Decisions answers carry a confidence and may be refusals, which an experimental \
+         judgment head's probabilities are not (see docs/DECISIONS_EVALUATION.md). {OPENAI_ROUTE} \
+         is answered only from an evaluated artifact; POST {ROUTE} with {FLAG} FILE returns a \
+         head's probabilities only"
     )
 }
 
