@@ -188,8 +188,14 @@ bins, n_fft 1024, hop 256, cells within 80 dB of the reference peak.
 | Predicted durations | identical on ≥ 90% of fixtures | **30/30 identical** |
 | Deterministic mode, log-mel distance | MAD ≤ 1.0 dB and mel cosine ≥ 0.99 on every fixture with identical durations | **MAD mean 0.650 dB (max 0.964), cosine mean 0.99874 (min 0.99605)** |
 | Seeded mode (different noise streams), log-mel distance | MAD ≤ 2.0 dB, cosine ≥ 0.98 | **MAD mean 0.572 dB (max 0.757), cosine mean 0.99897 (min 0.99765)** |
-| Intelligibility | native text-to-speech WER ≤ reference pipeline WER + 3 points | ASR_RESULT |
+| Intelligibility | native text-to-speech WER ≤ reference pipeline WER + 3 points | **native 0.30%, reference 0.30%** (1 of 328 words: "three thirty" heard as "3.30" in both); Whisper's transcripts of native and reference audio are identical on all 30 texts, in both the text path and the seeded phoneme path |
 | Native G2P vs `misaki` (lexicon only) | reported | **fixture texts 30/30 identical in both accents; Gutenberg (*Pride and Prejudice*, 400 sentences) words 99.46% (US) / 99.45% (GB) identical** |
+
+The ASR job (`tools/kaggle_kokoro_job.py --mode asr`, private Kaggle CPU
+kernel, `openai/whisper-large-v3-turbo` with Whisper's English text
+normalizer, audio resampled 24→16 kHz with `resample_poly`) transcribed the
+native and reference 16-bit WAVs of the text and seeded paths (120 clips,
+uploaded as a private dataset).
 
 Full text path (native G2P and chunking, seeded) against the reference
 `KPipeline` output: MAD mean 0.576 dB (max 0.758), cosine mean 0.99897.
