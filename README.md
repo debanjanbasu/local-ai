@@ -107,8 +107,9 @@ items of `POST /v1/responses/compact` and of Responses `context_management`
 compaction, which summarize older items with the same Bonsai model and keep
 the rest verbatim (never splitting a tool call from its result); without a key
 both are refused. `reasoning.summary` adds a short second generation that
-summarizes the raw reasoning, which itself stays `reasoning_text`. Both cost
-extra inference and a summary loses detail; see
+summarizes the raw reasoning, which itself stays `reasoning_text`. Both work
+with `background` and cost extra inference (counted in `usage`), and a
+summary loses detail; see
 [docs/BONSAI.md](docs/BONSAI.md#compaction-and-reasoning-summaries).
 `POST /v1/responses/input_tokens`
 returns the exact templated prompt-token count without generating. This is a
