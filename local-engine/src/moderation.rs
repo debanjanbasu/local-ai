@@ -136,7 +136,7 @@ impl Scores {
     /// Whether any supported category is flagged.
     #[must_use]
     pub fn flagged(&self) -> bool {
-        self.flags.iter().any(|f| *f == Some(true))
+        self.flags.contains(&Some(true))
     }
 }
 
@@ -235,14 +235,15 @@ impl ModerationHeads {
         for name in CATEGORIES {
             match &file.categories[name] {
                 CategoryFile::Head(head) => {
-                    let finite = head.weight.iter().all(|w| w.is_finite())
+                    let valid = head.weight.len() == EMBEDDING_DIMENSIONS
+                        && head.weight.iter().all(|w| w.is_finite())
                         && head.bias.is_finite()
-                        && head.platt_offset.is_finite();
-                    if head.weight.len() != EMBEDDING_DIMENSIONS
-                        || !finite
-                        || !(head.platt_scale.is_finite() && head.platt_scale > 0.0)
-                        || !(head.threshold > 0.0 && head.threshold < 1.0)
-                    {
+                        && head.platt_offset.is_finite()
+                        && head.platt_scale.is_finite()
+                        && head.platt_scale > 0.0
+                        && head.threshold > 0.0
+                        && head.threshold < 1.0;
+                    if !valid {
                         return Err(invalid(format!("head {name:?} is malformed")));
                     }
                     heads.push(Some(Head {
