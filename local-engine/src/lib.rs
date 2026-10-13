@@ -29,6 +29,7 @@ pub mod resources;
 mod sampler;
 mod structured;
 mod tools;
+pub mod transcription;
 
 mod error;
 pub use api::{

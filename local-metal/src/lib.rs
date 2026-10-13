@@ -10,6 +10,7 @@ pub mod embedding_vision;
 pub mod kokoro;
 pub mod sampling;
 pub mod shaders;
+pub mod whisper;
 
 mod error;
 pub use error::Error;
