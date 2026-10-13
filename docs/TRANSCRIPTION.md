@@ -39,14 +39,19 @@ also the model family behind OpenAI's own `whisper-1`.
 The checkpoint is `openai/whisper-large-v3` (transformers layout) at revision
 `06f233fe06e710322aca913c1bc4249a0d71fce1`, plus the original package's
 128-band mel filterbank (`whisper/assets/mel_filters.npz`, openai-whisper
-20250625). Whisper large-v3 is not on Kaggle Models, so a private Kaggle CPU
-kernel downloads these public MIT files and saves them as its output (the
-reference job below); this machine downloads the kernel output with the
-Kaggle CLI and converts it offline (standard library only, every source file
-size- and SHA-256-checked, the output checked against a pinned SHA-256):
+20250625). Whisper large-v3 is not on Kaggle Models and this machine does
+not download from Hugging Face, so `tools/kaggle_whisper_job.py` stages a
+private Kaggle **CPU** kernel that downloads these public MIT files at the
+pinned revision (and the pinned openai-whisper sdist from PyPI for the
+filterbank), checks every size and SHA-256 against the converter's pins, and
+saves them as its output; the conversion is then offline (standard library
+only, sources size- and SHA-256-checked, output checked against a pinned
+SHA-256):
 
 ```bash
-kaggle kernels output <owner>/stt-whisper-ref-s0 -p cache/whisper-large-v3
+python3 tools/kaggle_whisper_job.py --kernel <owner>/whisper-large-v3-fetch --output cache/whisper-job
+kaggle kernels push -p cache/whisper-job
+kaggle kernels output <owner>/whisper-large-v3-fetch -p cache/whisper-large-v3
 python3 tools/convert_whisper.py --source cache/whisper-large-v3
 ```
 
