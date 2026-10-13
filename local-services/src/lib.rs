@@ -7,6 +7,7 @@
 //! Each component owns and versions its own tables; this
 //! module only provides the hardened connection and the shared vocabulary.
 
+pub mod admin;
 pub mod batches;
 pub mod compaction;
 pub mod conversations;
@@ -92,6 +93,7 @@ impl Store {
         batches::initialize(&mut connection)?;
         vector_stores::initialize(&mut connection)?;
         evals::initialize(&mut connection)?;
+        admin::initialize(&mut connection)?;
         Ok(store)
     }
 

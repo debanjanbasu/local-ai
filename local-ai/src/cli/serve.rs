@@ -18,6 +18,7 @@ use local_engine::{ChatRequest, Engine, EngineHandle};
 
 use crate::resources::Resources;
 
+mod admin;
 mod background;
 mod backpressure;
 mod batches;
@@ -98,7 +99,8 @@ struct AppState {
     /// with a context-overflow error rather than being truncated.
     context: usize,
     thinking: bool,
-    api_key: Option<Arc<str>>,
+    /// Who may call: the `--api-key` key and the opt-in admin store's keys.
+    auth: Arc<admin::Gate>,
     alt_svc: Option<Arc<str>>,
     depth: QueueDepth,
     /// How long a client may stop consuming before its generation is dropped.
@@ -177,22 +179,12 @@ impl Drop for Admitted {
 #[allow(clippy::too_many_lines)]
 async fn route(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    if let Some(expected) = &state.api_key {
-        let valid = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|value| value == expected.as_ref());
-        if !valid {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "invalid API key",
-                &state,
-                &parts.headers,
-            )
-            .await;
-        }
+    let caller = match admin::authorize(&state, &parts).await {
+        Ok(caller) => caller,
+        Err(refused) => return *refused,
+    };
+    if admin::matches(parts.uri.path()) {
+        return admin::handle(&state, &parts, body, &caller).await;
     }
     if services::matches(parts.uri.path()) {
         let response = services::handle(&state, &parts, body).await;
@@ -239,7 +231,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         .await;
     }
     if parts.method == Method::POST && parts.uri.path() == embeddings::ROUTE {
-        return embeddings::handle(&state, &parts.headers, body).await;
+        return embeddings::handle(&state, &parts.headers, body, &caller).await;
     }
     if parts.method == Method::POST && parts.uri.path() == compaction::ROUTE {
         return compaction::handle(&state, &parts.headers, body).await;
@@ -400,10 +392,14 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             )))
         });
     let events = match events {
-        Ok(events) => match tool_loop {
-            Some(tool_loop) => tool_loop::start(tool_loop, events),
-            None => events,
-        },
+        Ok(events) => admin::meter(
+            &state,
+            &caller,
+            match tool_loop {
+                Some(tool_loop) => tool_loop::start(tool_loop, events),
+                None => events,
+            },
+        ),
         Err(error) => {
             if matches!(error, crate::Error::QueueFull) {
                 return queue_full_response(&state, &parts.headers).await;
@@ -1072,7 +1068,12 @@ async fn run_async(args: Args) -> crate::Result<()> {
         created: response::unix_now(),
         context,
         thinking: args.thinking,
-        api_key: args.api_key.map(Into::into),
+        auth: Arc::new(admin::Gate::new(
+            Some(Arc::new(local_services::admin::Admin::new(
+                services.store().clone(),
+            ))),
+            args.api_key.as_deref(),
+        )?),
         alt_svc: resources
             .tls
             .as_ref()
@@ -1115,6 +1116,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
     if let Some(store) = state.responses.clone() {
         resume_interrupted(&state, &store).await;
     }
+    admin::announce(&state.auth, args.host);
     eprintln!("Bonsai server listening on http://{address}");
     let background = Arc::clone(&state.background);
     let app = Router::new().fallback(any(route)).with_state(state);
