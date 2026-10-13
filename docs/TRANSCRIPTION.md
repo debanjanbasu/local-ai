@@ -182,6 +182,7 @@ the shared GPU lock):
 | Long-form (two 75 s concatenations of one speaker, with and without a prompt) | same segments | **4/4 token-identical, same seeks** (WER 0.59 % / 0.54 %) |
 | FLEURS fr/de/es/ja (3 test clips each; float WAVs), greedy translate windows | token-identical | **12/12 identical; 330/330 teacher-forced argmax, max abs logit difference 7.3e-5** |
 | Same 12 clips, `transcribe()` translate and transcribe, language detected | sane English, same as reference | **24/24 token-identical, 12/12 languages detected correctly; translation BLEU vs the FLEURS English references 30.18 (reference 30.18)** |
+| Word timestamps (`word_timestamps=True`): 21 LibriSpeech clips, the 75 s long-form file, 4 FLEURS clips (ja split on Unicode boundaries), language given or detected | same words and times | **26/26 token-identical, 653/653 words with identical start and end times** |
 
 ¹ One utterance (5105-28241-0001) falls into a "the king of the king…" loop
 at temperature 0 in both implementations identically (223 of the 299
