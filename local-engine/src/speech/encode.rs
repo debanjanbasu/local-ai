@@ -21,7 +21,7 @@ const MP3_KBPS: u32 = 64;
 const OPUS_BPS: i32 = 32_000;
 const OPUS_FRAME: usize = 480;
 /// Encoder lookahead at 48 kHz written as the Ogg Opus pre-skip: 170
-/// samples at 24 kHz for `rusty-opus` in VoIP mode (measured by
+/// samples at 24 kHz for `rusty-opus` in `VoIP` mode (measured by
 /// cross-correlating ffmpeg's decode of a speech clip with its input).
 const OPUS_PRE_SKIP: u16 = 340;
 const OGG_SERIAL: u32 = 0x4b4f_4b4f;
