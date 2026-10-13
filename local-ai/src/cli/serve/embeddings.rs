@@ -331,7 +331,12 @@ async fn busy(state: &AppState, headers: &HeaderMap) -> Response {
     response
 }
 
-pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+pub(super) async fn handle(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+    caller: &super::admin::Caller,
+) -> Response {
     let Some(service) = state.embeddings.clone() else {
         return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
     };
@@ -378,6 +383,12 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
     .await;
     match result {
         Ok(Ok((vectors, tokens))) => {
+            let mut record = caller.usage(
+                local_services::admin::usage::UsageKind::Embeddings,
+                EMBEDDING_MODEL_ID,
+            );
+            record.input_tokens = super::admin::count(tokens);
+            super::admin::record(state, record);
             json_response(
                 StatusCode::OK,
                 response_json(&vectors, tokens, base64, dimensions),
