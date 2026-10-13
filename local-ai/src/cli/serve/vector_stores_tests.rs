@@ -615,7 +615,7 @@ impl local_services::vector_stores::ChunkEmbedder for Letters {
 }
 
 #[tokio::test]
-async fn hybrid_search_answers_conform_and_refuses_unknown_options() {
+async fn embedding_search_answers_conform_and_refuses_unknown_options() {
     let scratch = Scratch::new();
     let store = scratch.store();
     let service = scratch.start();
@@ -648,10 +648,10 @@ async fn hybrid_search_answers_conform_and_refuses_unknown_options() {
         let data = results["data"].as_array().unwrap();
         assert_eq!(data[0]["file_id"], dogs.as_str(), "{ranker}");
         if ranker == "auto" {
-            // Hybrid: both files come back (dense ranks every chunk), the
-            // best scores exactly 1 (first in both rankings).
+            // Embeddings: every chunk comes back, nearest first, scored by
+            // cosine similarity.
             assert_eq!(data.len(), 2);
-            assert!((data[0]["score"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+            assert!(data[0]["score"].as_f64().unwrap() > data[1]["score"].as_f64().unwrap());
         } else {
             assert_eq!(data.len(), 1);
             assert!(data[0]["score"].as_f64().unwrap() < 1.0);

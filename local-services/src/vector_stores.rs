@@ -1,6 +1,6 @@
 //! Vector stores: `OpenAI`-compatible, durable collections of parsed files
-//! with ranked **lexical** search, and **hybrid** (lexical and embedding)
-//! search when an embedding model is installed.
+//! with ranked **lexical** search, and **semantic** (embedding) search when
+//! an embedding model is installed.
 //!
 //! # What "vector store" means here
 //!
@@ -11,9 +11,9 @@
 //! never finds it lexically. With an embedding model installed
 //! ([`VectorIndex::set_embedder`], a [`ChunkEmbedder`]; the server uses the
 //! native `EmbeddingGemma` 2 text encoder when its artifact is present),
-//! every chunk is also embedded and searches fuse the BM25 ranking with a
-//! cosine ranking of the embeddings (see "Embeddings"). Without one,
-//! nothing here computes embeddings and search is BM25 exactly. (Pooled
+//! every chunk is also embedded and searches rank chunks by the cosine
+//! similarity of their embeddings to the query's (see "Embeddings").
+//! Without one, nothing here computes embeddings and search is BM25 exactly. (Pooled
 //! hidden states of the server's Bonsai checkpoint were measured as
 //! retrieval embeddings and lost to BM25; see `docs/BONSAI.md`.)
 //!
@@ -88,34 +88,42 @@
 //! `ranker` and `score_threshold`; anything else, such as the `file_search`
 //! tool's `hybrid_search` weights, is an unknown field and refused):
 //!
-//! * `ranker: auto` (the default) is the hybrid ranking when an embedding
-//!   model is installed and BM25 otherwise; `ranker: none` is always BM25
-//!   alone (no query embedding, no GPU work: the low-latency choice the
-//!   spec describes); the named `default-2024-11-15` reranker is refused,
-//!   as is `rewrite_query: true` (nothing here can rerank with a trained
-//!   model or rewrite queries).
+//! * `ranker: auto` (the default) is the embedding ranking when an
+//!   embedding model is installed and BM25 otherwise; `ranker: none` is
+//!   always BM25 alone (no query embedding, no GPU work: the low-latency
+//!   choice the spec describes); the named `default-2024-11-15` reranker is
+//!   refused, as is `rewrite_query: true` (nothing here can rerank with a
+//!   trained model or rewrite queries).
 //! * `score_threshold` (0 to 1) applies to the reported score of the
-//!   ranking used: `s / (1 + s)` for BM25, the normalized fusion score for
-//!   hybrid (below).
+//!   ranking used: `s / (1 + s)` for BM25, `max(cos, 0)` for embeddings,
+//!   the normalized fusion score while a store is partly embedded (below).
 //!
 //! Results are chunk-level, one item per chunk, at most `max_num_results`
 //! (1 to 50), never paged.
 //!
 //! # Embeddings
 //!
-//! **Ranking.** The hybrid ranking is weighted reciprocal rank fusion
-//! ([`Ranking::HYBRID`]): per query, the best [`FUSION_DEPTH`] chunks by
-//! BM25 and the best [`FUSION_DEPTH`] by cosine similarity of the query and
-//! chunk embeddings are fused as `Σ wᵢ / (k + rankᵢ)` with `k` =
-//! [`RRF_K`] and equal weights, chosen by measurement over BM25 alone,
-//! embeddings alone and other weights on `SciFact`, `NFCorpus` and `CosQA`
-//! through this search path (`docs/EMBEDDINGS.md`). The reported score
-//! divides that by its largest possible value, so it is in `(0, 1]`: 1 for
-//! a chunk ranked first by both, 0.5 for one ranked first by one ranking
-//! and absent from the other. It is rank-based, not a similarity: a dense
-//! ranking always returns the nearest chunks, however far, so hybrid
-//! searches return results even for a query no chunk is about. Chunks of
-//! files not embedded yet (see the backfill) take part through BM25 only.
+//! **Ranking.** With an embedding model, `auto` ranks the admitted chunks
+//! by the cosine similarity of their embedding to the query's
+//! ([`Ranking::AUTO`]); the reported score is `max(cos, 0)`, a similarity
+//! (comparable across queries, unlike BM25's). This was chosen by
+//! measurement through this search path on `SciFact`, `NFCorpus` and
+//! `CosQA` (`docs/EMBEDDINGS.md`, "Vector stores"): embeddings alone beat
+//! BM25 on all three and beat every weighted reciprocal rank fusion of the
+//! two that was measured on `SciFact` and `CosQA` by wide margins, losing
+//! only on `NFCorpus`, by less than two points. The fusion
+//! ([`Ranking::Fused`], [`Ranking::HYBRID`]) stays available to
+//! [`VectorIndex::search_with`] for such measurements; no request field
+//! selects it (the pinned request has no fusion weights). A dense ranking
+//! always returns the nearest chunks, however far, so a query no chunk is
+//! about still gets results (with low scores; `score_threshold` cuts them).
+//! While some admitted file has no vectors in the current space yet (the
+//! backfill is running, or embedding it failed), `auto` uses
+//! [`Ranking::HYBRID`] instead, so that file is still found through BM25:
+//! equal-weight reciprocal rank fusion of the two rankings, its score
+//! normalized to `(0, 1]` (1 for a chunk first in both, 0.5 for one first in
+//! one ranking and absent from the other), rank-based rather than a
+//! similarity.
 //!
 //! **Prompts.** The model's prompts are the [`ChunkEmbedder`]'s job: the
 //! server's embeds chunks with the model card's document prompt (no title)
@@ -163,10 +171,13 @@
 //! transaction: at most [`MAX_FILE_CHUNKS`] × 1.5 KB = 77 MB. Search is
 //! brute force: it streams every vector of the admitted files from the
 //! database once, comparing each with every query, keeping
-//! [`FUSION_DEPTH`] candidates per query in memory; its time is linear in
-//! the store's chunks (about 0.5 µs per chunk and query on Apple Silicon,
-//! plus reading 1.5 KB per chunk), which suits stores of up to a few
-//! hundred thousand chunks; there is no approximate index.
+//! `max_num_results` (or [`FUSION_DEPTH`]) candidates per query in memory,
+//! so memory is bounded whatever the store's size, but time is linear in
+//! its chunks; there is no approximate index. Measured on Apple Silicon
+//! with 3,600 to 6,300 chunks, a 50-result embedding search took 30 to 36
+//! ms including the query's embedding, about what BM25 took; a store with
+//! a hundred times more chunks reads a hundred times more vectors (1.5 GB
+//! per million chunks) on every search.
 //!
 //! # Attribute filters
 //!
@@ -770,8 +781,8 @@ pub enum Ranker {
     /// BM25 alone, always.
     #[serde(rename = "none")]
     None,
-    /// Hybrid BM25 and embedding ranking when an embedding model is
-    /// installed; BM25 otherwise.
+    /// Embedding (cosine) ranking when an embedding model is installed;
+    /// BM25 otherwise.
     #[default]
     #[serde(rename = "auto")]
     Auto,
@@ -825,8 +836,8 @@ impl SearchRequest {
 pub struct SearchResult {
     pub file_id: String,
     pub filename: String,
-    /// In `[0, 1]`: `s / (1 + s)` of the BM25 score `s`, or the normalized
-    /// fusion score of the hybrid ranking (see the module docs).
+    /// In `[0, 1]`: `s / (1 + s)` of the BM25 score `s`, or `max(cos, 0)`
+    /// of the embedding ranking (see the module docs).
     pub score: f64,
     pub attributes: Attributes,
     pub content: Vec<ContentPart>,

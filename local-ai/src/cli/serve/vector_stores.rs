@@ -26,8 +26,8 @@
 //! `400`, an unknown object a `404`, and a state conflict (cancelling a
 //! finished batch, searching or attaching to an expired store) a `409`.
 //!
-//! Search is lexical BM25, or hybrid BM25 and embedding search when the
-//! embedding model is installed; see the native module for the rankings,
+//! Search is lexical BM25, or embedding (cosine) search for `ranker: auto`
+//! when the embedding model is installed; see the native module for the rankings,
 //! the score mapping and what `rewrite_query` and `ranking_options` do. Attaching
 //! files answers at once with `in_progress` objects and wakes the indexer;
 //! clients follow the status as they would with `OpenAI`.
@@ -116,7 +116,7 @@ impl VectorStores {
 
     /// Embed chunks and queries with `embedder` from now on: new files are
     /// embedded as they are indexed, the indexer backfills files indexed
-    /// before (in the background), and `auto` searches become hybrid.
+    /// before (in the background), and `auto` searches rank by embeddings.
     pub(super) fn set_embedder(
         &self,
         embedder: Arc<dyn local_services::vector_stores::ChunkEmbedder>,
