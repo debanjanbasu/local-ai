@@ -2,7 +2,7 @@
 //! (see `docs/TRANSCRIPTION.md`).
 //!
 //! ```text
-//! transcription-eval parity DIR
+//! transcription-eval parity DIR CASES.json
 //! transcription-eval transcribe MANIFEST.json OUT.jsonl
 //! transcription-eval bench AUDIO
 //! ```
@@ -11,7 +11,7 @@
 //! directory. `DIR` is the reference kernel's output with `audio.tar`
 //! extracted into it:
 //!
-//! - `parity`: for each case of `parity/parity.json` (openai-whisper
+//! - `parity`: for each case of `CASES` (`parity/parity.json` of the kernel; openai-whisper
 //!   20250625, FP32 CPU), compares the log-mel window and encoder output
 //!   (first case, from `parity/*.npy`), the language probabilities, the greedy
 //!   decode (token for token) and the teacher-forced logits along the
@@ -141,9 +141,8 @@ fn logsumexp(row: &[f32]) -> f32 {
 }
 
 #[allow(clippy::too_many_lines)]
-fn parity(dir: &Path) -> Result<()> {
-    let cases: Vec<Case> =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("parity/parity.json"))?)?;
+fn parity(dir: &Path, cases: &Path) -> Result<()> {
+    let cases: Vec<Case> = serde_json::from_str(&std::fs::read_to_string(cases)?)?;
     let mut model = open()?;
     let busy = || false;
     let mut pause = || Ok(());
@@ -389,13 +388,14 @@ fn bench(path: &Path) -> Result<()> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [mode, dir] if mode == "parity" => parity(Path::new(dir)),
+        [mode, dir, cases] if mode == "parity" => parity(Path::new(dir), Path::new(cases)),
         [mode, manifest, out] if mode == "transcribe" => {
             transcribe(Path::new(manifest), Path::new(out))
         }
         [mode, file] if mode == "bench" => bench(Path::new(file)),
         _ => Err(
-            "usage: transcription-eval parity DIR | transcribe MANIFEST OUT | bench AUDIO".into(),
+            "usage: transcription-eval parity DIR CASES | transcribe MANIFEST OUT | bench AUDIO"
+                .into(),
         ),
     }
 }
