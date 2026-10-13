@@ -32,7 +32,7 @@ pub const MODERATION_DIR: &str = "moderation";
 pub const MODERATION_ARTIFACT: &str = "moderation-heads.json";
 /// SHA-256 of the one artifact this build accepts.
 pub const MODERATION_HEADS_SHA256: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+    "b74727bf58afce5adad11dc3aa903388ad550fffc9c38b099d14995fc760bdc4";
 /// Id this build reports as the moderation `model`.
 pub const MODERATION_MODEL_ID: &str = "embeddinggemma-2-moderation-1";
 /// The model card's classification prompt, prepended to every input.

@@ -162,4 +162,54 @@ gating uses the point estimates.
 
 ## Results
 
-Pending: filled in from the single evaluation run.
+One evaluation run (`tools/moderation_train.py evaluate`, 2026-10-13), the
+criteria above unchanged. Features: 94,910 texts, 7.8 M tokens, embedded
+natively in two GPU-lock holds (9.2 k and 10.7 k tokens/s). Thresholds and
+Platt parameters come from the calibration split; the numbers below are the
+held-out test split and the OpenAI 2022 set at those thresholds (Wilson 95%
+intervals in brackets).
+
+| Category | Ships | Test pos / rows | Test AUC | Test precision | Test recall | Test ECE | OpenAI-eval AUC (pos) | OpenAI-eval precision / recall |
+| --- | --- | ---: | ---: | --- | --- | ---: | --- | --- |
+| hate | **yes** | 1,706 / 12,549 | 0.979 | 0.774 [0.76, 0.79] | 0.892 [0.88, 0.91] | 0.007 | 0.894 (162) | 0.541 / 0.821 |
+| harassment | **yes** | 3,685 / 11,635 | 0.965 | 0.798 [0.79, 0.81] | 0.912 [0.90, 0.92] | 0.005 | 0.870 (75) | 0.155 / 0.827 |
+| harassment/threatening | **yes** | 656 / 13,057 | 0.974 | 0.787 [0.75, 0.82] | 0.721 [0.69, 0.75] | 0.004 | — | — |
+| illicit | **yes** | 1,230 / 13,829 | 0.978 | 0.780 [0.76, 0.80] | 0.782 [0.76, 0.80] | 0.006 | — | — |
+| self-harm | **yes** | 78 / 13,829 | 0.985 | 0.879 [0.77, 0.94] | 0.654 [0.54, 0.75] | 0.001 | 0.974 (51) | 0.737 / 0.275 |
+| sexual | **yes** | 920 / 13,392 | 0.985 | 0.792 [0.77, 0.82] | 0.874 [0.85, 0.89] | 0.006 | 0.975 (229) | 0.661 / 0.969 |
+| illicit/violent | no: test recall 0.443 < 0.50 | 314 / 13,829 | 0.969 | 0.735 | 0.443 | 0.003 | — | — |
+| sexual/minors | no: test precision 0.667 < 0.70 | 33 / 12,698 | 0.978 | 0.667 | 0.667 | 0.000 | 0.927 (82) | 0.583 / 0.085 |
+| violence | no: test precision 0.675, recall 0.429 | 373 / 5,345 | 0.948 | 0.675 | 0.429 | 0.011 | 0.863 (93) | 0.295 / 0.247 |
+| hate/threatening | no: no calibration threshold reached precision 0.80 with recall ≥ 0.30 (92 calibration positives) | | | | | | | |
+| self-harm/intent, self-harm/instructions, violence/graphic | no: no training data | | | | | | | |
+
+ToxicChat 0124 test (4,972 user prompts, 354 toxic; report only): AUC of the
+maximum shipped score 0.922; `flagged` precision 0.535, recall 0.686.
+
+Calibration (fitted on the calibration split) holds in distribution (test
+ECE ≤ 0.007 for every shipped head) but **not out of distribution**: on the
+OpenAI 2022 set the shipped heads' ECE is 0.019–0.179 and precision at the
+chosen thresholds falls (harassment 0.155: that set's harassment label is
+much narrower than Civil Comments' insults). Self-harm ranks well out of
+distribution (AUC 0.974) but its threshold, chosen for 0.80 precision on
+Aegis-like prompts, recalls only 0.275 of the OpenAI set's self-harm. Treat
+scores as calibrated for content resembling the training sources (LLM chat
+prompts and responses, news comments), and choose your own thresholds on
+your own data otherwise.
+
+The artifact (`local-engine/assets/moderation/moderation-heads.json`,
+105,507 bytes, SHA-256
+`b74727bf58afce5adad11dc3aa903388ad550fffc9c38b099d14995fc760bdc4`) carries
+the heads, the full evaluation, the training settings and the provenance
+hashes.
+
+## Limitations
+
+- Six of thirteen categories are scored; the other seven are reported as
+  not scored. Scores are not comparable to OpenAI's omni-moderation scores.
+- Label mapping is approximate (see the table above); Civil Comments rows
+  are assumed negative for illicit, illicit/violent and self-harm.
+- English only in practice (both training sources are English).
+- Text only; image inputs are refused.
+- One threshold per category, chosen for precision 0.80 on the calibration
+  split; precision on the test split is 0.77–0.88.
