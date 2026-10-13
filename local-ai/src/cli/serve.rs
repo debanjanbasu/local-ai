@@ -24,6 +24,7 @@ mod batches;
 mod chunked;
 mod compaction;
 mod decisions;
+mod embeddings;
 mod evals;
 mod hosted;
 mod http3;
@@ -123,6 +124,8 @@ struct AppState {
     evals: Option<Arc<evals::Evals>>,
     /// Hosted tools this server may run for Responses; `None` grants none.
     tools: Option<Arc<tool_loop::Tools>>,
+    /// Native text embeddings, when the embedding model is installed.
+    embeddings: Option<Arc<embeddings::Embeddings>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -224,11 +227,19 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
         return json_response(
             StatusCode::OK,
-            models_json(&state.model, state.context, state.created),
+            models_json(
+                &state.model,
+                state.context,
+                state.created,
+                state.embeddings.is_some(),
+            ),
             &state,
             &parts.headers,
         )
         .await;
+    }
+    if parts.method == Method::POST && parts.uri.path() == embeddings::ROUTE {
+        return embeddings::handle(&state, &parts.headers, body).await;
     }
     if parts.method == Method::POST && parts.uri.path() == compaction::ROUTE {
         return compaction::handle(&state, &parts.headers, body).await;
@@ -939,8 +950,14 @@ fn stored_answer(
 /// `max_model_len` (vLLM's) are both the per-request admission limit from
 /// `BonsaiInfo::context`, prompt plus output, not the checkpoint's training
 /// length: it is what a request can actually use on this machine.
-fn models_json(model: &str, context: usize, created: u64) -> serde_json::Value {
-    json!({"object":"list","data":[{"id":model,"object":"model","created":created,"owned_by":"local","context_length":context,"max_model_len":context}]})
+fn models_json(model: &str, context: usize, created: u64, embeddings: bool) -> serde_json::Value {
+    let mut data = vec![
+        json!({"id":model,"object":"model","created":created,"owned_by":"local","context_length":context,"max_model_len":context}),
+    ];
+    if embeddings {
+        data.push(embeddings::model_json(created));
+    }
+    json!({"object":"list","data":data})
 }
 
 // Keep service startup and shutdown ownership together.
@@ -1009,8 +1026,14 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let engine = Engine::from_resources(&resources)?;
     eprintln!("{}", engine.info().json);
     let context = engine.info().model.context;
+    let engine = engine.into_handle();
+    // Beside the Bonsai model's own folder: `models/embeddinggemma2-text`.
+    let embeddings = match resources.model.parent().and_then(std::path::Path::parent) {
+        Some(models_dir) => embeddings::Embeddings::start(models_dir, engine.activity())?,
+        None => None,
+    };
     let mut state = AppState {
-        engine: engine.into_handle(),
+        engine,
         model,
         created: response::unix_now(),
         context,
@@ -1033,6 +1056,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         vector_stores: vector_stores.clone(),
         evals: None,
         tools,
+        embeddings,
     };
     let address = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
