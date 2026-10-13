@@ -20,8 +20,10 @@ const MP3_KBPS: u32 = 64;
 /// Opus bitrate and frame (20 ms at 24 kHz).
 const OPUS_BPS: i32 = 32_000;
 const OPUS_FRAME: usize = 480;
-/// Encoder lookahead at 48 kHz written as the Ogg Opus pre-skip.
-const OPUS_PRE_SKIP: u16 = 312;
+/// Encoder lookahead at 48 kHz written as the Ogg Opus pre-skip: 170
+/// samples at 24 kHz for `rusty-opus` in VoIP mode (measured by
+/// cross-correlating ffmpeg's decode of a speech clip with its input).
+const OPUS_PRE_SKIP: u16 = 340;
 const OGG_SERIAL: u32 = 0x4b4f_4b4f;
 
 /// The pinned API's `response_format` values.
@@ -131,7 +133,9 @@ struct OpusState {
     encoder: rusty_opus::OpusEncoder,
     writer: ogg::PacketWriter<'static, Cursor<Vec<u8>>>,
     pending: Vec<f32>,
-    granule: u64,
+    /// Samples pushed by the caller and samples encoded (padding included).
+    real: u64,
+    consumed: u64,
     taken: usize,
 }
 
@@ -192,7 +196,8 @@ impl StreamEncoder {
                     encoder,
                     writer,
                     pending: Vec::new(),
-                    granule: u64::from(OPUS_PRE_SKIP),
+                    real: 0,
+                    consumed: 0,
                     taken: 0,
                 }))
             }
@@ -245,6 +250,7 @@ impl StreamEncoder {
             }
             State::Opus(state) => {
                 state.pending.extend_from_slice(samples);
+                state.real += samples.len() as u64;
                 state.encode_frames(false)?;
                 Ok(state.take())
             }
@@ -288,6 +294,10 @@ impl StreamEncoder {
                 Ok(drain_mp3(encoder))
             }
             State::Opus(state) => {
+                // Push the encoder's lookahead out with silence; the final
+                // granule position trims it (and the last frame's padding).
+                let lookahead = usize::from(OPUS_PRE_SKIP) / 2;
+                state.pending.resize(state.pending.len() + lookahead, 0.0);
                 state.encode_frames(true)?;
                 Ok(state.take())
             }
@@ -330,22 +340,22 @@ impl OpusState {
                 break;
             }
             let mut frame: Vec<f32> = self.pending.drain(..available.min(OPUS_FRAME)).collect();
-            let real = frame.len();
+            self.consumed += frame.len() as u64;
             frame.resize(OPUS_FRAME, 0.0);
             let len = self
                 .encoder
                 .encode(&frame, OPUS_FRAME, &mut packet)
                 .map_err(|e| failure("Opus", e))?;
-            // Granule positions count 48 kHz samples, pre-skip included; the
-            // final page's granule trims the zero padding of the last frame.
-            self.granule += 2 * real as u64;
+            // Granule positions count 48 kHz samples, pre-skip included, of
+            // real input only, so the final page trims all padding.
+            let granule = u64::from(OPUS_PRE_SKIP) + 2 * self.consumed.min(self.real);
             let end = if last && self.pending.is_empty() {
                 ogg::PacketWriteEndInfo::EndStream
             } else {
                 ogg::PacketWriteEndInfo::EndPage
             };
             self.writer
-                .write_packet(packet[..len].to_vec(), OGG_SERIAL, end, self.granule)
+                .write_packet(packet[..len].to_vec(), OGG_SERIAL, end, granule)
                 .map_err(|e| failure("Opus", e))?;
         }
         Ok(())
