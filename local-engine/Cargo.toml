@@ -16,6 +16,14 @@ local-metal = { path = "../local-metal" }
 bytemuck.workspace = true
 futures-core = "0.3"
 half.workspace = true
+# Image decoding for the optional EmbeddingGemma 2 vision encoder. No default
+# features: no rayon pool, only the formats the embedding API accepts.
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+# JPEG decoding with libjpeg-turbo's decoder (built from source, NEON SIMD, no
+# nasm): bit-identical to the reference's Pillow/torchvision decode, which
+# zune-jpeg is not. Errors unwind (caught) instead of aborting.
+mozjpeg = { version = "0.10", default-features = false, features = ["with_simd"] }
+mozjpeg-sys = { version = "2", default-features = false, features = ["with_simd", "unwinding", "arith_dec"] }
 # Tool argument schemas. No default features: no HTTP or file `$ref`
 # retrieval (and no `idna`), so validation never leaves the process.
 jsonschema = { version = "0.58.6", default-features = false }
