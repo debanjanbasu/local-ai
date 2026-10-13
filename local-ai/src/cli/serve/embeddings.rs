@@ -100,6 +100,41 @@ impl Embeddings {
             activity,
         })))
     }
+
+    /// SHA-256 of the loaded encoder's payload.
+    pub(super) fn payload_sha256(&self) -> String {
+        self.model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .payload_sha256()
+            .to_owned()
+    }
+
+    /// One admission slot, shared by every route that runs the encoder.
+    pub(super) fn try_admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.slots).try_acquire_owned().ok()
+    }
+
+    /// Run `work` on the locked encoder with this service's pacing: yield to
+    /// Bonsai decode between submissions and stop once `cancelled` is set.
+    pub(super) fn with_model<T>(
+        &self,
+        cancelled: &AtomicBool,
+        work: impl FnOnce(&mut EmbeddingModel, &mut dyn FnMut() -> local_engine::Result<()>) -> T,
+    ) -> T {
+        let mut model = self.model.lock().unwrap_or_else(PoisonError::into_inner);
+        let activity = Arc::clone(&self.activity);
+        let mut pace = || {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(local_engine::Error::Generation(
+                    "embedding request cancelled".into(),
+                ));
+            }
+            activity.yield_to_decode(DECODE_YIELD_LIMIT);
+            Ok(())
+        };
+        work(&mut model, &mut pace)
+    }
 }
 
 /// `/v1/models` entry of the embedding model.
@@ -219,7 +254,7 @@ fn parse(body: &[u8]) -> Result<Parsed, String> {
 }
 
 /// Sets the flag when dropped: the handler future went away (client gone).
-struct CancelOnDrop(Arc<AtomicBool>);
+pub(super) struct CancelOnDrop(pub(super) Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -237,41 +272,31 @@ fn embed(
     inputs: Vec<Input>,
     cancelled: &AtomicBool,
 ) -> Result<(Vec<Vec<f32>>, usize), Failure> {
-    let mut model = service.model.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut ids = Vec::with_capacity(inputs.len());
-    let mut total = 0_usize;
-    for input in inputs {
-        let row = match input {
-            Input::Text(text) => model
-                .tokenize(&text)
-                .map_err(|error| Failure::Invalid(error.to_string()))?,
-            Input::Tokens(row) => row,
-        };
-        EmbeddingModel::validate_ids(&row).map_err(|error| Failure::Invalid(error.to_string()))?;
-        total += row.len();
-        if total > MAX_TOTAL_TOKENS {
-            return Err(Failure::Invalid(format!(
-                "the inputs hold more than {MAX_TOTAL_TOKENS} tokens in total"
-            )));
+    service.with_model(cancelled, |model, pace| {
+        let mut ids = Vec::with_capacity(inputs.len());
+        let mut total = 0_usize;
+        for input in inputs {
+            let row = match input {
+                Input::Text(text) => model
+                    .tokenize(&text)
+                    .map_err(|error| Failure::Invalid(error.to_string()))?,
+                Input::Tokens(row) => row,
+            };
+            EmbeddingModel::validate_ids(&row)
+                .map_err(|error| Failure::Invalid(error.to_string()))?;
+            total += row.len();
+            if total > MAX_TOTAL_TOKENS {
+                return Err(Failure::Invalid(format!(
+                    "the inputs hold more than {MAX_TOTAL_TOKENS} tokens in total"
+                )));
+            }
+            ids.push(row);
         }
-        ids.push(row);
-    }
-    let activity = Arc::clone(&service.activity);
-    let mut pace = || {
-        if cancelled.load(Ordering::SeqCst) {
-            return Err(local_engine::Error::Generation(
-                "embedding request cancelled".into(),
-            ));
-        }
-        activity.yield_to_decode(DECODE_YIELD_LIMIT);
-        Ok(())
-    };
-    let vectors = model.embed_ids(&ids, &mut pace);
-    drop(model);
-    Ok((
-        vectors.map_err(|error| Failure::Internal(error.to_string()))?,
-        total,
-    ))
+        let vectors = model
+            .embed_ids(&ids, pace)
+            .map_err(|error| Failure::Internal(error.to_string()))?;
+        Ok((vectors, total))
+    })
 }
 
 fn response_json(vectors: &[Vec<f32>], tokens: usize, base64: bool, dimensions: usize) -> Value {
@@ -297,7 +322,7 @@ fn response_json(vectors: &[Vec<f32>], tokens: usize, base64: bool, dimensions: 
     })
 }
 
-async fn busy(state: &AppState, headers: &HeaderMap) -> Response {
+pub(super) async fn busy(state: &AppState, headers: &HeaderMap) -> Response {
     let mut response = json_response(
         StatusCode::SERVICE_UNAVAILABLE,
         json!({"error":{
@@ -350,7 +375,7 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
             return error_response(StatusCode::BAD_REQUEST, &message, state, headers).await;
         }
     };
-    let Ok(permit) = Arc::clone(&service.slots).try_acquire_owned() else {
+    let Some(permit) = service.try_admit() else {
         return busy(state, headers).await;
     };
     let cancelled = Arc::new(AtomicBool::new(false));
