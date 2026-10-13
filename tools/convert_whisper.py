@@ -6,7 +6,10 @@ original package's 128-bin mel filterbank (`whisper/assets/mel_filters.npz`,
 openai-whisper 20250625). They reach this machine through a private Kaggle CPU
 kernel that downloads them and saves them as its output (docs/TRANSCRIPTION.md):
 
-  kaggle kernels output <owner>/stt-whisper-ref-s0 -p cache/whisper-large-v3
+  python3 tools/kaggle_whisper_job.py --kernel <owner>/whisper-large-v3-fetch \\
+      --output cache/whisper-job
+  kaggle kernels push -p cache/whisper-job
+  kaggle kernels output <owner>/whisper-large-v3-fetch -p cache/whisper-large-v3
 
 then convert (standard library only):
 
