@@ -165,7 +165,9 @@ fn decode_interleaved(bytes: Vec<u8>) -> crate::Result<(Vec<f32>, usize, u32)> {
         if channels == 0 {
             (channels, rate) = (c, r);
         } else if (channels, rate) != (c, r) {
-            return Err(bad_audio("the channel layout or sample rate changes mid-stream"));
+            return Err(bad_audio(
+                "the channel layout or sample rate changes mid-stream",
+            ));
         }
         buffer.copy_to_vec_interleaved(&mut chunk);
         samples.extend_from_slice(&chunk);
@@ -317,7 +319,8 @@ fn invalid(message: &str) -> Error {
 /// `relative_k_proj(sinusoid(distance))` for distances 0..=12, laid out as
 /// `[distance][head][dim]`.
 fn derived_constants(artifact: &Artifact, layer: usize) -> crate::Result<(Vec<f32>, Vec<f32>)> {
-    let per_dim = artifact.f32_values(&format!("layers.{layer}.self_attn.per_dim_scale"), HEAD_DIM)?;
+    let per_dim =
+        artifact.f32_values(&format!("layers.{layer}.self_attn.per_dim_scale"), HEAD_DIM)?;
     let base = (HEAD_DIM as f64).powf(-0.5) / std::f64::consts::LN_2;
     let q_scale = per_dim
         .iter()
@@ -350,7 +353,9 @@ fn derived_constants(artifact: &Artifact, layer: usize) -> crate::Result<(Vec<f3
                 .0
                 .iter()
                 .zip(&sinusoid)
-                .map(|(w, s)| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(*w)) << 16)) * s)
+                .map(|(w, s)| {
+                    f64::from(f32::from_bits(u32::from(u16::from_le_bytes(*w)) << 16)) * s
+                })
                 .sum::<f64>() as f32;
         }
     }
@@ -373,12 +378,13 @@ fn check_config(config: &serde_json::Value) -> crate::Result<()> {
         && int("output_proj_dims") == Some(OUT_DIMS as u64)
         && int("text_hidden_size") == Some(HIDDEN as u64)
         && config.get("use_clipped_linears") == Some(&serde_json::Value::Bool(true))
-        && config.get("subsampling_conv_channels")
-            == Some(&serde_json::json!([STEM0, STEM1]));
+        && config.get("subsampling_conv_channels") == Some(&serde_json::json!([STEM0, STEM1]));
     if ok {
         Ok(())
     } else {
-        Err(invalid("architecture differs from EmbeddingGemma 2's gemma4_audio"))
+        Err(invalid(
+            "architecture differs from EmbeddingGemma 2's gemma4_audio",
+        ))
     }
 }
 
@@ -528,8 +534,10 @@ impl AudioTower {
         let mut tokens_per_clip = Vec::with_capacity(clips.len());
         for clip in clips {
             let n = audio_tokens(clip.valid);
-            ws.frames
-                .copy_from_bytes(bytemuck::cast_slice(&clip.features), frame_row * MEL_BINS * 4);
+            ws.frames.copy_from_bytes(
+                bytemuck::cast_slice(&clip.features),
+                frame_row * MEL_BINS * 4,
+            );
             let t1 = clip.frames.div_ceil(2);
             let stem_offset = stem_row * 64 * STEM0 * 4;
             kernels.conv2d_s2(
@@ -619,7 +627,13 @@ impl AudioTower {
                 &ws.wide,
                 count,
             )?;
-            kernels.linear(batch, self.linear(ff.down, WIDTH, FF), &ws.wide, &ws.branch, count)?;
+            kernels.linear(
+                batch,
+                self.linear(ff.down, WIDTH, FF),
+                &ws.wide,
+                &ws.branch,
+                count,
+            )?;
             kernels.rms_add(
                 batch,
                 &ws.hidden,

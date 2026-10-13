@@ -41,7 +41,9 @@ fn silence_is_the_log_mel_floor_on_valid_frames_only() {
 #[test]
 fn a_tone_peaks_in_its_mel_bin() {
     let tone: Vec<f32> = (0..16_000)
-        .map(|i| (0.5 * (2.0 * std::f64::consts::PI * 1000.0 * f64::from(i) / 16_000.0).sin()) as f32)
+        .map(|i| {
+            (0.5 * (2.0 * std::f64::consts::PI * 1000.0 * f64::from(i) / 16_000.0).sin()) as f32
+        })
         .collect();
     let mel = FeatureExtractor::new().extract(&tone);
     let row = &mel.features[50 * MEL_BINS..51 * MEL_BINS];
@@ -52,8 +54,12 @@ fn a_tone_peaks_in_its_mel_bin() {
         .map(|(i, _)| i)
         .expect("bins");
     // 1 kHz is mel 1000 on the HTK scale; bins are 2840/129 mel apart.
-    let expected = (1000.0 / (2595.0 * (1.0_f64 + 8000.0 / 700.0).log10() / 129.0)).round() as usize - 1;
-    assert!(peak.abs_diff(expected) <= 1, "peak {peak}, expected {expected}");
+    let expected =
+        (1000.0 / (2595.0 * (1.0_f64 + 8000.0 / 700.0).log10() / 129.0)).round() as usize - 1;
+    assert!(
+        peak.abs_diff(expected) <= 1,
+        "peak {peak}, expected {expected}"
+    );
 }
 
 #[test]
@@ -166,7 +172,12 @@ fn log_mel_features_match_the_reference_fixture() {
     let extractor = FeatureExtractor::new();
     for (row, wave) in fixture() {
         let mel = extractor.extract(&wave);
-        assert_eq!((mel.frames, mel.valid), (row.frames, row.valid_frames), "{}", row.name);
+        assert_eq!(
+            (mel.frames, mel.valid),
+            (row.frames, row.valid_frames),
+            "{}",
+            row.name
+        );
         assert_eq!(audio_tokens(mel.valid), row.audio_tokens, "{}", row.name);
         if let Some(features) = &row.features_f32le_b64 {
             let reference = f32s_from_base64(features);

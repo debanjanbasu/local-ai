@@ -159,14 +159,14 @@ tokens, the final embedding, and per-layer intermediates for two clips.
 | --- | --- | --- |
 | log-mel features, 54 inputs (47,153 frames × 128) | frame counts identical, F32 rounding | **54/54 counts identical; max abs difference 4.8e-7** |
 | FLAC decode (Symphonia) vs the reference's soundfile decode, 41 clips | bit-identical | **41/41 identical** |
-| soft tokens (`embed_audio` output) | — | RESULT_SOFT |
-| embedding cosine, native vs reference, 54 inputs | mean ≥ 0.9995, min ≥ 0.999 | RESULT_COS |
-| packing independence (each clip alone vs packed) | ≥ 0.99999 | RESULT_PACK |
+| soft tokens (`embed_audio` output) | — | per-clip mean cosine 1.000000, worst token 0.999999 |
+| embedding cosine, native vs reference, 54 inputs | mean ≥ 0.9995, min ≥ 0.999 | **mean 1.000000, min 0.999999** (all 54; the worst is the tone) |
+| packing independence (each clip alone vs packed) | ≥ 0.99999 | **54/54 bitwise identical** |
 | committed fixture test (5 inputs, `#[ignore]`d real-model test) | same gate | pass |
 
 Native resampling is not part of the gate: the reference fed 16 kHz audio. As a probe, a
 44.1 kHz stereo version of one clip went through the native downmix and FFT resampler, and
-the reference's version went through librosa (soxr_hq). They agree to RESULT_PROBE cosine.
+the reference's version went through librosa (soxr_hq). They agree to 0.99903 embedding cosine.
 
 ### Retrieval: AudioCaps test
 
@@ -174,18 +174,70 @@ The set is 963 clips and 4,815 captions, decoded natively from the mirror's FLAC
 exact cosine search at 768-d. The reference protocol embeds captions with the query prompt
 for text→audio and with the document prompt for audio→text.
 
-RESULT_RETRIEVAL
+| Direction | Captions | Kaggle FP32 (Phase 1) | Native BF16 | Δ mean R |
+| --- | --- | --- | --- | ---: |
+| text→audio | query prompt (reference protocol) | 8.0 / 25.1 / 37.3 (mean 23.5) | 8.0 / 25.1 / 37.3 (mean 23.5) | 0.0 |
+| audio→text | document prompt (reference protocol) | 7.6 / 22.7 / 35.1 (mean 21.8) | 7.6 / 22.9 / 34.8 (mean 21.8) | 0.0 |
+| text→audio | raw | 9.0 / 26.0 / 38.1 (mean 24.3) | 9.0 / 26.0 / 38.1 (mean 24.3) | 0.0 |
+| audio→text | raw | 7.8 / 24.4 / 38.5 (mean 23.6) | 7.8 / 24.4 / 38.4 (mean 23.5) | −0.1 |
+| text→audio | document prompt | — | 7.6 / 23.6 / 34.9 (mean 22.0) | |
+| audio→text | query prompt | — | 8.0 / 22.6 / 36.4 (mean 22.4) | |
+
+The gate is within 0.5 mean R of Phase 1: it passes, and the native path reproduces the
+reference ranking. Embedding the 963 clips took 82.9 s, or 11.6 clips/s (115× real time).
+Decoding all 963 FLACs took 4.0 s on the CPU.
 
 ### The low absolute AudioCaps score
 
-RESULT_INVESTIGATION
+Phase 1 found AudioCaps text→audio R@1 at 8%, against roughly 35–40% for CLAP-style
+models. Cheap checks to explain the gap:
+
+- **Not a pipeline mismatch, at least not between this runtime and transformers.** This
+  implementation is independent and shares no code with transformers. It decodes the FLACs
+  bit-identically to soundfile, matches transformers' log-mel features to 4.8e-7, and
+  matches the FP32 embeddings to cosine ≥ 0.999999. Its AudioCaps numbers are the
+  reference's to ±0.1.
+- **Not the caption prompt.** All nine caption forms fall within 22.0–24.3 mean R for
+  text→audio. Raw captions are best (24.3), as Phase 1 found.
+- **Not the input level.** Clip loudness is ordinary: median −21.9 dBFS RMS (5th–95th
+  percentile −41 to −11.5), peaks 0.12–1.0. With the 0.001 mel floor, level has little
+  influence at these amplitudes.
+- **It leans to speech.** Captions that mention speech score 25.7 mean R text→audio (2,202
+  captions); the other 2,613 score 21.6. This fits a speech-heavy audio training mix (the
+  card's audio benchmark is MSEB, which is mostly speech).
+- **Audio embeddings are crowded.** The mean pairwise cosine is 0.759 among clips and 0.678
+  among query-prompted captions, and the gap between the two modality means has norm 0.43.
+  Centering each modality on its own mean is a transductive diagnostic that needs the whole
+  gallery, and it is not shipped. It raises mean R to 25.8 (t2m) and 24.3 (m2t): a gain,
+  but not the missing 10–15 points.
+- **The text side is not the bottleneck.** Retrieving another caption of the same clip from
+  a caption gives R@1/5/10 41.6 / 64.2 / 74.7. Even with text only, the five AudioCaps
+  captions of a clip are far apart.
+
+**Unresolved:** whether transformers' `Gemma4AudioFeatureExtractor` matches the front end
+Google trained with. Checking that needs the original model or a published audio-retrieval
+number to compare against, and neither is available. The evidence points to model
+behaviour on environmental sound rather than to a preprocessing error on our side.
+Relative comparisons, such as int8 against BF16 or prompt choices, are valid.
 
 ### Throughput
 
 Measured under the GPU lock with `embedding-audio-eval bench`, best of three, synthetic
 noise clips:
 
-RESULT_BENCH
+| Clips | Wall time | Clips/s | Real-time factor |
+| --- | ---: | ---: | ---: |
+| 1 × 10 s | 94 ms | 10.6 | 106× |
+| 32 × 10 s | 2,779 ms | 11.5 | 115× |
+| 1 × 30 s (750 tokens) | 326 ms | 3.1 | 92× |
+| 8 × 30 s | 2,550 ms | 3.1 | 94× |
+
+Most of the cost is the Conformer: about 40 M multiply-adds per token per layer, against
+5.5 M for a text-encoder layer. A 10 s clip is 250 tower tokens, then 254 tokens through the
+shared encoder. The GPU was shared with other work's lock queue but held exclusively for the
+run. The Conformer submits one layer per command buffer (≥ 128 tokens) before the pacing
+hook runs. This keeps a concurrent decode step's wait to roughly one layer of a pass, a few
+milliseconds for a single 10 s clip (the whole clip takes 94 ms end to end). Concurrent-decode impact was not measured for audio.
 
 ## Tools
 

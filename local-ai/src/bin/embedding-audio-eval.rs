@@ -77,7 +77,11 @@ fn open() -> Result<EmbeddingModel> {
     let started = Instant::now();
     let mut model = EmbeddingModel::open(&dir)?;
     model.load_audio(&dir)?;
-    eprintln!("loaded {} (+audio) in {:.2?}", dir.display(), started.elapsed());
+    eprintln!(
+        "loaded {} (+audio) in {:.2?}",
+        dir.display(),
+        started.elapsed()
+    );
     Ok(model)
 }
 
@@ -91,10 +95,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 fn summary(values: &[f32]) -> (f64, f32, usize) {
     let mean = values.iter().map(|c| f64::from(*c)).sum::<f64>() / values.len() as f64;
-    let (worst, min) = values
-        .iter()
-        .enumerate()
-        .fold((0, f32::INFINITY), |acc, (i, c)| if *c < acc.1 { (i, *c) } else { acc });
+    let (worst, min) =
+        values.iter().enumerate().fold(
+            (0, f32::INFINITY),
+            |acc, (i, c)| if *c < acc.1 { (i, *c) } else { acc },
+        );
     (mean, min, worst)
 }
 
@@ -216,7 +221,10 @@ fn parity(dir: &Path) -> Result<()> {
         .map(|(native, entry)| dot(native, &entry.emb))
         .collect();
     for (entry, c) in list.iter().zip(&cosines) {
-        println!("  {:<28} tokens {:>3}  cosine {c:.6}", entry.name, entry.audio_tokens);
+        println!(
+            "  {:<28} tokens {:>3}  cosine {c:.6}",
+            entry.name, entry.audio_tokens
+        );
     }
     let (mean, min, worst) = summary(&cosines);
     println!(
@@ -278,7 +286,9 @@ fn recall(scores: &[Vec<f32>], relevant: &[Vec<usize>]) -> [f64; 3] {
 }
 
 fn similarity(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<Vec<f32>> {
-    a.iter().map(|x| b.iter().map(|y| dot(x, y)).collect()).collect()
+    a.iter()
+        .map(|x| b.iter().map(|y| dot(x, y)).collect())
+        .collect()
 }
 
 fn retrieval(root: &Path) -> Result<()> {
@@ -333,14 +343,21 @@ fn retrieval(root: &Path) -> Result<()> {
         let dump = PathBuf::from(dump);
         std::fs::create_dir_all(&dump)?;
         let write = |name: &str, rows: &[Vec<f32>]| -> Result<()> {
-            let bytes: Vec<u8> = rows.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+            let bytes: Vec<u8> = rows
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             Ok(std::fs::write(dump.join(name), bytes)?)
         };
         write("media.f32", &media)?;
         for (name, embeddings) in &forms {
             write(&format!("captions-{name}.f32"), embeddings)?;
         }
-        std::fs::write(dump.join("caption_clip.json"), serde_json::to_vec(&caption_clip)?)?;
+        std::fs::write(
+            dump.join("caption_clip.json"),
+            serde_json::to_vec(&caption_clip)?,
+        )?;
     }
     let t2m_relevant: Vec<Vec<usize>> = caption_clip.iter().map(|c| vec![*c]).collect();
     let mut m2t_relevant = vec![Vec::new(); clips.len()];
@@ -359,8 +376,14 @@ fn retrieval(root: &Path) -> Result<()> {
     let mut t2m = Vec::new();
     let mut m2t = Vec::new();
     for (name, embeddings) in &forms {
-        t2m.push((*name, recall(&similarity(embeddings, &media), &t2m_relevant)));
-        m2t.push((*name, recall(&similarity(&media, embeddings), &m2t_relevant)));
+        t2m.push((
+            *name,
+            recall(&similarity(embeddings, &media), &t2m_relevant),
+        ));
+        m2t.push((
+            *name,
+            recall(&similarity(&media, embeddings), &m2t_relevant),
+        ));
     }
     for (name, r) in &t2m {
         println!("text->audio, captions {name:<3}: R@1/5/10 {}", fmt(*r));
@@ -428,8 +451,10 @@ fn main() -> Result<()> {
         Some("parity") if args.len() == 3 => parity(Path::new(&args[2])),
         Some("retrieval") if args.len() == 3 => retrieval(Path::new(&args[2])),
         Some("bench") => bench(&args[2..]),
-        _ => Err("usage: embedding-audio-eval features REF_DIR [AUDIOCAPS_DIR] | parity REF_DIR | \
+        _ => Err(
+            "usage: embedding-audio-eval features REF_DIR [AUDIOCAPS_DIR] | parity REF_DIR | \
                   retrieval AUDIOCAPS_DIR | bench [--clips N] [--seconds S]"
-            .into()),
+                .into(),
+        ),
     }
 }

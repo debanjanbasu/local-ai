@@ -44,10 +44,18 @@ pub struct LogMel {
 #[must_use]
 pub const fn frame_counts(samples: usize) -> (usize, usize) {
     let padded = samples.next_multiple_of(PAD_MULTIPLE) + FRAME / 2;
-    let frames = if padded > FRAME { (padded - FRAME - 1) / HOP + 1 } else { 0 };
+    let frames = if padded > FRAME {
+        (padded - FRAME - 1) / HOP + 1
+    } else {
+        0
+    };
     // Frame i is valid iff its last sample, i*HOP + FRAME (in padded
     // coordinates) - FRAME/2, is a real sample: i*HOP + HOP < samples.
-    let valid = if samples > HOP { (samples - HOP - 1) / HOP + 1 } else { 0 };
+    let valid = if samples > HOP {
+        (samples - HOP - 1) / HOP + 1
+    } else {
+        0
+    };
     (frames, if valid < frames { valid } else { frames })
 }
 

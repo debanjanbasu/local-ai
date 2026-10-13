@@ -180,7 +180,10 @@ impl AudioKernels {
             return Err(arg("audio convolution writes past its output"));
         }
         let count = u64::from(out_rows) * u64::from(out_f) * u64::from(out_c);
-        need(input, f32s(u64::from(in_t) * u64::from(in_f) * u64::from(in_c)))?;
+        need(
+            input,
+            f32s(u64::from(in_t) * u64::from(in_f) * u64::from(in_c)),
+        )?;
         need(weight, f32s(u64::from(out_c) * u64::from(in_c) * 9))?;
         need(output, f32s(count))?;
         if same(input.0, output.0) {
@@ -384,7 +387,11 @@ impl AudioKernels {
         set(encoder, &shape.max_distance, 8);
         set(encoder, &shape.k_scale, 9);
         set(encoder, &shape.logit_cap, 10);
-        grid(encoder, (shape.tokens as usize, 1), 32 * shape.heads as usize);
+        grid(
+            encoder,
+            (shape.tokens as usize, 1),
+            32 * shape.heads as usize,
+        );
         batch.record_dispatch();
         Ok(())
     }
