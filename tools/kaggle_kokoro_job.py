@@ -18,7 +18,9 @@ pinned `kokoro` and `misaki` packages, downloads `hexgrad/Kokoro-82M`
 - `asr.json`: a reference ASR transcript of each pipeline output.
 
 `--mode asr --dataset owner/slug` stages a job that transcribes every
-`*.wav` under the attached private dataset with the same ASR model and writes
+`*.wav` under the attached private dataset (named `GROUP__KEY.wav` or
+`GROUP/KEY.wav`, with a `texts.json` of `{KEY: text}`) with the same ASR model
+and writes
 `/kaggle/working/asr.json` (used to compare native outputs with the
 reference by word error rate).
 """
@@ -77,12 +79,12 @@ FIXTURES = (
     ("Thank you for calling. Your call is important to us.", "af_nicole", 1.0),
     ("A journey of a thousand miles begins with a single step.", "bf_lily", 1.0),
     ("Bright stars shimmered quietly above the silent mountain lake.", "bm_daniel", 1.0),
-    ("Software engineers often debate the merits of different programming styles,"
-     " but most agree that clear and simple code is easier to maintain over time.",
+    (("Software engineers often debate the merits of different programming styles,"
+      " but most agree that clear and simple code is easier to maintain over time."),
      "af_heart", 1.0),
-    ("Despite the storm, the small fishing boat returned safely to the harbour just"
-     " before midnight, and the whole village gathered on the pier to welcome the"
-     " exhausted crew home.", "am_michael", 1.0),
+    (("Despite the storm, the small fishing boat returned safely to the harbour just"
+      " before midnight, and the whole village gathered on the pier to welcome the"
+      " exhausted crew home."), "am_michael", 1.0),
     ("It's not what you look at that matters, it's what you see.", "bf_alice", 1.0),
     ("The library will be closed on Monday for maintenance.", "am_liam", 1.0),
 )
@@ -238,6 +240,7 @@ with open(work / "g2p.jsonl", "w", encoding="utf-8") as f:
     for r in g2p_rows:
         f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+from scipy.signal import resample_poly
 from transformers import pipeline as hf_pipeline
 asr = hf_pipeline("automatic-speech-recognition", model=ASR_MODEL, device="cpu")
 normalize = asr.tokenizer.normalize
@@ -245,7 +248,9 @@ import jiwer
 transcripts = {}
 for r in rows:
     audio = np.frombuffer((fixtures / "pipeline" / f"{r['index']:03d}.f32").read_bytes(), dtype="<f4")
-    text = asr({"raw": audio.astype(np.float32), "sampling_rate": 24000}, generate_kwargs={"language": "en", "task": "transcribe"})["text"]
+    # 24 kHz -> 16 kHz here: the pipeline would need torchaudio to resample.
+    audio16 = resample_poly(audio.astype(np.float64), 2, 3).astype(np.float32)
+    text = asr({"raw": audio16, "sampling_rate": 16000}, generate_kwargs={"language": "en", "task": "transcribe"})["text"]
     transcripts[f"{r['index']:03d}"] = {"reference_text": r["text"], "asr": text}
 refs = [normalize(v["reference_text"]) for v in transcripts.values()]
 hyps = [normalize(v["asr"]) for v in transcripts.values()]
@@ -263,23 +268,32 @@ import json, subprocess, sys, wave
 from pathlib import Path
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "jiwer"], check=True)
 import numpy as np, jiwer
+from scipy.signal import resample_poly
 from transformers import pipeline as hf_pipeline
 owner, slug = DATASET.split("/")
 roots = [p for p in (Path("/kaggle/input") / slug, Path("/kaggle/input/datasets") / owner / slug) if p.is_dir()]
 if len(roots) != 1:
     raise RuntimeError("dataset not found")
 texts = json.loads(next(roots[0].rglob("texts.json")).read_text())
+sys.stdout.reconfigure(line_buffering=True)
 asr = hf_pipeline("automatic-speech-recognition", model=ASR_MODEL, device="cpu")
 normalize = asr.tokenizer.normalize
 out = {"model": ASR_MODEL, "sets": {}}
 for path in sorted(roots[0].rglob("*.wav")):
     with wave.open(str(path)) as w:
         rate = w.getframerate()
-        audio = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
-    text = asr({"raw": audio, "sampling_rate": rate}, generate_kwargs={"language": "en", "task": "transcribe"})["text"]
-    group = path.parent.name
-    out["sets"].setdefault(group, {})[path.stem] = {"reference_text": texts[path.stem], "asr": text}
-    print(group, path.stem, text, flush=True)
+        audio = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float64) / 32768.0
+    if rate != 24000:
+        raise RuntimeError("expected 24 kHz audio: " + str(path))
+    # 24 kHz -> 16 kHz here: the pipeline would need torchaudio to resample.
+    audio16 = resample_poly(audio, 2, 3).astype(np.float32)
+    text = asr({"raw": audio16, "sampling_rate": 16000}, generate_kwargs={"language": "en", "task": "transcribe"})["text"]
+    # Flat uploads name files GROUP__KEY.wav; nested ones GROUP/KEY.wav.
+    group, _, key = path.stem.rpartition("__")
+    if not group:
+        group, key = path.parent.name, path.stem
+    out["sets"].setdefault(group, {})[key] = {"reference_text": texts[key], "asr": text}
+    print(group, key, text, flush=True)
 for group, rows in out["sets"].items():
     refs = [normalize(r["reference_text"]) for r in rows.values()]
     hyps = [normalize(r["asr"]) for r in rows.values()]

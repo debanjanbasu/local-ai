@@ -604,3 +604,6 @@ impl KokoroKernels {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
