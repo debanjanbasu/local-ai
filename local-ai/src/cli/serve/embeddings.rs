@@ -102,6 +102,17 @@ impl Embeddings {
     }
 }
 
+impl Embeddings {
+    /// The model as the vector stores' chunk embedder (same model and lock,
+    /// same yielding to decode).
+    pub(super) fn chunk_embedder(&self) -> Arc<dyn local_services::vector_stores::ChunkEmbedder> {
+        Arc::new(crate::cli::vector_embedder::ModelChunkEmbedder::new(
+            Arc::clone(&self.model),
+            Arc::clone(&self.activity),
+        ))
+    }
+}
+
 /// `/v1/models` entry of the embedding model.
 pub(super) fn model_json(created: u64) -> Value {
     json!({"id":EMBEDDING_MODEL_ID,"object":"model","created":created,"owned_by":"local",
