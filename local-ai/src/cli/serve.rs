@@ -374,13 +374,14 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         }
     };
     let (stream, mut request, protocol) = prepared;
-    let tool_loop = match hosted_loop(&state, &protocol, &mut request) {
+    let reply = Reply::new(protocol, Arc::clone(&state.model));
+    let tool_loop = match hosted_loop(&state, &reply, &mut request) {
         Ok(tool_loop) => tool_loop,
         Err(message) => {
             return error_response(StatusCode::BAD_REQUEST, &message, &state, &parts.headers).await;
         }
     };
-    let background = matches!(&protocol, Protocol::Responses(echo) if echo.background());
+    let background = matches!(&reply.protocol, Protocol::Responses(echo) if echo.background());
     if background && state.background.closing() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -390,8 +391,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         )
         .await;
     }
-    let responses = matches!(&protocol, Protocol::Responses(_));
-    let reply = Reply::new(protocol, Arc::clone(&state.model));
+    let responses = matches!(&reply.protocol, Protocol::Responses(_));
     // Submission compiles a structured response format synchronously before
     // queueing (about half a second the first time, building the tokenizer's
     // grammar tables), so it runs on the blocking pool, never on a runtime
@@ -503,12 +503,26 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 /// whose tools this server was not permitted to run.
 fn hosted_loop(
     state: &AppState,
-    protocol: &Protocol,
+    reply: &Reply,
     request: &mut GenerationRequest,
 ) -> Result<Option<tool_loop::Loop>, String> {
-    let (Protocol::Responses(echo), GenerationRequest::Chat(request)) = (protocol, request) else {
+    let (Protocol::Responses(echo), GenerationRequest::Chat(request)) = (&reply.protocol, request)
+    else {
         return Ok(None);
     };
+    responses_loop(state, echo, &reply.id, request)
+}
+
+/// [`hosted_loop`] for Response `id`, as `echo` describes it. A resumable
+/// background Response marks, durably, that a hosted call may run before the
+/// first one does, so a restarted server never regenerates one whose calls
+/// may already have taken effect.
+fn responses_loop(
+    state: &AppState,
+    echo: &responses::Echo,
+    id: &str,
+    request: &mut local_engine::ChatRequest,
+) -> Result<Option<tool_loop::Loop>, String> {
     if echo.kinds().all_hosted().next().is_none() {
         return Ok(None);
     }
@@ -529,6 +543,17 @@ fn hosted_loop(
         kinds: echo.kinds().clone(),
         bounds: tools.bounds,
         max_calls: echo.max_tool_calls(),
+        before_tools: echo.resumable_store().map(|store| {
+            let (store, id) = (Arc::clone(store), id.to_owned());
+            Box::new(move || {
+                store.mark_tools_started(&id).map_err(|error| {
+                    format!(
+                        "no hosted tool call was run: whether one may have run could not be \
+                         recorded for resuming this response after a restart: {error}"
+                    )
+                })
+            }) as tool_loop::BeforeTools
+        }),
     }))
 }
 
@@ -740,12 +765,22 @@ fn resume_background(
     id: &str,
 ) -> Result<bool, Failure> {
     let (engine, depth) = (state.engine.clone(), state.depth.clone());
+    let summarizer = compaction::summarizer(engine.clone());
     let resumed = state.background.resume(
         store,
         id,
-        (state.thinking, state.cipher.as_ref()),
-        move |request| {
-            let mut events = engine.chat(request)?;
+        (state.thinking, state.cipher.as_ref(), Some(&summarizer)),
+        move |mut request, reply| {
+            let tool_loop = match &reply.protocol {
+                Protocol::Responses(echo) => responses_loop(state, echo, &reply.id, &mut request)
+                    .map_err(crate::Error::InvalidArgument)?,
+                _ => None,
+            };
+            let events = engine.chat(request)?;
+            let mut events = match tool_loop {
+                Some(tool_loop) => tool_loop::start(tool_loop, events),
+                None => events,
+            };
             let cancel = events.cancel_handle();
             // No deadline: the job has no client to stall, and a closed
             // channel is `None`.
@@ -1227,3 +1262,7 @@ mod resume_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod recovery_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod combos_tests;

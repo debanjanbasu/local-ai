@@ -103,7 +103,15 @@ pub(super) struct Loop {
     pub(super) bounds: Bounds,
     /// The request's `max_tool_calls`.
     pub(super) max_calls: Option<u64>,
+    /// Runs once, before the first hosted call starts executing; an `Err`
+    /// ends the Response with that error instead, running nothing. A
+    /// resumable background Response records there that a call may have
+    /// run (see [`super::store::ResponseStore::mark_tools_started`]).
+    pub(super) before_tools: Option<BeforeTools>,
 }
+
+/// See [`Loop::before_tools`].
+pub(super) type BeforeTools = Box<dyn FnOnce() -> Result<(), String> + Send>;
 
 /// Run the loop over `first`, the request's first generation, returning the
 /// one stream its consumer reads.
@@ -224,6 +232,12 @@ impl Driver {
                 return;
             }
             let client_pending = turn.calls.len() > hosted.len();
+            if let Some(before) = self.tool_loop.before_tools.take()
+                && let Err(error) = before()
+            {
+                self.send(Event::Error(error));
+                return;
+            }
             let mut outputs = Vec::with_capacity(hosted.len());
             for (call, operation) in hosted {
                 let Some(result) = self.execute(&call, operation, &mut spent) else {

@@ -35,6 +35,12 @@
 //! `.{id}.events` journal of the events it published (see [`super::journal`]).
 //! It is created before the record and deleted after it, so every streamed
 //! record has one, and recovery reconciles it with the record it belongs to.
+//!
+//! A resumable background Response that declares hosted tools gets an empty
+//! owner-only `.{id}.tools` marker, flushed to disk before its first hosted
+//! call starts executing: a record without one provably never ran a hosted
+//! call, so a restarted server may regenerate it without running any twice.
+//! It is deleted with the record.
 
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -59,6 +65,10 @@ const LOCK_SUFFIX: &str = ".lock";
 
 /// Suffix of a streamed response's event journal, `.{id}.events`.
 const JOURNAL_SUFFIX: &str = ".events";
+
+/// Suffix of the marker a resumable background response gets, `.{id}.tools`,
+/// durably before its first hosted tool call starts executing.
+const TOOLS_SUFFIX: &str = ".tools";
 
 /// The error a background Response that could not be resumed reports,
 /// before why.
@@ -194,6 +204,13 @@ impl ResponseStore {
                 .and_then(|name| name.strip_suffix(JOURNAL_SUFFIX))
             {
                 self.remove_orphan_journal(id)?;
+                continue;
+            }
+            if let Some(id) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(TOOLS_SUFFIX))
+            {
+                self.remove_orphan_marker(id)?;
                 continue;
             }
             let Some(id) = name.strip_suffix(".json") else {
@@ -364,6 +381,48 @@ impl ResponseStore {
         Ok(())
     }
 
+    /// Remove the hosted-tool marker of a response with no record, unless a
+    /// writer holds its lease.
+    fn remove_orphan_marker(&self, id: &str) -> std::io::Result<()> {
+        let (Some(record), Some(marker)) = (self.path(id), self.marker_path(id)) else {
+            return Ok(());
+        };
+        if record.exists() {
+            return Ok(());
+        }
+        let Some(_lease) = self.lease(id)? else {
+            return Ok(());
+        };
+        if !record.exists() {
+            remove_if_present(&marker)?;
+        }
+        Ok(())
+    }
+
+    fn marker_path(&self, id: &str) -> Option<PathBuf> {
+        valid_id(id).then(|| self.dir.join(format!(".{id}{TOOLS_SUFFIX}")))
+    }
+
+    /// Record, durably, that a hosted tool call of response `id` is about to
+    /// start executing. Idempotent.
+    pub(super) fn mark_tools_started(&self, id: &str) -> std::io::Result<()> {
+        let path = self.marker_path(id).ok_or_else(|| invalid_id(id))?;
+        open_private(&path, Access::Lock)?.sync_all()?;
+        sync_dir(&self.dir);
+        Ok(())
+    }
+
+    /// Whether a hosted tool call of response `id` may have started
+    /// executing: its marker exists, whatever it is.
+    pub(super) fn tools_started(&self, id: &str) -> std::io::Result<bool> {
+        let path = self.marker_path(id).ok_or_else(|| invalid_id(id))?;
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn journal_path(&self, id: &str) -> Option<PathBuf> {
         valid_id(id).then(|| self.dir.join(format!(".{id}{JOURNAL_SUFFIX}")))
     }
@@ -491,6 +550,12 @@ impl ResponseStore {
                 return Err(error);
             }
             eprintln!("response {id}: event journal not removed: {error}");
+        }
+        if let Some(marker) = self.marker_path(id)
+            && let Err(error) = remove_if_present(&marker)
+        {
+            // Removed when a store next opens, as the record is gone.
+            eprintln!("response {id}: hosted tool marker not removed: {error}");
         }
         sync_dir(&self.dir);
         Ok(found)

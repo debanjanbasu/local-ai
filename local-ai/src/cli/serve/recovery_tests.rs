@@ -20,6 +20,7 @@ use super::background_tests::{
     Scratch, Step, event, manual_temporary, script, stats, status, stopper, stored, streamed_doc,
     temporary_doc,
 };
+use super::response::Reply;
 use super::responses::prepare_responses_with;
 use super::resume::{Subscription, subscribe};
 use super::store::ResponseStore;
@@ -31,7 +32,7 @@ const STALL: std::time::Duration = std::time::Duration::from_secs(30);
 /// would still look held to the resumption that follows.
 static SPAWNING: RwLock<()> = RwLock::new(());
 
-fn no_spawns() -> RwLockReadGuard<'static, ()> {
+pub(super) fn no_spawns() -> RwLockReadGuard<'static, ()> {
     SPAWNING.read().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -88,8 +89,8 @@ impl Engine {
     fn submit(
         &self,
         steps: Vec<Step>,
-    ) -> impl FnOnce(ChatRequest) -> crate::Result<Submitted> + '_ {
-        move |request| {
+    ) -> impl FnOnce(ChatRequest, &Reply) -> crate::Result<Submitted> + '_ {
+        move |request, _| {
             self.requests
                 .lock()
                 .expect("log")
@@ -116,7 +117,7 @@ fn resume(
     engine: &Engine,
 ) -> Pump {
     let Resumed::Started(pump) = background
-        .resume(store, id, (true, None), engine.submit(regenerated()))
+        .resume(store, id, (true, None, None), engine.submit(regenerated()))
         .expect("resumable")
     else {
         unreachable!("expected the job to start")
@@ -131,7 +132,7 @@ fn outcome(
     engine: &Engine,
 ) -> &'static str {
     match background
-        .resume(store, id, (true, None), engine.submit(regenerated()))
+        .resume(store, id, (true, None, None), engine.submit(regenerated()))
         .expect("resume ran")
     {
         Resumed::Started(_) => "started",
@@ -408,7 +409,7 @@ fn a_job_killed_twice_keeps_one_consistent_stream_and_its_request() {
         .resume(
             &store,
             &id,
-            (true, None),
+            (true, None, None),
             engine.submit(vec![
                 event(Event::Content("two".into())),
                 event(Event::Content("!".into())),
@@ -761,12 +762,13 @@ fn a_full_queue_defers_without_writing_twice_and_unresumable_jobs_fail() {
     let steps = vec![prefill(), event(Event::Content("Hi".into()))];
     let id = crashed(&scratch.open(), true, steps, 2);
     let store = scratch.open();
-    let full = |_: ChatRequest| -> crate::Result<Submitted> { Err(crate::Error::QueueFull) };
+    let full =
+        |_: ChatRequest, _: &Reply| -> crate::Result<Submitted> { Err(crate::Error::QueueFull) };
     for _ in 0..2 {
         let background = Arc::new(Background::default());
         assert!(matches!(
             background
-                .resume(&store, &id, (true, None), full)
+                .resume(&store, &id, (true, None, None), full)
                 .expect("ran"),
             Resumed::Deferred
         ));
@@ -809,13 +811,13 @@ fn a_full_queue_defers_without_writing_twice_and_unresumable_jobs_fail() {
 
     // An engine refusal fails it too, rather than leave it pending.
     let id = crashed(&store, false, Vec::new(), 0);
-    let refused = |_: ChatRequest| -> crate::Result<Submitted> {
+    let refused = |_: ChatRequest, _: &Reply| -> crate::Result<Submitted> {
         Err(crate::Error::InvalidArgument("refused".into()))
     };
     let background = Arc::new(Background::default());
     assert!(matches!(
         background
-            .resume(&store, &id, (true, None), refused)
+            .resume(&store, &id, (true, None, None), refused)
             .expect("ran"),
         Resumed::Settled
     ));
@@ -909,19 +911,36 @@ fn a_continuation_resumes_from_its_stored_history_even_after_its_parent_is_delet
 }
 
 #[test]
-fn a_job_that_declares_hosted_tools_fails_rather_than_run_its_calls_twice() {
+fn a_hosted_tool_job_resumes_only_if_no_hosted_call_had_started() {
     let _spawns = no_spawns();
     let scratch = Scratch::new();
     let store = scratch.open();
     let mut request = body(true);
     request["tools"] = json!([{"type":"function","name":"local_fs_read"}]);
-    let doc = streamed_doc(&request, &store, true);
-    let id = doc.id().to_owned();
-    let (_, stop) = stopper();
-    let (_, pump) = Arc::new(Background::default())
-        .admit(doc, script(vec![prefill()]), stop, None)
-        .expect("admitted");
-    pump.crash_after(1);
+    let crash = |store: &Arc<ResponseStore>| {
+        let doc = streamed_doc(&request, store, true);
+        let id = doc.id().to_owned();
+        let (_, stop) = stopper();
+        let (_, pump) = Arc::new(Background::default())
+            .admit(doc, script(vec![prefill()]), stop, None)
+            .expect("admitted");
+        pump.crash_after(1);
+        id
+    };
+    // No marker: no hosted call ever started, so it is regenerated.
+    let id = crash(&store);
+    let store = scratch.open();
+    assert!(!store.tools_started(&id).expect("readable"));
+    let engine = Engine::default();
+    let background = Arc::new(Background::default());
+    resume(&background, &store, &id, &engine).run();
+    assert_eq!(engine.asked(), 1);
+    assert_eq!(status(&store, &id), "completed");
+
+    // Marked before a call started executing: it may have run, so the job
+    // fails, saying exactly why, and nothing is regenerated.
+    let id = crash(&store);
+    store.mark_tools_started(&id).expect("marked");
     let store = scratch.open();
     let engine = Engine::default();
     assert_eq!(
@@ -935,6 +954,9 @@ fn a_job_that_declares_hosted_tools_fails_rather_than_run_its_calls_twice() {
         failed["error"]["message"]
             .as_str()
             .expect("message")
-            .contains("declares hosted tools")
+            .contains("a hosted tool call of this response had started executing")
     );
+    // The marker goes with the response.
+    assert!(store.delete(&id).expect("deleted"));
+    assert!(!store.tools_started(&id).expect("readable"));
 }
