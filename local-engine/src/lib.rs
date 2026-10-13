@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod activity;
 mod api;
 pub mod runtime;
 
@@ -17,6 +18,7 @@ pub mod bonsai_ngram;
 #[allow(clippy::too_long_first_doc_paragraph)]
 pub mod bonsai_tokenizer;
 pub mod compaction;
+pub mod embedding;
 pub mod judgment;
 mod prompt_cache;
 #[doc(hidden)]
