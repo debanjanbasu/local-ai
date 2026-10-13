@@ -290,13 +290,17 @@ Weights are not included. The runtime validates these pinned files:
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | for MTP speculation |
 | `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
+| `models/whisper-large-v3/whisper-large-v3-f16.bin` | 3,093,458,432 | `cce7ae83d4a15146f356a9f3bb5169b0fb42a86dc2e6a0c6cf932766e6d1cb53` | for `POST /v1/audio/transcriptions` and `/translations` |
+| `models/whisper-large-v3/tokenizer.json` | 2,480,617 | `6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca` | for `POST /v1/audio/transcriptions` and `/translations` |
 
 The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
 not: without it speculation falls back to suffix lookup alone and the startup
 policy says why. The EmbeddingGemma 2 text encoder is optional too: it is
 converted from the Kaggle checkpoint by `tools/convert_embeddinggemma2.py`, and
 when installed the server adds `POST /v1/embeddings`
-([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)).
+([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). So is Whisper large-v3: converted
+by `tools/convert_whisper.py`, it adds `POST /v1/audio/transcriptions` and
+`POST /v1/audio/translations` ([docs/TRANSCRIPTION.md](docs/TRANSCRIPTION.md)).
 
 The GGUF repository is pinned. Its head has moved past `6ed5e12b`, so keep the
 pin rather than tracking the branch.
@@ -441,6 +445,8 @@ is 1.074x and the best measured result 1.29%.
 - `docs/BONSAI.md`: technical reference and measurements.
 - `docs/EMBEDDINGS.md`: the optional native EmbeddingGemma 2 text encoder
   and `POST /v1/embeddings`.
+- `docs/TRANSCRIPTION.md`: the optional native Whisper large-v3 speech model
+  and `POST /v1/audio/transcriptions` and `/translations`.
 
 ## Verification
 

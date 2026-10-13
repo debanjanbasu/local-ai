@@ -52,7 +52,7 @@ python3 tools/convert_whisper.py --source cache/whisper-large-v3
 
 | File | Bytes | SHA256 |
 | --- | ---: | --- |
-| `models/whisper-large-v3/whisper-large-v3-f16.bin` | OUTPUT_SIZE | `OUTPUT_SHA256` |
+| `models/whisper-large-v3/whisper-large-v3-f16.bin` | 3,093,458,432 | `cce7ae83d4a15146f356a9f3bb5169b0fb42a86dc2e6a0c6cf932766e6d1cb53` |
 | `models/whisper-large-v3/tokenizer.json` | 2,480,617 | `6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca` |
 
 Source pins: `model.safetensors` 3,087,130,976 B `a8e94b85…40fd95`,

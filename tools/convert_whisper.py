@@ -79,8 +79,8 @@ SOURCE_FILES = {
     ),
 }
 ARTIFACT_NAME = "whisper-large-v3-f16.bin"
-OUTPUT_SIZE = None
-OUTPUT_SHA256 = None
+OUTPUT_SIZE = 3_093_458_432
+OUTPUT_SHA256 = "cce7ae83d4a15146f356a9f3bb5169b0fb42a86dc2e6a0c6cf932766e6d1cb53"
 DEFAULT_DESTINATION = Path("models/whisper-large-v3")
 
 CONFIG = {
