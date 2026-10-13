@@ -13,12 +13,11 @@
 //! ([`TRANSCRIPTION_MODEL_ID`] or `whisper-1`), `prompt`, `temperature` (0 to 1; 0
 //! means the reference's fallback ladder), `response_format` (`json`,
 //! `text`, `srt`, `verbose_json`, `vtt`). Transcriptions also take
-//! `language` (ISO-639-1), `timestamp_granularities[]` (`segment` only,
-//! with `verbose_json`), `include[]` (`logprobs`, with `json` or streaming)
+//! `language` (ISO-639-1), `timestamp_granularities[]` (`segment` and
+//! `word`, with `verbose_json`), `include[]` (`logprobs`, with `json` or streaming)
 //! and `stream` (`transcript.text.delta` events per finished 30-second
-//! window, then `transcript.text.done`). Word timestamps, diarization,
-//! `chunking_strategy`, `known_speaker_*`, `languages` and `keywords` are
-//! refused with `400`.
+//! window, then `transcript.text.done`). Diarization, `chunking_strategy`,
+//! `known_speaker_*`, `languages` and `keywords` are refused with `400`.
 //!
 //! # Scheduling
 //!
@@ -133,6 +132,7 @@ enum Format {
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct Form {
     file: Vec<u8>,
     extension: Option<String>,
@@ -142,6 +142,10 @@ struct Form {
     temperature: f32,
     stream: bool,
     logprobs: bool,
+    /// `timestamp_granularities[]` includes `word` / `segment` (segments
+    /// also when none is given).
+    words: bool,
+    segments: bool,
 }
 
 type Failure = (StatusCode, String);
@@ -348,17 +352,14 @@ fn validate(raw: RawForm, task: Task) -> Result<Form, Failure> {
     if stream && !matches!(format, Format::Json | Format::Text) {
         return Err(bad("streaming supports response_format json or text"));
     }
+    let (mut words, mut segments) = (false, raw.granularities.is_empty());
     for granularity in &raw.granularities {
         match granularity.as_str() {
-            "segment" => {}
-            "word" => {
-                return Err(bad(
-                    "word timestamps are not supported here; segment timestamps are",
-                ));
-            }
+            "segment" => segments = true,
+            "word" => words = true,
             other => {
                 return Err(bad(format!(
-                    "timestamp_granularities must be segment, not {other:?}"
+                    "timestamp_granularities must be word or segment, not {other:?}"
                 )));
             }
         }
@@ -387,6 +388,8 @@ fn validate(raw: RawForm, task: Task) -> Result<Form, Failure> {
         temperature,
         stream,
         logprobs,
+        words,
+        segments,
     })
 }
 
@@ -417,6 +420,7 @@ fn options(form: &Form, task: Task) -> TranscribeOptions {
         },
         condition_on_previous_text: true,
         seed: u64::from(std::process::id()) ^ local_seed(),
+        word_timestamps: form.words,
     }
 }
 
@@ -533,8 +537,8 @@ fn duration_usage(transcript: &Transcript) -> Value {
     json!({"type":"duration","seconds":(transcript.duration * 1000.0).round() / 1000.0})
 }
 
-fn verbose_json(transcript: &Transcript, task: Task) -> Value {
-    let segments: Vec<Value> = transcript
+fn verbose_json(transcript: &Transcript, task: Task, words: bool, segments: bool) -> Value {
+    let segment_values: Vec<Value> = transcript
         .segments
         .iter()
         .map(|s| {
@@ -557,8 +561,19 @@ fn verbose_json(transcript: &Transcript, task: Task) -> Value {
         "language":language,
         "duration":transcript.duration,
         "text":transcript.text.trim(),
-        "segments":segments,
     });
+    if segments {
+        value["segments"] = Value::Array(segment_values);
+    }
+    if words {
+        let words: Vec<Value> = transcript
+            .segments
+            .iter()
+            .flat_map(|s| &s.words)
+            .map(|w| json!({"word":w.word.trim(),"start":w.start,"end":w.end}))
+            .collect();
+        value["words"] = Value::Array(words);
+    }
     if task == Task::Transcribe {
         value["usage"] = duration_usage(transcript);
     }
@@ -602,6 +617,7 @@ fn sse(value: &Value) -> Bytes {
     Bytes::from(format!("data: {value}\n\n"))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Response {
     let headers = &parts.headers;
     let Some(service) = state.transcription.clone() else {
@@ -637,11 +653,15 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
             (Ok(t), true) => Some(logprobs_json(&worker, &t.segments)),
             _ => None,
         };
-        (transcript, form.format, logprobs)
+        (
+            transcript,
+            (form.format, form.words, form.segments),
+            logprobs,
+        )
     })
     .await;
     drop(guard);
-    let (transcript, format, logprobs) = match result {
+    let (transcript, (format, words, segments), logprobs) = match result {
         Ok(value) => value,
         Err(error) => {
             return error_response(
@@ -681,7 +701,7 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
         Format::VerboseJson => {
             json_response(
                 StatusCode::OK,
-                verbose_json(&transcript, task),
+                verbose_json(&transcript, task, words, segments),
                 state,
                 headers,
             )
@@ -826,7 +846,6 @@ mod tests {
     #[test]
     fn unsupported_requests_are_refused() {
         for fields in [
-            vec![("granularity", "word"), ("response_format", "verbose_json")],
             vec![("granularity", "segment")],
             vec![("response_format", "diarized_json")],
             vec![("response_format", "xml")],
@@ -861,6 +880,12 @@ mod tests {
             avg_logprob: -0.1,
             compression_ratio: 1.0,
             no_speech_prob: 0.01,
+            words: vec![local_engine::transcription::Word {
+                word: format!(" w{id}"),
+                start,
+                end,
+                probability: 0.9,
+            }],
         }
     }
 
@@ -892,13 +917,17 @@ mod tests {
             segments: vec![segment(0, 0.0, 2.0, " Hallo.")],
             usage: local_engine::transcription::Usage::default(),
         };
-        let value = verbose_json(&transcript, Task::Transcribe);
+        let value = verbose_json(&transcript, Task::Transcribe, true, false);
+        assert_eq!(value["words"][0]["word"], "w0");
+        assert!(value.get("segments").is_none());
+        let value = verbose_json(&transcript, Task::Transcribe, false, true);
+        assert!(value.get("words").is_none());
         assert_eq!(value["language"], "german");
         assert_eq!(value["text"], "Hallo.");
         assert_eq!(value["task"], "transcribe");
         assert_eq!(value["segments"][0]["tokens"], json!([1, 2]));
         assert_eq!(value["usage"]["type"], "duration");
-        let value = verbose_json(&transcript, Task::Translate);
+        let value = verbose_json(&transcript, Task::Translate, false, true);
         assert_eq!(value["language"], "english");
         assert!(value.get("usage").is_none());
     }

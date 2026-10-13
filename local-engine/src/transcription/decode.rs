@@ -44,6 +44,19 @@ pub trait Forward {
     ) -> crate::Result<Vec<Vec<f32>>>;
     /// Run one more token at the next position; its logits.
     fn step(&mut self, token: u32, pace: &mut Pace<'_>) -> crate::Result<Vec<f32>>;
+    /// Forced decode of `tokens` from position 0 (word timestamps): the
+    /// pre-softmax cross-attention scores of each `[layer, head]` over the
+    /// first `frames` encoder frames, `[heads][tokens][frames]`, and the
+    /// logits of rows `first_row .. first_row + rows`.
+    fn alignment(
+        &mut self,
+        tokens: &[u32],
+        heads: &[[u32; 2]],
+        frames: usize,
+        first_row: usize,
+        rows: usize,
+        pace: &mut Pace<'_>,
+    ) -> crate::Result<(Vec<f32>, Vec<Vec<f32>>)>;
 }
 
 /// Counters for usage reporting.
@@ -355,6 +368,9 @@ fn decode_with_fallback(
 pub struct WindowOptions {
     pub task: Task,
     pub language: u32,
+    /// ISO code of `language` (word splitting depends on it).
+    pub language_code: String,
+    pub word_timestamps: bool,
     pub temperature: Temperature,
     pub condition_on_previous_text: bool,
 }
@@ -387,7 +403,19 @@ fn new_segment(
         avg_logprob: result.avg_logprob,
         compression_ratio: result.compression_ratio,
         no_speech_prob: result.no_speech_prob,
+        words: Vec::new(),
     }
+}
+
+/// `whisper.utils.get_end`: the last word's end, else the last segment's.
+fn get_end(segments: &[Segment]) -> Option<f64> {
+    segments
+        .iter()
+        .rev()
+        .flat_map(|s| s.words.iter().rev())
+        .map(|w| w.end)
+        .next()
+        .or_else(|| segments.last().map(|s| s.end))
 }
 
 /// The reference's `transcribe()` with `clip_timestamps="0"`, no word
@@ -396,7 +424,7 @@ fn new_segment(
 /// segments as soon as they are final. `first_window_encoded`: the forward
 /// already holds the encoding of the full first window (`mel.window(0,
 /// 3000)`, as language detection leaves it).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn transcribe(
     forward: &mut dyn Forward,
     tokenizer: &WhisperTokenizer,
@@ -415,6 +443,7 @@ pub fn transcribe(
     let mut all_tokens: Vec<u32> = initial_prompt.to_vec();
     let mut all_segments: Vec<Segment> = Vec::new();
     let mut prompt_reset_since = 0_usize;
+    let mut last_speech_timestamp = 0.0_f64;
     while seek < content_frames {
         let time_offset = (seek * 160) as f64 / 16_000.0;
         let segment_size = WINDOW_FRAMES.min(content_frames - seek);
@@ -490,11 +519,38 @@ pub fn transcribe(
                 seek += last_timestamp * INPUT_STRIDE;
             }
         }
+        if options.word_timestamps {
+            let task_token = match options.task {
+                Task::Transcribe => sp.transcribe,
+                Task::Translate => sp.translate,
+            };
+            super::timing::add_word_timestamps(
+                &mut current,
+                forward,
+                tokenizer,
+                &options.language_code,
+                options.language,
+                task_token,
+                segment_size,
+                last_speech_timestamp,
+                pace,
+            )?;
+            if !single_timestamp_ending
+                && let Some(last_word_end) = get_end(&current)
+                && last_word_end > time_offset
+            {
+                seek = (last_word_end * 100.0).round_ties_even() as usize;
+            }
+            if let Some(end) = get_end(&current) {
+                last_speech_timestamp = end;
+            }
+        }
         for segment in &mut current {
             if segment.start == segment.end || segment.text.trim().is_empty() {
                 segment.text.clear();
                 segment.tokens.clear();
                 segment.logprobs.clear();
+                segment.words.clear();
             }
         }
         all_tokens.extend(current.iter().flat_map(|s| s.tokens.iter().copied()));

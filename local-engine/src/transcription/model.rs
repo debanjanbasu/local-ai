@@ -141,6 +141,8 @@ pub(super) struct WhisperGpu {
     self_k: MetalBuffer,
     self_v: MetalBuffer,
     logits: MetalBuffer,
+    /// Cross-attention queries of the alignment layers (word timestamps).
+    captured: MetalBuffer,
     /// Decoder positions in the KV cache.
     length: usize,
     /// Whether a window is encoded.
@@ -287,6 +289,7 @@ impl WhisperGpu {
             self_k: buffer(floats(LAYERS * CTX_TEXT * STATE))?,
             self_v: buffer(floats(LAYERS * CTX_TEXT * STATE))?,
             logits: buffer(floats(2 * VOCAB))?,
+            captured: buffer(4)?,
             ws,
             context,
             kernels,
@@ -596,6 +599,7 @@ impl WhisperGpu {
         tokens: &[u32],
         start: usize,
         rows: &[usize],
+        capture: &[usize],
         pace: &mut Pace<'_>,
     ) -> crate::Result<Vec<Vec<f32>>> {
         if !self.encoded {
@@ -617,6 +621,11 @@ impl WhisperGpu {
         self.ws.dx.copy_from_bytes(bytemuck::cast_slice(&x0), 0);
         if self.logits.length() < floats(rows.len() * VOCAB) {
             self.logits = MetalBuffer::empty(self.context.device(), floats(rows.len() * VOCAB))?;
+        }
+        let capture_plane = floats(n * STATE);
+        if !capture.is_empty() && self.captured.length() < capture.len() * capture_plane {
+            self.captured =
+                MetalBuffer::empty(self.context.device(), capture.len() * capture_plane)?;
         }
         let mut sub = Submit::new(&self.context, pace)?;
         let ws = &self.ws;
@@ -687,6 +696,18 @@ impl WhisperGpu {
                 false,
                 None,
             )?;
+            if let Some(slot) = capture.iter().position(|layer| *layer == l) {
+                // The cross-attention queries of an alignment layer, kept.
+                self.linear(
+                    &mut sub,
+                    &c.q,
+                    whole(&ws.dnormed),
+                    Region::at(&self.captured, slot * capture_plane),
+                    n,
+                    false,
+                    None,
+                )?;
+            }
             self.kernels.decoder_attention(
                 &mut sub.batch,
                 whole(&ws.dq),
@@ -779,13 +800,61 @@ impl Forward for Bound<'_> {
         rows: &[usize],
         pace: &mut Pace<'_>,
     ) -> crate::Result<Vec<Vec<f32>>> {
-        self.gpu.decode_tokens(self.payload, tokens, 0, rows, pace)
+        self.gpu
+            .decode_tokens(self.payload, tokens, 0, rows, &[], pace)
+    }
+
+    fn alignment(
+        &mut self,
+        tokens: &[u32],
+        heads: &[[u32; 2]],
+        frames: usize,
+        first_row: usize,
+        rows: usize,
+        pace: &mut Pace<'_>,
+    ) -> crate::Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        let mut layers: Vec<usize> = heads.iter().map(|h| h[0] as usize).collect();
+        layers.sort_unstable();
+        layers.dedup();
+        if heads
+            .iter()
+            .any(|h| h[0] as usize >= LAYERS || h[1] as usize >= HEADS)
+            || frames > CTX_AUDIO
+        {
+            return Err(Error::InvalidFormat("alignment head out of range".into()));
+        }
+        let logit_rows: Vec<usize> = (first_row..first_row + rows).collect();
+        let logits = self
+            .gpu
+            .decode_tokens(self.payload, tokens, 0, &logit_rows, &layers, pace)?;
+        let n = tokens.len();
+        let q_all = self.gpu.captured.as_slice::<f32>();
+        let k_all = self.gpu.cross_k.as_slice::<f32>();
+        let mut weights = vec![0.0_f32; heads.len() * n * frames];
+        for (h, &[layer, head]) in heads.iter().enumerate() {
+            let slot = layers
+                .iter()
+                .position(|l| *l == layer as usize)
+                .unwrap_or(0);
+            let q = &q_all[slot * n * STATE..(slot + 1) * n * STATE];
+            let k = &k_all[layer as usize * CTX_AUDIO * STATE..][..CTX_AUDIO * STATE];
+            let offset = head as usize * 64;
+            for t in 0..n {
+                let qv = &q[t * STATE + offset..t * STATE + offset + 64];
+                for f in 0..frames {
+                    let kv = &k[f * STATE + offset..f * STATE + offset + 64];
+                    let dot: f32 = qv.iter().zip(kv).map(|(a, b)| a * b).sum();
+                    weights[(h * n + t) * frames + f] = dot * 0.125;
+                }
+            }
+        }
+        Ok((weights, logits))
     }
 
     fn step(&mut self, token: u32, pace: &mut Pace<'_>) -> crate::Result<Vec<f32>> {
         let start = self.gpu.length;
         self.gpu
-            .decode_tokens(self.payload, &[token], start, &[0], pace)?
+            .decode_tokens(self.payload, &[token], start, &[0], &[], pace)?
             .pop()
             .ok_or_else(|| Error::Generation("no logits".into()))
     }

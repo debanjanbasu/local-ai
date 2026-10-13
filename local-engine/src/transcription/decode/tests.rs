@@ -105,6 +105,18 @@ impl Forward for Script {
     fn step(&mut self, _token: u32, _: &mut Pace<'_>) -> crate::Result<Vec<f32>> {
         Ok(self.logits())
     }
+
+    fn alignment(
+        &mut self,
+        _tokens: &[u32],
+        _heads: &[[u32; 2]],
+        _frames: usize,
+        _first_row: usize,
+        _rows: usize,
+        _: &mut Pace<'_>,
+    ) -> crate::Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        Err(crate::Error::Generation("not scripted".into()))
+    }
 }
 
 fn mel(content_frames: usize) -> LogMel {
@@ -125,6 +137,8 @@ fn run(
     let options = WindowOptions {
         task: Task::Transcribe,
         language: SOT + 1,
+        language_code: "en".into(),
+        word_timestamps: false,
         temperature,
         condition_on_previous_text: true,
     };
