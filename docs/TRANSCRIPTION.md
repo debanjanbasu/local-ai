@@ -198,7 +198,27 @@ Speed (`transcription-eval bench`, GPU otherwise idle):
 | LibriSpeech subset (202 short files, 1,518 s) | 307 s: RTF 0.20 (each file pays a whole 30 s window) |
 | Reference on the Kaggle CPU (4 cores, FP32) | RTF 4.2 |
 
-CONC_TBD
+Effect on concurrent Bonsai decode (server, `--no-thinking`, greedy,
+300-token answers, 24 different prompts used once each in A-B-B-A order so
+suffix lookup cannot copy an earlier answer; the load is a loop of 75 s
+`verbose_json` transcriptions started 1 s before each answer; the machine was
+shared, load average about 5):
+
+| | Bonsai decode | Transcription |
+| --- | ---: | ---: |
+| Alone | 34.35 tok/s (31.1–38.2) | RTF 0.096 |
+| Together | 33.79 tok/s (31.0–38.8), **−1.6 %** (median −3.2 %) | RTF 0.21 ¹ |
+
+¹ Includes the tail of the last transcription after the answer finished.
+
+Through the server (`api_smoke.py` in the research notes) every response
+format, the `whisper-1` alias, streaming with logprobs, word and segment
+timestamps, M4A (AAC) and 48 kHz stereo WAV input, French transcription with
+detection and French→English translation return `200`, and unsupported
+fields, models, formats, garbage audio and a 25 MiB+ upload return `400`/`413`.
+A request whose client disconnects stops within about 2 s (the next request
+then waited 4.7 s instead of the ≈ 10 s an uncancelled 75 s transcription
+would have cost).
 
 ## Limitations
 
