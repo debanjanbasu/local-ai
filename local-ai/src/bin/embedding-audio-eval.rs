@@ -291,6 +291,33 @@ fn similarity(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// Raw F32 embeddings for offline analysis (`AUDIO_EVAL_DUMP`).
+fn dump_embeddings(
+    dump: &Path,
+    media: &[Vec<f32>],
+    forms: &[(&str, Vec<Vec<f32>>)],
+    caption_clip: &[usize],
+) -> Result<()> {
+    std::fs::create_dir_all(dump)?;
+    let write = |name: &str, rows: &[Vec<f32>]| -> Result<()> {
+        let bytes: Vec<u8> = rows
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        Ok(std::fs::write(dump.join(name), bytes)?)
+    };
+    write("media.f32", media)?;
+    for (name, embeddings) in forms {
+        write(&format!("captions-{name}.f32"), embeddings)?;
+    }
+    std::fs::write(
+        dump.join("caption_clip.json"),
+        serde_json::to_vec(caption_clip)?,
+    )?;
+    Ok(())
+}
+
 fn retrieval(root: &Path) -> Result<()> {
     let texts: std::collections::BTreeMap<String, Vec<String>> =
         serde_json::from_slice(&std::fs::read(root.join("test_texts.json"))?)?;
@@ -339,25 +366,7 @@ fn retrieval(root: &Path) -> Result<()> {
         forms.push((name, model.embed_texts(&refs, &mut || Ok(()))?));
     }
     if let Some(dump) = std::env::var_os("AUDIO_EVAL_DUMP") {
-        // Optional: raw F32 embeddings for offline analysis.
-        let dump = PathBuf::from(dump);
-        std::fs::create_dir_all(&dump)?;
-        let write = |name: &str, rows: &[Vec<f32>]| -> Result<()> {
-            let bytes: Vec<u8> = rows
-                .iter()
-                .flatten()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            Ok(std::fs::write(dump.join(name), bytes)?)
-        };
-        write("media.f32", &media)?;
-        for (name, embeddings) in &forms {
-            write(&format!("captions-{name}.f32"), embeddings)?;
-        }
-        std::fs::write(
-            dump.join("caption_clip.json"),
-            serde_json::to_vec(&caption_clip)?,
-        )?;
+        dump_embeddings(&PathBuf::from(dump), &media, &forms, &caption_clip)?;
     }
     let t2m_relevant: Vec<Vec<usize>> = caption_clip.iter().map(|c| vec![*c]).collect();
     let mut m2t_relevant = vec![Vec::new(); clips.len()];
