@@ -54,7 +54,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, watch};
 
-use local_engine::{EngineHandle, Event, Signal};
+use local_engine::{ChatRequest, EngineHandle, Event, Signal};
 use local_services::batches::{
     BatchLease, CreateBatch, Endpoint, LineOutcome, ListBatches, NextLine, PendingLine,
 };
@@ -62,7 +62,6 @@ use local_services::{Error, Metadata, Store};
 
 use super::chunked::{Body as Document, Flow, absorb};
 use super::reasoning_crypto::ReasoningCipher;
-use super::request::GenerationRequest;
 use super::response::{
     Protocol, Reply, checked, error_response, error_status, error_status_message, json_response,
     unix_now,
@@ -98,7 +97,7 @@ pub(super) struct Generation {
 }
 
 /// Queues one request on the engine (or, in tests, a script).
-pub(super) type Submit = Arc<dyn Fn(GenerationRequest) -> crate::Result<Generation> + Send + Sync>;
+pub(super) type Submit = Arc<dyn Fn(ChatRequest) -> crate::Result<Generation> + Send + Sync>;
 
 /// What the worker needs from the server, cloned from [`AppState`].
 pub(super) struct Config {
@@ -478,7 +477,15 @@ impl Worker {
         let api = match line.endpoint {
             Endpoint::Responses => Api::Responses,
             Endpoint::ChatCompletions => Api::Chat,
-            Endpoint::Completions => Api::Completion,
+            // A batch created before the legacy endpoint was removed: its
+            // lines fail as a request to it would now.
+            Endpoint::RetiredCompletions => {
+                return Some(failed(
+                    StatusCode::NOT_FOUND,
+                    "/v1/completions is the legacy Completions API, which this server does not \
+                     serve; use /v1/responses or /v1/chat/completions",
+                ));
+            }
         };
         let config = &self.config;
         // A batch stored by a server with another model (resumed here) never
@@ -535,7 +542,7 @@ impl Worker {
     fn generate(
         &self,
         line: &PendingLine,
-        request: &GenerationRequest,
+        request: &ChatRequest,
         protocol: Protocol,
         interrupted: &AtomicBool,
     ) -> Option<LineOutcome> {
@@ -611,13 +618,13 @@ impl Worker {
     /// when the engine refused the request.
     fn admit(
         &self,
-        request: &GenerationRequest,
+        request: &ChatRequest,
         interrupted: &AtomicBool,
         deadline: Instant,
     ) -> Result<Generation, Option<LineOutcome>> {
         let mut wait = QUEUE_RETRY_FIRST;
         loop {
-            match (self.submit)(duplicate(request)) {
+            match (self.submit)(request.clone()) {
                 Ok(generation) => {
                     {
                         let mut control = self.lock();
@@ -660,26 +667,14 @@ impl Worker {
 
 /// The engine as the worker drives it.
 fn engine_submit(engine: EngineHandle) -> Submit {
-    Arc::new(
-        move |request: GenerationRequest| -> crate::Result<Generation> {
-            let mut events = match request {
-                GenerationRequest::Chat(request) => engine.chat(request),
-                GenerationRequest::Completion(request) => engine.complete(request),
-            }?;
-            let handle = events.cancel_handle();
-            Ok(Generation {
-                next: Box::new(move |timeout| events.next_signal(timeout)),
-                cancel: Arc::new(move || handle.cancel()),
-            })
-        },
-    )
-}
-
-fn duplicate(request: &GenerationRequest) -> GenerationRequest {
-    match request {
-        GenerationRequest::Chat(request) => GenerationRequest::Chat(request.clone()),
-        GenerationRequest::Completion(request) => GenerationRequest::Completion(request.clone()),
-    }
+    Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
+        let mut events = engine.chat(request)?;
+        let handle = events.cancel_handle();
+        Ok(Generation {
+            next: Box::new(move |timeout| events.next_signal(timeout)),
+            cancel: Arc::new(move || handle.cancel()),
+        })
+    })
 }
 
 /// When generation for a batch expiring at `expires_at` must stop: just

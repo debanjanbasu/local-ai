@@ -1,34 +1,77 @@
-//! Chat Completions and legacy Completions request parsing.
+//! Chat Completions request parsing.
 //!
 //! Chat `response_format` is mapped onto the engine's native
 //! [`ResponseFormat`]: `text`, `json_object`, and `json_schema` with its
 //! nested `json_schema` object (see [`chat_response_format`]). The engine
 //! compiles the schema before queueing and enforces it on every answer token,
-//! whatever `strict` says. Legacy Completions keep refusing every format but
-//! `text`: structured output is not part of that API.
+//! whatever `strict` says.
 //!
 //! Chat `tool_choice` (`auto`, `none`, `required` or
 //! `{"type":"function","function":{"name"}}`), `parallel_tool_calls` and a
 //! tool's `function.strict` map one to one onto the engine's native
 //! [`ToolChoice`], `parallel_tool_calls` and [`ToolDefinition::strict`],
 //! which the engine enforces with its tool grammar (see [`tool_policy`]).
+//!
+//! Only the current API is served: the parameters the `OpenAI` specification
+//! marks deprecated (see [`CHAT_DEPRECATED`]) fail with a 400 naming their
+//! replacement rather than being honoured or ignored.
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use local_engine::{
-    ChatMessage, ChatRequest, CompletionRequest, ResponseFormat, Sampling, ToolCall, ToolChoice,
-    ToolDefinition,
+    ChatMessage, ChatRequest, ResponseFormat, Sampling, ToolCall, ToolChoice, ToolDefinition,
 };
 
 use crate::GenerateParams;
 
+/// Chat Completions request members the `OpenAI` specification marks
+/// deprecated, or this server's own superseded aliases, with what replaces
+/// each. Any of them set to a value other than `null` fails the request.
+pub(super) const CHAT_DEPRECATED: &[(&str, &str)] = &[
+    ("max_tokens", "use max_completion_tokens"),
+    (
+        "seed",
+        "Chat Completions deprecated it; this server samples with its fixed seed",
+    ),
+    ("user", "use prompt_cache_key (and safety_identifier)"),
+    ("functions", "use tools"),
+    ("function_call", "use tool_choice"),
+    ("prompt_cache_retention", "prompt caching is automatic here"),
+    ("session_id", "use prompt_cache_key"),
+];
+
+/// Fail when `body` sets any member of `deprecated` to a non-`null` value.
+///
+/// `body` that is not a JSON object is left to the request's own parser,
+/// which reports it with its usual message.
+pub(super) fn reject_deprecated(
+    body: &[u8],
+    deprecated: &[(&str, &str)],
+    api: &str,
+) -> crate::Result<()> {
+    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) else {
+        return Ok(());
+    };
+    match deprecated
+        .iter()
+        .find(|(field, _)| object.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        Some((field, instead)) => Err(deprecated_field(field, instead, api)),
+        None => Ok(()),
+    }
+}
+
+/// The 400 for a deprecated request member.
+pub(super) fn deprecated_field(field: &str, instead: &str, api: &str) -> crate::Error {
+    crate::Error::InvalidArgument(format!(
+        "{field} is deprecated and not supported by this server's {api}: {instead}"
+    ))
+}
+
 #[derive(Deserialize)]
 struct GenerateRequest {
-    prompt: Option<String>,
     messages: Option<Vec<Message>>,
-    max_tokens: Option<usize>,
-    /// Chat's current name for `max_tokens`; it wins when both are sent.
     max_completion_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -36,11 +79,8 @@ struct GenerateRequest {
     min_p: Option<f32>,
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
-    seed: Option<u64>,
     stream: Option<bool>,
     stream_options: Option<StreamOptions>,
-    user: Option<String>,
-    session_id: Option<String>,
     prompt_cache_key: Option<String>,
     tools: Option<Vec<ChatTool>>,
     tool_choice: Option<Value>,
@@ -50,20 +90,14 @@ struct GenerateRequest {
     // sets one fails instead of being answered as if it had not.
     n: Option<u64>,
     stop: Option<Value>,
-    /// Boolean for Chat, an integer for legacy Completions.
     logprobs: Option<Value>,
     top_logprobs: Option<u64>,
     logit_bias: Option<Value>,
-    best_of: Option<u64>,
-    echo: Option<bool>,
-    suffix: Option<String>,
     store: Option<bool>,
     verbosity: Option<String>,
     response_format: Option<Value>,
     audio: Option<Value>,
     modalities: Option<Vec<String>>,
-    functions: Option<Value>,
-    function_call: Option<Value>,
     prediction: Option<Value>,
     web_search_options: Option<Value>,
     service_tier: Option<String>,
@@ -79,10 +113,7 @@ impl GenerateRequest {
     fn params(&self) -> GenerateParams {
         let defaults = GenerateParams::default();
         GenerateParams {
-            max_tokens: self
-                .max_completion_tokens
-                .or(self.max_tokens)
-                .unwrap_or(defaults.max_tokens),
+            max_tokens: self.max_completion_tokens.unwrap_or(defaults.max_tokens),
             temperature: self.temperature.unwrap_or(defaults.temperature),
             top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(defaults.top_k),
@@ -91,12 +122,12 @@ impl GenerateRequest {
             repetition_penalty: self
                 .frequency_penalty
                 .map_or(defaults.repetition_penalty, |value| 1.0 + value.max(0.0)),
-            seed: self.seed.unwrap_or(defaults.seed),
+            seed: defaults.seed,
         }
     }
 
     /// Fail on any named option whose effect this server cannot produce.
-    fn reject_unsupported(&self, chat: bool) -> crate::Result<()> {
+    fn reject_unsupported(&self) -> crate::Result<()> {
         let unsupported = |name: &str, why: &str| {
             Err(crate::Error::InvalidArgument(format!(
                 "{name} is not supported: {why}"
@@ -110,12 +141,10 @@ impl GenerateRequest {
         }
         let logprobs = match self.logprobs.as_ref() {
             None | Some(Value::Null) => false,
-            Some(Value::Bool(enabled)) if chat => *enabled,
-            Some(Value::Number(count)) if !chat && count.as_u64().is_some() => true,
+            Some(Value::Bool(enabled)) => *enabled,
             _ => {
                 return Err(crate::Error::InvalidArgument(
-                    "logprobs must be a boolean for Chat or a non-negative integer for Completions"
-                        .into(),
+                    "logprobs must be a boolean".into(),
                 ));
             }
         };
@@ -125,37 +154,11 @@ impl GenerateRequest {
         if self.logit_bias.as_ref().is_some_and(|bias| !is_empty(bias)) {
             return unsupported("logit_bias", "the sampler has no per-token bias");
         }
-        if self.best_of.is_some_and(|count| count != 1) {
-            return unsupported("best_of", "this server generates exactly one candidate");
-        }
-        if self.echo == Some(true) {
-            return unsupported("echo", "prompt echo is not implemented");
-        }
-        if self
-            .suffix
-            .as_ref()
-            .is_some_and(|suffix| !suffix.is_empty())
-        {
-            return unsupported("suffix", "fill-in-the-middle generation is not implemented");
-        }
         if self.store == Some(true) {
             return unsupported("store", "this server stores no completions");
         }
         if !matches!(self.verbosity.as_deref(), None | Some("medium")) {
             return unsupported("verbosity", "only the default, medium, is produced");
-        }
-        // Chat parses its format strictly in `chat_response_format`; legacy
-        // Completions keep their old, lenient refusal of anything but text.
-        if !chat
-            && let Some(format) = &self.response_format
-            && !format.is_null()
-            && format.get("type").and_then(Value::as_str) != Some("text")
-        {
-            return unsupported(
-                "response_format",
-                "JSON mode and structured outputs are Chat Completions and Responses options, \
-                 not legacy Completions ones; only {\"type\":\"text\"} is accepted here",
-            );
         }
         if self.audio.as_ref().is_some_and(|audio| !audio.is_null()) {
             return unsupported("audio", "Bonsai 2 is text-only");
@@ -166,17 +169,6 @@ impl GenerateRequest {
             .is_some_and(|modalities| modalities.iter().any(|modality| modality != "text"))
         {
             return unsupported("modalities", "Bonsai 2 only produces text");
-        }
-        if self
-            .functions
-            .as_ref()
-            .is_some_and(|value| !value.is_null())
-            || self
-                .function_call
-                .as_ref()
-                .is_some_and(|value| !value.is_null())
-        {
-            return unsupported("functions", "use tools and tool_choice instead");
         }
         if self
             .prediction
@@ -227,6 +219,8 @@ struct Message {
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ChatToolCall>>,
     tool_call_id: Option<String>,
+    /// Deprecated in favour of `tool_calls`; any value but `null` fails.
+    function_call: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -258,23 +252,16 @@ struct ChatFunction {
     strict: Option<bool>,
 }
 
-pub(super) enum GenerationRequest {
-    Chat(ChatRequest),
-    Completion(CompletionRequest),
-}
-
 pub(super) struct PreparedGeneration {
     pub(super) stream: bool,
-    /// `stream_options.include_usage`, Chat only.
+    /// `stream_options.include_usage`.
     pub(super) include_usage: bool,
-    pub(super) request: GenerationRequest,
+    pub(super) request: ChatRequest,
 }
 
-pub(super) fn prepare_generation(
-    body: &[u8],
-    chat: bool,
-    thinking: bool,
-) -> crate::Result<PreparedGeneration> {
+/// Parse a Chat Completions request body.
+pub(super) fn prepare_generation(body: &[u8], thinking: bool) -> crate::Result<PreparedGeneration> {
+    reject_deprecated(body, CHAT_DEPRECATED, "Chat Completions")?;
     let request: GenerateRequest = serde_json::from_slice(body)
         .map_err(|error| crate::Error::InvalidArgument(format!("invalid JSON request: {error}")))?;
     let params = request.params();
@@ -284,86 +271,40 @@ pub(super) fn prepare_generation(
         .as_ref()
         .and_then(|options| options.include_usage)
         .unwrap_or(false);
-    request.reject_unsupported(chat)?;
-    if !chat
-        && (request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty())
-            || request
-                .tool_choice
-                .as_ref()
-                .is_some_and(|choice| !choice.is_null())
-            || request.parallel_tool_calls == Some(false))
-    {
-        return Err(crate::Error::InvalidArgument(
-            "tools is not supported: tools, tool_choice and parallel_tool_calls are Chat \
-             Completions and Responses options, not legacy Completions ones"
-                .into(),
-        ));
-    }
-    if !chat && include_usage {
-        return Err(crate::Error::InvalidArgument(
-            "stream_options.include_usage is not supported for legacy Completions".into(),
-        ));
-    }
-    let generation = if chat {
-        let messages = request
-            .messages
-            .as_deref()
-            .ok_or_else(|| crate::Error::InvalidArgument("messages are required".into()))?;
-        let messages = messages
-            .iter()
-            .map(chat_message)
-            .collect::<crate::Result<Vec<_>>>()?;
-        let tools = request
-            .tools
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(chat_tool)
-            .collect::<crate::Result<Vec<_>>>()?;
-        let tool_choice = chat_tool_choice(request.tool_choice.as_ref())?;
-        tool_policy(&tools, &tool_choice)?;
-        let response_format = chat_response_format(request.response_format.as_ref())?;
-        GenerationRequest::Chat(ChatRequest {
+    request.reject_unsupported()?;
+    let messages = request
+        .messages
+        .as_deref()
+        .ok_or_else(|| crate::Error::InvalidArgument("messages are required".into()))?;
+    let messages = messages
+        .iter()
+        .map(chat_message)
+        .collect::<crate::Result<Vec<_>>>()?;
+    let tools = request
+        .tools
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(chat_tool)
+        .collect::<crate::Result<Vec<_>>>()?;
+    let tool_choice = chat_tool_choice(request.tool_choice.as_ref())?;
+    tool_policy(&tools, &tool_choice)?;
+    let response_format = chat_response_format(request.response_format.as_ref())?;
+    Ok(PreparedGeneration {
+        stream,
+        include_usage: stream && include_usage,
+        request: ChatRequest {
             messages,
             max_tokens: params.max_tokens,
             sampling: Sampling(params),
             thinking: effective_thinking(request.reasoning_effort.as_deref(), thinking)?,
-            session: session(request.prompt_cache_key, request.session_id, request.user),
+            session: request.prompt_cache_key,
             tools,
             tool_choice,
             parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
             response_format,
-        })
-    } else {
-        let prompt = request
-            .prompt
-            .ok_or_else(|| crate::Error::InvalidArgument("prompt is required".into()))?;
-        GenerationRequest::Completion(CompletionRequest {
-            prompt,
-            max_tokens: params.max_tokens,
-            sampling: Sampling(params),
-            session: session(request.prompt_cache_key, request.session_id, request.user),
-            response_format: ResponseFormat::Text,
-        })
-    };
-    Ok(PreparedGeneration {
-        stream,
-        include_usage: chat && stream && include_usage,
-        request: generation,
+        },
     })
-}
-
-/// The prompt-cache affinity hint: `prompt_cache_key` is the `OpenAI` name for
-/// it, `session_id` this server's older one, and `user` the field it replaced.
-pub(super) fn session(
-    prompt_cache_key: Option<String>,
-    session_id: Option<String>,
-    user: Option<String>,
-) -> Option<String> {
-    prompt_cache_key.or(session_id).or(user)
 }
 
 /// Chat's `response_format`: absent or `null` is text; otherwise exactly
@@ -802,6 +743,17 @@ fn chat_message(message: &Message) -> crate::Result<ChatMessage> {
     if message.role == "function" {
         return Err(crate::Error::InvalidArgument(
             "the deprecated function role is not supported; use tool messages".into(),
+        ));
+    }
+    if message
+        .function_call
+        .as_ref()
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(deprecated_field(
+            "messages[].function_call",
+            "use tool_calls",
+            "Chat Completions",
         ));
     }
     Ok(ChatMessage {

@@ -20,8 +20,22 @@ target/release/local-ai chat 'What is 17 * 23?'
 ```
 
 The server listens on `127.0.0.1:8080` and implements a text, function-calling and
-JSON-constrained subset of the OpenAI Chat Completions, Completions and Responses HTTP
-contracts (not full OpenAI compatibility). A client that stops reading its
+JSON-constrained subset of the OpenAI Chat Completions and Responses HTTP
+contracts (not full OpenAI compatibility).
+
+**Supported OpenAI APIs.** Only current OpenAI APIs are served: Chat
+Completions, Responses (with `input_tokens`, `compact`, retrieval,
+cancellation and input items), Models, Embeddings, Conversations, Files,
+Uploads, Batches, Vector Stores, Evals and Decisions. Legacy and deprecated
+APIs are intentionally not served: the legacy Completions API
+(`POST /v1/completions`) is a 404, batches cannot target it, and request
+members the OpenAI specification marks deprecated (Chat's `max_tokens`,
+`seed`, `user`, `functions`/`function_call`; Responses' `user`, `truncation`,
+`reasoning.generate_summary`; `prompt_cache_retention` on both) are a 400
+naming the replacement. The full list is in
+[docs/BONSAI.md](docs/BONSAI.md#supported-openai-apis).
+
+A client that stops reading its
 socket without closing it is invisible to TCP, so `serve`
 takes `--stall-timeout SECONDS` (default 30, accepted 10 to 3600) to bound how
 long a generation may go undelivered before it is cancelled and the engine
@@ -155,8 +169,7 @@ that are both a blocking `Iterator` and a `Stream`. `EngineHandle::open` is
 another executor should reach the model through `Engine::open` plus
 `spawn_blocking`. See `local-engine/examples/chat.rs`.
 
-`count_chat_tokens` and `count_completion_tokens` on `Engine` and
-`EngineHandle` return the exact prompt length generation would prefill, using
+`count_chat_tokens` on `Engine` and `EngineHandle` returns the exact prompt length generation would prefill, using
 the same template and tokenizer. They run on the CPU, queue no job and submit
 no GPU work.
 

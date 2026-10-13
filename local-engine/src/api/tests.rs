@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{CompletionRequest, Event, PrefillProgress, Sampling, Signal};
+use super::{Event, PrefillProgress, Sampling, Signal};
 use crate::Engine;
 
 #[test]
@@ -32,6 +32,26 @@ fn a_silent_stream_times_out_without_closing_the_generation() {
     producer.join().expect("producer");
 }
 
+/// A chat request whose user turn is several prefill chunks long (400 words
+/// at `PREFILL_CHUNK` of 128), unique to `marker` so the prompt cache cannot
+/// already hold it, without reasoning.
+fn long_prompt(marker: u128, max_tokens: usize) -> super::ChatRequest {
+    super::ChatRequest {
+        messages: vec![message(
+            "user",
+            &format!("{} {marker}", "word ".repeat(400)),
+        )],
+        max_tokens,
+        sampling: Sampling::default(),
+        thinking: false,
+        session: None,
+        tools: Vec::new(),
+        tool_choice: crate::ToolChoice::Auto,
+        parallel_tool_calls: true,
+        response_format: crate::ResponseFormat::default(),
+    }
+}
+
 /// Prefill reports every chunk, in order, before the first event exists.
 ///
 /// This is the claim the whole prefill heartbeat rests on: the model emits
@@ -49,14 +69,8 @@ fn prefill_reports_every_chunk_before_the_first_event() {
         .as_nanos();
     // 400 words is several chunks at `PREFILL_CHUNK` of 128, and one generated
     // token is enough because the assertion is about what arrives before it.
-    let request = CompletionRequest {
-        prompt: format!("{} {marker}", "word ".repeat(400)),
-        max_tokens: 1,
-        sampling: Sampling::default(),
-        session: None,
-        response_format: crate::ResponseFormat::default(),
-    };
-    let mut events = handle.complete(request).expect("queue");
+    let request = long_prompt(marker, 1);
+    let mut events = handle.chat(request).expect("queue");
     let mut boundaries: Vec<PrefillProgress> = Vec::new();
     let first_event = loop {
         match events.next_signal(None).expect("signal") {
@@ -110,14 +124,8 @@ fn a_prefill_boundary_survives_a_wait_that_only_wanted_events() {
         .duration_since(UNIX_EPOCH)
         .expect("clock after the epoch")
         .as_nanos();
-    let request = CompletionRequest {
-        prompt: format!("{} {marker}", "word ".repeat(400)),
-        max_tokens: 8,
-        sampling: Sampling::default(),
-        session: None,
-        response_format: crate::ResponseFormat::default(),
-    };
-    let mut events = handle.complete(request).expect("queue");
+    let request = long_prompt(marker, 8);
+    let mut events = handle.chat(request).expect("queue");
     // Generous on purpose: this wait is allowed to cover the whole prefill, which
     // is the point. Only the *absence* of a deadline is what a caller needs there.
     let budget = Duration::from_secs(3600);
@@ -451,27 +459,6 @@ fn an_invalid_chat_fails_counting_exactly_as_it_fails_generation() {
 }
 
 #[test]
-fn a_completion_count_parses_special_tokens_without_a_template() {
-    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
-    let request = |prompt: &str| CompletionRequest {
-        prompt: prompt.into(),
-        max_tokens: 1,
-        sampling: Sampling::default(),
-        session: None,
-        response_format: crate::ResponseFormat::default(),
-    };
-    // `abc` is one merged token and `<|x|>` one special token.
-    assert_eq!(
-        super::count_completion(&tokenizer, &request("abc<|x|>")).expect("count"),
-        2
-    );
-    assert_eq!(
-        super::count_completion(&tokenizer, &request("")).expect("empty"),
-        0
-    );
-}
-
-#[test]
 fn a_handle_can_count_from_any_thread() {
     const fn shareable<T: Clone + Send + Sync>() {}
     shareable::<super::EngineHandle>();
@@ -484,13 +471,6 @@ fn a_handle_can_count_from_any_thread() {
 #[ignore = "requires the pinned model and the GPU"]
 fn counted_prompt_tokens_match_generation_stats() {
     let engine = Engine::open().expect("open engine");
-    let completion = CompletionRequest {
-        prompt: "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n".into(),
-        max_tokens: 1,
-        sampling: Sampling::default(),
-        session: None,
-        response_format: crate::ResponseFormat::default(),
-    };
     // Allow a complete tool call: a one-token budget can stop just after the
     // opening tag, which correctly fails parsing before Finished is emitted.
     let chats = [tool_history(true), tool_history(false)].map(|mut request| {
@@ -502,9 +482,6 @@ fn counted_prompt_tokens_match_generation_stats() {
         .iter()
         .map(|request| engine.count_chat_tokens(request).expect("engine count"))
         .collect::<Vec<_>>();
-    let engine_completion = engine
-        .count_completion_tokens(&completion)
-        .expect("engine completion count");
     let handle = engine.into_handle();
     let finished = |mut events: super::EventStream| {
         events
@@ -520,14 +497,6 @@ fn counted_prompt_tokens_match_generation_stats() {
         let generated = finished(handle.chat(request).expect("queue chat"));
         assert_eq!(generated, counted);
     }
-    assert_eq!(
-        handle
-            .count_completion_tokens(&completion)
-            .expect("completion count"),
-        engine_completion
-    );
-    let generated = finished(handle.complete(completion).expect("queue completion"));
-    assert_eq!(generated, engine_completion);
 }
 
 #[test]

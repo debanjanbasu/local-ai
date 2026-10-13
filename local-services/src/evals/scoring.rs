@@ -119,7 +119,7 @@ fn generated(record: Option<&Value>, endpoint: Endpoint) -> Generated {
     }
     match endpoint {
         Endpoint::Responses => responses_answer(body),
-        Endpoint::ChatCompletions | Endpoint::Completions => chat_answer(body),
+        Endpoint::ChatCompletions | Endpoint::RetiredCompletions => chat_answer(body),
     }
 }
 

@@ -90,22 +90,6 @@ pub struct ChatRequest {
     pub response_format: ResponseFormat,
 }
 
-/// A raw-text generation request.
-#[derive(Clone, Debug)]
-pub struct CompletionRequest {
-    /// Prompt passed directly to the tokenizer.
-    pub prompt: String,
-    /// Maximum number of generated tokens.
-    pub max_tokens: usize,
-    /// Sampling controls.
-    pub sampling: Sampling,
-    /// Optional prompt-cache affinity hint.
-    pub session: Option<String>,
-    /// The shape the generated text must take, enforced from the first
-    /// generated token. See [`ChatRequest::response_format`].
-    pub response_format: ResponseFormat,
-}
-
 /// Typed automatic startup decisions.
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -143,7 +127,7 @@ pub struct Stats {
     pub cache_source: PromptCacheSource,
     /// Generated tokens through the first `</think>` delimiter (inclusive),
     /// or all generated tokens if thinking ended before that delimiter.
-    /// Zero for requests with thinking disabled and for raw completions.
+    /// Zero for requests with thinking disabled.
     pub reasoning_tokens: usize,
     /// Token and speculation measurements.
     pub generation: GenerationStats,
@@ -345,18 +329,6 @@ impl Engine {
         count_chat(self.inner.tokenizer(), request)
     }
 
-    /// Count the prompt tokens a raw completion would prefill, without
-    /// generating.
-    ///
-    /// The prompt is tokenized as [`Engine::complete`] tokenizes it: no
-    /// template, special-token text parsed as special tokens. An empty prompt
-    /// counts zero, although generation rejects it. `max_tokens`, `sampling`,
-    /// `session` and `response_format` are ignored (no schema is compiled).
-    /// CPU-only; no GPU work is submitted.
-    pub fn count_completion_tokens(&self, request: &CompletionRequest) -> crate::Result<usize> {
-        count_completion(self.inner.tokenizer(), request)
-    }
-
     /// Chat with one user prompt and collect the final answer and statistics.
     ///
     /// ```no_run
@@ -431,40 +403,6 @@ impl Engine {
             request.session.as_deref(),
             request.thinking,
             tools,
-            grammar,
-            cancel,
-            progress,
-            callback,
-        )
-    }
-
-    /// Generate a raw completion, stopping when the callback returns `Break`.
-    pub fn complete(
-        &mut self,
-        request: &CompletionRequest,
-        callback: impl FnMut(Event) -> ControlFlow<()>,
-    ) -> crate::Result<Stats> {
-        let cancel = CancelToken::default();
-        let mut progress = ignore_progress;
-        self.complete_with_cancel(request, &cancel, &mut progress, callback)
-    }
-
-    fn complete_with_cancel(
-        &mut self,
-        request: &CompletionRequest,
-        cancel: &CancelToken,
-        progress: &mut dyn FnMut(PrefillProgress),
-        callback: impl FnMut(Event) -> ControlFlow<()>,
-    ) -> crate::Result<Stats> {
-        let ids = encode_prompt(self.inner.tokenizer(), &request.prompt)?;
-        let grammar = completion_grammar(self.inner.tokenizer(), request)?;
-        self.generate(
-            &ids,
-            request.max_tokens,
-            &request.sampling,
-            request.session.as_deref(),
-            false,
-            None,
             grammar,
             cancel,
             progress,
@@ -602,20 +540,17 @@ impl Engine {
     }
 }
 
+/// A queued chat request, its constraint already compiled.
+struct ChatJob {
+    request: ChatRequest,
+    grammar: Option<Grammar>,
+    events: async_mpsc::Sender<Delivered>,
+    cancel: CancelToken,
+}
+
 /// A queued request, its response format already compiled.
 enum Job {
-    Chat(
-        ChatRequest,
-        Option<Grammar>,
-        async_mpsc::Sender<Delivered>,
-        CancelToken,
-    ),
-    Completion(
-        CompletionRequest,
-        Option<Grammar>,
-        async_mpsc::Sender<Delivered>,
-        CancelToken,
-    ),
+    Chat(Box<ChatJob>),
     /// An experimental decision, validated and tokenized.
     Decision(Box<DecisionJob>),
 }
@@ -631,8 +566,8 @@ const fn ignore_progress(_: PrefillProgress) {}
 ///
 /// The job queue is bounded. Request methods are plain `&self` calls that work
 /// without an async runtime and hand back a blocking [`EventStream`], which is
-/// also a [`Stream`]; [`EngineHandle::chat_stream`] and
-/// [`EngineHandle::complete_stream`] name that intent at call sites.
+/// also a [`Stream`]; [`EngineHandle::chat_stream`] names that intent at call
+/// sites.
 #[derive(Clone)]
 pub struct EngineHandle {
     sender: async_mpsc::Sender<Job>,
@@ -686,12 +621,6 @@ impl EngineHandle {
         count_chat(&self.tokenizer, request)
     }
 
-    /// Count the prompt tokens a raw completion would prefill, exactly as
-    /// [`Engine::count_completion_tokens`] does, without queueing a job.
-    pub fn count_completion_tokens(&self, request: &CompletionRequest) -> crate::Result<usize> {
-        count_completion(&self.tokenizer, request)
-    }
-
     /// Queue a chat request and return a blocking event iterator.
     ///
     /// A [`ChatRequest::response_format`] other than text, and any native
@@ -716,14 +645,14 @@ impl EngineHandle {
     /// ```
     pub fn chat(&self, request: ChatRequest) -> crate::Result<EventStream> {
         let grammar = chat_grammar(&self.tokenizer, &request)?;
-        self.submit(|events, cancel| Job::Chat(request, grammar, events, cancel))
-    }
-
-    /// Queue a raw completion and return its event stream and cancellation
-    /// handle. Its response format is compiled first, as [`Self::chat`] does.
-    pub fn complete(&self, request: CompletionRequest) -> crate::Result<EventStream> {
-        let grammar = completion_grammar(&self.tokenizer, &request)?;
-        self.submit(|events, cancel| Job::Completion(request, grammar, events, cancel))
+        self.submit(|events, cancel| {
+            Job::Chat(Box::new(ChatJob {
+                request,
+                grammar,
+                events,
+                cancel,
+            }))
+        })
     }
 
     /// Queue a chat request for `Stream` consumption.
@@ -732,14 +661,6 @@ impl EngineHandle {
     /// exists, so this needs no runtime.
     pub fn chat_stream(&self, request: ChatRequest) -> crate::Result<EventStream> {
         self.chat(request)
-    }
-
-    /// Queue a raw completion for `Stream` consumption.
-    ///
-    /// Thin alias for [`EngineHandle::complete`]; nothing happens before the
-    /// stream exists, so this needs no runtime.
-    pub fn complete_stream(&self, request: CompletionRequest) -> crate::Result<EventStream> {
-        self.complete(request)
     }
 
     /// EXPERIMENTAL: queue a typed text question for an explicitly supplied
@@ -1055,11 +976,19 @@ impl EventStream {
     /// # use local_engine::{Engine, Signal};
     /// # use std::time::Duration;
     /// let handle = Engine::open()?.into_handle();
-    /// let mut events = handle.complete_stream(local_engine::CompletionRequest {
-    ///     prompt: "Hello".into(),
+    /// let mut events = handle.chat_stream(local_engine::ChatRequest {
+    ///     messages: vec![local_engine::ChatMessage {
+    ///         role: "user".into(),
+    ///         content: "Hello".into(),
+    ///         ..local_engine::ChatMessage::default()
+    ///     }],
     ///     max_tokens: 8,
     ///     sampling: local_engine::Sampling::default(),
+    ///     thinking: false,
     ///     session: None,
+    ///     tools: Vec::new(),
+    ///     tool_choice: local_engine::ToolChoice::Auto,
+    ///     parallel_tool_calls: true,
     ///     response_format: local_engine::ResponseFormat::Text,
     /// })?;
     /// // Prefill has started, and the model has produced no text yet.
@@ -1176,7 +1105,7 @@ fn prepare_chat(request: &ChatRequest) -> crate::Result<(String, Option<Arc<Tool
     Ok((prompt, (!tools.is_empty()).then(|| Arc::new(tools))))
 }
 
-/// Tokenize a rendered or raw prompt; every generation and count goes through
+/// Tokenize a rendered prompt; every generation and count goes through
 /// here, so a count is the prompt length generation prefills.
 fn encode_prompt(tokenizer: &BonsaiTokenizer, prompt: &str) -> crate::Result<Vec<u32>> {
     tokenizer.encode(prompt)
@@ -1226,23 +1155,8 @@ fn chat_grammar(
         .map(Some)
 }
 
-/// Compile a raw completion's response format, which has no reasoning phase.
-fn completion_grammar(
-    tokenizer: &BonsaiTokenizer,
-    request: &CompletionRequest,
-) -> crate::Result<Option<Grammar>> {
-    tokenizer.compile_format(&request.response_format, false)
-}
-
 fn count_chat(tokenizer: &BonsaiTokenizer, request: &ChatRequest) -> crate::Result<usize> {
     chat_prompt_ids(tokenizer, request).map(|(ids, _)| ids.len())
-}
-
-fn count_completion(
-    tokenizer: &BonsaiTokenizer,
-    request: &CompletionRequest,
-) -> crate::Result<usize> {
-    encode_prompt(tokenizer, &request.prompt).map(|ids| ids.len())
 }
 
 fn render_messages(
