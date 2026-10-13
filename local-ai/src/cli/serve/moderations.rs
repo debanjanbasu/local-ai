@@ -140,7 +140,9 @@ fn parse(body: &[u8]) -> Result<Vec<String>, String> {
                     ) {
                         (Some(text), Some(2)) => parts.push(text),
                         _ => {
-                            return Err("a text input is {\"type\":\"text\",\"text\":string}".into());
+                            return Err(
+                                "a text input is {\"type\":\"text\",\"text\":string}".into()
+                            );
                         }
                     },
                     Some("image_url") => {

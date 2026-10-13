@@ -14,13 +14,14 @@ Output (`--out DIR`):
     dataset-manifest.json   input hashes, mapping version, row and label counts, and the
                     SHA-256 of dataset.jsonl.
 
-Splits: `train`, `calibration`, `test` (in-distribution: Aegis 2.0 test, validation -> calibration,
-its train file 80/10/10 by id hash; Civil Comments 70/15/15 by row hash; Aegis 2.0 + Civil
-Comments) and `ood_openai` (OpenAI's 2022 moderation evaluation set) and
-`ood_toxicchat` (ToxicChat 0124 test, binary toxicity only, CC-BY-NC-4.0:
-evaluation only, never trained on). A text is kept only in the most held-out
-split it occurs in (OOD, then `test`, then `calibration`, then `train`), so no
-evaluation or calibration text is fitted on.
+Splits: `train`, `calibration`, `test` are in-distribution (Aegis 2.0: its
+test file -> test, validation -> calibration, train file 80/10/10 by id hash;
+Civil Comments 70/15/15 by row hash). `ood_openai` is OpenAI's 2022
+moderation evaluation set and `ood_toxicchat` the ToxicChat 0124 test file
+(binary toxicity only, CC-BY-NC-4.0: evaluation only, never trained on). A
+text is kept only in the most held-out split it occurs in (OOD, then `test`,
+then `calibration`, then `train`), so no evaluation or calibration text is
+fitted on.
 
 The category mapping is explicit (`AEGIS_MAP`, `CIVIL_MAP`, `OPENAI_MAP`).
 Standard library only.

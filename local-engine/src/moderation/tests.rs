@@ -168,3 +168,39 @@ fn long_inputs_are_split_into_prompted_windows() {
         .collect();
     assert_eq!(body, full[3..full.len() - 1]);
 }
+
+#[test]
+fn the_committed_artifact_matches_the_pin_and_ships_only_passing_categories() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/moderation/moderation-heads.json");
+    let bytes = std::fs::read(&path).expect("committed artifact");
+    let heads = ModerationHeads::from_bytes(&bytes, MODERATION_HEADS_SHA256, PAYLOAD)
+        .expect("the committed artifact validates against the pin");
+    assert_eq!(
+        heads.supported().collect::<Vec<_>>(),
+        [
+            "hate",
+            "harassment",
+            "harassment/threatening",
+            "illicit",
+            "self-harm",
+            "sexual"
+        ]
+    );
+    let file: Value = serde_json::from_slice(&bytes).expect("json");
+    for name in CATEGORIES {
+        let evaluated = &file["evaluation"]["categories"][name];
+        assert_eq!(
+            evaluated["ships"].as_bool(),
+            Some(heads.head(name).is_some()),
+            "{name}: the artifact ships exactly the categories that passed"
+        );
+        if heads.head(name).is_none() {
+            assert!(
+                heads
+                    .unsupported_reason(name)
+                    .is_some_and(|r| !r.is_empty())
+            );
+        }
+    }
+}
