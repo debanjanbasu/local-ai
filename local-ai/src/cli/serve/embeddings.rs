@@ -408,12 +408,15 @@ pub(super) async fn handle(
     .await;
     match result {
         Ok(Ok((vectors, tokens))) => {
-            let mut record = caller.usage(
-                local_services::admin::usage::UsageKind::Embeddings,
-                EMBEDDING_MODEL_ID,
+            super::admin::record(
+                state,
+                super::admin::token_usage(
+                    caller,
+                    local_services::admin::usage::UsageKind::Embeddings,
+                    EMBEDDING_MODEL_ID,
+                    tokens,
+                ),
             );
-            record.input_tokens = super::admin::count(tokens);
-            super::admin::record(state, record);
             json_response(
                 StatusCode::OK,
                 response_json(&vectors, tokens, base64, dimensions),

@@ -55,11 +55,13 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, watch};
 
 use local_engine::{ChatRequest, EngineHandle, Event, Signal};
+use local_services::admin::usage::{UsageKind, UsageRecord};
 use local_services::batches::{
     BatchLease, CreateBatch, Endpoint, LineOutcome, ListBatches, NextLine, PendingLine,
 };
 use local_services::{Error, Metadata, Store};
 
+use super::admin::Meter;
 use super::chunked::{Body as Document, Flow, absorb};
 use super::reasoning_crypto::ReasoningCipher;
 use super::response::{
@@ -151,9 +153,15 @@ impl Batches {
             cipher: state.cipher.clone(),
             depth: state.depth.clone(),
         };
+        // Lines (eval-run generations included) are recorded as batch
+        // completions, unattributed: a batch outlives its creator's request.
+        let mut record = UsageRecord::new(UsageKind::Completions);
+        record.model = Some(state.model.to_string());
+        record.batch = true;
+        let meter = Meter::into_store(state.auth.admin(), record);
         Self::spawn(
             services.store().clone(),
-            engine_submit(state.engine.clone()),
+            engine_submit(state.engine.clone(), meter),
             config,
         )
     }
@@ -665,14 +673,37 @@ impl Worker {
     }
 }
 
-/// The engine as the worker drives it.
-fn engine_submit(engine: EngineHandle) -> Submit {
+/// The engine as the worker drives it, each finished line recorded by
+/// `meter`.
+fn engine_submit(engine: EngineHandle, meter: Meter) -> Submit {
+    metered_submit(
+        Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
+            let mut events = engine.chat(request)?;
+            let handle = events.cancel_handle();
+            Ok(Generation {
+                next: Box::new(move |timeout| events.next_signal(timeout)),
+                cancel: Arc::new(move || handle.cancel()),
+            })
+        }),
+        meter,
+    )
+}
+
+/// `submit` with every generation's final measurements recorded by `meter`
+/// as the worker reads them (on the worker's own thread).
+pub(super) fn metered_submit(submit: Submit, meter: Meter) -> Submit {
     Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
-        let mut events = engine.chat(request)?;
-        let handle = events.cancel_handle();
+        let Generation { mut next, cancel } = submit(request)?;
+        let meter = meter.clone();
         Ok(Generation {
-            next: Box::new(move |timeout| events.next_signal(timeout)),
-            cancel: Arc::new(move || handle.cancel()),
+            next: Box::new(move |timeout| {
+                let signal = next(timeout);
+                if let Ok(Some(Signal::Event(Event::Finished(stats)))) = &signal {
+                    meter.generation(stats);
+                }
+                signal
+            }),
+            cancel,
         })
     })
 }
