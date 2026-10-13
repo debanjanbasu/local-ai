@@ -1,7 +1,10 @@
 # Tools on the Responses API
 
 The model always chooses tools; Rust executes them, outside model execution.
-Two families exist.
+Two families exist. Tools are declared only in the current shapes: Responses
+`tools`, and Chat Completions `tools` with `tool_choice`; Chat's deprecated
+`functions`/`function_call` are refused, as is every legacy or deprecated API
+([supported OpenAI APIs](BONSAI.md#supported-openai-apis)).
 
 ## Client-executed tools (no permission needed)
 

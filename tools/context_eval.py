@@ -30,7 +30,7 @@ split over several bounded runs of the shared GPU lock:
     lockf -k /tmp/local-ai-gpu.lock tools/context_eval.py --sizes 8k --seeds 0,1,2
     lockf -k /tmp/local-ai-gpu.lock tools/context_eval.py --sizes 32k --seeds 0,1
     HOME=$PWD/.amp/in/home-250k-s0 lockf -k /tmp/local-ai-gpu.lock \
-        tools/context_eval.py --sizes 250k --seeds 0 --efforts xhigh --stage-tokens 120000
+        tools/context_eval.py --sizes 250k --seeds 0 --efforts xhigh --stage-tokens 120000  # no server
     tools/context_eval.py --report            # tables from the JSONL, no server
     tools/context_eval.py --dry-run --sizes 8k  # write prompts, no server
 
@@ -351,7 +351,7 @@ def score(needle: Needle, answer: str) -> tuple[bool, str]:
 def chat(port: int, system: str, question: str, effort: str, seed: int) -> dict:
     body = {
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": question}],
-        "reasoning_effort": effort, "temperature": 0, "seed": seed, "max_tokens": MAX_TOKENS[effort],
+        "reasoning_effort": effort, "temperature": 0, "max_completion_tokens": MAX_TOKENS[effort],
     }
     return post(port, "/v1/chat/completions", body)
 
@@ -430,13 +430,24 @@ def done_keys(path: Path) -> set[tuple]:
 #
 # A cold ~250K group prefills for well over one bounded GPU-lock hold, and a
 # request cut short by the end of a hold leaves nothing in the prompt cache.
-# Staging prefills a token-exact prefix of the group's rendered chat prompt as
-# a raw completion instead: its request-tail snapshot (prompt minus its last
-# token) goes to the disk tier, the next hold's server restores it and extends
-# it, and the group's first chat question restores the longest stage. A disk
-# snapshot larger than the automatic budget is still kept while it is the only
-# one, so each group needs its own prompt-cache directory (run the server with
-# its own HOME) or a later snapshot evicts the stage.
+# Staging prefills a token-exact prefix of the group's rendered chat prompt
+# instead: its request-tail snapshot (prompt minus its last token) goes to the
+# disk tier, the next hold restores it and extends it, and the group's first
+# chat question restores the longest stage. A disk snapshot larger than the
+# automatic budget is still kept while it is the only one, so each group needs
+# its own prompt-cache directory (run with its own HOME) or a later snapshot
+# evicts the stage.
+#
+# The prefix ends inside the system message, so it is prefilled as a raw,
+# template-free prompt by the native CLI (`local-ai bonsai --raw`), which runs
+# the same engine, tokenizer and prompt-cache directory as `local-ai serve`
+# and writes the same snapshot; staging starts no server. The HTTP API serves
+# only current OpenAI APIs, and neither Chat Completions nor Responses can
+# stand in: a chat-rendered prompt always ends with the template's turn
+# closers, so its persisted snapshots (end of the system turn, request tail)
+# all hold tokens the question prompt lacks at that position, and the only
+# in-message one, a divergence from the previous request, costs a second
+# prefill of the same prefix and evicts the stage it extends.
 
 # The template's xhigh instruction (local-engine/src/bonsai_tokenizer.rs),
 # placed ahead of the system message; `none` adds no system text.
@@ -470,26 +481,49 @@ def prompt_cache_dir() -> Path:
     return Path(os.environ["HOME"]) / "Library/Caches/local-ai/prompt-cache"
 
 
-def wait_for_snapshot(root: Path, tokens: int, deadline: float = 600.0, interval: float = 2.0) -> str | None:
-    """The committed disk snapshot of `tokens` prompt tokens, once it exists.
+def committed_snapshot(root: Path, tokens: int) -> str | None:
+    """The committed disk snapshot of `tokens` prompt tokens, or None.
 
-    The server writes it in the background after answering and reports the
-    commit nowhere but the file system (`<tokens>-<digest>.bpc`, renamed into
-    place when complete), so this polls the directory, bounded by `deadline`.
-    Stopping the server before then would drop a queued write.
+    The engine reports the commit nowhere but the file system
+    (`<tokens>-<digest>.bpc`, renamed into place when complete). The CLI
+    drains its prompt-cache writer before it exits, so once it has exited
+    the snapshot is either there or was never written; there is nothing to
+    wait for.
     """
-    started = time.monotonic()
-    while True:
-        found = sorted(root.glob(f"*/{tokens}-*.bpc"))
-        if found:
-            return str(found[0])
-        if time.monotonic() - started >= deadline:
-            print(f"no {tokens}-token snapshot under {root} after {deadline:.0f}s", flush=True)
-            return None
-        time.sleep(interval)
+    found = sorted(root.glob(f"*/{tokens}-*.bpc"))
+    return str(found[0]) if found else None
 
 
-def run_stage(port: int, out: Path, size: str, seed: int, effort: str, tokens: int) -> None:
+def stage_command(server_bin: Path, prompt_file: Path) -> list[str]:
+    """Prefill `prompt_file` raw, as the server would tokenize it, sampling one
+    greedy token and reporting the measurements as JSON on stdout."""
+    return [str(server_bin), "bonsai", "--raw", "--greedy", "--json", "--max-tokens", "1",
+            "--prompt-file", str(prompt_file)]
+
+
+def run_bounded(command: list[str], log: Path, timeout: float) -> tuple[int, str]:
+    """Run `command` with stderr appended to `log`, returning its exit code and
+    stdout. A bounding `timeout` that terminates this process terminates the
+    child too, so no model is left holding the GPU."""
+    with log.open("a") as stderr:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr, text=True)
+
+        def handler(signum, _frame):
+            process.terminate()
+            os._exit(128 + signum)
+
+        previous = signal.signal(signal.SIGTERM, handler)
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, _ = process.communicate()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+    return process.returncode, stdout
+
+
+def run_stage(server_bin: Path, out: Path, size: str, seed: int, effort: str, tokens: int) -> None:
     results, stages = out / "results.jsonl", out / "stages.jsonl"
     if any(k[:3] == (size, seed, effort) for k in done_keys(results)):
         return  # the group's questions have started; its prompt is cached past any stage
@@ -499,23 +533,34 @@ def run_stage(port: int, out: Path, size: str, seed: int, effort: str, tokens: i
         return
     system, _ = build_context(seed, size, make_needles(seed))
     prompt = stage_prefix(system, effort, tokens)
-    payload = post(port, "/v1/completions", {"prompt": prompt, "max_tokens": 1, "temperature": 0, "seed": seed})
-    usage = payload.get("usage") or {}
-    timings = payload.get("timings") or {}
-    details = usage.get("prompt_tokens_details") or {}
+    (out / "prompts").mkdir(exist_ok=True)
+    prompt_file = out / "prompts" / f"{size}-seed{seed}-{effort}-stage{tokens}.txt"
+    prompt_file.write_text(prompt)
+    started = time.monotonic()
+    code, stdout = run_bounded(stage_command(server_bin, prompt_file), out / "stage.log", 14_400)
+    lines = stdout.strip().splitlines()
+    try:
+        payload = json.loads(lines[-1]) if code == 0 and lines else {}
+    except json.JSONDecodeError:
+        payload = {}
     row = {
-        "size": size, "seed": seed, "effort": effort, "stage_tokens": tokens, "status": payload["_status"],
-        "error": payload.get("error"), "prompt_chars": len(prompt), "prompt_tokens": usage.get("prompt_tokens"),
-        "cached_tokens": details.get("cached_tokens") or 0, "cache_source": details.get("cache_source"),
-        "prefill_seconds": timings.get("prefill_seconds") or 0, "wall_seconds": payload["_wall_seconds"],
+        # 200 when the stage ran, as when it was an HTTP request, so older rows
+        # read the same; otherwise the CLI's exit code.
+        "size": size, "seed": seed, "effort": effort, "stage_tokens": tokens,
+        "status": 200 if payload else code, "error": None if payload else f"local-ai bonsai exited {code}",
+        "prompt_chars": len(prompt), "prompt_tokens": payload.get("prompt_tokens"),
+        "cached_tokens": payload.get("cached_tokens") or 0, "cache_source": None,
+        "prefill_seconds": payload.get("prefill_seconds") or 0, "wall_seconds": time.monotonic() - started,
     }
     if row["status"] == 200:
-        row["snapshot"] = wait_for_snapshot(prompt_cache_dir(), (row["prompt_tokens"] or 1) - 1)
+        row["snapshot"] = committed_snapshot(prompt_cache_dir(), (row["prompt_tokens"] or 1) - 1)
+        if row["snapshot"] is None:
+            print(f"no {(row['prompt_tokens'] or 1) - 1}-token snapshot under {prompt_cache_dir()}", flush=True)
     row["finished_at"] = time.time()
     with stages.open("a") as handle:
         handle.write(json.dumps(row) + "\n")
-    print(f"{size:>5} seed{seed} {effort:5} stage {tokens}: HTTP {row['status']} prompt={row['prompt_tokens']} "
-          f"cached={row['cached_tokens']} ({row['cache_source']}) prefill={row['prefill_seconds']:.0f}s", flush=True)
+    print(f"{size:>5} seed{seed} {effort:5} stage {tokens}: status {row['status']} prompt={row['prompt_tokens']} "
+          f"cached={row['cached_tokens']} prefill={row['prefill_seconds']:.0f}s", flush=True)
 
 
 def run_group(port: int, out: Path, size: str, seed: int, effort: str, concurrency: int) -> None:
@@ -615,7 +660,7 @@ def report(out: Path) -> str:
 def stop_server(server: LocalServer, grace: float) -> None:
     """Stop `local-ai serve` with SIGINT, its graceful shutdown, which drops
     the engine and so finishes queued prompt-cache disk writes; SIGTERM ends
-    the process at once and loses them (a staged prefix among them). After
+    the process at once and loses them. After
     `grace` seconds fall back to `LocalServer.stop` (SIGTERM, then SIGKILL)."""
     process = server.process
     if process and process.poll() is None:
@@ -640,7 +685,8 @@ def stop_server_on_sigterm(server: LocalServer) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--server-bin", type=Path, default=ROOT / "target/release/local-ai")
+    parser.add_argument("--server-bin", type=Path, default=ROOT / "target/release/local-ai",
+                        help="the local-ai binary: `serve` for questions, `bonsai --raw` for stages")
     parser.add_argument("--port", type=int, default=8107)
     parser.add_argument("--no-serve", action="store_true")
     parser.add_argument("--sizes", default="short,8k")
@@ -672,7 +718,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     server = None
     try:
-        if not args.no_serve:
+        # Staging prefills through the CLI, which loads the model itself.
+        if not args.no_serve and not args.stage_tokens:
             server = LocalServer(args.server_bin, args.port, args.out / "server.log", [])
             stop_server_on_sigterm(server)
             server.start()
@@ -680,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
             for seed in seeds:
                 for effort in efforts:
                     if args.stage_tokens:
-                        run_stage(args.port, args.out, size, seed, effort, args.stage_tokens)
+                        run_stage(args.server_bin, args.out, size, seed, effort, args.stage_tokens)
                     else:
                         run_group(args.port, args.out, size, seed, effort, args.concurrency)
     finally:
