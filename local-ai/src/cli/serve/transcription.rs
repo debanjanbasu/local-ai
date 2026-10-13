@@ -438,6 +438,10 @@ fn run(
     let samples = audio::decode(file, form.extension.as_deref(), MAX_AUDIO_SECONDS)
         .map_err(|error| Outcome::Invalid(error.to_string()))?;
     let mut model = service.model.lock().unwrap_or_else(PoisonError::into_inner);
+    // The client may have gone while the file decoded or the model was busy.
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(Outcome::Cancelled);
+    }
     let activity = Arc::clone(&service.activity);
     let busy = || activity.busy();
     let mut pause = || {
