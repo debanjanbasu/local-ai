@@ -252,7 +252,7 @@ pub(super) fn unfinished_format(stats: &Stats) -> Option<&'static str> {
     )
 }
 
-/// An engine event as a Chat or Completions client may be told it: a
+/// An engine event as a Chat Completions client may be told it: a
 /// `Finished` without the complete structured answer it promises becomes the
 /// error it is (see [`unfinished_format`]).
 pub(super) fn checked(event: local_engine::Event) -> local_engine::Event {
@@ -294,8 +294,6 @@ pub(super) fn new_id(prefix: &str) -> String {
 /// Which API a generation answers, with what its documents need to echo.
 #[derive(Clone)]
 pub(super) enum Protocol {
-    /// `POST /v1/completions`.
-    Completion,
     /// `POST /v1/chat/completions`.
     Chat {
         /// `stream_options.include_usage`: a final chunk with `usage`.
@@ -318,7 +316,6 @@ pub(super) struct Reply {
 impl Reply {
     pub(super) fn new(protocol: Protocol, model: Arc<str>) -> Self {
         let prefix = match &protocol {
-            Protocol::Completion => "cmpl-",
             Protocol::Chat { .. } => "chatcmpl-",
             Protocol::Responses(_) => "resp_",
         };
@@ -329,13 +326,9 @@ impl Reply {
             model,
         }
     }
-
-    pub(super) const fn chat(&self) -> bool {
-        matches!(self.protocol, Protocol::Chat { .. })
-    }
 }
 
-/// Chat and completion `usage`, with the engine's prompt-cache reuse.
+/// Chat Completions `usage`, with the engine's prompt-cache reuse.
 pub(super) fn usage_json(stats: &Stats) -> Value {
     let generation = &stats.generation;
     json!({"prompt_tokens":generation.prompt_tokens,"prompt_tokens_details":{"cached_tokens":generation.reused_prompt_tokens,"cache_source":stats.cache_source},"completion_tokens":generation.generated_tokens,"completion_tokens_details":{"reasoning_tokens":stats.reasoning_tokens},"total_tokens":generation.prompt_tokens+generation.generated_tokens})

@@ -13,13 +13,12 @@ use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
-use local_engine::{Event, GenerationStats, Signal, Stats};
+use local_engine::{ChatRequest, Event, GenerationStats, Signal, Stats};
 use local_services::Store;
 use local_services::batches::{CreateBatch, LineOutcome};
 use local_services::files::{CreateFile, FilePurpose};
 
 use super::super::QueueDepth;
-use super::super::request::GenerationRequest;
 use super::{Batches, Config, Generation, Submit, matches};
 
 /// A store in a temporary directory, removed when dropped.
@@ -85,15 +84,12 @@ fn chat(custom_id: &str, text: &str) -> Value {
 }
 
 /// The text the fake engine keys its behaviour on.
-fn prompt(request: &GenerationRequest) -> String {
-    match request {
-        GenerationRequest::Chat(chat) => chat
-            .messages
-            .last()
-            .map(|message| message.content.clone())
-            .unwrap_or_default(),
-        GenerationRequest::Completion(completion) => completion.prompt.clone(),
-    }
+fn prompt(request: &ChatRequest) -> String {
+    request
+        .messages
+        .last()
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
 }
 
 fn scripted(signals: Vec<Signal>) -> Generation {
@@ -136,25 +132,23 @@ fn fake(blocking: bool) -> (Submit, Seen, mpsc::Receiver<()>) {
     let (started, receiver) = mpsc::channel();
     let started = Mutex::new(started);
     let log = Arc::clone(&seen);
-    let submit: Submit = Arc::new(
-        move |request: GenerationRequest| -> crate::Result<Generation> {
-            let text = prompt(&request);
-            log.lock().expect("log").push(text.clone());
-            Ok(match text.as_str() {
-                "boom" => scripted(vec![Signal::Event(Event::Error(
-                    "generation error: boom".into(),
-                ))]),
-                "block" if blocking => {
-                    let _ = started.lock().expect("started").send(());
-                    blocked()
-                }
-                _ => scripted(vec![
-                    Signal::Event(Event::Content(format!("echo:{text}"))),
-                    Signal::Event(Event::Finished(Box::new(stats()))),
-                ]),
-            })
-        },
-    );
+    let submit: Submit = Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
+        let text = prompt(&request);
+        log.lock().expect("log").push(text.clone());
+        Ok(match text.as_str() {
+            "boom" => scripted(vec![Signal::Event(Event::Error(
+                "generation error: boom".into(),
+            ))]),
+            "block" if blocking => {
+                let _ = started.lock().expect("started").send(());
+                blocked()
+            }
+            _ => scripted(vec![
+                Signal::Event(Event::Content(format!("echo:{text}"))),
+                Signal::Event(Event::Finished(Box::new(stats()))),
+            ]),
+        })
+    });
     (submit, seen, receiver)
 }
 
@@ -322,7 +316,7 @@ async fn chat_lines_run_in_order_and_keep_their_custom_ids() {
 }
 
 #[tokio::test]
-async fn responses_and_completions_answer_in_their_own_shapes() {
+async fn responses_answer_in_their_own_shape_and_legacy_apis_are_refused() {
     let scratch = Scratch::new();
     let (submit, _, _) = fake(false);
     let batches = start(&scratch.store, submit);
@@ -339,7 +333,20 @@ async fn responses_and_completions_answer_in_their_own_shapes() {
         "body": {"model": "local", "prompt": "hey"},
     })]);
     let (_, first) = create(&batches, &responses, "/v1/responses").await;
-    let (_, second) = create(&batches, &completions, "/v1/completions").await;
+    // The legacy Completions API is not an endpoint a batch may target.
+    let (status, refused) = create(&batches, &completions, "/v1/completions").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("legacy Completions")),
+        "{refused}"
+    );
+    // A Chat line with a deprecated member fails as the HTTP route would.
+    let mut deprecated = chat("d", "hi");
+    deprecated["body"]["max_tokens"] = json!(4);
+    let deprecated = scratch.input(&[deprecated]);
+    let (_, third) = create(&batches, &deprecated, "/v1/chat/completions").await;
 
     let done = settled(&scratch.store, first["id"].as_str().expect("id")).await;
     assert_eq!(done["status"], "completed", "{done}");
@@ -347,12 +354,15 @@ async fn responses_and_completions_answer_in_their_own_shapes() {
     assert_eq!(output[0]["response"]["body"]["object"], "response");
     assert_eq!(output[0]["response"]["body"]["status"], "completed");
 
-    let done = settled(&scratch.store, second["id"].as_str().expect("id")).await;
-    assert_eq!(done["status"], "completed", "{done}");
-    let output = records(&scratch.store, &done["output_file_id"]);
-    assert_eq!(
-        output[0]["response"]["body"]["choices"][0]["text"],
-        "echo:hey"
+    let done = settled(&scratch.store, third["id"].as_str().expect("id")).await;
+    assert_eq!(done["request_counts"]["failed"], 1, "{done}");
+    let errors = records(&scratch.store, &done["error_file_id"]);
+    assert_eq!(errors[0]["response"]["status_code"], 400);
+    assert!(
+        errors[0]["response"]["body"]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_tokens is deprecated")),
+        "{errors:?}"
     );
     stop(&batches).await;
 }

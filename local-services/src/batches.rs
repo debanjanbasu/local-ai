@@ -159,8 +159,12 @@ pub enum Endpoint {
     Responses,
     #[serde(rename = "/v1/chat/completions")]
     ChatCompletions,
+    /// The legacy Completions API, which this server no longer serves. Never
+    /// accepted for a new batch; it exists only so a batch created before it
+    /// was removed still reads back as it was created. Its pending lines fail
+    /// rather than run.
     #[serde(rename = "/v1/completions")]
-    Completions,
+    RetiredCompletions,
 }
 
 impl Endpoint {
@@ -170,11 +174,20 @@ impl Endpoint {
         match self {
             Self::Responses => "/v1/responses",
             Self::ChatCompletions => "/v1/chat/completions",
-            Self::Completions => "/v1/completions",
+            Self::RetiredCompletions => "/v1/completions",
+        }
+    }
+
+    /// An endpoint read back from a stored batch, the retired one included.
+    fn stored(value: &str) -> Result<Self> {
+        match value {
+            "/v1/completions" => Ok(Self::RetiredCompletions),
+            other => other.parse(),
         }
     }
 }
 
+/// Parses an endpoint a new batch may target.
 impl FromStr for Endpoint {
     type Err = Error;
 
@@ -182,10 +195,13 @@ impl FromStr for Endpoint {
         match value {
             "/v1/responses" => Ok(Self::Responses),
             "/v1/chat/completions" => Ok(Self::ChatCompletions),
-            "/v1/completions" => Ok(Self::Completions),
+            "/v1/completions" => Err(invalid(
+                "endpoint \"/v1/completions\" is the legacy Completions API, which this server \
+                 does not serve; batches run only /v1/responses and /v1/chat/completions",
+            )),
             other => Err(invalid(format!(
-                "endpoint {other:?} is not supported; batches run only /v1/responses, \
-                 /v1/chat/completions and /v1/completions on the local model"
+                "endpoint {other:?} is not supported; batches run only /v1/responses and \
+                 /v1/chat/completions on the local model"
             ))),
         }
     }
@@ -1175,7 +1191,7 @@ impl Raw {
         ] = self.times;
         let [total, completed, failed] = self.counts;
         Ok(Batch {
-            endpoint: self.endpoint.parse()?,
+            endpoint: Endpoint::stored(&self.endpoint)?,
             status: BatchStatus::parse(&self.status)?,
             errors: self
                 .errors

@@ -23,7 +23,7 @@ use super::responses::{
     Generate, History, PreparedResponses, Summarizer, compaction_resource, prepare_compact,
     prepare_responses_conversing,
 };
-use super::{AppState, MAX_REQUEST_BYTES, request::GenerationRequest, services};
+use super::{AppState, MAX_REQUEST_BYTES, services};
 
 /// The route this module answers.
 pub(super) const ROUTE: &str = "/v1/responses/compact";
@@ -129,7 +129,7 @@ async fn shrinks(
 pub(super) async fn prepare_responses(
     state: &AppState,
     body: Vec<u8>,
-) -> crate::Result<(bool, GenerationRequest, Protocol)> {
+) -> crate::Result<(bool, local_engine::ChatRequest, Protocol)> {
     let (thinking, store) = (state.thinking, state.responses.clone());
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
     let temporary = state.temporary.clone();
@@ -157,7 +157,7 @@ pub(super) async fn prepare_responses(
     }
     Ok((
         prepared.stream,
-        GenerationRequest::Chat(prepared.request),
+        prepared.request,
         Protocol::Responses(Arc::new(prepared.echo)),
     ))
 }
