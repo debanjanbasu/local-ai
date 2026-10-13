@@ -470,6 +470,8 @@ is 1.074x and the best measured result 1.29%.
 - `docs/BONSAI.md`: technical reference and measurements.
 - `docs/EMBEDDINGS.md`: the optional native EmbeddingGemma 2 text encoder
   and `POST /v1/embeddings`.
+- `docs/EMBEDDINGS_AUDIO.md`: the optional native EmbeddingGemma 2 audio
+  encoder (Rust API).
 
 ## Verification
 

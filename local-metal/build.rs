@@ -20,6 +20,7 @@ fn main() {
         "draft.metal",
         "embedding.metal",
         "embedding_vision.metal",
+        "embedding_audio.metal",
     ];
 
     let mut air_files = Vec::new();

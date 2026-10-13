@@ -30,6 +30,7 @@ use local_metal::embedding::{Bf16Rows, EmbeddingKernels};
 use local_metal::embedding_vision::VisionKernels;
 use local_metal::shaders::ShaderLibrary;
 
+pub use super::multimodal::{MAX_MULTIMODAL_TOKENS, MediaPart};
 use super::{EmbeddingModel, HIDDEN};
 use crate::Error;
 use artifact::VisionArtifact;
@@ -40,9 +41,6 @@ pub use preprocess::{
 
 /// Vision artifact file name inside the embedding install directory.
 pub const VISION_ARTIFACT: &str = "embeddinggemma2-vision-bf16.bin";
-/// Longest multimodal input in tokens (the model's context), `<bos>`,
-/// `<eos>`, the image/frame delimiters and every soft token included.
-pub const MAX_MULTIMODAL_TOKENS: usize = 8192;
 
 const WIDTH: usize = 768;
 const MLP: usize = 3072;
@@ -53,10 +51,6 @@ const POSITIONS: usize = 10_240;
 const ROPE_THETA: f32 = 100.0;
 const TEXT_HIDDEN: usize = HIDDEN;
 const EPSILON: f32 = 1e-6;
-const BOI: u32 = 255_999;
-const EOI: u32 = 258_882;
-const BOS: u32 = 2;
-const EOS: u32 = 1;
 /// Patches per vision pass: one 280-token image or two 140-token frames.
 /// A larger image (budget 560 or 1120) takes a pass of its own.
 const PASS_PATCHES: usize = 2520;
@@ -67,16 +61,6 @@ pub fn vision_installed(dir: &Path) -> bool {
     dir.join(VISION_ARTIFACT).is_file()
 }
 
-/// One part of a multimodal input, in order. Text is embedded as given (the
-/// model card uses no prompt for media).
-#[derive(Clone, Copy, Debug)]
-pub enum MediaPart<'a> {
-    Text(&'a str),
-    /// One preprocessed image ([`preprocess::patchify`]).
-    Image(&'a ImagePatches),
-    /// Preprocessed, already sampled frames of one video.
-    Video(&'a [ImagePatches]),
-}
 
 /// Decode and preprocess an encoded image file for the default budget of
 /// [`IMAGE_SOFT_TOKENS`].
@@ -566,161 +550,33 @@ impl EmbeddingModel {
         self.single(&[MediaPart::Video(frames)], pace)
     }
 
-    fn single(
+    /// Vision soft tokens (`[Σ soft tokens, 512]`, frame order) of
+    /// preprocessed images or frames, loading the vision artifact from the
+    /// install directory on first use. `pace` runs after each layer.
+    ///
+    /// # Errors
+    ///
+    /// A missing vision artifact, a `pace` error, or a Metal failure.
+    pub(super) fn vision_soft_tokens(
         &mut self,
-        parts: &[MediaPart<'_>],
+        frames: &[&ImagePatches],
         pace: &mut dyn FnMut() -> crate::Result<()>,
     ) -> crate::Result<Vec<f32>> {
-        self.embed_multimodal(&[parts.to_vec()], pace)?
-            .pop()
-            .ok_or_else(|| Error::Generation("no embedding produced".into()))
-    }
-
-    /// Token sequence of one multimodal input, with `None` marking soft-token
-    /// slots (filled in frame order), as the reference processor lays it out:
-    /// `<bos>`, then each part in order (text tokens; per image or video
-    /// frame `<|image>`, one slot per soft token, `<image|>`), then `<eos>`.
-    ///
-    /// # Errors
-    ///
-    /// Tokenizer failures, media placeholder ids inside text, empty videos,
-    /// or more than [`MAX_MULTIMODAL_TOKENS`] tokens.
-    pub fn multimodal_layout(&self, parts: &[MediaPart<'_>]) -> crate::Result<Vec<Option<u32>>> {
-        let mut layout = vec![Some(BOS)];
-        let mut text = String::new();
-        let flush = |text: &mut String, layout: &mut Vec<Option<u32>>| -> crate::Result<()> {
-            if !text.is_empty() {
-                let encoding = self
-                    .tokenizer
-                    .encode(text.as_str(), false)
-                    .map_err(|error| Error::Tokenizer(error.to_string()))?;
-                if encoding
-                    .get_ids()
-                    .iter()
-                    .any(|id| super::MEDIA_PLACEHOLDERS.contains(id))
-                {
-                    return Err(Error::InvalidArgument(
-                        "text part contains an image, audio or video placeholder token".into(),
-                    ));
-                }
-                layout.extend(encoding.get_ids().iter().map(|&id| Some(id)));
-                text.clear();
+        if self.vision.is_none() {
+            let path = self.dir.join(VISION_ARTIFACT);
+            if !path.is_file() {
+                return Err(Error::InvalidArgument(format!(
+                    "image and video embeddings need {} (see docs/EMBEDDINGS.md)",
+                    path.display()
+                )));
             }
-            Ok(())
-        };
-        let frame = |patches: &ImagePatches, layout: &mut Vec<Option<u32>>| {
-            layout.push(Some(BOI));
-            layout.extend(std::iter::repeat_n(None, patches.soft_tokens()));
-            layout.push(Some(EOI));
-        };
-        for part in parts {
-            match part {
-                MediaPart::Text(t) => text.push_str(t),
-                MediaPart::Image(image) => {
-                    flush(&mut text, &mut layout)?;
-                    frame(image, &mut layout);
-                }
-                MediaPart::Video(frames) => {
-                    if frames.is_empty() {
-                        return Err(Error::InvalidArgument("video has no frames".into()));
-                    }
-                    flush(&mut text, &mut layout)?;
-                    for f in *frames {
-                        frame(f, &mut layout);
-                    }
-                }
-            }
-            if layout.len() > MAX_MULTIMODAL_TOKENS {
-                break;
-            }
+            self.vision = Some(VisionTower::open(&path, &self.context)?);
         }
-        flush(&mut text, &mut layout)?;
-        layout.push(Some(EOS));
-        if layout.len() > MAX_MULTIMODAL_TOKENS {
-            return Err(Error::ContextOverflow(format!(
-                "multimodal input has {} tokens; the limit is {MAX_MULTIMODAL_TOKENS}",
-                layout.len()
-            )));
-        }
-        Ok(layout)
-    }
-
-    /// Embed multimodal inputs (each a sequence of text, image and video
-    /// parts; a text-only input matches [`Self::embed_texts`]); one
-    /// full-width L2-normalized vector per input, in order.
-    ///
-    /// Every image and frame runs through the vision encoder (in passes of up
-    /// to 2,520 patches, one command buffer per layer, `pace` after each),
-    /// then the sequences through the text encoder (packed up to 1,024
-    /// tokens per pass; a longer input takes its own).
-    ///
-    /// # Errors
-    ///
-    /// [`Self::multimodal_layout`] errors, a missing vision artifact (for
-    /// media parts), a `pace` error, or a Metal failure.
-    pub fn embed_multimodal(
-        &mut self,
-        inputs: &[Vec<MediaPart<'_>>],
-        pace: &mut dyn FnMut() -> crate::Result<()>,
-    ) -> crate::Result<Vec<Vec<f32>>> {
-        let layouts = inputs
-            .iter()
-            .map(|parts| self.multimodal_layout(parts))
-            .collect::<crate::Result<Vec<_>>>()?;
-        let frames: Vec<&ImagePatches> = inputs
-            .iter()
-            .flatten()
-            .flat_map(|part| match part {
-                MediaPart::Text(_) => &[][..],
-                MediaPart::Image(image) => std::slice::from_ref(*image),
-                MediaPart::Video(frames) => frames,
-            })
-            .collect();
-        let soft = if frames.is_empty() {
-            Vec::new()
-        } else {
-            let context = &self.context;
-            let shared = &self.kernels;
-            if self.vision.is_none() {
-                let path = self.dir.join(VISION_ARTIFACT);
-                if !path.is_file() {
-                    return Err(Error::InvalidArgument(format!(
-                        "image and video embeddings need {} (see docs/EMBEDDINGS.md)",
-                        path.display()
-                    )));
-                }
-                self.vision = Some(VisionTower::open(&path, context)?);
-            }
-            let vision = self
-                .vision
-                .as_mut()
-                .ok_or_else(|| Error::Generation("vision encoder missing".into()))?;
-            vision.encode(context, shared, &frames, pace)?
-        };
-        let mut out = Vec::with_capacity(inputs.len());
-        let mut soft_rows = soft.as_chunks::<TEXT_HIDDEN>().0.iter();
-        let mut start = 0;
-        while start < layouts.len() {
-            let mut end = start + 1;
-            let mut tokens = layouts[start].len();
-            while end < layouts.len() && tokens + layouts[end].len() <= super::PASS_TOKENS {
-                tokens += layouts[end].len();
-                end += 1;
-            }
-            let mut x0 = Vec::with_capacity(tokens * HIDDEN);
-            for slot in layouts[start..end].iter().flatten() {
-                match slot {
-                    Some(id) => self.push_token_embedding(&mut x0, *id),
-                    None => x0.extend_from_slice(soft_rows.next().ok_or_else(|| {
-                        Error::Generation("fewer soft tokens than placeholders".into())
-                    })?),
-                }
-            }
-            let lens: Vec<usize> = layouts[start..end].iter().map(Vec::len).collect();
-            out.extend(self.encode_embedded(&x0, &lens, pace)?);
-            start = end;
-        }
-        Ok(out)
+        let vision = self
+            .vision
+            .as_mut()
+            .ok_or_else(|| Error::Generation("vision encoder missing".into()))?;
+        vision.encode(&self.context, &self.kernels, frames, pace)
     }
 }
 
