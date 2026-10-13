@@ -59,7 +59,7 @@
 //!   second, short generation of the same model after the first ends, which
 //!   summarizes the raw reasoning into the reasoning item's `summary` with
 //!   the `response.reasoning_summary_*` events; the item's `output_item.done`
-//!   waits for it. Not with `background`.
+//!   waits for it. A background job journals each piece as it is generated.
 //! - Compaction (`POST /v1/responses/compact`, and `context_management`
 //!   compaction here) summarizes older items with the same model and keeps
 //!   the rest verbatim (policy: [`local_services::compaction`]; prompts:
@@ -69,8 +69,10 @@
 //!   the items after it; anything before it is skipped. With
 //!   `context_management`, a prompt that reaches `compact_threshold`, or that
 //!   leaves less than `max_output_tokens` of the context, is compacted before
-//!   generation and the compaction item is the Response's first output item.
-//!   Not with `background`.
+//!   generation and the compaction item is the Response's first output item;
+//!   for `background`, before the job is admitted, and a resumed job reuses
+//!   the item its record holds. Both extra generations' tokens are added to
+//!   `usage` (see [`Spent`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -205,6 +207,9 @@ pub(super) struct Echo {
     /// The compaction item made before generation (`context_management`),
     /// the Response's first output item.
     compaction: Option<Value>,
+    /// What the compaction generation run before this Response's own cost,
+    /// whether or not its item was kept; added to the Response's `usage`.
+    spent: Spent,
     /// Who executes each declared tool that is not a plain function.
     kinds: super::hosted::Kinds,
     /// `max_tool_calls`: hosted calls this Response may run.
@@ -224,6 +229,31 @@ pub(super) type Generate =
 /// event (the summary generation runs after the main one's last event), and
 /// answers `false` once the client is gone.
 pub(super) type Flush = Box<dyn FnMut(Vec<Value>) -> bool + Send>;
+
+/// A borrowed [`Flush`], for one call (see [`ResponsesState::event_with`]).
+pub(super) type Sink<'a> = dyn FnMut(Vec<Value>) -> bool + 'a;
+
+/// The tokens of the extra generations a Response runs with the same model
+/// besides its own (a `context_management` compaction, a reasoning summary).
+///
+/// The pinned `ResponseUsage` has no field of its own for them, so they are
+/// added to `input_tokens` (with their reused prefix in `cached_tokens`) and
+/// `output_tokens`, and so to `total_tokens`; `reasoning_tokens` stays the
+/// Response's own, as neither generation reasons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Spent {
+    prompt: usize,
+    reused: usize,
+    generated: usize,
+}
+
+impl Spent {
+    pub(super) const fn add(&mut self, stats: &Stats) {
+        self.prompt += stats.generation.prompt_tokens;
+        self.reused += stats.generation.reused_prompt_tokens;
+        self.generated += stats.generation.generated_tokens;
+    }
+}
 
 /// The generation a Response summarizes its reasoning with.
 #[derive(Clone)]
@@ -309,6 +339,20 @@ impl Echo {
     pub(super) const fn max_tool_calls(&self) -> Option<u64> {
         self.max_tool_calls
     }
+
+    /// Count a compaction generation run for this Response in its `usage`.
+    pub(super) const fn spend(&mut self, stats: &Stats) {
+        self.spent.add(stats);
+    }
+
+    /// The durable store of a background Response that a restarted server
+    /// may regenerate: one kept in `--response-store`, not temporarily.
+    pub(super) fn resumable_store(&self) -> Option<&Arc<ResponseStore>> {
+        self.persist
+            .as_ref()
+            .filter(|persist| self.background && persist.request.is_some())
+            .map(|persist| &persist.store)
+    }
 }
 
 /// A Response that is to be stored, and the resolved input it answers.
@@ -383,24 +427,6 @@ impl ResponsesRequest {
         encrypted: bool,
         conversations: bool,
     ) -> crate::Result<()> {
-        let summarizes = self.reasoning.as_ref().is_some_and(|reasoning| {
-            reasoning.summary.is_some() || reasoning.generate_summary.is_some()
-        });
-        // Refused first: they cannot run in the background at all.
-        if self.background == Some(true) {
-            if present(self.context_management.as_ref()) {
-                return Err(unsupported(
-                    "context_management with background",
-                    "compaction runs before generation, as part of the request",
-                ));
-            }
-            if summarizes {
-                return Err(unsupported(
-                    "reasoning.summary with background",
-                    "the summary generation runs only for foreground responses",
-                ));
-            }
-        }
         if !stored && self.store == Some(true) {
             return Err(unsupported(
                 "store=true",
@@ -841,6 +867,7 @@ pub(super) fn prepare_responses_conversing(
         summary,
         summarizer: None,
         compaction: None,
+        spent: Spent::default(),
         kinds,
         max_tool_calls: request.max_tool_calls,
     };
@@ -1199,11 +1226,15 @@ pub(super) fn compaction_resource(output: &[Value], stats: Option<&Stats>) -> Va
 /// whatever this server's default (`thinking`), which must still allow it.
 /// The Response keeps its ID, creation time
 /// and model; the record keeps `request`, so a later restart can do the same.
-/// Blocks on nothing but decryption.
+/// A compaction item the record already reports is reused rather than run
+/// again; `summarizer` runs a requested reasoning summary. A Response that
+/// declares hosted tools is regenerated only when no hosted call of it had
+/// started executing (see [`ResponseStore::tools_started`]). Blocks on the
+/// store and on decryption.
 pub(super) fn prepare_resumed(
     stored: &StoredResponse,
     request: &Value,
-    thinking: bool,
+    (thinking, summarizer): (bool, Option<&Summarizer>),
     store: &Arc<ResponseStore>,
     cipher: Option<&Arc<ReasoningCipher>>,
 ) -> crate::Result<(ChatRequest, Reply)> {
@@ -1242,14 +1273,43 @@ pub(super) fn prepare_resumed(
     let bytes = serde_json::to_vec(&body).map_err(|error| invalid(error.to_string()))?;
     let mut prepared =
         prepare_responses_conversing(&bytes, thinking, Some(store), None, None, cipher, model)?;
+    let id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     if prepared.echo.kinds().all_hosted().next().is_some() {
         // Regenerating would run its hosted calls again, and a shell command
         // or file write may already have taken effect before the restart.
-        return Err(unsupported(
-            "resuming",
-            "a response that declares hosted tools is not regenerated, since its tool calls \
-             could run twice",
-        ));
+        // The marker is durable before any hosted call starts, so without it
+        // none ever did.
+        let started = store.tools_started(&id).map_err(|error| {
+            crate::Error::Generation(format!("its hosted tool record is unreadable: {error}"))
+        })?;
+        if started {
+            return Err(unsupported(
+                "resuming",
+                "a hosted tool call of this response had started executing before the \
+                 restart, so regenerating it could run that call twice",
+            ));
+        }
+    }
+    // A compaction made before the restart is reused, not run again: it is
+    // already the first output item the record (and any stream) reported.
+    if let Some(item) = response
+        .pointer("/output/0")
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some(COMPACTION))
+    {
+        let history = History::resolve(
+            std::slice::from_ref(item),
+            prepared.history.instructions.clone(),
+            cipher,
+            model,
+        )?;
+        prepared.compacted(item.clone(), history)?;
+    }
+    if let Some(summarizer) = summarizer.filter(|_| prepared.echo.summarizes()) {
+        prepared.echo.set_summarizer(summarizer.clone());
     }
     prepared.echo.previous_response_id = response
         .get("previous_response_id")
@@ -1267,11 +1327,7 @@ pub(super) fn prepare_resumed(
     }
     let reply = Reply {
         protocol: super::response::Protocol::Responses(Arc::new(prepared.echo)),
-        id: response
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        id,
         created: response
             .get("created_at")
             .and_then(Value::as_u64)
@@ -1851,6 +1907,16 @@ struct Unfinished {
     part_added: bool,
     text_done: bool,
     part_done: bool,
+    /// A reasoning item's summary part, once the journal opened it.
+    summary: Option<SummaryPart>,
+}
+
+/// The reasoning summary part a lost generation was streaming.
+#[derive(Default)]
+struct SummaryPart {
+    text: String,
+    text_done: bool,
+    part_done: bool,
 }
 
 /// The output item text is currently being written into.
@@ -1885,6 +1951,8 @@ pub(super) struct ResponsesState {
     deferred: Option<usize>,
     /// Where summary events go as they are generated, when streaming.
     flush: Option<Flush>,
+    /// The extra generations run for this Response so far (see [`Spent`]).
+    spent: Spent,
 }
 
 impl ResponsesState {
@@ -1895,6 +1963,7 @@ impl ResponsesState {
             .unwrap_or(&reply.id)
             .to_owned();
         let output = echo.compaction.iter().cloned().collect();
+        let spent = echo.spent;
         Self {
             id: reply.id.clone(),
             stem,
@@ -1909,6 +1978,7 @@ impl ResponsesState {
             encryption_error: None,
             deferred: None,
             flush: None,
+            spent,
         }
     }
 
@@ -1956,6 +2026,22 @@ impl ResponsesState {
     pub(super) fn started(&mut self) {
         let response = self.snapshot("in_progress");
         self.emit("response.in_progress", json!({"response":response}));
+        self.announce_compaction();
+    }
+
+    /// The compaction item, which ran before generation and so is complete,
+    /// as output item 0.
+    fn announce_compaction(&mut self) {
+        if let Some(item) = self.echo.compaction.clone() {
+            self.emit(
+                "response.output_item.added",
+                json!({"output_index":0,"item":item}),
+            );
+            self.emit(
+                "response.output_item.done",
+                json!({"output_index":0,"item":item}),
+            );
+        }
     }
 
     /// Take over the stream `journaled` began before a restart lost its
@@ -2022,8 +2108,39 @@ impl ResponsesState {
                 | "response.output_text.done"
                 | "response.function_call_arguments.done" => unfinished.text_done = true,
                 "response.content_part.done" => unfinished.part_done = true,
+                "response.reasoning_summary_part.added" => {
+                    unfinished.summary = Some(SummaryPart::default());
+                }
+                "response.reasoning_summary_text.delta" => {
+                    if let (Some(summary), Some(delta)) = (
+                        unfinished.summary.as_mut(),
+                        event.get("delta").and_then(Value::as_str),
+                    ) {
+                        summary.text.push_str(delta);
+                    }
+                }
+                "response.reasoning_summary_text.done" => {
+                    if let Some(summary) = unfinished.summary.as_mut() {
+                        summary.text_done = true;
+                    }
+                }
+                "response.reasoning_summary_part.done" => {
+                    if let Some(summary) = unfinished.summary.as_mut() {
+                        summary.part_done = true;
+                    }
+                }
                 _ => {}
             }
+        }
+        // `response.in_progress` and the compaction item are one batch, but
+        // a crash may have cut it short: an item the record holds is never
+        // left unannounced.
+        let announced = journaled.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                && event.get("output_index").and_then(Value::as_u64) == Some(0)
+        });
+        if started && !announced {
+            self.announce_compaction();
         }
         for (index, unfinished) in open {
             self.finish_interrupted(index, unfinished);
@@ -2035,8 +2152,28 @@ impl ResponsesState {
     /// emitting only the events its journal lacks.
     fn finish_interrupted(&mut self, index: usize, unfinished: Unfinished) {
         let mut item = unfinished.item;
+        if item.get("type").and_then(Value::as_str) == Some(COMPACTION) {
+            // Made whole before generation; only its `done` was lost.
+            self.emit(
+                "response.output_item.done",
+                json!({"output_index":index,"item":item}),
+            );
+            if let Some(slot) = self.output.get_mut(index) {
+                *slot = item;
+            }
+            return;
+        }
         let id = item.get("id").cloned().unwrap_or(Value::Null);
-        let status = if unfinished.text_done {
+        let reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning");
+        // A reasoning item waiting for its summary is complete only once
+        // the summary is.
+        let summarized = !reasoning
+            || self.echo.summary.is_none()
+            || unfinished
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.part_done);
+        let status = if unfinished.text_done && summarized {
             "completed"
         } else {
             "incomplete"
@@ -2087,6 +2224,9 @@ impl ResponsesState {
             }
             item["arguments"] = json!(text);
         }
+        if let Some(summary) = unfinished.summary.filter(|_| reasoning) {
+            item["summary"] = json!([self.close_summary(index, &id, &summary)]);
+        }
         item["status"] = json!(status);
         if part.is_some()
             && item.get("type").and_then(Value::as_str) == Some("reasoning")
@@ -2104,6 +2244,26 @@ impl ResponsesState {
         if let Some(slot) = self.output.get_mut(index) {
             *slot = item;
         }
+    }
+
+    /// Close the summary part of the reasoning item `id` at `index` that a
+    /// lost generation was streaming, emitting only the events its journal
+    /// lacks, and return the part, with the text it had.
+    fn close_summary(&mut self, index: usize, id: &Value, summary: &SummaryPart) -> Value {
+        let part = json!({"type":"summary_text","text":summary.text});
+        if !summary.text_done {
+            self.emit(
+                "response.reasoning_summary_text.done",
+                json!({"item_id":id,"output_index":index,"summary_index":0,"text":summary.text}),
+            );
+        }
+        if !summary.part_done {
+            self.emit(
+                "response.reasoning_summary_part.done",
+                json!({"item_id":id,"output_index":index,"summary_index":0,"part":part}),
+            );
+        }
+        part
     }
 
     /// Withdraw the events announcing the end that was just folded in —
@@ -2139,17 +2299,7 @@ impl ResponsesState {
         self.emit("response.created", json!({"response":response}));
         let response = self.response("in_progress", None, None, None);
         self.emit("response.in_progress", json!({"response":response}));
-        // The compaction ran before generation, so its item is complete.
-        if let Some(item) = self.echo.compaction.clone() {
-            self.emit(
-                "response.output_item.added",
-                json!({"output_index":0,"item":item}),
-            );
-            self.emit(
-                "response.output_item.done",
-                json!({"output_index":0,"item":item}),
-            );
-        }
+        self.announce_compaction();
     }
 
     fn item_id(&self, prefix: &str) -> String {
@@ -2279,7 +2429,7 @@ impl ResponsesState {
     ///
     /// Runs on the pump's blocking thread. The raw reasoning stays the
     /// item's `reasoning_text` content; only the generated text is summary.
-    fn summarize(&mut self) -> Result<(), String> {
+    fn summarize(&mut self, mut sink: Option<&mut Sink<'_>>) -> Result<(), String> {
         let (Some(index), Some(detail)) = (self.deferred, self.echo.summary) else {
             return Ok(());
         };
@@ -2295,21 +2445,27 @@ impl ResponsesState {
             self.release(Vec::new());
             return Err("reasoning.summary has no summarizer on this server".into());
         };
-        self.emit(
-            "response.reasoning_summary_part.added",
-            json!({"item_id":id,"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}}),
-        );
+        let added = json!({"item_id":id,"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}});
+        // The part opens with the first piece, so a summary that fails
+        // before producing anything leaves no part to contradict.
+        let mut opened = false;
         let mut text = String::new();
         let generated = generate(
             reasoning_summary_request(&reasoning, detail),
             &mut |piece: &str| {
+                if !opened {
+                    opened = true;
+                    self.emit("response.reasoning_summary_part.added", added.clone());
+                }
                 text.push_str(piece);
                 self.emit(
                     "response.reasoning_summary_text.delta",
                     json!({"item_id":id,"output_index":index,"summary_index":0,"delta":piece}),
                 );
                 let events = std::mem::take(&mut self.events);
-                if let Some(flush) = self.flush.as_mut() {
+                if let Some(sink) = sink.as_mut() {
+                    sink(events)
+                } else if let Some(flush) = self.flush.as_mut() {
                     flush(events)
                 } else {
                     self.events = events;
@@ -2317,12 +2473,24 @@ impl ResponsesState {
                 }
             },
         );
-        if let Err(error) = generated {
-            self.release(Vec::new());
-            return Err(format!(
+        let failed = match generated {
+            Ok(stats) => {
+                self.spent.add(&stats);
+                None
+            }
+            Err(error) => Some(format!(
                 "the reasoning summary could not be generated: {error}"
-            ));
+            )),
+        };
+        if failed.is_some() && !opened {
+            self.release(Vec::new());
+            return failed.map_or(Ok(()), Err);
         }
+        if !opened {
+            self.emit("response.reasoning_summary_part.added", added);
+        }
+        // A summary cut short keeps, and closes, the part it streamed; its
+        // item is then incomplete.
         self.emit(
             "response.reasoning_summary_text.done",
             json!({"item_id":id,"output_index":index,"summary_index":0,"text":text}),
@@ -2332,8 +2500,13 @@ impl ResponsesState {
             "response.reasoning_summary_part.done",
             json!({"item_id":id,"output_index":index,"summary_index":0,"part":part}),
         );
+        if failed.is_some()
+            && let Some(slot) = self.output.get_mut(index)
+        {
+            slot["status"] = json!("incomplete");
+        }
         self.release(vec![part]);
-        Ok(())
+        failed.map_or(Ok(()), Err)
     }
 
     /// Finish the deferred reasoning item, if any, with `summary`.
@@ -2408,19 +2581,31 @@ impl ResponsesState {
     /// Fold one engine event in. Returns the final Response on a terminal
     /// event: `Finished`, or `Error` once generation had started.
     pub(super) fn event(&mut self, event: Event) -> Option<Value> {
+        self.event_with(event, None)
+    }
+
+    /// [`Self::event`], handing the reasoning summary's events to `sink` as
+    /// they are generated instead of to the [`Flush`] the state was given.
+    /// A background job journals them through it; `sink` answering `false`
+    /// stops the summary, which then fails the Response.
+    pub(super) fn event_with(
+        &mut self,
+        event: Event,
+        sink: Option<&mut Sink<'_>>,
+    ) -> Option<Value> {
         match event {
             Event::Reasoning(piece) => self.text(ItemKind::Reasoning, &piece),
             Event::Content(piece) => self.text(ItemKind::Message, &piece),
             Event::ToolCall(call) => self.call(&call),
             Event::ToolOutput(output) => self.tool_output(&output),
             Event::TokenIds(_) => {}
-            Event::Finished(stats) => return Some(self.finish(&stats)),
+            Event::Finished(stats) => return Some(self.finish(&stats, sink)),
             Event::Error(message) => return Some(self.fail(&message)),
         }
         None
     }
 
-    fn finish(&mut self, stats: &Stats) -> Value {
+    fn finish(&mut self, stats: &Stats, sink: Option<&mut Sink<'_>>) -> Value {
         // An end of turn the format did not complete (during reasoning, so
         // there is no answer at all) is no completed structured answer, and
         // `incomplete_details` has no reason for it: the Response fails.
@@ -2450,7 +2635,7 @@ impl ResponsesState {
         }
         if stats.stop_reason == StopReason::Cancelled {
             self.release(Vec::new());
-        } else if let Err(message) = self.summarize() {
+        } else if let Err(message) = self.summarize(sink) {
             return self.fail(&message);
         }
         let response = self.response(overall, incomplete.as_ref(), error.as_ref(), Some(stats));
@@ -2588,9 +2773,13 @@ impl ResponsesState {
         let echo = &self.echo;
         let usage = measured.map(|stats| {
             let generation = &stats.generation;
+            let extra = self.spent;
+            let input = generation.prompt_tokens + extra.prompt;
+            let cached = generation.reused_prompt_tokens + extra.reused;
+            let output = generation.generated_tokens + extra.generated;
             // No separately accounted cache-creation tokens: cache writes are
             // automatic local state, not OpenAI's charged cache-write tier.
-            json!({"input_tokens":generation.prompt_tokens,"input_tokens_details":{"cached_tokens":generation.reused_prompt_tokens,"cache_write_tokens":0},"output_tokens":generation.generated_tokens,"output_tokens_details":{"reasoning_tokens":stats.reasoning_tokens},"total_tokens":generation.prompt_tokens+generation.generated_tokens})
+            json!({"input_tokens":input,"input_tokens_details":{"cached_tokens":cached,"cache_write_tokens":0},"output_tokens":output,"output_tokens_details":{"reasoning_tokens":stats.reasoning_tokens},"total_tokens":input+output})
         });
         let completed_at = (status == "completed").then(unix_now);
         let output: Vec<&Value> = self.output.iter().filter(|item| !item.is_null()).collect();

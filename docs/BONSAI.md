@@ -366,13 +366,20 @@ original ID; a streamed job first continues its journal with a restart
 boundary that finishes every output item the lost generation opened (as
 `incomplete`, with the text it had), and the regenerated items follow at the
 next output index, so no journaled event is repeated or contradicted and the
-final Response holds every item its stream announced. Only one server can
+final Response holds every item its stream announced. A reasoning item
+waiting for its summary is finished there too: a summary part the journal
+opened is closed with the text it had and the item is `incomplete`; one whose
+summary never started is `incomplete` with an empty summary. The regenerated
+output gets its own summary. A compaction the record already reports
+(`context_management`, run before the job was admitted) is reused, not run
+again, and is announced exactly once. Only one server can
 resume a job (the lease), a cancel or delete before the restart wins, and a
-job continuing a conversation, one that declares hosted tools (regenerating
-could run a shell command or file write twice), or one without its stored
-request, is marked `failed` instead. `context_management` and
-`reasoning.summary` are refused with `background` when the request is made,
-so neither is ever resumed.
+job continuing a conversation, one that declares hosted tools and had started
+executing a hosted call (regenerating could run a shell command or file write
+twice; see [docs/TOOLS.md](TOOLS.md)), or one without its stored request, is
+marked `failed` instead, saying why. After a restart, `usage` counts only the
+resuming server's generations (the regenerated answer and its summary), not
+the lost generation or a compaction run before the restart.
 Graceful shutdown refuses new background requests (503), marks every
 unfinished job `failed`, cancels it and waits for the workers to release the
 engine before exiting; a resumption still waiting for a queue slot stays
@@ -699,9 +706,12 @@ the output space the harness reserves. The kept budget is a quarter of `N` (or
 of the context less that reservation). A compaction that would not shorten the
 prompt is discarded and the request is generated uncompacted. The compaction item is the Response's
 first output item (`output_item.added`/`done` at index 0, right after
-`response.in_progress`); `usage` covers the answer's generation only. With
+`response.in_progress`). With
 `conversation` or `previous_response_id` the item is stored with the output, so
-the compacted window persists across restarts. Not with `background`.
+the compacted window persists across restarts. With `background`, a due
+compaction runs before the job is admitted, so the `POST` returns `queued`
+only after it, with the compaction item already the first output item; a
+streamed job announces it right after `response.in_progress`.
 `compaction_trigger` input items are refused.
 
 Without `--reasoning-key` both are refused rather than returning the summary
@@ -719,16 +729,26 @@ It streams as `response.reasoning_summary_part.added`,
 with one `summary_text` part. The raw reasoning stays the item's
 `reasoning_text` content (and `encrypted_content`, when requested) and is never relabeled.
 `reasoning.summary` is echoed. A summary that cannot be generated fails the
-Response; a cancelled one gets none; with effort `none` nothing runs. Not with
-`background`. The summary runs on the stream's own pump and its deltas go out
-as they are generated, under the same stall budget; a client that disconnects
-cancels it. Its output budget is 160, 320 or 900 tokens by detail.
+Response (a part already streamed is closed with the text it had, and its
+item is `incomplete`); a cancelled one gets none; with effort `none` nothing
+runs. The summary runs on the stream's own pump and its deltas go out as they
+are generated, under the same stall budget; a client that disconnects cancels
+it. With `background` it runs on the job's pump: each piece is journaled
+before the next is generated, so a subscriber or a replay sees it at once,
+and a cancel, delete or shutdown during it stops it at its next piece
+(`cancelled`, or `failed` saying why). Its output budget is 160, 320 or 900 tokens by detail.
 
 Cost: a compaction prefills the summarized history again unless the prompt
 cache still holds it (the summary request renders the conversation's own
 tools and session to share that prefix) and decodes up to 2,048 tokens; a
 reasoning summary prefills the reasoning plus about 70 tokens and decodes up
-to its budget. Neither cost is in the Response's `usage`. Risk: a summary is
+to its budget. Both run for the Response, so both are in its `usage`: the
+pinned `ResponseUsage` has no field of its own for them, so their prompt
+tokens are added to `input_tokens` (their reused prefix to `cached_tokens`),
+their generated tokens to `output_tokens`, and `total_tokens` stays
+`input_tokens + output_tokens`; `reasoning_tokens` is the answer's own, as
+neither reasons. A compaction discarded for not shortening the prompt still
+counts. Risk: a summary is
 lossy and is believed by every later turn; an exact string the model left out
 is gone from the prompt, and a mistaken summary is not detectable from it.
 Only kept items are exact.
