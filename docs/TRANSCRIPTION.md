@@ -156,4 +156,39 @@ submission boundary (streams: at the next window).
 
 ## Verification
 
-RESULTS
+Reference: the original **openai-whisper 20250625**, FP32 on a Kaggle CPU
+(torch 2.11.0), with the same weights (bit-identical, above). The jobs
+(`stt-whisper-ref-s0` … `s4`) decoded the audio exactly as `whisper.load_audio`
+does and saved it, so the native side runs the very same files.
+`target/release/transcription-eval` runs the comparisons; WER uses the
+package's own `EnglishTextNormalizer`. Results on this machine (M4 Pro, under
+the shared GPU lock):
+
+| Gate | Threshold | Result |
+| --- | --- | --- |
+| Log-mel window vs reference (10.4 s clip) | ≈ F32 rounding | max abs 1.0e-5, mean 3.0e-8 |
+| Encoder output vs reference (1,500 × 1,280) | ≈ F32 rounding | max abs 8.3e-3 (values up to 19.9), mean 6.6e-6 |
+| Language probabilities (5 LibriSpeech/silence windows) | same top language | identical to 4–6 digits |
+| Greedy decode with timestamps, 5 parity windows (prompted and silent included) | token-identical | **5/5 identical** |
+| Teacher-forced logits along the reference tokens, 121 steps | same argmax | **121/121 argmax, 121/121 top-10 sets; max abs logit difference 1.1e-4** |
+| LibriSpeech test-clean subset (202 utterances, every 13th id, 4,056 words), `transcribe()` at temperature 0, language en | WER within 0.3 of the reference | **reference 7.372 %, native 7.372 % (Δ 0.000); 202/202 token-identical** ¹ |
+| Long-form (two 75 s concatenations of one speaker, with and without a prompt) | same segments | **4/4 token-identical, same seeks** (WER 0.59 % / 0.54 %) |
+| FLEURS fr/de/es/ja (3 test clips each; float WAVs), greedy translate windows | token-identical | **12/12 identical; 330/330 teacher-forced argmax, max abs logit difference 7.3e-5** |
+| Same 12 clips, `transcribe()` translate and transcribe, language detected | sane English, same as reference | **24/24 token-identical, 12/12 languages detected correctly; translation BLEU vs the FLEURS English references 30.18 (reference 30.18)** |
+
+¹ One utterance (5105-28241-0001) falls into a "the king of the king…" loop
+at temperature 0 in both implementations identically (223 of the 299
+errors); excluding it the WER is 1.90 % for both. The API's default
+temperature 0 uses the fallback ladder, which re-decodes such windows.
+
+Speed (`transcription-eval bench`, GPU otherwise idle):
+
+| Measure | Result |
+| --- | --- |
+| Encoder, one 30 s window | 1.07 s (F16 GEMMs at 5.4–5.7 TFLOPS) |
+| Decoder | 14.3 ms per token (≈ 70 tokens/s) |
+| Long-form 75 s file, `transcribe()` | 7.1 s: **real-time factor 0.095** |
+| LibriSpeech subset (202 short files, 1,518 s) | 307 s: RTF 0.20 (each file pays a whole 30 s window) |
+| Reference on the Kaggle CPU (4 cores, FP32) | RTF 4.2 |
+
+CONC_TBD

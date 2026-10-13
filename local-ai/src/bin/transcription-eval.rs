@@ -6,6 +6,7 @@
 //! transcription-eval transcribe MANIFEST.json OUT.jsonl
 //! transcription-eval bench AUDIO
 //! transcription-eval mel AUDIO FILTERS.f32 REFERENCE.npy
+//! transcription-eval decode AUDIO OUT.f32
 //! ```
 //!
 //! The model loads from `models/whisper-large-v3` under the working
@@ -24,6 +25,7 @@
 //! - `mel`: CPU only (no model): the log-mel window of `AUDIO` with the
 //!   128x201 F32 filterbank in `FILTERS.f32` against the reference's
 //!   `[128][3000]` window.
+//! - `decode`: CPU only: the 16 kHz samples the model would see, as raw F32.
 //! - `bench`: real-time factor of one file (best of three), with the encoder
 //!   and per-token decoder times.
 
@@ -417,6 +419,10 @@ fn mel_check(audio_path: &Path, filters: &Path, reference: &Path) -> Result<()> 
     Ok(())
 }
 
+fn bytemuck_free(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
@@ -425,6 +431,12 @@ fn main() -> Result<()> {
             transcribe(Path::new(manifest), Path::new(out))
         }
         [mode, file] if mode == "bench" => bench(Path::new(file)),
+        [mode, audio, out] if mode == "decode" => {
+            let samples = load(Path::new(audio))?;
+            std::fs::write(out, bytemuck_free(&samples))?;
+            println!("{}", json!({"samples":samples.len()}));
+            Ok(())
+        }
         [mode, audio, filters, reference] if mode == "mel" => {
             mel_check(Path::new(audio), Path::new(filters), Path::new(reference))
         }
