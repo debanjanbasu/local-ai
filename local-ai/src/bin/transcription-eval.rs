@@ -5,6 +5,7 @@
 //! transcription-eval parity DIR CASES.json
 //! transcription-eval transcribe MANIFEST.json OUT.jsonl
 //! transcription-eval bench AUDIO
+//! transcription-eval mel AUDIO FILTERS.f32 REFERENCE.npy
 //! ```
 //!
 //! The model loads from `models/whisper-large-v3` under the working
@@ -20,12 +21,16 @@
 //!   "language"?, "prompt"?}` of the manifest at temperature 0 (no fallback,
 //!   like the reference runs) and writes one JSON line per file with the
 //!   text, the segments' tokens and the wall time.
+//! - `mel`: CPU only (no model): the log-mel window of `AUDIO` with the
+//!   128x201 F32 filterbank in `FILTERS.f32` against the reference's
+//!   `[128][3000]` window.
 //! - `bench`: real-time factor of one file (best of three), with the encoder
 //!   and per-token decoder times.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use local_engine::transcription::mel::MelFilters;
 use local_engine::transcription::{
     Pace, Task, Temperature, TranscribeOptions, TranscriptionModel, audio, installed_model,
 };
@@ -385,6 +390,33 @@ fn bench(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn mel_check(audio_path: &Path, filters: &Path, reference: &Path) -> Result<()> {
+    let samples = load(audio_path)?;
+    let raw = std::fs::read(filters)?;
+    let filters: Vec<f32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    let bank = MelFilters::new(&filters, 128);
+    let mel = bank.log_mel(&samples, PADDING);
+    let window = mel.window(0, (mel.frames - 3000).min(3000));
+    let (shape, reference) = npy(reference)?;
+    let mut ours = vec![0.0_f32; reference.len()];
+    for t in 0..3000 {
+        for m in 0..shape[0] {
+            ours[m * 3000 + t] = window[t * shape[0] + m];
+        }
+    }
+    let (worst, mean) = max_abs(&ours, &reference);
+    println!(
+        "{}",
+        json!({"samples":samples.len(),"frames":mel.frames,"mel_max_abs":worst,"mel_mean_abs":mean})
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
@@ -393,6 +425,9 @@ fn main() -> Result<()> {
             transcribe(Path::new(manifest), Path::new(out))
         }
         [mode, file] if mode == "bench" => bench(Path::new(file)),
+        [mode, audio, filters, reference] if mode == "mel" => {
+            mel_check(Path::new(audio), Path::new(filters), Path::new(reference))
+        }
         _ => Err(
             "usage: transcription-eval parity DIR CASES | transcribe MANIFEST OUT | bench AUDIO"
                 .into(),
