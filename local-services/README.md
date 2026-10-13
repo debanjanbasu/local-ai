@@ -197,17 +197,20 @@ line boundaries.
 files, file batches, file content, search) over the Files API. The full
 contract, limits and semantics are the module docs; the essentials:
 
-- **Ranking is lexical BM25, not embeddings.** Tantivy, `k1 = 1.2`,
-  `b = 0.75`, statistics over all stores' chunks; Unicode words, lowercased,
-  ASCII-folded, English Porter-2 stemming. Scores are `s / (1 + s)` of the BM25
-  score `s`: in `[0, 1)`, ordered like BM25 within one query, not calibrated
-  and not comparable across queries. `rewrite_query: true` and the
-  `default-2024-11-15` ranker are refused; `auto` and `none` are plain BM25.
-  Pooled Bonsai hidden states were measured as embeddings and rejected (see
-  [docs/BONSAI.md](../docs/BONSAI.md#tried-and-rejected)); the module docs
-  ("Adding embedding ranking") describe where a dedicated embedding model's
-  vectors would be written (`index_next`, under the same outbox) and ranked
-  (the single ranking step of `search`, over the same chunk keys).
+- **Ranking is lexical BM25, or semantic with an embedding model.** BM25:
+  Tantivy, `k1 = 1.2`, `b = 0.75`, statistics over all stores' chunks;
+  Unicode words, lowercased, ASCII-folded, English Porter-2 stemming; scores
+  `s / (1 + s)` of the BM25 score `s` (in `[0, 1)`, ordered like BM25 within
+  one query, not calibrated, not comparable across queries). With a
+  `ChunkEmbedder` installed (`VectorIndex::set_embedder`; the server's is
+  the native EmbeddingGemma 2 encoder), chunks are embedded as they are
+  indexed and `ranker: auto` ranks by cosine similarity (score
+  `max(cos, 0)`); `ranker: none` is always BM25 alone. Embeddings alone beat
+  BM25 and reciprocal rank fusion of both in the measurements (see
+  [docs/EMBEDDINGS.md](../docs/EMBEDDINGS.md#vector-stores)). Without an
+  embedder, search is BM25 exactly. `rewrite_query: true`, the
+  `default-2024-11-15` ranker and fields outside the pinned
+  `ranking_options` are refused. See the module docs ("Embeddings").
 - **Lifecycle.** Attaching a live File (any purpose) answers `in_progress`;
   the indexer reads UTF-8 text (BOM dropped; NUL or invalid UTF-8 is
   `unsupported_file`; over 16 MiB, empty, or over 50,000 chunks is
@@ -224,8 +227,9 @@ contract, limits and semantics are the module docs; the essentials:
 `VectorIndex::open(&store)` owns the index (an exclusive lock file; a second
 process gets a conflict) and is the native search API (`search`, used by a
 `file_search` tool); `VectorStoreIndexer` is the event-driven worker thread
-(woken by `notify`, never polling) that calls `collect_garbage` and
-`index_next`.
+(woken by `notify`, never polling) that calls `collect_garbage`,
+`index_next` and then `embed_next`, the embedding backfill of completed
+files without vectors in the installed model's space.
 
 ### Index consistency
 
@@ -250,8 +254,18 @@ and any other document belongs to an attachment in the
    and rebuilds the index from the stored text on any mismatch, or when the
    index is missing, unreadable or of another schema.
 
-Tests simulate each crash point, a lost index, an unreadable `meta.json` and
-a document planted outside the protocol.
+Vectors (F16, one row per chunk, keyed like the chunk) live in SQLite and
+extend the invariant: every chunk of a completed file with an
+`embedding_space` has exactly one vector, and any other vector row belongs to
+an attachment in the outbox. They are inserted in the same confirming
+transaction as the chunks (or, for the backfill, in one transaction per
+batch that also sets the file's space), deleted with the outbox entry, and
+checked on open (stray rows removed, a file whose rows do not match its
+chunks re-embedded).
+
+Tests simulate each crash point, a lost index, an unreadable `meta.json`,
+a document planted outside the protocol, and damaged, stray or stale-space
+vectors.
 
 ## Workspace
 
@@ -332,7 +346,8 @@ The following are not part of this crate:
 - Encryption at rest.
 - A background sweeper or poller (the vector store indexer runs only when
   notified).
-- Embeddings or semantic (vector) search; vector stores are lexical.
+- An embedding model: vector stores take one through the `ChunkEmbedder`
+  trait (the server supplies the native encoder) and are lexical without it.
 - Physical purge of deleted conversations.
 - Compaction's summary generation: `compaction` decides when to compact and
   what is kept verbatim; the server runs the model and seals the item.
