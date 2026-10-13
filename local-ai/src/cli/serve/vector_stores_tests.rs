@@ -573,3 +573,103 @@ async fn a_restarted_server_resumes_and_keeps_its_index() {
     assert_eq!(results["data"][0]["content"][0]["text"], text);
     service.close();
 }
+
+/// A deterministic stand-in for the embedding model: letter frequencies.
+struct Letters;
+
+impl Letters {
+    fn vector(text: &str) -> Vec<f32> {
+        let mut vector = [0.0_f32; 26];
+        for byte in text
+            .to_ascii_lowercase()
+            .bytes()
+            .filter(u8::is_ascii_lowercase)
+        {
+            vector[usize::from(byte - b'a')] += 1.0;
+        }
+        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        vector.iter().map(|v| v / norm).collect()
+    }
+}
+
+impl local_services::vector_stores::ChunkEmbedder for Letters {
+    fn space(&self) -> &'static str {
+        "letters/1"
+    }
+
+    fn dimensions(&self) -> usize {
+        26
+    }
+
+    fn embed_documents(
+        &self,
+        texts: &[&str],
+        _stop: &dyn Fn() -> bool,
+    ) -> local_services::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|text| Self::vector(text)).collect())
+    }
+
+    fn embed_queries(&self, queries: &[&str]) -> local_services::Result<Vec<Vec<f32>>> {
+        Ok(queries.iter().map(|text| Self::vector(text)).collect())
+    }
+}
+
+#[tokio::test]
+async fn hybrid_search_answers_conform_and_refuses_unknown_options() {
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let service = scratch.start();
+    let cats = upload(&store, "cats.txt", "Cats sleep most of the day.");
+    let dogs = upload(&store, "dogs.txt", "Dogs need daily walks and play.");
+    service.set_embedder(Arc::new(Letters));
+    let created = ok(
+        &service,
+        Method::POST,
+        "/v1/vector_stores",
+        Some(json!({"file_ids":[cats, dogs]})),
+        "VectorStoreObject",
+    )
+    .await;
+    service.wait_idle();
+    let search = format!(
+        "/v1/vector_stores/{}/search",
+        created["id"].as_str().unwrap()
+    );
+    for ranker in ["auto", "none"] {
+        let results = ok(
+            &service,
+            Method::POST,
+            &search,
+            Some(json!({"query":["dogs walks", "zzz"],
+                        "ranking_options":{"ranker":ranker,"score_threshold":0}})),
+            "VectorStoreSearchResultsPage",
+        )
+        .await;
+        let data = results["data"].as_array().unwrap();
+        assert_eq!(data[0]["file_id"], dogs.as_str(), "{ranker}");
+        if ranker == "auto" {
+            // Hybrid: both files come back (dense ranks every chunk), the
+            // best scores exactly 1 (first in both rankings).
+            assert_eq!(data.len(), 2);
+            assert!((data[0]["score"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        } else {
+            assert_eq!(data.len(), 1);
+            assert!(data[0]["score"].as_f64().unwrap() < 1.0);
+        }
+    }
+    for body in [
+        r#"{"query":"x","ranking_options":{"hybrid_search":{"embedding_weight":1,"text_weight":1}}}"#,
+        r#"{"query":"x","ranking_options":{"ranker":"default-2024-11-15"}}"#,
+        r#"{"query":"x","ranking_options":{"score_threshold":2}}"#,
+    ] {
+        refused(
+            &service,
+            Method::POST,
+            &search,
+            Some(body),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    service.close();
+}
