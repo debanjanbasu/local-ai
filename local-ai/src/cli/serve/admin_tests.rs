@@ -680,6 +680,7 @@ fn requests_are_strict() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn usage_families_aggregate_recorded_requests_and_costs_are_empty() {
     let (_dir, admin) = open();
     let day = 1_730_419_200;
