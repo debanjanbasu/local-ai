@@ -173,7 +173,7 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | readiness |
-| `GET` | `/v1/models` | installed model and admitted `context_length`/`max_model_len` |
+| `GET` | `/v1/models` | the loaded Bonsai model with its admitted `context_length`/`max_model_len`, then every installed optional model (`embeddinggemma-2`, `embeddinggemma-2-moderation-1`, `kokoro-82m`, `whisper-large-v3`) |
 | `POST` | `/v1/chat/completions` | templated text and function calling |
 | `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
@@ -185,6 +185,12 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST`, `GET`, `DELETE` | `/v1/files[/{id}[/content]]` | streamed multipart files |
 | `POST` | `/v1/uploads[/{id}/parts\|complete\|cancel]` | multipart uploads with optional MD5 |
 | `POST`, `GET` | `/v1/batches[/{id}[/cancel]]` | batches of Chat Completions or Responses requests on the loaded model |
+| `POST`, `GET`, `DELETE` | `/v1/vector_stores[/{id}[/files\|file_batches\|search…]]` | vector stores, BM25 or (with the embedding model) embedding-ranked ([native services](#native-services)) |
+| `POST` | `/v1/embeddings` | EmbeddingGemma 2 text embeddings (installed model only; [EMBEDDINGS.md](EMBEDDINGS.md)) |
+| `POST` | `/v1/moderations` | calibrated moderation heads on EmbeddingGemma 2 (installed heads only; [MODERATION.md](MODERATION.md)) |
+| `POST` | `/v1/audio/speech` | Kokoro-82M text to speech (installed model only; [SPEECH.md](SPEECH.md)) |
+| `POST` | `/v1/audio/transcriptions`, `/v1/audio/translations` | Whisper large-v3 speech recognition and translation to English (installed model only; [TRANSCRIPTION.md](TRANSCRIPTION.md)) |
+| `GET`, `POST`, `DELETE` | `/v1/organization/*` | Administration API: admin keys, projects, service accounts, audit logs, usage (admin key only; [ADMIN.md](ADMIN.md)) |
 | `POST`, `GET`, `DELETE` | `/v1/evals[/{id}[/runs[/{run_id}[/cancel\|/output_items[/{item_id}]]]]]` | evals of the loaded model, run through batches |
 | `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
 | `POST` | `/v1/decisions` | calibrated, scope-gated decisions (`--decisions-artifact` only; 404 with an explanation otherwise) |
@@ -194,8 +200,10 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 The server implements only current OpenAI APIs, as the pinned OpenAPI
 specification defines them: Chat Completions, Responses (with
 `input_tokens`, `compact`, retrieval, cancellation and input items), Models,
-Embeddings, Conversations, Files, Uploads, Batches, Vector Stores, Evals and
-Decisions; `/health` and `/v1/experimental/decisions` are this server's own.
+Conversations, Files, Uploads, Batches, Vector Stores, Evals, Decisions and
+the Administration API; with the optional models installed, Embeddings,
+Moderations, Audio speech, and Audio transcriptions and translations.
+`/health` and `/v1/experimental/decisions` are this server's own.
 Legacy and deprecated APIs are intentionally not served:
 
 - The legacy Completions API, `POST /v1/completions`, is a 404 like any
@@ -549,16 +557,19 @@ responses with cancellation and journal-based stream resumption, temporary
 JSON-object/JSON-schema output, tool calls constrained during decoding, and
 durable conversations, files, uploads and text-endpoint batches
 ([native services](#native-services)) are now implemented as described;
-lexical (BM25) vector stores are implemented too ([native services](#native-services));
+vector stores (BM25, or embedding-ranked with the embedding model) are implemented too ([native services](#native-services));
 compaction and reasoning summaries are implemented with the loaded model
 ([below](#compaction-and-reasoning-summaries)); OpenAI-compatible Decisions needs
-a judgment head with evaluated confidence and refusal semantics; media,
-embedding, audio and moderation capabilities need suitable models or heads.
+a judgment head with evaluated confidence and refusal semantics; embeddings,
+moderations, text to speech and transcription run on optional native models
+(EmbeddingGemma 2, its moderation heads, Kokoro-82M, Whisper large-v3; see the
+endpoint table), while image and audio input to generation still needs a
+multimodal generator.
 Evals run on the batch worker ([native services](#native-services)), and
 client-executed `custom`/`local_shell`/`apply_patch` tools and opt-in
 sandboxed hosted tools are described in [docs/TOOLS.md](TOOLS.md); other
-built-in tools, fine-tuning and administrative APIs still need their own
-services. None is implemented by merely accepting its request fields.
+built-in tools and fine-tuning still need their own services; the
+Administration API is described in [docs/ADMIN.md](ADMIN.md). None is implemented by merely accepting its request fields.
 
 [Codex at 4aa94dc](https://github.com/openai/codex/tree/4aa94dce270de668eff6e2fa8585c82385e84455)
 uses stateless Responses, requests `reasoning.encrypted_content`, and sends
@@ -2274,9 +2285,9 @@ their own entry, not with current rates.
   tokens/s on the GPU (about 0.5 documents/s, 34 minutes for the 1,000
   documents), while BM25 indexed the same documents in 4.9 s and answered a
   query in 7 ms. Neither quality nor throughput is competitive, so pooled
-  Bonsai states are not used as embeddings and vector store ranking stays
-  lexical; a dedicated embedding model is a separate question (the
-  vector store module docs describe where its ranking would plug in).
+  Bonsai states are not used as embeddings. A dedicated embedding model was
+  the answer: vector stores now rank `ranker: auto` by EmbeddingGemma 2
+  embeddings when it is installed (see [EMBEDDINGS.md](EMBEDDINGS.md#vector-stores)).
 - PTQ1 pipeline descriptor hints (32-thread maximum and the multiple-of-SIMD
   execution-width flag): outputs stayed bitwise identical, but timing shifts
   were within about 2% and moved with the repeated default control. No

@@ -25,8 +25,13 @@ contracts (not full OpenAI compatibility).
 
 **Supported OpenAI APIs.** Only current OpenAI APIs are served: Chat
 Completions, Responses (with `input_tokens`, `compact`, retrieval,
-cancellation and input items), Models, Embeddings, Conversations, Files,
-Uploads, Batches, Vector Stores, Evals and Decisions. Legacy and deprecated
+cancellation and input items), Models, Conversations, Files, Uploads,
+Batches, Vector Stores, Evals, Decisions and the Administration API
+(`/v1/organization/*`: keys, projects, audit logs, usage; see
+[docs/ADMIN.md](docs/ADMIN.md)); with the optional models installed,
+Embeddings, Moderations, Audio speech (`/v1/audio/speech`) and Audio
+transcriptions and translations (`/v1/audio/transcriptions`,
+`/v1/audio/translations`). Legacy and deprecated
 APIs are intentionally not served: the legacy Completions API
 (`POST /v1/completions`) is a 404, batches cannot target it, and request
 members the OpenAI specification marks deprecated (Chat's `max_tokens`,
@@ -105,7 +110,7 @@ The server also always opens a durable native services store at
 blobs, in plaintext, with no flag and no alternative backend). It serves
 Conversations and their items, Responses `conversation` (appended once, and
 refused on a version conflict), streamed Files and Uploads (with optional
-MD5), Batches for the three text endpoints, and Evals whose model calls run as
+MD5), Batches of Chat Completions and Responses requests, and Evals whose model calls run as
 batches. Batches run on one worker that
 resumes unsettled lines after a restart. File expiry is enforced on access, and
 expired bytes are purged at startup. The same crate offers native repository search

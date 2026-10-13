@@ -84,12 +84,25 @@ Implemented:
   `start_time` to `end_time` (default: the end of the bucket holding now),
   every bucket listed (empty ones with no results), `limit`, `page`, the
   documented filters and `group_by`. The server writes one record per
-  finished generation (Chat Completions, Completions, Responses, including a
-  client that went away: the generation is drained to its final count) and per
-  embeddings request. `vector_stores` reports the current storage level in the
-  bucket holding now. Families the server cannot produce (images, web search,
-  code interpreter, file search calls) are always empty, as are moderations
-  and audio until those routes record usage (`admin::record` in the server).
+  finished request, attributed to the calling project and key:
+  - `completions`: every finished generation (Chat Completions, Responses,
+    including a client that went away: the generation is drained to its final
+    count; each compaction and reasoning-summary generation as a record of its
+    own), input, cached and output tokens;
+  - `completions` with `batch: true`: every batch line, eval-run generations
+    included, unattributed (a batch outlives the request that created it);
+  - `embeddings`: input tokens of each `POST /v1/embeddings`;
+  - `moderations`: input tokens (every scored window) of each
+    `POST /v1/moderations`;
+  - `audio_speeches`: input characters of each `POST /v1/audio/speech`,
+    recorded once the whole input is synthesized;
+  - `audio_transcriptions`: seconds of decoded audio (a started second counts
+    as one) of each `POST /v1/audio/transcriptions` and
+    `/v1/audio/translations`, as the hosted API counts both.
+
+  `vector_stores` reports the current storage level in the bucket holding
+  now. Families the server cannot produce (images, web search, code
+  interpreter, file search calls) are always empty.
   Group fields the server does not record (`service_tier`, `size`, `source`,
   `context_level`, `vector_store_id`) are `null`; `api_source` is
   `unlabeled`.
@@ -103,8 +116,10 @@ limits, data retention, model and hosted-tool permissions, external storage.
 
 ## Limits
 
-- Not recorded: batch lines, eval runs, compaction and reasoning-summary
-  generations, and background Responses resumed after a restart.
+- Background Responses resumed after a restart, and batch lines, are
+  recorded unattributed (the original caller is not stored with them).
+- A failed or cancelled speech, transcription, embeddings or moderations
+  request records nothing; a generation records what it produced.
 - Usage records are kept indefinitely (one small row per request).
 - The TCP listener speaks plain HTTP (TLS covers only HTTP/3, when
   configured): on a non-loopback address, keys cross the network in clear

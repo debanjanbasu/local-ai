@@ -2,7 +2,8 @@
 
 Durable native services shared by the `local-ai` server and native Rust
 callers: Conversations, Files and Uploads, Batches, Evals, Vector Stores
-(lexical), conversation compaction planning, sandboxed hosted tool executors
+(BM25, or embedding-ranked through a caller-supplied chunk embedder), the
+Administration API store (keys, projects, audit logs, usage), conversation compaction planning, sandboxed hosted tool executors
 (`tools`: workspace files, shell, allowlisted web fetch; see
 [docs/TOOLS.md](../docs/TOOLS.md)) and a read-only repository Workspace.
 Nothing here loads or needs a model. Only the web fetch tool reaches the
