@@ -1,8 +1,8 @@
 //! `POST /v1/audio/transcriptions` and `POST /v1/audio/translations` on the
-//! native Whisper large-v3 model ([`local_engine::speech`]).
+//! native Whisper large-v3 model ([`local_engine::transcription`]).
 //!
 //! Served only when the artifact is installed beside the Bonsai checkpoint
-//! (`models/whisper-large-v3/`, see `docs/SPEECH.md`); there is no flag.
+//! (`models/whisper-large-v3/`, see `docs/TRANSCRIPTION.md`); there is no flag.
 //! Without it both routes answer `404` like any unknown route, and
 //! `/v1/models` does not list the model.
 //!
@@ -10,7 +10,7 @@
 //! `CreateTranslationRequest` (multipart): `file` (flac, mp3, mp4, mpeg,
 //! mpga, m4a, ogg, wav or webm, at most [`MAX_FILE_BYTES`] and
 //! [`MAX_AUDIO_SECONDS`] of audio; Opus is not decodable here), `model`
-//! ([`SPEECH_MODEL_ID`] or `whisper-1`), `prompt`, `temperature` (0 to 1; 0
+//! ([`TRANSCRIPTION_MODEL_ID`] or `whisper-1`), `prompt`, `temperature` (0 to 1; 0
 //! means the reference's fallback ladder), `response_format` (`json`,
 //! `text`, `srt`, `verbose_json`, `vtt`). Transcriptions also take
 //! `language` (ISO-639-1), `timestamp_granularities[]` (`segment` only,
@@ -47,10 +47,10 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
 
 use local_engine::activity::EngineActivity;
-use local_engine::speech::tokens::{language_code, language_name};
-use local_engine::speech::{
-    Pace, SPEECH_MODEL_ID, Segment, SpeechModel, Task, Temperature, TranscribeOptions, Transcript,
-    audio, installed_model,
+use local_engine::transcription::tokens::{language_code, language_name};
+use local_engine::transcription::{
+    Pace, Segment, TRANSCRIPTION_MODEL_ID, Task, Temperature, TranscribeOptions, Transcript,
+    TranscriptionModel, audio, installed_model,
 };
 
 use super::response::{add_alt_svc, error_response, json_response};
@@ -71,15 +71,15 @@ const DECODE_YIELD_LIMIT: Duration = Duration::from_millis(500);
 const RETRY_AFTER_SECONDS: u32 = 1;
 /// `model` values served by the local Whisper (`whisper-1` is the hosted API's name
 /// for its hosted Whisper).
-const MODEL_ALIASES: [&str; 2] = [SPEECH_MODEL_ID, "whisper-1"];
+const MODEL_ALIASES: [&str; 2] = [TRANSCRIPTION_MODEL_ID, "whisper-1"];
 const EXTENSIONS: [&str; 9] = [
     "flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm",
 ];
 /// Audio encoder frames per 30-second window, for token usage.
 const AUDIO_TOKENS_PER_WINDOW: usize = 1500;
 
-pub(super) struct Speech {
-    model: Arc<Mutex<SpeechModel>>,
+pub(super) struct Transcriber {
+    model: Arc<Mutex<TranscriptionModel>>,
     /// Token bytes for `logprobs`, readable while the model is busy.
     token_bytes: Arc<Vec<Vec<u8>>>,
     eot: u32,
@@ -87,7 +87,7 @@ pub(super) struct Speech {
     activity: Arc<EngineActivity>,
 }
 
-impl Speech {
+impl Transcriber {
     /// The service, when the model is installed in `models_dir`.
     pub(super) fn start(
         models_dir: &Path,
@@ -96,14 +96,14 @@ impl Speech {
         let Some(dir) = installed_model(models_dir) else {
             return Ok(None);
         };
-        let model = SpeechModel::open(&dir).map_err(|error| {
+        let model = TranscriptionModel::open(&dir).map_err(|error| {
             crate::Error::InvalidArgument(format!(
                 "cannot load the speech model in {}: {error}",
                 dir.display()
             ))
         })?;
         eprintln!(
-            "speech at POST {TRANSCRIPTIONS} and {TRANSLATIONS}: {SPEECH_MODEL_ID} from {} (F16, \
+            "speech at POST {TRANSCRIPTIONS} and {TRANSLATIONS}: {TRANSCRIPTION_MODEL_ID} from {} (F16, \
              payload sha256 {})",
             dir.display(),
             model.payload_sha256()
@@ -120,7 +120,7 @@ impl Speech {
 
 /// `/v1/models` entry of the speech model.
 pub(super) fn model_json(created: u64) -> Value {
-    json!({"id":SPEECH_MODEL_ID,"object":"model","created":created,"owned_by":"local"})
+    json!({"id":TRANSCRIPTION_MODEL_ID,"object":"model","created":created,"owned_by":"local"})
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,7 +291,7 @@ fn validate(raw: RawForm, task: Task) -> Result<Form, Failure> {
         .ok_or_else(|| bad("field \"model\" is required"))?;
     if !MODEL_ALIASES.contains(&model.as_str()) {
         return Err(bad(format!(
-            "model {model:?} is not served here; use {SPEECH_MODEL_ID:?}"
+            "model {model:?} is not served here; use {TRANSCRIPTION_MODEL_ID:?}"
         )));
     }
     let extension = filename
@@ -428,7 +428,7 @@ fn local_seed() -> u64 {
 
 /// Decode the upload and run the model, sending segments to `on_segments`.
 fn run(
-    service: &Speech,
+    service: &Transcriber,
     form: &Form,
     file: Vec<u8>,
     task: Task,
@@ -466,7 +466,7 @@ fn run(
     })
 }
 
-fn logprobs_json(service: &Speech, segments: &[Segment]) -> Vec<Value> {
+fn logprobs_json(service: &Transcriber, segments: &[Segment]) -> Vec<Value> {
     segments
         .iter()
         .flat_map(|s| s.tokens.iter().zip(&s.logprobs))
@@ -600,7 +600,7 @@ fn sse(value: &Value) -> Bytes {
 
 pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Response {
     let headers = &parts.headers;
-    let Some(service) = state.speech.clone() else {
+    let Some(service) = state.transcription.clone() else {
         return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
     };
     let task = if parts.uri.path() == TRANSLATIONS {
@@ -700,7 +700,7 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
 /// `stream: true`: deltas per finished window, then the done event.
 fn stream(
     state: &AppState,
-    service: Arc<Speech>,
+    service: Arc<Transcriber>,
     mut form: Form,
     task: Task,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -771,7 +771,7 @@ mod tests {
     fn raw(fields: &[(&str, &str)]) -> RawForm {
         let mut form = RawForm {
             file: Some((b"audio".to_vec(), Some("clip.wav".into()))),
-            model: Some(SPEECH_MODEL_ID.into()),
+            model: Some(TRANSCRIPTION_MODEL_ID.into()),
             ..RawForm::default()
         };
         for (name, value) in fields {
@@ -886,7 +886,7 @@ mod tests {
             language: "de".into(),
             duration: 2.0,
             segments: vec![segment(0, 0.0, 2.0, " Hallo.")],
-            usage: local_engine::speech::Usage::default(),
+            usage: local_engine::transcription::Usage::default(),
         };
         let value = verbose_json(&transcript, Task::Transcribe);
         assert_eq!(value["language"], "german");

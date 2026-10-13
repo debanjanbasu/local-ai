@@ -385,3 +385,52 @@ fn decoder_attention_is_causal_over_the_cache_and_full_over_frames() {
         );
     }
 }
+
+/// Throughput of the encoder's largest GEMM shape (run explicitly).
+#[test]
+#[ignore = "benchmark; run with --ignored under the GPU lock"]
+fn gemm_throughput_on_encoder_shapes() {
+    let Some((context, kernels)) = gpu_or_skip() else {
+        return;
+    };
+    for (rows, columns, tokens) in [
+        (5120_usize, 1280_usize, 1500_usize),
+        (1280, 5120, 1500),
+        (1280, 1280, 1500),
+    ] {
+        let (halves, _) = f16_matrix(rows, columns, 1);
+        let packed = MetalBuffer::from_slice(context.device(), &halves).expect("weights");
+        let x = buffer(&context, &values(tokens * columns, 3));
+        let y = MetalBuffer::empty(context.device(), tokens * rows * 4).expect("y");
+        let matrix = F16Rows {
+            weights: &packed,
+            offset: 0,
+            rows: rows as u32,
+            columns: columns as u32,
+        };
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let mut batch = CommandBatch::new(&context).expect("batch");
+            for _ in 0..10 {
+                kernels
+                    .gemm(
+                        &mut batch,
+                        matrix,
+                        Region::whole(&x),
+                        Region::whole(&y),
+                        tokens as u32,
+                        &Epilogue::default(),
+                    )
+                    .expect("gemm");
+            }
+            let started = std::time::Instant::now();
+            batch.commit_and_wait().expect("commit");
+            best = best.min(started.elapsed().as_secs_f64() / 10.0);
+        }
+        let tflops = 2.0 * (rows * columns * tokens) as f64 / best / 1e12;
+        eprintln!(
+            "gemm {rows}x{columns} x {tokens} tokens: {:.3} ms, {tflops:.2} TFLOPS",
+            best * 1e3
+        );
+    }
+}

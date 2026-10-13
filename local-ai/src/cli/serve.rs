@@ -18,7 +18,6 @@ use local_engine::{Engine, EngineHandle};
 
 use crate::resources::Resources;
 
-mod audio;
 mod background;
 mod backpressure;
 mod batches;
@@ -41,6 +40,7 @@ mod services;
 mod sse;
 mod store;
 mod tool_loop;
+mod transcription;
 mod vector_stores;
 
 #[cfg(test)]
@@ -128,7 +128,7 @@ struct AppState {
     /// Native text embeddings, when the embedding model is installed.
     embeddings: Option<Arc<embeddings::Embeddings>>,
     /// Native speech recognition and translation, when Whisper is installed.
-    speech: Option<Arc<audio::Speech>>,
+    transcription: Option<Arc<transcription::Transcriber>>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -235,7 +235,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
                 state.context,
                 state.created,
                 state.embeddings.is_some(),
-                state.speech.is_some(),
+                state.transcription.is_some(),
             ),
             &state,
             &parts.headers,
@@ -245,10 +245,10 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     if parts.method == Method::POST
         && matches!(
             parts.uri.path(),
-            audio::TRANSCRIPTIONS | audio::TRANSLATIONS
+            transcription::TRANSCRIPTIONS | transcription::TRANSLATIONS
         )
     {
-        return audio::handle(&state, &parts, body).await;
+        return transcription::handle(&state, &parts, body).await;
     }
     if parts.method == Method::POST && parts.uri.path() == embeddings::ROUTE {
         return embeddings::handle(&state, &parts.headers, body).await;
@@ -1002,7 +1002,7 @@ fn models_json(
     context: usize,
     created: u64,
     embeddings: bool,
-    speech: bool,
+    transcription: bool,
 ) -> serde_json::Value {
     let mut data = vec![
         json!({"id":model,"object":"model","created":created,"owned_by":"local","context_length":context,"max_model_len":context}),
@@ -1010,8 +1010,8 @@ fn models_json(
     if embeddings {
         data.push(embeddings::model_json(created));
     }
-    if speech {
-        data.push(audio::model_json(created));
+    if transcription {
+        data.push(transcription::model_json(created));
     }
     json!({"object":"list","data":data})
 }
@@ -1089,8 +1089,8 @@ async fn run_async(args: Args) -> crate::Result<()> {
         None => None,
     };
     // And `models/whisper-large-v3`.
-    let speech = match resources.model.parent().and_then(std::path::Path::parent) {
-        Some(models_dir) => audio::Speech::start(models_dir, engine.activity())?,
+    let transcription = match resources.model.parent().and_then(std::path::Path::parent) {
+        Some(models_dir) => transcription::Transcriber::start(models_dir, engine.activity())?,
         None => None,
     };
     let mut state = AppState {
@@ -1118,7 +1118,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         evals: None,
         tools,
         embeddings,
-        speech,
+        transcription,
     };
     let address = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(address).await?;

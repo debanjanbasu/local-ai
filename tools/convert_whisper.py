@@ -4,7 +4,7 @@ The source is `openai/whisper-large-v3` (MIT) at revision
 06f233fe06e710322aca913c1bc4249a0d71fce1 in the transformers layout, plus the
 original package's 128-bin mel filterbank (`whisper/assets/mel_filters.npz`,
 openai-whisper 20250625). They reach this machine through a private Kaggle CPU
-kernel that downloads them and saves them as its output (docs/SPEECH.md):
+kernel that downloads them and saves them as its output (docs/TRANSCRIPTION.md):
 
   kaggle kernels output <owner>/stt-whisper-ref-s0 -p cache/whisper-large-v3
 
