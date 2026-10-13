@@ -302,7 +302,7 @@ def convert_state(checkpoint: dict) -> dict[str, Tensor]:
     flat: dict[str, Tensor] = {}
     for group, state in checkpoint.items():
         for key, tensor in state.items():
-            key = key[len("module."):] if key.startswith("module.") else key
+            key = key.removeprefix("module.")
             flat[f"{group}.{key}"] = tensor
     flat = fold_weight_norm(flat)
     out: dict[str, Tensor] = {}

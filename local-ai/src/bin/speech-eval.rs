@@ -508,6 +508,32 @@ fn g2p(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Encode raw F32 24 kHz samples into every supported format (for checking
+/// the encoders with an independent decoder).
+fn encode_all(input: &Path, prefix: &Path) -> Result<()> {
+    use local_engine::speech::encode::{Format, StreamEncoder};
+    let samples = f32_file(input)?;
+    for (format, ext) in [
+        (Format::Mp3, "mp3"),
+        (Format::Opus, "opus"),
+        (Format::Flac, "flac"),
+        (Format::Wav, "wav"),
+        (Format::Pcm, "pcm"),
+    ] {
+        // Streamed in 0.5 s pieces, as the server does chunk by chunk.
+        let mut encoder = StreamEncoder::new(format, SAMPLE_RATE)?;
+        let mut bytes = Vec::new();
+        for piece in samples.chunks(12_000) {
+            bytes.extend(encoder.push(piece)?);
+        }
+        bytes.extend(encoder.finish()?);
+        let path = prefix.with_extension(ext);
+        std::fs::write(&path, &bytes)?;
+        println!("{} {} bytes", path.display(), bytes.len());
+    }
+    Ok(())
+}
+
 fn bench(chunks: usize) -> Result<()> {
     let model = open()?;
     let text = "Software engineers often debate the merits of different programming styles, but \
@@ -533,6 +559,23 @@ fn main() -> Result<()> {
         Some("synth") if args.len() == 3 => synth(Path::new(&args[1]), &PathBuf::from(&args[2])),
         Some("compare") if args.len() == 3 => compare(Path::new(&args[1]), &PathBuf::from(&args[2])),
         Some("g2p") if args.len() == 2 => g2p(Path::new(&args[1])),
+        Some("encode") if args.len() == 3 => encode_all(Path::new(&args[1]), Path::new(&args[2])),
+        Some("mel") if args.len() == 4 => {
+            // REF.f32 OTHER.s16le LAG: log-mel distance of a decoded file.
+            let reference = f32_file(Path::new(&args[1]))?;
+            let bytes = std::fs::read(&args[2])?;
+            let lag: usize = args[3].parse()?;
+            let other: Vec<f32> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .skip(lag)
+                .map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0)
+                .collect();
+            let (mad, cos) = mel_distance(&reference, &other);
+            println!("log-mel MAD {mad:.3} dB, mel cosine {cos:.5}");
+            Ok(())
+        }
         Some("bench") => {
             let chunks = args
                 .iter()
