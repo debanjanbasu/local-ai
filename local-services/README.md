@@ -244,6 +244,15 @@ and any other document belongs to an attachment in the
 Tests simulate each crash point, a lost index, an unreadable `meta.json` and
 a document planted outside the protocol.
 
+## Administration
+
+`admin` holds opt-in authentication and the OpenAI Administration API objects
+for one local organization: admin API keys, projects, service accounts and
+their project keys (stored only as a lookup, a redacted form and a salted
+HMAC-SHA-256 tag, verified in constant time), audit logs, and per-request
+usage records with UTC-bucketed aggregation. See
+[docs/ADMIN.md](../docs/ADMIN.md).
+
 ## Workspace
 
 `Workspace::open(root)` gives synchronous, read-only access to one directory
