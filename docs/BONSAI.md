@@ -2588,7 +2588,14 @@ lockf -k /tmp/local-ai-gpu.lock python3 tools/client_compat.py --no-reasoning-ke
     --scenarios omp-fix-xhigh --out .scratch/artifacts/client-compat/<run>-nokey
 # long-context matrix; finished items are skipped, so split it into bounded runs
 lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes short,8k,32k
-lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes 128k --seeds 0 --efforts xhigh
+# a long group in pieces: stage a token-exact prefix (a raw completion whose
+# disk snapshot the next hold restores), then ask; one HOME per group keeps
+# the over-budget snapshot from being evicted
+export HOME=$PWD/.scratch/home/250k-s0-xhigh
+for n in 100000 165000 215000; do   # one lock hold each
+  lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes 250k --seeds 0 --efforts xhigh --stage-tokens $n
+done
+lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes 250k --seeds 0 --efforts xhigh
 python3 tools/context_eval.py --report
 ```
 
@@ -2682,7 +2689,7 @@ tests; no such call occurred in this re-run). Still open: `namespace` and
 freeform `apply_patch` declaration. Evidence:
 `.scratch/artifacts/client-compat/merged-main` and `merged-main-nokey`.
 
-#### Long-context coding quality (2026-10-11, server at `d2cad1b`)
+#### Long-context coding quality
 
 Each seed plants nine questions in a synthetic Python repository: at the
 start, middle and end (4%, 50%, 94% of the prompt) a `recall` (state a
@@ -2695,13 +2702,28 @@ needles in about 1.7K tokens. The repository is the system message, each
 question its own user turn, greedy, non-streamed Chat Completions; the
 first question of each (size, seed, effort) group pays the cold prefill and
 the rest reuse it from the prompt cache (three in parallel). `none` allows 384
-output tokens, `xhigh` 4,096; no answer hit its limit. Seconds in the prefill
-column are the cold first request.
+output tokens, `xhigh` 4,096; no answer hit its limit. Groups at 128K and
+above were prefilled in pieces, one GPU-lock hold each: a raw completion of a
+token-exact prefix of the rendered prompt (72K tokens at 128K) whose disk
+snapshot the next hold's server restored, so the cold-prefill column adds the
+stages and the first question's own prefill. Intervals are 95% Wilson
+intervals over questions; the nine questions of a seed are not independent,
+so they are optimistic.
+
+Rerun 2026-10-12/13, server built at `6ac7dec` (`9228478` adds only docs), M4 Pro 48 GB:
+
+| Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All (95% CI) | Cold prefill | Warm wall, median |
+| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: |
+| short | none | 0,1,2 | 1,593–1,808 | 9/9 | 3/9 | 8/9 | 7/9 | 7/9 | 6/9 | 20/27 (55–87%) | 126–130 tok/s | 1.6 s |
+| short | xhigh | 0,1,2 | 1,629–1,844 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | **27/27** (88–100%) | 129 tok/s | 7.9 s |
+| 128K | none | 1,2 | 127,510–127,668 | 6/6 | 2/6 | 4/6 | 3/6 | 5/6 | 4/6 | 12/18 (44–84%) | 67–69 tok/s (1,861–1,894 s) | 21.2 s |
+| 128K | xhigh | 1,2 | 127,546–127,704 | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 | **18/18** (82–100%) | 68–69 tok/s (1,862–1,872 s) | 41.5 s |
+| ~250K | xhigh | 0 | 249,435–249,447 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **9/9** (70–100%) | 47 tok/s (5,280 s) | 94.5 s |
+
+Earlier run (2026-10-11, server at `d2cad1b`; raw rows lost, not rerun):
 
 | Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All | Cold prefill | Warm wall, median |
 | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: |
-| short | none | 0,1,2 | 1,593–1,808 | 9/9 | 3/9 | 8/9 | 7/9 | 7/9 | 6/9 | 20/27 | 112–130 tok/s | 1.8 s |
-| short | xhigh | 0,1,2 | 1,629–1,844 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | **27/27** | 112–130 tok/s | 9.1 s |
 | 8K | none | 0,1,2 | 8,636–8,758 | 9/9 | 4/9 | 6/9 | 4/9 | 9/9 | 6/9 | 19/27 | 111–124 tok/s (≈76 s) | 2.7 s |
 | 8K | xhigh | 0,1,2 | 8,672–8,794 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | **27/27** | 104–125 tok/s (≈80 s) | 12.4 s |
 | 32K | none | 0,1,2 | 32,380–32,759 | 9/9 | 7/9 | 6/9 | 7/9 | 9/9 | 6/9 | 22/27 | 106–107 tok/s (≈305 s) | 3.7 s |
@@ -2709,26 +2731,35 @@ column are the cold first request.
 | 128K | none | 0 | 127,931–127,943 | 3/3 | 0/3 | 2/3 | 1/3 | 2/3 | 2/3 | 5/9 | 67 tok/s (1,911 s) | 12.1 s |
 | 128K | xhigh | 0 | 127,967–127,979 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **9/9** | 66 tok/s (1,923 s) | 36.7 s |
 
-`xhigh` answered every question at every size, with 83–397 reasoning tokens
-(median 206) and no truncation; at 128K its follow-ups decoded at 19–24
-tok/s while three ran together. `none` retrieved every constant (recall
-9/9 at each size, 3/3 at 128K) but missed lookups, which need a two-step
-calculation (3–7 of 9 per size, 0/3 at 128K), and failed one fix needle
-consistently: for `sum_even` (`range(1, n)` should be `range(1, n + 1)`) it
-returned `total += 2 * (i + 1)`, a change to the wrong line that is also
+The short controls matched the earlier run's scores (20/27 and 27/27). With the earlier seed 0, 128K now has three seeds per
+effort: `xhigh` 27/27 (88–100%), `none` 17/27 (44–78%). `xhigh` answered
+every question at every size measured, with 83–408 reasoning tokens and no
+truncation; its 128K follow-ups decoded at 18–23 tok/s three at a time, with
+a 4–7 s time to first token. `none` retrieved every constant (recall 100% at
+every size) but missed lookups, which need a two-step calculation (2/6 at
+128K, 3/9 in the short control), and failed the same fix needle wherever it
+appeared: for `sum_even` (`range(1, n)` should be `range(1, n + 1)`) it
+returns `total += 2 * (i + 1)`, a change to the wrong line that is also
 incorrect. Its failures appear in the short control too, so they are a
-reasoning-mode effect, not a context-length one; across the sizes measured
-no position (start/middle/end) failed under `xhigh`. Latency is dominated by
-cold prefill: about 115 tok/s to 8K, 107 at 32K and 66 at 128K, so a fresh
-128K repository costs 32 minutes before the first token. With the prefix
-cached, a 128K follow-up still took 11–29 s for a two-token `none` answer
-and 7–41 s for an `xhigh` one.
+reasoning-mode effect, not a context-length one; no position failed under
+`xhigh`. Latency is dominated by cold prefill: about 127 tok/s at 4K, 87 tok/s
+over the first 72K and 54 tok/s from 72K to 128K, so a fresh 128K repository
+costs 31 minutes before its first token. With the prefix cached, a 128K
+follow-up took 15–83 s (median 21 s) for a two-token `none` answer and 9–49 s
+for an `xhigh` one.
 
-Not measured: 64K and ~250K. A cold ~250K group would need well over an
-hour of prefill at the measured rate, so each (seed, effort) group exceeds a
-45-minute GPU lock hold and needs a longer dedicated window (or a host
-prompt-cache tier that survives restarts); the 2026-10-10 near-maximum probe
-above is the only 250K-class evidence. 128K has one seed per effort, so its
-rows show that 128K works, not a rate. Raw rows (answers, token counts,
-timings, cache hits) are in `.scratch/artifacts/context-eval/results.jsonl`,
-the prompts in `prompts/`, and the run logs beside them.
+At ~250K (seed 0, `xhigh`; 249,445 prompt tokens plus 4,096 of output room
+within the 262,144 limit) every question passed, with 98–408 reasoning
+tokens. The cold prefill took four holds: to 100K in 1,310 s (76 tok/s), to
+165K in 1,429 s (46), to 215K in 1,419 s (35) and the last 34K in 1,122 s
+(30), each including the restore of the previous stage from disk: 88 minutes
+in all. Follow-ups at 128K and ~250K were served from the disk tier, not a
+GPU checkpoint (every warm row reports `cache_source: disk`): restoring the
+9.8 GB system-turn snapshot put the ~250K time to first token at 10–15 s,
+and answers then decoded at 12–14 tok/s three at a time, 26–110 s per
+answer. One ~250K seed is evidence that the length works, not a rate.
+
+Not measured: 64K, 8K/32K and 128K seed 0 on the current server, more
+~250K seeds, and `none` at ~250K. Raw rows (answers, token counts, timings, cache hits) are in
+`.scratch/artifacts/context-eval/results.jsonl`, the staged prefixes in
+`stages.jsonl`, the prompts in `prompts/`, and the server log beside them.
