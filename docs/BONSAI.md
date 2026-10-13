@@ -175,7 +175,6 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `GET` | `/health` | readiness |
 | `GET` | `/v1/models` | installed model and admitted `context_length`/`max_model_len` |
 | `POST` | `/v1/chat/completions` | templated text and function calling |
-| `POST` | `/v1/completions` | raw completion |
 | `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
 | `POST` | `/v1/responses/compact` | compact a window with the loaded model (`--reasoning-key` only; [compaction](#compaction-and-reasoning-summaries)) |
@@ -185,17 +184,48 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST`, `GET`, `DELETE` | `/v1/conversations[/{id}[/items[/{item_id}]]]` | durable conversations and items ([native services](#native-services)) |
 | `POST`, `GET`, `DELETE` | `/v1/files[/{id}[/content]]` | streamed multipart files |
 | `POST` | `/v1/uploads[/{id}/parts\|complete\|cancel]` | multipart uploads with optional MD5 |
-| `POST`, `GET` | `/v1/batches[/{id}[/cancel]]` | batches of the three text endpoints on the loaded model |
+| `POST`, `GET` | `/v1/batches[/{id}[/cancel]]` | batches of Chat Completions or Responses requests on the loaded model |
 | `POST`, `GET`, `DELETE` | `/v1/evals[/{id}[/runs[/{run_id}[/cancel\|/output_items[/{item_id}]]]]]` | evals of the loaded model, run through batches |
 | `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
 | `POST` | `/v1/decisions` | calibrated, scope-gated decisions (`--decisions-artifact` only; 404 with an explanation otherwise) |
 
-Generation accepts `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
-`presence_penalty`, `frequency_penalty`, `seed`, and `stream`. Chat's
-`max_completion_tokens` takes precedence over `max_tokens`; Responses uses
-`max_output_tokens`. Cache affinity prefers `prompt_cache_key`, then
-`session_id`, then `user`. Requests are limited to 2 MiB (multipart file and
-upload-part bodies have their own streamed limits); media is rejected.
+### Supported OpenAI APIs
+
+The server implements only current OpenAI APIs, as the pinned OpenAPI
+specification defines them: Chat Completions, Responses (with
+`input_tokens`, `compact`, retrieval, cancellation and input items), Models,
+Embeddings, Conversations, Files, Uploads, Batches, Vector Stores, Evals and
+Decisions; `/health` and `/v1/experimental/decisions` are this server's own.
+Legacy and deprecated APIs are intentionally not served:
+
+- The legacy Completions API, `POST /v1/completions`, is a 404 like any
+  unknown route, and a batch cannot target it (a batch created before it was
+  removed reads back unchanged, and its pending lines fail with a 404).
+- Request members the specification marks deprecated are a 400 that names
+  the replacement: on Chat Completions `max_tokens` (use
+  `max_completion_tokens`), `seed`, `user` (use `prompt_cache_key` and
+  `safety_identifier`), `functions` and `function_call` (use `tools` and
+  `tool_choice`), `prompt_cache_retention`, the `function` message role and an
+  assistant message's `function_call` (use `tool_calls`); on Responses
+  `user`, `truncation`, `prompt_cache_retention` and
+  `reasoning.generate_summary` (use `reasoning.summary`), on `input_tokens`
+  too; on `compact`, `prompt_cache_retention`. This server's own superseded
+  `session_id` alias is refused the same way in favor of `prompt_cache_key`.
+  Chat accepts any of them as `null`, which sets nothing; Responses, whose
+  parser refuses unknown members, refuses even that.
+- Evals sample a `completions` data source and run `score_model` graders
+  through Chat Completions, so their `sampling_params.seed` is refused; a
+  Chat-sampled item reports the server's fixed sampling seed.
+
+### Generation requests
+
+Generation accepts `temperature`, `top_p`, `top_k`, `min_p`,
+`presence_penalty`, `frequency_penalty` and `stream`; Responses also takes a
+`seed`, an extension of this server (Chat Completions samples with a fixed
+one). Chat limits output with `max_completion_tokens`, Responses with
+`max_output_tokens`. Cache affinity is `prompt_cache_key`. Requests are
+limited to 2 MiB (multipart file and upload-part bodies have their own
+streamed limits); media is rejected.
 
 Chat supports function `tools`, assistant `tool_calls`, and tool-result messages
 with `tool_call_id`. Native rendering and validation belong to `local-engine`
@@ -223,8 +253,7 @@ schema the engine can enforce exactly; otherwise the request fails with 400
 before generation, with the reason, rather than being enforced partially.
 Responses echoes the accepted `tool_choice`, `parallel_tool_calls` and each
 tool's `strict`. With all defaults, generation is unconstrained and calls are
-validated after they are generated, as before. Legacy Completions refuses
-`tools`, `tool_choice` and `parallel_tool_calls: false`. The grammar
+validated after they are generated, as before. The grammar
 constrains the call layout and strict arguments, not which tool is
 appropriate or whether its values are sensible.
 
@@ -460,7 +489,7 @@ from anyone who can read the store.
 
 `POST /v1/responses/input_tokens` accepts the Responses input contract
 (`input`, `instructions`, `tools`, `reasoning`, `previous_response_id`, `text`,
-`tool_choice`, `parallel_tool_calls`, `truncation`, `model`) and returns
+`tool_choice`, `parallel_tool_calls`, `model`) and returns
 `{"object":"response.input_tokens","input_tokens":N}`. `N` is exact: the
 request is validated, rendered by the checkpoint template (tools, replayed
 calls and the reasoning mode included) and tokenized by the same code that
@@ -491,7 +520,7 @@ cannot enforce exactly (including any without `"additionalProperties": false`),
 accepted but never offered to the model, which cannot search here),
 `include` values other than
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
-`truncation:auto`, log-probabilities, images and audio are rejected.
+log-probabilities, images and audio are rejected.
 `tool_choice` `auto`, `none`, `required` and a named function,
 `parallel_tool_calls` and tool `strict` are supported and enforced during
 decoding, as is a structured format beside tools; a grammar guarantees the
@@ -679,8 +708,8 @@ the rendering of a summary belong to `local_engine::compaction`; the server
 only adapts them ([engine contract](../local-engine/README.md#compaction-and-reasoning-summaries)).
 
 `POST /v1/responses/compact` takes `model`, `input`, `previous_response_id`,
-`instructions` and `prompt_cache_key` (`prompt_cache_options` and
-`prompt_cache_retention` are refused, `service_tier` as elsewhere) and returns
+`instructions` and `prompt_cache_key` (`prompt_cache_options` is refused, the
+deprecated `prompt_cache_retention` too, `service_tier` as elsewhere) and returns
 a `response.compaction` object. It counts the resolved window, keeps the
 newest items up to a quarter of that count verbatim, and summarizes the rest.
 `output` is the kept items, then one `compaction` item whose
@@ -723,7 +752,7 @@ content, the contract calls it encrypted, and plaintext under that name would
 mislead.
 
 `reasoning.summary` (`auto`, `concise` or `detailed`; the deprecated
-`generate_summary` likewise) runs after the answer's generation ends: the raw
+`generate_summary` is refused) runs after the answer's generation ends: the raw
 reasoning is quoted to the model, which writes the summary as visible content.
 It streams as `response.reasoning_summary_part.added`,
 `response.reasoning_summary_text.delta`, `.done` and
@@ -858,9 +887,9 @@ preparation and generation blocking tasks, never on runtime workers.
   enforced on access. Bytes are purged physically only at startup or through
   the native `purge_file_storage`. A `purpose` is stored and echoed only; it
   enables no processing.
-- **Batches.** These run `/v1/responses`, `/v1/chat/completions` and
-  `/v1/completions`, with `completion_window: "24h"`, on the loaded model
-  only. The whole input file is validated before anything is stored.
+- **Batches.** These run `/v1/responses` and `/v1/chat/completions`, with
+  `completion_window: "24h"`, on the loaded model only; the legacy
+  `/v1/completions` is refused. The whole input file is validated before anything is stored.
   `output_expires_after` is refused, like any unknown field. One worker thread
   runs one line at a time through the same preparation and collector as the
   HTTP endpoints. Lines are stateless: `store: true`, `previous_response_id`
@@ -883,8 +912,11 @@ preparation and generation blocking tasks, never on runtime workers.
   to `rouge_5` and `rouge_l` are computed to match `rapidfuzz`, `nltk` and
   `rouge-score`. Refused: `python` graders (no sandbox), `multi` (not an eval
   criterion), `cosine` (no validated embeddings), `meteor` (no WordNet), model
-  graders or sampling naming another model, and `logs`/`stored_completions`
-  sources.
+  graders or sampling naming another model, `logs`/`stored_completions`
+  sources (`stored_completions` configs are also deprecated), and
+  `sampling_params.seed` wherever the call runs through Chat Completions,
+  which deprecated `seed` (`completions` sampling and `score_model` graders);
+  such samples report the server's fixed seed.
 
 - **Vector Stores.** Stores, store files, file batches (create, retrieve,
   cancel, list files), parsed file content and `search`, with the contract's
@@ -2639,7 +2671,8 @@ and write failures have CPU tests.
 
 With structured output and streamed background responses added, the existing
 208 HTTP checks passed again on the real model. Natively, 57 real-model checks
-passed through the engine API, including schema-constrained raw completions.
+passed through the engine API, including schema-constrained raw-prompt
+generations (an engine API since removed).
 Four requests with different schemas decoded concurrently in batched rows
 produced the same token IDs as each run alone, and constrained output matched
 with speculation on and off. A streamed background response produced 68
@@ -2696,9 +2729,9 @@ lockf -k /tmp/local-ai-gpu.lock python3 tools/client_compat.py --no-reasoning-ke
     --scenarios omp-fix-xhigh --out .scratch/artifacts/client-compat/<run>-nokey
 # long-context matrix; finished items are skipped, so split it into bounded runs
 lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes short,8k,32k
-# a long group in pieces: stage a token-exact prefix (a raw completion whose
-# disk snapshot the next hold restores), then ask; one HOME per group keeps
-# the over-budget snapshot from being evicted
+# a long group in pieces: stage a token-exact prefix (a raw `local-ai bonsai
+# --raw` prefill, no server, whose disk snapshot the next hold restores), then
+# ask; one HOME per group keeps the over-budget snapshot from being evicted
 export HOME=$PWD/.scratch/home/250k-s0-xhigh
 for n in 100000 165000 215000; do   # one lock hold each
   lockf -k /tmp/local-ai-gpu.lock python3 tools/context_eval.py --sizes 250k --seeds 0 --efforts xhigh --stage-tokens $n
@@ -2836,9 +2869,10 @@ question its own user turn, greedy, non-streamed Chat Completions; the
 first question of each (size, seed, effort) group pays the cold prefill and
 the rest reuse it from the prompt cache (three in parallel). `none` allows 384
 output tokens, `xhigh` 4,096; no answer hit its limit. Groups at 128K and
-above were prefilled in pieces, one GPU-lock hold each: a raw completion of a
-token-exact prefix of the rendered prompt (72K tokens at 128K) whose disk
-snapshot the next hold's server restored, so the cold-prefill column adds the
+above were prefilled in pieces, one GPU-lock hold each: a raw, template-free
+prefill of a token-exact prefix of the rendered prompt (72K tokens at 128K;
+then through the server, now `local-ai bonsai --raw`) whose disk snapshot the
+next hold restored, so the cold-prefill column adds the
 stages and the first question's own prefill. Intervals are 95% Wilson
 intervals over questions; the nine questions of a seed are not independent,
 so they are optimistic.
