@@ -52,10 +52,25 @@ let query = model.embed_texts(&["task: search result | query: a dog barks"], &mu
 let score: f32 = audio[0].iter().zip(&query[0]).map(|(a, b)| a * b).sum();
 ```
 
-- **`decode_audio(bytes)`** decodes WAV/PCM, FLAC, Ogg Vorbis or MP3 with Symphonia. It
-  probes the container from the bytes, averages the channels to mono, and resamples any
-  other rate to 16 kHz with Rubato's synchronous FFT resampler. Decoding stops with an
-  error past 600 s.
+- **`decode_audio(bytes)`** decodes with Symphonia, probing the container from the bytes.
+  It averages the channels to mono and resamples any other rate to 16 kHz with Rubato's
+  synchronous FFT resampler. Decoding stops with an error past 600 s. Supported formats:
+
+  | Container | Codecs | Test result (`tests/fixtures/audio-formats/`) |
+  | --- | --- | --- |
+  | WAV | PCM | decodes to the exact samples |
+  | FLAC | FLAC | decodes to the exact samples |
+  | MP4 / M4A | ALAC | decodes to the exact samples |
+  | MP4 / M4A | AAC-LC | correlation 0.995; the encoder's priming and padding are kept (+1,216 samples, mostly 1,024 of near-silence at the start), because MP4 edit lists are not applied |
+  | MP3 | MPEG-1/2 Layer III | correlation 0.99999 |
+  | Ogg | Vorbis | correlation 0.99999 |
+  | Matroska / WebM | FLAC, Vorbis | FLAC decodes to the exact samples; Vorbis-in-WebM reaches correlation 0.99999, with the encoder's padding kept (+192 samples) |
+
+  Opus (in Ogg or WebM) and every other codec are refused with `InvalidArgument`. The
+  fixtures are 0.5 s of a two-tone signal, encoded once per format by FFmpeg 9.0. The
+  test runs them through this decoder and through the transcription decoder, which uses
+  the same codec set. Correlation is the best normalized cross-correlation within
+  ±2,048 samples.
 - **`to_mono_16k(interleaved, channels, rate)`** does the same downmix and resampling for
   PCM you already have.
 - **`EmbeddingModel::embed_audio(clips, pace)`** returns one normalized vector per clip,
@@ -255,6 +270,8 @@ milliseconds for a single 10 s clip (the whole clip takes 94 ms end to end). Con
 - `local-engine/tests/fixtures/embeddinggemma2-audio-reference.jsonl`: three AudioCaps crops
   (waveform, features, embedding) and the tone and silence embeddings. The log-mel test
   always runs; the embedding test is ignored unless the model is installed.
+- `local-engine/tests/fixtures/audio-formats/`: one short two-tone clip per supported
+  container and codec, plus an Opus file that must be refused. The decode test always runs.
 
 ## Limitations
 

@@ -94,9 +94,12 @@ const SUBMIT_TOKEN_LAYERS: usize = 128;
 
 /// Decode an audio file to 16 kHz mono F32 samples.
 ///
-/// WAV/PCM, FLAC, Ogg Vorbis or MP3 (the container is probed from the
-/// bytes); channels are averaged and other sample rates are resampled with
-/// Rubato's FFT resampler.
+/// The container is probed from the bytes: WAV (PCM), FLAC, MP3, Ogg
+/// (Vorbis), MP4/M4A (AAC or ALAC) and Matroska/WebM (Vorbis or FLAC);
+/// Opus is not supported. Each is covered by a fixture test. AAC keeps the
+/// encoder's priming and padding (about 1,024 samples of near-silence at the
+/// start), since edit lists are not applied. Channels are averaged and other
+/// sample rates are resampled with Rubato's FFT resampler.
 ///
 /// # Errors
 ///
