@@ -69,6 +69,7 @@ impl BonsaiEngine {
         };
         self.set_session_cache((host_bytes / (1024 * 1024)) as usize, directory);
         self.prompt_cache_disk_bytes = disk_budget_bytes;
+        self.reclaim_disk_tier();
         self.info.policy["prompt_cache"]["host_tier"] = serde_json::json!({
             "enabled": host_bytes > 0,
             "budget_bytes": host_bytes,
@@ -92,6 +93,36 @@ impl BonsaiEngine {
         });
         self.info.policy["prompt_cache"]["disk_budget_bytes"] = disk_budget_bytes.into();
         Ok(())
+    }
+
+    /// Sweep orphaned temporaries out of the disk tier and trim it to the
+    /// budget, before serving: a previous process may have been killed
+    /// mid-write, or stopped between a commit and its trim, or run with a
+    /// larger budget. Deleted snapshots are forgotten.
+    fn reclaim_disk_tier(&mut self) {
+        let Some(dir) = self.prompt_cache_dir.clone() else {
+            return;
+        };
+        if self.prompt_cache_disk_bytes == 0 {
+            return;
+        }
+        // Writes this engine already queued would race the trim otherwise.
+        self.flush_prompt_cache();
+        let evicted = prompt_cache::reclaim(
+            &dir,
+            &self.prompt_cache_model_key,
+            self.prompt_cache_disk_bytes,
+        );
+        self.disk_snapshots
+            .retain(|entry| !evicted.contains(&entry.path));
+    }
+
+    /// A handle that closes this engine's disk writer with a deadline from
+    /// any thread: for a process whose engine is never dropped before exit
+    /// (the server's lives on a worker thread), so queued snapshot writes
+    /// either commit or leave no temporary behind.
+    pub(crate) fn prompt_cache_closer(&self) -> prompt_cache::Closer {
+        self.disk_closer.clone()
     }
 
     pub fn set_prompt_cache_checkpoints(&mut self, count: usize) -> crate::Result<()> {

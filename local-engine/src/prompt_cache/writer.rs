@@ -28,17 +28,37 @@
 //!   shared-prefix boundary, the snapshot most likely to be reused.
 //! - **Writes are flushed on drop.** Dropping the [`Writer`] finishes the
 //!   in-flight and queued jobs before joining the thread, so a process that
-//!   drops its engine finds every accepted snapshot on the next start. A
-//!   process that exits without dropping it loses at most those two jobs and
-//!   leaves at worst a `.tmp`, which `trim` reclaims once it is abandoned.
+//!   drops its engine finds every accepted snapshot on the next start.
+//! - **Bounded close.** A process that cannot drop its engine (the server,
+//!   whose engine lives on a worker thread) calls [`Closer::close`] when it
+//!   shuts down: new jobs are refused, accepted ones get a deadline to commit,
+//!   and past it the in-flight write is aborted within one piece and its
+//!   temporary removed. A process that exits without either loses at most
+//!   those two jobs and leaves at worst an unlocked `.tmp`, which the next
+//!   sweep (at the latest the next start's) reclaims.
+//! - **Admission.** A job whose snapshot the trim after it would delete again
+//!   (see `DiskIndex::admits`) is not written at all, so a near-duplicate
+//!   boundary neither costs a multi-gigabyte write nor evicts the shared
+//!   prefix it extends.
 //! - **Serial order.** Jobs run one at a time in submission order, so `trim`
 //!   never races another `store` from the same engine.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use super::{DiskEntry, DiskIndex, PromptSnapshot, store, sweep_abandoned_temporaries};
+use super::{
+    DiskEntry, DiskIndex, PromptSnapshot, store_abortable, stored_bytes,
+    sweep_abandoned_temporaries,
+};
+
+/// How long [`Closer::close`] waits, after aborting, for the in-flight write
+/// to stop and remove its temporary. An abort is seen within one piece
+/// (64 MiB); only a final `fsync` already under way can take longer, and a
+/// write still unfinished past this is left to the next sweep.
+const ABORT_GRACE: Duration = Duration::from_secs(10);
 
 /// One snapshot to persist, with everything `store` and `trim` need.
 pub struct StoreJob {
@@ -54,8 +74,9 @@ pub struct StoreJob {
 
 /// The outcome of one job, reported once the store and trim have finished.
 pub struct Completion {
-    /// The committed snapshot, or why it was not written.
-    pub stored: crate::Result<DiskEntry>,
+    /// The committed snapshot, `None` when it was not admitted (the trim
+    /// would have deleted it again), or why it was not written.
+    pub stored: crate::Result<Option<DiskEntry>>,
     /// Snapshots `trim` deleted to stay within the budget.
     pub evicted: Vec<PathBuf>,
 }
@@ -67,8 +88,8 @@ pub enum Submitted {
     Queued,
     /// Queued in place of an older queued job, which will not be written.
     Replaced,
-    /// Not queued: a shared-prefix boundary is already waiting, or the thread
-    /// is gone.
+    /// Not queued: a shared-prefix boundary is already waiting, the writer
+    /// is closed, or the thread is gone.
     Dropped,
 }
 
@@ -79,6 +100,8 @@ struct State {
     in_flight: Option<Vec<u32>>,
     completed: Vec<Completion>,
     shutdown: bool,
+    /// [`Closer::close`] was called: no new job is accepted.
+    closed: bool,
     /// The thread is gone (it panicked); nothing pending will ever finish.
     dead: bool,
 }
@@ -95,6 +118,9 @@ impl State {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    /// Set by a [`Closer::close`] past its deadline; read by the store
+    /// between pieces.
+    abort: AtomicBool,
 }
 
 impl Shared {
@@ -109,9 +135,72 @@ pub struct Writer {
     thread: Option<JoinHandle<()>>,
 }
 
+/// What [`Closer::close`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closed {
+    /// Every accepted job finished (committed, skipped or failed) in time.
+    Flushed,
+    /// The deadline passed: the queued job was discarded and the in-flight
+    /// write aborted, its temporary removed.
+    Aborted,
+}
+
+/// Shuts a [`Writer`] down from another thread with a deadline, whether or
+/// not its thread was ever spawned.
+#[derive(Clone, Default)]
+pub struct Closer {
+    shared: Arc<Shared>,
+}
+
+impl Closer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Refuse new jobs and wait up to `deadline` for the accepted ones; past
+    /// it, discard the queued job and abort the in-flight write, then wait
+    /// up to [`ABORT_GRACE`] for it to remove its temporary.
+    ///
+    /// A blocking wait on the writer's own completion signal, not a poll.
+    pub fn close(&self, deadline: Duration) -> Closed {
+        if self.wait(true, deadline) {
+            return Closed::Flushed;
+        }
+        self.shared.lock().queued = None;
+        self.shared.abort.store(true, Ordering::Release);
+        self.shared.changed.notify_all();
+        let _ = self.wait(false, ABORT_GRACE);
+        Closed::Aborted
+    }
+
+    /// Wait up to `timeout` until nothing is pending, first refusing new jobs
+    /// when `close`; whether nothing is.
+    // The guard moves into the wait, which the lint does not follow.
+    #[allow(clippy::significant_drop_tightening)]
+    fn wait(&self, close: bool, timeout: Duration) -> bool {
+        let mut state = self.shared.lock();
+        state.closed |= close;
+        let waited = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.pending(|_| true))
+            .unwrap_or_else(PoisonError::into_inner)
+            .1;
+        !waited.timed_out()
+    }
+}
+
 impl Writer {
+    #[cfg(test)]
     pub fn spawn() -> std::io::Result<Self> {
-        let shared = Arc::new(Shared::default());
+        Self::spawn_with(&Closer::new())
+    }
+
+    /// Spawn the thread behind `closer`, so a [`Closer`] handed out before
+    /// the first write closes this writer.
+    pub fn spawn_with(closer: &Closer) -> std::io::Result<Self> {
+        let shared = Arc::clone(&closer.shared);
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("prompt-cache-writer".into())
@@ -125,7 +214,7 @@ impl Writer {
     /// Hand a job to the thread without waiting for any of it.
     pub fn submit(&self, job: StoreJob) -> Submitted {
         let mut state = self.shared.lock();
-        if state.dead {
+        if state.dead || state.closed {
             return Submitted::Dropped;
         }
         let submitted = enqueue(&mut state.queued, job);
@@ -215,7 +304,7 @@ fn run(shared: &Shared) {
             state.in_flight = Some(job.tokens.clone());
             job
         };
-        let completion = persist(job, &mut index);
+        let completion = persist(job, &mut index, &shared.abort);
         let mut state = shared.lock();
         state.in_flight = None;
         state.completed.push(completion);
@@ -224,34 +313,49 @@ fn run(shared: &Shared) {
     }
 }
 
-/// `store` then `trim`, against an in-memory index of the directory.
+/// Admission, `store` then `trim`, against an in-memory index of the
+/// directory.
 ///
 /// The index is read from disk once per directory, with `discover`, and then
 /// kept current from this thread's own stores and evictions, so trimming no
 /// longer re-opens every `.bpc` to read its header and tokens after each store.
-fn persist(job: StoreJob, index: &mut Option<DiskIndex>) -> Completion {
+fn persist(job: StoreJob, index: &mut Option<DiskIndex>, abort: &AtomicBool) -> Completion {
     let index = match index {
         Some(index) if index.is_for(&job.root, &job.model_key) => index,
         _ => index.insert(DiskIndex::discover(&job.root, &job.model_key)),
     };
-    let stored = store(
-        &job.root,
+    let bytes = stored_bytes(
         &job.model_key,
         &job.tokens,
         job.session_id.as_deref(),
         &job.snapshot,
         job.reusable_boundary,
     );
+    if !index.admits(&job.tokens, bytes, job.reusable_boundary, job.budget) {
+        return Completion {
+            stored: Ok(None),
+            evicted: Vec::new(),
+        };
+    }
+    let stored = store_abortable(
+        &job.root,
+        &job.model_key,
+        &job.tokens,
+        job.session_id.as_deref(),
+        &job.snapshot,
+        job.reusable_boundary,
+        abort,
+    );
     // The payload is no longer needed; release it before the trim.
     drop(job.snapshot);
     let stored = stored.map(|path| {
-        index.insert(&path, job.reusable_boundary);
-        DiskEntry {
+        index.insert(&path, &job.tokens, job.reusable_boundary);
+        Some(DiskEntry {
             path,
             tokens: job.tokens,
             session_id: job.session_id,
             reusable_boundary: job.reusable_boundary,
-        }
+        })
     });
     sweep_abandoned_temporaries(&job.root, &job.model_key);
     let evicted = index.evict_over(job.budget);

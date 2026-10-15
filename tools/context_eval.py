@@ -658,10 +658,10 @@ def report(out: Path) -> str:
 
 
 def stop_server(server: LocalServer, grace: float) -> None:
-    """Stop `local-ai serve` with SIGINT, its graceful shutdown, which drops
-    the engine and so finishes queued prompt-cache disk writes; SIGTERM ends
-    the process at once and loses them. After
-    `grace` seconds fall back to `LocalServer.stop` (SIGTERM, then SIGKILL)."""
+    """Stop `local-ai serve` with SIGINT, its graceful shutdown, which gives
+    queued prompt-cache disk writes up to two minutes to commit (past that the
+    unfinished one is discarded, never left as a `.tmp`). After `grace`
+    seconds fall back to `LocalServer.stop` (SIGTERM, then SIGKILL)."""
     process = server.process
     if process and process.poll() is None:
         process.send_signal(signal.SIGINT)
