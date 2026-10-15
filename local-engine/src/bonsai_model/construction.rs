@@ -1,7 +1,7 @@
 use super::{
     AttentionKernel, BonsaiEngine, BonsaiInfo, BonsaiModel, BonsaiPackage, BonsaiTokenizer,
     DRAFT_CHAIN_MIN_MARGIN, KvOptions, MtpMode, MtpResolution, NgramSettings, Path, SuffixStore,
-    VOCAB,
+    VOCAB, prompt_cache,
 };
 impl BonsaiEngine {
     /// `max_context` of `None` chooses the largest context that fits safely.
@@ -108,6 +108,7 @@ impl BonsaiEngine {
             session_snapshots: Vec::new(),
             disk_snapshots: Vec::new(),
             disk_writer: None,
+            disk_closer: prompt_cache::Closer::new(),
             prompt_cache_bytes: 0,
             prompt_cache_disk_bytes: 0,
             prompt_cache_dir: None,
