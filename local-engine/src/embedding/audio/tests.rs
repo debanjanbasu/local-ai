@@ -101,6 +101,94 @@ fn decoding_rejects_garbage_and_reads_wav() {
     assert!((samples[800] - 0.25).abs() < 1e-3, "{}", samples[800]);
 }
 
+/// The signal every file in `tests/fixtures/audio-formats/` encodes: 0.5 s
+/// of `0.4 sin(2π·440 t) + 0.2 sin(2π·1250 t)` at 16 kHz mono, quantized to
+/// 16 bits (`ffmpeg -f lavfi -i aevalsrc=…:s=16000:d=0.5`, then one encoder
+/// each; the Vorbis files are its stereo upmix).
+fn format_tone() -> Vec<f32> {
+    (0..8000)
+        .map(|i| {
+            let t = f64::from(i) / 16_000.0;
+            let tau = 2.0 * std::f64::consts::PI;
+            let value = 0.2f64.mul_add((tau * 1250.0 * t).sin(), 0.4 * (tau * 440.0 * t).sin());
+            ((value * 32768.0).round().clamp(-32768.0, 32767.0) / 32768.0) as f32
+        })
+        .collect()
+}
+
+/// The best normalized cross-correlation of `decoded` with `reference` over
+/// shifts of up to `max_lag` samples either way (lossy codecs add priming
+/// and padding).
+fn best_correlation(decoded: &[f32], reference: &[f32], max_lag: usize) -> f64 {
+    let energy = |x: &[f32]| x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>();
+    let mut best = f64::MIN;
+    for lag in 0..=2 * max_lag {
+        let (a, b) = if lag <= max_lag {
+            (decoded.get(max_lag - lag..).unwrap_or_default(), reference)
+        } else {
+            (decoded, reference.get(lag - max_lag..).unwrap_or_default())
+        };
+        let n = a.len().min(b.len());
+        if n < reference.len() / 2 {
+            continue;
+        }
+        let (a, b) = (&a[..n], &b[..n]);
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum();
+        best = best.max(dot / (energy(a) * energy(b)).sqrt().max(f64::MIN_POSITIVE));
+    }
+    best
+}
+
+/// Every container and codec the decoder is built with decodes to the
+/// encoded signal: lossless ones to the sample, lossy ones to a high
+/// correlation with at most codec delay. The same files go through the
+/// transcription decoder, which shares the codec set. Opus is refused.
+#[test]
+fn every_supported_container_and_codec_decodes_the_signal() {
+    const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/audio-formats");
+    let tone = format_tone();
+    let lossless = ["tone.flac", "tone-alac.m4a", "tone-flac.mkv"];
+    let lossy = [
+        "tone.mp3",
+        "tone.ogg",
+        "tone-aac.m4a",
+        "tone-aac.mp4",
+        "tone-vorbis.webm",
+    ];
+    for name in lossless.iter().chain(&lossy) {
+        let bytes = std::fs::read(format!("{DIR}/{name}")).expect(name);
+        let extension = name.rsplit('.').next();
+        let embedding = decode_audio(bytes.clone()).expect(name);
+        let transcription = crate::transcription::audio::decode(bytes, extension, 60).expect(name);
+        for decoded in [&embedding, &transcription] {
+            if lossless.contains(name) {
+                assert_eq!(decoded.len(), tone.len(), "{name}");
+                let worst = decoded
+                    .iter()
+                    .zip(&tone)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(worst <= 2.0 / 32768.0, "{name}: max error {worst}");
+            } else {
+                assert!(
+                    decoded.len().abs_diff(tone.len()) <= 2048,
+                    "{name}: {} samples",
+                    decoded.len()
+                );
+                let correlation = best_correlation(decoded, &tone, 2048);
+                assert!(correlation >= 0.99, "{name}: correlation {correlation}");
+            }
+        }
+    }
+    let opus = std::fs::read(format!("{DIR}/tone-opus.ogg")).expect("opus");
+    assert!(decode_audio(opus.clone()).is_err());
+    assert!(crate::transcription::audio::decode(opus, Some("ogg"), 60).is_err());
+}
+
 #[derive(serde::Deserialize)]
 struct FixtureRow {
     name: String,
