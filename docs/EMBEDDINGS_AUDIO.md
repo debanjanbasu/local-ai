@@ -180,6 +180,7 @@ tokens, the final embedding, and per-layer intermediates for two clips.
 | embedding cosine, native vs reference, 54 inputs | mean ≥ 0.9995, min ≥ 0.999 | **mean 1.000000, min 0.999999** (all 54; the worst is the tone) |
 | packing independence (each clip alone vs packed) | ≥ 0.99999 | **54/54 bitwise identical** |
 | committed fixture test (5 inputs, `#[ignore]`d real-model test) | same gate | pass |
+| text + audio in one sequence, 4 inputs ([mixed-modality inputs](EMBEDDINGS.md#mixed-modality-inputs)) | same gate | **cosine 1.000000 each**; token layouts identical |
 
 Native resampling is not part of the gate: the reference fed 16 kHz audio. As a probe, a
 44.1 kHz stereo version of one clip went through the native downmix and FFT resampler, and
@@ -279,8 +280,9 @@ milliseconds for a single 10 s clip (the whole clip takes 94 ms end to end). Con
   embeddings mechanism carries audio.
 - Clips are 30 s at most. The model's soft-token budget is 750 per clip, and longer audio
   must be split by the caller.
-- Mixed text-and-audio inputs (a prompt plus audio in one sequence) are not exposed. The
-  reference embeds media without text.
+- Text and audio in one sequence work through `embed_multimodal` and match the reference
+  (see [mixed-modality inputs](EMBEDDINGS.md#mixed-modality-inputs)). The audio
+  retrieval protocol above embeds media without text, as the model card does.
 - The resampler is Rubato's FFT resampler, not soxr. On non-16 kHz input the embeddings
   can therefore differ slightly from a librosa-fed reference (see the probe above).
-- The vision and video encoders are separate work.
+- Images and video are documented in [EMBEDDINGS.md](EMBEDDINGS.md#images-and-video).
