@@ -2962,6 +2962,24 @@ its 249,350-token system-turn snapshot as a 4.66 GB `.tmp` (of ~9.8 GB), so
 the next question could only restore the 215K stage. The `xhigh` answers
 presumably took long enough for the write to commit first.
 
+Both are fixed after `0c9ec76`. The first was not a code regression: the
+prompt-cache code is identical at `d2cad1b`, `6ac7dec` and `0c9ec76`. A
+follow-up's divergence boundary is its common prefix with whichever prompt
+the engine cached last, so a question that follows one of its own kind
+yields a boundary a few tokens past the system turn, and both the disk trim
+and the four GPU checkpoints evicted the oldest boundary first; whether
+that happened depended on arrival order. A boundary that only barely
+extends a kept one is now the one dropped (see [Prompt cache](#prompt-cache)).
+The second: the server's engine lives on a worker thread that exit never
+joined, so SIGINT killed the background write; shutdown (SIGINT or SIGTERM)
+now closes the writer with a two-minute deadline, and startup removes
+orphaned temporaries and trims to the budget. Rerun of 128K seed 0 `none`
+(72K stage, then nine questions, eight three at a time, server at `4004c39`):
+every follow-up restored the 127,882-token system-turn snapshot (seven from
+disk, one from a GPU checkpoint 4 tokens past it), 4–11 s to first token and
+8.5–27 s per answer, scoring the same 5/9; afterwards the disk held only that
+snapshot, and the SIGINT stop left no `.tmp`.
+
 Rerun 2026-10-12/13, server built at `6ac7dec` (`9228478` adds only docs), M4 Pro 48 GB:
 
 | Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All (95% CI) | Cold prefill | Warm wall, median |
