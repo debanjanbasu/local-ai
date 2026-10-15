@@ -2854,11 +2854,17 @@ time, the rest three at a time):
 | 128K | none | 0 | 127,931–127,943 | 3/3 | 0/3 | 2/3 | 1/3 | 2/3 | 2/3 | 5/9 (27–81%) | 71 tok/s (1,809 s) | 2.1 tok/s | 24.5 s |
 | 128K | xhigh | 0 | 127,967–127,979 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **9/9** (70–100%) | 71 tok/s (1,790 s) | 18.4 tok/s | 16.3 s |
 | ~250K | xhigh | 1 | 249,944–249,956 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **9/9** (70–100%) | 48 tok/s (5,242 s) | 10.9 tok/s | 31.4 s |
-| ~250K | none | 0 | 249,409 | - | 0/1 | - | 0/1 | - | - | 0/1 (lookup start only) | 44 tok/s (5,699 s) | - | - |
+| ~250K | none | 0,1 | 249,399–249,920 | 6/6 | 0/6 | 4/6 | 2/6 | 4/6 | 4/6 | 10/18 (34–75%) | 44–50 tok/s (5,040–5,699 s) | 2.2 tok/s | 11.3 s |
 
-The ~250K `none` group stopped after its first question (a lookup, answered
-133 for 182, the kind `none` also misses at 128K) when the lock-time budget ran out;
-its 215K stage is kept for a resume.
+~250K `none` (2026-10-16, same build; seed 0 resumed from its 215K stage,
+whose last 34K took 1,108 s; seed 1 staged at 100K/165K/215K in 1,251, 1,369
+and 1,350 s, then 1,070 s for the rest) scored 5/9 on each seed, the same
+pattern as 128K seed 0: recall 6/6 (61–100%), lookup 0/6 (0–39%; answers
+101–137 for 182–552), fix 4/6 (30–90%; both misses are the `sum_even`
+needle, at the start in both seeds). By position start 2/6 (10–70%), middle
+4/6 and end 4/6 (30–90% each). Every follow-up was asked alone after
+restoring a clone of the system-turn snapshot (10–17 s per answer). Seed 0's
+lookup-start was asked again and repeated its earlier 133.
 
 The scores repeat the earlier runs exactly where they overlap: 128K seed 0
 `none` 5/9 with every lookup wrong, `xhigh` 9/9. Pooled with the earlier
@@ -2947,10 +2953,8 @@ GPU checkpoint (every warm row reports `cache_source: disk`): restoring the
 and answers then decoded at 12–14 tok/s three at a time, 26–110 s per
 answer. One ~250K seed is evidence that the length works, not a rate.
 
-Not measured: 8K/32K on a current server, ~250K seed 2, `none` at ~250K
-beyond seed 0's first question, and 128K seeds 1–2 on `0c9ec76`. Raw rows (answers, token
-counts, timings, cache hits) are in `.amp/in/artifacts/context-eval/results.jsonl`
-(second run) and `run2/results.jsonl` (third run), the staged prefixes in
-`stages.jsonl` beside each (`run2-restage/` holds the two rebuilt 72K
-stages), the prompts in `prompts/`, and the server log and per-hold log
-(`holds.log`, with every snapshot file before and after each hold) beside them.
+Not measured: 8K/32K on a current server, ~250K seed 2, and 128K seeds 1–2
+on `0c9ec76`. The raw rows of the second and third runs were deleted; those
+of the ~250K `none` run (answers, token counts, timings, cache hits, seed 1's
+stages, prompts, server log and `holds.log` with the snapshot files after
+each item) are in `.amp/in/artifacts/context-eval/`.
