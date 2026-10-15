@@ -405,7 +405,7 @@ providers:
       supportsForcedToolChoice: false
       reasoningEffortMap: {minimal: xhigh, low: xhigh, medium: xhigh, high: xhigh, max: xhigh}
     models:
-      - id: ternary-bonsai-2-27b # not checked by the server
+      - id: ternary-bonsai-2-27b # the server's id (GET /v1/models)
         name: Ternary Bonsai 2 27B (local-ai)
         reasoning: true
         thinking: {mode: effort, efforts: [xhigh], defaultLevel: xhigh, requiresEffort: false}

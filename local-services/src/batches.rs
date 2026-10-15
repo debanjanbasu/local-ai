@@ -98,8 +98,11 @@ const EXPIRED_MESSAGE: &str =
     "this request was not executed before the batch's completion window expired";
 
 /// Version 1: batches and their lines. `ending` is the terminal status a
-/// finalizing or cancelling batch is moving to.
-const MIGRATIONS: &[&str] = &["
+/// finalizing or cancelling batch is moving to. Version 2: the batch's
+/// [`Owner`], `NULL` for batches created before it was kept and for
+/// unattributed callers.
+const MIGRATIONS: &[&str] = &[
+    "
 CREATE TABLE batches (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -140,7 +143,12 @@ CREATE TABLE batch_lines (
     UNIQUE (batch_id, custom_id)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX batch_lines_state ON batch_lines (batch_id, state, line);
-"];
+",
+    "
+ALTER TABLE batches ADD COLUMN project_id TEXT;
+ALTER TABLE batches ADD COLUMN api_key_id TEXT;
+",
+];
 
 const COLUMNS: &str = "id, endpoint, model, input_file_id, completion_window, status, metadata, \
      errors, output_file_id, error_file_id, created_at, in_progress_at, expires_at, \
@@ -334,6 +342,14 @@ pub struct CreateBatch {
     pub metadata: Metadata,
 }
 
+/// Who created a batch: the project API key its lines' usage is attributed
+/// to. Kept with the batch but not part of the public `batch` object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub project_id: String,
+    pub api_key_id: String,
+}
+
 /// Query for [`Store::list_batches`]: newest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -388,6 +404,8 @@ pub struct PendingLine {
     pub body: Map<String, Value>,
     /// When the batch expires; generation past it is wasted.
     pub expires_at: u64,
+    /// Who created the batch; `None` when unattributed.
+    pub owner: Option<Owner>,
 }
 
 /// The result of one line.
@@ -409,6 +427,17 @@ impl Store {
     /// lines) as its `body.model`; any other model is refused as invalid
     /// before anything is stored.
     pub fn create_batch(&self, request: &CreateBatch, installed_model: &str) -> Result<Batch> {
+        self.create_batch_for(request, installed_model, None)
+    }
+
+    /// [`Self::create_batch`] for `owner`, whose project and key the lines'
+    /// usage is attributed to (see [`PendingLine::owner`]).
+    pub fn create_batch_for(
+        &self,
+        request: &CreateBatch,
+        installed_model: &str,
+        owner: Option<&Owner>,
+    ) -> Result<Batch> {
         let endpoint: Endpoint = request.endpoint.parse()?;
         if request.completion_window != COMPLETION_WINDOW {
             return Err(invalid(format!(
@@ -441,8 +470,9 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO batches (id, endpoint, model, input_file_id, completion_window, status,
-                                  metadata, created_at, in_progress_at, expires_at, total)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'in_progress', ?6, ?7, ?7, ?8, ?9)",
+                                  metadata, created_at, in_progress_at, expires_at, total,
+                                  project_id, api_key_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'in_progress', ?6, ?7, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 endpoint.as_str(),
@@ -453,6 +483,8 @@ impl Store {
                 signed(created_at)?,
                 signed(created_at.saturating_add(COMPLETION_WINDOW_SECONDS))?,
                 signed(count(lines.len()))?,
+                owner.map(|owner| owner.project_id.as_str()),
+                owner.map(|owner| owner.api_key_id.as_str()),
             ],
         )?;
         {
@@ -607,6 +639,19 @@ impl Store {
         let Some((line, custom_id, record_id, body)) = row else {
             return Ok(NextLine::Finish);
         };
+        let owner = connection.query_row(
+            "SELECT project_id, api_key_id FROM batches WHERE id = ?1",
+            [&lease.id],
+            |row| {
+                Ok(match (row.get(0)?, row.get(1)?) {
+                    (Some(project_id), Some(api_key_id)) => Some(Owner {
+                        project_id,
+                        api_key_id,
+                    }),
+                    _ => None,
+                })
+            },
+        )?;
         Ok(NextLine::Line(PendingLine {
             line: unsigned(line)?,
             custom_id,
@@ -614,6 +659,7 @@ impl Store {
             endpoint: batch.endpoint,
             body: serde_json::from_str(&body)?,
             expires_at: batch.expires_at,
+            owner,
         }))
     }
 

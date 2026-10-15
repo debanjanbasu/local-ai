@@ -69,9 +69,6 @@ const MAX_FORM_FIELDS: usize = 16;
 const MAX_TEXT_FIELD_BYTES: usize = 16 * 1024;
 const DECODE_YIELD_LIMIT: Duration = Duration::from_millis(500);
 const RETRY_AFTER_SECONDS: u32 = 1;
-/// `model` values served by the local Whisper (`whisper-1` is the hosted API's name
-/// for its hosted Whisper).
-const MODEL_ALIASES: [&str; 2] = [TRANSCRIPTION_MODEL_ID, "whisper-1"];
 const EXTENSIONS: [&str; 9] = [
     "flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm",
 ];
@@ -294,7 +291,9 @@ fn validate(raw: RawForm, task: Task) -> Result<Form, Failure> {
     let model = raw
         .model
         .ok_or_else(|| bad("field \"model\" is required"))?;
-    if !MODEL_ALIASES.contains(&model.as_str()) {
+    if super::models::resolve(&model, super::models::BONSAI_MODEL_ID)
+        != Some(super::models::Served::Transcription)
+    {
         return Err(bad(format!(
             "model {model:?} is not served here; use {TRANSCRIPTION_MODEL_ID:?}"
         )));

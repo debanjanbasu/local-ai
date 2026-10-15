@@ -17,6 +17,7 @@ use local_engine::{ChatRequest, Event, GenerationStats, Signal, Stats};
 use local_services::Store;
 
 use super::super::QueueDepth;
+use super::super::admin::Meter;
 use super::super::batches::{Batches, Config, Generation, Submit};
 use super::{Evals, matches};
 
@@ -142,6 +143,7 @@ impl Server {
                 thinking: false,
                 cipher: None,
                 depth: QueueDepth::default(),
+                meter: Meter::default(),
             },
         )
         .expect("batch worker starts");
@@ -169,7 +171,7 @@ impl Server {
             .body(body)
             .expect("request");
         let (parts, body) = request.into_parts();
-        match self.evals.dispatch(&parts, body).await {
+        match self.evals.dispatch(&parts, body, None).await {
             Ok(answer) => answer,
             Err((status, message)) => (status, json!({"error": {"message": message}})),
         }

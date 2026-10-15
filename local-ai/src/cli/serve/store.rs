@@ -100,6 +100,11 @@ pub(super) struct StoredResponse {
     /// The request body a pending durable background Response is regenerated
     /// from after a restart; `None` once it has ended, and for every other.
     pub(super) request: Option<Value>,
+    /// Who created that pending request, kept beside it so a resumed
+    /// generation's usage is attributed to them: `{"project_id",
+    /// "api_key_id"}` for a project API key. `None` for an unattributed
+    /// caller and in records written before creators were kept.
+    pub(super) creator: Option<Value>,
 }
 
 impl StoredResponse {
@@ -464,13 +469,14 @@ impl ResponseStore {
         self.save_with(response, input_items, None)
     }
 
-    /// [`Self::save`], keeping `request` in the record as well: the body a
-    /// pending background Response is regenerated from after a restart.
+    /// [`Self::save`], keeping `pending` in the record as well: the body a
+    /// pending background Response is regenerated from after a restart, and
+    /// who created it.
     pub(super) fn save_with(
         &self,
         response: &Value,
         input_items: &[Value],
-        request: Option<&Value>,
+        pending: Option<(&Value, Option<&Value>)>,
     ) -> std::io::Result<()> {
         let id = response.get("id").and_then(Value::as_str).unwrap_or("");
         let path = self.path(id).ok_or_else(|| invalid_id(id))?;
@@ -480,8 +486,11 @@ impl ResponseStore {
             "response":response,
             "input_items":input_items,
         });
-        if let Some(request) = request {
+        if let Some((request, creator)) = pending {
             record["request"] = request.clone();
+            if let Some(creator) = creator {
+                record["creator"] = creator.clone();
+            }
         }
         let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         let temporary = self
@@ -517,6 +526,10 @@ impl ResponseStore {
         let response = record.get_mut("response").map(Value::take);
         let input_items = record.get_mut("input_items").map(Value::take);
         let request = record.get_mut("request").map(Value::take);
+        let creator = record
+            .get_mut("creator")
+            .map(Value::take)
+            .filter(|creator| request.is_some() && creator.is_object());
         match (version, response, input_items) {
             (Some(RECORD_VERSION), Some(response), Some(Value::Array(input_items)))
                 if response.get("id").and_then(Value::as_str) == Some(id) =>
@@ -525,6 +538,7 @@ impl ResponseStore {
                     response,
                     input_items,
                     request,
+                    creator,
                 }))
             }
             _ => Err(std::io::Error::new(
