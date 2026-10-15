@@ -2892,6 +2892,61 @@ stages and the first question's own prefill. Intervals are 95% Wilson
 intervals over questions; the nine questions of a seed are not independent,
 so they are optimistic.
 
+Third run 2026-10-13/14, server built at `0c9ec76`, M4 Pro 48 GB (decode
+is the warm median per answer; ~250K and some 128K follow-ups ran one at a
+time, the rest three at a time):
+
+| Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All (95% CI) | Cold prefill | Warm decode | Warm wall, median |
+| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
+| 64K | none | 0,1,2 | 64,296–64,415 | 9/9 | 7/9 | 6/9 | 7/9 | 9/9 | 6/9 | 22/27 (63–92%) | 87–93 tok/s (691–736 s) | 3.9 tok/s | 7.2 s |
+| 64K | xhigh | 0,1,2 | 64,332–64,451 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | **27/27** (88–100%) | 92–93 tok/s (693–702 s) | 9.6 tok/s | 22.9 s |
+| 128K | none | 0 | 127,931–127,943 | 3/3 | 0/3 | 2/3 | 1/3 | 2/3 | 2/3 | 5/9 (27–81%) | 71 tok/s (1,809 s) | 2.1 tok/s | 24.5 s |
+| 128K | xhigh | 0 | 127,967–127,979 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **9/9** (70–100%) | 71 tok/s (1,790 s) | 18.4 tok/s | 16.3 s |
+| ~250K | xhigh | 1 | 249,944–249,956 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **9/9** (70–100%) | 48 tok/s (5,242 s) | 10.9 tok/s | 31.4 s |
+| ~250K | none | 0 | 249,409 | - | 0/1 | - | 0/1 | - | - | 0/1 (lookup start only) | 44 tok/s (5,699 s) | - | - |
+
+The ~250K `none` group stopped after its first question (a lookup, answered
+133 for 182, the kind `none` also misses at 128K) when the lock-time budget ran out;
+its 215K stage is kept for a resume.
+
+The scores repeat the earlier runs exactly where they overlap: 128K seed 0
+`none` 5/9 with every lookup wrong, `xhigh` 9/9. Pooled with the earlier
+seeds, `xhigh` is 27/27 at 64K, 27/27 at 128K (88–100%) and 18/18 at ~250K
+(82–100%, seeds 0 and 1). `none` fails the same `sum_even` fix needle at
+every size (the changed line is not the buggy one, and its indentation no
+longer parses) and most lookups, while recall stays 100%. Single-stream
+`xhigh` decode was 17–22 tok/s at 128K and 9–13 tok/s at ~250K after a
+12 s disk restore of the 9.8 GB system-turn snapshot; cold prefill was 92
+tok/s to 64K, 88 tok/s to 72K and 48 tok/s averaged to ~250K (stages to 100K,
+165K, 215K: 1,259, 1,409 and 1,425 s, then 1,148 s for the last 34K).
+
+**Prompt-cache trimming at ≥128K.** The automatic disk budget is 5.9 GB
+(bounded by the 5 GiB model), and a 128K snapshot is 5.06 GB, so one snapshot
+fills it; each newer one evicts the older, always keeping one. Staging
+relies on that: each ~250K stage restored the previous one and its commit
+deleted it, except that the 100K stage of seed 0 `none` survived beside the
+165K one (10.5 GB on disk) until the 215K commit trimmed both, so a
+restarted server can briefly hold more than the budget. With three
+follow-ups in parallel, a later question that shared a deeper prefix with an
+earlier one of its kind (recall vs recall at `none`, 127,895 tokens; fix vs
+fix at `xhigh`, 127,926) wrote a divergence boundary that evicted the
+system-turn boundary (127,882 / 127,920) and the staged prefix, so every
+question of another kind fell back to a full cold prefill (a stack sample
+showed the engine in `prefill_segment` at 99% GPU six minutes into the last
+two `none` requests). Those holds were stopped, the snapshot deleted, the 72K
+stage rebuilt, and the remaining questions asked one per server start after
+restoring an APFS clone of the system-turn snapshot (a scratch wrapper
+around `tools/context_eval.py`; prompts and scoring unchanged). Each answer
+then took 11–50 s plus a few seconds of server start. Under the previous
+build every follow-up of five 128K/~250K groups reused the system-turn
+boundary or one 4 tokens past it and no deeper one appeared, so this looks like a
+regression in long-context multi-question reuse (not bisected). A SIGINT
+stop does not always finish a queued write either: signalled right after a
+3-token ~250K `none` answer, the server exited within about a second, leaving
+its 249,350-token system-turn snapshot as a 4.66 GB `.tmp` (of ~9.8 GB), so
+the next question could only restore the 215K stage. The `xhigh` answers
+presumably took long enough for the write to commit first.
+
 Rerun 2026-10-12/13, server built at `6ac7dec` (`9228478` adds only docs), M4 Pro 48 GB:
 
 | Size | Effort | Seeds | Prompt tokens | Recall | Lookup | Fix | Start | Middle | End | All (95% CI) | Cold prefill | Warm wall, median |
@@ -2941,7 +2996,10 @@ GPU checkpoint (every warm row reports `cache_source: disk`): restoring the
 and answers then decoded at 12–14 tok/s three at a time, 26–110 s per
 answer. One ~250K seed is evidence that the length works, not a rate.
 
-Not measured: 64K, 8K/32K and 128K seed 0 on the current server, more
-~250K seeds, and `none` at ~250K. Raw rows (answers, token counts, timings, cache hits) are in
-`.amp/in/artifacts/context-eval/results.jsonl`, the staged prefixes in
-`stages.jsonl`, the prompts in `prompts/`, and the server log beside them.
+Not measured: 8K/32K on a current server, ~250K seed 2, `none` at ~250K
+beyond seed 0's first question, and 128K seeds 1–2 on `0c9ec76`. Raw rows (answers, token
+counts, timings, cache hits) are in `.amp/in/artifacts/context-eval/results.jsonl`
+(second run) and `run2/results.jsonl` (third run), the staged prefixes in
+`stages.jsonl` beside each (`run2-restage/` holds the two rebuilt 72K
+stages), the prompts in `prompts/`, and the server log and per-hold log
+(`holds.log`, with every snapshot file before and after each hold) beside them.
