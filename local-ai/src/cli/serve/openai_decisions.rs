@@ -141,8 +141,8 @@ pub(super) fn close(service: Option<&OpenAiDecisions>) {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestBody {
-    /// Required by the spec; the loaded model answers.
-    #[allow(dead_code)]
+    /// Required by the spec; checked by [`super::models::check_generation`],
+    /// the loaded model answers.
     model: String,
     input: Value,
     questions: Vec<Question>,
@@ -196,6 +196,7 @@ pub(super) struct Prepared {
 pub(super) fn prepare(body: &[u8]) -> Result<Prepared, String> {
     let body: RequestBody =
         serde_json::from_slice(body).map_err(|error| format!("invalid JSON body: {error}"))?;
+    super::models::check_generation(Some(&body.model)).map_err(|error| error.to_string())?;
     if !QUESTIONS.contains(&body.questions.len()) {
         return Err(format!(
             "questions must hold {}..={} questions, got {}",

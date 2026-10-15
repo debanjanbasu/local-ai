@@ -13,11 +13,12 @@ use local_engine::{
 };
 
 use super::chunked::{Body, Flow, absorb};
+use super::models::{Catalog, Installed};
+use super::prepare;
 use super::request::prepare_generation;
 use super::response::{Protocol, Reply};
 use super::responses::{ResponsesState, prepare_responses};
 use super::sse::Frames;
-use super::{Installed, models_json, prepare};
 
 fn chat_request(body: &Value, thinking: bool) -> crate::Result<ChatRequest> {
     Ok(prepare_generation(body.to_string().as_bytes(), thinking)?.request)
@@ -1154,7 +1155,13 @@ fn reply_ids_are_prefixed_and_unique() {
 
 #[test]
 fn models_report_the_admitted_context() {
-    let models = models_json("bonsai", 32768, 1234, Installed::default());
+    let models = Catalog {
+        bonsai: "bonsai",
+        context: 32768,
+        created: 1234,
+        installed: Installed::default(),
+    }
+    .list();
     assert_eq!(models["data"][0]["id"], "bonsai");
     assert_eq!(models["data"][0]["created"], 1234);
     assert_eq!(models["data"][0]["context_length"], 32768);
@@ -1170,7 +1177,13 @@ fn models_list_every_installed_model() {
         speech: true,
         transcription: true,
     };
-    let models = models_json("bonsai", 32768, 1234, installed);
+    let models = Catalog {
+        bonsai: "bonsai",
+        context: 32768,
+        created: 1234,
+        installed,
+    }
+    .list();
     let ids: Vec<&str> = models["data"]
         .as_array()
         .expect("data")

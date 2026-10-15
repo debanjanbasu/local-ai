@@ -15,10 +15,13 @@ use serde_json::{Value, json};
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{ChatRequest, Event, GenerationStats, Signal, Stats};
 use local_services::Store;
-use local_services::batches::{CreateBatch, LineOutcome};
+use local_services::admin::Admin;
+use local_services::admin::usage::{UsageKind, UsageQuery, UsageRecord};
+use local_services::batches::{CreateBatch, LineOutcome, Owner};
 use local_services::files::{CreateFile, FilePurpose};
 
 use super::super::QueueDepth;
+use super::super::admin::Meter;
 use super::{Batches, Config, Generation, Submit, matches};
 
 /// A store in a temporary directory, removed when dropped.
@@ -161,6 +164,7 @@ fn start(store: &Store, submit: Submit) -> Arc<Batches> {
             thinking: false,
             cipher: None,
             depth: QueueDepth::default(),
+            meter: Meter::default(),
         },
     )
     .expect("worker starts")
@@ -183,7 +187,7 @@ async fn send(batches: &Batches, method: Method, uri: &str, body: &Value) -> (St
         .body(body)
         .expect("request");
     let (parts, body) = request.into_parts();
-    match batches.dispatch(&parts, body).await {
+    match batches.dispatch(&parts, body, None).await {
         Ok(value) => (StatusCode::OK, value),
         Err((status, message)) => (status, json!({"error":{"message":message}})),
     }
@@ -635,4 +639,117 @@ async fn a_resumed_line_for_another_model_fails_without_generating() {
     );
     stop(&batches).await;
     assert!(seen.lock().expect("seen").is_empty());
+}
+
+#[tokio::test]
+async fn a_line_stored_with_the_legacy_path_model_id_still_runs() {
+    let scratch = Scratch::new();
+    let legacy = "/Users/me/local-ai/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+    let mut line = chat("a", "hello");
+    line["body"]["model"] = json!(legacy);
+    // Stored by an earlier version, which named the model by its path.
+    let stored = scratch
+        .store
+        .create_batch(
+            &CreateBatch {
+                input_file_id: scratch.input(&[line]),
+                endpoint: "/v1/chat/completions".to_owned(),
+                completion_window: "24h".to_owned(),
+                metadata: local_services::Metadata::new(),
+            },
+            legacy,
+        )
+        .expect("batch created");
+    let (submit, seen, _) = fake(false);
+    let batches = start(&scratch.store, submit);
+    let done = settled(&scratch.store, &stored.id).await;
+    assert_eq!(
+        done["request_counts"],
+        json!({"total":1,"completed":1,"failed":0}),
+        "{done}"
+    );
+    stop(&batches).await;
+    assert_eq!(*seen.lock().expect("seen"), ["hello"]);
+}
+
+/// Completions usage written by batch lines, grouped by project and key.
+fn batch_usage(admin: &Admin) -> Vec<Value> {
+    let page = admin
+        .usage(&UsageQuery {
+            kind: UsageKind::Completions,
+            start_time: i64::try_from(super::super::response::unix_now()).expect("now") - 60,
+            end_time: None,
+            bucket_width: local_services::admin::usage::DAY,
+            limit: Some(2),
+            page: None,
+            project_ids: Vec::new(),
+            user_ids: Vec::new(),
+            api_key_ids: Vec::new(),
+            models: Vec::new(),
+            batch: Some(true),
+            group_by: vec!["project_id".into(), "api_key_id".into()],
+        })
+        .expect("usage");
+    page.data
+        .into_iter()
+        .flat_map(|bucket| bucket.results)
+        .collect()
+}
+
+#[tokio::test]
+async fn lines_are_attributed_to_the_project_key_that_created_the_batch() {
+    let scratch = Scratch::new();
+    let admin = Arc::new(Admin::new(scratch.store.clone()));
+    let mut record = UsageRecord::new(UsageKind::Completions);
+    record.model = Some("local".into());
+    record.batch = true;
+    let (submit, _, _) = fake(false);
+    let batches = Batches::spawn(
+        scratch.store.clone(),
+        submit,
+        Config {
+            model: "local".into(),
+            thinking: false,
+            cipher: None,
+            depth: QueueDepth::default(),
+            meter: Meter::into_store(Some(&admin), record),
+        },
+    )
+    .expect("worker starts");
+    let owner = Owner {
+        project_id: "proj_a".into(),
+        api_key_id: "key_a".into(),
+    };
+    let mut ids = Vec::new();
+    for owner in [Some(owner), None] {
+        let file = scratch.input(&[chat("a", "hello"), chat("b", "world")]);
+        let body = json!({"input_file_id":file,"endpoint":"/v1/chat/completions",
+                          "completion_window":"24h"});
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/batches")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let (parts, body) = request.into_parts();
+        let created = batches
+            .dispatch(&parts, body, owner)
+            .await
+            .expect("created");
+        ids.push(created["id"].as_str().expect("id").to_owned());
+    }
+    for id in &ids {
+        let done = settled(&scratch.store, id).await;
+        assert_eq!(done["request_counts"]["completed"], 2, "{done}");
+    }
+    stop(&batches).await;
+    let mut usage = batch_usage(&admin);
+    usage.sort_by_key(|result| result["project_id"].is_null());
+    assert_eq!(usage.len(), 2, "{usage:#?}");
+    assert_eq!(usage[0]["project_id"], "proj_a");
+    assert_eq!(usage[0]["api_key_id"], "key_a");
+    assert_eq!(usage[0]["num_model_requests"], 2);
+    assert_eq!(usage[0]["input_tokens"], 14);
+    // A batch created without a project key stays unattributed.
+    assert_eq!(usage[1]["project_id"], Value::Null);
+    assert_eq!(usage[1]["num_model_requests"], 2);
 }

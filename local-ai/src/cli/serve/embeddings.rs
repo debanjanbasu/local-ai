@@ -197,7 +197,9 @@ fn tokens(values: &[Value]) -> Result<Vec<u32>, String> {
 fn parse(body: &[u8]) -> Result<Parsed, String> {
     let request: RequestBody = serde_json::from_slice(body)
         .map_err(|error| format!("invalid embeddings request: {error}"))?;
-    if request.model != EMBEDDING_MODEL_ID {
+    if super::models::resolve(&request.model, super::models::BONSAI_MODEL_ID)
+        != Some(super::models::Served::Embeddings)
+    {
         return Err(format!(
             "model {:?} is not served here; use {EMBEDDING_MODEL_ID:?}",
             request.model
