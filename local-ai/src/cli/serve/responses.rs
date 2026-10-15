@@ -121,7 +121,7 @@ const COMPACT_DEPRECATED: &[(&str, &str)] =
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponsesRequest {
-    #[allow(dead_code)]
+    /// Checked by [`super::models::check_generation`]; the loaded model answers.
     model: Option<String>,
     input: Option<Value>,
     instructions: Option<String>,
@@ -358,6 +358,18 @@ impl Echo {
         self.spent.add(stats);
     }
 
+    /// Record who creates this Response (see [`StoredResponse::creator`]),
+    /// for a durable background one that a restarted server may resume.
+    pub(super) fn set_creator(&mut self, creator: Option<Value>) {
+        if let Some(persist) = self
+            .persist
+            .as_mut()
+            .filter(|persist| persist.request.is_some())
+        {
+            persist.creator = creator;
+        }
+    }
+
     /// The durable store of a background Response that a restarted server
     /// may regenerate: one kept in `--response-store`, not temporarily.
     pub(super) fn resumable_store(&self) -> Option<&Arc<ResponseStore>> {
@@ -382,6 +394,8 @@ struct Persist {
     /// else, including one continuing a conversation, which is never
     /// regenerated because its append cannot be repeated with new output.
     request: Option<Value>,
+    /// Who created `request` (see [`StoredResponse::creator`]), kept with it.
+    creator: Option<Value>,
 }
 
 /// A `context_management` compaction entry.
@@ -764,6 +778,7 @@ pub(super) fn prepare_responses_conversing(
     }
     let request: ResponsesRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
+    super::models::check_generation(request.model.as_deref())?;
     reject_temporary_previous(request.previous_response_id.as_deref(), temporary)?;
     request.reject_unsupported(
         store.is_some(),
@@ -1103,8 +1118,8 @@ impl PreparedResponses {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompactRequest {
-    /// Required by the contract; any value names the one loaded model.
-    #[allow(dead_code)]
+    /// Required by the contract; checked by
+    /// [`super::models::check_generation_value`], the loaded model answers.
     model: Option<Value>,
     input: Option<Value>,
     previous_response_id: Option<String>,
@@ -1134,6 +1149,7 @@ pub(super) fn prepare_compact(
     reject_deprecated(body, COMPACT_DEPRECATED, "Responses compaction")?;
     let request: CompactRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
+    super::models::check_generation_value(request.model.as_ref())?;
     let cipher = cipher.ok_or_else(|| {
         unsupported(
             "compaction",
@@ -1333,6 +1349,7 @@ pub(super) fn prepare_resumed(
     match prepared.echo.persist.as_mut() {
         Some(persist) if prepared.echo.background && persist.temporary.is_none() => {
             persist.request = Some(request.clone());
+            persist.creator.clone_from(&stored.creator);
         }
         _ => {
             return Err(invalid(
@@ -1370,6 +1387,7 @@ fn persist(
             input_items: items,
             temporary: Some(Arc::clone(temporary)),
             request: None,
+            creator: None,
         }),
         None => store
             .filter(|_| request.store.unwrap_or(true))
@@ -1378,6 +1396,7 @@ fn persist(
                 input_items: items,
                 temporary: None,
                 request: None,
+                creator: None,
             }),
     }
 }
@@ -2737,7 +2756,8 @@ impl ResponsesState {
         let request = persist
             .request
             .as_ref()
-            .filter(|_| matches!(status, Some("queued" | "in_progress")));
+            .filter(|_| matches!(status, Some("queued" | "in_progress")))
+            .map(|request| (request, persist.creator.as_ref()));
         let Some(conversing) = self.echo.conversation.as_ref().filter(|_| ended) else {
             return persist
                 .store

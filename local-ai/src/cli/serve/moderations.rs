@@ -47,6 +47,8 @@ use local_services::admin::usage::UsageKind;
 
 use super::admin::{self, Caller};
 use super::embeddings::{self, CancelOnDrop, Embeddings};
+#[cfg(test)]
+use super::models::MODERATION_ALIASES as ALIASES;
 use super::response::{error_response, json_response, new_id};
 use super::{AppState, MAX_REQUEST_BYTES};
 
@@ -55,13 +57,6 @@ pub(super) const ROUTE: &str = "/v1/moderations";
 const MAX_INPUTS: usize = 256;
 /// Tokens over every window of a request.
 const MAX_TOTAL_TOKENS: usize = 300_000;
-/// `OpenAI` moderation model names accepted as aliases.
-const ALIASES: [&str; 4] = [
-    "omni-moderation-latest",
-    "omni-moderation-2024-09-26",
-    "text-moderation-latest",
-    "text-moderation-stable",
-];
 /// Categories whose `categories` value may be `null` in the spec.
 const NULLABLE: [&str; 2] = ["illicit", "illicit/violent"];
 pub(super) const UNSCORED_HEADER: &str = "x-moderation-unscored-categories";
@@ -121,8 +116,8 @@ fn parse(body: &[u8]) -> Result<Vec<String>, String> {
     let request: RequestBody = serde_json::from_slice(body)
         .map_err(|error| format!("invalid moderation request: {error}"))?;
     if let Some(model) = request.model.as_deref()
-        && model != MODERATION_MODEL_ID
-        && !ALIASES.contains(&model)
+        && super::models::resolve(model, super::models::BONSAI_MODEL_ID)
+            != Some(super::models::Served::Moderation)
     {
         return Err(format!(
             "model {model:?} is not served here; use {MODERATION_MODEL_ID:?} (or omit it)"
