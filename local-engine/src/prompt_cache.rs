@@ -433,36 +433,50 @@ pub fn barely_extends(child: &[u32], parent: &[u32]) -> bool {
         && child.starts_with(parent)
 }
 
-/// The order in which entries (oldest first) are evicted to fit `budget`,
-/// always keeping one:
+/// Which of `entries` (tokens and whether each is a shared-prefix boundary,
+/// oldest first) to evict next, when one must go:
 ///
-/// 1. request tails, oldest first;
-/// 2. then shared-prefix boundaries that barely extend another kept boundary
-///    (see [`barely_extends`]), newest first;
-/// 3. then the remaining boundaries, oldest first.
+/// 1. the oldest request tail;
+/// 2. else the newest boundary that barely extends another one (see
+///    [`barely_extends`]);
+/// 3. else the oldest boundary.
+///
+/// The disk tier applies it until its byte budget holds, the GPU tier when
+/// it holds one checkpoint too many.
+pub fn next_victim(entries: &[(&[u32], bool)]) -> Option<usize> {
+    let near_duplicate = |&(tokens, boundary): &(&[u32], bool)| {
+        boundary
+            && entries
+                .iter()
+                .any(|&(other, shared)| shared && barely_extends(tokens, other))
+    };
+    entries
+        .iter()
+        .position(|&(_, boundary)| !boundary)
+        .or_else(|| entries.iter().rposition(near_duplicate))
+        .or_else(|| (!entries.is_empty()).then_some(0))
+}
+
+/// The order in which entries (oldest first) are evicted to fit `budget`,
+/// by [`next_victim`], always keeping one.
 fn eviction_order(entries: &[Indexed], budget: u64) -> Vec<usize> {
-    let mut alive = vec![true; entries.len()];
-    let mut remaining = entries.len();
+    let mut live = (0..entries.len()).collect::<Vec<_>>();
     let mut bytes = entries.iter().map(|entry| entry.bytes).sum::<u64>();
     let mut order = Vec::new();
-    while bytes > budget && remaining > 1 {
-        let live = || (0..entries.len()).filter(|&index| alive[index]);
-        let near_duplicate = |index: usize| {
-            entries[index].reusable_boundary
-                && live().any(|other| {
-                    entries[other].reusable_boundary
-                        && barely_extends(&entries[index].tokens, &entries[other].tokens)
-                })
-        };
-        let victim = live()
-            .find(|&index| !entries[index].reusable_boundary)
-            .or_else(|| live().rfind(|&index| near_duplicate(index)))
-            .or_else(|| live().next());
-        let Some(victim) = victim else {
+    while bytes > budget && live.len() > 1 {
+        let view = live
+            .iter()
+            .map(|&index| {
+                (
+                    entries[index].tokens.as_slice(),
+                    entries[index].reusable_boundary,
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(position) = next_victim(&view) else {
             break;
         };
-        alive[victim] = false;
-        remaining -= 1;
+        let victim = live.remove(position);
         bytes = bytes.saturating_sub(entries[victim].bytes);
         order.push(victim);
     }

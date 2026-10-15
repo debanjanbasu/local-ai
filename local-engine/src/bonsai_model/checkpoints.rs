@@ -39,11 +39,14 @@ impl BonsaiEngine {
             reusable_boundary,
         });
         if self.prompt_checkpoints.len() > self.max_prompt_checkpoints {
-            let victim = self
+            // The disk tier's policy: a boundary a few tokens past a kept one
+            // goes before the boundary every sharing request restores.
+            let entries = self
                 .prompt_checkpoints
                 .iter()
-                .position(|entry| !entry.reusable_boundary)
-                .unwrap_or(0);
+                .map(|entry| (entry.tokens.as_slice(), entry.reusable_boundary))
+                .collect::<Vec<_>>();
+            let victim = prompt_cache::next_victim(&entries).unwrap_or(0);
             self.prompt_checkpoints.remove(victim);
         }
         Ok(())
