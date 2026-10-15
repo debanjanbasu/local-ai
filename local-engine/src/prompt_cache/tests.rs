@@ -627,7 +627,7 @@ fn eviction_keeps_the_shortest_shared_ancestor_of_near_duplicates() {
 /// A restarted server finds what its predecessor left: two staged prefixes
 /// over the budget together (100K and 165K tokens, 10.5 GB against 5.9 GB)
 /// and a temporary from a write killed with the process. Before, both stayed
-/// until a later store trimmed them, and the temporary for ten minutes.
+/// until a later store trimmed them, and the temporary until it was ten minutes old.
 #[test]
 fn reclaim_at_startup_trims_to_the_budget_and_removes_orphans() {
     let dir = tempfile::tempdir().expect("tempdir");
