@@ -167,6 +167,9 @@ pub struct BonsaiEngine {
     /// Persists disk snapshots off the request path; spawned on first use.
     /// Dropping it finishes pending writes, so it flushes with the engine.
     disk_writer: Option<prompt_cache::Writer>,
+    /// Closes `disk_writer` with a deadline from outside the engine (see
+    /// [`Self::prompt_cache_closer`]); exists before the writer does.
+    disk_closer: prompt_cache::Closer,
     prompt_cache_bytes: usize,
     prompt_cache_disk_bytes: u64,
     prompt_cache_dir: Option<PathBuf>,

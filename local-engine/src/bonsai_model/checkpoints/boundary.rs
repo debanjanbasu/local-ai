@@ -152,10 +152,14 @@ impl BonsaiEngine {
         self.claim_gpu_cache();
         self.save_prompt_checkpoint(tokens, true)?;
         if self.caches_snapshots() {
-            // Only the GPU readback is paid here, mid-prefill; the disk
-            // write is queued to the background writer.
-            let snapshot = self.model.prompt_snapshot()?;
-            self.save_session_snapshot(tokens, session_id, Some(snapshot), true, true)?;
+            // With no host tier, a boundary the disk tier would refuse is not
+            // worth its readback either (gigabytes at long prompts).
+            if self.prompt_cache_bytes > 0 || !self.disk_ancestor_suffices(tokens) {
+                // Only the GPU readback is paid here, mid-prefill; the disk
+                // write is queued to the background writer.
+                let snapshot = self.model.prompt_snapshot()?;
+                self.save_session_snapshot(tokens, session_id, Some(snapshot), true, true)?;
+            }
             plan.persisted_reusable_boundary = true;
         }
         Ok(())

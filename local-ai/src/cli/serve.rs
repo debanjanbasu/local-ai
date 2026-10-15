@@ -1120,6 +1120,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
     eprintln!("{}", engine.info().json);
     let context = engine.info().model.context;
     let engine = engine.into_handle();
+    let prompt_cache = engine.clone();
     // Beside the Bonsai model's own folder: `models/embeddinggemma2-text`.
     let models_dir = resources.model.parent().and_then(std::path::Path::parent);
     let embeddings = match models_dir {
@@ -1249,8 +1250,31 @@ async fn run_async(args: Args) -> crate::Result<()> {
     if let Some(task) = h3_task {
         task.abort();
     }
+    // Last, once no request can queue another snapshot: the engine's worker
+    // thread is never joined, so exiting now would kill a disk write partway.
+    let flushed = tokio::task::spawn_blocking(move || {
+        prompt_cache.close_prompt_cache(PROMPT_CACHE_CLOSE_DEADLINE)
+    })
+    .await
+    .unwrap_or(false);
+    if !flushed {
+        eprintln!(
+            "warning: prompt-cache disk writes did not finish within {} s of shutdown; \
+             the unfinished snapshot was discarded",
+            PROMPT_CACHE_CLOSE_DEADLINE.as_secs()
+        );
+    }
     served
 }
+
+/// How long shutdown waits for accepted prompt-cache snapshots to commit.
+///
+/// At most two are pending (one writing, one queued). The largest, ~10 GB at
+/// a ~250K-token prompt, hashes and writes in about 15 s on an M4 Pro
+/// (~1.7 GB/s measured write rate), so two minutes covers both with room for
+/// a slower disk while still bounding the stop; past it the write in flight
+/// is aborted and its temporary removed.
+const PROMPT_CACHE_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(2);
 
 /// The hosted tools `args` grant, or `None` when they grant nothing.
 fn open_tools(args: &options::ToolArgs) -> crate::Result<Option<Arc<tool_loop::Tools>>> {
@@ -1289,8 +1313,21 @@ fn open_tools(args: &options::ToolArgs) -> crate::Result<Option<Arc<tool_loop::T
     })))
 }
 
+/// Resolve on SIGINT or SIGTERM: both stop the server gracefully, so a
+/// supervisor's SIGTERM no longer loses queued prompt-cache writes.
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = terminate => {}
+    }
 }
 
 pub fn main_with_args(args: &[String]) -> ExitCode {
