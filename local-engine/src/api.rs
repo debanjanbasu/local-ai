@@ -575,6 +575,8 @@ pub struct EngineHandle {
     tokenizer: BonsaiTokenizer,
     /// Decode activity the worker publishes for low-priority GPU users.
     activity: Arc<crate::activity::EngineActivity>,
+    /// Closes the worker engine's prompt-cache disk writer at shutdown.
+    prompt_cache: crate::prompt_cache::Closer,
 }
 
 impl EngineHandle {
@@ -592,6 +594,7 @@ impl EngineHandle {
 
     fn new(engine: Engine) -> Self {
         let tokenizer = engine.inner.tokenizer().clone();
+        let prompt_cache = engine.inner.prompt_cache_closer();
         let (sender, receiver) = async_mpsc::channel::<Job>(SERVE_QUEUE);
         let activity = Arc::new(crate::activity::EngineActivity::default());
         let published = Arc::clone(&activity);
@@ -600,7 +603,22 @@ impl EngineHandle {
             sender,
             tokenizer,
             activity,
+            prompt_cache,
         }
+    }
+
+    /// Finish the prompt-cache disk writes the engine has accepted, within
+    /// `deadline`, for a process about to exit.
+    ///
+    /// The worker thread owns the engine and is never joined, so exiting
+    /// would otherwise kill a snapshot write partway and leave its temporary
+    /// behind. From this call on no new snapshot is accepted; accepted ones
+    /// get `deadline` to commit, and past it the write in flight is aborted
+    /// and its temporary removed. Returns whether every accepted write
+    /// finished in time. Blocks: call it off the async runtime.
+    #[must_use]
+    pub fn close_prompt_cache(&self, deadline: std::time::Duration) -> bool {
+        self.prompt_cache.close(deadline) == crate::prompt_cache::Closed::Flushed
     }
 
     /// Decode activity of this handle's worker, for scheduling low-priority
