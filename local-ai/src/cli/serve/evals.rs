@@ -72,7 +72,12 @@ pub(super) fn matches(path: &str) -> bool {
 }
 
 /// Answer an Evals request. Authentication has already passed.
-pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Response {
+pub(super) async fn handle(
+    state: &AppState,
+    parts: &Parts,
+    body: Body,
+    caller: &super::admin::Caller,
+) -> Response {
     let Some(evals) = state.evals.as_ref() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -82,7 +87,10 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
         )
         .await;
     };
-    match evals.dispatch(parts, body).await {
+    match evals
+        .dispatch(parts, body, super::batches::owner(caller))
+        .await
+    {
         Ok((status, value)) => json_response(status, value, state, &parts.headers).await,
         Err((status, message)) => error_response(status, &message, state, &parts.headers).await,
     }
@@ -156,11 +164,14 @@ impl Evals {
     }
 
     /// Answer one request, independent of the server's other state.
+    /// `owner` is the caller's project key, which a created run keeps for
+    /// the batches it creates.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn dispatch(
         &self,
         parts: &Parts,
         body: Body,
+        owner: Option<local_services::batches::Owner>,
     ) -> Result<(StatusCode, Value), Failure> {
         let rest = parts.uri.path().strip_prefix(PREFIX).unwrap_or_default();
         let segments: Vec<String> = rest.split('/').skip(1).map(str::to_owned).collect();
@@ -229,7 +240,9 @@ impl Evals {
                 };
                 let (id, model) = ((*id).to_owned(), Arc::clone(&self.worker.model));
                 let run = self
-                    .call(move |store| store.create_eval_run(&id, &create, &model))
+                    .call(move |store| {
+                        store.create_eval_run_for(&id, &create, &model, owner.as_ref())
+                    })
                     .await?;
                 self.worker.notify();
                 Ok((StatusCode::CREATED, run_json(run, &base)))

@@ -847,3 +847,32 @@ fn runs_page_by_creation_and_filter_by_status() {
         Err(Error::NotFound(_))
     ));
 }
+
+#[test]
+fn a_runs_batches_belong_to_the_runs_owner() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let eval = store
+        .create_eval(&eval_request(json!([string_check(), score_model()])), MODEL)
+        .expect("created");
+    let owner = Owner {
+        project_id: "proj_e".into(),
+        api_key_id: "key_e".into(),
+    };
+    let run = store
+        .create_eval_run_for(&eval.id, &sampling_run(&rows()), MODEL, Some(&owner))
+        .expect("created");
+    let unowned = store
+        .create_eval_run(&eval.id, &sampling_run(&rows()), MODEL)
+        .expect("created");
+    for (run, expected) in [(&run.id, Some(owner)), (&unowned.id, None)] {
+        let Advance::Started(batch) = advance(store, run) else {
+            panic!("a sampling batch is started");
+        };
+        let lease = store.lease_batch(&batch).expect("lease").expect("free");
+        let NextLine::Line(line) = store.next_batch_line(&lease).expect("next") else {
+            panic!("a pending line");
+        };
+        assert_eq!(line.owner, expected);
+    }
+}

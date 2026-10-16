@@ -938,7 +938,7 @@ fn out_of_band_generations_are_recorded_as_completions() {
         unreachable!()
     };
     meter.generation(&stats);
-    // A batch line (an eval run's included): unattributed, batch.
+    // A batch line (an eval run's included) of an unattributed batch.
     let mut line = UsageRecord::new(UsageKind::Completions);
     line.model = Some("bonsai".into());
     line.batch = true;
@@ -953,10 +953,11 @@ fn out_of_band_generations_are_recorded_as_completions() {
             cancel: Arc::new(|| {}),
         })
     });
-    let submit =
-        super::super::batches::metered_submit(submit, super::Meter::into_store(Some(&admin), line));
     let request = local_engine::compaction::compaction_request(Vec::new(), Vec::new(), None);
-    let mut generation = submit(request).unwrap();
+    let mut generation = super::super::batches::metered(
+        submit(request).unwrap(),
+        super::Meter::into_store(Some(&admin), line),
+    );
     while let Ok(Some(_)) = (generation.next)(None) {}
     // Without a store nothing is written and nothing fails.
     super::Meter::default().generation(&stats);

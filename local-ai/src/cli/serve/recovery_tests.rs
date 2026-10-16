@@ -20,8 +20,8 @@ use super::background_tests::{
     Scratch, Step, event, manual_temporary, script, stats, status, stopper, stored, streamed_doc,
     temporary_doc,
 };
-use super::response::Reply;
-use super::responses::prepare_responses_with;
+use super::response::{Protocol, Reply};
+use super::responses::{ResponsesState, prepare_responses_with};
 use super::resume::{Subscription, subscribe};
 use super::store::ResponseStore;
 
@@ -959,4 +959,90 @@ fn a_hosted_tool_job_resumes_only_if_no_hosted_call_had_started() {
     // The marker goes with the response.
     assert!(store.delete(&id).expect("deleted"));
     assert!(!store.tools_started(&id).expect("readable"));
+}
+
+#[test]
+fn a_resumed_job_keeps_its_creator_until_it_ends() {
+    let _spawns = no_spawns();
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let creator = super::admin::Caller::Project {
+        key_id: "key_a".into(),
+        project_id: "proj_a".into(),
+    };
+    let mut prepared = prepare_responses_with(
+        body(false).to_string().as_bytes(),
+        true,
+        Some(&store),
+        None,
+        "m",
+    )
+    .expect("prepared");
+    prepared.echo.set_creator(creator.creator());
+    let reply = Reply::new(Protocol::Responses(Arc::new(prepared.echo)), "m".into());
+    let Protocol::Responses(echo) = &reply.protocol else {
+        unreachable!("responses reply")
+    };
+    let doc = ResponsesState::new(&reply, Arc::clone(echo), false);
+    let id = doc.id().to_owned();
+    let (_, stop) = stopper();
+    let (_, pump) = Arc::new(Background::default())
+        .admit(doc, script(Vec::new()), stop, None)
+        .expect("admitted");
+    pump.crash_after(0);
+    // The restarted server finds who created it beside its request.
+    let store = scratch.open();
+    let pending = store.load(&id).expect("readable").expect("stored");
+    assert!(pending.request.is_some());
+    assert_eq!(
+        super::admin::Caller::from_creator(pending.creator.as_ref()),
+        creator
+    );
+    // Resumed and killed again, the record still keeps it.
+    resume(
+        &Arc::new(Background::default()),
+        &store,
+        &id,
+        &Engine::default(),
+    )
+    .crash_after(1);
+    let store = scratch.open();
+    let pending = store.load(&id).expect("readable").expect("stored");
+    assert_eq!(pending.response["status"], "in_progress");
+    assert_eq!(pending.creator, creator.creator());
+    // Once it ends the record drops both.
+    resume(
+        &Arc::new(Background::default()),
+        &store,
+        &id,
+        &Engine::default(),
+    )
+    .run();
+    let ended = store.load(&id).expect("readable").expect("stored");
+    assert_eq!(ended.response["status"], "completed");
+    assert_eq!((ended.request, ended.creator), (None, None));
+}
+
+#[test]
+fn a_record_without_a_creator_resumes_unattributed() {
+    assert_eq!(
+        super::admin::Caller::from_creator(None),
+        super::admin::Caller::Anonymous
+    );
+    for malformed in [
+        json!({}),
+        json!({"project_id":"p"}),
+        json!({"project_id":1,"api_key_id":"k"}),
+    ] {
+        assert_eq!(
+            super::admin::Caller::from_creator(Some(&malformed)),
+            super::admin::Caller::Anonymous
+        );
+    }
+    for caller in [
+        super::admin::Caller::Anonymous,
+        super::admin::Caller::Static,
+    ] {
+        assert_eq!(caller.creator(), None);
+    }
 }

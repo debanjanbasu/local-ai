@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::{Value, json};
 
 use local_services::batches::{
-    Batch, BatchStatus, CreateBatch, LineOutcome, ListBatches, MAX_LINES, NextLine, PendingLine,
+    Batch, BatchStatus, CreateBatch, LineOutcome, ListBatches, MAX_LINES, NextLine, Owner,
+    PendingLine,
 };
 use local_services::files::{
     BATCH_OUTPUT_EXPIRES_AFTER_SECONDS, CreateFile, FileObject, FilePurpose, ListFiles,
@@ -633,4 +634,50 @@ fn listing_pages_newest_first() {
         json["request_counts"],
         json!({"total":1,"completed":0,"failed":0})
     );
+}
+
+#[test]
+fn a_batch_keeps_its_owner_for_its_lines_but_not_in_the_batch_object() {
+    let root = TempRoot::new();
+    let store = root.open();
+    let owner = Owner {
+        project_id: "proj_a".to_owned(),
+        api_key_id: "key_a".to_owned(),
+    };
+    let file = upload(&store, &jsonl(&[line("a", "a")]), FilePurpose::Batch);
+    let attributed = store
+        .create_batch_for(&request(&file), MODEL, Some(&owner))
+        .unwrap();
+    let unowned = create(&store, &["b"]);
+    let lease = store.lease_batch(&attributed.id).unwrap().unwrap();
+    assert_eq!(next(&store, &lease).owner, Some(owner));
+    let lease = store.lease_batch(&unowned.id).unwrap().unwrap();
+    assert_eq!(next(&store, &lease).owner, None);
+    let object = serde_json::to_value(store.get_batch(&attributed.id).unwrap()).unwrap();
+    assert!(object.get("project_id").is_none() && object.get("api_key_id").is_none());
+}
+
+#[test]
+fn batches_stored_before_owners_were_kept_migrate_unattributed() {
+    let root = TempRoot::new();
+    let id = {
+        let store = root.open();
+        let id = create(&store, &["a"]).id;
+        // Undo version 2 of the schema, as a database written before owners.
+        rusqlite::Connection::open(store.root().join("services.sqlite3"))
+            .unwrap()
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE batches DROP COLUMN project_id;
+                 ALTER TABLE batches DROP COLUMN api_key_id;
+                 UPDATE schema_versions SET version = 1 WHERE component = 'batches';
+                 COMMIT;",
+            )
+            .unwrap();
+        id
+    };
+    let store = root.open();
+    let lease = store.lease_batch(&id).unwrap().unwrap();
+    let pending = next(&store, &lease);
+    assert_eq!((pending.custom_id.as_str(), pending.owner), ("a", None));
 }

@@ -52,10 +52,25 @@ let query = model.embed_texts(&["task: search result | query: a dog barks"], &mu
 let score: f32 = audio[0].iter().zip(&query[0]).map(|(a, b)| a * b).sum();
 ```
 
-- **`decode_audio(bytes)`** decodes WAV/PCM, FLAC, Ogg Vorbis or MP3 with Symphonia. It
-  probes the container from the bytes, averages the channels to mono, and resamples any
-  other rate to 16 kHz with Rubato's synchronous FFT resampler. Decoding stops with an
-  error past 600 s.
+- **`decode_audio(bytes)`** decodes with Symphonia, probing the container from the bytes.
+  It averages the channels to mono and resamples any other rate to 16 kHz with Rubato's
+  synchronous FFT resampler. Decoding stops with an error past 600 s. Supported formats:
+
+  | Container | Codecs | Test result (`tests/fixtures/audio-formats/`) |
+  | --- | --- | --- |
+  | WAV | PCM | decodes to the exact samples |
+  | FLAC | FLAC | decodes to the exact samples |
+  | MP4 / M4A | ALAC | decodes to the exact samples |
+  | MP4 / M4A | AAC-LC | correlation 0.995; the encoder's priming and padding are kept (+1,216 samples, mostly 1,024 of near-silence at the start), because MP4 edit lists are not applied |
+  | MP3 | MPEG-1/2 Layer III | correlation 0.99999 |
+  | Ogg | Vorbis | correlation 0.99999 |
+  | Matroska / WebM | FLAC, Vorbis | FLAC decodes to the exact samples; Vorbis-in-WebM reaches correlation 0.99999, with the encoder's padding kept (+192 samples) |
+
+  Opus (in Ogg or WebM) and every other codec are refused with `InvalidArgument`. The
+  fixtures are 0.5 s of a two-tone signal, encoded once per format by FFmpeg 9.0. The
+  test runs them through this decoder and through the transcription decoder, which uses
+  the same codec set. Correlation is the best normalized cross-correlation within
+  ±2,048 samples.
 - **`to_mono_16k(interleaved, channels, rate)`** does the same downmix and resampling for
   PCM you already have.
 - **`EmbeddingModel::embed_audio(clips, pace)`** returns one normalized vector per clip,
@@ -165,6 +180,7 @@ tokens, the final embedding, and per-layer intermediates for two clips.
 | embedding cosine, native vs reference, 54 inputs | mean ≥ 0.9995, min ≥ 0.999 | **mean 1.000000, min 0.999999** (all 54; the worst is the tone) |
 | packing independence (each clip alone vs packed) | ≥ 0.99999 | **54/54 bitwise identical** |
 | committed fixture test (5 inputs, `#[ignore]`d real-model test) | same gate | pass |
+| text + audio in one sequence, 4 inputs ([mixed-modality inputs](EMBEDDINGS.md#mixed-modality-inputs)) | same gate | **cosine 1.000000 each**; token layouts identical |
 
 Native resampling is not part of the gate: the reference fed 16 kHz audio. As a probe, a
 44.1 kHz stereo version of one clip went through the native downmix and FFT resampler, and
@@ -255,6 +271,8 @@ milliseconds for a single 10 s clip (the whole clip takes 94 ms end to end). Con
 - `local-engine/tests/fixtures/embeddinggemma2-audio-reference.jsonl`: three AudioCaps crops
   (waveform, features, embedding) and the tone and silence embeddings. The log-mel test
   always runs; the embedding test is ignored unless the model is installed.
+- `local-engine/tests/fixtures/audio-formats/`: one short two-tone clip per supported
+  container and codec, plus an Opus file that must be refused. The decode test always runs.
 
 ## Limitations
 
@@ -262,8 +280,9 @@ milliseconds for a single 10 s clip (the whole clip takes 94 ms end to end). Con
   embeddings mechanism carries audio.
 - Clips are 30 s at most. The model's soft-token budget is 750 per clip, and longer audio
   must be split by the caller.
-- Mixed text-and-audio inputs (a prompt plus audio in one sequence) are not exposed. The
-  reference embeds media without text.
+- Text and audio in one sequence work through `embed_multimodal` and match the reference
+  (see [mixed-modality inputs](EMBEDDINGS.md#mixed-modality-inputs)). The audio
+  retrieval protocol above embeds media without text, as the model card does.
 - The resampler is Rubato's FFT resampler, not soxr. On non-16 kHz input the embeddings
   can therefore differ slightly from a librosa-fed reference (see the probe above).
-- The vision and video encoders are separate work.
+- Images and video are documented in [EMBEDDINGS.md](EMBEDDINGS.md#images-and-video).

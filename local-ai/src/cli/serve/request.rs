@@ -71,6 +71,9 @@ pub(super) fn deprecated_field(field: &str, instead: &str, api: &str) -> crate::
 
 #[derive(Deserialize)]
 struct GenerateRequest {
+    /// Checked by [`super::models::check_generation_value`]; the loaded model
+    /// answers.
+    model: Option<Value>,
     messages: Option<Vec<Message>>,
     max_completion_tokens: Option<usize>,
     temperature: Option<f32>,
@@ -272,6 +275,7 @@ pub(super) fn prepare_generation(body: &[u8], thinking: bool) -> crate::Result<P
         .and_then(|options| options.include_usage)
         .unwrap_or(false);
     request.reject_unsupported()?;
+    super::models::check_generation_value(request.model.as_ref())?;
     let messages = request
         .messages
         .as_deref()

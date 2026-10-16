@@ -458,5 +458,36 @@ refused as token-id input):
 
 Each media encoder artifact is optional and loads on the first input that
 needs it. Mixed inputs (text with images or audio) are laid out part by part
-in order; only single-modality media inputs are covered by the parity
-fixtures.
+in order.
+
+### Mixed-modality inputs
+
+Text, images and audio can share one input sequence. The reference places
+media inside the text with the `<|image|>` and `<|audio|>` placeholders
+(`model.encode({"text": "Picture <|image|> and sound <|audio|>.", "image": …,
+"audio": …})`). Natively the same input is the parts in that order:
+`[Text("Picture "), Image(&image), Text(" and sound "), Audio(&clip), Text(".")]`.
+Each text part is tokenized on its own, and the media sit between the parts,
+exactly as the reference processor splits the text at its placeholders. A
+reference dict without placeholders puts the text first, then the media,
+with no space in between.
+
+The reference is `eg2-mixedref`, a private Kaggle kernel: sentence-transformers
+6.1.0, transformers 5.19.0, torch 2.11.0, FP32 on the CPU, and the pinned
+model files. It covers six inputs:
+
+- text then image, and image then text (the 7×5 PNG from the vision fixture,
+  266 soft tokens);
+- text then audio (a 1 s 1 kHz tone, 25 soft tokens), and audio then text
+  (the 0.25 s AudioCaps crop from the audio fixture, 6 soft tokens);
+- text, image, text, audio in one input;
+- a query-prompted audio input (`task: search result | query: <|audio|> beeping`).
+
+| Gate | Threshold | Result |
+| --- | --- | --- |
+| token layout (`multimodal_layout`) vs the reference `input_ids`, soft-token slots aside | identical | **6/6 identical** |
+| embedding cosine, native vs reference | mean ≥ 0.9995, min ≥ 0.999 | **mean 1.000000, min 0.999999** (text then image) |
+
+The fixture is `local-engine/tests/fixtures/embeddinggemma2-mixed-reference.json`.
+`native_mixed_modality_embeddings_match_the_reference_fixture` checks it; that test is
+`#[ignore]`d because it needs the installed text, vision and audio artifacts.
