@@ -30,6 +30,7 @@ mod evals;
 mod hosted;
 mod http3;
 mod journal;
+mod models;
 mod moderations;
 mod openai_decisions;
 mod options;
@@ -208,13 +209,13 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
         return response;
     }
     if batches::matches(parts.uri.path()) {
-        return batches::handle(&state, &parts, body).await;
+        return batches::handle(&state, &parts, body, &caller).await;
     }
     if vector_stores::matches(parts.uri.path()) {
         return vector_stores::handle(&state, &parts, body).await;
     }
     if evals::matches(parts.uri.path()) {
-        return evals::handle(&state, &parts, body).await;
+        return evals::handle(&state, &parts, body, &caller).await;
     }
     if parts.method == Method::GET && parts.uri.path() == "/health" {
         return json_response(
@@ -228,16 +229,21 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
     if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
         return json_response(
             StatusCode::OK,
-            models_json(
-                &state.model,
-                state.context,
-                state.created,
-                Installed::of(&state),
-            ),
+            state.catalog().list(),
             &state,
             &parts.headers,
         )
         .await;
+    }
+    if let Some(model) = parts.uri.path().strip_prefix("/v1/models/")
+        && matches!(parts.method, Method::GET | Method::DELETE)
+    {
+        return match state.catalog().answer(&parts.method, model) {
+            Ok(value) => json_response(StatusCode::OK, value, &state, &parts.headers).await,
+            Err((status, message)) => {
+                error_response(status, &message, &state, &parts.headers).await
+            }
+        };
     }
     if parts.method == Method::POST && parts.uri.path() == moderations::ROUTE {
         return moderations::handle(&state, &parts.headers, body, &caller).await;
@@ -385,7 +391,14 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
             .await;
         }
     };
-    let (stream, mut request, protocol) = prepared;
+    let (stream, mut request, mut protocol) = prepared;
+    if let Protocol::Responses(echo) = &mut protocol
+        && let Some(echo) = Arc::get_mut(echo)
+    {
+        // A resumable background Response keeps its creator, so a restarted
+        // server attributes the regenerated usage to them.
+        echo.set_creator(caller.creator());
+    }
     let reply = Reply::new(protocol, Arc::clone(&state.model));
     let tool_loop = match hosted_loop(&state, &reply, &mut request) {
         Ok(tool_loop) => tool_loop,
@@ -782,9 +795,16 @@ fn resume_background(
     id: &str,
 ) -> Result<bool, Failure> {
     let (engine, depth) = (state.engine.clone(), state.depth.clone());
-    // Resumed after a restart: the original caller is not stored, so the
-    // generations are recorded unattributed.
-    let meter = admin::Meter::completions(state, &admin::Caller::Anonymous);
+    // Resumed after a restart: the generations are attributed to the caller
+    // the record keeps (unattributed for one an earlier version wrote). The
+    // creator never changes, so reading it before the lease is taken is safe.
+    let creator = store
+        .load(id)
+        .ok()
+        .flatten()
+        .and_then(|stored| stored.creator);
+    let caller = admin::Caller::from_creator(creator.as_ref());
+    let meter = admin::Meter::completions(state, &caller);
     let summarizer = compaction::summarizer(engine.clone(), meter);
     let resumed = state.background.resume(
         store,
@@ -801,7 +821,7 @@ fn resume_background(
                 Some(tool_loop) => tool_loop::start(tool_loop, events),
                 None => events,
             };
-            let mut events = admin::meter(state, &admin::Caller::Anonymous, events);
+            let mut events = admin::meter(state, &caller, events);
             let cancel = events.cancel_handle();
             // No deadline: the job has no client to stall, and a closed
             // channel is `None`.
@@ -999,18 +1019,7 @@ fn stored_answer(
     }
 }
 
-/// Which optional models this server runs beside Bonsai (independent
-/// installs, so independent flags).
-#[derive(Clone, Copy, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
-struct Installed {
-    embeddings: bool,
-    moderation: bool,
-    speech: bool,
-    transcription: bool,
-}
-
-impl Installed {
+impl models::Installed {
     const fn of(state: &AppState) -> Self {
         Self {
             embeddings: state.embeddings.is_some(),
@@ -1021,36 +1030,16 @@ impl Installed {
     }
 }
 
-/// `GET /v1/models`: the loaded Bonsai model with the context the engine
-/// admitted for it, then every installed optional model (each served by its
-/// own route).
-///
-/// `context_length` (the name `OpenRouter` and LM Studio read) and
-/// `max_model_len` (vLLM's) are both the per-request admission limit from
-/// `BonsaiInfo::context`, prompt plus output, not the checkpoint's training
-/// length: it is what a request can actually use on this machine.
-fn models_json(
-    model: &str,
-    context: usize,
-    created: u64,
-    installed: Installed,
-) -> serde_json::Value {
-    let mut data = vec![
-        json!({"id":model,"object":"model","created":created,"owned_by":"local","context_length":context,"max_model_len":context}),
-    ];
-    if installed.embeddings {
-        data.push(embeddings::model_json(created));
+impl AppState {
+    /// The models this server serves.
+    fn catalog(&self) -> models::Catalog<'_> {
+        models::Catalog {
+            bonsai: &self.model,
+            context: self.context,
+            created: self.created,
+            installed: models::Installed::of(self),
+        }
     }
-    if installed.moderation {
-        data.push(moderations::model_json(created));
-    }
-    if installed.speech {
-        data.push(speech::model_json(created));
-    }
-    if installed.transcription {
-        data.push(transcription::model_json(created));
-    }
-    json!({"object":"list","data":data})
 }
 
 // Keep service startup and shutdown ownership together.
@@ -1076,7 +1065,6 @@ async fn run_async(args: Args) -> crate::Result<()> {
         .as_ref()
         .map(|path| {
             ReasoningCipher::open(path)
-                .map(Arc::new)
                 .map_err(|error| crate::Error::InvalidArgument(error.to_string()))
         })
         .transpose()?;
@@ -1115,7 +1103,10 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // One discovery serves both the engine and the TLS lookup: each one probes
     // the disk's write rate with a 16 MiB file, so a second is wasted startup.
     let resources = Resources::discover(None, true)?;
-    let model: Arc<str> = resources.model.to_string_lossy().into_owned().into();
+    let model: Arc<str> = models::BONSAI_MODEL_ID.into();
+    // Envelopes an earlier version sealed for the checkpoint's path still open.
+    let legacy_model = resources.model.to_string_lossy().into_owned();
+    let cipher = cipher.map(|cipher| Arc::new(cipher.with_legacy_model(legacy_model)));
     let engine = Engine::from_resources(&resources)?;
     eprintln!("{}", engine.info().json);
     let context = engine.info().model.context;

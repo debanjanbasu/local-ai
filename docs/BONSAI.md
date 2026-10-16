@@ -173,7 +173,8 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | readiness |
-| `GET` | `/v1/models` | the loaded Bonsai model with its admitted `context_length`/`max_model_len`, then every installed optional model (`embeddinggemma-2`, `embeddinggemma-2-moderation-1`, `kokoro-82m`, `whisper-large-v3`) |
+| `GET` | `/v1/models` | the loaded Bonsai model, `ternary-bonsai-2-27b`, with its admitted `context_length`/`max_model_len`, then every installed optional model (`embeddinggemma-2`, `embeddinggemma-2-moderation-1`, `kokoro-82m`, `whisper-large-v3`) |
+| `GET`, `DELETE` | `/v1/models/{model}` | one served model by id or alias ([model ids](#model-ids)); `DELETE` is for fine-tuned models, so a served base model is a 403 and any other name a 404 |
 | `POST` | `/v1/chat/completions` | templated text and function calling |
 | `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
@@ -194,6 +195,36 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST`, `GET`, `DELETE` | `/v1/evals[/{id}[/runs[/{run_id}[/cancel\|/output_items[/{item_id}]]]]]` | evals of the loaded model, run through batches |
 | `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
 | `POST` | `/v1/decisions` | calibrated, scope-gated decisions (`--decisions-artifact` only; 404 with an explanation otherwise) |
+
+### Model ids
+
+Each served model has one stable id, and every route reads `model` from the
+same table:
+
+| Model | Id | Also accepted | Routes |
+| --- | --- | --- | --- |
+| Ternary Bonsai 2 27B | `ternary-bonsai-2-27b` | none | Chat Completions, Responses, `input_tokens`, `compact`, decisions, batches, evals |
+| EmbeddingGemma 2 | `embeddinggemma-2` | none | `/v1/embeddings` |
+| moderation heads | `embeddinggemma-2-moderation-1` | `omni-moderation-latest`, `omni-moderation-2024-09-26`, `text-moderation-latest`, `text-moderation-stable` | `/v1/moderations` (`model` may be omitted) |
+| Kokoro-82M | `kokoro-82m` | none | `/v1/audio/speech` |
+| Whisper large-v3 | `whisper-large-v3` | `whisper-1` | `/v1/audio/transcriptions`, `/v1/audio/translations` |
+
+The generation routes accept an omitted `model` or any name that is not
+another local model's, since many clients send a configured name the server
+cannot know; the response always names `ternary-bonsai-2-27b`. Naming another
+local model there (for example `embeddinggemma-2` on Chat Completions) is a
+400 that names the right route. Batches and evals run later from stored
+requests, so their `model` must be exactly `ternary-bonsai-2-27b`.
+`GET /v1/models/{model}` answers an installed model by id or alias (an alias
+answers with the model's own id) and 404 otherwise.
+
+Earlier versions used the GGUF file path as the Bonsai id. It named one
+machine's layout, so it is not accepted from new requests. What those versions
+stored keeps working: batch lines naming the path still run, and with the same
+`--reasoning-key`, reasoning and compaction envelopes sealed for the path
+still open (new ones are sealed for `ternary-bonsai-2-27b`). An eval run
+created before the change and still in progress fails when it starts its next
+batch; create the run again.
 
 ### Supported OpenAI APIs
 
@@ -975,7 +1006,8 @@ native renderer reproduces exactly: `input` must be a non-empty text string
 (rendered as the `State:`); `questions` holds 1 to 200 questions of `type`
 `predicate`, `choice` (2 to 26 string or boolean `choices[].value`) or
 `score` (2 to 10 `levels[].label`), each with `instructions` and an optional
-`name`; `model` and `safety_identifier` are accepted and ignored. Message
+`name`; `model` is read as on the other generation routes
+([model ids](#model-ids)) and `safety_identifier` is accepted and ignored. Message
 arrays, images, non-empty option or level descriptions and unknown fields are
 refused with 400 rather than approximated. A 200 response has
 `"object":"experimental.decision"` and one answer per question: a predicate's

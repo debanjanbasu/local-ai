@@ -100,6 +100,34 @@ impl Caller {
         }
         record
     }
+
+    /// The project and key that work stored for this caller, and run later
+    /// (resumed background Responses), is attributed to: `None` unless
+    /// this is a project API key.
+    pub(super) fn creator(&self) -> Option<Value> {
+        match self {
+            Self::Project { key_id, project_id } => {
+                Some(json!({"project_id":project_id,"api_key_id":key_id}))
+            }
+            Self::Anonymous | Self::Static | Self::Admin { .. } => None,
+        }
+    }
+
+    /// The caller [`Self::creator`] stored: the project key it names, or
+    /// [`Self::Anonymous`] (unattributed) for none or a malformed one.
+    pub(super) fn from_creator(creator: Option<&Value>) -> Self {
+        let field = |name: &str| {
+            creator
+                .and_then(|creator| creator.get(name))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        match (field("project_id"), field("api_key_id")) {
+            (Some(project_id), Some(key_id)) => Self::Project { key_id, project_id },
+            _ => Self::Anonymous,
+        }
+    }
 }
 
 /// Why a request was not authorized.
@@ -994,6 +1022,17 @@ impl Meter {
     /// `record` (counts zero) as the template written to `admin`.
     pub(super) fn into_store(admin: Option<&Arc<Admin>>, record: UsageRecord) -> Self {
         Self(admin.map(|admin| (Arc::clone(admin), record)))
+    }
+
+    /// This meter with its records attributed to project `project_id` and
+    /// its API key `api_key_id` (work stored by that caller and run later).
+    pub(super) fn attributed(&self, project_id: &str, api_key_id: &str) -> Self {
+        let mut meter = self.clone();
+        if let Some((_, record)) = &mut meter.0 {
+            record.project_id = Some(project_id.to_owned());
+            record.api_key_id = Some(api_key_id.to_owned());
+        }
+        meter
     }
 
     /// Record one finished generation from its final measurements. Blocks on

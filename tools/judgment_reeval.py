@@ -760,7 +760,7 @@ def offline_decisions(records, artifact: dict) -> list[dict]:
 
 
 def http_parity(url: str, requests_path: Path, expected_path: Path, ids: list[str],
-                model: str = "bonsai", opener=None) -> dict:
+                model: str = "ternary-bonsai-2-27b", opener=None) -> dict:
     """POST each request (one predicate) to a running server's /v1/decisions and
     compare with the offline decision of the same row."""
     import urllib.request

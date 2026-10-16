@@ -140,7 +140,9 @@ struct Parsed {
 fn parse(body: &[u8]) -> Result<Parsed, String> {
     let request: RequestBody =
         serde_json::from_slice(body).map_err(|error| format!("invalid speech request: {error}"))?;
-    if request.model != SPEECH_MODEL_ID {
+    if super::models::resolve(&request.model, super::models::BONSAI_MODEL_ID)
+        != Some(super::models::Served::Speech)
+    {
         return Err(format!(
             "model {:?} is not served here; use {SPEECH_MODEL_ID:?}",
             request.model
