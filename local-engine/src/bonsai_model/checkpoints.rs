@@ -39,11 +39,14 @@ impl BonsaiEngine {
             reusable_boundary,
         });
         if self.prompt_checkpoints.len() > self.max_prompt_checkpoints {
-            let victim = self
+            // The disk tier's policy: a boundary a few tokens past a kept one
+            // goes before the boundary every sharing request restores.
+            let entries = self
                 .prompt_checkpoints
                 .iter()
-                .position(|entry| !entry.reusable_boundary)
-                .unwrap_or(0);
+                .map(|entry| (entry.tokens.as_slice(), entry.reusable_boundary))
+                .collect::<Vec<_>>();
+            let victim = prompt_cache::next_victim(&entries).unwrap_or(0);
             self.prompt_checkpoints.remove(victim);
         }
         Ok(())
@@ -109,7 +112,7 @@ impl BonsaiEngine {
         }
         if save_to_disk && let Some(root) = self.prompt_cache_dir.clone() {
             if self.disk_writer.is_none() {
-                self.disk_writer = Some(prompt_cache::Writer::spawn()?);
+                self.disk_writer = Some(prompt_cache::Writer::spawn_with(&self.disk_closer)?);
             }
             if let Some(writer) = &self.disk_writer {
                 writer.submit(prompt_cache::StoreJob {
@@ -156,6 +159,22 @@ impl BonsaiEngine {
         }
     }
 
+    /// Whether a committed disk boundary that `tokens` only barely extends
+    /// (see [`prompt_cache::barely_extends`]) already fills half the budget.
+    ///
+    /// A snapshot of `tokens` is at least as large as its ancestor's, so the
+    /// two cannot both fit, and the writer would refuse it to keep the
+    /// ancestor every request sharing `tokens` also shares.
+    pub(super) fn disk_ancestor_suffices(&self, tokens: &[u32]) -> bool {
+        self.disk_snapshots.iter().any(|entry| {
+            entry.reusable_boundary
+                && prompt_cache::barely_extends(tokens, &entry.tokens)
+                && std::fs::metadata(&entry.path).is_ok_and(|metadata| {
+                    metadata.len().saturating_mul(2) > self.prompt_cache_disk_bytes
+                })
+        })
+    }
+
     /// Index the disk snapshots the writer has committed since the last call,
     /// and forget the ones its trim deleted.
     ///
@@ -171,7 +190,14 @@ impl BonsaiEngine {
             .map(|root| root.join(&self.prompt_cache_model_key));
         for completion in writer.take_completed() {
             match completion.stored {
-                Ok(entry) => {
+                Ok(None) => {
+                    eprintln!(
+                        "prompt cache: snapshot not written to disk: the budget would delete it \
+                         again (a request tail behind shared prefixes, or a boundary that only \
+                         barely extends a kept one)"
+                    );
+                }
+                Ok(Some(entry)) => {
                     if current
                         .as_ref()
                         .is_some_and(|dir| entry.path.starts_with(dir))

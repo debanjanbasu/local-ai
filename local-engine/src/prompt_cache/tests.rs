@@ -1,5 +1,6 @@
 use super::writer::{Completion, Submitted};
 use super::*;
+use std::time::{Duration, SystemTime};
 
 fn snapshot_fixture() -> PromptSnapshot {
     PromptSnapshot {
@@ -128,11 +129,9 @@ fn backdate(path: &Path, age: Duration) {
         .expect("set mtime");
 }
 
-/// Ages are absolute, not multiples of `ORPHANED_TEMPORARY_AGE`, so that retuning
-/// the constant — upward to something absurd, downward to zero — breaks these
-/// tests instead of sliding along with it. `IN_FLIGHT_AGE` is a `store` partway
-/// through its ~152 MiB payload; `ABANDONED_FOR` is what SIGKILL leaves behind
-/// by the time the app is reopened.
+/// Liveness is the writer's lock, not age: `IN_FLIGHT_AGE` is a `store`
+/// partway through a long payload; `ABANDONED_FOR` is what SIGKILL leaves
+/// behind by the time the app is reopened. Neither age decides anything.
 const IN_FLIGHT_AGE: Duration = Duration::from_secs(75);
 const ABANDONED_FOR: Duration = Duration::from_mins(30);
 
@@ -150,17 +149,26 @@ fn a_temporary_being_written_is_not_reclaimed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let model_dir = dir.path().join("model");
     fs::create_dir_all(&model_dir).expect("create model dir");
-    // Stand in for a `store` mid-flight: a real temporary, still being written.
+    // Stand in for a `store` mid-flight: a real temporary, still being
+    // written, so its writer holds the lock — however old it looks.
     let in_flight = model_dir.join("3-0123456789abcdef.tmp");
-    File::create(&in_flight).expect("create in-flight temporary");
-    fs::write(&in_flight, vec![7_u8; 4096]).expect("write into in-flight temporary");
-    backdate(&in_flight, IN_FLIGHT_AGE);
+    let mut writing = create_locked(&in_flight).expect("create in-flight temporary");
+    writing
+        .write_all(&[7_u8; 4096])
+        .expect("write into in-flight temporary");
+    backdate(&in_flight, ABANDONED_FOR);
 
     trim(dir.path(), "model", 0);
 
     assert!(
         in_flight.exists(),
-        "a temporary younger than the threshold belongs to a running store and must survive"
+        "a temporary whose writer holds its lock belongs to a running store and must survive"
+    );
+    drop(writing);
+    trim(dir.path(), "model", 0);
+    assert!(
+        !in_flight.exists(),
+        "once its writer is gone the same temporary is an orphan"
     );
 }
 
@@ -184,6 +192,27 @@ fn a_temporary_orphaned_by_a_crash_is_reclaimed() {
 }
 
 #[test]
+fn a_young_orphaned_temporary_is_reclaimed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model_dir = dir.path().join("model");
+    fs::create_dir_all(&model_dir).expect("create model dir");
+    // A server stopped a second after a long answer: the write was killed
+    // with the process, so its temporary is seconds old, not minutes.
+    let orphan = model_dir.join("249350-fedcba9876543210.tmp");
+    fs::write(&orphan, vec![7_u8; 4096]).expect("write orphaned temporary");
+
+    assert_eq!(
+        reclaim(dir.path(), "model", u64::MAX),
+        Vec::<PathBuf>::new()
+    );
+
+    assert!(
+        !orphan.exists(),
+        "an unlocked temporary is an orphan whatever its age, and the next start reclaims it"
+    );
+}
+
+#[test]
 fn the_temporary_sweep_never_reclaims_a_committed_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let model_dir = dir.path().join("model");
@@ -202,7 +231,8 @@ fn the_temporary_sweep_never_reclaims_a_committed_snapshot() {
     backdate(&committed, Duration::from_hours(720));
     let young = model_dir.join("3-000000000000000a.tmp");
     let stale = model_dir.join("3-000000000000000b.tmp");
-    fs::write(&young, b"young").expect("write young temporary");
+    let mut live = create_locked(&young).expect("create live temporary");
+    live.write_all(b"young").expect("write live temporary");
     fs::write(&stale, b"stale").expect("write stale temporary");
     backdate(&stale, ABANDONED_FOR);
     let bytes = fs::metadata(&committed).expect("metadata").len();
@@ -212,7 +242,8 @@ fn the_temporary_sweep_never_reclaims_a_committed_snapshot() {
     trim(dir.path(), "model", u64::MAX);
 
     assert!(!stale.exists(), "the stale temporary is reclaimed");
-    assert!(young.exists(), "the young temporary survives");
+    assert!(young.exists(), "the live temporary survives");
+    drop(live);
     assert!(
         committed.exists(),
         "a committed snapshot is never a temporary-sweep victim, at any age"
@@ -307,7 +338,12 @@ fn job(root: &Path, tokens: &[u32], reusable_boundary: bool, budget: u64) -> Sto
 fn committed(completions: Vec<Completion>) -> Vec<DiskEntry> {
     completions
         .into_iter()
-        .map(|completion| completion.stored.expect("background store"))
+        .map(|completion| {
+            completion
+                .stored
+                .expect("background store")
+                .expect("admitted")
+        })
         .collect()
 }
 
@@ -419,21 +455,32 @@ fn the_writer_trims_from_its_index_and_reports_evictions() {
     let writer = Writer::spawn().expect("writer");
     let mut stored = Vec::new();
     let mut evicted = Vec::new();
-    // A zero budget keeps exactly one snapshot, preferring the boundary.
-    for (tokens, boundary) in [([1, 1], true), ([2, 2], false), ([3, 3], false)] {
+    // A zero budget keeps exactly one snapshot, preferring the boundary: two
+    // tails evict each other in turn, and the boundary evicts the last.
+    for (tokens, boundary) in [([1, 1], false), ([2, 2], false), ([3, 3], true)] {
         writer.submit(job(dir.path(), &tokens, boundary, 0));
         writer.flush();
         for completion in writer.take_completed() {
-            stored.push(completion.stored.expect("store").path);
+            stored.push(completion.stored.expect("store").expect("admitted").path);
             evicted.extend(completion.evicted);
         }
     }
     assert_eq!(stored.len(), 3);
-    assert_eq!(snapshot_paths(dir.path(), "model"), [stored[0].clone()]);
-    evicted.sort();
-    let mut expected = vec![stored[1].clone(), stored[2].clone()];
-    expected.sort();
-    assert_eq!(evicted, expected);
+    assert_eq!(snapshot_paths(dir.path(), "model"), [stored[2].clone()]);
+    assert_eq!(evicted, [stored[0].clone(), stored[1].clone()]);
+    // A tail behind it would be deleted again at once, so it is not written.
+    writer.submit(job(dir.path(), &[4, 4], false, 0));
+    writer.flush();
+    let completions = writer.take_completed();
+    assert!(matches!(
+        completions[..],
+        [Completion {
+            stored: Ok(None),
+            ..
+        }]
+    ));
+    assert_eq!(completions[0].evicted, Vec::<PathBuf>::new());
+    assert_eq!(snapshot_paths(dir.path(), "model"), [stored[2].clone()]);
 }
 
 #[test]
@@ -452,4 +499,222 @@ fn a_failed_background_store_is_reported_not_raised() {
     writer.submit(job(dir.path(), &[6], true, u64::MAX));
     writer.flush();
     assert_eq!(committed(writer.take_completed()).len(), 1);
+}
+
+fn tokens(range: std::ops::Range<u32>) -> Vec<u32> {
+    range.collect()
+}
+
+fn extended(prefix: &[u32], extra: std::ops::Range<u32>) -> Vec<u32> {
+    prefix.iter().copied().chain(extra).collect()
+}
+
+/// A budget that holds one fixture snapshot of `tokens` but not two, as the
+/// automatic 5.9 GB budget holds one 5.06 GB 128K-token snapshot.
+fn one_snapshot_budget(tokens: &[u32]) -> u64 {
+    stored_bytes("model", tokens, Some("a"), &snapshot_fixture(), true) * 11 / 10
+}
+
+fn stored_lengths(dir: &Path) -> Vec<usize> {
+    let mut lengths = discover(dir, "model")
+        .into_iter()
+        .map(|entry| entry.tokens.len())
+        .collect::<Vec<_>>();
+    lengths.sort_unstable();
+    lengths
+}
+
+/// The long-context evaluation's third run, in miniature: a staged prefix
+/// (a request tail), then the system-turn boundary every question shares,
+/// then the divergence boundaries later questions observe a few tokens into
+/// the user turn (the turn opener, then the first words of one kind of
+/// question). Each fills the budget alone. Before, each newer boundary
+/// evicted the older one, so the system-turn boundary was gone and every
+/// question of another kind re-prefilled the whole prompt.
+#[test]
+fn a_near_duplicate_boundary_never_evicts_the_shared_prefix_it_extends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer = Writer::spawn().expect("writer");
+    let stage = tokens(0..1100);
+    let system = tokens(0..2000);
+    let opener = extended(&system, 5000..5004);
+    let recall = extended(&opener, 6000..6009);
+    let budget = one_snapshot_budget(&recall);
+    let mut outcomes = Vec::new();
+    for (tokens, boundary) in [
+        (&stage, false),
+        (&system, true),
+        (&opener, true),
+        (&recall, true),
+    ] {
+        writer.submit(job(dir.path(), tokens, boundary, budget));
+        writer.flush();
+        outcomes.extend(writer.take_completed().into_iter().map(|completion| {
+            (
+                completion
+                    .stored
+                    .expect("store")
+                    .map(|entry| entry.tokens.len()),
+                completion.evicted.len(),
+            )
+        }));
+    }
+    assert_eq!(
+        outcomes,
+        [
+            (Some(1100), 0),
+            // The system-turn boundary replaces the staged prefix it extends.
+            (Some(2000), 1),
+            // The near-duplicates are not written and evict nothing.
+            (None, 0),
+            (None, 0),
+        ]
+    );
+    assert_eq!(stored_lengths(dir.path()), [2000]);
+}
+
+/// Controls for the admission rule: a boundary that extends its ancestor by
+/// more than the ancestor holds (a long shared document after a short system
+/// prompt) still replaces it, and request tails, staged prefixes included,
+/// still replace older tails.
+#[test]
+fn a_far_extension_and_newer_tails_still_replace_what_they_extend() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let writer = Writer::spawn().expect("writer");
+    let system = tokens(0..200);
+    let document = extended(&system, 1000..1300);
+    let budget = one_snapshot_budget(&document);
+    for (tokens, boundary) in [(&system, true), (&document, true)] {
+        writer.submit(job(dir.path(), tokens, boundary, budget));
+        writer.flush();
+    }
+    assert_eq!(stored_lengths(dir.path()), [500]);
+
+    let staged = tempfile::tempdir().expect("tempdir");
+    let first = tokens(0..1000);
+    let second = tokens(0..1650);
+    let budget = one_snapshot_budget(&second);
+    for stage in [&first, &second] {
+        writer.submit(job(staged.path(), stage, false, budget));
+        writer.flush();
+    }
+    assert_eq!(stored_lengths(staged.path()), [1650]);
+    assert_eq!(committed(writer.take_completed()).len(), 4);
+}
+
+#[test]
+fn eviction_keeps_the_shortest_shared_ancestor_of_near_duplicates() {
+    let entry = |tokens: Vec<u32>, reusable_boundary| Indexed {
+        path: PathBuf::new(),
+        tokens,
+        bytes: 10,
+        reusable_boundary,
+    };
+    let system = tokens(0..100);
+    // Oldest first, whatever order the near-duplicates arrived in.
+    let entries = [
+        entry(extended(&system, 500..513), true),
+        entry(system.clone(), true),
+        entry(extended(&system, 600..604), true),
+        entry(tokens(0..50), false),
+    ];
+    assert_eq!(eviction_order(&entries, 10), [3, 2, 0]);
+    // Unrelated boundaries still go oldest first.
+    let entries = [entry(tokens(0..100), true), entry(tokens(1..101), true)];
+    assert_eq!(eviction_order(&entries, 10), [0]);
+}
+
+/// A restarted server finds what its predecessor left: two staged prefixes
+/// over the budget together (100K and 165K tokens, 10.5 GB against 5.9 GB)
+/// and a temporary from a write killed with the process. Before, both stayed
+/// until a later store trimmed them, and the temporary until it was ten minutes old.
+#[test]
+fn reclaim_at_startup_trims_to_the_budget_and_removes_orphans() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let older = tokens(0..1000);
+    let newer = tokens(0..1650);
+    store(
+        dir.path(),
+        "model",
+        &older,
+        None,
+        &snapshot_fixture(),
+        false,
+    )
+    .expect("store");
+    let kept = store(
+        dir.path(),
+        "model",
+        &newer,
+        None,
+        &snapshot_fixture(),
+        false,
+    )
+    .expect("store");
+    let orphan = dir.path().join("model").join("2000-0123456789abcdef.tmp");
+    fs::write(&orphan, b"partial").expect("write orphan");
+    let budget = one_snapshot_budget(&newer);
+
+    let evicted = reclaim(dir.path(), "model", budget);
+
+    assert_eq!(evicted.len(), 1);
+    assert_eq!(snapshot_paths(dir.path(), "model"), [kept]);
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn close_finishes_accepted_writes_and_then_refuses_new_ones() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let closer = Closer::new();
+    let writer = Writer::spawn_with(&closer).expect("writer");
+    let mut large = job(dir.path(), &[1, 2, 3], true, u64::MAX);
+    large.snapshot.target_kv = PageBytes::zeroed(64 << 20).expect("bytes");
+    assert_eq!(writer.submit(large), Submitted::Queued);
+
+    assert_eq!(closer.close(Duration::from_mins(1)), Closed::Flushed);
+
+    assert_eq!(stored_lengths(dir.path()), [3]);
+    assert_eq!(
+        names_with_extension(&dir.path().join("model"), ".tmp"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        writer.submit(job(dir.path(), &[4, 5, 6], true, u64::MAX)),
+        Submitted::Dropped
+    );
+    drop(writer);
+    assert_eq!(stored_lengths(dir.path()), [3]);
+}
+
+/// A server stopped with SIGINT right after a long answer used to exit with
+/// the ~10 GB snapshot write partway, leaving a 4.66 GB temporary. Past its
+/// deadline, close aborts the write and removes the temporary instead.
+#[test]
+fn close_past_its_deadline_aborts_and_leaves_no_temporary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("model")).expect("create model dir");
+    let closer = Closer::new();
+    let writer = Writer::spawn_with(&closer).expect("writer");
+    for tokens in [[1, 1], [2, 2]] {
+        let mut large = job(dir.path(), &tokens, true, u64::MAX);
+        large.snapshot.target_kv = PageBytes::zeroed(512 << 20).expect("bytes");
+        writer.submit(large);
+    }
+
+    assert_eq!(closer.close(Duration::ZERO), Closed::Aborted);
+
+    assert_eq!(
+        names_with_extension(&dir.path().join("model"), ".tmp"),
+        Vec::<String>::new()
+    );
+    // An abort that lands during the final `fsync` still commits; whatever
+    // is committed is complete.
+    for path in snapshot_paths(dir.path(), "model") {
+        load(&path, "model").expect("a committed snapshot is complete");
+    }
+    drop(writer);
+    assert_eq!(
+        names_with_extension(&dir.path().join("model"), ".tmp"),
+        Vec::<String>::new()
+    );
 }

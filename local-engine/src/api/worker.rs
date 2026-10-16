@@ -440,6 +440,7 @@ mod tests {
             sender,
             tokenizer: BonsaiTokenizer::tiny_for_tests(),
             activity: Arc::default(),
+            prompt_cache: crate::prompt_cache::Closer::new(),
         };
         (handle, receiver)
     }
