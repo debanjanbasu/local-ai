@@ -1558,7 +1558,9 @@ layout, MTP configuration, tokens, recurrent state, and target and head K/V.
    storage probe does not select SSD-first. Snapshot staging uses anonymous
    page mappings that return to the OS when dropped.
 3. Disk `.bpc` snapshots are versioned and SHA256-checked, written atomically,
-   discovered at startup, and trimmed within the automatic disk budget.
+   discovered at startup, and trimmed within the automatic disk budget (at
+   startup too, so a store a previous process left over budget is trimmed
+   before the first request).
 
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
@@ -1567,7 +1569,13 @@ its rename is reported, so a file still being written is never loaded; a
 request whose best disk match is still in flight waits for that one write.
 At most one job is in flight and one queued: a newer job replaces the queued
 one, except that a request tail never displaces a shared boundary. Dropping
-the engine finishes pending writes. A failed write is a cache miss reported
+the engine finishes pending writes; the server, whose engine is never
+dropped, closes the writer on SIGINT or SIGTERM instead: accepted writes get
+two minutes to commit, past which the one in flight is aborted and its
+temporary removed. A temporary is live only while its writer holds an
+exclusive lock on it (taken in `open`), so the sweep after every store and
+at startup removes any other at once, whatever its age. A snapshot the trim
+after it would delete again is not written. A failed write is a cache miss reported
 on stderr, not a request error. Trim keeps an in-memory index of the
 directory instead of re-reading every snapshot header after each store.
 
@@ -1586,7 +1594,14 @@ next rendered turn diverges at the assistant opener. One reusable boundary is
 also materialized per prefill: a newly observed shared-prefix divergence is
 preferred, otherwise the end of the system turn. Boundaries shorter than one
 128-token prefill chunk are skipped. Shared boundaries receive eviction
-priority over request-tail snapshots and can be reused across sessions.
+priority over request-tail snapshots and can be reused across sessions. When
+the budget cannot hold both, a boundary that extends a kept boundary by
+fewer tokens than that boundary holds is the one evicted (and is then not
+written or read back at all): every request it serves, its ancestor serves
+too, so keeping the ancestor costs those requests only the short extension,
+where keeping it would cost every other request the whole prefix. A
+divergence a few tokens into one kind of question therefore never replaces
+the system-turn boundary every question of a 128K-token prompt restores.
 
 Measured effects:
 
@@ -2946,6 +2961,24 @@ stop does not always finish a queued write either: signalled right after a
 its 249,350-token system-turn snapshot as a 4.66 GB `.tmp` (of ~9.8 GB), so
 the next question could only restore the 215K stage. The `xhigh` answers
 presumably took long enough for the write to commit first.
+
+Both are fixed after `0c9ec76`. The first was not a code regression: the
+prompt-cache code is identical at `d2cad1b`, `6ac7dec` and `0c9ec76`. A
+follow-up's divergence boundary is its common prefix with whichever prompt
+the engine cached last, so a question that follows one of its own kind
+yields a boundary a few tokens past the system turn, and both the disk trim
+and the four GPU checkpoints evicted the oldest boundary first; whether
+that happened depended on arrival order. A boundary that only barely
+extends a kept one is now the one dropped (see [Prompt cache](#prompt-cache)).
+The second: the server's engine lives on a worker thread that exit never
+joined, so SIGINT killed the background write; shutdown (SIGINT or SIGTERM)
+now closes the writer with a two-minute deadline, and startup removes
+orphaned temporaries and trims to the budget. Rerun of 128K seed 0 `none`
+(72K stage, then nine questions, eight three at a time, server at `4004c39`):
+every follow-up restored the 127,882-token system-turn snapshot (seven from
+disk, one from a GPU checkpoint 4 tokens past it), 4–11 s to first token and
+8.5–27 s per answer, scoring the same 5/9; afterwards the disk held only that
+snapshot, and the SIGINT stop left no `.tmp`.
 
 Rerun 2026-10-12/13, server built at `6ac7dec` (`9228478` adds only docs), M4 Pro 48 GB:
 
