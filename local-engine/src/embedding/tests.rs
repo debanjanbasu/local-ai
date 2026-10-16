@@ -118,3 +118,161 @@ fn native_embeddings_match_the_reference_fixture() {
     let min = cosines.iter().copied().fold(f32::INFINITY, f32::min);
     assert!(mean >= 0.9995 && min >= 0.999, "mean {mean}, min {min}");
 }
+
+/// One piece of a reference input's text: text, or a media placeholder.
+#[derive(Debug, PartialEq, Eq)]
+enum Piece<'a> {
+    Text(&'a str),
+    Image,
+    Audio,
+}
+
+/// `text` split at its `<|image|>` and `<|audio|>` placeholders, in order.
+fn placeholder_pieces(mut text: &str) -> Vec<Piece<'_>> {
+    let mut pieces = Vec::new();
+    loop {
+        let image = text.split_once("<|image|>");
+        let audio = text.split_once("<|audio|>");
+        let (before, after, media) = match (image, audio) {
+            (Some(i), Some(a)) if a.0.len() < i.0.len() => (a.0, a.1, Piece::Audio),
+            (Some(i), _) => (i.0, i.1, Piece::Image),
+            (None, Some(a)) => (a.0, a.1, Piece::Audio),
+            (None, None) => break,
+        };
+        if !before.is_empty() {
+            pieces.push(Piece::Text(before));
+        }
+        pieces.push(media);
+        text = after;
+    }
+    if !text.is_empty() {
+        pieces.push(Piece::Text(text));
+    }
+    pieces
+}
+
+#[test]
+fn placeholders_split_text_in_order() {
+    assert_eq!(
+        placeholder_pieces("Picture <|image|> and sound <|audio|> together."),
+        [
+            Piece::Text("Picture "),
+            Piece::Image,
+            Piece::Text(" and sound "),
+            Piece::Audio,
+            Piece::Text(" together.")
+        ]
+    );
+    assert_eq!(placeholder_pieces("<|audio|>"), [Piece::Audio]);
+}
+
+/// Mixed-modality inputs (text with an image, text with an audio clip, and
+/// both) against the FP32 reference: sentence-transformers 6.1.0 /
+/// transformers 5.19.0 on Kaggle (`eg2-mixedref`), each input one sequence
+/// with the media placed by the model's `<|image|>` / `<|audio|>`
+/// placeholders. The native layout must give the reference's token ids
+/// (soft-token slots aside), and the embeddings must pass the parity gate
+/// (mean cosine ≥ 0.9995, min ≥ 0.999).
+#[test]
+#[ignore = "requires the installed embedding model with the vision and audio artifacts"]
+#[allow(clippy::cast_precision_loss)]
+fn native_mixed_modality_embeddings_match_the_reference_fixture() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        cases: Vec<Case>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        text: String,
+        image: Option<String>,
+        audio: Option<String>,
+        ids: Vec<u32>,
+        embedding: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct AudioRow {
+        name: String,
+        wave_f32le_b64: Option<String>,
+    }
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let fixtures = format!("{root}/local-engine/tests/fixtures");
+    let fixture: Fixture = serde_json::from_str(
+        &std::fs::read_to_string(format!("{fixtures}/embeddinggemma2-mixed-reference.json"))
+            .expect("fixture"),
+    )
+    .expect("fixture json");
+    // The clips: a generated 1 s 1 kHz tone and an AudioCaps crop whose
+    // waveform the audio fixture holds.
+    let tone: Vec<f32> = (0..16_000)
+        .map(|i| {
+            let t = f64::from(i) / 16_000.0;
+            (0.5 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()) as f32
+        })
+        .collect();
+    let crop: Vec<f32> =
+        std::fs::read_to_string(format!("{fixtures}/embeddinggemma2-audio-reference.jsonl"))
+            .expect("audio fixture")
+            .lines()
+            .map(|line| serde_json::from_str::<AudioRow>(line).expect("row"))
+            .find(|row| row.name == "clip70-crop4000")
+            .and_then(|row| row.wave_f32le_b64)
+            .map(|wave| {
+                base64_decode(&wave)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect()
+            })
+            .expect("crop waveform");
+    let dir = installed_model(&Path::new(root).join("models")).expect("installed model");
+    let mut model = EmbeddingModel::open(&dir).expect("open");
+    let mut cosines = Vec::new();
+    for case in &fixture.cases {
+        let image = case.image.as_ref().map(|file| {
+            let bytes = std::fs::read(format!("{fixtures}/vision/{file}")).expect("image");
+            prepare_image(&bytes).expect("prepare")
+        });
+        let clip: Option<&[f32]> = case.audio.as_deref().map(|name| {
+            match name {
+                "tone1k-1s" => Some(tone.as_slice()),
+                "clip70-crop4000" => Some(crop.as_slice()),
+                _ => None,
+            }
+            .expect("a known clip")
+        });
+        let parts: Vec<MediaPart<'_>> = placeholder_pieces(&case.text)
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::Text(text) => MediaPart::Text(text),
+                Piece::Image => MediaPart::Image(image.as_ref().expect("case image")),
+                Piece::Audio => MediaPart::Audio(clip.expect("case clip")),
+            })
+            .collect();
+        let layout = model.multimodal_layout(&parts).expect("layout");
+        let expected: Vec<Option<u32>> = case
+            .ids
+            .iter()
+            .map(|id| (!MEDIA_PLACEHOLDERS.contains(id)).then_some(*id))
+            .collect();
+        assert_eq!(layout, expected, "token layout of {}", case.name);
+        let native = model
+            .embed_multimodal(&[parts], &mut || Ok(()))
+            .expect("embed")
+            .pop()
+            .expect("one embedding");
+        assert_eq!(case.embedding.len(), EMBEDDING_DIMENSIONS);
+        let norm = case.embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let cosine: f32 = native
+            .iter()
+            .zip(&case.embedding)
+            .map(|(a, b)| a * b / norm)
+            .sum();
+        eprintln!("{}: cosine {cosine:.6}", case.name);
+        cosines.push(cosine);
+    }
+    let mean = cosines.iter().sum::<f32>() / cosines.len() as f32;
+    let min = cosines.iter().copied().fold(f32::INFINITY, f32::min);
+    assert!(mean >= 0.9995 && min >= 0.999, "mean {mean}, min {min}");
+}

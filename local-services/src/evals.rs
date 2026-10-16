@@ -89,7 +89,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::batches::{
-    self, BatchStatus, COMPLETION_WINDOW, CreateBatch, Endpoint, MAX_LINE_BYTES, MAX_LINES,
+    self, BatchStatus, COMPLETION_WINDOW, CreateBatch, Endpoint, MAX_LINE_BYTES, MAX_LINES, Owner,
 };
 use crate::conversations::{Metadata, Order, Page};
 use crate::files::{CreateFile, FilePurpose};
@@ -116,7 +116,9 @@ const MAX_ID_TAIL: usize = 64;
 const BATCH_KEY: &str = "eval_batch";
 
 /// Version 1: evals, runs, their rows, model grades and output items.
-const MIGRATIONS: &[&str] = &["
+/// Version 2: each run's batch [`Owner`], given to the batches it creates.
+const MIGRATIONS: &[&str] = &[
+    "
 CREATE TABLE evals (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -172,7 +174,12 @@ CREATE TABLE eval_output_items (
     UNIQUE (run_id, item)
 ) STRICT;
 CREATE INDEX eval_output_items_run ON eval_output_items (run_id, status, seq);
-"];
+",
+    "
+ALTER TABLE eval_runs ADD COLUMN project_id TEXT;
+ALTER TABLE eval_runs ADD COLUMN api_key_id TEXT;
+",
+];
 
 /// Create or upgrade the eval tables.
 pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
@@ -616,6 +623,18 @@ impl Store {
         request: &CreateEvalRun,
         installed_model: &str,
     ) -> Result<EvalRun> {
+        self.create_eval_run_for(eval_id, request, installed_model, None)
+    }
+
+    /// [`Self::create_eval_run`] for `owner`: the batches the run creates
+    /// are theirs, so its generations' usage is attributed to them.
+    pub fn create_eval_run_for(
+        &self,
+        eval_id: &str,
+        request: &CreateEvalRun,
+        installed_model: &str,
+        owner: Option<&Owner>,
+    ) -> Result<EvalRun> {
         let eval = self.get_eval(eval_id)?;
         let criteria = criteria(&eval)?;
         let metadata = request.metadata.clone().unwrap_or_default();
@@ -659,8 +678,8 @@ impl Store {
         load_eval(&transaction, eval_id)?;
         transaction.execute(
             "INSERT INTO eval_runs (id, eval_id, name, model, data_source, metadata, status, phase,
-                                    created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8)",
+                                    created_at, project_id, api_key_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10)",
             params![
                 id,
                 eval_id,
@@ -673,7 +692,9 @@ impl Store {
                 } else {
                     Phase::Grading.as_str()
                 },
-                signed(now()?)?
+                signed(now()?)?,
+                owner.map(|owner| owner.project_id.as_str()),
+                owner.map(|owner| owner.api_key_id.as_str()),
             ],
         )?;
         {
@@ -1214,7 +1235,20 @@ impl Store {
             metadata.insert(BATCH_KEY.to_owned(), key);
             metadata.insert("eval_id".to_owned(), row.run.eval_id.clone());
             metadata.insert("eval_run_id".to_owned(), row.run.id.clone());
-            let created = self.create_batch(
+            let owner = self.connection()?.query_row(
+                "SELECT project_id, api_key_id FROM eval_runs WHERE id = ?1",
+                [&row.run.id],
+                |row| {
+                    Ok(match (row.get(0)?, row.get(1)?) {
+                        (Some(project_id), Some(api_key_id)) => Some(Owner {
+                            project_id,
+                            api_key_id,
+                        }),
+                        _ => None,
+                    })
+                },
+            )?;
+            let created = self.create_batch_for(
                 &CreateBatch {
                     input_file_id: file.id.clone(),
                     endpoint: endpoint.as_str().to_owned(),
@@ -1222,6 +1256,7 @@ impl Store {
                     metadata,
                 },
                 installed_model,
+                owner.as_ref(),
             );
             match created {
                 Ok(batch) => batch.id,

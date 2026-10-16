@@ -57,11 +57,11 @@ use tokio::sync::{Semaphore, watch};
 use local_engine::{ChatRequest, EngineHandle, Event, Signal};
 use local_services::admin::usage::{UsageKind, UsageRecord};
 use local_services::batches::{
-    BatchLease, CreateBatch, Endpoint, LineOutcome, ListBatches, NextLine, PendingLine,
+    BatchLease, CreateBatch, Endpoint, LineOutcome, ListBatches, NextLine, Owner, PendingLine,
 };
 use local_services::{Error, Metadata, Store};
 
-use super::admin::Meter;
+use super::admin::{Caller, Meter};
 use super::chunked::{Body as Document, Flow, absorb};
 use super::reasoning_crypto::ReasoningCipher;
 use super::response::{
@@ -107,6 +107,9 @@ pub(super) struct Config {
     pub(super) thinking: bool,
     pub(super) cipher: Option<Arc<ReasoningCipher>>,
     pub(super) depth: QueueDepth,
+    /// Records each line's generation as a batch completion, attributed to
+    /// the batch's [`Owner`] when it has one.
+    pub(super) meter: Meter,
 }
 
 /// Whether `path` belongs to the Batches API (any method).
@@ -116,7 +119,12 @@ pub(super) fn matches(path: &str) -> bool {
 }
 
 /// Answer a Batches request. Authentication has already passed.
-pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Response {
+pub(super) async fn handle(
+    state: &AppState,
+    parts: &Parts,
+    body: Body,
+    caller: &Caller,
+) -> Response {
     let Some(batches) = state.batches.as_ref() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -126,7 +134,7 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
         )
         .await;
     };
-    match batches.dispatch(parts, body).await {
+    match batches.dispatch(parts, body, owner(caller)).await {
         Ok(value) => json_response(StatusCode::OK, value, state, &parts.headers).await,
         Err((status, message)) => error_response(status, &message, state, &parts.headers).await,
     }
@@ -147,21 +155,23 @@ impl Batches {
         let services = state.services.as_ref().ok_or_else(|| {
             crate::Error::InvalidArgument("batches need the native services store".into())
         })?;
+        // Lines (eval-run generations included) are recorded as batch
+        // completions of the project key that created the batch (or the
+        // eval run), which is stored with it: a batch outlives its creator's
+        // request.
+        let mut record = UsageRecord::new(UsageKind::Completions);
+        record.model = Some(state.model.to_string());
+        record.batch = true;
         let config = Config {
             model: Arc::clone(&state.model),
             thinking: state.thinking,
             cipher: state.cipher.clone(),
             depth: state.depth.clone(),
+            meter: Meter::into_store(state.auth.admin(), record),
         };
-        // Lines (eval-run generations included) are recorded as batch
-        // completions, unattributed: a batch outlives its creator's request.
-        let mut record = UsageRecord::new(UsageKind::Completions);
-        record.model = Some(state.model.to_string());
-        record.batch = true;
-        let meter = Meter::into_store(state.auth.admin(), record);
         Self::spawn(
             services.store().clone(),
-            engine_submit(state.engine.clone(), meter),
+            engine_submit(state.engine.clone()),
             config,
         )
     }
@@ -229,7 +239,13 @@ impl Batches {
     }
 
     /// Answer one request, independent of the server's other state.
-    pub(super) async fn dispatch(&self, parts: &Parts, body: Body) -> Result<Value, Failure> {
+    /// `owner` is the caller's project key, which a created batch keeps.
+    pub(super) async fn dispatch(
+        &self,
+        parts: &Parts,
+        body: Body,
+        owner: Option<Owner>,
+    ) -> Result<Value, Failure> {
         let rest = parts.uri.path().strip_prefix(PREFIX).unwrap_or_default();
         let segments: Vec<&str> = rest.split('/').skip(1).collect();
         if segments.iter().any(|segment| segment.is_empty()) {
@@ -239,7 +255,7 @@ impl Batches {
         match (parts.method.clone(), segments.as_slice()) {
             (Method::POST, []) => {
                 no_query(query)?;
-                self.create(body).await
+                self.create(body, owner).await
             }
             (Method::GET, []) => {
                 let list = list_query(query)?;
@@ -267,7 +283,7 @@ impl Batches {
         }
     }
 
-    async fn create(&self, body: Body) -> Result<Value, Failure> {
+    async fn create(&self, body: Body, owner: Option<Owner>) -> Result<Value, Failure> {
         let request: CreateBody = read_json(body).await?;
         let create = CreateBatch {
             input_file_id: request.input_file_id,
@@ -277,7 +293,7 @@ impl Batches {
         };
         let model = Arc::clone(&self.worker.config.model);
         let batch = self
-            .call(move |store| store.create_batch(&create, &model))
+            .call(move |store| store.create_batch_for(&create, &model, owner.as_ref()))
             .await?;
         self.worker.notify();
         Ok(to_json(&batch))
@@ -497,9 +513,11 @@ impl Worker {
         };
         let config = &self.config;
         // A batch stored by a server with another model (resumed here) never
-        // runs on this one.
+        // runs on this one. One stored by an earlier version, which named
+        // the model by its file path, does.
         let model = line.body.get("model").and_then(Value::as_str);
-        if model != Some(config.model.as_ref()) {
+        if model != Some(config.model.as_ref()) && !model.is_some_and(super::models::legacy_bonsai)
+        {
             return Some(failed(
                 StatusCode::BAD_REQUEST,
                 &format!(
@@ -555,8 +573,16 @@ impl Worker {
         interrupted: &AtomicBool,
     ) -> Option<LineOutcome> {
         let deadline = deadline(line.expires_at);
+        let meter = line.owner.as_ref().map_or_else(
+            || self.config.meter.clone(),
+            |owner| {
+                self.config
+                    .meter
+                    .attributed(&owner.project_id, &owner.api_key_id)
+            },
+        );
         let mut generation = match self.admit(request, interrupted, deadline) {
-            Ok(generation) => generation,
+            Ok(generation) => metered(generation, meter),
             Err(outcome) => return outcome,
         };
         let _admitted = self.config.depth.admit();
@@ -673,39 +699,44 @@ impl Worker {
     }
 }
 
-/// The engine as the worker drives it, each finished line recorded by
-/// `meter`.
-fn engine_submit(engine: EngineHandle, meter: Meter) -> Submit {
-    metered_submit(
-        Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
-            let mut events = engine.chat(request)?;
-            let handle = events.cancel_handle();
-            Ok(Generation {
-                next: Box::new(move |timeout| events.next_signal(timeout)),
-                cancel: Arc::new(move || handle.cancel()),
-            })
-        }),
-        meter,
-    )
-}
-
-/// `submit` with every generation's final measurements recorded by `meter`
-/// as the worker reads them (on the worker's own thread).
-pub(super) fn metered_submit(submit: Submit, meter: Meter) -> Submit {
+/// The engine as the worker drives it.
+fn engine_submit(engine: EngineHandle) -> Submit {
     Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
-        let Generation { mut next, cancel } = submit(request)?;
-        let meter = meter.clone();
+        let mut events = engine.chat(request)?;
+        let handle = events.cancel_handle();
         Ok(Generation {
-            next: Box::new(move |timeout| {
-                let signal = next(timeout);
-                if let Ok(Some(Signal::Event(Event::Finished(stats)))) = &signal {
-                    meter.generation(stats);
-                }
-                signal
-            }),
-            cancel,
+            next: Box::new(move |timeout| events.next_signal(timeout)),
+            cancel: Arc::new(move || handle.cancel()),
         })
     })
+}
+
+/// `generation` with its final measurements recorded by `meter` as the
+/// worker reads them (on the worker's own thread), including those drained
+/// after a cancellation.
+pub(super) fn metered(generation: Generation, meter: Meter) -> Generation {
+    let Generation { mut next, cancel } = generation;
+    Generation {
+        next: Box::new(move |timeout| {
+            let signal = next(timeout);
+            if let Ok(Some(Signal::Event(Event::Finished(stats)))) = &signal {
+                meter.generation(stats);
+            }
+            signal
+        }),
+        cancel,
+    }
+}
+
+/// The batch owner a caller's project key makes; `None` when unattributed.
+pub(super) fn owner(caller: &Caller) -> Option<Owner> {
+    match caller {
+        Caller::Project { key_id, project_id } => Some(Owner {
+            project_id: project_id.clone(),
+            api_key_id: key_id.clone(),
+        }),
+        Caller::Anonymous | Caller::Static | Caller::Admin { .. } => None,
+    }
 }
 
 /// When generation for a batch expiring at `expires_at` must stop: just

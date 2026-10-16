@@ -21,7 +21,9 @@ target/release/local-ai chat 'What is 17 * 23?'
 
 The server listens on `127.0.0.1:8080` and implements a text, function-calling and
 JSON-constrained subset of the OpenAI Chat Completions and Responses HTTP
-contracts (not full OpenAI compatibility).
+contracts (not full OpenAI compatibility). The Bonsai model's id is
+`ternary-bonsai-2-27b`; `GET /v1/models` lists it with every installed
+optional model ([model ids](docs/BONSAI.md#model-ids)).
 
 **Supported OpenAI APIs.** Only current OpenAI APIs are served: Chat
 Completions, Responses (with `input_tokens`, `compact`, retrieval,
