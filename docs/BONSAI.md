@@ -3134,7 +3134,9 @@ input item), Chat `stop` sequences and `text.verbosity` other than `medium`.
 Evidence: `.scratch/artifacts/client-compat/final-a` (Codex, opencode
 Responses; its `codex-fix`, `codex-compact` and `opencode-cancel` predate the
 fixes above), `final-b` (Oh My Pi, Codex reruns, HTTP probes), `final-c`
-(opencode cancel, invalid-then-valid), `final-d` (opencode Chat).
+(opencode cancel, invalid-then-valid), `final-d` (opencode Chat), `final-e`
+(one read scenario per client and two probes, rerun after rebasing onto
+image input).
 
 #### Long-context coding quality
 
