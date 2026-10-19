@@ -52,23 +52,27 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// For a `tool` message, the [`ToolCall::id`] this result answers.
     pub tool_call_id: Option<String>,
-    /// Images in `content`, each at a byte offset of it, in order. The
-    /// template renders each as `<|vision_start|><|image_pad|><|vision_end|>`
-    /// there; system and developer messages may not hold images. Needs the
-    /// vision projector installed.
+    /// Images and videos in `content`, each at a byte offset of it, in
+    /// order. The template renders each image as
+    /// `<|vision_start|><|image_pad|><|vision_end|>` there (a video with
+    /// `<|video_pad|>`); system and developer messages may not hold them.
+    /// Needs the vision projector installed.
     pub images: Vec<ChatImage>,
 }
 
-/// An image part of a [`ChatMessage`].
+/// An image or video part of a [`ChatMessage`].
 #[derive(Clone, Debug)]
 pub struct ChatImage {
     /// Byte offset in the message content (a character boundary) where the
-    /// image sits; offsets never decrease along a message's images.
+    /// part sits; offsets never decrease along a message's parts.
     pub offset: usize,
-    /// The encoded file: JPEG, PNG, WebP, GIF (first frame) or BMP.
+    /// The encoded file: JPEG, PNG, WebP, GIF (first frame) or BMP; for a
+    /// video, MP4 or MOV.
     pub data: Arc<[u8]>,
-    /// Its pixel budget.
+    /// An image's pixel budget (a video's is fixed).
     pub detail: ImageDetail,
+    /// Whether `data` is a video.
+    pub video: bool,
 }
 
 /// Sampling controls for one generation.
@@ -1238,22 +1242,60 @@ fn has_images(request: &ChatRequest) -> bool {
 fn vision_required(vision: Option<&VisionEncoder>) -> crate::Result<&VisionEncoder> {
     vision.ok_or_else(|| {
         crate::Error::InvalidArgument(format!(
-            "image input needs the Bonsai vision projector {}, which is not installed beside \
+            "image and video input need the Bonsai vision projector {}, which is not installed beside \
              the model",
             crate::bonsai_vision::VISION_PROJECTOR_FILE
         ))
     })
 }
 
-/// Decode and resize every image of `request`, in prompt order.
-fn prepare_images(
-    request: &ChatRequest,
-) -> crate::Result<Vec<crate::bonsai_vision::PreparedImage>> {
+/// One image or video of a request, decoded and resized.
+enum Prepared {
+    Image(crate::bonsai_vision::PreparedImage),
+    Video(Arc<crate::bonsai_vision::PreparedVideo>),
+}
+
+/// Decode and resize every image and video of `request`, in prompt order.
+fn prepare_images(request: &ChatRequest) -> crate::Result<Vec<Prepared>> {
     request
         .messages
         .iter()
         .flat_map(|message| &message.images)
-        .map(|image| crate::bonsai_vision::prepare_image(&image.data, image.detail))
+        .map(|part| {
+            if part.video {
+                crate::bonsai_vision::prepare_video(&part.data).map(Prepared::Video)
+            } else {
+                crate::bonsai_vision::prepare_image(&part.data, part.detail).map(Prepared::Image)
+            }
+        })
+        .collect()
+}
+
+/// `prepared` laid out for the prompt, each grid's rows from `rows`.
+fn visuals<'a>(
+    tokenizer: &BonsaiTokenizer,
+    prepared: &'a [Prepared],
+    mut rows: impl FnMut(&crate::bonsai_vision::PreparedImage) -> crate::Result<Arc<[f32]>>,
+) -> crate::Result<Vec<crate::bonsai_vision::Visual<'a>>> {
+    use crate::bonsai_vision::{Visual, video::timestamp_text};
+    prepared
+        .iter()
+        .map(|part| match part {
+            Prepared::Image(image) => Ok(Visual::Image(image, rows(image)?)),
+            Prepared::Video(video) => video
+                .groups
+                .iter()
+                .zip(&video.timestamps)
+                .map(|(group, &seconds)| {
+                    Ok((
+                        tokenizer.encode(&timestamp_text(seconds))?,
+                        group,
+                        rows(group)?,
+                    ))
+                })
+                .collect::<crate::Result<Vec<_>>>()
+                .map(Visual::Video),
+        })
         .collect()
 }
 
@@ -1276,10 +1318,7 @@ fn chat_prompt(
     }
     let vision = vision_required(vision)?;
     let prepared = prepare_images(request)?;
-    let encoded = prepared
-        .iter()
-        .map(|image| Ok((image, vision.encode(image, activity)?)))
-        .collect::<crate::Result<Vec<_>>>()?;
+    let encoded = visuals(tokenizer, &prepared, |image| vision.encode(image, activity))?;
     let (ids, images) = crate::bonsai_vision::expand_prompt(&ids, vision.digest(), &encoded)?;
     Ok(ChatPrompt {
         ids,
@@ -1334,7 +1373,10 @@ fn count_chat(
         return Ok(ids.len());
     }
     vision_required(vision)?;
-    crate::bonsai_vision::expanded_len(&ids, &prepare_images(request)?)
+    let prepared = prepare_images(request)?;
+    let empty: Arc<[f32]> = Arc::new([]);
+    let layout = visuals(tokenizer, &prepared, |_| Ok(Arc::clone(&empty)))?;
+    crate::bonsai_vision::expanded_len(&ids, &layout)
 }
 
 fn render_messages(
@@ -1369,7 +1411,7 @@ fn content_with_images(message: &ChatMessage) -> crate::Result<std::borrow::Cow<
     }
     if matches!(message.role.as_str(), "system" | "developer") {
         return Err(crate::Error::InvalidArgument(format!(
-            "{} messages cannot contain images",
+            "{} messages cannot contain images or videos",
             message.role
         )));
     }
@@ -1385,7 +1427,11 @@ fn content_with_images(message: &ChatMessage) -> crate::Result<std::borrow::Cow<
             )
         })?;
         rendered.push_str(text);
-        rendered.push_str(crate::bonsai_vision::IMAGE_PLACEHOLDER);
+        rendered.push_str(if image.video {
+            crate::bonsai_vision::VIDEO_PLACEHOLDER
+        } else {
+            crate::bonsai_vision::IMAGE_PLACEHOLDER
+        });
         done = image.offset;
     }
     rendered.push_str(content.get(done..).unwrap_or_default());

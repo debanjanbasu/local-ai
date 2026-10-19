@@ -1114,6 +1114,14 @@ fn responses_reject_what_they_cannot_honour() {
             "must be a base64 data URL",
         ),
         (
+            json!({"input":[{"role":"user","content":[{"type":"input_video","video_url":"x"}]}]}),
+            "a video URL must be a base64 data URL",
+        ),
+        (
+            json!({"input":[{"role":"user","content":[{"type":"input_video"}]}]}),
+            "exactly one of video_url and file_id",
+        ),
+        (
             json!({"input":[{"type":"item_reference","id":"msg_1"}]}),
             "item_reference",
         ),

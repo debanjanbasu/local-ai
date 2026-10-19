@@ -984,13 +984,16 @@ pub(super) fn tool_call(id: String, name: String, arguments: &Value) -> crate::R
     })
 }
 
-/// A message's `content`: a string, or `text`, `image_url` (a base64 data
-/// URL, with `detail`) and `file` (an uploaded image's `file_id`, or its
-/// base64 `file_data`) parts in order.
+/// A message's `content`: a string, or `text`, `image_url` (a data or
+/// `http(s)` URL, with `detail`), `video_url` (likewise; vLLM's and
+/// llama.cpp's extension, also llama.cpp's `input_video` alias) and `file`
+/// (an uploaded image's or video's `file_id`, or its base64 `file_data`)
+/// parts in order.
 pub(super) fn message_parts(
     value: &Value,
     files: Option<&local_services::Store>,
 ) -> crate::Result<super::images::Parts> {
+    use super::images::Kind;
     let invalid = |message: &str| crate::Error::InvalidArgument(message.into());
     let mut parts = super::images::Parts::default();
     if let Some(text) = value.as_str() {
@@ -1000,6 +1003,25 @@ pub(super) fn message_parts(
     let items = value
         .as_array()
         .ok_or_else(|| invalid("message content must be a text string or an array of parts"))?;
+    // `{"url": …}` (with `detail`) or a bare URL string.
+    let source = |item: &Value, field: &str| -> crate::Result<(String, Option<Value>)> {
+        match item.get(field) {
+            Some(Value::String(url)) => Ok((url.clone(), None)),
+            Some(Value::Object(object)) => {
+                let url = object
+                    .get("url")
+                    .or_else(|| object.get("data"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        crate::Error::InvalidArgument(format!("{field} requires a url string"))
+                    })?;
+                Ok((url.to_owned(), object.get("detail").cloned()))
+            }
+            _ => Err(crate::Error::InvalidArgument(format!(
+                "a {field} part requires {field}, an object with a url"
+            ))),
+        }
+    };
     for item in items {
         match item.get("type").and_then(Value::as_str) {
             Some("text") => parts.push_text(
@@ -1008,21 +1030,23 @@ pub(super) fn message_parts(
                     .ok_or_else(|| invalid("text content requires a text string"))?,
             ),
             Some("image_url") => {
-                let image = item
-                    .get("image_url")
-                    .ok_or_else(|| invalid("an image_url part requires image_url"))?;
-                let (url, detail) = match image {
-                    Value::String(url) => (url.as_str(), None),
-                    Value::Object(image) => (
-                        image
-                            .get("url")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| invalid("image_url requires a url string"))?,
-                        image.get("detail"),
-                    ),
-                    _ => return Err(invalid("image_url must be an object with a url")),
+                let (url, detail) = source(item, "image_url")?;
+                parts.push_image(
+                    super::images::url(&url, Kind::Image)?,
+                    super::images::detail(detail.as_ref())?,
+                );
+            }
+            Some(kind @ ("video_url" | "input_video")) => {
+                let (url, _) = source(item, kind)?;
+                let data = if url.starts_with("data:")
+                    || url.starts_with("http://")
+                    || url.starts_with("https://")
+                {
+                    super::images::url(&url, Kind::Video)?
+                } else {
+                    super::images::data_url(&url, true)?
                 };
-                parts.push_image(super::images::url(url)?, super::images::detail(detail)?);
+                parts.push_video(data);
             }
             Some("file") => {
                 let file = item
@@ -1040,14 +1064,18 @@ pub(super) fn message_parts(
                         ));
                     }
                 };
-                parts.push_image(data, local_engine::ImageDetail::Auto);
+                parts.push_file(data, local_engine::ImageDetail::Auto);
             }
             Some("input_audio") => {
                 return Err(invalid(
-                    "audio content is not supported; send text or images",
+                    "audio content is not supported; send text, images or video",
                 ));
             }
-            _ => return Err(invalid("content parts must be text, image_url or file")),
+            _ => {
+                return Err(invalid(
+                    "content parts must be text, image_url, video_url or file",
+                ));
+            }
         }
     }
     Ok(parts)

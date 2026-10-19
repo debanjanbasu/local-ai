@@ -1,7 +1,8 @@
 //! The Qwen3.5 vision tower of the Bonsai mmproj, on Metal.
 //!
 //! Width 1152, 27 pre-LN blocks (16 heads x 72, 2-D `RoPE` θ 10,000 over
-//! rows then columns, bidirectional attention over the whole image,
+//! rows then columns, bidirectional attention over the whole image or video
+//! frame group,
 //! GELU-tanh MLP 4304), a learned 48 x 48 position table interpolated
 //! bilinearly to the patch grid, then the merger: `LayerNorm`, 2x2 patch
 //! concatenation (4608), GELU (exact), 5120. F32 activations throughout; the
@@ -62,6 +63,9 @@ struct Gpu {
     /// `W(t=0) + W(t=1)` of the patch convolution, `[1152][768]` F32: the
     /// processor feeds two identical temporal slices.
     patch: MetalBuffer,
+    /// `[W(t=0) | W(t=1)]` per output row, `[1152][1536]` F32: a video frame
+    /// group's two frames.
+    patch_pair: MetalBuffer,
     patch_bias: BonsaiMetalTensor,
     blocks: Vec<Block>,
     post_ln: (BonsaiMetalTensor, BonsaiMetalTensor),
@@ -228,10 +232,20 @@ impl VisionEncoder {
                 .collect())
         };
         let patch_dims = [16, 16, 3, HIDDEN as u64];
-        let patch_weights = f32s("v.patch_embd.weight", &patch_dims)?
+        let (first, second) = (
+            f32s("v.patch_embd.weight", &patch_dims)?,
+            f32s("v.patch_embd.weight.1", &patch_dims)?,
+        );
+        let patch_weights = first
             .iter()
-            .zip(f32s("v.patch_embd.weight.1", &patch_dims)?)
+            .zip(&second)
             .map(|(a, b)| a + b)
+            .collect::<Vec<_>>();
+        let patch_pair = first
+            .chunks(PATCH_VALUES)
+            .zip(second.chunks(PATCH_VALUES))
+            .flat_map(|(a, b)| a.iter().chain(b))
+            .copied()
             .collect::<Vec<_>>();
         let blocks = (0..BLOCKS)
             .map(|index| {
@@ -248,6 +262,7 @@ impl VisionEncoder {
             .collect::<crate::Result<Vec<_>>>()?;
         let gpu = Gpu {
             patch: MetalBuffer::from_slice(context.device(), &patch_weights)?,
+            patch_pair: MetalBuffer::from_slice(context.device(), &patch_pair)?,
             patch_bias: tensor("v.patch_embd.bias", BonsaiTensorType::F32, &[HIDDEN as u64])?,
             blocks,
             post_ln: norm("v.post_ln")?,
@@ -345,12 +360,16 @@ impl VisionEncoder {
             &mut batch,
             Linear {
                 f32: true,
-                weights: &gpu.patch,
+                weights: if image.next.is_some() {
+                    &gpu.patch_pair
+                } else {
+                    &gpu.patch
+                },
                 weights_offset: 0,
                 bias: gpu.patch_bias.buffer(),
                 bias_offset: gpu.patch_bias.offset(),
                 rows: HIDDEN as u32,
-                columns: PATCH_VALUES as u32,
+                columns: image.patch_values() as u32,
             },
             &input,
             &hidden,

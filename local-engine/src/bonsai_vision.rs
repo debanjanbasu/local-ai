@@ -22,12 +22,16 @@
 //!   first pad sits at text position `t0` rotates by `(t0, t0 + k / cols,
 //!   t0 + k % cols)`, and the text after it resumes at `t0 + max(rows, cols)`.
 //!
+//! Video parts ([`video`]) become frame groups of two frames, each encoded
+//! like an image and laid out like one after its timestamp text.
+//!
 //! Prompt caching keys on token ids, so each image token gets a virtual id
 //! above the vocabulary ([`image_token_id`]) derived from the mmproj and the
 //! preprocessed pixels: equal images share prefixes, different ones never do.
 
 mod preprocess;
 mod tower;
+pub mod video;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -38,6 +42,7 @@ use crate::bonsai::WIDTH;
 
 pub use self::preprocess::{ImageDetail, PreparedImage, prepare_decoded, prepare_image};
 pub use self::tower::{VISION_PROJECTOR_FILE, VisionEncoder};
+pub use self::video::{PreparedVideo, VIDEO_PAD, VIDEO_PLACEHOLDER, prepare_video};
 
 /// `<|vision_start|>`.
 pub const VISION_START: u32 = 248_053;
@@ -228,42 +233,78 @@ pub(crate) fn check_tokens(
     Ok(())
 }
 
-/// Replace each template `<|image_pad|>` in `ids` with its image's tokens,
-/// returning the expanded ids and spans for `embeddings` (one per image, in
-/// prompt order, each `[tokens][WIDTH]` in the embedding basis).
+/// One image or video of a prompt, encoded, for [`expand_prompt`].
+#[derive(Clone, Debug)]
+pub enum Visual<'a> {
+    /// An image and its decoder rows (`[tokens][WIDTH]`, embedding basis).
+    Image(&'a PreparedImage, Arc<[f32]>),
+    /// A video: its frame groups in order.
+    Video(Vec<FrameGroup<'a>>),
+}
+
+/// A video frame group of a [`Visual::Video`]: the token ids of its
+/// timestamp text, the group and its rows.
+pub type FrameGroup<'a> = (Vec<u32>, &'a PreparedImage, Arc<[f32]>);
+
+impl Visual<'_> {
+    /// The template token this part's expansion replaces.
+    const fn pad(&self) -> u32 {
+        match self {
+            Self::Image(..) => IMAGE_PAD,
+            Self::Video(_) => VIDEO_PAD,
+        }
+    }
+
+    /// Tokens the pad becomes.
+    fn len(&self) -> usize {
+        match self {
+            Self::Image(image, _) => image.tokens(),
+            Self::Video(groups) => groups
+                .iter()
+                .map(|(text, group, _)| text.len() + group.tokens() + 2)
+                .sum(),
+        }
+    }
+}
+
+fn check_pads(ids: &[u32], visuals: &[Visual<'_>]) -> crate::Result<()> {
+    let mut expected = visuals.iter().map(Visual::pad);
+    let matched = ids
+        .iter()
+        .filter(|&&id| id == IMAGE_PAD || id == VIDEO_PAD)
+        .all(|&id| expected.next() == Some(id));
+    if matched && expected.next().is_none() {
+        return Ok(());
+    }
+    Err(crate::Error::InvalidArgument(format!(
+        "the prompt's <|image_pad|> and <|video_pad|> tokens do not match its {} images and \
+         videos; message text may not contain them",
+        visuals.len()
+    )))
+}
+
+/// Replace each template `<|image_pad|>` and `<|video_pad|>` in `ids` with
+/// its part's tokens, returning the expanded ids and the image spans (one
+/// per image and per video frame group, in prompt order).
+///
+/// An image becomes its tokens. A video becomes, for each frame group, its
+/// timestamp text, `<|vision_start|>`, the group's tokens and
+/// `<|vision_end|>`, as the processor expands it.
 ///
 /// # Errors
 ///
-/// [`crate::Error::InvalidArgument`] when the prompt holds a different number
-/// of `<|image_pad|>` tokens than images (text may not spell one).
+/// [`crate::Error::InvalidArgument`] when the prompt's pads do not match
+/// `visuals` one to one, in order (text may not spell one).
 pub fn expand_prompt(
     ids: &[u32],
     projector: &[u8; 32],
-    images: &[(&PreparedImage, Arc<[f32]>)],
+    visuals: &[Visual<'_>],
 ) -> crate::Result<(Vec<u32>, PromptImages)> {
-    let pads = ids.iter().filter(|&&id| id == IMAGE_PAD).count();
-    if pads != images.len() {
-        return Err(crate::Error::InvalidArgument(format!(
-            "the prompt has {pads} <|image_pad|> tokens for {} images; message text may not \
-             contain <|image_pad|>",
-            images.len()
-        )));
-    }
-    let extra = images
-        .iter()
-        .map(|(image, _)| image.tokens() - 1)
-        .sum::<usize>();
+    check_pads(ids, visuals)?;
+    let extra = visuals.iter().map(Visual::len).sum::<usize>();
     let mut expanded = Vec::with_capacity(ids.len() + extra);
-    let mut spans = Vec::with_capacity(images.len());
-    let mut next = images.iter();
-    for &id in ids {
-        if id != IMAGE_PAD {
-            expanded.push(id);
-            continue;
-        }
-        let Some((image, embedding)) = next.next() else {
-            break;
-        };
+    let mut spans = Vec::new();
+    let mut grid = |expanded: &mut Vec<u32>, image: &PreparedImage, embedding: &Arc<[f32]>| {
         let start = expanded.len();
         expanded.extend(
             (0..image.tokens() as u32).map(|k| image_token_id(projector, &image.digest, k)),
@@ -274,26 +315,38 @@ pub fn expand_prompt(
             cols: image.cols,
             embedding: Arc::clone(embedding),
         });
+    };
+    let mut next = visuals.iter();
+    for &id in ids {
+        if id != IMAGE_PAD && id != VIDEO_PAD {
+            expanded.push(id);
+            continue;
+        }
+        match next.next() {
+            Some(Visual::Image(image, embedding)) => grid(&mut expanded, image, embedding),
+            Some(Visual::Video(groups)) => {
+                for (text, group, embedding) in groups {
+                    expanded.extend_from_slice(text);
+                    expanded.push(VISION_START);
+                    grid(&mut expanded, group, embedding);
+                    expanded.push(VISION_END);
+                }
+            }
+            None => break,
+        }
     }
     Ok((expanded, PromptImages::new(spans)?))
 }
 
-/// The prompt length `ids` (holding one `<|image_pad|>` per image) expands
-/// to.
+/// The prompt length `ids` (holding one pad per part) expands to; the rows
+/// of `visuals` are not read.
 ///
 /// # Errors
 ///
 /// As [`expand_prompt`].
-pub fn expanded_len(ids: &[u32], images: &[PreparedImage]) -> crate::Result<usize> {
-    let pads = ids.iter().filter(|&&id| id == IMAGE_PAD).count();
-    if pads != images.len() {
-        return Err(crate::Error::InvalidArgument(format!(
-            "the prompt has {pads} <|image_pad|> tokens for {} images; message text may not \
-             contain <|image_pad|>",
-            images.len()
-        )));
-    }
-    Ok(ids.len() + images.iter().map(|image| image.tokens() - 1).sum::<usize>())
+pub fn expanded_len(ids: &[u32], visuals: &[Visual<'_>]) -> crate::Result<usize> {
+    check_pads(ids, visuals)?;
+    Ok(ids.len() + visuals.iter().map(|visual| visual.len() - 1).sum::<usize>())
 }
 
 /// Forward signed-Hadamard rotation of decoder input rows into the basis the

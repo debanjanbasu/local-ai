@@ -213,6 +213,11 @@ forms are refused), and the connection goes to a checked address, so the
 name is not re-resolved. Redirects are reported, not followed. TLS is
 verified by the macOS trust store. The body is capped at 256 KiB.
 
+Remote image and video URLs in chat requests use the same transport
+(`tools::fetch::download`) with the same address checks but no allowlist,
+public IP literals allowed, up to five redirects each checked anew, and a
+64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
+
 **Known gaps** (stated, not papered over):
 
 - macOS rejects `RLIMIT_AS` and does not enforce `RLIMIT_DATA`/`RLIMIT_RSS`,

@@ -56,6 +56,12 @@ symphonia = { version = "0.6.1", default-features = false, features = ["flac", "
 rustfft = "6.4"
 # zlib itself (not a re-implementation) for Whisper's compression-ratio test.
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
-
-[dev-dependencies]
+# Video input (`bonsai_vision::video`): AVFoundation's demuxers and
+# VideoToolbox's decoders, the system's own (no bundled codec library).
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVMediaFormat", "objc2-core-foundation", "objc2-core-media"] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMBase", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSArray"] }
+# The video file AVFoundation opens, deleted when dropped.
 tempfile = "3"

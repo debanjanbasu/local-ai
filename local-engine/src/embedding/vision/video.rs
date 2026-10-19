@@ -143,7 +143,7 @@ pub fn probe(path: &Path) -> crate::Result<VideoStream> {
 
 /// swscale's `ff_yuv2rgb_coeffs` row for an `FFmpeg` colour-space name
 /// (`sws_getCoefficients`: unknown and unsupported spaces use BT.601).
-fn yuv2rgb_coefficients(color_space: Option<&str>) -> [i64; 4] {
+pub(crate) fn yuv2rgb_coefficients(color_space: Option<&str>) -> [i64; 4] {
     const BT709: [i64; 4] = [117_489, 138_438, 13_975, 34_925];
     const BT601: [i64; 4] = [104_597, 132_201, 25_675, 53_279];
     match color_space {
@@ -159,7 +159,7 @@ fn yuv2rgb_coefficients(color_space: Option<&str>) -> [i64; 4] {
 /// path: coefficients rounded to 16 bits, `(a · b) >> 16` products,
 /// saturating 16-bit adds, nearest chroma), default contrast and saturation.
 #[allow(clippy::many_single_char_names)]
-fn yuv420_to_rgb(
+pub(crate) fn yuv420_to_rgb(
     planes: &[u8],
     width: usize,
     height: usize,
