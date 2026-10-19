@@ -4,6 +4,7 @@
 //! mtp-capture tables DIR
 //! mtp-capture signs DIR
 //! mtp-capture capture --out DIR [options] CORPUS.jsonl...
+//! mtp-capture render CORPUS.jsonl...
 //! mtp-capture parity  --out DIR [--doc N] [--positions P,..] [--depth D] CORPUS.jsonl...
 //! mtp-capture features --out DIR [--max-tokens N] [--rows N] ROWS.jsonl
 //! mtp-capture features --validate-only [--out DIR] [--max-tokens N] ROWS.jsonl
@@ -84,6 +85,9 @@ const USAGE: &str = "usage:
                       [--max-doc-tokens N] [--min-doc-tokens N] [--rows N] [--top-k N]
                       CORPUS.jsonl...
       one shard-NNNNNN.bin per document; existing shards are kept (resume)
+  mtp-capture render CORPUS.jsonl...
+      print each document as capture would read it, {source, line, text}
+      per line; loads no model
   mtp-capture parity --out DIR [--doc N] [--positions P,..] [--depth D] CORPUS.jsonl...
       capture one document and record the runtime head's draft chains
   mtp-capture features --out DIR [--max-tokens N] [--rows N] ROWS.jsonl
@@ -99,7 +103,12 @@ const USAGE: &str = "usage:
       output written
 
 Corpus lines are JSON objects with `messages` (chat template, no thinking)
-or `text` (raw). Files are read round-robin, one document from each in turn.";
+or `text` (raw). A line with `tools` or `thinking` is an agent transcript,
+rendered as the server renders a request: `messages` may replay
+`reasoning_content`, `tool_calls` ({id, name, arguments}) and `tool_call_id`,
+`tools` are tool definitions ({name, description, parameters}), and
+`thinking` defaults to true. Files are read round-robin, one document from
+each in turn.";
 
 struct Options {
     out: PathBuf,
@@ -222,6 +231,9 @@ fn documents(paths: &[PathBuf]) -> local_engine::Result<impl Iterator<Item = Doc
 
 fn render(line: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("tools").is_some() || value.get("thinking").is_some() {
+        return render_transcript(&value);
+    }
     if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
         let messages: Vec<ChatMessage<'_>> = messages
             .iter()
@@ -240,6 +252,60 @@ fn render(line: &str) -> Option<String> {
         .and_then(|text| text.as_str())
         .filter(|text| !text.trim().is_empty())
         .map(str::to_owned)
+}
+
+/// An agent transcript as the server renders it: `messages` with replayed
+/// `reasoning_content`, `tool_calls` (`{id, name, arguments}`) and
+/// `tool_call_id`, the `tools` definitions, and `thinking` (default true), so
+/// the captured tokens are the prompt and generations the model actually saw.
+/// A transcript that fails to render is reported and skipped.
+fn render_transcript(value: &serde_json::Value) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Message {
+        role: String,
+        #[serde(default)]
+        content: String,
+        reasoning_content: Option<String>,
+        #[serde(default)]
+        tool_calls: Vec<local_engine::ToolCall>,
+        tool_call_id: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Transcript {
+        messages: Vec<Message>,
+        #[serde(default)]
+        tools: Vec<local_engine::ToolDefinition>,
+        #[serde(default = "default_thinking")]
+        thinking: bool,
+    }
+    const fn default_thinking() -> bool {
+        true
+    }
+    let rendered = serde_json::from_value::<Transcript>(value.clone())
+        .map_err(|error| error.to_string())
+        .and_then(|transcript| {
+            let messages = transcript
+                .messages
+                .into_iter()
+                .map(|message| local_engine::ChatMessage {
+                    role: message.role,
+                    content: message.content,
+                    reasoning_content: message.reasoning_content,
+                    tool_calls: message.tool_calls,
+                    tool_call_id: message.tool_call_id,
+                    ..local_engine::ChatMessage::default()
+                })
+                .collect::<Vec<_>>();
+            local_engine::Engine::render_chat_with_tools(
+                &messages,
+                transcript.thinking,
+                &transcript.tools,
+            )
+            .map_err(|error| error.to_string())
+        });
+    rendered
+        .map_err(|error| eprintln!("skipping transcript: {error}"))
+        .ok()
 }
 
 fn head_settings(resources: &Resources) -> local_engine::Result<MtpSettings> {
@@ -753,6 +819,17 @@ fn run(args: &[String]) -> Result<(), String> {
             })
         }
         "capture" => capture(&parse(rest)?),
+        "render" => {
+            let paths: Vec<PathBuf> = rest.iter().map(PathBuf::from).collect();
+            documents(&paths).map(|docs| {
+                for doc in docs {
+                    println!(
+                        "{}",
+                        serde_json::json!({"source": doc.source, "line": doc.line, "text": doc.text})
+                    );
+                }
+            })
+        }
         "parity" => parity(&parse(rest)?),
         "features" => return features(&parse_features(rest)?),
         _ => return Err(USAGE.into()),
