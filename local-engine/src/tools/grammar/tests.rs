@@ -147,7 +147,7 @@ fn parse(tools: &[ToolDefinition], text: &str) -> Result<(Vec<ToolCall>, String)
     let mut parser = ToolCallParser::new(Arc::new(ToolSet::new(tools).expect("tools")));
     let mut calls = Vec::new();
     let mut content = String::new();
-    let mut sink = |event| {
+    let mut sink = |event, _| {
         match event {
             Event::ToolCall(call) => calls.push(call),
             Event::Content(text) => content.push_str(&text),

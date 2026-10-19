@@ -174,7 +174,7 @@ fn split(
         std::ops::ControlFlow::Continue(())
     };
     for piece in pieces {
-        if splitter.emit(piece, &mut sink).is_break() {
+        if splitter.emit(piece, Vec::new(), &mut sink).is_break() {
             break;
         }
     }
@@ -199,6 +199,63 @@ fn tool_calls_are_parsed_only_in_the_answer_of_a_request_with_tools() {
     let (events, failure) = split(false, None, &[CALL]);
     assert_eq!(failure, None);
     assert!(matches!(events.as_slice(), [Event::Content(text)] if text == CALL));
+}
+
+/// Log-probabilities go just before the content their tokens produced, and
+/// only answer tokens are reported: not reasoning, `</think>`, the dropped
+/// whitespace around the answer and calls, call markup, or text from a stop
+/// sequence on.
+#[test]
+fn logprobs_precede_the_content_their_tokens_produced() {
+    let pieces = [
+        "Plan",
+        " it",
+        "</think>",
+        "\n\n",
+        "Sure",
+        ".",
+        "\n\n",
+        "<tool_call>",
+        "\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n",
+        "</tool_call>",
+        "\n",
+        "Done",
+        " now",
+        " STOP",
+        " after",
+    ];
+    let mut splitter = super::EventSplitter::new(true, Some(weather_tools()), vec!["STOP".into()]);
+    let mut events = Vec::new();
+    let mut sink = |event| {
+        events.push(event);
+        std::ops::ControlFlow::Continue(())
+    };
+    for (index, piece) in pieces.iter().enumerate() {
+        let token = crate::TokenLogprob {
+            token: index as u32,
+            logprob: -1.0,
+            bytes: piece.as_bytes().to_vec(),
+            top: Vec::new(),
+        };
+        if splitter.emit(piece, vec![token], &mut sink).is_break() {
+            break;
+        }
+    }
+    let _ = splitter.close(crate::bonsai_model::StopReason::Eos, &mut sink);
+    let mut reported = Vec::new();
+    let mut content = String::new();
+    for (index, event) in events.iter().enumerate() {
+        match event {
+            Event::Logprobs(tokens) => {
+                assert!(matches!(events.get(index + 1), Some(Event::Content(_))));
+                reported.extend(tokens.iter().map(|token| token.token));
+            }
+            Event::Content(text) => content.push_str(text),
+            _ => {}
+        }
+    }
+    assert_eq!(content, "Sure.Done now ");
+    assert_eq!(reported, [4, 5, 11, 12, 13]);
 }
 
 fn delivery(
@@ -241,8 +298,8 @@ fn outbox_events(delivery: &super::Delivery) -> Vec<Event> {
 #[test]
 fn the_worker_streams_a_valid_call_and_then_finishes() {
     let (mut delivery, _receiver) = delivery(Some(weather_tools()));
-    assert!(delivery.emit("Checking.\n\n"));
-    assert!(delivery.emit(CALL));
+    assert!(delivery.emit("Checking.\n\n", Vec::new()));
+    assert!(delivery.emit(CALL, Vec::new()));
     delivery.complete(Ok(generation()));
     let events = outbox_events(&delivery);
     assert!(matches!(&events[0], Event::Content(text) if text == "Checking."));
@@ -265,7 +322,7 @@ fn usage_counts_reasoning_tokens_including_the_delimiter_not_text_chunks() {
     ] {
         let (mut delivery, _receiver) = delivery(None);
         delivery.splitter = super::EventSplitter::new(thinking, None, Vec::new());
-        assert!(delivery.emit(text));
+        assert!(delivery.emit(text, Vec::new()));
         let mut output = generation();
         output.token_ids = tokens;
         delivery.complete(Ok(output));
@@ -283,8 +340,8 @@ fn the_worker_reports_invalid_and_truncated_calls_without_finishing() {
     let truncated = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar";
     for (output, stops) in [(invalid.as_str(), true), (truncated, false)] {
         let (mut delivery, _receiver) = delivery(Some(weather_tools()));
-        assert!(delivery.emit("Checking. "));
-        assert_eq!(delivery.emit(output), !stops);
+        assert!(delivery.emit("Checking. ", Vec::new()));
+        assert_eq!(delivery.emit(output, Vec::new()), !stops);
         delivery.complete(Ok(generation()));
         let events = outbox_events(&delivery);
         assert!(
@@ -326,7 +383,7 @@ fn a_call_cut_off_by_the_budget_is_dropped_and_the_stop_reason_stands() {
     ] {
         for reason in [StopReason::TokenLimit, StopReason::Cancelled] {
             let (mut delivery, _receiver) = delivery(Some(std::sync::Arc::clone(&tools)));
-            assert!(delivery.emit(&output));
+            assert!(delivery.emit(&output, Vec::new()));
             let mut generation = generation();
             generation.stop_reason = reason;
             delivery.complete(Ok(generation));
@@ -492,7 +549,7 @@ fn stop_sequences_end_the_visible_answer_without_streaming_part_of_one() {
         );
         let mut engine = case.engine;
         for piece in case.pieces {
-            if !delivery.emit(piece) {
+            if !delivery.emit(piece, Vec::new()) {
                 // What the engine does when a piece is refused.
                 engine = StopReason::Stopped;
                 break;

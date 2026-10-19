@@ -833,6 +833,9 @@ pub struct ToolCallParser {
     failure: Option<String>,
     /// The open call's streamed deltas, once it named a configured tool.
     streamed: Option<Streamed>,
+    /// Input bytes dropped from the front of `pending` so far: where
+    /// `pending` starts in everything fed.
+    consumed: usize,
 }
 
 /// How much of the open call has been streamed: whole pieces, then bytes of
@@ -861,6 +864,7 @@ impl ToolCallParser {
             after_call: false,
             failure: None,
             streamed: None,
+            consumed: 0,
         }
     }
 
@@ -873,10 +877,14 @@ impl ToolCallParser {
         self.failure.take()
     }
 
+    /// Parse `text`, the next part of the answer. `callback` receives each
+    /// event with, for [`Event::Content`], where its text starts in
+    /// everything fed (content is the input less call markup and the
+    /// whitespace around calls).
     pub fn feed(
         &mut self,
         text: &str,
-        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+        callback: &mut impl FnMut(Event, usize) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         if self.failure.is_some() {
             return ControlFlow::Break(());
@@ -890,6 +898,7 @@ impl ToolCallParser {
                 };
                 let rest = self.pending.split_off(end + marker.len());
                 let mut block = std::mem::replace(&mut self.pending, rest);
+                self.consumed += block.len();
                 block.truncate(end);
                 self.in_call = false;
                 self.after_call = true;
@@ -903,7 +912,7 @@ impl ToolCallParser {
                         if let Some(streamed) = streamed {
                             call.id = streamed.id;
                         }
-                        if callback(Event::ToolCall(call)).is_break() {
+                        if callback(Event::ToolCall(call), self.consumed).is_break() {
                             return ControlFlow::Break(());
                         }
                     }
@@ -917,9 +926,11 @@ impl ToolCallParser {
             if let Some(start) = self.pending.find(CALL_START) {
                 let rest = self.pending.split_off(start + CALL_START.len());
                 let mut text = std::mem::replace(&mut self.pending, rest);
+                let offset = self.consumed;
+                self.consumed += text.len();
                 text.truncate(start);
                 self.in_call = true;
-                if self.text(text.trim_end(), callback).is_break() {
+                if self.text(text.trim_end(), offset, callback).is_break() {
                     return ControlFlow::Break(());
                 }
                 continue;
@@ -930,7 +941,9 @@ impl ToolCallParser {
             }
             let rest = self.pending.split_off(split);
             let text = std::mem::replace(&mut self.pending, rest);
-            return self.text(&text, callback);
+            let offset = self.consumed;
+            self.consumed += text.len();
+            return self.text(&text, offset, callback);
         }
     }
 
@@ -943,7 +956,7 @@ impl ToolCallParser {
     pub fn finish(
         &mut self,
         reason: StopReason,
-        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+        callback: &mut impl FnMut(Event, usize) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         if self.failure.is_some() {
             return ControlFlow::Break(());
@@ -956,6 +969,7 @@ impl ToolCallParser {
                     return ControlFlow::Break(());
                 }
                 StopReason::TokenLimit | StopReason::Cancelled | StopReason::Stopped => {
+                    self.consumed += self.pending.len();
                     self.pending.clear();
                     self.in_call = false;
                     self.streamed = None;
@@ -964,11 +978,16 @@ impl ToolCallParser {
             }
         }
         let text = std::mem::take(&mut self.pending);
-        self.text(&text, callback)
+        let offset = self.consumed;
+        self.consumed += text.len();
+        self.text(&text, offset, callback)
     }
 
     /// Report whatever more of the open call's arguments is now certain.
-    fn stream(&mut self, callback: &mut impl FnMut(Event) -> ControlFlow<()>) -> ControlFlow<()> {
+    fn stream(
+        &mut self,
+        callback: &mut impl FnMut(Event, usize) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         let Some((name, pieces)) = pieces(&self.pending, &self.tools) else {
             return ControlFlow::Continue(());
         };
@@ -1000,28 +1019,35 @@ impl ToolCallParser {
                 streamed.json = piece.json.len();
                 streamed.text = piece.text.as_ref().map_or(0, |(_, text)| text.len());
             }
-            if !delta.arguments.is_empty() && callback(Event::ToolCallDelta(delta)).is_break() {
+            if !delta.arguments.is_empty()
+                && callback(Event::ToolCallDelta(delta), self.consumed).is_break()
+            {
                 return ControlFlow::Break(());
             }
         }
         ControlFlow::Continue(())
     }
 
+    /// Emit `text`, which starts at `offset` of everything fed.
     fn text(
         &mut self,
         text: &str,
-        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+        offset: usize,
+        callback: &mut impl FnMut(Event, usize) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
-        let text = if self.after_call {
+        let trimmed = if self.after_call {
             text.trim_start()
         } else {
             text
         };
-        if text.is_empty() {
+        if trimmed.is_empty() {
             return ControlFlow::Continue(());
         }
         self.after_call = false;
-        callback(Event::Content(text.to_owned()))
+        callback(
+            Event::Content(trimmed.to_owned()),
+            offset + text.len() - trimmed.len(),
+        )
     }
 }
 

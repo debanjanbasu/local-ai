@@ -384,6 +384,23 @@ impl BonsaiTokenizer {
         .map_err(|error| crate::Error::Tokenizer(error.to_string()))
     }
 
+    /// The bytes token `id` stands for, which need not be whole characters:
+    /// its byte-level symbols decoded (a special token's text is its own
+    /// bytes). Empty for an id outside the vocabulary.
+    pub(crate) fn token_bytes(&self, id: u32) -> Vec<u8> {
+        let Some(token) = self.inner.id_to_token(id) else {
+            return Vec::new();
+        };
+        let mut bytes = Vec::with_capacity(token.len());
+        for symbol in token.chars() {
+            match byte_level_byte(symbol) {
+                Some(byte) => bytes.push(byte),
+                None => bytes.extend_from_slice(symbol.encode_utf8(&mut [0; 4]).as_bytes()),
+            }
+        }
+        bytes
+    }
+
     pub(crate) fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }
@@ -433,6 +450,21 @@ fn nonempty<'a>(text: &'a str, field: &str) -> crate::Result<&'a str> {
     } else {
         Ok(text)
     }
+}
+
+/// The byte a byte-level BPE symbol stands for (GPT-2's `bytes_to_unicode`
+/// inverted): printable Latin-1 bytes are their own symbol, and the other 68
+/// bytes, in order, are U+0100 onwards.
+fn byte_level_byte(symbol: char) -> Option<u8> {
+    let printable = |byte: u32| matches!(byte, 33..=126 | 161..=172 | 174..=255);
+    let code = u32::from(symbol);
+    if code < 256 {
+        return printable(code).then_some(code as u8);
+    }
+    (0..256_u32)
+        .filter(|&byte| !printable(byte))
+        .nth((code - 256) as usize)
+        .map(|byte| byte as u8)
 }
 
 /// Map exclusive UTF-8 byte endpoints to ending token indices, given each
@@ -670,6 +702,24 @@ mod tests {
         let clone = tokenizer.clone();
         assert!(std::sync::Arc::ptr_eq(&tokenizer.inner, &clone.inner));
         assert_eq!(clone.encode("abc<|x|>").expect("encode"), vec![257, 258]);
+    }
+
+    #[test]
+    fn token_bytes_spell_the_text_including_split_characters() {
+        let tokenizer = tiny_tokenizer();
+        let text = "abc \n\u{ad}é😀<|x|>c";
+        let ids = tokenizer.encode(text).expect("encode");
+        let bytes = ids
+            .iter()
+            .flat_map(|&id| tokenizer.token_bytes(id))
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, text.as_bytes());
+        // One byte of a split character is not UTF-8 on its own.
+        assert!(
+            ids.iter()
+                .any(|&id| std::str::from_utf8(&tokenizer.token_bytes(id)).is_err())
+        );
+        assert_eq!(tokenizer.token_bytes(u32::MAX), Vec::<u8>::new());
     }
 
     #[test]

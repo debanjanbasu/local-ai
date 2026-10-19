@@ -181,6 +181,162 @@ impl GpuTopK {
     }
 }
 
+/// Most alternatives [`LogprobRows`] reports per row: `OpenAI`'s `top_logprobs` limit.
+pub const MAX_TOP_LOGPROBS: usize = 20;
+/// Logits each first-stage threadgroup of [`LogprobRows`] reduces.
+const LOGPROB_GROUP: usize = 4096;
+/// Candidates the second stage can hold: 256 threads, 8 each.
+const LOGPROB_FINAL_CANDIDATES: usize = 256 * 8;
+
+/// Raw log-probability statistics of logit rows: each row's log-sum-exp and
+/// its best `k` logits, selected in the order of [`GpuTopK`].
+///
+/// Like the other kernel sets here, `encode` only records work, and only reads
+/// the logits; results are readable once the containing batch completes, and
+/// two batches using this workspace must not overlap.
+pub struct LogprobRows {
+    partial: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    finish: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    stats: MetalBuffer,
+    partials: MetalBuffer,
+    lse: MetalBuffer,
+    top: MetalBuffer,
+    vocab: usize,
+    max_rows: usize,
+}
+
+impl LogprobRows {
+    pub fn new(
+        ctx: &MetalContext,
+        shaders: &ShaderLibrary,
+        vocab: usize,
+        max_rows: usize,
+    ) -> crate::Result<Self> {
+        let groups = vocab.div_ceil(LOGPROB_GROUP);
+        if vocab == 0 || vocab >= u32::MAX as usize || max_rows == 0 {
+            return Err(Error::InvalidArgument(
+                "log-probability rows need a vocabulary and one row".into(),
+            ));
+        }
+        if groups * MAX_TOP_LOGPROBS > LOGPROB_FINAL_CANDIDATES {
+            return Err(Error::InvalidArgument(
+                "vocabulary too large for log-probability selection".into(),
+            ));
+        }
+        let make_pipeline = |name: &str| {
+            let function = shaders.get_function(name)?;
+            ctx.device()
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|error| Error::PipelineCreation(error.to_string()))
+        };
+        let candidate = size_of::<TopKCandidate>();
+        Ok(Self {
+            partial: make_pipeline("logprob_rows_partial")?,
+            finish: make_pipeline("logprob_rows_final")?,
+            stats: MetalBuffer::empty(ctx.device(), max_rows * groups * 2 * size_of::<f32>())?,
+            partials: MetalBuffer::empty(
+                ctx.device(),
+                max_rows * groups * MAX_TOP_LOGPROBS * candidate,
+            )?,
+            lse: MetalBuffer::empty(ctx.device(), max_rows * size_of::<f32>())?,
+            top: MetalBuffer::empty(ctx.device(), max_rows * MAX_TOP_LOGPROBS * candidate)?,
+            vocab,
+            max_rows,
+        })
+    }
+
+    /// Encode the statistics of the first `rows` rows of `logits`, with the
+    /// best `k` (at most [`MAX_TOP_LOGPROBS`]) logits of each.
+    #[allow(unsafe_code)]
+    pub fn encode(
+        &self,
+        batch: &mut CommandBatch,
+        logits: &MetalBuffer,
+        rows: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        if rows == 0
+            || rows > self.max_rows
+            || k > MAX_TOP_LOGPROBS
+            || logits.length() < rows * self.vocab * size_of::<f32>()
+        {
+            return Err(Error::InvalidArgument(
+                "log-probability rows exceed the workspace or the logits".into(),
+            ));
+        }
+        let groups = self.vocab.div_ceil(LOGPROB_GROUP);
+        let vocab = self.vocab as u32;
+        let k = k as u32;
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.partial);
+        unsafe {
+            bind(encoder, logits, 0, 0);
+            bind(encoder, &self.stats, 0, 1);
+            bind(encoder, &self.partials, 0, 2);
+            set_u32(encoder, &vocab, 3);
+            set_u32(encoder, &k, 4);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: groups,
+                height: rows,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        batch.record_dispatch();
+        let groups = groups as u32;
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.finish);
+        unsafe {
+            bind(encoder, &self.stats, 0, 0);
+            bind(encoder, &self.partials, 0, 1);
+            bind(encoder, &self.lse, 0, 2);
+            bind(encoder, &self.top, 0, 3);
+            set_u32(encoder, &groups, 4);
+            set_u32(encoder, &k, 5);
+        }
+        dispatch(encoder, rows, 256);
+        batch.record_dispatch();
+        Ok(())
+    }
+
+    /// Row `row`'s log-sum-exp, from the last completed [`Self::encode`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `row` is outside the workspace.
+    #[must_use]
+    pub fn log_sum_exp(&self, row: usize) -> f32 {
+        self.lse.as_slice::<f32>()[row]
+    }
+
+    /// Row `row`'s best `k` logits, best first, from the last completed
+    /// [`Self::encode`] (which must have selected at least `k`).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `row` is outside the workspace or `k` exceeds [`MAX_TOP_LOGPROBS`].
+    #[must_use]
+    pub fn top(&self, row: usize, k: usize) -> &[TopKCandidate] {
+        assert!(
+            k <= MAX_TOP_LOGPROBS,
+            "log-probability count exceeds the maximum"
+        );
+        let start = row * MAX_TOP_LOGPROBS;
+        &self.top.as_slice::<TopKCandidate>()[start..start + k]
+    }
+
+    #[must_use]
+    pub const fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+}
+
 fn dispatch(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, groups: usize, threads: usize) {
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {

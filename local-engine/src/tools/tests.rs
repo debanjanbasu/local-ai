@@ -458,8 +458,13 @@ fn rejects_unpaired_duplicate_and_invalid_tool_history() {
 
 fn parse(tools: &[ToolDefinition], pieces: &[&str]) -> (Vec<Event>, Option<String>) {
     let mut parser = ToolCallParser::new(Arc::new(ToolSet::new(tools).expect("tools")));
+    let fed = pieces.concat();
     let mut events = Vec::new();
-    let mut sink = |event| {
+    // Every content event is the input at the offset it reports.
+    let mut sink = |event, offset: usize| {
+        if let Event::Content(text) = &event {
+            assert_eq!(fed.get(offset..offset + text.len()), Some(text.as_str()));
+        }
         events.push(event);
         ControlFlow::Continue(())
     };
@@ -779,7 +784,7 @@ fn a_string_value_streams_before_it_ends_and_a_cut_call_reports_nothing_more() {
     let half = "<tool_call>\n<function=search>\n<parameter=query>\nlong query text\n</para";
     let mut parser = ToolCallParser::new(Arc::new(ToolSet::new(&[search()]).expect("tools")));
     let events = std::cell::RefCell::new(Vec::new());
-    let mut sink = |event| {
+    let mut sink = |event, _| {
         events.borrow_mut().push(event);
         ControlFlow::Continue(())
     };

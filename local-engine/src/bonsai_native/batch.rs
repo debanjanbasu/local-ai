@@ -25,7 +25,7 @@ use local_metal::draft::GreedyRows;
 use local_metal::shaders::ShaderLibrary;
 
 use super::{
-    AttentionLayer, BonsaiModel, BufferCopyRequest, CONV_STATE_BYTES, CommandBatch,
+    AttentionLayer, BonsaiModel, BufferCopyRequest, CONV_STATE_BYTES, CommandBatch, Described,
     FullAttentionLayer, HadamardDirection, MetalBuffer, RecurrentLayer, Selection, VOCAB, WIDTH,
     decode_embeddings, grow_cache, layers::decay_projection,
 };
@@ -377,6 +377,7 @@ impl BonsaiModel {
                 AttentionWorkspace::new(&self.context, self.kv_allocated as u32)?;
         }
         self.selection = Selection::None;
+        self.distributions.described = Described::None;
         Ok(())
     }
 
@@ -522,6 +523,10 @@ impl BonsaiModel {
             })
             .collect::<Vec<_>>();
         self.selection = Selection::None;
+        self.distributions.described = Described::None;
+        if self.logprobs.is_some() {
+            self.distributions.reserve(&self.context, decoded)?;
+        }
         let tokens = rows
             .iter()
             .flat_map(|row| std::iter::once(row.token).chain(row.drafts.iter().copied()))
@@ -608,6 +613,10 @@ impl BonsaiModel {
         if selected {
             output.greedy.encode(&mut batch, &output.logits, decoded)?;
         }
+        if let Some(top) = self.logprobs {
+            self.distributions
+                .encode(&mut batch, &output.logits, decoded, top)?;
+        }
         let row_bytes = WIDTH * size_of::<f32>();
         let copies = rows
             .iter()
@@ -657,6 +666,10 @@ impl BonsaiModel {
             .ok_or_else(|| crate::Error::InvalidArgument("batch scratch missing".into()))?;
         output.rows = decoded;
         output.selected = selected;
+        if let Some(top) = self.logprobs {
+            self.distributions.described = Described::Batch;
+            self.distributions.top = top;
+        }
         output.starts = spans[..count].iter().map(|&(start, _)| start).collect();
         let nonfinite = if selected {
             output
@@ -749,14 +762,19 @@ impl BonsaiModel {
                 "batched row out of range".into(),
             ));
         }
-        if output.selected && sampler.selects_argmax() {
-            return Ok(sampler.greedy_result(output.greedy.results(output.rows)[row].best_id));
-        }
-        sampler.sample_buffer(
+        let argmax = output
+            .selected
+            .then(|| output.greedy.results(output.rows)[row].best_id);
+        let distribution = sampler
+            .logprobs()
+            .and_then(|top| self.distributions.row(Described::Batch, row, top));
+        sampler.select_row(
             &mut output.logits,
             row * VOCAB * size_of::<f32>(),
             &self.context,
             &self.sampling,
+            argmax,
+            distribution,
         )
     }
 
