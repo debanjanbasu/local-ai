@@ -3,8 +3,8 @@
 //!
 //! # Authentication
 //!
-//! Off by default, as before: on loopback every local process (and every web
-//! page a local browser opens that can reach it) may use the server. It turns
+//! Off by default, as before: on loopback every local process may use the
+//! server (web pages a local browser opens may not; see `super::browser`). It turns
 //! on when the owner creates the first admin key with `local-ai admin
 //! create-key`, which prints the key once; from then on every request needs
 //! `Authorization: Bearer <key>` (see [`Gate::check`]):
@@ -250,14 +250,30 @@ impl Gate {
     }
 }
 
+impl Gate {
+    /// Whether requests need a key (a failing store counts as yes). Blocks
+    /// on the store; call off the runtime.
+    fn enabled(&self) -> bool {
+        self.fixed.is_some()
+            || self
+                .admin
+                .as_ref()
+                .is_some_and(|admin| admin.auth_enabled().unwrap_or(true))
+    }
+}
+
+/// [`Gate::enabled`] from the runtime.
+pub(super) async fn enabled(state: &AppState) -> bool {
+    let gate = Arc::clone(&state.auth);
+    tokio::task::spawn_blocking(move || gate.enabled())
+        .await
+        .unwrap_or(true)
+}
+
 /// Say at startup whether requests need a key, warning when anyone who can
 /// reach a non-loopback address may use the server.
 pub(super) fn announce(gate: &Gate, host: std::net::IpAddr) {
-    let stored = gate
-        .admin
-        .as_ref()
-        .is_some_and(|admin| admin.auth_enabled().unwrap_or(true));
-    if stored || gate.fixed.is_some() {
+    if gate.enabled() {
         eprintln!("authentication: on (Authorization: Bearer <key> required)");
     } else if host.is_loopback() {
         eprintln!(

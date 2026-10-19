@@ -22,6 +22,7 @@ mod admin;
 mod background;
 mod backpressure;
 mod batches;
+mod browser;
 mod chunked;
 mod compaction;
 mod decisions;
@@ -90,6 +91,9 @@ struct Args {
     decisions_artifact: Option<PathBuf>,
     /// Hosted tool permissions and bounds; none by default.
     tools: options::ToolArgs,
+    /// `--allow-origin` values: browser origins admitted while
+    /// authentication is off (see [`browser`]).
+    allowed_origins: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -105,6 +109,9 @@ struct AppState {
     thinking: bool,
     /// Who may call: the `--api-key` key and the opt-in admin store's keys.
     auth: Arc<admin::Gate>,
+    /// Which browser requests are admitted (DNS rebinding and cross-site
+    /// protection).
+    browsers: Arc<browser::Browsers>,
     alt_svc: Option<Arc<str>>,
     depth: QueueDepth,
     /// How long a client may stop consuming before its generation is dropped.
@@ -186,13 +193,64 @@ impl Drop for Admitted {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Every request, on every HTTP version: browser protection (see
+/// [`browser`]), authentication, then [`dispatch`].
 async fn route(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
+    if let Some(message) = state.browsers.host_refusal(&parts) {
+        return error_response(StatusCode::FORBIDDEN, &message, &state, &parts.headers).await;
+    }
+    let origin = state.browsers.origin(&parts.headers);
+    if browser::is_preflight(&parts) {
+        // A preflight carries no key: with authentication on, every origin
+        // may ask, since the request itself still needs one.
+        let origin = match origin {
+            Ok(origin) => origin,
+            Err(foreign) if admin::enabled(&state).await => foreign.origin,
+            Err(foreign) => {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    &foreign.message,
+                    &state,
+                    &parts.headers,
+                )
+                .await;
+            }
+        };
+        return browser::preflight(origin, &parts.headers);
+    }
     let caller = match admin::authorize(&state, &parts).await {
         Ok(caller) => caller,
         Err(refused) => return *refused,
     };
+    let origin = match origin {
+        Ok(origin) => origin,
+        Err(foreign) if caller != admin::Caller::Anonymous => foreign.origin,
+        Err(foreign) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                &foreign.message,
+                &state,
+                &parts.headers,
+            )
+            .await;
+        }
+    };
+    let mut response = dispatch(state, parts, body, caller).await;
+    if let Some(origin) = origin {
+        browser::allow(&mut response, origin);
+    }
+    response
+}
+
+/// Serve an admitted request.
+#[allow(clippy::too_many_lines)]
+async fn dispatch(
+    state: AppState,
+    parts: axum::http::request::Parts,
+    body: Body,
+    caller: admin::Caller,
+) -> Response {
     if admin::matches(parts.uri.path()) {
         return admin::handle(&state, &parts, body, &caller).await;
     }
@@ -1159,6 +1217,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
             ))),
             args.api_key.as_deref(),
         )?),
+        browsers: Arc::new(browser::Browsers::new(args.host, args.allowed_origins)),
         alt_svc: resources
             .tls
             .as_ref()

@@ -8,9 +8,9 @@ with a `400` whose `code` is `unsupported` and whose message gives the reason.
 ## Authentication
 
 Off by default. On `127.0.0.1` that means any local process can use the
-server, and so can any web page a local browser opens that is allowed to
-reach the port. Bound to another address, anyone who can reach it can; `serve`
-prints a warning then.
+server; web pages a local browser opens cannot (see [Browsers](#browsers)).
+Bound to another address, anyone who can reach it can; `serve` prints a
+warning then.
 
 ```bash
 local-ai admin create-key --name ops   # prints sk-admin-... once on stdout
@@ -45,6 +45,50 @@ curl -s localhost:8080/v1/organization/projects/$PROJECT/service_accounts \
   -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
   -d '{"name":"my-app"}'        # .api_key.value is the sk-proj-... key, shown once
 ```
+
+### Browsers
+
+A web page can reach a local server in two ways: by sending requests whose
+answers it cannot read (a `text/plain` POST needs no CORS preflight, which is
+enough to start a generation or delete a file), and by DNS rebinding, where
+`evil.example` re-points its name at `127.0.0.1` and then reads the server as
+its own origin (Ollama's CVE-2024-28224). Every request, on every HTTP
+version, is checked before authentication:
+
+- **Host.** While bound to a loopback address, a request is refused (`403`)
+  unless its `Host` (HTTP/2 and HTTP/3 `:authority`) is `localhost`, a
+  `*.localhost` name, a `*.internal` name (Docker's `host.docker.internal`;
+  the TLD is reserved for private use, so public DNS cannot rebind it) or an
+  IP address. A rebinding page always sends its own name. Bound to another
+  address the server can be reached under names it cannot know, and the host
+  is not checked.
+- **Origin.** While authentication is off, a request whose `Origin` is
+  another site, or that has no `Origin` but `Sec-Fetch-Site: cross-site`, is
+  refused (`403`). Admitted without configuration: `http(s)` pages on
+  `localhost`, `*.localhost`, `127.0.0.0/8` or `[::1]` (any port, like
+  Ollama's default `OLLAMA_ORIGINS`), and origins that are not `http(s)`
+  (`tauri://`, `vscode-webview://`, `chrome-extension://`, ...), which only
+  local applications and extensions have. `null` (sandboxed frames, `file:`
+  pages) can come from any site and is refused. `serve --allow-origin
+  ORIGIN` admits an exact origin (repeatable; `*` admits every origin, `null`
+  admits `file:` pages). Once authentication is on, an authorized request is
+  admitted from any origin: the page was given a key.
+
+CLIs, SDKs and agent harnesses send no `Origin` or `Sec-Fetch-*` headers and
+address the server as `localhost` or an IP, so neither check affects them.
+An admitted request with an `Origin` gets `Access-Control-Allow-Origin`
+reflecting it, and an admitted CORS preflight is answered `204` with the
+methods and headers it asked for (with authentication on, every origin's
+preflight is admitted, since the request itself still needs a key), so
+browser applications can read the answers.
+
+Other local servers differ: Ollama checks the host the same way and admits
+only its `OLLAMA_ORIGINS` (localhost and app schemes by default); llama.cpp's
+server reflects every origin unless `--cors-origins` is set, and limits it to
+localhost once its file and shell tools are on; LM Studio sends no CORS
+headers unless "Enable CORS" is switched on. Neither check here can be turned
+off; `--allow-origin '*'` comes closest to llama.cpp's default, and the host
+check still applies.
 
 ### Key storage
 
