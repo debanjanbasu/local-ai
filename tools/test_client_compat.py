@@ -215,9 +215,12 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(exchanges[0]["request_headers"]["Authorization"], "<redacted>")
         self.assertIsNone(cc.exchange_failure(exchanges[0]))
         self.assertEqual(cc.exchange_failure(exchanges[1]), "HTTP 400: refused")
+        # A request without tools (a title) does not count as a streamed turn.
+        self.assertFalse(self.recorder.first_chunk.is_set())
+        self.request({"input": "hi", "tools": [{"type": "function", "name": "f"}]})
         self.assertTrue(self.recorder.first_chunk.is_set())
         logged = [json.loads(line) for line in (Path(self.tmp.name) / "x.jsonl").read_text().splitlines()]
-        self.assertEqual(len(logged), 2)
+        self.assertEqual(len(logged), 3)
 
 
 if __name__ == "__main__":

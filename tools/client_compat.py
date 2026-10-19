@@ -40,7 +40,7 @@ Scenario kinds:
 
 - `omp-*` / `codex-*` / `opencode-*`: the client itself runs a task (read,
   edit, tool result, final answer; tool-error recovery; a resumed second user
-  turn; SIGINT cancellation mid-stream). `task_ok` checks the repository or
+  turn; SIGINT (opencode: SIGTERM) cancellation mid-stream). `task_ok` checks the repository or
   the answer; `protocol_ok` requires that no proxied exchange failed.
 - `http-*`: direct protocol probes of request shapes those clients send
   (hosted and custom tools, reasoning summaries, compaction, encrypted
@@ -311,7 +311,12 @@ class Recorder:
                         except OSError:
                             exchange["client_disconnected"] = True
                             break
-                        recorder.first_chunk.set()
+                        # Only an agent turn counts: opencode's title
+                        # request streams first, while its turn may still
+                        # be queued behind it, and the proxy cannot pass a
+                        # disconnect upstream before the first byte.
+                        if isinstance(exchange["request_body"], dict) and exchange["request_body"].get("tools"):
+                            recorder.first_chunk.set()
                     # Record before the terminating chunk so a client that has
                     # read the whole response always finds its exchange logged.
                     finish()
@@ -698,8 +703,9 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
             catalog.write_text(json.dumps(codex_catalog(ctx.codex_bin, env), indent=2))
         # Above Codex's first request (about 6,000 tokens, nearly all its own
         # instructions and tools), so it compacts once tool results pile up;
-        # a limit under it compacts after every turn and never finishes.
-        compact_limit = 9000 if variant == "compact" else None
+        # a limit under it compacts after every turn and never finishes, and
+        # the fix task ends near 7,700 tokens, so 9,000 is never reached.
+        compact_limit = 7000 if variant == "compact" else None
         (codex_home / "config.toml").write_text(
             codex_config(ctx.proxy_port, effort, compat, catalog, compact_limit))
         env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
@@ -902,6 +908,9 @@ def signal_group(pid: int, signum: int) -> None:
 
 def cancel_run(ctx: Context, result: Result, client: str, effort: str, repo: Path, env: dict, log: Path) -> None:
     command = client_command(ctx, client, CANCEL_PROMPT, effort, repo)
+    # opencode 1.19.3's `run` ignores SIGINT while its title request is still
+    # streaming (reproduced against a slow stub); SIGTERM stops it.
+    stop_signal = signal.SIGTERM if client == "opencode" else signal.SIGINT
     start = ctx.recorder.begin(result.name)
     began = time.monotonic()
     with log.open("ab") as out:
@@ -912,7 +921,7 @@ def cancel_run(ctx: Context, result: Result, client: str, effort: str, repo: Pat
         time.sleep(3)
         interrupted = time.monotonic()
         early_exit = process.poll()
-        signal_group(process.pid, signal.SIGINT)
+        signal_group(process.pid, stop_signal)
         try:
             process.wait(20)
             exited = True
@@ -940,11 +949,11 @@ def cancel_run(ctx: Context, result: Result, client: str, effort: str, repo: Pat
     result.task_ok = streamed and exited and disconnected and early_exit is None
     result.passed = result.protocol_ok and result.task_ok
     result.detail = (
-        f"streamed={streamed}, client exited after SIGINT={exited} ({exit_seconds:.1f}s), "
+        f"streamed={streamed}, client exited after {stop_signal.name}={exited} ({exit_seconds:.1f}s), "
         f"upstream closed on disconnect={disconnected}, follow-up {probe['status']} in {probe['seconds']:.1f}s"
     )
     if early_exit is not None:
-        result.detail += f"; client had already exited {early_exit} before SIGINT"
+        result.detail += f"; client had already exited {early_exit} before {stop_signal.name}"
     if result.failing_exchange:
         result.detail += f"; {exchange_failure(result.failing_exchange)}"
 
@@ -1176,7 +1185,7 @@ def background_cancel(ctx: Context, result: Result) -> None:
 
 def invalid_then_valid(ctx: Context, result: Result) -> None:
     start = ctx.recorder.begin(result.name)
-    bad, body, _ = post(ctx.proxy_port, "/v1/responses", {**SIMPLE, "reasoning": {"effort": "medium"}})
+    bad, body, _ = post(ctx.proxy_port, "/v1/responses", {**SIMPLE, "reasoning": {"effort": "maximum"}})
     good, _, seconds = post(ctx.proxy_port, "/v1/responses", SIMPLE)
     exchanges = ctx.recorder.since(start)
     result.requests = len(exchanges)
