@@ -289,7 +289,9 @@ impl BonsaiEngine {
         let id = self.active[index].id;
         let result = self.make_resident(index).and_then(|()| {
             let mut generation = self.active.swap_remove(index);
-            let result = self.prefill_round(&mut generation, budget, progress);
+            let result = self
+                .refresh_prefix(&mut generation)
+                .and_then(|()| self.prefill_round(&mut generation, budget, progress));
             self.active.push(generation);
             result
         });
@@ -583,10 +585,13 @@ impl BonsaiEngine {
         {
             return None;
         }
-        let run = generation
-            .prefill
-            .as_ref()?
-            .plain_run(generation.prompt.len());
+        let plan = generation.prefill.as_ref()?;
+        // A prompt's first chunk goes through `step_prefill`, which first
+        // looks for a longer cached prefix than the one admission restored.
+        if plan.done() == plan.reused {
+            return None;
+        }
+        let run = plan.plain_run(generation.prompt.len());
         let chunk = (seeds + PREFILL_FOLD_MIN).next_multiple_of(8) - seeds;
         let limit = self
             .model

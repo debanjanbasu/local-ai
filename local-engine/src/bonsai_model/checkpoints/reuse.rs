@@ -46,6 +46,44 @@ impl BonsaiEngine {
         ReuseBounds::new(lcp, prompt.len(), self.info.prefill_chunk_size)
     }
 
+    /// The longest prefix of `prompt` [`Self::restore_reusable_prefix`]
+    /// would restore into the resident set now, without restoring it.
+    pub(in crate::bonsai_model) fn reusable_prefix(&mut self, prompt: &[u32]) -> usize {
+        self.collect_disk_writes();
+        let bounds = self.reuse_bounds(prompt);
+        let gpu = if self.cache_state == self.model.state_id() {
+            self.prompt_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.state.position)
+                .filter(|&position| position <= bounds.reusable)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let host = self
+            .session_snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.state.position() <= bounds.snapshot_reusable
+                    && snapshot.tokens.as_slice() == &prompt[..snapshot.state.position()]
+            })
+            .map(|snapshot| snapshot.state.position())
+            .max()
+            .unwrap_or(0);
+        let disk = self
+            .disk_snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.tokens.len() <= bounds.snapshot_reusable
+                    && prompt.starts_with(&snapshot.tokens)
+            })
+            .map(|snapshot| snapshot.tokens.len())
+            .max()
+            .unwrap_or(0);
+        gpu.max(host).max(disk)
+    }
+
     /// The three-tier cascade: a live GPU checkpoint, then a host session
     /// snapshot, then a disk snapshot, which always resolves.
     pub(super) fn restore_reusable_prefix(
