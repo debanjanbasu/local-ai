@@ -45,7 +45,7 @@ class FakeMachine:
         return subprocess.CompletedProcess(argv, 0, json.dumps(stats), "")
 
 
-class MainTests(unittest.TestCase):
+class Harness(unittest.TestCase):
     def setUp(self):
         root = tempfile.TemporaryDirectory()
         self.addCleanup(root.cleanup)
@@ -75,6 +75,8 @@ class MainTests(unittest.TestCase):
             code = benchmark.main(["--rounds", "2", *args])
         return code, stdout.getvalue(), stderr.getvalue()
 
+
+class MainTests(Harness):
     def test_on_ac_measures_under_caffeinate(self):
         machine = FakeMachine([AC])
         code, out, err = self.main(machine)
@@ -192,6 +194,59 @@ class MainTests(unittest.TestCase):
         self.assertIn("power source: Battery Power", err)
         self.assertNotIn("refusing", err)
         self.assertEqual(machine.engine_calls, [])
+
+
+class PrefillMachine(FakeMachine):
+    """A disk prompt cache per HOME: the second process on one HOME restores."""
+
+    def __init__(self, warm_ids=(1, 2)):
+        super().__init__([AC])
+        self.warm_ids = list(warm_ids)
+        self.homes = []
+
+    def run(self, argv, **kwargs):
+        if "--tokenize" in argv:
+            chars = len(Path(argv[-1]).read_text())
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"prompt_tokens": chars // 4}), ""
+            )
+        if argv[0] in ("ps", "pmset"):
+            return super().run(argv, **kwargs)
+        self.engine_calls.append(argv)
+        home = kwargs["env"]["HOME"]
+        warm = home in self.homes
+        self.homes.append(home)
+        prompt = len(Path(argv[-1]).read_text()) // 4
+        stats = {
+            "prompt_tokens": prompt,
+            "cached_tokens": prompt - 1 if warm else 0,
+            "prefill_tokens_per_second": None if warm else 120.0,
+            "first_token_seconds": 0.5 if warm else prompt / 120.0,
+            "token_ids": self.warm_ids if warm else [1, 2],
+        }
+        load = json.dumps({"load_seconds": 0.4})
+        return subprocess.CompletedProcess(argv, 0, json.dumps(stats), load + "\n")
+
+
+class PrefillTests(Harness):
+    def test_cold_then_restarted_warm_run_per_round(self):
+        machine = PrefillMachine()
+        code, out, err = self.main(machine, "--prefill", "2048")
+        self.assertEqual(code, 0, err)
+        # warm-up, then cold + warm for each of two rounds
+        self.assertEqual(len(machine.engine_calls), 5)
+        measured = machine.homes[1:]
+        self.assertEqual(measured[0], measured[1])
+        self.assertEqual(measured[2], measured[3])
+        self.assertNotEqual(measured[0], measured[2])
+        row = next(line for line in out.splitlines() if "default" in line)
+        self.assertEqual(row.split()[:3], ["2048", "default", "120.0"])
+        self.assertIn("2047", row)
+
+    def test_warm_output_that_differs_is_an_error(self):
+        machine = PrefillMachine(warm_ids=(1, 3))
+        with self.assertRaisesRegex(RuntimeError, "greedy output must not depend"):
+            self.main(machine, "--prefill", "2048")
 
 
 if __name__ == "__main__":
