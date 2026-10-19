@@ -4,7 +4,7 @@
 //!
 //! | model | id | aliases | routes |
 //! |-------|----|---------|--------|
-//! | Bonsai | [`BONSAI_MODEL_ID`] | none | Chat Completions, Responses, compaction, input tokens, decisions, batches, evals |
+//! | Bonsai | [`BONSAI_MODEL_ID`] | none | Chat Completions, Responses, compaction, input tokens, decisions, batches |
 //! | embeddings | [`EMBEDDING_MODEL_ID`] | the `OpenAI` embedding model names | `/v1/embeddings` |
 //! | moderation | [`MODERATION_MODEL_ID`] | the `OpenAI` moderation model names | `/v1/moderations` |
 //! | speech | [`SPEECH_MODEL_ID`] | the `OpenAI` speech model names | `/v1/audio/speech` |
@@ -14,16 +14,17 @@
 //! the local model answers, under its own id.
 //!
 //! Routes of the optional models require their own model (moderation lets it
-//! be omitted). The Bonsai generation routes accept an omitted `model` or any
-//! name that is not another served model's, because many `OpenAI` clients
-//! send a configured name the server cannot know; a name of another local
-//! model is a mistake and is refused. Batches and evals are stored and run
-//! later, so their `model` must be exactly [`BONSAI_MODEL_ID`].
+//! be omitted). The Bonsai generation routes, batch lines included, accept an
+//! omitted `model` (batch lines must name one) or any name that is not
+//! another served model's, because many `OpenAI` clients send a configured
+//! name the server cannot know; a name of another local model is a mistake
+//! and is refused. Evals still require exactly [`BONSAI_MODEL_ID`].
 //!
 //! Earlier versions reported the GGUF file path as the Bonsai id. It is
-//! machine specific and not accepted from new requests; batch lines stored by
-//! those versions still run (see [`legacy_bonsai`]), and reasoning envelopes
-//! they sealed still open (see `ReasoningCipher::with_legacy_model`).
+//! machine specific and no longer listed; as a name of no other model it is
+//! accepted like any other, so batch lines stored by those versions still
+//! run, and reasoning envelopes they sealed still open (see
+//! `ReasoningCipher::with_legacy_model`).
 
 use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -38,10 +39,6 @@ use super::{embeddings, moderations, speech, transcription};
 /// The id this server gives the pinned Ternary Bonsai 2 27B checkpoint
 /// (`prism-ml/Ternary-Bonsai-2-27B-gguf`, PTQ1).
 pub(super) const BONSAI_MODEL_ID: &str = "ternary-bonsai-2-27b";
-
-/// The file name of the pinned checkpoint, whose path earlier versions
-/// reported as the Bonsai id.
-const LEGACY_BONSAI_FILE: &str = "Ternary-Bonsai-2-27B-PTQ1_0.gguf";
 
 /// `OpenAI` embedding model names, accepted for [`EMBEDDING_MODEL_ID`].
 pub(super) const EMBEDDING_ALIASES: [&str; 3] = [
@@ -93,25 +90,25 @@ pub(super) fn resolve(name: &str, bonsai: &str) -> Option<Served> {
     }
 }
 
-/// Whether `name` is the Bonsai id an earlier version reported: the
-/// checkpoint's path (or bare file name).
-pub(super) fn legacy_bonsai(name: &str) -> bool {
-    name == LEGACY_BONSAI_FILE
-        || name
-            .strip_suffix(LEGACY_BONSAI_FILE)
-            .is_some_and(|directory| directory.ends_with('/'))
-}
-
 /// Check the `model` of a Bonsai generation request: absent or any name but
 /// another served model's (see the module docs).
 pub(super) fn check_generation(model: Option<&str>) -> crate::Result<()> {
-    match model.and_then(|name| resolve(name, BONSAI_MODEL_ID)) {
-        None | Some(Served::Bonsai) => Ok(()),
-        Some(other) => Err(crate::Error::InvalidArgument(format!(
-            "model {:?} is {}, not a text generation model; use {BONSAI_MODEL_ID:?} here",
-            model.unwrap_or_default(),
+    model
+        .and_then(generation_refusal)
+        .map_or(Ok(()), |refusal| {
+            Err(crate::Error::InvalidArgument(format!("model {refusal}")))
+        })
+}
+
+/// Why `name` is refused as a generation model, after the word "model":
+/// `None` unless it names another served model.
+pub(super) fn generation_refusal(name: &str) -> Option<String> {
+    match resolve(name, BONSAI_MODEL_ID)? {
+        Served::Bonsai => None,
+        other => Some(format!(
+            "{name:?} is {}, not a text generation model; use {BONSAI_MODEL_ID:?} here",
             route_of(other)
-        ))),
+        )),
     }
 }
 
@@ -337,18 +334,5 @@ mod tests {
         }
         assert!(check_generation_value(Some(&json!(7))).is_err());
         check_generation_value(Some(&Value::Null)).expect("null");
-    }
-
-    #[test]
-    fn the_legacy_path_id_is_recognized_only_as_the_pinned_file() {
-        assert!(legacy_bonsai(
-            "/Users/me/local-ai/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
-        ));
-        assert!(legacy_bonsai(
-            "models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
-        ));
-        assert!(legacy_bonsai("Ternary-Bonsai-2-27B-PTQ1_0.gguf"));
-        assert!(!legacy_bonsai("/tmp/xTernary-Bonsai-2-27B-PTQ1_0.gguf"));
-        assert!(!legacy_bonsai(BONSAI_MODEL_ID));
     }
 }

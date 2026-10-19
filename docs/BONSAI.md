@@ -218,14 +218,18 @@ The generation routes accept an omitted `model` or any name that is not
 another local model's, since many clients send a configured name the server
 cannot know; the response always names `ternary-bonsai-2-27b`. Naming another
 local model there (for example `embeddinggemma-2` on Chat Completions) is a
-400 that names the right route. Batches and evals run later from stored
-requests, so their `model` must be exactly `ternary-bonsai-2-27b`.
+400 that names the right route. Batch lines follow the same rule (each line
+must name a model, all lines the same one, and the batch object reports it as
+given); a stored line naming another local model fails without generating.
+Evals still require exactly `ternary-bonsai-2-27b`.
 `GET /v1/models/{model}` answers an installed model by id or alias (an alias
 answers with the model's own id) and 404 otherwise.
 
 Earlier versions used the GGUF file path as the Bonsai id. It named one
-machine's layout, so it is not accepted from new requests. What those versions
-stored keeps working: batch lines naming the path still run, and with the same
+machine's layout, so it is no longer listed or retrieved (as a name of no
+other model, generation routes and batch lines accept it like any other name).
+What those versions stored keeps working: batch lines naming the path still
+run, and with the same
 `--reasoning-key`, reasoning and compaction envelopes sealed for the path
 still open (new ones are sealed for `ternary-bonsai-2-27b`). An eval run
 created before the change and still in progress fails when it starts its next
@@ -965,7 +969,8 @@ preparation and generation blocking tasks, never on runtime workers.
   the native `purge_file_storage`. A `purpose` is stored and echoed only; it
   enables no processing.
 - **Batches.** These run `/v1/responses` and `/v1/chat/completions`, with
-  `completion_window: "24h"`, on the loaded model only; the legacy
+  `completion_window: "24h"`, on the loaded model, whatever generation model
+  name the lines share; the legacy
   `/v1/completions` is refused. The whole input file is validated before anything is stored.
   `output_expires_after` is refused, like any unknown field. One worker thread
   runs one line at a time through the same preparation and collector as the

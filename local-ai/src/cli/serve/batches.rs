@@ -10,9 +10,13 @@
 //!
 //! Creating a batch validates its whole input file and stores it, or stores
 //! nothing (see [`local_services::batches`]); unsupported endpoints are
-//! refused then, never queued, and so is a batch whose `body.model` is not
-//! the loaded model. A stored line naming another model (a batch resumed by a
-//! server with a different model) fails without being generated. Lists are
+//! refused then, never queued. Every line names one `body.model`, which may
+//! be any name but another served model's, as on the generation routes (see
+//! [`super::models`]): harnesses send the model name they are configured
+//! with, and the loaded model answers under its own id. A batch naming another
+//! local model (`embeddinggemma-2`, `whisper-1`, ...) is refused, and a
+//! stored line that does (written by another server) fails without being
+//! generated. Lists are
 //! newest first, 20 per page (1 to 100), paged with `after`.
 //! `output_expires_after` is not supported and is refused like any other
 //! unknown field.
@@ -291,9 +295,12 @@ impl Batches {
             completion_window: request.completion_window,
             metadata: request.metadata.unwrap_or_default(),
         };
-        let model = Arc::clone(&self.worker.config.model);
+        let accept = |model: &str| {
+            super::models::generation_refusal(model)
+                .map_or(Ok(()), |refusal| Err(format!("body.model {refusal}")))
+        };
         let batch = self
-            .call(move |store| store.create_batch_for(&create, &model, owner.as_ref()))
+            .call(move |store| store.create_batch_accepting(&create, accept, owner.as_ref()))
             .await?;
         self.worker.notify();
         Ok(to_json(&batch))
@@ -512,19 +519,14 @@ impl Worker {
             }
         };
         let config = &self.config;
-        // A batch stored by a server with another model (resumed here) never
-        // runs on this one. One stored by an earlier version, which named
-        // the model by its file path, does.
+        // A line naming another local model (stored by another server)
+        // never runs. Any other name does, including the file path an
+        // earlier version named the model by.
         let model = line.body.get("model").and_then(Value::as_str);
-        if model != Some(config.model.as_ref()) && !model.is_some_and(super::models::legacy_bonsai)
-        {
+        if let Some(refusal) = model.and_then(super::models::generation_refusal) {
             return Some(failed(
                 StatusCode::BAD_REQUEST,
-                &format!(
-                    "body.model {:?} is not the loaded model {:?}",
-                    model.unwrap_or_default(),
-                    config.model
-                ),
+                &format!("body.model {refusal}"),
             ));
         }
         let body = serde_json::to_vec(&line.body).unwrap_or_default();
