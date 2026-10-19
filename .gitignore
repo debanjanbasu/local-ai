@@ -29,3 +29,6 @@ __pycache__/
 
 # graphify knowledge graph (generated, rebuilt on commit via git hook)
 graphify-out/
+
+# Local scratch: evaluation runs, client-compat evidence, benchmarks
+/.scratch/
