@@ -1020,7 +1020,7 @@ pub(super) fn record(state: &AppState, record: UsageRecord) {
 }
 
 /// Where a generation that runs outside the request's own event stream
-/// (batch lines, eval runs, compaction and reasoning summaries) records its
+/// (batch lines, compaction and reasoning summaries) records its
 /// usage: the usage store and a record template, or nowhere while there is
 /// no store.
 #[derive(Clone, Default)]

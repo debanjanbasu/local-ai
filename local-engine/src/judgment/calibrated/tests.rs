@@ -7,7 +7,7 @@ use super::{
     sha256_hex,
 };
 use crate::judgment::{
-    DECISION_RENDERER, Decision, DecisionKind, DecisionProbability, DecisionRequest, DecisionValue,
+    Decision, DecisionKind, DecisionProbability, DecisionRequest, DecisionValue,
     JUDGMENT_HEAD_FORMAT,
 };
 
@@ -273,9 +273,6 @@ fn decision(head: &CalibratedHead, yes: [f32; 4], no: [f32; 4], decide: [f32; 4]
         score: None,
         prompt_tokens: 100,
         captured: true,
-        renderer: DECISION_RENDERER,
-        renderer_declared: true,
-        calibration_scope: String::new(),
         decide_row: decide.to_vec(),
     }
 }
@@ -417,9 +414,6 @@ fn offline_parity_with_the_python_evaluation() {
             score: None,
             prompt_tokens: row["token_ids"].as_array().unwrap().len(),
             captured: true,
-            renderer: DECISION_RENDERER,
-            renderer_declared: true,
-            calibration_scope: String::new(),
             decide_row: features[features.len() - head.head().width()..].to_vec(),
         };
         let judged = head.judge(family, &decision).unwrap();

@@ -5,9 +5,8 @@
 //! judgment-capture --validate-only [--max-tokens N] REQUESTS.jsonl
 //! ```
 //!
-//! Each input line is one typed decision, exactly what
-//! `POST /v1/experimental/decisions` turns a question into
-//! (unknown fields and blank lines are rejected):
+//! Each input line is one typed decision (unknown fields and blank lines are
+//! rejected):
 //!
 //! ```text
 //! {"id": "<string>", "state": "<text>", "question": "<text>",

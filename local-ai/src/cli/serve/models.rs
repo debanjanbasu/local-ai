@@ -18,13 +18,7 @@
 //! omitted `model` (batch lines must name one) or any name that is not
 //! another served model's, because many `OpenAI` clients send a configured
 //! name the server cannot know; a name of another local model is a mistake
-//! and is refused. Evals still require exactly [`BONSAI_MODEL_ID`].
-//!
-//! Earlier versions reported the GGUF file path as the Bonsai id. It is
-//! machine specific and no longer listed; as a name of no other model it is
-//! accepted like any other, so batch lines stored by those versions still
-//! run, and reasoning envelopes they sealed still open (see
-//! `ReasoningCipher::with_legacy_model`).
+//! and is refused.
 
 use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -287,15 +281,9 @@ mod tests {
     }
 
     #[test]
-    fn uninstalled_unknown_and_legacy_names_are_not_found() {
+    fn uninstalled_and_unknown_names_are_not_found() {
         let catalog = catalog(Installed::default());
-        for name in [
-            EMBEDDING_MODEL_ID,
-            SPEECH_MODEL_ID,
-            "whisper-1",
-            "gpt-4o",
-            "/Users/me/local-ai/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
-        ] {
+        for name in [EMBEDDING_MODEL_ID, SPEECH_MODEL_ID, "whisper-1", "gpt-4o"] {
             let (status, _) = catalog.answer(&Method::GET, name).expect_err(name);
             assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
         }
