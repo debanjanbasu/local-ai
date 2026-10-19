@@ -144,9 +144,10 @@ An owner-only reasoning key, created on first start as
 FILE`), adds AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
 reasoning is still returned and, with a store, still written, so it is neither
 encryption at rest nor hidden reasoning. The same key seals the `compaction`
-items of `POST /v1/responses/compact` and of Responses `context_management`
-compaction, which summarize older items with the same Bonsai model and keep
-the rest verbatim (never splitting a tool call from its result).
+items of `POST /v1/responses/compact`, of Responses `context_management`
+compaction and of `compaction_trigger` turns (Codex's remote compaction),
+which summarize older items with the same Bonsai model and keep the rest
+verbatim (never splitting a tool call from its result).
 `reasoning.summary` adds a short second generation that
 summarizes the raw reasoning, which itself stays `reasoning_text`. Both work
 with `background` and cost extra inference (counted in `usage`), and a

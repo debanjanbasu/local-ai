@@ -79,7 +79,11 @@
 //!   generation and the compaction item is the Response's first output item;
 //!   for `background`, before the job is admitted, and a resumed job reuses
 //!   the item its record holds. Both extra generations' tokens are added to
-//!   `usage` (see [`Spent`]).
+//!   `usage` (see [`Spent`]). An input ending with a `compaction_trigger`
+//!   item (Codex's remote compaction) is a compaction turn: the history is
+//!   compacted whatever its length and the Response's only output item is
+//!   the compaction item, with the summary generation's `usage`; nothing
+//!   else is generated, and the trigger itself is never kept as history.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,6 +113,12 @@ use super::request::{
 use super::response::{Reply, arguments_text, new_id, unix_now};
 use super::store::{ResponseStore, StoredResponse};
 use crate::GenerateParams;
+
+/// The `type` of the input item that asks for a compaction turn: Codex's
+/// remote compaction (provider capability `remote_compaction = "v2"`)
+/// appends one, payload-free, to an otherwise ordinary request and expects
+/// exactly one `compaction` output item back.
+const COMPACTION_TRIGGER: &str = "compaction_trigger";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,6 +240,10 @@ pub(super) struct Echo {
     /// The compaction item made before generation (`context_management`),
     /// the Response's first output item.
     compaction: Option<Value>,
+    /// A `compaction_trigger` turn's summary generation: the Response is
+    /// `compaction` alone, finished with these measurements, and nothing
+    /// else is generated.
+    compaction_turn: Option<Stats>,
     /// What the compaction generation run before this Response's own cost,
     /// whether or not its item was kept; added to the Response's `usage`.
     spent: Spent,
@@ -370,6 +384,12 @@ impl Echo {
         self.spent.add(stats);
     }
 
+    /// For a `compaction_trigger` turn, the measurements its Response
+    /// finishes with in place of a generation of its own.
+    pub(super) const fn compaction_turn(&self) -> Option<&Stats> {
+        self.compaction_turn.as_ref()
+    }
+
     /// Record who creates this Response (see [`StoredResponse::creator`]),
     /// for a durable background one that a restarted server may resume.
     pub(super) fn set_creator(&mut self, creator: Option<Value>) {
@@ -423,6 +443,9 @@ pub(super) struct PreparedResponses {
     pub(super) echo: Echo,
     /// `context_management` compaction, when requested.
     pub(super) context_compaction: Option<ContextCompaction>,
+    /// The input ended with a `compaction_trigger`: this Response compacts
+    /// the history and answers with the compaction item alone.
+    pub(super) compaction_trigger: bool,
     /// The prompt's history, as rendered: what a compaction pass summarizes.
     pub(super) history: History,
 }
@@ -866,7 +889,22 @@ pub(super) fn prepare_responses_conversing(
         None
     };
     let replayed = items.len();
-    normalize_input(input, &mut items)?;
+    let compaction_trigger = normalize_input(input, &mut items)?;
+    if compaction_trigger {
+        if cipher.is_none() {
+            return Err(unsupported(
+                "compaction_trigger",
+                "compaction items are sealed with --reasoning-key, which this server was started \
+                 without",
+            ));
+        }
+        if request.background == Some(true) {
+            return Err(unsupported(
+                "compaction_trigger with background",
+                "a compaction turn is answered while the request waits",
+            ));
+        }
+    }
     // This request's own items, before any reasoning is decrypted below: only
     // these, never the replayed history, are appended to a conversation.
     let new_input = if snapshot.is_some() {
@@ -931,6 +969,7 @@ pub(super) fn prepare_responses_conversing(
         summary,
         summarizer: None,
         compaction: None,
+        compaction_turn: None,
         spent: Spent::default(),
         kinds,
         max_tool_calls: request.max_tool_calls,
@@ -953,6 +992,7 @@ pub(super) fn prepare_responses_conversing(
         },
         echo,
         context_compaction,
+        compaction_trigger,
         history,
     })
 }
@@ -1053,7 +1093,8 @@ impl History {
         open_reasoning(&mut kept, cipher, model)?;
         kept.extend_from_slice(items.get(at + 1..).unwrap_or_default());
         Ok(Self {
-            summary: Some(compacted.summary),
+            // An item that summarized nothing ([`Self::sealed`]) has none.
+            summary: Some(compacted.summary).filter(|summary| !summary.is_empty()),
             items: kept,
             instructions,
             files,
@@ -1136,17 +1177,11 @@ impl CompactionPass {
                 "the compaction summary came back empty, so nothing was compacted".into(),
             ));
         }
-        let id = new_id("cmp_");
         let compacted = Compacted {
             summary: summary.to_owned(),
             items: self.kept,
         };
-        let payload = serde_json::to_string(&compacted)
-            .map_err(|error| crate::Error::Generation(error.to_string()))?;
-        let sealed = cipher
-            .seal_compaction(model, &id, &payload)
-            .map_err(|error| crate::Error::Generation(error.to_string()))?;
-        let item = json!({"type":COMPACTION,"id":id,"encrypted_content":sealed});
+        let item = seal(&compacted, cipher, model)?;
         let history = History {
             summary: Some(compacted.summary),
             items: compacted.items,
@@ -1162,7 +1197,41 @@ impl CompactionPass {
     }
 }
 
+/// `compacted`, sealed into a new compaction item.
+fn seal(compacted: &Compacted, cipher: &ReasoningCipher, model: &str) -> crate::Result<Value> {
+    let id = new_id("cmp_");
+    let payload = serde_json::to_string(compacted)
+        .map_err(|error| crate::Error::Generation(error.to_string()))?;
+    let sealed = cipher
+        .seal_compaction(model, &id, &payload)
+        .map_err(|error| crate::Error::Generation(error.to_string()))?;
+    Ok(json!({"type":COMPACTION,"id":id,"encrypted_content":sealed}))
+}
+
+impl History {
+    /// A compaction item that renders exactly as this history does: its
+    /// summary, if any, and every item kept. A `compaction_trigger` turn
+    /// answers with it when no summary would shorten the history.
+    pub(super) fn sealed(&self, cipher: &ReasoningCipher, model: &str) -> crate::Result<Value> {
+        let compacted = Compacted {
+            summary: self.summary.clone().unwrap_or_default(),
+            items: self.items.clone(),
+        };
+        seal(&compacted, cipher, model)
+    }
+}
+
 impl PreparedResponses {
+    /// Answer this `compaction_trigger` turn with compaction `item` alone,
+    /// finishing with `stats` (the summary generation's, if one ran) instead
+    /// of generating. A summary cut short by its token budget still
+    /// compacted, so the Response is `completed`.
+    pub(super) fn answer_with_compaction(&mut self, item: Value, mut stats: Stats) {
+        stats.stop_reason = StopReason::Eos;
+        self.echo.compaction = Some(item);
+        self.echo.compaction_turn = Some(stats);
+    }
+
     /// Generate from compacted `history` instead, reporting compaction
     /// `item` as the Response's first output item.
     pub(super) fn compacted(&mut self, item: Value, history: History) -> crate::Result<()> {
@@ -1236,7 +1305,10 @@ pub(super) fn prepare_compact(
         (None, _) => Vec::new(),
     };
     match (&request.input, request.previous_response_id.is_some()) {
-        (Some(input), _) if !input.is_null() => normalize_input(input, &mut items)?,
+        // Compacting is what this route does anyway, so a trigger adds nothing.
+        (Some(input), _) if !input.is_null() => {
+            normalize_input(input, &mut items)?;
+        }
         (_, true) => {}
         _ => return Err(invalid("input is required")),
     }
@@ -1720,7 +1792,10 @@ fn plain(role: &str, content: String, tool_call_id: Option<String>) -> ChatMessa
 /// so an invalid one fails with the same message it would without a store.
 /// A client-supplied `id` is kept unless it repeats one already present, so
 /// `input_items` pagination by `after` always names one item.
-fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
+///
+/// `compaction_trigger` items are requests, not history, so none is kept;
+/// `true` says the input ended with one (see [`COMPACTION_TRIGGER`]).
+fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<bool> {
     let new: Vec<Value> = match input {
         Value::String(text) => {
             vec![
@@ -1734,7 +1809,8 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
         .iter()
         .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
-    for item in new {
+    let triggered = new.last().is_some_and(is_trigger);
+    for item in new.into_iter().filter(|item| !is_trigger(item)) {
         let mut item = match item {
             Value::Object(item) => item,
             other => {
@@ -1822,7 +1898,12 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
         item.insert("id".into(), json!(id));
         items.push(Value::Object(item));
     }
-    Ok(())
+    Ok(triggered)
+}
+
+/// Whether `item` is a `compaction_trigger` input item.
+fn is_trigger(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some(COMPACTION_TRIGGER)
 }
 
 /// Convert already-authenticated `input` into the chat history the engine renders.

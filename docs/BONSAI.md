@@ -886,13 +886,24 @@ wire_api = "responses"
 # with authentication on: env_key = "LOCAL_AI_API_KEY"
 ```
 
-Codex sends `store: false` with the whole conversation in `input`, asks for
+Codex sends `store: false` with the whole conversation in `input` and asks for
 `reasoning.encrypted_content` (sealed with the reasoning key created on first
-start), and compacts locally: at 90% of the window it sends its summarization
-prompt as an ordinary Response and continues from the summary. Leave its
-provider capability `remote_compaction` at its default, `unsupported`: `v2`
-sends a `compaction_trigger` input item, which this server does not
-implement. Codex declares its freeform `apply_patch` tool (a `custom` tool
+start). By default it compacts locally: at 90% of the window it sends its
+summarization prompt as an ordinary Response and continues from the summary.
+To have this server compact instead, add the provider capability:
+
+```toml
+[model_providers.local-ai.capabilities]
+remote_compaction = "v2"   # compaction_trigger turns, for automatic compaction and /compact
+```
+
+Codex then sends a `compaction_trigger` turn and replays the sealed
+`compaction` item it gets back
+([compaction](#compaction-and-reasoning-summaries)). The summary is written
+with the server's own compaction prompt, and the item keeps the newest tool
+calls and results verbatim, where Codex's local compaction keeps only user
+messages and its summary. Codex 0.163 has no `"v1"` value, so it never calls
+`/v1/responses/compact`. Codex declares its freeform `apply_patch` tool (a `custom` tool
 with a Lark grammar, enforced while the patch is generated) only for models
 its catalog marks freeform; for any other model it edits through
 `exec_command`. Its fallback instructions still mention `apply_patch`, so the
@@ -1007,7 +1018,27 @@ the compacted window persists across restarts. With `background`, a due
 compaction runs before the job is admitted, so the `POST` returns `queued`
 only after it, with the compaction item already the first output item; a
 streamed job announces it right after `response.in_progress`.
-`compaction_trigger` input items are refused.
+
+An input that ends with a `{"type":"compaction_trigger"}` item is a
+compaction turn, the protocol of Codex's remote compaction (provider
+capability `remote_compaction = "v2"`): Codex sends its whole history, its
+tools and the trigger as an ordinary streamed `POST /v1/responses` and
+expects exactly one `compaction` output item, delivered in
+`response.output_item.done` before `response.completed`. The history is
+compacted whatever its length, keeping the newest quarter of its prompt count
+verbatim as `/responses/compact` does, and the Response's only output item is
+the compaction item; nothing else is generated, `usage` is the summary
+generation's, and the Response is `completed` even when the summary used its
+whole 2,048-token budget. When nothing can be summarized, the summary is
+empty, or it would not shorten the prompt, the item seals the history
+unchanged instead (it renders exactly as the input did), since the client
+asked for one. Codex then replaces its history with the user messages it
+retains, its re-injected developer context, and the item, last; the next
+request renders from the item, so those retained copies before it are not
+rendered twice (the item kept the leading instructions and the latest user
+message itself). The trigger is never history: it is not stored, appended to
+a conversation, or rendered, and one that is not the last input item is
+dropped. A trigger needs the reasoning key and is refused with `background`.
 
 Without a key (only in tests now, since a server always has one) both are refused rather than returning the summary
 in a field named `encrypted_content`: the item carries the conversation's
@@ -3136,6 +3167,27 @@ fixes above), `final-b` (Oh My Pi, Codex reruns, HTTP probes), `final-c`
 (opencode cancel, invalid-then-valid), `final-d` (opencode Chat), `final-e`
 (one read scenario per client and two probes, rerun after rebasing onto
 image input).
+
+**Codex remote compaction** (branch `codex-compaction`, 2026-10-19; Codex
+CLI 0.163.0; server with `--reasoning-key`). Codex 0.163 sends remote
+compaction only as `compaction_trigger` turns (its provider capability has no
+`"v1"`), so that gap above is closed by implementing the trigger; Codex never
+calls `/v1/responses/compact`, which `http-compact` still covers.
+`codex-remote-compact` is `codex-compact` with
+`remote_compaction = "v2"` (automatic compaction at the 7,000-token limit);
+`codex-remote-compact-manual` drives `codex app-server`: a read turn,
+`thread/compact/start` (the TUI's `/compact`, which `codex exec` cannot
+send), then a follow-up that needs the compacted context.
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| codex-remote-compact | PASS | 12 requests, 186 s; three `compaction_trigger` turns (7,342 to 7,679 prompt tokens, 6,715 to 7,101 of them from the prompt cache, 475 to 561-token summaries, 15 to 17 s each), each answered with one `compaction` item; the second and third fold the earlier item in; the 7 other requests after the first replay the latest item, and the next prompt after each falls to about 6,050 tokens, near Codex's first request of 6,007; tests pass |
+| codex-remote-compact-manual | PASS | 5 requests, 23 s; `42`; the manual compaction turn (6,264 prompt tokens, 90-token summary, 4 s); then "that same file" resolved to `settings/limits.py`, which the prompt names only through the compaction item, re-read, `7`; both later requests replay the item |
+| codex-compact (local compaction, unchanged) | PASS | 26 requests, 509 s; local summarization turns, tests pass |
+| http-compact | PASS | 200 `response.compaction` |
+
+Evidence: `.scratch/artifacts/client-compat/remote-b` (after rebasing; an
+earlier run, `remote-a`, passed the same four with one automatic compaction).
 
 #### Long-context coding quality
 
