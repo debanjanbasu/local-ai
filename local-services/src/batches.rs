@@ -47,9 +47,9 @@
 //! batch still names it. A result file that cannot be written fails the
 //! batch with `output_failed`.
 //!
-//! Every line names the same `body.model`, and it must be the installed model
-//! the caller names when creating the batch; a batch for any other model is
-//! refused before anything is stored.
+//! Every line names the same `body.model`, which the caller accepts or refuses
+//! when creating the batch ([`Store::create_batch_accepting`]); a refused
+//! model stores nothing.
 //!
 //! Expiry (`completion_window` is `24h`) and cancellation are observed at line
 //! boundaries: unfinished lines of an expired batch are failed with
@@ -310,7 +310,8 @@ pub struct BatchErrors {
 pub struct Batch {
     pub id: String,
     pub endpoint: Endpoint,
-    /// The `body.model` every line names; the server's one model runs them.
+    /// The `body.model` every line names, as given; the server's one model
+    /// runs them.
     pub model: String,
     pub errors: Option<BatchErrors>,
     pub input_file_id: String,
@@ -423,9 +424,8 @@ impl Store {
     /// one pending line per request, atomically. Nothing is stored when any
     /// line is refused.
     ///
-    /// Every line must name `installed_model` (the model that will run the
-    /// lines) as its `body.model`; any other model is refused as invalid
-    /// before anything is stored.
+    /// Every line must name exactly `installed_model` as its `body.model`;
+    /// any other model is refused as invalid before anything is stored.
     pub fn create_batch(&self, request: &CreateBatch, installed_model: &str) -> Result<Batch> {
         self.create_batch_for(request, installed_model, None)
     }
@@ -436,6 +436,23 @@ impl Store {
         &self,
         request: &CreateBatch,
         installed_model: &str,
+        owner: Option<&Owner>,
+    ) -> Result<Batch> {
+        let exact = |model: &str| {
+            (model == installed_model).then_some(()).ok_or_else(|| {
+                format!("body.model {model:?} is not the installed model {installed_model:?}")
+            })
+        };
+        self.create_batch_accepting(request, exact, owner)
+    }
+
+    /// [`Self::create_batch_for`] with the caller deciding which shared
+    /// `body.model` it runs: `accept` returns why a model is refused, and a
+    /// refused batch is invalid and stores nothing.
+    pub fn create_batch_accepting(
+        &self,
+        request: &CreateBatch,
+        accept: impl FnOnce(&str) -> std::result::Result<(), String>,
         owner: Option<&Owner>,
     ) -> Result<Batch> {
         let endpoint: Endpoint = request.endpoint.parse()?;
@@ -459,11 +476,7 @@ impl Store {
             )));
         }
         let (model, lines) = parse_input(content.content, endpoint)?;
-        if model != installed_model {
-            return Err(invalid(format!(
-                "body.model {model:?} is not the installed model {installed_model:?}"
-            )));
-        }
+        accept(&model).map_err(invalid)?;
         let id = new_id(ID_PREFIX)?;
         let created_at = now()?;
         let mut connection = self.connection()?;

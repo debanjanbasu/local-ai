@@ -582,33 +582,51 @@ async fn listing_pages_newest_first() {
 }
 
 #[tokio::test]
-async fn a_batch_for_another_model_is_refused_without_a_new_batch() {
+async fn any_model_name_but_another_local_models_runs() {
     let scratch = Scratch::new();
     let (submit, seen, _) = fake(false);
     let batches = start(&scratch.store, submit);
-    let mut other = chat("a", "hello");
-    other["body"]["model"] = json!("other");
-    let file = scratch.input(&[other]);
+    // The name a harness is configured with runs on the loaded model.
+    let mut harness = chat("a", "hello");
+    harness["body"]["model"] = json!("gpt-4o");
+    let file = scratch.input(&[harness]);
+    let (status, batch) = create(&batches, &file, "/v1/chat/completions").await;
+    assert_eq!(status, StatusCode::OK, "{batch}");
+    assert_eq!(batch["model"], "gpt-4o");
+    let id = batch["id"].as_str().expect("id").to_owned();
+    let done = settled(&scratch.store, &id).await;
+    assert_eq!(
+        done["request_counts"],
+        json!({"total":1,"completed":1,"failed":0}),
+        "{done}"
+    );
+    let output = records(&scratch.store, &done["output_file_id"]);
+    assert_eq!(output[0]["response"]["body"]["model"], "local");
+
+    // Another local model's name is a mistake, refused before storing.
+    let mut whisper = chat("b", "hello");
+    whisper["body"]["model"] = json!("whisper-1");
+    let file = scratch.input(&[whisper]);
     let (status, refused) = create(&batches, &file, "/v1/chat/completions").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
     assert!(
         refused["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("installed model")),
+            .is_some_and(|message| message.contains("served by POST /v1/audio/transcriptions")),
         "{refused}"
     );
     let (_, page) = send(&batches, Method::GET, "/v1/batches", &Value::Null).await;
-    assert_eq!(page["data"], json!([]));
+    assert_eq!(page["data"].as_array().map(Vec::len), Some(1), "{page}");
     stop(&batches).await;
-    assert!(seen.lock().expect("seen").is_empty());
+    assert_eq!(*seen.lock().expect("seen"), ["hello"]);
 }
 
 #[tokio::test]
-async fn a_resumed_line_for_another_model_fails_without_generating() {
+async fn a_resumed_line_for_another_local_model_fails_without_generating() {
     let scratch = Scratch::new();
     let mut other = chat("a", "hello");
-    other["body"]["model"] = json!("other");
-    // Stored by a server whose installed model was `other`.
+    other["body"]["model"] = json!("embeddinggemma-2");
+    // Stored by a server that accepted it.
     let stored = scratch
         .store
         .create_batch(
@@ -618,7 +636,7 @@ async fn a_resumed_line_for_another_model_fails_without_generating() {
                 completion_window: "24h".to_owned(),
                 metadata: local_services::Metadata::new(),
             },
-            "other",
+            "embeddinggemma-2",
         )
         .expect("batch created");
     let (submit, seen, _) = fake(false);
@@ -634,7 +652,7 @@ async fn a_resumed_line_for_another_model_fails_without_generating() {
     assert!(
         errors[0]["response"]["body"]["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("loaded model")),
+            .is_some_and(|message| message.contains("served by POST /v1/embeddings")),
         "{errors:?}"
     );
     stop(&batches).await;
