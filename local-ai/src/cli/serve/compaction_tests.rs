@@ -547,11 +547,10 @@ fn compaction_needs_the_key_and_an_authentic_sealed_item() {
     let mut moved = item.clone();
     moved["id"] = json!("cmp_other");
     assert!(error(&json!({"input":[moved]}), Some(&cipher)).contains("compaction item"));
+    // Without its id it takes the one its envelope carries.
     let mut anonymous = item;
     anonymous.as_object_mut().expect("object").remove("id");
-    assert!(
-        error(&json!({"input":[anonymous]}), Some(&cipher)).contains("original unique item id")
-    );
+    assert!(prepare(&json!({"input":[anonymous]}), None, Some(&cipher)).is_ok());
 }
 
 #[test]
