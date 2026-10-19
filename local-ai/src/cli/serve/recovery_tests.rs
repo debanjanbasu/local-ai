@@ -788,19 +788,24 @@ fn a_full_queue_defers_without_writing_twice_and_unresumable_jobs_fail() {
     let record = stored(&store, &id).expect("stored");
     assert_consistent(&stream(&background, &store, &id, None), &record);
 
-    // A record without its request (an older server's) fails, saying why.
-    let mut legacy = stored(&store, &id).expect("stored");
-    let legacy_id = "resp_legacy";
-    legacy["id"] = json!(legacy_id);
-    legacy["status"] = json!("in_progress");
-    store.save(&legacy, &[]).expect("saved");
+    // A record without its request fails, saying why.
+    let mut requestless = stored(&store, &id).expect("stored");
+    let requestless_id = "resp_requestless";
+    requestless["id"] = json!(requestless_id);
+    requestless["status"] = json!("in_progress");
+    store.save(&requestless, &[]).expect("saved");
     let engine = Engine::default();
     assert_eq!(
-        outcome(&Arc::new(Background::default()), &store, legacy_id, &engine),
+        outcome(
+            &Arc::new(Background::default()),
+            &store,
+            requestless_id,
+            &engine
+        ),
         "settled"
     );
     assert_eq!(engine.asked(), 0);
-    let failed = stored(&store, legacy_id).expect("stored");
+    let failed = stored(&store, requestless_id).expect("stored");
     assert_eq!(failed["status"], "failed");
     assert!(
         failed["error"]["message"]

@@ -27,8 +27,8 @@
 //! `in_progress` whose lease is free has lost its writer to a crash or
 //! restart. While it is pending, a durable background record also keeps the
 //! request it was created from (`request`), and a server resumes it from that
-//! (see [`super::background::Background::resume`]); one without it (written
-//! by an older server, or continuing a conversation) is marked `failed` when
+//! (see [`super::background::Background::resume`]); one without it (one
+//! continuing a conversation) is marked `failed` when
 //! a store opens. A record whose lease is held belongs to a live server
 //! sharing the directory and is left alone.
 //!
@@ -104,7 +104,7 @@ pub(super) struct StoredResponse {
     /// Who created that pending request, kept beside it so a resumed
     /// generation's usage is attributed to them: `{"project_id",
     /// "api_key_id"}` for a project API key. `None` for an unattributed
-    /// caller and in records written before creators were kept.
+    /// caller.
     pub(super) creator: Option<Value>,
 }
 

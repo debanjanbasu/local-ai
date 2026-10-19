@@ -28,7 +28,7 @@ optional model ([model ids](docs/BONSAI.md#model-ids)).
 **Supported OpenAI APIs.** Only current OpenAI APIs are served: Chat
 Completions, Responses (with `input_tokens`, `compact`, retrieval,
 cancellation and input items), Models, Conversations, Files, Uploads,
-Batches, Vector Stores, Evals, Decisions and the Administration API
+Batches, Vector Stores, Decisions and the Administration API
 (`/v1/organization/*`: keys, projects, audit logs, usage; see
 [docs/ADMIN.md](docs/ADMIN.md)); with the optional models installed,
 Embeddings, Moderations, Audio speech (`/v1/audio/speech`) and Audio
@@ -92,14 +92,7 @@ itself (sandboxed `shell`, `local_fs_*` file access, allowlisted
 with explicit `--tools-*` permissions; by default none are available. The
 permission model, bounds and known gaps are in [docs/TOOLS.md](docs/TOOLS.md).
 
-`--experimental-decision-head FILE` opts in to
-`POST /v1/experimental/decisions`, which returns an explicitly loaded
-judgment head's option probabilities for text questions. It is experimental,
-has no confidence or refusal, carries only the calibration evaluated for that
-artifact's scope (the legacy devtools-v1 head: two-option Yes/No code-diff
-questions; the development-only hard-v1 heads: see
-[their results](local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)),
-and is not the OpenAI Decisions API. `POST /v1/decisions` is served whenever
+`POST /v1/decisions` is served whenever
 a decisions artifact is installed as `models/decisions-v2` (or named with
 `--decisions-artifact DIR`): a head, gate and calibration artifact that passed
 the [pre-registered confidence and refusal evaluation](docs/DECISIONS_EVALUATION.md)
@@ -115,8 +108,8 @@ The server also always opens a durable native services store at
 blobs, in plaintext, with no flag and no alternative backend). It serves
 Conversations and their items, Responses `conversation` (appended once, and
 refused on a version conflict), streamed Files and Uploads (with optional
-MD5), Batches of Chat Completions and Responses requests, and Evals whose model calls run as
-batches. Batches run on one worker that
+MD5), and Batches of Chat Completions and Responses requests. Batches run on
+one worker that
 resumes unsettled lines after a restart. File expiry is enforced on access, and
 expired bytes are purged at startup. The same crate offers native repository search
 (ranked, exact or regex) with no HTTP route. See
@@ -208,10 +201,10 @@ no GPU work.
 
 `ChatRequest::tool_choice`, `parallel_tool_calls` and `ToolDefinition::strict`
 select [native constrained tool calling](local-engine/README.md#constrained-tool-calling);
-the defaults shown above leave generation unconstrained. The experimental
+the defaults shown above leave generation unconstrained.
 `Engine::decide` and `EngineHandle::decide` score typed text questions with an
 explicitly loaded judgment head
-([experimental native decisions](local-engine/README.md#experimental-native-decisions)).
+([native decisions](local-engine/README.md#native-decisions)).
 
 ## Automatic policy
 
@@ -272,8 +265,6 @@ bandwidth:
 | Peak memory footprint | 0.96 GB |
 | Swaps | 0 |
 | Automatically selected context | 61,538 tokens, under the former F16 K/V default |
-| MTP head load, retired int8 head: cold from the BF16 source | 5.94 s |
-| MTP head load, retired int8 head: warm artifact | 3.18 s |
 
 **Read the two decode rates as one session, not as constants.** Both come from
 the same machine with `--no-thinking --greedy`, but they are not comparable to
@@ -479,14 +470,11 @@ python3 tools/kaggle_bonsai_mtp_job.py \
   --kernel USER/bonsai2-mtp --output cache/kaggle-bonsai-mtp
 ```
 
-An earlier all-ternary QAT head measured 27.46 tok/s at 74.3% draft acceptance
-against the retired int8 head's 28.40 at 80.8% (six prompts, byte-identical
-text); the mixed head above superseded it. See
-[docs/BONSAI.md](docs/BONSAI.md#tried-and-rejected) for those measurements.
+Heads tried before the mixed one, and their measurements, are in
+[docs/BONSAI.md](docs/BONSAI.md#tried-and-rejected).
 
-Artifact compression only ever applied to the retired int8 head. The
-5,946,648,928-byte GGUF is not compressible in practice: the measured ceiling
-is 1.074x and the best measured result 1.29%.
+The 5,946,648,928-byte GGUF is not compressible in practice: the measured
+ceiling is 1.074x and the best measured result 1.29%.
 
 ## Workspace
 

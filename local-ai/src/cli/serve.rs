@@ -839,7 +839,7 @@ fn resume_background(
 ) -> Result<bool, Failure> {
     let (engine, depth) = (state.engine.clone(), state.depth.clone());
     // Resumed after a restart: the generations are attributed to the caller
-    // the record keeps (unattributed for one an earlier version wrote). The
+    // the record keeps. The
     // creator never changes, so reading it before the lease is taken is safe.
     let creator = store
         .load(id)
@@ -1109,10 +1109,10 @@ async fn run_async(args: Args) -> crate::Result<()> {
         Some(path) => path.clone(),
         None => services::data_dir()?.join("reasoning.key"),
     };
-    let cipher = Some(
-        ReasoningCipher::open(&key)
-            .map_err(|error| crate::Error::InvalidArgument(error.to_string()))?,
-    );
+    let cipher =
+        Some(Arc::new(ReasoningCipher::open(&key).map_err(|error| {
+            crate::Error::InvalidArgument(error.to_string())
+        })?));
     // Opened before the model loads, so a bad directory fails in milliseconds.
     let responses = match &args.response_store {
         options::ResponseStoreArg::Off => None,
@@ -1158,9 +1158,6 @@ async fn run_async(args: Args) -> crate::Result<()> {
     });
     let decisions = decisions::Decisions::start(decisions_artifact.as_deref())?;
     let model: Arc<str> = models::BONSAI_MODEL_ID.into();
-    // Envelopes an earlier version sealed for the checkpoint's path still open.
-    let legacy_model = resources.model.to_string_lossy().into_owned();
-    let cipher = cipher.map(|cipher| Arc::new(cipher.with_legacy_model(legacy_model)));
     let engine = Engine::from_resources(&resources)?;
     eprintln!("{}", engine.info().json);
     let context = engine.info().model.context;
