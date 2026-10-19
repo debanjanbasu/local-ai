@@ -228,6 +228,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--val-fraction", type=float, default=0.02,
                     help="share of capture shards held out for EVAL")
+    ap.add_argument("--min-match", type=float, default=0.0,
+                    help="skip windows where fewer positions follow the target argmax "
+                    "(data.DocBatcher): 0.9 keeps self-generated transcript spans")
     ap.add_argument("--int8", help="int8 runtime matrices (ternary.parse_int8 spec; "
                     "default: the --init checkpoint's, else none)")
     ap.add_argument("--sweep", help="eval-only: JSON list of {label, int8} configs")
@@ -287,7 +290,7 @@ def main():
         return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * t))
 
     batcher = DocBatcher(args.capture, window=args.window, batch=args.batch, seed=args.seed,
-                         val_fraction=args.val_fraction)
+                         val_fraction=args.val_fraction, min_match=args.min_match)
     if args.start_step:
         # Same held-out split (fixed in the constructor), fresh training order.
         batcher.rng = np.random.default_rng((args.seed, args.start_step))
