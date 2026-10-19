@@ -298,6 +298,9 @@ pub(super) enum Protocol {
     Chat {
         /// `stream_options.include_usage`: a final chunk with `usage`.
         include_usage: bool,
+        /// The request declared deprecated `functions`: its call is answered
+        /// as `function_call` (see [`legacy_function_call`]).
+        functions: bool,
     },
     /// `POST /v1/responses`.
     Responses(Arc<super::responses::Echo>),
@@ -341,6 +344,34 @@ pub(super) fn usage_json(stats: &Stats) -> Value {
 /// than the model's exact spelling, which is the same document.
 pub(super) fn chat_tool_call(index: usize, call: &ToolCall) -> Value {
     json!({"index":index,"id":call.id,"type":"function","function":{"name":call.name,"arguments":arguments_text(call)}})
+}
+
+/// A [`chat_tool_call`] (or its delta) in the deprecated `function_call`
+/// shape a request with `functions` reads: the call's `name`, when the
+/// fragment has one, and its `arguments`. A request with `functions` makes
+/// at most one call, so no index or ID is needed.
+pub(super) fn legacy_function_call(call: &Value) -> Value {
+    let mut legacy = serde_json::Map::new();
+    if let Some(name) = call.pointer("/function/name") {
+        legacy.insert("name".into(), name.clone());
+    }
+    legacy.insert(
+        "arguments".into(),
+        call.pointer("/function/arguments")
+            .cloned()
+            .unwrap_or_else(|| json!("")),
+    );
+    Value::Object(legacy)
+}
+
+/// [`chat_finish_reason`] for a request that declared `functions` or not:
+/// the deprecated shape ends on a call with `function_call`.
+pub(super) const fn legacy_finish_reason(reason: &'static str, functions: bool) -> &'static str {
+    if functions && matches!(reason.as_bytes(), b"tool_calls") {
+        "function_call"
+    } else {
+        reason
+    }
 }
 
 pub(super) fn arguments_text(call: &ToolCall) -> String {

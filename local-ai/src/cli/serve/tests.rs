@@ -294,6 +294,7 @@ fn reply() -> Reply {
     Reply {
         protocol: Protocol::Chat {
             include_usage: false,
+            functions: false,
         },
         id: "local".into(),
         created: 0,

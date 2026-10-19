@@ -93,8 +93,8 @@ the reference to F32 rounding; it costs 136 MB more GPU memory than int8.
 - `user`: accepted and ignored (current on this endpoint; the specification
   deprecates `user` only on Chat Completions and Responses).
 
-Like every route of the server, this is the current OpenAI API; legacy and
-deprecated APIs are not served
+Like every route of the server, this is the current OpenAI API; the legacy
+Completions API is not served
 ([supported OpenAI APIs](BONSAI.md#supported-openai-apis)).
 
 Text is embedded exactly as sent. Retrieval quality depends on the model

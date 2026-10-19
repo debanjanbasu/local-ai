@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run real coding clients (Codex CLI, Oh My Pi) against `local-ai serve`.
+"""Run real coding clients (Codex CLI, Oh My Pi, opencode) against `local-ai serve`.
 
 Every client request passes through a recording reverse proxy, so a failing
 scenario carries the exact request body, the exact response (SSE included)
@@ -28,18 +28,26 @@ with a Lark grammar) only for models its catalog marks freeform, which this
 provider is not, so `http-custom-tool-apply-patch` sends that declaration
 itself, verbatim, and forces a call.
 
+`opencode-*` scenarios configure opencode's custom provider with the AI
+SDK's `@ai-sdk/openai-compatible` package, so it speaks Chat Completions;
+`opencode-responses-*` use `@ai-sdk/openai`, which speaks Responses.
+`codex-apply-patch` gives Codex a model catalog (`model_catalog_json`) that
+marks this model freeform, so Codex edits through its own `apply_patch`
+grammar tool; `codex-compact` lowers Codex's auto-compaction limit so its
+local compaction runs mid-task.
+
 Scenario kinds:
 
-- `omp-*` / `codex-*`: the client itself runs a task (read, edit, tool result,
-  final answer; tool-error recovery; a resumed second user turn; SIGINT
-  cancellation mid-stream). `task_ok` checks the repository or the answer;
-  `protocol_ok` requires that no proxied exchange failed.
+- `omp-*` / `codex-*` / `opencode-*`: the client itself runs a task (read,
+  edit, tool result, final answer; tool-error recovery; a resumed second user
+  turn; SIGINT cancellation mid-stream). `task_ok` checks the repository or
+  the answer; `protocol_ok` requires that no proxied exchange failed.
 - `http-*`: direct protocol probes of request shapes those clients send
   (hosted and custom tools, reasoning summaries, compaction, encrypted
   reasoning replay, disconnect and background cancellation), and
-  `http-legacy-apis-refused`: the legacy Completions route is a 404 and
-  deprecated request members are 400s, since only current OpenAI APIs are
-  served.
+  `http-legacy-members`: the legacy Completions route is a 404, while the
+  deprecated request members harnesses still send (`max_tokens`,
+  `functions`, `user`) are honoured.
 
 Each result names the workstream that owns a failure, so a rerun after a
 merge shows which gaps closed. Output: `results.json`, `summary.md`,
@@ -159,6 +167,23 @@ def response_object(exchange: dict) -> dict | None:
     return None
 
 
+def chat_reply(exchange: dict) -> dict | None:
+    """A Chat Completions exchange's answer as `{"text", "usage"}` (streamed or
+    not), or None for any other exchange."""
+    if not str(exchange.get("path", "")).startswith("/v1/chat/completions"):
+        return None
+    body = exchange.get("response_body")
+    if isinstance(body, dict):
+        message = ((body.get("choices") or [{}])[0]).get("message") or {}
+        return {"text": message.get("content") or "", "usage": body.get("usage") or {}}
+    text, usage = [], {}
+    for event in sse_events(body) if isinstance(body, str) else []:
+        for choice in event.get("choices") or []:
+            text.append((choice.get("delta") or {}).get("content") or "")
+        usage = event.get("usage") or usage
+    return {"text": "".join(text), "usage": usage}
+
+
 def output_text(response: dict | None) -> str:
     if not response:
         return ""
@@ -172,9 +197,17 @@ def output_text(response: dict | None) -> str:
 
 
 def function_outputs(request_body: object) -> list[dict]:
-    if not isinstance(request_body, dict) or not isinstance(request_body.get("input"), list):
+    """Tool results a request carries: Responses `function_call_output` (and
+    `custom_tool_call_output`) items, or Chat `tool` messages as `{"output"}`."""
+    if not isinstance(request_body, dict):
         return []
-    return [i for i in request_body["input"] if isinstance(i, dict) and i.get("type") == "function_call_output"]
+    if isinstance(request_body.get("messages"), list):
+        return [{"output": m.get("content")} for m in request_body["messages"]
+                if isinstance(m, dict) and m.get("role") == "tool"]
+    if not isinstance(request_body.get("input"), list):
+        return []
+    return [i for i in request_body["input"] if isinstance(i, dict)
+            and i.get("type") in ("function_call_output", "custom_tool_call_output")]
 
 
 class Recorder:
@@ -390,6 +423,8 @@ def client_env(home: Path, **extra: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
     for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OMP_PROFILE", "PI_CODING_AGENT_DIR", "CODEX_HOME"):
         env.pop(key, None)
+    for key in [k for k in env if k.startswith(("XDG_", "OPENCODE"))]:
+        env.pop(key)
     env["HOME"] = str(home)
     env.update(extra)
     return env
@@ -397,8 +432,42 @@ def client_env(home: Path, **extra: str) -> dict[str, str]:
 
 OMP_TOOLS = "read,bash,edit,write,grep,glob"
 CODEX_COMPAT_FEATURES = ["multi_agent", "goals", "view_image", "skill_search", "apps", "plugins"]
-def codex_config(proxy_port: int, effort: str, compat: bool) -> str:
-    """config.toml for a scratch CODEX_HOME. `compat` keeps only function tools."""
+# Fields of a Codex model-catalog entry that describe this model rather than
+# the OpenAI model the entry is copied from (see `codex_catalog`).
+CODEX_CATALOG_OVERRIDES = {
+    "slug": MODEL_ID, "display_name": "Ternary Bonsai 2 27B (local-ai)", "description": "local-ai",
+    "default_reasoning_level": "xhigh",
+    "supported_reasoning_levels": [{"effort": e, "description": e} for e in ("low", "medium", "xhigh")],
+    "priority": 1, "upgrade": None, "additional_speed_tiers": [], "service_tiers": [],
+    "model_messages": None, "default_reasoning_summary": "none", "support_verbosity": False,
+    "default_verbosity": None, "apply_patch_tool_type": "freeform", "web_search_tool_type": "text",
+    "supports_search_tool": False, "supports_image_detail_original": False, "input_modalities": ["text"],
+    "context_window": 65536, "max_context_window": 65536,
+}
+
+
+def codex_catalog(codex_bin: str, env: dict) -> dict:
+    """A `model_catalog_json` for this model: Codex declares its freeform
+    `apply_patch` grammar tool only for catalog models marked freeform. The
+    entry is Codex's own bundled `gpt-5.5` entry (`codex debug models`), whose
+    base instructions are written for that tool and unified exec, with this
+    model's identity, reasoning levels and context window."""
+    raw = subprocess.run([codex_bin, "debug", "models"], check=True, capture_output=True, text=True,
+                         env=env, timeout=120).stdout
+    models = json.loads(raw)["models"]
+    base = next((m for m in models if m["slug"] == "gpt-5.5"),
+                next(m for m in models if m.get("apply_patch_tool_type") == "freeform"))
+    return {"models": [{**base, **CODEX_CATALOG_OVERRIDES}]}
+
+
+# The opening of Codex's local compaction prompt.
+CODEX_COMPACTION_PROMPT = "CONTEXT CHECKPOINT COMPACTION"
+
+
+def codex_config(proxy_port: int, effort: str, compat: bool, catalog: Path | None = None,
+                 compact_limit: int | None = None) -> str:
+    """config.toml for a scratch CODEX_HOME. `compat` keeps only function tools;
+    `catalog` is a `model_catalog_json`; `compact_limit` an auto-compaction limit."""
     lines = [
         f'model = "{MODEL_ID}"',
         'model_provider = "localai"',
@@ -408,6 +477,10 @@ def codex_config(proxy_port: int, effort: str, compat: bool) -> str:
         'approval_policy = "never"',
         'sandbox_mode = "workspace-write"',
     ]
+    if catalog:
+        lines.append(f'model_catalog_json = "{catalog}"')
+    if compact_limit:
+        lines.append(f"model_auto_compact_token_limit = {compact_limit}")
     tail = [
         "",
         "[sandbox_workspace_write]",
@@ -449,17 +522,51 @@ def omp_models_yml(proxy_port: int, context_window: int = 65536) -> str:
       includeEncryptedReasoning: false
       reasoningDisableMode: none-effort
       supportsForcedToolChoice: false
-      reasoningEffortMap: {{minimal: xhigh, low: xhigh, medium: xhigh, high: xhigh, max: xhigh}}
+      reasoningEffortMap: {{minimal: low, low: low, medium: medium, high: xhigh, max: xhigh}}
     models:
       - id: {MODEL_ID}
         name: Ternary Bonsai 2 27B (local-ai)
         reasoning: true
-        thinking: {{mode: effort, efforts: [xhigh], defaultLevel: xhigh, requiresEffort: false}}
+        thinking: {{mode: effort, efforts: [low, medium, xhigh], defaultLevel: xhigh, requiresEffort: false}}
         input: [text]
         contextWindow: {context_window}
         maxTokens: 8192
         cost: {{input: 0, output: 0, cacheRead: 0, cacheWrite: 0}}
 """
+
+
+def opencode_config(proxy_port: int, responses: bool, effort: str, context_window: int = 65536) -> str:
+    """opencode.json with this server as a custom AI SDK provider.
+
+    `@ai-sdk/openai-compatible` speaks Chat Completions; `@ai-sdk/openai`
+    speaks Responses (and needs some `apiKey`, though the server checks none).
+    The effort is a model option (`reasoningEffort`); without one the server
+    reasons at its default. No web fetch and no sub-agents, as for the other
+    clients."""
+    options: dict = {"baseURL": f"http://127.0.0.1:{proxy_port}/v1"}
+    if responses:
+        options["apiKey"] = "local"
+    return json.dumps({
+        "$schema": "https://opencode.ai/config.json",
+        "autoupdate": False,
+        "share": "disabled",
+        "model": f"local-ai/{MODEL_ID}",
+        "small_model": f"local-ai/{MODEL_ID}",
+        "permission": {"edit": "allow", "bash": "allow", "webfetch": "deny"},
+        "tools": {"webfetch": False, "task": False},
+        "provider": {"local-ai": {
+            "npm": "@ai-sdk/openai" if responses else "@ai-sdk/openai-compatible",
+            "name": "local-ai",
+            "options": options,
+            "models": {MODEL_ID: {
+                "name": "Ternary Bonsai 2 27B (local-ai)",
+                "reasoning": True,
+                "tool_call": True,
+                "limit": {"context": context_window, "output": 8192},
+                "options": {"reasoningEffort": effort},
+            }},
+        }},
+    }, indent=2)
 
 
 @dataclass
@@ -471,6 +578,7 @@ class Context:
     server: LocalServer | None
     codex_bin: str | None
     omp_bin: str | None
+    opencode_bin: str | None
     timeout: float
     # Every codex-* scenario keeps Codex's default configuration.
     codex_default: bool = False
@@ -567,7 +675,10 @@ def file_hash(path: Path) -> str:
 # ---------------------------------------------------------------- client runs
 
 
-def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bool = True) -> tuple[Path, Path, dict]:
+def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bool = True,
+                   variant: str = "") -> tuple[Path, Path, dict]:
+    """Scratch repository, HOME and environment for one run. `variant` picks a
+    client configuration: `responses` (opencode), `apply-patch` or `compact` (Codex)."""
     base = ctx.out / "scenarios" / name
     if base.exists():
         shutil.rmtree(base)
@@ -580,21 +691,40 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
         codex_home = home / ".codex"
         codex_home.mkdir()
         compat = compat and not ctx.codex_default
-        (codex_home / "config.toml").write_text(codex_config(ctx.proxy_port, effort, compat))
+        catalog = None
+        if variant == "apply-patch":
+            catalog = (codex_home / "models.json").resolve()
+            env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
+            catalog.write_text(json.dumps(codex_catalog(ctx.codex_bin, env), indent=2))
+        compact_limit = 6000 if variant == "compact" else None
+        (codex_home / "config.toml").write_text(
+            codex_config(ctx.proxy_port, effort, compat, catalog, compact_limit))
         env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
+    elif client == "opencode":
+        config = home / ".config" / "opencode"
+        config.mkdir(parents=True)
+        (config / "opencode.json").write_text(opencode_config(ctx.proxy_port, variant == "responses", effort))
+        env = client_env(
+            home, TMPDIR=scratch_tmp, XDG_CONFIG_HOME=str(home / ".config"),
+            XDG_DATA_HOME=str(home / ".local/share"), XDG_CACHE_HOME=str(home / ".cache"),
+            XDG_STATE_HOME=str(home / ".local/state"), OPENCODE_DISABLE_AUTOUPDATE="1",
+            OPENCODE_DISABLE_LSP_DOWNLOAD="1", OPENCODE_DISABLE_MODELS_FETCH="1")
     else:
         agent = home / ".omp" / "agent"
         agent.mkdir(parents=True)
         (agent / "models.yml").write_text(omp_models_yml(ctx.proxy_port))
         env = client_env(home, TMPDIR=scratch_tmp)
+    # opencode takes its project directory from PWD, not from the process's
+    # working directory, which is the scratch repository.
+    env["PWD"] = str(repo.resolve())
     return repo, base, env
 
 
 def write_jail(base: Path) -> list[str]:
     """`sandbox-exec` prefix that denies file writes outside `base` (and /dev).
 
-    Oh My Pi has no sandbox of its own and runs with `--auto-approve`, so the
-    harness confines it with macOS Seatbelt. Codex is not wrapped: Seatbelt
+    Oh My Pi and opencode have no sandbox of their own and run with
+    auto-approval, so the harness confines them with macOS Seatbelt. Codex is not wrapped: Seatbelt
     cannot nest, and its own `workspace-write` sandbox is configured instead.
     """
     root = str(base.resolve()).replace("\\", "\\\\").replace('"', '\\"')
@@ -609,6 +739,13 @@ def client_command(ctx: Context, client: str, prompt: str, effort: str, repo: Pa
         if resume:
             return [*head, "resume", "--last", prompt]
         return [*head, "-C", str(repo), prompt]
+    if client == "opencode":
+        assert ctx.opencode_bin
+        command = [*write_jail(repo.parent), ctx.opencode_bin, "run", "--format", "json", "--auto",
+                   "--model", f"local-ai/{MODEL_ID}"]
+        if resume:
+            command.append("--continue")
+        return [*command, prompt]
     assert ctx.omp_bin
     command = [
         *write_jail(repo.parent),
@@ -657,25 +794,34 @@ def summarize_exchanges(result: Result, exchanges: list[dict]) -> None:
     result.requests = len(exchanges)
     for exchange in exchanges:
         response = response_object(exchange)
-        usage = (response or {}).get("usage") or {}
-        result.input_tokens += int(usage.get("input_tokens") or 0)
-        result.output_tokens += int(usage.get("output_tokens") or 0)
+        usage = (response or chat_reply(exchange) or {}).get("usage") or {}
+        result.input_tokens += int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+        result.output_tokens += int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
         if result.failing_exchange is None and exchange_failure(exchange):
             result.failing_exchange = exchange
     result.protocol_ok = result.failing_exchange is None and bool(exchanges)
 
 
 def final_answer(exchanges: list[dict]) -> str:
+    """The last agent turn's text. Requests without tools (opencode's title
+    generation) are side requests, not the agent's answer."""
     for exchange in reversed(exchanges):
+        body = exchange.get("request_body")
+        if isinstance(body, dict) and not body.get("tools"):
+            continue
         response = response_object(exchange)
         if response is not None:
             return output_text(response)
+        reply = chat_reply(exchange)
+        if reply is not None:
+            return reply["text"]
     return ""
 
 
-def client_scenario(kind: str, client: str, effort: str, compat: bool = True) -> Callable[[Context, Result], None]:
+def client_scenario(kind: str, client: str, effort: str, compat: bool = True,
+                    variant: str = "") -> Callable[[Context, Result], None]:
     def run(ctx: Context, result: Result) -> None:
-        repo, base, env = prepare_client(ctx, client, result.name, effort, compat)
+        repo, base, env = prepare_client(ctx, client, result.name, effort, compat, variant)
         files = {"fix": BUG_FILES, "read": READ_FILES, "recover": RECOVERY_FILES, "cancel": {"README.md": "scratch\n"}}[kind]
         write_files(repo, files)
         git_init(repo)
@@ -721,6 +867,21 @@ def client_scenario(kind: str, client: str, effort: str, compat: bool = True) ->
                 for e in exchanges for o in function_outputs(e.get("request_body")))
             result.task_ok = "PERIWINKLE" in answers[0] and error_seen
             result.detail = f"answer={answers[0]!r}, tool results={tool_results}, error result seen={error_seen}"
+        if variant == "apply-patch":
+            # Codex's own edit tool, generated under its Lark grammar.
+            patches = sum(1 for e in exchanges for o in function_outputs(e.get("request_body"))
+                          if o.get("type") == "custom_tool_call_output")
+            result.extra["apply_patch_results"] = patches
+            result.task_ok = result.task_ok and patches >= 1
+            result.detail += f", apply_patch results={patches}"
+        if variant == "compact":
+            # Codex's local compaction: its summarization prompt as the last
+            # input item of an ordinary Response, and the task continuing after.
+            compacted = any(CODEX_COMPACTION_PROMPT in json.dumps((e.get("request_body") or {}).get("input", [])[-1:])
+                            for e in exchanges if isinstance(e.get("request_body"), dict))
+            result.extra["compaction_turn"] = compacted
+            result.task_ok = result.task_ok and compacted
+            result.detail += f", compaction turn seen={compacted}"
         result.passed = result.protocol_ok and result.task_ok and code == 0
         if code != 0:
             result.detail += f"; client exit {code}"
@@ -1023,30 +1184,41 @@ def invalid_then_valid(ctx: Context, result: Result) -> None:
     result.detail = f"invalid effort -> {bad} {json.dumps(body)[:200]}; valid -> {good}"
 
 
-# The server serves only current OpenAI APIs: the legacy Completions route is
-# not found, and members the specification deprecates are invalid requests.
-LEGACY_REFUSALS: list[tuple[str, dict, int]] = [
+# The legacy Completions route is not found, but the deprecated members
+# harnesses still send are honoured: `max_tokens` (Aider's cache warming,
+# opencode's AI SDK), legacy `functions` answered as `function_call`, and
+# Responses `user`.
+SAY_OK = [{"role": "user", "content": "Say OK."}]
+LEGACY_MEMBERS: list[tuple[str, dict, int]] = [
     ("/v1/completions", {"model": MODEL_ID, "prompt": "Say OK.", "max_tokens": 4}, 404),
-    ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say OK."}], "max_tokens": 4}, 400),
-    ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say OK."}],
-                              "functions": [{"name": "f", "parameters": {"type": "object"}}]}, 400),
-    ("/v1/responses", {**SIMPLE, "user": "u"}, 400),
+    ("/v1/chat/completions", {"messages": SAY_OK, "max_tokens": 4, "seed": 7, "user": "u",
+                              "reasoning_effort": "none"}, 200),
+    ("/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "What is the weather in Oslo? Use the function."}],
+        "functions": [{"name": "weather", "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
+        "function_call": {"name": "weather"}, "max_tokens": 64, "reasoning_effort": "none"}, 200),
+    ("/v1/responses", {**SIMPLE, "user": "u", "truncation": "disabled"}, 200),
 ]
 
 
-def legacy_apis_refused(ctx: Context, result: Result) -> None:
+def legacy_members(ctx: Context, result: Result) -> None:
     start = ctx.recorder.begin(result.name)
-    statuses = [post(ctx.proxy_port, path, body)[0] for path, body, _ in LEGACY_REFUSALS]
-    good, _, seconds = post(ctx.proxy_port, "/v1/responses", SIMPLE)
+    answers = [post(ctx.proxy_port, path, body) for path, body, _ in LEGACY_MEMBERS]
+    statuses = [status for status, _, _ in answers]
     exchanges = ctx.recorder.since(start)
     result.requests = len(exchanges)
-    result.seconds = seconds
-    result.protocol_ok = good == 200
-    result.task_ok = statuses == [expected for _, _, expected in LEGACY_REFUSALS]
+    result.seconds = sum(seconds for _, _, seconds in answers)
+    message = ((answers[2][1] or {}).get("choices") or [{}])[0] if isinstance(answers[2][1], dict) else {}
+    function_call = (message.get("message") or {}).get("function_call") or {}
+    result.protocol_ok = statuses[1:] == [200, 200, 200]
+    result.task_ok = (statuses == [expected for _, _, expected in LEGACY_MEMBERS]
+                      and function_call.get("name") == "weather"
+                      and message.get("finish_reason") == "function_call")
     result.passed = result.protocol_ok and result.task_ok
     result.detail = "; ".join(
-        f"{path} -> {status}" for (path, _, _), status in zip(LEGACY_REFUSALS, statuses, strict=True)
-    ) + f"; current -> {good}"
+        f"{path} -> {status}" for (path, _, _), status in zip(LEGACY_MEMBERS, statuses, strict=True)
+    ) + f"; function_call={json.dumps(function_call)[:120]}"
 
 
 # ---------------------------------------------------------------- registry
@@ -1064,7 +1236,7 @@ class Scenario:
 
 def scenarios() -> list[Scenario]:
     items: list[Scenario] = []
-    for client in ("omp", "codex"):
+    for client in ("omp", "codex", "opencode"):
         for kind, owner in (("fix", "protocol"), ("read", "protocol"), ("recover", "protocol")):
             items.append(Scenario(f"{client}-{kind}", client, "none", owner, client_scenario(kind, client, "none"), client))
         items.append(Scenario(f"{client}-fix-xhigh", client, "xhigh", "protocol", client_scenario("fix", client, "xhigh"), client))
@@ -1072,6 +1244,17 @@ def scenarios() -> list[Scenario]:
     items.append(Scenario(
         "codex-default-config", "codex", "none", "hosted-custom-tools",
         client_scenario("read", "codex", "none", compat=False), "codex"))
+    items.append(Scenario(
+        "codex-apply-patch", "codex", "none", "hosted-custom-tools",
+        client_scenario("fix", "codex", "none", variant="apply-patch"), "codex"))
+    items.append(Scenario(
+        "codex-compact", "codex", "none", "compaction",
+        client_scenario("fix", "codex", "none", variant="compact"), "codex"))
+    for kind, effort in (("fix", "none"), ("read", "none"), ("fix", "xhigh")):
+        name = f"opencode-responses-{kind}" + ("-xhigh" if effort == "xhigh" else "")
+        items.append(Scenario(
+            name, "opencode", effort, "protocol",
+            client_scenario(kind, "opencode", effort, variant="responses"), "opencode"))
     for name, (owner, body, path) in SHAPE_PROBES.items():
         items.append(Scenario(name, "http", "-", owner, shape_probe(owner, body, path)))
     items.append(Scenario("http-custom-tool-apply-patch", "http", "none", "hosted-custom-tools", custom_apply_patch))
@@ -1080,7 +1263,7 @@ def scenarios() -> list[Scenario]:
     items.append(Scenario("http-stream-disconnect", "http", "none", "protocol", stream_disconnect))
     items.append(Scenario("http-background-cancel", "http", "none", "background", background_cancel))
     items.append(Scenario("http-invalid-then-valid", "http", "none", "protocol", invalid_then_valid))
-    items.append(Scenario("http-legacy-apis-refused", "http", "-", "protocol", legacy_apis_refused))
+    items.append(Scenario("http-legacy-members", "http", "none", "protocol", legacy_members))
     return items
 
 
@@ -1103,6 +1286,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-serve", action="store_true", help="use a server already on --port")
     parser.add_argument("--codex-bin", default=shutil.which("codex"))
     parser.add_argument("--omp-bin", default=shutil.which("omp"))
+    parser.add_argument("--opencode-bin", default=shutil.which("opencode"))
     parser.add_argument("--scenarios", default="", help="comma-separated names or prefixes")
     parser.add_argument("--timeout", type=float, default=900.0, help="per client run, seconds")
     parser.add_argument("--out", type=Path)
@@ -1126,7 +1310,8 @@ def main(argv: list[str] | None = None) -> int:
     out = (args.out or ROOT / ".scratch/artifacts/client-compat" / time.strftime("run-%Y%m%dT%H%M%S")).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
-    versions = {"omp": tool_version(args.omp_bin), "codex": tool_version(args.codex_bin)}
+    versions = {"omp": tool_version(args.omp_bin), "codex": tool_version(args.codex_bin),
+                "opencode": tool_version(args.opencode_bin)}
     server = None
     if not args.no_serve:
         key = out / "reasoning.key"
@@ -1138,11 +1323,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         proxy_port = recorder.start()
         ctx = Context(
-            out, recorder, proxy_port, args.port, server, args.codex_bin, args.omp_bin, args.timeout,
-            args.codex_default_config)
+            out, recorder, proxy_port, args.port, server, args.codex_bin, args.omp_bin, args.opencode_bin,
+            args.timeout, args.codex_default_config)
         for scenario in chosen:
             result = Result(scenario.name, scenario.client, scenario.effort, scenario.owner)
-            binary = {"codex": args.codex_bin, "omp": args.omp_bin}.get(scenario.needs, "-")
+            binary = {"codex": args.codex_bin, "omp": args.omp_bin,
+                      "opencode": args.opencode_bin}.get(scenario.needs, "-")
             if not binary:
                 result.detail = f"skipped: {scenario.needs} not installed"
                 results.append(result)

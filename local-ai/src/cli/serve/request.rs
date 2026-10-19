@@ -12,9 +12,13 @@
 //! [`ToolChoice`], `parallel_tool_calls` and [`ToolDefinition::strict`],
 //! which the engine enforces with its tool grammar (see [`tool_policy`]).
 //!
-//! Only the current API is served: the parameters the `OpenAI` specification
-//! marks deprecated (see [`CHAT_DEPRECATED`]) fail with a 400 naming their
-//! replacement rather than being honoured or ignored.
+//! Members the `OpenAI` specification marks deprecated are honoured, because
+//! harnesses and older SDKs still send them: `max_tokens` is
+//! `max_completion_tokens`, `seed` seeds the sampler, `functions` and
+//! `function_call` are function `tools` and `tool_choice` (answered in their
+//! own legacy shape, see [`PreparedGeneration::functions`]), `session_id` is
+//! `prompt_cache_key`, and `user` and `prompt_cache_retention`, which change
+//! nothing here, are ignored like any other unknown member.
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -25,50 +29,6 @@ use local_engine::{
 };
 
 use crate::GenerateParams;
-
-/// Chat Completions request members the `OpenAI` specification marks
-/// deprecated, or this server's own superseded aliases, with what replaces
-/// each. Any of them set to a value other than `null` fails the request.
-pub(super) const CHAT_DEPRECATED: &[(&str, &str)] = &[
-    ("max_tokens", "use max_completion_tokens"),
-    (
-        "seed",
-        "Chat Completions deprecated it; this server samples with its fixed seed",
-    ),
-    ("user", "use prompt_cache_key (and safety_identifier)"),
-    ("functions", "use tools"),
-    ("function_call", "use tool_choice"),
-    ("prompt_cache_retention", "prompt caching is automatic here"),
-    ("session_id", "use prompt_cache_key"),
-];
-
-/// Fail when `body` sets any member of `deprecated` to a non-`null` value.
-///
-/// `body` that is not a JSON object is left to the request's own parser,
-/// which reports it with its usual message.
-pub(super) fn reject_deprecated(
-    body: &[u8],
-    deprecated: &[(&str, &str)],
-    api: &str,
-) -> crate::Result<()> {
-    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) else {
-        return Ok(());
-    };
-    match deprecated
-        .iter()
-        .find(|(field, _)| object.get(*field).is_some_and(|value| !value.is_null()))
-    {
-        Some((field, instead)) => Err(deprecated_field(field, instead, api)),
-        None => Ok(()),
-    }
-}
-
-/// The 400 for a deprecated request member.
-pub(super) fn deprecated_field(field: &str, instead: &str, api: &str) -> crate::Error {
-    crate::Error::InvalidArgument(format!(
-        "{field} is deprecated and not supported by this server's {api}: {instead}"
-    ))
-}
 
 #[derive(Deserialize)]
 struct GenerateRequest {
@@ -90,6 +50,24 @@ struct GenerateRequest {
     tool_choice: Option<Value>,
     parallel_tool_calls: Option<bool>,
     reasoning_effort: Option<String>,
+    /// Deprecated spelling of `max_completion_tokens`, which wins when both
+    /// are set.
+    max_tokens: Option<usize>,
+    /// Any JSON integer; a negative one is reinterpreted as its 64 bits.
+    seed: Option<serde_json::Number>,
+    /// Deprecated spelling of `tools` (functions only).
+    functions: Option<Vec<ChatFunction>>,
+    /// Deprecated spelling of `tool_choice`: `"none"`, `"auto"` or
+    /// `{"name"}`.
+    function_call: Option<Value>,
+    /// This server's former spelling of `prompt_cache_key`.
+    session_id: Option<String>,
+    /// vLLM's and llama.cpp's multiplicative penalty, used as given; it
+    /// replaces the one `frequency_penalty` maps to.
+    repetition_penalty: Option<f32>,
+    /// vLLM's and llama.cpp's template switches; `enable_thinking` turns
+    /// reasoning off (`false`) or leaves it to `reasoning_effort` (`true`).
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     // Options this server cannot honour. They are named so a request that
     // sets one fails instead of being answered as if it had not.
     n: Option<u64>,
@@ -108,6 +86,11 @@ struct GenerateRequest {
 }
 
 #[derive(Deserialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct StreamOptions {
     #[serde(default)]
     include_usage: Option<bool>,
@@ -117,16 +100,24 @@ impl GenerateRequest {
     fn params(&self) -> GenerateParams {
         let defaults = GenerateParams::default();
         GenerateParams {
-            max_tokens: self.max_completion_tokens.unwrap_or(defaults.max_tokens),
+            max_tokens: self
+                .max_completion_tokens
+                .or(self.max_tokens)
+                .unwrap_or(defaults.max_tokens),
             temperature: self.temperature.unwrap_or(defaults.temperature),
             top_p: self.top_p.unwrap_or(defaults.top_p),
             top_k: self.top_k.unwrap_or(defaults.top_k),
             min_p: self.min_p.unwrap_or(defaults.min_p),
             presence_penalty: self.presence_penalty.unwrap_or(defaults.presence_penalty),
-            repetition_penalty: self
-                .frequency_penalty
-                .map_or(defaults.repetition_penalty, |value| 1.0 + value.max(0.0)),
-            seed: defaults.seed,
+            repetition_penalty: repetition_penalty(self.repetition_penalty, self.frequency_penalty),
+            seed: self
+                .seed
+                .as_ref()
+                .and_then(|seed| {
+                    seed.as_u64()
+                        .or_else(|| seed.as_i64().map(i64::cast_unsigned))
+                })
+                .unwrap_or(defaults.seed),
         }
     }
 
@@ -137,6 +128,15 @@ impl GenerateRequest {
                 "{name} is not supported: {why}"
             )))
         };
+        if self
+            .seed
+            .as_ref()
+            .is_some_and(|seed| seed.as_u64().is_none() && seed.as_i64().is_none())
+        {
+            return Err(crate::Error::InvalidArgument(
+                "seed must be an integer".into(),
+            ));
+        }
         if self.n.is_some_and(|n| n != 1) {
             return unsupported("n", "this server generates exactly one choice");
         }
@@ -192,6 +192,15 @@ impl GenerateRequest {
     }
 }
 
+/// The sampler's multiplicative repetition penalty: vLLM's
+/// `repetition_penalty` as given, else `OpenAI`'s additive
+/// `frequency_penalty` as `1 + max(value, 0)`, else none.
+pub(super) fn repetition_penalty(repetition: Option<f32>, frequency: Option<f32>) -> f32 {
+    repetition
+        .or_else(|| frequency.map(|value| 1.0 + value.max(0.0)))
+        .unwrap_or_else(|| GenerateParams::default().repetition_penalty)
+}
+
 fn is_empty(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -223,7 +232,7 @@ struct Message {
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ChatToolCall>>,
     tool_call_id: Option<String>,
-    /// Deprecated in favour of `tool_calls`; any value but `null` fails.
+    /// Deprecated spelling of a single `tool_calls` entry: `{"name","arguments"}`.
     function_call: Option<Value>,
 }
 
@@ -260,6 +269,10 @@ pub(super) struct PreparedGeneration {
     pub(super) stream: bool,
     /// `stream_options.include_usage`.
     pub(super) include_usage: bool,
+    /// The request declared deprecated `functions`, so its call is answered
+    /// as `message.function_call` with finish reason `function_call`, the
+    /// shape such a client reads.
+    pub(super) functions: bool,
     pub(super) request: ChatRequest,
 }
 
@@ -276,7 +289,6 @@ pub(super) fn prepare_generation_with(
     thinking: bool,
     files: Option<&local_services::Store>,
 ) -> crate::Result<PreparedGeneration> {
-    reject_deprecated(body, CHAT_DEPRECATED, "Chat Completions")?;
     let request: GenerateRequest = serde_json::from_slice(body)
         .map_err(|error| crate::Error::InvalidArgument(format!("invalid JSON request: {error}")))?;
     let params = request.params();
@@ -292,24 +304,74 @@ pub(super) fn prepare_generation_with(
         .messages
         .as_deref()
         .ok_or_else(|| crate::Error::InvalidArgument("messages are required".into()))?;
+    // The ID of the last deprecated assistant `function_call`, which the
+    // `function` message after it answers.
+    let mut pending = None;
     let messages = messages
         .iter()
-        .map(|message| chat_message(message, files))
+        .enumerate()
+        .map(|(index, message)| chat_message(message, index, &mut pending, files))
         .collect::<crate::Result<Vec<_>>>()?;
-    let tools = request
-        .tools
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(chat_tool)
-        .collect::<crate::Result<Vec<_>>>()?;
-    let tool_choice = chat_tool_choice(request.tool_choice.as_ref())?;
+    let functions = request.functions.is_some();
+    let (tools, tool_choice) = match (&request.functions, &request.tools) {
+        (Some(_), Some(_)) => {
+            return Err(crate::Error::InvalidArgument(
+                "use tools or the deprecated functions, not both".into(),
+            ));
+        }
+        (Some(functions), None) => {
+            if request.tool_choice.is_some() {
+                return Err(crate::Error::InvalidArgument(
+                    "the deprecated functions take function_call, not tool_choice".into(),
+                ));
+            }
+            let tools = functions
+                .iter()
+                .map(|function| {
+                    function_definition(
+                        function.name.clone(),
+                        function.description.clone(),
+                        function.parameters.clone(),
+                        function.strict,
+                    )
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            (tools, function_call_choice(request.function_call.as_ref())?)
+        }
+        (None, tools) => {
+            if request
+                .function_call
+                .as_ref()
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(crate::Error::InvalidArgument(
+                    "function_call selects one of the deprecated functions; with tools use \
+                     tool_choice"
+                        .into(),
+                ));
+            }
+            let tools = tools
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(chat_tool)
+                .collect::<crate::Result<Vec<_>>>()?;
+            (tools, chat_tool_choice(request.tool_choice.as_ref())?)
+        }
+    };
     tool_policy(&tools, &tool_choice)?;
     let response_format = chat_response_format(request.response_format.as_ref())?;
-    let reasoning = effective_reasoning(request.reasoning_effort.as_deref(), thinking)?;
+    let effort = match &request.chat_template_kwargs {
+        Some(ChatTemplateKwargs {
+            enable_thinking: Some(false),
+        }) => Some("none"),
+        _ => request.reasoning_effort.as_deref(),
+    };
+    let reasoning = effective_reasoning(effort, thinking)?;
     Ok(PreparedGeneration {
         stream,
         include_usage: stream && include_usage,
+        functions,
         request: ChatRequest {
             messages,
             max_tokens: params.max_tokens,
@@ -317,13 +379,31 @@ pub(super) fn prepare_generation_with(
             thinking: reasoning.is_some(),
             effort: reasoning.unwrap_or_default(),
             preserve_thinking: true,
-            session: request.prompt_cache_key,
+            session: request.prompt_cache_key.or(request.session_id),
             tools,
             tool_choice,
-            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+            // A deprecated function call is always the only one.
+            parallel_tool_calls: !functions && request.parallel_tool_calls.unwrap_or(true),
             response_format,
         },
     })
+}
+
+/// The deprecated `function_call`: absent, `null` or `"auto"` is `auto`,
+/// `"none"` is none, and `{"name":"NAME"}` names the function to call.
+fn function_call_choice(choice: Option<&Value>) -> crate::Result<ToolChoice> {
+    match choice {
+        None | Some(Value::Null) => Ok(ToolChoice::Auto),
+        Some(Value::String(mode)) if mode == "auto" => Ok(ToolChoice::Auto),
+        Some(Value::String(mode)) if mode == "none" => Ok(ToolChoice::None),
+        Some(Value::Object(object)) => {
+            only_members(object, &["name"], "function_call")?;
+            Ok(ToolChoice::Function(choice_name(object, "function_call")?))
+        }
+        Some(other) => Err(crate::Error::InvalidArgument(format!(
+            "invalid function_call {other}; expected \"auto\", \"none\" or {{\"name\":...}}"
+        ))),
+    }
 }
 
 /// Chat's `response_format`: absent or `null` is text; otherwise exactly
@@ -806,17 +886,22 @@ fn chat_tool(tool: &ChatTool) -> crate::Result<ToolDefinition> {
     )
 }
 
+/// One history message. `index` names the call a deprecated assistant
+/// `function_call` becomes, which `pending` keeps for the deprecated
+/// `function` message answering it.
 fn chat_message(
     message: &Message,
+    index: usize,
+    pending: &mut Option<String>,
     files: Option<&local_services::Store>,
 ) -> crate::Result<ChatMessage> {
-    let nullable = matches!(message.role.as_str(), "assistant" | "tool");
+    let nullable = matches!(message.role.as_str(), "assistant" | "tool" | "function");
     let parts = if nullable && message.content.is_null() {
         super::images::Parts::default()
     } else {
         message_parts(&message.content, files)?
     };
-    let tool_calls = message
+    let mut tool_calls = message
         .tool_calls
         .as_deref()
         .unwrap_or_default()
@@ -835,38 +920,48 @@ fn chat_message(
             )
         })
         .collect::<crate::Result<Vec<_>>>()?;
+    if let Some(call) = message
+        .function_call
+        .as_ref()
+        .filter(|call| !call.is_null())
+    {
+        let call: ChatFunctionCall = serde_json::from_value(call.clone()).map_err(|error| {
+            crate::Error::InvalidArgument(format!(
+                "messages[{index}].function_call must be {{\"name\",\"arguments\"}}: {error}"
+            ))
+        })?;
+        let id = format!("call_function_{index}");
+        tool_calls.push(tool_call(id.clone(), call.name, &call.arguments)?);
+        *pending = Some(id);
+    }
     if !tool_calls.is_empty() && message.role != "assistant" {
         return Err(crate::Error::InvalidArgument(
             "only assistant messages can carry tool_calls".into(),
         ));
     }
-    if message.role == "tool" && message.tool_call_id.is_none() {
+    let (role, tool_call_id) = if message.role == "function" {
+        // A deprecated `function` message is the result of the assistant's
+        // last `function_call`: the tool message answering that call.
+        let id = pending.take().ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "messages[{index}] has the function role but answers no assistant function_call"
+            ))
+        })?;
+        ("tool".to_owned(), Some(id))
+    } else {
+        (message.role.clone(), message.tool_call_id.clone())
+    };
+    if role == "tool" && tool_call_id.is_none() {
         return Err(crate::Error::InvalidArgument(
             "a tool message requires tool_call_id".into(),
         ));
     }
-    if message.role == "function" {
-        return Err(crate::Error::InvalidArgument(
-            "the deprecated function role is not supported; use tool messages".into(),
-        ));
-    }
-    if message
-        .function_call
-        .as_ref()
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(deprecated_field(
-            "messages[].function_call",
-            "use tool_calls",
-            "Chat Completions",
-        ));
-    }
     Ok(ChatMessage {
-        role: message.role.clone(),
+        role,
         content: parts.text,
         reasoning_content: message.reasoning_content.clone(),
         tool_calls,
-        tool_call_id: message.tool_call_id.clone(),
+        tool_call_id,
         images: parts.images,
     })
 }

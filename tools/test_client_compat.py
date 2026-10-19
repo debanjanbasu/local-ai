@@ -57,6 +57,21 @@ class ParsingTest(unittest.TestCase):
         body = {"input": [{"type": "message"}, {"type": "function_call_output", "call_id": "c", "output": "x"}]}
         self.assertEqual(len(cc.function_outputs(body)), 1)
         self.assertEqual(cc.function_outputs("text"), [])
+        chat = {"messages": [{"role": "user", "content": "q"}, {"role": "tool", "content": "ENOENT"}]}
+        self.assertEqual(cc.function_outputs(chat), [{"output": "ENOENT"}])
+
+    def test_chat_answers_and_side_requests(self):
+        chunks = [{"choices": [{"delta": {"content": "4"}}]}, {"choices": [{"delta": {"content": "2"}}]},
+                  {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 2}}]
+        streamed = {"path": "/v1/chat/completions", "request_body": {"tools": [{}]},
+                    "response_body": "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"}
+        title = {"path": "/v1/chat/completions", "request_body": {"messages": []},
+                 "response_body": {"choices": [{"message": {"content": "Title"}}]}}
+        # The tool-less title request finishing last is not the agent's answer.
+        self.assertEqual(cc.final_answer([streamed, title]), "42")
+        result = cc.Result("x", "opencode", "none", "protocol")
+        cc.summarize_exchanges(result, [{**streamed, "status": 200}])
+        self.assertEqual((result.input_tokens, result.output_tokens), (9, 2))
 
 
 class ConfigTest(unittest.TestCase):
@@ -83,7 +98,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_default_config_flag_drops_the_compat_config(self):
         with tempfile.TemporaryDirectory() as scratch:
-            ctx = cc.Context(Path(scratch), None, 1, 2, None, "codex", None, 60, codex_default=True)
+            ctx = cc.Context(Path(scratch), None, 1, 2, None, "codex", None, None, 60, codex_default=True)
             _, base, env = cc.prepare_client(ctx, "codex", "codex-read", "none")
             config = tomllib.loads((Path(env["CODEX_HOME"]) / "config.toml").read_text())
             self.assertNotIn("features", config)
@@ -91,12 +106,38 @@ class ConfigTest(unittest.TestCase):
             self.assertTrue(str(base).startswith(scratch))
 
     def test_omp_runs_in_write_jail(self):
-        ctx = cc.Context(Path("/s"), None, 1, 2, None, None, "omp", 60)
+        ctx = cc.Context(Path("/s"), None, 1, 2, None, None, "omp", "opencode", 60)
         command = cc.client_command(ctx, "omp", "hi", "none", Path("/scratch/base/repo"))
         self.assertEqual(command[0], "/usr/bin/sandbox-exec")
         self.assertIn('(deny file-write*)', command[2])
         self.assertIn('(subpath "/scratch/base")', command[2])
         self.assertEqual(command[3:5], ["omp", "-p"])
+
+    def test_opencode_config_and_jail(self):
+        chat = json.loads(cc.opencode_config(4321, responses=False, effort="none"))
+        provider = chat["provider"]["local-ai"]
+        self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
+        self.assertEqual(provider["options"]["baseURL"], "http://127.0.0.1:4321/v1")
+        self.assertEqual(provider["models"][cc.MODEL_ID]["options"]["reasoningEffort"], "none")
+        responses = json.loads(cc.opencode_config(4321, responses=True, effort="xhigh"))
+        self.assertEqual(responses["provider"]["local-ai"]["npm"], "@ai-sdk/openai")
+        ctx = cc.Context(Path("/s"), None, 1, 2, None, None, None, "opencode", 60)
+        command = cc.client_command(ctx, "opencode", "hi", "none", Path("/scratch/base/repo"), resume=True)
+        self.assertEqual(command[0], "/usr/bin/sandbox-exec")
+        self.assertEqual(command[3:5], ["opencode", "run"])
+        self.assertIn("--continue", command)
+
+    def test_codex_catalog_variant(self):
+        bundled = {"models": [{"slug": "gpt-x", "apply_patch_tool_type": "freeform", "base_instructions": "b"}]}
+        done = mock.Mock(stdout=json.dumps(bundled))
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(cc.subprocess, "run", return_value=done):
+            ctx = cc.Context(Path(scratch), None, 1, 2, None, "codex", None, None, 60)
+            _, _, env = cc.prepare_client(ctx, "codex", "codex-apply-patch", "none", variant="apply-patch")
+            config = tomllib.loads((Path(env["CODEX_HOME"]) / "config.toml").read_text())
+            catalog = json.loads(Path(config["model_catalog_json"]).read_text())
+            self.assertEqual(catalog["models"][0]["slug"], cc.MODEL_ID)
+            self.assertEqual(catalog["models"][0]["apply_patch_tool_type"], "freeform")
+            self.assertEqual(catalog["models"][0]["base_instructions"], "b")
 
     def test_omp_models(self):
         text = cc.omp_models_yml(1234)

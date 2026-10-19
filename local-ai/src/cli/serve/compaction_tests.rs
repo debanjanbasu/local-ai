@@ -530,10 +530,6 @@ fn compaction_needs_the_key_and_an_authentic_sealed_item() {
             json!({"input":"hi","previous_response_id":"resp_1"}),
             "--response-store",
         ),
-        (
-            json!({"input":"hi","prompt_cache_retention":"24h"}),
-            "prompt_cache_retention is deprecated",
-        ),
     ] {
         let message = prepare_compact(body.to_string().as_bytes(), None, Some(&cipher), "m")
             .err()
@@ -928,17 +924,11 @@ fn summary_failure_fails_and_cancellation_skips_the_summary() {
 fn reasoning_summary_options_are_validated() {
     let body = |reasoning: Value| json!({"input":"hi","reasoning":reasoning});
     assert!(error(&body(json!({"summary":"verbose"})), None).contains("auto, concise or detailed"));
-    // `generate_summary` is deprecated: refused even when it agrees.
-    for reasoning in [
-        json!({"summary":"auto","generate_summary":"detailed"}),
-        json!({"generate_summary":"concise"}),
-    ] {
-        let message = error(&body(reasoning), None);
-        assert!(
-            message.contains("reasoning.generate_summary is deprecated"),
-            "{message}"
-        );
-    }
+    // The deprecated `generate_summary` is validated as `summary` is.
+    assert!(
+        error(&body(json!({"generate_summary":"verbose"})), None)
+            .contains("auto, concise or detailed")
+    );
     let background = json!({"input":"hi","background":true,"reasoning":{"summary":"auto"}});
     let message = error(&background, None);
     assert!(!message.contains("reasoning.summary"), "{message}");

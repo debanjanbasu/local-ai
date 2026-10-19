@@ -103,31 +103,12 @@ use super::background::Temporary;
 use super::hosted::{Hosted, Kind};
 use super::reasoning_crypto::ReasoningCipher;
 use super::request::{
-    deprecated_field, effective_reasoning, function_definition, reject_deprecated,
-    responses_text_format, responses_tool_choice, service_tier, tool_call, tool_policy,
+    effective_reasoning, function_definition, repetition_penalty, responses_text_format,
+    responses_tool_choice, service_tier, tool_call, tool_policy,
 };
 use super::response::{Reply, arguments_text, new_id, unix_now};
 use super::store::{ResponseStore, StoredResponse};
 use crate::GenerateParams;
-
-/// Responses request members the `OpenAI` specification marks deprecated,
-/// or this server's own superseded aliases, with what replaces each. One
-/// fails the request (so does the deprecated `reasoning.generate_summary`),
-/// naming its replacement; a `null` one fails too, as the unknown member it
-/// is to this strict parser. `input_tokens` counts refuse them alike.
-pub(super) const RESPONSES_DEPRECATED: &[(&str, &str)] = &[
-    ("user", "use prompt_cache_key (and safety_identifier)"),
-    (
-        "truncation",
-        "the engine never drops input; an over-long request fails instead",
-    ),
-    ("prompt_cache_retention", "prompt caching is automatic here"),
-    ("session_id", "use prompt_cache_key"),
-];
-
-/// `POST /v1/responses/compact` members the specification marks deprecated.
-const COMPACT_DEPRECATED: &[(&str, &str)] =
-    &[("prompt_cache_retention", "prompt caching is automatic here")];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +153,19 @@ struct ResponsesRequest {
     top_k: Option<usize>,
     min_p: Option<f32>,
     seed: Option<u64>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
+    // Deprecated members, accepted because clients still send them:
+    // `user` and `prompt_cache_retention` change nothing here, `session_id`
+    // (this server's former spelling) is `prompt_cache_key`, and
+    // `truncation` is checked by `reject_unsupported`.
+    #[allow(dead_code)]
+    user: Option<String>,
+    #[allow(dead_code)]
+    prompt_cache_retention: Option<Value>,
+    session_id: Option<String>,
+    truncation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +173,8 @@ struct ResponsesRequest {
 struct Reasoning {
     effort: Option<String>,
     summary: Option<String>,
+    /// The deprecated spelling of `summary`, used when `summary` is absent.
+    generate_summary: Option<String>,
     context: Option<String>,
     mode: Option<String>,
 }
@@ -478,6 +474,12 @@ impl ResponsesRequest {
         encrypted: bool,
         conversations: bool,
     ) -> crate::Result<()> {
+        if !matches!(self.truncation.as_deref(), None | Some("disabled" | "auto")) {
+            return Err(invalid(
+                "truncation must be \"auto\" or \"disabled\"; either way the engine never drops \
+                 input, and a request over the context fails instead",
+            ));
+        }
         if !stored && self.store == Some(true) {
             return Err(unsupported(
                 "store=true",
@@ -584,7 +586,8 @@ impl ResponsesRequest {
             top_k: self.top_k.unwrap_or(defaults.top_k),
             min_p: self.min_p.unwrap_or(defaults.min_p),
             seed: self.seed.unwrap_or(defaults.seed),
-            ..defaults
+            presence_penalty: self.presence_penalty.unwrap_or(defaults.presence_penalty),
+            repetition_penalty: repetition_penalty(self.repetition_penalty, self.frequency_penalty),
         }
     }
 }
@@ -595,7 +598,11 @@ fn summary_detail(reasoning: Option<&Reasoning>) -> crate::Result<Option<Summary
     let Some(reasoning) = reasoning else {
         return Ok(None);
     };
-    let Some(name) = &reasoning.summary else {
+    let Some(name) = reasoning
+        .summary
+        .as_ref()
+        .or(reasoning.generate_summary.as_ref())
+    else {
         return Ok(None);
     };
     SummaryDetail::parse(name).map(Some).ok_or_else(|| {
@@ -714,7 +721,6 @@ pub(super) fn prepare_input_tokens_conversing(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<ChatRequest> {
-    reject_deprecated(body, RESPONSES_DEPRECATED, "Responses API")?;
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
     let object = value
@@ -726,6 +732,7 @@ pub(super) fn prepare_input_tokens_conversing(
             "model"
                 | "input"
                 | "previous_response_id"
+                | "truncation"
                 | "tools"
                 | "text"
                 | "reasoning"
@@ -794,18 +801,6 @@ pub(super) fn prepare_responses_conversing(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedResponses> {
-    reject_deprecated(body, RESPONSES_DEPRECATED, "Responses API")?;
-    if let Ok(value) = serde_json::from_slice::<Value>(body)
-        && value
-            .pointer("/reasoning/generate_summary")
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err(deprecated_field(
-            "reasoning.generate_summary",
-            "use reasoning.summary",
-            "Responses API",
-        ));
-    }
     let request: ResponsesRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
     super::models::check_generation(request.model.as_deref())?;
@@ -915,7 +910,10 @@ pub(super) fn prepare_responses_conversing(
         } else {
             "current_turn"
         },
-        prompt_cache_key: request.prompt_cache_key.clone(),
+        prompt_cache_key: request
+            .prompt_cache_key
+            .clone()
+            .or_else(|| request.session_id.clone()),
         safety_identifier: request.safety_identifier.clone(),
         previous_response_id: request.previous_response_id.clone(),
         // Reasoning is sealed only on request, as `OpenAI` does: a key on
@@ -947,7 +945,7 @@ pub(super) fn prepare_responses_conversing(
             thinking,
             effort: reasoning.unwrap_or_default(),
             preserve_thinking,
-            session: request.prompt_cache_key,
+            session: request.prompt_cache_key.or(request.session_id),
             tools,
             tool_choice: choice,
             parallel_tool_calls,
@@ -1187,6 +1185,9 @@ struct CompactRequest {
     prompt_cache_key: Option<String>,
     prompt_cache_options: Option<Value>,
     service_tier: Option<String>,
+    /// Deprecated, and nothing to set here: prompt caching is automatic.
+    #[allow(dead_code)]
+    prompt_cache_retention: Option<Value>,
 }
 
 /// A parsed `POST /v1/responses/compact`.
@@ -1206,7 +1207,6 @@ pub(super) fn prepare_compact(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedCompact> {
-    reject_deprecated(body, COMPACT_DEPRECATED, "Responses compaction")?;
     let request: CompactRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
     super::models::check_generation_value(request.model.as_ref())?;
@@ -1339,15 +1339,6 @@ pub(super) fn prepare_resumed(
         ));
     }
     object.remove("previous_response_id");
-    // A request stored before deprecated members were refused is resumed as
-    // it was answered: without them, since none changed what was generated
-    // beyond the cache hint they shared with `prompt_cache_key`.
-    for (field, _) in RESPONSES_DEPRECATED {
-        object.remove(*field);
-    }
-    if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
-        reasoning.remove("generate_summary");
-    }
     object.insert("input".into(), Value::Array(stored.input_items.clone()));
     let effort = response
         .pointer("/reasoning/effort")

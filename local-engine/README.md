@@ -474,8 +474,9 @@ show what each flag changes:
 Oh My Pi already sends `store: false`, resends earlier turns in `input`, puts
 the system prompt in `instructions`, and leaves out the `developer` role and
 `stream_options` for non-OpenAI hosts. With `input: [text]`, images in tool
-results become text placeholders. Presence or repetition penalties configured
-in Oh My Pi are unknown fields to this Responses endpoint and fail the request.
+results become text placeholders. Presence and repetition penalties, `top_k`
+and `min_p` configured in Oh My Pi are honoured (it sends no frequency
+penalty to a Responses endpoint).
 For a server started with `--no-thinking`, set `reasoning: false` and remove
 `thinking`; Oh My Pi then sends no reasoning field.
 
