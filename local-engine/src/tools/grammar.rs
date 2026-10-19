@@ -163,6 +163,58 @@ pub fn needs_grammar(
         && (*choice != ToolChoice::Auto || !parallel || tools.any_strict() || !format_is_text)
 }
 
+/// The indices of the tools `choice` lets the model call.
+fn callable(tools: &ToolSet, choice: &ToolChoice) -> Result<Vec<usize>, String> {
+    let position = |name: &String| {
+        tools
+            .tools
+            .iter()
+            .position(|tool| tool.definition.name == *name)
+            .ok_or_else(|| format!("tool_choice names unknown tool {name:?}"))
+    };
+    match choice {
+        ToolChoice::Function(name) => Ok(vec![position(name)?]),
+        ToolChoice::Allowed { tools: allowed, .. } if allowed.is_empty() => {
+            Err("allowed_tools needs at least one tool".into())
+        }
+        ToolChoice::Allowed { tools: allowed, .. } => allowed.iter().map(position).collect(),
+        _ => Ok((0..tools.tools.len()).collect()),
+    }
+}
+
+/// The grammar's start rule under `choice`, with a structured final answer
+/// or not, and `more` calls after the first.
+fn start_rule(choice: &ToolChoice, final_answer: bool, more: &str) -> String {
+    match (choice, final_answer) {
+        (ToolChoice::None, false) => "TEXT".to_owned(),
+        (ToolChoice::None, true) => "LEAD? @final".to_owned(),
+        (
+            ToolChoice::Auto
+            | ToolChoice::Allowed {
+                required: false, ..
+            },
+            false,
+        ) => {
+            format!("TEXT | pre call {more}")
+        }
+        (
+            ToolChoice::Auto
+            | ToolChoice::Allowed {
+                required: false, ..
+            },
+            true,
+        ) => {
+            format!("LEAD? @final | LEAD? open call {more}")
+        }
+        (
+            ToolChoice::Required
+            | ToolChoice::Function(_)
+            | ToolChoice::Allowed { required: true, .. },
+            _,
+        ) => format!("LEAD? open call {more}"),
+    }
+}
+
 /// Build the grammar for `tools` under `choice`, `parallel` and an optional
 /// final-answer `format` schema.
 pub fn build(
@@ -172,16 +224,7 @@ pub fn build(
     format: Option<Value>,
     tags: CallTags,
 ) -> Result<ToolGrammar, String> {
-    let callable: Vec<usize> = match choice {
-        ToolChoice::Function(name) => vec![
-            tools
-                .tools
-                .iter()
-                .position(|tool| tool.definition.name == *name)
-                .ok_or_else(|| format!("tool_choice names unknown tool {name:?}"))?,
-        ],
-        _ => (0..tools.tools.len()).collect(),
-    };
+    let callable = callable(tools, choice)?;
     let mut lark = String::from("%llguidance {}\n");
     let mut grammars = Vec::new();
     let mut parameters = Vec::new();
@@ -200,14 +243,11 @@ pub fn build(
             lark_grammar: None,
         });
     }
-    let call_required = matches!(choice, ToolChoice::Required | ToolChoice::Function(_));
-    let start = match (choice, final_answer) {
-        (ToolChoice::None, false) => "TEXT".to_owned(),
-        (ToolChoice::None, true) => "LEAD? @final".to_owned(),
-        (ToolChoice::Auto, false) => format!("TEXT | pre call {more}"),
-        (ToolChoice::Auto, true) => format!("LEAD? @final | LEAD? open call {more}"),
-        (ToolChoice::Required | ToolChoice::Function(_), _) => format!("LEAD? open call {more}"),
-    };
+    let call_required = matches!(
+        choice,
+        ToolChoice::Required | ToolChoice::Function(_) | ToolChoice::Allowed { required: true, .. }
+    );
+    let start = start_rule(choice, final_answer, more);
     let _ = writeln!(lark, "start: {start}");
     let pre = tags.open.map_or_else(
         || "hd".to_owned(),

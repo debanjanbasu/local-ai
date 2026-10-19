@@ -49,10 +49,12 @@ long a generation may go undelivered before it is cancelled and the engine
 released; the budgets, measurements and limits are in
 [docs/BONSAI.md](docs/BONSAI.md#server-api).
 
-Response objects are stateless and are not stored by default (the separate
-native services store is described below).
-`--response-store DIR` opts in to keeping them (owner-only, unencrypted files)
-for `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
+Responses are stored by default, as on OpenAI, in
+`~/Library/Application Support/local-ai/responses` (owner-only, unencrypted
+files; settled responses older than 30 days are removed at startup).
+`--response-store DIR` keeps them in DIR instead, until deleted, and
+`--no-response-store` keeps none. The store serves
+`GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
 `previous_response_id`, which carries over conversation items but not
 `instructions`, tools or sampling settings. `background: true` requests are
 written before they are acknowledged: without `stream` the `POST` returns the
@@ -61,7 +63,7 @@ streams journaled events that
 `GET /v1/responses/{id}?stream=true&starting_after=N` resumes after any
 sequence number. A disconnected or stalled stream does not cancel the job;
 `POST /v1/responses/{id}/cancel` does. With `store: true` (the default once a
-store exists) the job lives in `--response-store`, and its record and event
+store exists) the job lives in the response store, and its record and event
 journal survive a restart. A job interrupted by a crash or `kill -9` is
 resumed when a server next opens the store: generation restarts from the
 stored request, and a streamed job's journal continues after a restart
@@ -97,15 +99,16 @@ has no confidence or refusal, carries only the calibration evaluated for that
 artifact's scope (the legacy devtools-v1 head: two-option Yes/No code-diff
 questions; the development-only hard-v1 heads: see
 [their results](local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)),
-and is not the OpenAI Decisions API. `POST /v1/decisions` is served only with
-`--decisions-artifact DIR`: a head, gate and calibration artifact that passed
+and is not the OpenAI Decisions API. `POST /v1/decisions` is served whenever
+a decisions artifact is installed as `models/decisions-v2` (or named with
+`--decisions-artifact DIR`): a head, gate and calibration artifact that passed
 the [pre-registered confidence and refusal evaluation](docs/DECISIONS_EVALUATION.md)
 (part 3), verified by hash at startup. Its scope is narrow: CommitPackFT-style
 "does this commit message describe this diff?" predicates over a rendered diff
 are answered with a calibrated probability; CodeReviewer "needs a reviewer
 comment?" is always refused (no threshold met the target risk); every other
-question is answered `refusal`. Without the flag the route is a 404 with an
-explanation.
+question is answered `refusal`. Without an artifact the route is a 404 with
+an explanation.
 
 The server also always opens a durable native services store at
 `~/Library/Application Support/local-ai/services` (owner-only SQLite plus file
@@ -134,14 +137,15 @@ stored only as salted HMAC-SHA-256 tags in the services store. Users,
 invites, rate limits, certificates, roles and spend controls are refused or
 minimal; see [docs/ADMIN.md](docs/ADMIN.md).
 
-`--reasoning-key FILE` adds
-AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
+An owner-only reasoning key, created on first start as
+`~/Library/Application Support/local-ai/reasoning.key` (or `--reasoning-key
+FILE`), adds AES-256-GCM `reasoning.encrypted_content` for stateless replay; the raw
 reasoning is still returned and, with a store, still written, so it is neither
 encryption at rest nor hidden reasoning. The same key seals the `compaction`
 items of `POST /v1/responses/compact` and of Responses `context_management`
 compaction, which summarize older items with the same Bonsai model and keep
-the rest verbatim (never splitting a tool call from its result); without a key
-both are refused. `reasoning.summary` adds a short second generation that
+the rest verbatim (never splitting a tool call from its result).
+`reasoning.summary` adds a short second generation that
 summarizes the raw reasoning, which itself stays `reasoning_text`. Both work
 with `background` and cost extra inference (counted in `usage`), and a
 summary loses detail; see
@@ -159,7 +163,9 @@ and `futures-core` supplies the `Stream` implementation. `Engine` is `Send` but
 not `Sync`; `EngineHandle` provides a cloneable `Send + Sync` worker handle.
 
 ```rust,no_run
-use local_engine::{ChatMessage, ChatRequest, Engine, Event, ResponseFormat, Sampling, ToolChoice};
+use local_engine::{
+    ChatMessage, ChatRequest, Engine, Event, ReasoningEffort, ResponseFormat, Sampling, ToolChoice,
+};
 use std::ops::ControlFlow;
 
 let mut engine = Engine::open()?;
@@ -170,6 +176,8 @@ let request = ChatRequest {
     max_tokens: 128,
     sampling: Sampling::default(),
     thinking: true,
+    effort: ReasoningEffort::default(),
+    preserve_thinking: true,
     session: None,
     tools: vec![],
     tool_choice: ToolChoice::Auto,

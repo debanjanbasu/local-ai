@@ -1,4 +1,5 @@
-//! The opt-in Responses store behind `--response-store DIR`.
+//! The Responses store: by default in the user's data directory, pruned of
+//! responses older than 30 days at startup, or `--response-store DIR`.
 //!
 //! One JSON file per stored Response, named by its ID. Each record holds the
 //! final Response object and the *resolved* input it was generated from: the
@@ -228,6 +229,34 @@ impl ResponseStore {
             }
         }
         Ok(())
+    }
+
+    /// Delete every settled response created more than `retention` ago,
+    /// with its journal and marker, and return how many went. Pending
+    /// background responses are kept whatever their age, and records that
+    /// cannot be read are left for `load` to report.
+    pub(super) fn prune(&self, retention: std::time::Duration) -> std::io::Result<usize> {
+        let cutoff = super::response::unix_now().saturating_sub(retention.as_secs());
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.dir)? {
+            let name = entry?.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            if valid_id(id)
+                && let Ok(Some(stored)) = self.load(id)
+                && !super::background::pending(&stored.response)
+                && stored
+                    .response
+                    .get("created_at")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|created| created < cutoff)
+                && self.delete(id)?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// The IDs of every background response still `queued` or `in_progress`

@@ -164,6 +164,16 @@ pub(super) struct Services {
     downloads: Arc<Semaphore>,
 }
 
+/// This server's directory in the user's macOS application data, where the
+/// services store, the default response store and the default reasoning key
+/// live.
+pub(super) fn data_dir() -> crate::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join("Library/Application Support/local-ai"))
+        .ok_or_else(|| crate::Error::InvalidArgument("HOME must name the user's directory".into()))
+}
+
 impl Services {
     pub(super) const fn store(&self) -> &Store {
         &self.store
@@ -171,13 +181,7 @@ impl Services {
 
     /// Use the native macOS application-data location without backend configuration.
     pub(super) fn open_default() -> crate::Result<Arc<Self>> {
-        let path = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                crate::Error::InvalidArgument("HOME must name the user's directory".into())
-            })?
-            .join("Library/Application Support/local-ai/services");
+        let path = data_dir()?.join("services");
         Self::open(&path).map(Arc::new).map_err(|error| {
             crate::Error::InvalidArgument(format!(
                 "cannot open native services at {}: {error}",

@@ -370,9 +370,12 @@ pub(super) fn absorb(body: &mut Body, signal: Signal) -> Flow {
             body.reasoning(&piece);
             due(body)
         }
-        // Token IDs are not part of this document.
-        // Hosted tool results only run in the Responses loop.
-        Signal::Event(Event::TokenIds(_) | Event::ToolOutput(_)) => Flow::Keep,
+        // Token IDs are not part of this document, and a call is written
+        // whole once it is complete. Hosted tool results only run in the
+        // Responses loop.
+        Signal::Event(Event::TokenIds(_) | Event::ToolCallDelta(_) | Event::ToolOutput(_)) => {
+            Flow::Keep
+        }
         Signal::Event(Event::ToolCall(call)) => {
             // A Responses document took its events above; a chat keeps calls for its tail.
             if let Document::Chat { calls } = &mut body.document {

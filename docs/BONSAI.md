@@ -122,12 +122,17 @@ local-ai serve [options]
   --stall-timeout N  drop a generation whose client stopped reading; seconds,
                      default 30, accepted 10 to 3600
   --response-store DIR  keep Responses API responses in DIR (owner-only,
-                     unencrypted); default: nothing is kept durably
-  --reasoning-key FILE  enable reasoning.encrypted_content replay with an
-                     owner-only persistent AES-256-GCM key in FILE
+                     unencrypted) until deleted; default: the user's data
+                     directory, pruned of responses older than 30 days
+  --no-response-store  keep no Responses API responses
+  --reasoning-key FILE  owner-only AES-256-GCM key for
+                     reasoning.encrypted_content and compaction, created if
+                     absent; default: the user's data directory
+  --decisions-artifact DIR  serve POST /v1/decisions from DIR; default:
+                     models/decisions-v2 when installed
   --experimental-decision-head FILE  EXPERIMENTAL: serve
                      POST /v1/experimental/decisions with this judgment head
-                     (probabilities only; default: off)
+                     (probabilities only; default: off; not in --help)
 
 local-ai bonsai [options] <prompt>
   --max-tokens N     output cap (default 8192)
@@ -176,9 +181,9 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `GET` | `/v1/models` | the loaded Bonsai model, `ternary-bonsai-2-27b`, with its admitted `context_length`/`max_model_len`, then every installed optional model (`embeddinggemma-2`, `embeddinggemma-2-moderation-1`, `kokoro-82m`, `whisper-large-v3`) |
 | `GET`, `DELETE` | `/v1/models/{model}` | one served model by id or alias ([model ids](#model-ids)); `DELETE` is for fine-tuned models, so a served base model is a 403 and any other name a 404 |
 | `POST` | `/v1/chat/completions` | templated text and function calling |
-| `POST` | `/v1/responses` | text and function calling; stateless unless `--response-store` is given |
+| `POST` | `/v1/responses` | text and function calling; stored by default (`--no-response-store` makes it stateless) |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
-| `POST` | `/v1/responses/compact` | compact a window with the loaded model (`--reasoning-key` only; [compaction](#compaction-and-reasoning-summaries)) |
+| `POST` | `/v1/responses/compact` | compact a window with the loaded model ([compaction](#compaction-and-reasoning-summaries)) |
 | `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored or temporary background response, or (`GET ?stream=true`) resume a streamed background response |
 | `GET` | `/v1/responses/{id}/input_items` | paginated input items of a stored or temporary background response |
 | `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
@@ -194,7 +199,7 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `GET`, `POST`, `DELETE` | `/v1/organization/*` | Administration API: admin keys, projects, service accounts, audit logs, usage (admin key only; [ADMIN.md](ADMIN.md)) |
 | `POST`, `GET`, `DELETE` | `/v1/evals[/{id}[/runs[/{run_id}[/cancel\|/output_items[/{item_id}]]]]]` | evals of the loaded model, run through batches |
 | `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
-| `POST` | `/v1/decisions` | calibrated, scope-gated decisions (`--decisions-artifact` only; 404 with an explanation otherwise) |
+| `POST` | `/v1/decisions` | calibrated, scope-gated decisions (with `models/decisions-v2` or `--decisions-artifact`; 404 with an explanation otherwise) |
 
 ### Model ids
 
@@ -204,10 +209,10 @@ same table:
 | Model | Id | Also accepted | Routes |
 | --- | --- | --- | --- |
 | Ternary Bonsai 2 27B | `ternary-bonsai-2-27b` | none | Chat Completions, Responses, `input_tokens`, `compact`, decisions, batches, evals |
-| EmbeddingGemma 2 | `embeddinggemma-2` | none | `/v1/embeddings` |
+| EmbeddingGemma 2 | `embeddinggemma-2` | `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002` | `/v1/embeddings` |
 | moderation heads | `embeddinggemma-2-moderation-1` | `omni-moderation-latest`, `omni-moderation-2024-09-26`, `text-moderation-latest`, `text-moderation-stable` | `/v1/moderations` (`model` may be omitted) |
-| Kokoro-82M | `kokoro-82m` | none | `/v1/audio/speech` |
-| Whisper large-v3 | `whisper-large-v3` | `whisper-1` | `/v1/audio/transcriptions`, `/v1/audio/translations` |
+| Kokoro-82M | `kokoro-82m` | `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts` | `/v1/audio/speech` |
+| Whisper large-v3 | `whisper-large-v3` | `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | `/v1/audio/transcriptions`, `/v1/audio/translations` |
 
 The generation routes accept an omitted `model` or any name that is not
 another local model's, since many clients send a configured name the server
@@ -269,9 +274,18 @@ streamed limits); media is rejected.
 Chat supports function `tools`, assistant `tool_calls`, and tool-result messages
 with `tool_call_id`. Native rendering and validation belong to `local-engine`
 ([contract](../local-engine/README.md#native-tool-calling)); HTTP never executes
-a tool. Calls carry stable IDs and canonical JSON argument strings. A complete
-validated call is delivered as one argument delta: incremental partial argument
-streaming is not implemented. Chat finishes with `tool_calls` unless a token
+a tool. Calls carry stable IDs and JSON argument strings in the order the model
+wrote the arguments. Arguments stream while the call is generated: the first
+`tool_calls` chunk carries the ID and name as soon as the call names a
+declared tool, a string parameter whose schema accepts any string streams as
+it is written, any other value arrives whole when it ends, and the validated
+call sends whatever is left (usually `}`), so the fragments concatenate to the
+final arguments. Responses streams the same `response.function_call_arguments.delta`
+events, and a `custom` tool's raw input as `response.custom_tool_call_input.delta`;
+shell, `local_shell` and `apply_patch` calls are still reported whole. A call
+is still validated when it ends: one that fails ends the stream with an error
+after its fragments, and one cut short by the token limit stays `incomplete`
+with what streamed. Chat finishes with `tool_calls` unless a token
 limit takes precedence. Ordinary answer and reasoning text still stream.
 
 Both APIs accept `tool_choice`, `parallel_tool_calls` and a function tool's
@@ -280,8 +294,13 @@ grammar enforces on every sampled token
 ([contract](../local-engine/README.md#constrained-tool-calling)).
 `tool_choice` is `auto` (the default), `none`, `required`, or one named
 function: `{"type":"function","function":{"name":"NAME"}}` in Chat and
-`{"type":"function","name":"NAME"}` in Responses; the other API's shape,
-unknown members, `allowed_tools` and other tool kinds are refused. `required`
+`{"type":"function","name":"NAME"}` in Responses, or `allowed_tools`
+(`{"type":"allowed_tools","allowed_tools":{"mode","tools"}}` in Chat,
+`{"type":"allowed_tools","mode","tools"}` in Responses, whose entries name
+functions, custom tools or built-in types as a `tool_choice` would): every
+tool stays in the prompt, so the cached prefix is shared, while the grammar
+admits calls only to the listed ones, mandatory with `mode: "required"`. The
+other API's shape, unknown members and other tool kinds are refused. `required`
 with no tools, or a name not in `tools`, is a 400. `none` no longer withholds
 the tools from the prompt: they are rendered as for every choice, and the
 grammar keeps the answer from containing a call. `parallel_tool_calls: false`
@@ -358,11 +377,15 @@ still reasoning, before any answer, Chat reports an error and Responses
 Optional tools with a text answer may end during reasoning without a call;
 required or named calls mask end-of-sequence until the call is complete.
 
-Response storage is opt-in and **no Response is stored durably by default**
+Responses are **stored by default**, as on OpenAI, in
+`~/Library/Application Support/local-ai/responses`; a server pruning that
+default store at startup removes settled responses created more than 30 days
+earlier (pending background ones are kept). `--response-store DIR` uses DIR
+instead and prunes nothing, and `--no-response-store` stores nothing
 (conversations, files and batches use the always-on
-[native services](#native-services) store); only
-background responses are kept, briefly, without it. Without
-`--response-store DIR` the endpoint is stateless: responses report
+[native services](#native-services) store either way). With
+`--no-response-store` only background responses are kept, briefly, and the
+endpoint is otherwise stateless: responses report
 `store: false`, `store: true` and `previous_response_id` are refused, and
 `GET`/`DELETE /v1/responses/{id}` answer 404 for everything except a
 temporary background response (below); resend history in `input` instead.
@@ -501,7 +524,9 @@ curl -sN localhost:8080/v1/responses -H 'content-type: application/json' \
 curl -sN 'localhost:8080/v1/responses/resp_…?stream=true&starting_after=7'
 ```
 
-`--reasoning-key FILE` enables `reasoning.encrypted_content`. The key is 32
+`reasoning.encrypted_content` is always available: the key is
+`~/Library/Application Support/local-ai/reasoning.key` unless
+`--reasoning-key FILE` names another. The key is 32
 random bytes in an owner-only file, created on first start without
 overwriting anything and reused across restarts; a symlink, a non-regular
 file, a file owned by another user, a file with group or other access, or a
@@ -541,12 +566,22 @@ setting; no tool grammar is compiled, so a strict schema the grammar cannot
 enforce is refused only when generation is requested.
 
 Reasoning controls are `reasoning_effort` (Chat) and `reasoning.effort`
-(Responses): `none` or `xhigh`. A server started with `--no-thinking` rejects
-`xhigh`. Usage counts reasoning tokens from generated IDs through the first
-`</think>` token, inclusive; a response truncated before that token counts all
-generated tokens as reasoning. Prior reasoning is retained in replayed history.
-Responses accepts `reasoning.context: "all_turns"` (also the effective mode
-reported for the default `auto`); `current_turn` filtering is not implemented.
+(Responses). The checkpoint template has three reasoning levels, `low` (a
+"keep your thinking brief" instruction), `medium` (no instruction) and
+`xhigh` (the default), or none: `none`, `low`, `medium` and `xhigh` run as
+named, `minimal` runs at `low` and `high` at `xhigh`, and a Response's
+`reasoning.effort` reports the level that ran. A server started with
+`--no-thinking` rejects every level but `none`. Usage counts reasoning tokens
+from generated IDs through the first `</think>` token, inclusive; a response
+truncated before that token counts all generated tokens as reasoning.
+Prior reasoning is retained in replayed history by default, as the template's
+`preserve_thinking` default does. Responses `reasoning.context:
+"current_turn"` renders the template's `preserve_thinking: false`: assistant
+turns up to the last user message lose their thought block, while the current
+tool loop keeps its reasoning. It shortens long multi-turn prompts; the cached
+prefix stays valid up to the previous user turn. `auto` (the default) and
+`all_turns` keep every turn's reasoning, and the Response reports the
+effective mode.
 Responses reports measured prefix reuse as `input_tokens_details.cached_tokens`.
 `cache_write_tokens` is zero: local cache creation has no separately accounted
 or charged cache-write tier.
@@ -554,7 +589,7 @@ or charged cache-write tier.
 This is **not the full OpenAI platform contract**. Schema keywords
 llguidance cannot enforce exactly, strict tool schemas the native grammar
 cannot enforce exactly (including any without `"additionalProperties": false`),
-`allowed_tools`, built-in tools other than those of
+built-in tools other than those of
 [docs/TOOLS.md](TOOLS.md) (MCP, `file_search` and the like; `web_search` is
 accepted but never offered to the model, which cannot search here),
 `include` values other than
@@ -788,7 +823,7 @@ only after it, with the compaction item already the first output item; a
 streamed job announces it right after `response.in_progress`.
 `compaction_trigger` input items are refused.
 
-Without `--reasoning-key` both are refused rather than returning the summary
+Without a key (only in tests now, since a server always has one) both are refused rather than returning the summary
 in a field named `encrypted_content`: the item carries the conversation's
 content, the contract calls it encrypted, and plaintext under that name would
 mislead.
@@ -897,7 +932,7 @@ these requests.
 `~/Library/Application Support/local-ai/services` (an owner-only SQLite
 database in WAL mode plus file blobs, all plaintext) and refuses to start if
 it cannot. There is no flag and no alternative backend. The store is separate
-from `--response-store`, which stays opt-in. Storage, limits, crash safety and
+from the Responses store. Storage, limits, crash safety and
 the native API, including the workspace search that has no HTTP route, are in
 [local-services/README.md](../local-services/README.md). Routes sit behind
 `--api-key` and are also served over HTTP/3. Service CRUD uses a bounded
@@ -1039,7 +1074,8 @@ way. These waits are futures woken by the engine or by shutdown, not polling.
 `POST /v1/experimental/decisions` is not the OpenAI Decisions API: OpenAI's
 responses require a `confidence` on every choice and score answer and may
 answer with a `refusal`, and this route's head produces neither.
-`POST /v1/decisions` is served separately, only with `--decisions-artifact DIR`
+`POST /v1/decisions` is served separately, whenever the artifact is installed
+as `models/decisions-v2` or named with `--decisions-artifact DIR`
 (`head.safetensors`, `gate.safetensors`, `calibration.json`). At startup the
 server checks the artifact's canonical-JSON content hash, the head and gate
 file hashes it pins, that its pre-registered acceptance passed and that its

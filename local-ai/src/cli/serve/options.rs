@@ -13,6 +13,17 @@ const MAX_TOOL_CALL_SECONDS: u64 = 300;
 const DEFAULT_TOOL_BUDGET_SECONDS: u64 = 120;
 const MAX_TOOL_BUDGET_SECONDS: u64 = 3600;
 
+/// Where Responses are stored.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ResponseStoreArg {
+    /// The user's data directory, pruned of responses older than 30 days.
+    Default,
+    /// `--response-store DIR`, kept until deleted.
+    Dir(PathBuf),
+    /// `--no-response-store`: nothing is kept.
+    Off,
+}
+
 /// Hosted tool permissions and bounds. The default grants nothing.
 #[derive(Debug)]
 pub(super) struct ToolArgs {
@@ -83,25 +94,24 @@ pub(super) fn usage() {
     eprintln!("  --no-thinking      Disable thinking");
     eprintln!(
         "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \
-         unencrypted) for retrieval and previous_response_id (default: no durable storage; \
+         unencrypted) until deleted (default: ~/Library/Application Support/local-ai/responses, \
+         where responses older than 30 days are removed at startup)"
+    );
+    eprintln!(
+        "  --no-response-store  Keep no Responses (no retrieval or previous_response_id; \
          background responses are kept temporarily)"
     );
     eprintln!(
-        "  --reasoning-key FILE  Enable encrypted reasoning replay with an owner-only persistent key"
+        "  --reasoning-key FILE  Owner-only key for encrypted reasoning and compaction, created \
+         if absent (default: ~/Library/Application Support/local-ai/reasoning.key)"
     );
     eprintln!(
         "  --stall-timeout SECONDS  Drop a generation whose client stopped reading \
          (default: {DEFAULT_STALL_SECONDS})"
     );
     eprintln!(
-        "  --experimental-decision-head FILE  EXPERIMENTAL: serve POST /v1/experimental/decisions \
-         with this judgment head (probabilities only; no confidence or refusal; calibration \
-         provenance comes from the artifact, unknown when absent; default: off)"
-    );
-    eprintln!(
-        "  --decisions-artifact DIR  Serve POST /v1/decisions from an evaluated head, gate and \
-         calibration (head.safetensors, gate.safetensors, calibration.json; hashes, acceptance \
-         and scope verified at startup; calibrated probabilities and refusals; default: off)"
+        "  --decisions-artifact DIR  Serve POST /v1/decisions from this evaluated head, gate and \
+         calibration (default: models/decisions-v2 when installed)"
     );
     eprintln!();
     eprintln!("  Hosted tools (Responses API; default: none; see docs/TOOLS.md):");
@@ -139,7 +149,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         thinking: true,
         api_key: None,
         stall: Duration::from_secs(DEFAULT_STALL_SECONDS),
-        response_store: None,
+        response_store: ResponseStoreArg::Default,
         reasoning_key: None,
         decision_head: None,
         decisions_artifact: None,
@@ -153,6 +163,11 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         }
         if flag == "--no-thinking" {
             parsed.thinking = false;
+            index += 1;
+            continue;
+        }
+        if flag == "--no-response-store" {
+            parsed.response_store = ResponseStoreArg::Off;
             index += 1;
             continue;
         }
@@ -216,7 +231,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 if value.is_empty() {
                     return Err("--response-store requires a directory".into());
                 }
-                parsed.response_store = Some(value.into());
+                parsed.response_store = ResponseStoreArg::Dir(value.into());
             }
             tools if tools.starts_with("--tools-") => tool_value(&mut parsed.tools, flag, value)?,
             _ => return Err(format!("unknown option: {flag}")),

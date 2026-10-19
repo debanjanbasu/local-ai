@@ -44,6 +44,8 @@ fn long_prompt(marker: u128, max_tokens: usize) -> super::ChatRequest {
         max_tokens,
         sampling: Sampling::default(),
         thinking: false,
+        effort: crate::ReasoningEffort::default(),
+        preserve_thinking: true,
         session: None,
         tools: Vec::new(),
         tool_choice: crate::ToolChoice::Auto,
@@ -390,6 +392,8 @@ fn tool_history(thinking: bool) -> super::ChatRequest {
         max_tokens: 1,
         sampling: Sampling::default(),
         thinking,
+        effort: crate::ReasoningEffort::default(),
+        preserve_thinking: true,
         session: None,
         tools: vec![crate::ToolDefinition {
             name: "get_weather".into(),
@@ -589,6 +593,11 @@ fn a_strict_call_is_parsed_by_its_exact_layout_after_reasoning() {
     let pieces = text.split_inclusive(['>', '"']).collect::<Vec<_>>();
     let (events, failure) = split(true, Some(tools), &pieces);
     assert_eq!(failure, None);
+    // Deltas report the call while it is generated; the call itself ends it.
+    let events = events
+        .into_iter()
+        .filter(|event| !matches!(event, Event::ToolCallDelta(_)))
+        .collect::<Vec<_>>();
     assert!(
         matches!(events.as_slice(), [Event::Reasoning(_), Event::ToolCall(call)]
             if call.arguments == serde_json::json!({"names": ["</tool_call>", "b"]})),

@@ -5,10 +5,13 @@
 //! | model | id | aliases | routes |
 //! |-------|----|---------|--------|
 //! | Bonsai | [`BONSAI_MODEL_ID`] | none | Chat Completions, Responses, compaction, input tokens, decisions, batches, evals |
-//! | embeddings | [`EMBEDDING_MODEL_ID`] | none | `/v1/embeddings` |
+//! | embeddings | [`EMBEDDING_MODEL_ID`] | the `OpenAI` embedding model names | `/v1/embeddings` |
 //! | moderation | [`MODERATION_MODEL_ID`] | the `OpenAI` moderation model names | `/v1/moderations` |
-//! | speech | [`SPEECH_MODEL_ID`] | none | `/v1/audio/speech` |
-//! | transcription | [`TRANSCRIPTION_MODEL_ID`] | `whisper-1` | `/v1/audio/transcriptions`, `/v1/audio/translations` |
+//! | speech | [`SPEECH_MODEL_ID`] | the `OpenAI` speech model names | `/v1/audio/speech` |
+//! | transcription | [`TRANSCRIPTION_MODEL_ID`] | the `OpenAI` transcription model names | `/v1/audio/transcriptions`, `/v1/audio/translations` |
+//!
+//! The aliases let a client keep the `OpenAI` model name it was written for;
+//! the local model answers, under its own id.
 //!
 //! Routes of the optional models require their own model (moderation lets it
 //! be omitted). The Bonsai generation routes accept an omitted `model` or any
@@ -40,6 +43,16 @@ pub(super) const BONSAI_MODEL_ID: &str = "ternary-bonsai-2-27b";
 /// reported as the Bonsai id.
 const LEGACY_BONSAI_FILE: &str = "Ternary-Bonsai-2-27B-PTQ1_0.gguf";
 
+/// `OpenAI` embedding model names, accepted for [`EMBEDDING_MODEL_ID`].
+pub(super) const EMBEDDING_ALIASES: [&str; 3] = [
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+    "text-embedding-ada-002",
+];
+
+/// `OpenAI` speech model names, accepted for [`SPEECH_MODEL_ID`].
+pub(super) const SPEECH_ALIASES: [&str; 3] = ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"];
+
 /// `OpenAI` moderation model names, accepted for [`MODERATION_MODEL_ID`].
 pub(super) const MODERATION_ALIASES: [&str; 4] = [
     "omni-moderation-latest",
@@ -48,8 +61,9 @@ pub(super) const MODERATION_ALIASES: [&str; 4] = [
     "text-moderation-stable",
 ];
 
-/// `OpenAI`'s Whisper name, accepted for [`TRANSCRIPTION_MODEL_ID`].
-pub(super) const TRANSCRIPTION_ALIASES: [&str; 1] = ["whisper-1"];
+/// `OpenAI` transcription model names, accepted for [`TRANSCRIPTION_MODEL_ID`].
+pub(super) const TRANSCRIPTION_ALIASES: [&str; 3] =
+    ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"];
 
 /// A model this server can serve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,11 +80,11 @@ pub(super) enum Served {
 pub(super) fn resolve(name: &str, bonsai: &str) -> Option<Served> {
     if name == bonsai {
         Some(Served::Bonsai)
-    } else if name == EMBEDDING_MODEL_ID {
+    } else if name == EMBEDDING_MODEL_ID || EMBEDDING_ALIASES.contains(&name) {
         Some(Served::Embeddings)
     } else if name == MODERATION_MODEL_ID || MODERATION_ALIASES.contains(&name) {
         Some(Served::Moderation)
-    } else if name == SPEECH_MODEL_ID {
+    } else if name == SPEECH_MODEL_ID || SPEECH_ALIASES.contains(&name) {
         Some(Served::Speech)
     } else if name == TRANSCRIPTION_MODEL_ID || TRANSCRIPTION_ALIASES.contains(&name) {
         Some(Served::Transcription)

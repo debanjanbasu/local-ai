@@ -870,7 +870,7 @@ mod tests {
             vec![("language", "klingon")],
             vec![("stream", "true"), ("response_format", "srt")],
             vec![("include", "logprobs"), ("response_format", "text")],
-            vec![("model", "gpt-4o-transcribe")],
+            vec![("model", "tts-1")],
             vec![("file", "clip.aiff")],
         ] {
             assert!(

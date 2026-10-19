@@ -51,6 +51,7 @@ async fn generate(engine: &EngineHandle, request: ChatRequest) -> crate::Result<
             Event::Finished(stats) => return Ok((text, *stats)),
             Event::Error(message) => return Err(crate::Error::Generation(message)),
             Event::Reasoning(_)
+            | Event::ToolCallDelta(_)
             | Event::ToolCall(_)
             | Event::ToolOutput(_)
             | Event::TokenIds(_) => {}
@@ -81,6 +82,7 @@ fn blocking_generate(engine: EngineHandle, meter: Meter) -> Generate {
                 }
                 Event::Error(message) => return Err(crate::Error::Generation(message)),
                 Event::Reasoning(_)
+                | Event::ToolCallDelta(_)
                 | Event::ToolCall(_)
                 | Event::ToolOutput(_)
                 | Event::TokenIds(_) => {}

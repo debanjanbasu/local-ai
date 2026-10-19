@@ -13,6 +13,38 @@ use crate::tools::grammar::CallTags;
 use crate::tools::{ToolChoice, ToolSet};
 
 pub const DEFAULT_REASONING_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const LOW_REASONING_INSTRUCTION: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+
+/// How hard the model reasons when it thinks: the checkpoint template's
+/// `reasoning_effort`, which knows exactly these three levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    #[default]
+    XHigh,
+}
+
+impl ReasoningEffort {
+    /// The instruction the template puts in the system turn; `medium` has none.
+    pub(crate) const fn instruction(self) -> Option<&'static str> {
+        match self {
+            Self::Low => Some(LOW_REASONING_INSTRUCTION),
+            Self::Medium => None,
+            Self::XHigh => Some(DEFAULT_REASONING_INSTRUCTION),
+        }
+    }
+
+    /// The template's name for this level.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::XHigh => "xhigh",
+        }
+    }
+}
 
 const CHAT_TEMPLATE_SHA256: &str =
     "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
@@ -385,7 +417,12 @@ impl BonsaiTokenizer {
                 tool_call_id: None,
             })
             .collect::<Vec<_>>();
-        crate::tools::render(&turns, thinking, &crate::tools::ToolSet::default())
+        crate::tools::render(
+            &turns,
+            thinking.then_some(ReasoningEffort::XHigh),
+            true,
+            &crate::tools::ToolSet::default(),
+        )
     }
 }
 

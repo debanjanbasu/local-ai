@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{
-    ChatRequest, Event, GenerationStats, PrefillProgress, ResponseFormat, Signal, Stats, ToolCall,
-    ToolChoice,
+    ChatRequest, Event, GenerationStats, PrefillProgress, ReasoningEffort, ResponseFormat, Signal,
+    Stats, ToolCall, ToolCallDelta, ToolChoice,
 };
 
 use super::chunked::{Body, Flow, absorb};
@@ -156,25 +156,115 @@ fn chat_refuses_deprecated_parameters() {
 }
 
 #[test]
-fn chat_reasoning_effort_only_accepts_the_modes_the_template_has() {
+fn chat_reasoning_effort_runs_at_the_nearest_template_level() {
     let effort = |effort: &str, server: bool| {
         chat_request(
             &json!({"messages":[user()],"reasoning_effort":effort}),
             server,
         )
-        .map(|request| request.thinking)
+        .map(|request| request.thinking.then_some(request.effort))
     };
-    assert!(!effort("none", true).expect("none"));
-    assert!(effort("xhigh", true).expect("xhigh"));
-    assert!(!effort("none", false).expect("none without thinking"));
-    let error = effort("xhigh", false).expect_err("operator disabled thinking");
-    assert!(error.to_string().contains("--no-thinking"), "{error}");
-    for invalid in ["low", "medium", "high", "minimal", "max", "bogus"] {
+    for (requested, level) in [
+        ("none", None),
+        ("minimal", Some(ReasoningEffort::Low)),
+        ("low", Some(ReasoningEffort::Low)),
+        ("medium", Some(ReasoningEffort::Medium)),
+        ("high", Some(ReasoningEffort::XHigh)),
+        ("xhigh", Some(ReasoningEffort::XHigh)),
+    ] {
+        assert_eq!(
+            effort(requested, true).expect(requested),
+            level,
+            "{requested}"
+        );
+    }
+    assert_eq!(effort("none", false).expect("none without thinking"), None);
+    for requested in ["low", "xhigh"] {
+        let error = effort(requested, false).expect_err("operator disabled thinking");
+        assert!(error.to_string().contains("--no-thinking"), "{error}");
+    }
+    for invalid in ["max", "bogus"] {
         let error = effort(invalid, true).expect_err(invalid);
         assert!(error.to_string().contains("reasoning effort"), "{error}");
     }
     assert!(
         chat_request(&json!({"messages":[user()]}), false).is_ok_and(|request| !request.thinking)
+    );
+}
+
+#[test]
+fn responses_reasoning_context_and_effort_reach_the_engine() {
+    let prepare = |reasoning: Value| {
+        let body = json!({"input":"hi","reasoning":reasoning});
+        let request = prepare_responses(body.to_string().as_bytes(), true)
+            .expect("valid")
+            .request;
+        (
+            request.thinking.then_some(request.effort),
+            request.preserve_thinking,
+        )
+    };
+    assert_eq!(
+        prepare(json!({"effort":"minimal","context":"current_turn"})),
+        (Some(ReasoningEffort::Low), false)
+    );
+    assert_eq!(
+        prepare(json!({"effort":"medium","context":"all_turns"})),
+        (Some(ReasoningEffort::Medium), true)
+    );
+    assert_eq!(
+        prepare(json!({"context":"auto"})),
+        (Some(ReasoningEffort::XHigh), true)
+    );
+}
+
+#[test]
+fn allowed_tools_choices_reach_the_engine_on_both_apis() {
+    let chat_tools = json!([
+        {"type":"function","function":{"name":"weather"}},
+        {"type":"function","function":{"name":"time"}}
+    ]);
+    let chat = |choice: Value| {
+        chat_request(
+            &json!({"messages":[user()],"tools":chat_tools,"tool_choice":choice}),
+            true,
+        )
+        .map(|request| request.tool_choice)
+    };
+    assert_eq!(
+        chat(
+            json!({"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[
+                {"type":"function","function":{"name":"time"}}
+            ]}})
+        )
+        .expect("allowed"),
+        ToolChoice::Allowed {
+            tools: vec!["time".into()],
+            required: true
+        }
+    );
+    for invalid in [
+        json!({"type":"allowed_tools","allowed_tools":{"tools":[]}}),
+        json!({"type":"allowed_tools","allowed_tools":{"mode":"always","tools":[{"type":"function","function":{"name":"time"}}]}}),
+        json!({"type":"allowed_tools","allowed_tools":{"tools":[{"type":"function","function":{"name":"nope"}}]}}),
+    ] {
+        assert!(chat(invalid.clone()).is_err(), "{invalid}");
+    }
+    let body = json!({"input":"hi","tools":[
+        {"type":"function","name":"weather"},
+        {"type":"custom","name":"patch"}
+    ],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[
+        {"type":"function","name":"weather"},{"type":"custom","name":"patch"}
+    ]}});
+    let request = prepare_responses(body.to_string().as_bytes(), true)
+        .expect("valid")
+        .request;
+    assert_eq!(
+        request.tool_choice,
+        ToolChoice::Allowed {
+            tools: vec!["weather".into(), "patch".into()],
+            required: false
+        }
     );
 }
 
@@ -424,6 +514,100 @@ fn chat_stream_emits_complete_tool_calls_in_order_and_finishes_with_tool_calls()
     assert_eq!(out[6], "data: [DONE]\n\n");
 }
 
+fn delta(id: &str, name: &str, arguments: &str, text: Option<(&str, &str)>) -> Event {
+    Event::ToolCallDelta(ToolCallDelta {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+        text: text.map(|(key, text)| (key.into(), text.into())),
+    })
+}
+
+#[test]
+fn streamed_call_arguments_reach_both_apis_and_end_in_the_validated_call() {
+    let events = [
+        delta("c1", "weather", "{\"city\":\"Os", Some(("city", "Os"))),
+        delta("c1", "weather", "lo", Some(("city", "lo"))),
+        Event::ToolCall(call("c1", "weather", json!({"city":"Oslo"}))),
+    ];
+    // Chat: the first fragment names the call, later ones add arguments, and
+    // the validated call sends the rest; together they are the arguments.
+    let mut frames = Frames::new(chat_reply(false));
+    let mut out = Vec::new();
+    for event in events {
+        out.extend(frames.event(event).0);
+    }
+    out.extend(frames.event(Event::Finished(stats(StopReason::Eos))).0);
+    let calls: Vec<Value> = out
+        .iter()
+        .map(|frame| parse_data(frame)["choices"][0]["delta"]["tool_calls"][0].clone())
+        .filter(|call| !call.is_null())
+        .collect();
+    assert_eq!(calls.len(), 3, "{out:#?}");
+    assert_eq!(calls[0]["id"], "c1");
+    assert_eq!(calls[0]["function"]["name"], "weather");
+    assert!(calls[1].get("id").is_none() && calls[2].get("id").is_none());
+    assert!(calls.iter().all(|call| call["index"] == 0));
+    let arguments: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(arguments, r#"{"city":"Oslo"}"#);
+    assert_eq!(
+        parse_data(&out[out.len() - 2])["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+    // Responses: a custom tool streams its raw input; a function call cut
+    // short by the token limit ends incomplete with what streamed.
+    let mut frames = Frames::new(responses_reply(&json!({"input":"hi","tools":[
+        {"type":"custom","name":"apply_patch"},
+        {"type":"function","name":"weather"}
+    ]})));
+    let mut out = frames.start();
+    for event in [
+        delta(
+            "c2",
+            "apply_patch",
+            "{\"input\":\"*** Be",
+            Some(("input", "*** Be")),
+        ),
+        delta("c2", "apply_patch", "gin\"", Some(("input", "gin"))),
+        Event::ToolCall(call("c2", "apply_patch", json!({"input":"*** Begin"}))),
+        delta("c3", "weather", "{\"ci", None),
+        Event::Finished(stats(StopReason::TokenLimit)),
+    ] {
+        out.extend(frames.event(event).0);
+    }
+    let events = sse_events(&out);
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+    assert_eq!(
+        kinds[2..],
+        [
+            "response.output_item.added",
+            "response.custom_tool_call_input.delta",
+            "response.custom_tool_call_input.delta",
+            "response.custom_tool_call_input.done",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.incomplete",
+        ]
+    );
+    assert_eq!(events[2]["item"]["input"], "");
+    assert_eq!(events[3]["delta"], "*** Be");
+    assert_eq!(events[4]["delta"], "gin");
+    assert_eq!(events[5]["input"], "*** Begin");
+    assert_eq!(events[6]["item"]["call_id"], "c2");
+    let output = &events[11]["response"]["output"];
+    assert_eq!(output[0]["type"], "custom_tool_call");
+    assert_eq!(output[0]["input"], "*** Begin");
+    assert_eq!(output[1]["type"], "function_call");
+    assert_eq!(output[1]["status"], "incomplete");
+    assert_eq!(output[1]["arguments"], "{\"ci");
+}
+
 #[test]
 fn chat_stream_reports_length_even_after_a_call_and_omits_usage_unless_asked() {
     let mut frames = Frames::new(chat_reply(false));
@@ -656,8 +840,12 @@ fn responses_reject_what_they_cannot_honour() {
             "not declared in tools",
         ),
         (
-            json!({"input":"hi","reasoning":{"effort":"high"}}),
+            json!({"input":"hi","reasoning":{"effort":"max"}}),
             "reasoning effort",
+        ),
+        (
+            json!({"input":"hi","reasoning":{"context":"some_turns"}}),
+            "reasoning.context",
         ),
         (
             json!({"input":"hi","reasoning":{"summary":"verbose"}}),
