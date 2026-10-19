@@ -84,6 +84,23 @@ class ContextTest(unittest.TestCase):
             for path in needle.files:
                 self.assertIn(path, text)
 
+    def test_session_replays_the_whole_repository_in_bounded_reads(self):
+        needles = ce.make_needles(1)
+        text, _ = ce.build_context(1, "16k", needles)
+        files = ce.repository_files(text)
+        steps = ce.session_items(files)
+        outputs = [output["output"] for _, output in steps]
+        self.assertEqual("".join(outputs), text[text.index("\nFILE ") + 1:])
+        self.assertTrue(all(len(o) <= ce.SESSION_CHUNK_TOKENS * ce.CHARS_PER_TOKEN for o in outputs))
+        self.assertGreater(len(steps), 4)
+        for call, output in steps:
+            self.assertEqual(call["call_id"], output["call_id"])
+            self.assertEqual(ce.read_files(files, call["arguments"]), output["output"])
+        fix = next(n for n in needles if n.task == "fix")
+        path = next(iter(fix.files))
+        self.assertEqual(ce.read_files(files, f'{{"paths": ["{path}"]}}'), f"FILE {path}\n{fix.files[path]}\n")
+        self.assertIn("no such file", ce.read_files(files, '{"paths": ["nope.py"]}'))
+
 
 class RecordTest(unittest.TestCase):
     def test_record_report_and_resume(self):
