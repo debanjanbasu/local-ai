@@ -89,7 +89,7 @@ impl Resources {
         let vision_reason = vision.as_ref().map_or_else(
             || {
                 format!(
-                    "no {} installed beside the model; image input disabled",
+                    "no {} installed beside the model; image and video input disabled",
                     crate::bonsai_vision::VISION_PROJECTOR_FILE
                 )
             },

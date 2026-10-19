@@ -597,7 +597,7 @@ is accepted but never offered to the model, which cannot search here, while
 `file_search` runs natively over the vector stores),
 `include` values other than `file_search_call.results` and
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
-log-probabilities, remote image URLs and audio are rejected.
+log-probabilities and audio are rejected.
 `tool_choice` `auto`, `none`, `required` and a named function,
 `parallel_tool_calls` and tool `strict` are supported and enforced during
 decoding, as is a structured format beside tools; a grammar guarantees the
@@ -784,18 +784,17 @@ projector is not read.
 
 | API | Image parts |
 | --- | --- |
-| Chat Completions | `{"type":"image_url","image_url":{"url":"data:image/…;base64,…","detail":…}}` (or `image_url` as a bare string); `{"type":"file","file":{"file_id":…}}` or `{"file_data":"<base64>"}` |
-| Responses | `{"type":"input_image","image_url":"data:…","detail":…}` or `{"type":"input_image","file_id":…,"detail":…}`, in user messages and `function_call_output` |
+| Chat Completions | `{"type":"image_url","image_url":{"url":"data:image/…;base64,…" or "https://…","detail":…}}` (or `image_url` as a bare string); `{"type":"file","file":{"file_id":…}}` or `{"file_data":"<base64>"}` |
+| Responses | `{"type":"input_image","image_url":"data:…" or "https://…","detail":…}` or `{"type":"input_image","file_id":…,"detail":…}`, in user messages and `function_call_output` |
 
 Images may sit anywhere among the text parts of user and tool messages and
 keep their place; system, developer and assistant messages cannot hold them,
 as in the checkpoint's chat template. `file_id` names an upload of the
-[Files API](#native-services) (at most 32 MiB per image). JPEG (decoded with
-libjpeg-turbo), PNG, WebP, GIF (first frame) and BMP are read. Remote
-`http(s)` URLs are refused rather than fetched: the server never fetches a
-URL a request names on its behalf, so send a data URL or upload the file.
-Conversations store `input_image` parts too (within the 4 MiB item limit,
-so larger images go by `file_id`).
+[Files API](#native-services) (at most 64 MiB per image or video). JPEG
+(decoded with libjpeg-turbo), PNG, WebP, GIF (first frame) and BMP are read.
+`http(s)` URLs are fetched by the server ([remote media
+URLs](#remote-media-urls)). Conversations store `input_image` parts too
+(within the 4 MiB item limit, so larger images go by `file_id` or URL).
 
 The template renders each image as
 `<|vision_start|><|image_pad|><|vision_end|>` exactly where the checkpoint's
@@ -858,6 +857,127 @@ compares a download of its output (`bench IMAGE [detail]` times the tower):
   embeddings are 0.9991–0.99999 cosine from the native ones, which match
   HF's exactly. The card's text (`BONSAI 27B`, `Vision test 2026`,
   `Invoice #4821`, …) is read back verbatim.
+
+### Remote media URLs
+
+An `http(s)` URL in `image_url`, `input_image`, `video_url` or `input_video`
+is fetched by the server, through the hosted fetch tool's transport
+(`local_services::tools::fetch::download`, [docs/TOOLS.md](TOOLS.md)):
+
+- Any public host, by name or public IP literal; no allowlist.
+- **Loopback, private (RFC 1918), link-local (including the
+  169.254.169.254 metadata address), CGNAT, unique-local, documentation and
+  other non-public addresses are refused, by default and without a flag.**
+  Every address a name resolves to must be public, and the connection goes
+  to a checked address, so DNS rebinding cannot reach the LAN. A request
+  names a URL on behalf of whatever produced its content (a web page a tool
+  read, a document an agent pasted), so a server reachable by others must
+  not become a way to probe or `GET` its own network. Media on the local
+  machine or LAN goes as a data URL or through `/v1/files`.
+- At most five redirects, each target checked anew; `https` verified by the
+  macOS trust store.
+- At most 64 MiB (the generation request body limit), refused (not
+  truncated) by `Content-Length` or while reading; one 60-second deadline
+  for the whole exchange.
+- The response's `Content-Type` must be `image/*` for images and `video/*`
+  (or `application/mp4`) for videos; none, `application/octet-stream` and
+  `binary/octet-stream` pass and the decoder decides. Anything else (an HTML
+  error page, say) is a 400 naming the type.
+- Fetched bytes are kept by URL for ten minutes (256 MiB in all), so a
+  conversation replaying the URL in its history every turn fetches it once.
+
+Every failure is a 400 naming the URL and the reason.
+
+### Video input
+
+With the vision projector installed, videos go where images go:
+
+| API | Video parts |
+| --- | --- |
+| Chat Completions | `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,…" or "https://…"}}` (vLLM's and llama.cpp's extension; `video_url` may be a bare string); llama.cpp's `{"type":"input_video","input_video":{"url"|"data":…}}`; `{"type":"file","file":{"file_id"|"file_data":…}}` holding a video |
+| Responses | `{"type":"input_video","video_url":"…"}` (or `{"url":…}`) or `{"type":"input_video","file_id":…}` — this server's extension, as OpenAI's Responses API has no video part |
+
+MP4, MOV and M4V files are read, with any codec macOS decodes (H.264 and
+HEVC on every Apple Silicon Mac, ProRes, AV1 where the hardware has it);
+Matroska and WebM are refused with a 400, since AVFoundation does not open
+them. A `file` part whose bytes are an ISO media file is taken as a video,
+otherwise as an image.
+
+The layout is the checkpoint's own processor (`Qwen3VLVideoProcessor`,
+which Qwen3.5 uses, with the base model's `video_preprocessor_config.json`):
+
+1. **Sampling**: 2 frames per second, `int(frames / fps * 2)` frames, at
+   least 4 and at most 768 (and at most the video's own), at
+   `round(linspace(0, frames - 1, n))`.
+2. **Size**: every frame resized (antialiased bicubic) to one size in
+   multiples of 32 within a clip budget of 25,165,824 pixels (12,288 tokens)
+   and, as the reference qwen-vl-utils does (`cap_pixels_per_frame`, the
+   transformers default from v5.22), at most 786,432 pixels (768 tokens) a
+   frame; at least 4,096 pixels a clip.
+3. **Frame groups**: each pair of frames (the last repeated when the count
+   is odd) is one temporal patch group, its 16x16x2 patches embedded with
+   both temporal kernel slices, and attended to within the group only.
+4. **Prompt**: the template's `<|vision_start|><|video_pad|><|vision_end|>`,
+   with the pad expanded as the processor expands it: for each group
+   `<{t:.1f} seconds>` (the mean time of its two frames),
+   `<|vision_start|>`, the group's tokens, `<|vision_end|>`. Each group takes
+   image M-RoPE positions; the timestamps carry the time
+   (`get_rope_index` splits video grids into `t = 1` grids).
+
+Video tokens count toward the prompt like image tokens (a 10-second 640x360
+clip at 30 fps is 10 groups of 220 tokens; a long or large one stops at the
+12,288-token clip budget). Memory stays bounded by that budget rather than
+the video's length: frames are resized as soon as they are decoded (one
+source frame in memory at a time), a clip's resized frames hold at most 72
+MiB, the tower runs one frame group at a time (at most 3,072 patches, about
+150 MB of activations), and the encoded rows (20 KB a token, at most 240 MiB
+a clip) are cached by content with images. Prepared videos are cached by
+file digest (256 MiB), so a video kept in a conversation's history is
+decoded once. `detail` does not apply to videos.
+
+**Decoding.** AVFoundation through `objc2` (no new C dependency; the repo
+already binds Metal through it), from a temporary file: one pass over the
+compressed samples counts the frames and their duration (the reference
+decoders' frame count and `frames / duration` rate) and reads the stream's
+declared colour matrix; a second pass decodes in presentation order and
+keeps only the sampled frames. VideoToolbox returns its native 8-bit 4:2:0
+planes, converted to RGB with the swscale fixed-point arithmetic the
+EmbeddingGemma video path already reproduces (BT.601 when the stream
+declares no matrix, as FFmpeg reads it, where VideoToolbox's own conversion
+would guess BT.709 for HD). 10-bit streams are reduced to 8 bits by
+VideoToolbox, which can differ from FFmpeg's conversion by a few levels.
+
+**Parity.** `bonsai-vision-eval video OUT_DIR CLIP...` dumps the native
+probe, sampled frames, patch rows, tower output and prompt layout of each
+clip; `.scratch/video/ref.py` (run with `uv run --with torch --with
+torchvision --with transformers==5.20.1 --with av --with gguf --with numpy`)
+compares them with transformers 5.20.1 on CPU: `sample_frames` on PyAV's
+metadata, `Qwen3VLVideoProcessor` on the native frames, `replace_video_token`
+inside the template's placeholder, `Qwen3_5Model.get_rope_index`, and the
+FP32 `Qwen3_5VisionModel` with the mmproj's weights. Five synthetic clips
+(H.264 640x360 at 30 fps with B-frames, HEVC 272x480 at 25 fps in MOV,
+H.264 64x48 with 3 frames, H.264 1280x720 at 24 fps for 20 s, BT.709-tagged
+H.264 480x270 at 29.97 fps):
+
+- Frame counts, rates and sampled indices equal PyAV's for all five.
+- Decoded frames: bit-identical, for all five, to the EmbeddingGemma video
+  path's (`ffmpeg`'s decoded planes through the same swscale conversion,
+  which matched torchcodec's frames for the reference): VideoToolbox's
+  planes equal FFmpeg's and the colour matrix is chosen alike, including
+  BT.601 for the untagged 1280x720 clip. PyAV on this Mac (arm64 swscale)
+  is within 2 levels (50–52 dB PSNR).
+- Grids identical, and every pixel value of `Qwen3VLVideoProcessor`'s output
+  identical (0 of 81,518,592 differ; the 20-second clip at the per-frame
+  cap included).
+- The expanded prompt text and every M-RoPE position identical.
+- Tower output against HF FP32: cosine 1.0000000 for every clip (minimum
+  per-token cosine 0.99999997), up to 2,376 tokens (4 groups) per clip.
+
+No llama.cpp reference was made: upstream mtmd's video support lays videos
+out differently from the checkpoint's processor (FFmpeg's `fps` filter at 4
+fps, a `Video:` prefix and `[0m5.00s]` timestamps every 5 s, no per-group
+timestamps), so it would not check this layout. The decoder side is the
+image path's, whose end-to-end parity is above.
 
 ### Coding client configuration
 

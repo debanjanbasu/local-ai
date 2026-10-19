@@ -465,19 +465,23 @@ fn an_invalid_chat_fails_counting_exactly_as_it_fails_generation() {
 
 #[test]
 fn images_render_as_the_templates_vision_markers_where_they_sit() {
-    let image = |offset| super::ChatImage {
+    let part = |offset, video| super::ChatImage {
         offset,
         data: std::sync::Arc::from(&b"not decoded while rendering"[..]),
         detail: super::ImageDetail::Auto,
+        video,
     };
     let mut user = message("user", "Compare  and ");
-    user.images = vec![image(8), image(13), image(13)];
+    user.images = vec![part(8, false), part(13, true), part(13, false)];
     let tools = crate::tools::ToolSet::default();
     let rendered =
         super::render_messages(std::slice::from_ref(&user), None, false, &tools).expect("render");
-    let marker = crate::bonsai_vision::IMAGE_PLACEHOLDER;
+    let (image, video) = (
+        crate::bonsai_vision::IMAGE_PLACEHOLDER,
+        crate::bonsai_vision::VIDEO_PLACEHOLDER,
+    );
     assert!(
-        rendered.contains(&format!("Compare {marker} and {marker}{marker}<|im_end|>")),
+        rendered.contains(&format!("Compare {image} and {video}{image}<|im_end|>")),
         "{rendered}"
     );
 

@@ -648,7 +648,8 @@ fn normalize_item(item: Value) -> Result<Item> {
                 Some(Value::Array(parts)) => input_parts(parts)?,
                 _ => {
                     return Err(invalid(
-                        "output must be a string or an array of input_text and input_image parts",
+                        "output must be a string or an array of input_text, input_image and \
+                         input_video parts",
                     ));
                 }
             }
@@ -819,18 +820,41 @@ fn normalize_reasoning(body: &mut Map<String, Value>, has_id: bool) -> Result<()
     check_status(body)
 }
 
-/// Check input parts: `input_text`, or `input_image` with exactly one of a
+/// Check input parts: `input_text`, `input_image` with exactly one of a
 /// string `image_url` or `file_id` (the other `null`) and a `detail` of
-/// `low`, `high` or `auto` (the default).
+/// `low`, `high` or `auto` (the default), or `input_video` with exactly one
+/// of a `video_url` (a string, or `{"url": …}`, stored as the string) or
+/// `file_id`.
 fn input_parts(parts: &mut [Value]) -> Result<()> {
     for part in parts {
         let Value::Object(image) = &mut *part else {
             return Err(invalid("a content part must be an object"));
         };
+        if image.get("type").and_then(Value::as_str) == Some("input_video") {
+            only_keys(image, &["type", "video_url", "file_id"])?;
+            if let Some(Value::Object(video)) = image.get("video_url") {
+                let url = video.get("url").cloned().unwrap_or(Value::Null);
+                image.insert("video_url".to_owned(), url);
+            }
+            let source = |key| match image.get(key) {
+                None | Some(Value::Null) => Ok(false),
+                Some(Value::String(value)) if !value.is_empty() => Ok(true),
+                _ => Err(invalid(format!("{key} must be a non-empty string or null"))),
+            };
+            if source("video_url")? == source("file_id")? {
+                return Err(invalid(
+                    "an input_video part needs exactly one of video_url and file_id",
+                ));
+            }
+            for key in ["video_url", "file_id"] {
+                image.entry(key).or_insert(Value::Null);
+            }
+            continue;
+        }
         if image.get("type").and_then(Value::as_str) != Some("input_image") {
             text_parts(
                 std::slice::from_mut(part),
-                &["input_text", "input_image"],
+                &["input_text", "input_image", "input_video"],
                 "input_text",
                 false,
             )?;

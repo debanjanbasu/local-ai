@@ -27,6 +27,8 @@ pub const MERGE: usize = 2;
 const FACTOR: usize = PATCH * MERGE;
 /// Values per patch row (one temporal slice).
 pub const PATCH_VALUES: usize = 3 * PATCH * PATCH;
+/// `smart_resize`'s factor, for the video processor's variant.
+pub(super) const RESIZE_FACTOR: usize = FACTOR;
 /// The processor's `shortest_edge` (minimum pixels).
 const MIN_PIXELS: usize = 65_536;
 /// Largest aspect ratio the processor accepts.
@@ -79,6 +81,9 @@ impl ImageDetail {
 pub struct PreparedImage {
     /// The resized image (`height = rows * 32`, `width = cols * 32`).
     pub image: RgbImage,
+    /// A video frame group's second frame, the same size; `None` for a
+    /// still image, whose one frame fills both temporal slices.
+    pub next: Option<RgbImage>,
     /// Merged grid: `rows * cols` image tokens.
     pub rows: usize,
     pub cols: usize,
@@ -104,20 +109,37 @@ impl PreparedImage {
         (self.rows * MERGE, self.cols * MERGE)
     }
 
-    /// Normalized patch rows `[patches][PATCH_VALUES]` in merge order.
+    /// Values per patch row: one temporal slice for a still image, both
+    /// (frame then next) for a video frame group.
+    #[must_use]
+    pub const fn patch_values(&self) -> usize {
+        if self.next.is_some() {
+            2 * PATCH_VALUES
+        } else {
+            PATCH_VALUES
+        }
+    }
+
+    /// Normalized patch rows `[patches][patch_values]` in merge order, each
+    /// slice `(channel, row, column)`.
     #[must_use]
     pub fn patch_rows(&self) -> Vec<f32> {
         let (grid_h, grid_w) = self.grid();
         let width = self.image.width;
-        let pixels = &self.image.pixels;
-        let mut out = Vec::with_capacity(self.patches() * PATCH_VALUES);
+        let frames = std::iter::once(&self.image)
+            .chain(&self.next)
+            .map(|frame| frame.pixels.as_slice())
+            .collect::<Vec<_>>();
+        let mut out = Vec::with_capacity(self.patches() * self.patch_values());
         for (h, w) in merge_order(grid_h, grid_w) {
-            for channel in 0..3 {
-                for y in 0..PATCH {
-                    let row = (h * PATCH + y) * width + w * PATCH;
-                    for x in 0..PATCH {
-                        let value = f32::from(pixels[(row + x) * 3 + channel]);
-                        out.push((value - 127.5) / 127.5);
+            for pixels in &frames {
+                for channel in 0..3 {
+                    for y in 0..PATCH {
+                        let row = (h * PATCH + y) * width + w * PATCH;
+                        for x in 0..PATCH {
+                            let value = f32::from(pixels[(row + x) * 3 + channel]);
+                            out.push((value - 127.5) / 127.5);
+                        }
                     }
                 }
             }
@@ -138,7 +160,7 @@ pub fn merge_order(grid_h: usize, grid_w: usize) -> impl Iterator<Item = (usize,
 }
 
 /// Python's `round` (half to even) of a non-negative ratio.
-const fn round_half_even(value: f64) -> usize {
+pub(super) const fn round_half_even(value: f64) -> usize {
     value.round_ties_even() as usize
 }
 
@@ -199,6 +221,7 @@ pub fn prepare_decoded(image: &RgbImage, max_pixels: usize) -> crate::Result<Pre
         .into();
     Ok(PreparedImage {
         image,
+        next: None,
         rows,
         cols,
         digest,

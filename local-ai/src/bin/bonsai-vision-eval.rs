@@ -4,6 +4,7 @@
 //! ```text
 //! bonsai-vision-eval tower OUT_DIR
 //! bonsai-vision-eval llama OUT_DIR
+//! bonsai-vision-eval video OUT_DIR CLIP...
 //! bonsai-vision-eval bench IMAGE_FILE [low|auto|high]
 //! ```
 //!
@@ -23,6 +24,11 @@
 //!   prompt and after each of llama.cpp's first four greedy tokens (KL,
 //!   top-1, cosine), with the native tower's embeddings and with llama.cpp's
 //!   own, and the native greedy continuation against llama.cpp's.
+//! - `video`: per clip, the native decode (probe, sampled indices and
+//!   frames), preprocessing (patch rows), tower output and prompt layout
+//!   (expanded text and M-RoPE positions) under `OUT_DIR/<clip>/`, for the
+//!   transformers comparison (`Qwen3VLVideoProcessor`, the Qwen3.5 tower and
+//!   `get_rope_index`; see docs/BONSAI.md, "Video input").
 //! - `bench`: tower latency of one image at a detail.
 
 use std::path::{Path, PathBuf};
@@ -34,9 +40,12 @@ use local_engine::bonsai::{BonsaiPackage, WIDTH};
 use local_engine::bonsai_model::BonsaiEngine;
 use local_engine::bonsai_native::KvOptions;
 use local_engine::bonsai_ngram::NgramSettings;
+use local_engine::bonsai_tokenizer::BonsaiTokenizer;
+use local_engine::bonsai_vision::video::{decode_sampled, timestamp_text};
 use local_engine::bonsai_vision::{
-    IMAGE_PLACEHOLDER, ImageDetail, VISION_PROJECTOR_FILE, VisionEncoder, expand_prompt,
-    prepare_decoded, prepare_image, rotate_rows,
+    IMAGE_PLACEHOLDER, ImageDetail, VIDEO_PAD, VISION_END, VISION_PROJECTOR_FILE, VISION_START,
+    VisionEncoder, Visual, expand_prompt, prepare_decoded, prepare_image, prepare_video,
+    rotate_rows,
 };
 use local_engine::embedding::vision::preprocess::decode_image;
 use serde_json::Value;
@@ -340,7 +349,7 @@ fn llama(out: &Path) -> Result<()> {
                 .zip(embeddings)
                 .map(|(image, mut rows)| {
                     rotate_rows(&mut rows, &signs);
-                    (image, Arc::<[f32]>::from(rows))
+                    Visual::Image(image, Arc::<[f32]>::from(rows))
                 })
                 .collect::<Vec<_>>();
             let (expanded, images) = expand_prompt(&ids, encoder.digest(), &pairs)?;
@@ -421,18 +430,152 @@ fn bench(file: &Path, detail: ImageDetail) -> Result<()> {
     Ok(())
 }
 
+fn write_f32(path: &Path, values: &[f32]) -> Result<()> {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Dump each clip's native video preprocessing, tower output and prompt
+/// layout under `out/<stem>/` for the transformers comparison.
+#[allow(clippy::too_many_lines)]
+fn video(out: &Path, clips: &[String]) -> Result<()> {
+    let package = BonsaiPackage::open(MODEL)?;
+    let tokenizer = BonsaiTokenizer::from_package(&package)?;
+    let encoder = encoder(package.hadamard().signs(WIDTH as u32)?)?;
+    for clip in clips {
+        let path = Path::new(clip);
+        let stem = path.file_stem().ok_or("clip name")?.to_string_lossy();
+        let dir = out.join(stem.as_ref());
+        std::fs::create_dir_all(&dir)?;
+        let bytes = std::fs::read(path)?;
+        let started = Instant::now();
+        let (probe, indices, frames) = decode_sampled(&bytes)?;
+        let decoded = started.elapsed().as_secs_f64();
+        let mut raw = Vec::new();
+        for frame in &frames {
+            raw.extend_from_slice(&frame.pixels);
+        }
+        // The FFmpeg command-line path (swscale-exact, torchcodec's frames)
+        // as the decode reference.
+        let stream = local_engine::embedding::vision::video::probe(path)?;
+        let ffmpeg =
+            local_engine::embedding::vision::video::decode_frames(path, &stream, &indices)?;
+        let differ = frames
+            .iter()
+            .zip(&ffmpeg)
+            .map(|(a, b)| {
+                a.pixels
+                    .iter()
+                    .zip(&b.pixels)
+                    .filter(|(x, y)| x != y)
+                    .count()
+            })
+            .sum::<usize>();
+        println!(
+            "{}: decode vs FFmpeg ({:?}, {:?}, {} frames, {:?} fps): {differ} of {} values differ",
+            path.display(),
+            stream.pixel_format,
+            stream.color_space,
+            stream.timing.frames,
+            stream.timing.fps,
+            raw.len(),
+        );
+        std::fs::write(dir.join("frames.u8"), raw)?;
+        let started = Instant::now();
+        let video = prepare_video(&bytes)?;
+        let prepared = started.elapsed().as_secs_f64();
+        let first = video.groups.first().ok_or("no groups")?;
+        let mut pixels = Vec::new();
+        let mut embedding = Vec::new();
+        let started = Instant::now();
+        for group in &video.groups {
+            pixels.extend(group.patch_rows());
+            embedding.extend(encoder.encode_raw(group, None, &mut |_, _| {})?);
+        }
+        let tower = started.elapsed().as_secs_f64();
+        write_f32(&dir.join("pixels.f32"), &pixels)?;
+        write_f32(&dir.join("embd.f32"), &embedding)?;
+        // A prompt: text, the template's video placeholder, text.
+        let mut ids = tokenizer.encode("Describe:")?;
+        ids.extend([VISION_START, VIDEO_PAD, VISION_END]);
+        ids.extend(tokenizer.encode(" Done.")?);
+        let groups = video
+            .groups
+            .iter()
+            .zip(&video.timestamps)
+            .map(|(group, &seconds)| {
+                Ok((
+                    tokenizer.encode(&timestamp_text(seconds))?,
+                    group,
+                    vec![0.0; group.tokens() * WIDTH].into(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (expanded, images) = expand_prompt(&ids, encoder.digest(), &[Visual::Video(groups)])?;
+        let mut text = String::new();
+        for (position, &id) in expanded.iter().enumerate() {
+            if images.covers(position) {
+                text.push_str("<|video_pad|>");
+            } else {
+                text.push_str(&tokenizer.decode(&[id], false)?);
+            }
+        }
+        let rope = (0..expanded.len())
+            .map(|position| images.rope(position))
+            .collect::<Vec<_>>();
+        let record = serde_json::json!({
+            "clip": clip,
+            "total_frames": probe.total_frames,
+            "fps": probe.fps,
+            "width": probe.width,
+            "height": probe.height,
+            "indices": indices,
+            "frames": frames.len(),
+            "resized": [first.image.height, first.image.width],
+            "grid_thw": [video.groups.len(), first.rows * 2, first.cols * 2],
+            "timestamps": video.timestamps,
+            "tokens": video.tokens(),
+            "prompt_text": text,
+            "rope": rope,
+            "video_token": (0..expanded.len()).map(|position| images.covers(position)).collect::<Vec<_>>(),
+            "video_spans": images.spans().iter().map(|span| span.start).collect::<Vec<_>>(),
+            "seconds": {"decode": decoded, "prepare": prepared, "tower": tower},
+        });
+        std::fs::write(dir.join("native.json"), serde_json::to_vec_pretty(&record)?)?;
+        println!(
+            "{stem}: {} frames at {:.3} fps, sampled {}, {} groups of {}x{} merged ({} tokens); \
+             decode {decoded:.2}s, prepare {prepared:.2}s, tower {tower:.2}s",
+            probe.total_frames,
+            probe.fps,
+            indices.len(),
+            video.groups.len(),
+            first.rows,
+            first.cols,
+            video.tokens(),
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("tower") if args.len() == 2 => tower(Path::new(&args[1])),
         Some("llama") if args.len() == 2 => llama(Path::new(&args[1])),
+        Some("video") if args.len() >= 3 => video(Path::new(&args[1]), &args[2..]),
         Some("bench") if args.len() >= 2 => bench(
             Path::new(&args[1]),
             args.get(2)
                 .map_or(Ok(ImageDetail::Auto), |d| ImageDetail::parse(d))?,
         ),
         _ => Err(
-            "usage: bonsai-vision-eval tower|llama OUT_DIR | bench IMAGE [low|auto|high]".into(),
+            "usage: bonsai-vision-eval tower|llama OUT_DIR | video OUT_DIR CLIP... | bench IMAGE \
+             [low|auto|high]"
+                .into(),
         ),
     }
 }

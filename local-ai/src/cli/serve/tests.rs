@@ -89,9 +89,31 @@ fn image_parts_keep_their_place_in_the_text() {
             (12, local_engine::ImageDetail::Auto, 4)
         ]
     );
+    // Videos (vLLM's `video_url`, llama.cpp's `input_video`, or an uploaded
+    // or inline file that is one) sit among them the same way.
+    let mp4 = base64::engine::general_purpose::STANDARD.encode(b"\0\0\0\x18ftypisom\0\0\x02\0");
+    let parts = message_parts(
+        &json!([
+            {"type":"video_url","video_url":{"url":format!("data:video/mp4;base64,{mp4}")}},
+            {"type":"text","text":"and"},
+            {"type":"input_video","input_video":{"data":mp4}},
+            {"type":"file","file":{"file_data":mp4}},
+            {"type":"file","file":{"file_data":png}},
+        ]),
+        None,
+    )
+    .expect("video parts");
+    let placed = parts
+        .images
+        .iter()
+        .map(|part| (part.offset, part.video))
+        .collect::<Vec<_>>();
+    assert_eq!(placed, [(0, true), (3, true), (3, true), (3, false)]);
     for refused in [
         json!([{"type":"image_url"}]),
-        json!([{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]),
+        json!([{"type":"image_url","image_url":{"url":"http://127.0.0.1:9/a.png"}}]),
+        json!([{"type":"video_url","video_url":{"url":"http://localhost:9/a.mp4"}}]),
+        json!([{"type":"video_url","video_url":{}}]),
         json!([{"type":"image_url","image_url":{"url":"data:image/png,abc"}}]),
         json!([{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png}"),"detail":"max"}}]),
         json!([{"type":"file","file":{"file_id":"file-1"}}]),

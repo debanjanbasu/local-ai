@@ -299,6 +299,8 @@ fn an_invalid_item_rolls_back_the_whole_batch() {
         json!({"role": "user", "content": [{"type": "input_image", "image_url": "data:,", "file_id": "file-1"}]}),
         json!({"role": "user", "content": [{"type": "input_image", "file_id": "file-1", "detail": "max"}]}),
         json!({"role": "assistant", "content": [{"type": "input_image", "file_id": "file-1"}]}),
+        json!({"role": "user", "content": [{"type": "input_video", "video_url": "https://v/a.mp4", "file_id": "file-1"}]}),
+        json!({"role": "user", "content": [{"type": "input_video", "video_url": {"url": ""}}]}),
         json!({"role": "user", "content": [{"type": "input_audio", "input_audio": {}}]}),
         json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
         json!({"type": "file_search_call", "queries": "q"}),
@@ -360,6 +362,17 @@ fn an_invalid_item_rolls_back_the_whole_batch() {
     assert_eq!(
         added.data[0].body["content"][1],
         json!({"type": "input_image", "file_id": "file-1", "image_url": null, "detail": "auto"})
+    );
+    // So is a video part, its `{"url"}` form stored as the URL.
+    let video = json!({"role": "user", "content": [
+        {"type": "input_video", "video_url": {"url": "https://example.com/v.mp4"}},
+    ]});
+    let added = store
+        .add_items(&conversation.id, vec![video])
+        .expect("video added");
+    assert_eq!(
+        added.data[0].body["content"][0],
+        json!({"type": "input_video", "video_url": "https://example.com/v.mp4", "file_id": null})
     );
 }
 

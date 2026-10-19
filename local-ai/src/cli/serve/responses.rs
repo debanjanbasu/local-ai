@@ -2047,14 +2047,17 @@ fn input_item(
     Ok(())
 }
 
-/// Text and images of a message or tool output: a string, or text parts
-/// concatenated with each `input_image` (a base64 data URL `image_url` or
-/// an uploaded `file_id`, with `detail`) in its place.
+/// Text, images and videos of a message or tool output: a string, or text
+/// parts concatenated with each `input_image` (a data or `http(s)` URL
+/// `image_url`, or an uploaded `file_id`, with `detail`) and `input_video`
+/// (a `video_url`, likewise, or `file_id`; this server's extension) in its
+/// place.
 fn item_parts(
     content: &Value,
     role: &str,
     files: Option<&ConversationStore>,
 ) -> crate::Result<super::images::Parts> {
+    use super::images::Kind;
     let mut out = super::images::Parts::default();
     match content {
         Value::String(text) => {
@@ -2072,7 +2075,7 @@ fn item_parts(
                             part.get("image_url").and_then(Value::as_str),
                             part.get("file_id").and_then(Value::as_str),
                         ) {
-                            (Some(url), None) => super::images::url(url)?,
+                            (Some(url), None) => super::images::url(url, Kind::Image)?,
                             (None, Some(id)) => super::images::file(files, id)?,
                             _ => {
                                 return Err(invalid(
@@ -2084,10 +2087,28 @@ fn item_parts(
                         out.push_image(data, super::images::detail(part.get("detail"))?);
                         continue;
                     }
+                    "input_video" => {
+                        let url = match part.get("video_url") {
+                            Some(Value::Object(video)) => video.get("url").and_then(Value::as_str),
+                            other => other.and_then(Value::as_str),
+                        };
+                        let data = match (url, part.get("file_id").and_then(Value::as_str)) {
+                            (Some(url), None) => super::images::url(url, Kind::Video)?,
+                            (None, Some(id)) => super::images::file(files, id)?,
+                            _ => {
+                                return Err(invalid(
+                                    "an input_video part needs exactly one of video_url and \
+                                     file_id",
+                                ));
+                            }
+                        };
+                        out.push_video(data);
+                        continue;
+                    }
                     "input_file" | "input_audio" => {
                         return Err(unsupported(
                             &format!("content part {kind:?}"),
-                            "Bonsai 2 reads text and images (input_image)",
+                            "Bonsai 2 reads text, images (input_image) and video (input_video)",
                         ));
                     }
                     other => {

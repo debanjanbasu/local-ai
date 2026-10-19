@@ -1,4 +1,5 @@
-//! Web fetch: one `GET` to an allowlisted public host.
+//! Web fetch: one `GET` to an allowlisted public host ([`fetch`]), and the
+//! same checked transport for media a request names by URL ([`download`]).
 //!
 //! - The URL must be `http` or `https`, without user information, naming a
 //!   host by DNS name (IP literals are refused) that equals an allowlisted
@@ -9,7 +10,8 @@
 //!   to an address that was checked, so the name is never resolved again in
 //!   between (no DNS rebinding).
 //! - Redirects are reported, never followed: the model may fetch the target
-//!   itself, through the same checks.
+//!   itself, through the same checks. ([`download`] follows up to five, each
+//!   target checked anew.)
 //! - `https` is verified by the platform verifier (the macOS trust store).
 //! - The body is read up to the byte limit and the connection then dropped,
 //!   with a marker saying the text was cut; the caller's deadline bounds the
@@ -108,8 +110,9 @@ pub struct Target {
     pub path: String,
 }
 
-/// Parse and check `url` against `domains`, before any network use.
-pub fn target(url: &str, domains: &[String]) -> Result<Target, ToolError> {
+/// Parse `url` (scheme, user information, host and port) before any
+/// network use. An IP literal host is kept, without IPv6 brackets.
+fn parse(url: &str) -> Result<Target, ToolError> {
     if url.len() > MAX_URL_BYTES {
         return Err(ToolError::Invalid(format!(
             "the URL is longer than {MAX_URL_BYTES} bytes"
@@ -136,17 +139,11 @@ pub fn target(url: &str, domains: &[String]) -> Result<Target, ToolError> {
         ));
     }
     let host = authority.host().to_ascii_lowercase();
-    let host = host.trim_end_matches('.').to_owned();
-    if host.starts_with('[') || host.parse::<IpAddr>().is_ok() {
-        return Err(ToolError::Denied(
-            "IP address hosts are refused; the allowlist names domains".into(),
-        ));
-    }
-    if !allowed(&host, domains) {
-        return Err(ToolError::Denied(format!(
-            "{host} is not on this server's fetch allowlist"
-        )));
-    }
+    let host = host
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
     let port = authority.port_u16().unwrap_or(if https { 443 } else { 80 });
     let path = uri
         .path_and_query()
@@ -157,6 +154,23 @@ pub fn target(url: &str, domains: &[String]) -> Result<Target, ToolError> {
         port,
         path,
     })
+}
+
+/// Parse and check `url` against `domains`, before any network use.
+pub fn target(url: &str, domains: &[String]) -> Result<Target, ToolError> {
+    let target = parse(url)?;
+    if target.host.parse::<IpAddr>().is_ok() {
+        return Err(ToolError::Denied(
+            "IP address hosts are refused; the allowlist names domains".into(),
+        ));
+    }
+    if !allowed(&target.host, domains) {
+        return Err(ToolError::Denied(format!(
+            "{} is not on this server's fetch allowlist",
+            target.host
+        )));
+    }
+    Ok(target)
 }
 
 /// Resolve `target` and return an address, refusing the name if any of its
@@ -189,43 +203,48 @@ impl Drop for Connection {
     }
 }
 
-/// Fetch `url`, reading at most `max_bytes` of body.
-pub async fn fetch(url: &str, domains: &[String], max_bytes: usize) -> Result<Output, ToolError> {
-    let target = target(url, domains)?;
-    let address = resolve(&target).await?;
+/// Connect to `target` (at a checked public address) and send one `GET`.
+async fn open(
+    target: &Target,
+) -> Result<(http::Response<hyper::body::Incoming>, Connection), ToolError> {
+    let address = resolve(target).await?;
     let failed =
         |error: &dyn std::fmt::Display| ToolError::Failed(format!("fetch failed: {error}"));
     let tcp = tokio::net::TcpStream::connect(address)
         .await
         .map_err(|error| failed(&error))?;
     let request = http::Request::get(target.path.as_str())
-        .header(http::header::HOST, host_header(&target))
+        .header(http::header::HOST, host_header(target))
         .header(http::header::USER_AGENT, "local-ai-tools/1")
         .header(http::header::ACCEPT, "*/*")
         .header(http::header::ACCEPT_ENCODING, "identity")
         .header(http::header::CONNECTION, "close")
         .body(http_body_util::Empty::<bytes::Bytes>::new())
         .map_err(|error| failed(&error))?;
-    let response = if target.https {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))
-            .map_err(|error| failed(&error))?;
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|error| failed(&error))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
-        let name = ServerName::try_from(target.host.clone()).map_err(|error| failed(&error))?;
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-            .connect(name, tcp)
-            .await
-            .map_err(|error| failed(&error))?;
-        send(TokioIo::new(tls), request).await?
-    } else {
-        send(TokioIo::new(tcp), request).await?
-    };
-    let (response, _connection) = response;
+    if !target.https {
+        return send(TokioIo::new(tcp), request).await;
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))
+        .map_err(|error| failed(&error))?;
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| failed(&error))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    let name = ServerName::try_from(target.host.clone()).map_err(|error| failed(&error))?;
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await
+        .map_err(|error| failed(&error))?;
+    send(TokioIo::new(tls), request).await
+}
+
+/// Fetch `url`, reading at most `max_bytes` of body.
+pub async fn fetch(url: &str, domains: &[String], max_bytes: usize) -> Result<Output, ToolError> {
+    let target = target(url, domains)?;
+    let (response, _connection) = open(&target).await?;
     let status = response.status();
     let mut text = format!("HTTP {}\n", status.as_u16());
     for name in [http::header::CONTENT_TYPE, http::header::LOCATION] {
@@ -249,7 +268,7 @@ pub async fn fetch(url: &str, domains: &[String], max_bytes: usize) -> Result<Ou
     let mut kept = Vec::new();
     let mut truncated = false;
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|error| failed(&error))?;
+        let frame = frame.map_err(|error| ToolError::Failed(format!("fetch failed: {error}")))?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
@@ -268,12 +287,112 @@ pub async fn fetch(url: &str, domains: &[String], max_bytes: usize) -> Result<Ou
     Ok(Output::Text { text, truncated })
 }
 
+/// Redirects [`download`] follows.
+const MAX_REDIRECTS: usize = 5;
+
+/// A body [`download`] read whole.
+#[derive(Debug)]
+pub struct Download {
+    /// The response's `Content-Type`, if any.
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// `GET` `url` from any public host, for media a request names.
+///
+/// A host by name or public IP literal, with the address checks of
+/// [`fetch`] but no allowlist. Up to five redirects are followed, each target checked anew; a status
+/// other than success, or a body over `max_bytes`, fails. The caller's
+/// deadline bounds the whole exchange.
+pub async fn download(url: &str, max_bytes: usize) -> Result<Download, ToolError> {
+    let mut target = parse(url)?;
+    for _ in 0..=MAX_REDIRECTS {
+        let (response, _connection) = open(&target).await?;
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(http::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    ToolError::Failed(format!("HTTP {} without a Location", status.as_u16()))
+                })?;
+            target = parse(&join(&target, location))?;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(ToolError::Failed(format!(
+                "the server answered HTTP {}",
+                status.as_u16()
+            )));
+        }
+        let too_large = || ToolError::Invalid(format!("the body is larger than {max_bytes} bytes"));
+        let headers = response.headers();
+        if headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(too_large());
+        }
+        let content_type = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut body = response.into_body();
+        let mut kept = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame =
+                frame.map_err(|error| ToolError::Failed(format!("fetch failed: {error}")))?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if data.len() > max_bytes - kept.len() {
+                return Err(too_large());
+            }
+            kept.extend_from_slice(&data);
+        }
+        return Ok(Download {
+            content_type,
+            body: kept,
+        });
+    }
+    Err(ToolError::Failed(format!(
+        "more than {MAX_REDIRECTS} redirects"
+    )))
+}
+
+/// `location` (absolute, scheme-relative, absolute-path or relative) resolved
+/// against `base`.
+fn join(base: &Target, location: &str) -> String {
+    let scheme = if base.https { "https" } else { "http" };
+    if location.starts_with("http://") || location.starts_with("https://") {
+        location.to_owned()
+    } else if let Some(rest) = location.strip_prefix("//") {
+        format!("{scheme}://{rest}")
+    } else if location.starts_with('/') {
+        format!("{scheme}://{}{location}", host_header(base))
+    } else {
+        let path = base.path.split(['?', '#']).next().unwrap_or_default();
+        let directory = path
+            .rfind('/')
+            .and_then(|end| path.get(..=end))
+            .unwrap_or("/");
+        format!("{scheme}://{}{directory}{location}", host_header(base))
+    }
+}
+
 fn host_header(target: &Target) -> String {
     let default = if target.https { 443 } else { 80 };
-    if target.port == default {
-        target.host.clone()
+    let host = if target.host.contains(':') {
+        format!("[{}]", target.host)
     } else {
-        format!("{}:{}", target.host, target.port)
+        target.host.clone()
+    };
+    if target.port == default {
+        host
+    } else {
+        format!("{host}:{}", target.port)
     }
 }
 
@@ -295,4 +414,27 @@ where
         .await
         .map_err(|error| ToolError::Failed(format!("fetch failed: {error}")))?;
     Ok((response, connection))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    #[test]
+    fn redirect_locations_resolve_against_the_request() {
+        let base = super::parse("https://cdn.example.com:8443/media/a/b.png?x=1").expect("url");
+        for (location, expected) in [
+            ("http://other.example/x.png", "http://other.example/x.png"),
+            ("//img.example/y.png", "https://img.example/y.png"),
+            ("/z.png", "https://cdn.example.com:8443/z.png"),
+            (
+                "c.png?v=2",
+                "https://cdn.example.com:8443/media/a/c.png?v=2",
+            ),
+        ] {
+            assert_eq!(super::join(&base, location), expected);
+        }
+        let v6 = super::parse("http://[2606:4700::1]/p/q").expect("url");
+        assert_eq!(v6.host, "2606:4700::1");
+        assert_eq!(super::join(&v6, "r"), "http://[2606:4700::1]/p/r");
+    }
 }
