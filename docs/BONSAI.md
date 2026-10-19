@@ -538,8 +538,7 @@ stateless request, with its original `id` or without one (the AI SDK omits it
 with `store: false`, since `OpenAI`'s envelopes need none), when the ID the
 envelope carries is used; the authenticated text replaces any plaintext
 beside it, and an altered envelope, one from another key, model or item, or an
-unknown version fails the request. Envelopes from before the ID was carried
-still open with their `id`. Compaction items are sealed the same way.
+unknown version fails the request. Compaction items are sealed the same way.
 `include: ["reasoning.encrypted_content"]` is accepted only with a key and is
 the only `include` value implemented; without a key it, and any
 `encrypted_content` input, are refused. A request that does not ask for it gets

@@ -27,8 +27,7 @@
 //! The item ID travels in the envelope, in the clear and authenticated, so a
 //! client that replays an item without its `id` (the AI SDK does, with
 //! `store: false`, because `OpenAI`'s envelopes need none) still names the
-//! item it was sealed for ([`ReasoningCipher::sealed_item_id`]). Version 1
-//! envelopes, which carried no ID, still open when the ID is given.
+//! item it was sealed for ([`ReasoningCipher::sealed_item_id`]).
 
 use std::ffi::OsString;
 use std::fmt;
@@ -45,8 +44,6 @@ use rustix::io::Errno;
 
 /// Envelope format version; bound into the associated data.
 const VERSION: u8 = 2;
-/// The format before the item ID was carried in the envelope.
-const VERSION_WITHOUT_ID: u8 = 1;
 /// Longest item ID an envelope carries; server item IDs are 35 bytes.
 const MAX_ITEM_ID_BYTES: usize = u8::MAX as usize;
 /// Domain separation for the associated data.
@@ -299,22 +296,19 @@ impl ReasoningCipher {
         let mut sealed = URL_SAFE_NO_PAD
             .decode(envelope)
             .map_err(|_| ReasoningCryptoError::MalformedEnvelope)?;
-        let (version, start) = match split_item_id(&sealed)? {
-            (VERSION_WITHOUT_ID, None) => (VERSION_WITHOUT_ID, HEADER_LEN),
-            // The carried ID is authenticated through the associated data
-            // too; comparing it first only gives a mismatch its own path.
-            (VERSION, Some(carried)) if carried == item_id.as_bytes() => {
-                (VERSION, HEADER_LEN + 1 + carried.len())
-            }
-            (VERSION, Some(_)) => return Err(ReasoningCryptoError::Authentication),
-            (other, _) => return Err(ReasoningCryptoError::UnsupportedVersion(other)),
-        };
+        // The carried ID is authenticated through the associated data too;
+        // comparing it first only gives a mismatch its own path.
+        let carried = split_item_id(&sealed)?;
+        if carried != item_id.as_bytes() {
+            return Err(ReasoningCryptoError::Authentication);
+        }
+        let start = HEADER_LEN + 1 + carried.len();
         if sealed.len() < start + TAG_LEN {
             return Err(ReasoningCryptoError::MalformedEnvelope);
         }
         let mut nonce = [0_u8; NONCE_LEN];
         nonce.copy_from_slice(&sealed[1..HEADER_LEN]);
-        let aad = associated_data(domain, version, model_id, item_id);
+        let aad = associated_data(domain, VERSION, model_id, item_id);
         let plaintext = self
             .key
             .open_in_place(
@@ -330,28 +324,24 @@ impl ReasoningCipher {
 
 impl ReasoningCipher {
     /// The item ID `envelope` says it was sealed for, read without the key,
-    /// or `None` for an envelope that carries none. Unauthenticated until
+    /// or `None` for a malformed envelope. Unauthenticated until
     /// [`unseal`](Self::unseal) succeeds with it.
     pub fn sealed_item_id(envelope: &str) -> Option<String> {
         if envelope.len() > MAX_ENVELOPE_CHARS {
             return None;
         }
         let sealed = URL_SAFE_NO_PAD.decode(envelope).ok()?;
-        match split_item_id(&sealed).ok()? {
-            (VERSION, Some(id)) => String::from_utf8(id.to_vec()).ok(),
-            _ => None,
-        }
+        String::from_utf8(split_item_id(&sealed).ok()?.to_vec()).ok()
     }
 }
 
-/// A decoded envelope's version and, for the current version, the item ID
-/// it carries.
-fn split_item_id(sealed: &[u8]) -> Result<(u8, Option<&[u8]>)> {
+/// The item ID a decoded envelope carries, after checking its version.
+fn split_item_id(sealed: &[u8]) -> Result<&[u8]> {
     let version = *sealed
         .first()
         .ok_or(ReasoningCryptoError::MalformedEnvelope)?;
     if version != VERSION {
-        return Ok((version, None));
+        return Err(ReasoningCryptoError::UnsupportedVersion(version));
     }
     let len = usize::from(
         *sealed
@@ -361,7 +351,7 @@ fn split_item_id(sealed: &[u8]) -> Result<(u8, Option<&[u8]>)> {
     let id = sealed
         .get(HEADER_LEN + 1..HEADER_LEN + 1 + len)
         .ok_or(ReasoningCryptoError::MalformedEnvelope)?;
-    Ok((version, Some(id)))
+    Ok(id)
 }
 
 /// The associated data binding an envelope to its version, model and item.
@@ -540,12 +530,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use ring::aead::{Aad, NONCE_LEN, Nonce};
 
-    use super::{
-        DOMAIN, HEADER_LEN, MAX_REASONING_BYTES, ReasoningCipher, ReasoningCryptoError,
-        VERSION_WITHOUT_ID, associated_data,
-    };
+    use super::{HEADER_LEN, MAX_REASONING_BYTES, ReasoningCipher, ReasoningCryptoError};
 
     const MODEL: &str = "bonsai-2-27b";
     const ITEM: &str = "rs_0123456789abcdef";
@@ -784,8 +770,7 @@ mod tests {
     }
 
     /// The envelope names its item, so an item replayed without its `id`
-    /// can be opened; a carried ID altered to another item's fails, and a
-    /// version 1 envelope (no carried ID) still opens with its ID.
+    /// can be opened, and a carried ID altered to another item's fails.
     #[test]
     fn envelopes_carry_their_authenticated_item_id() {
         let scratch = Scratch::new();
@@ -808,27 +793,6 @@ mod tests {
             Err(ReasoningCryptoError::Authentication)
         ));
         assert_eq!(ReasoningCipher::sealed_item_id("not an envelope"), None);
-
-        let nonce = [7_u8; NONCE_LEN];
-        let aad = associated_data(DOMAIN, VERSION_WITHOUT_ID, MODEL, ITEM);
-        let mut legacy = vec![VERSION_WITHOUT_ID];
-        legacy.extend_from_slice(&nonce);
-        legacy.extend_from_slice(b"older");
-        let tag = cipher
-            .key
-            .seal_in_place_separate_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad.as_slice()),
-                &mut legacy[HEADER_LEN..],
-            )
-            .expect("seals");
-        legacy.extend_from_slice(tag.as_ref());
-        let legacy = URL_SAFE_NO_PAD.encode(&legacy);
-        assert_eq!(ReasoningCipher::sealed_item_id(&legacy), None);
-        assert_eq!(
-            cipher.unseal(MODEL, ITEM, &legacy).expect("unseals"),
-            "older"
-        );
     }
 
     #[test]
