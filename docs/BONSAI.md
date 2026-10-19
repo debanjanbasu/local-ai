@@ -3342,6 +3342,31 @@ send), then a follow-up that needs the compacted context.
 Evidence: `.scratch/artifacts/client-compat/remote-b` (after rebasing; an
 earlier run, `remote-a`, passed the same four with one automatic compaction).
 
+**Current-spec request surface** (branch `request-surface`, 2026-10-19;
+Codex CLI 0.163.0, opencode 1.19.3, Oh My Pi 18.12.2; server with
+`--reasoning-key`), after Chat `stop` and `verbosity`, ignored unknown
+Responses members, and the removal of the deprecated-member adapters
+(`functions`/`function_call`, `user`, `reasoning.generate_summary`,
+`session_id`, `prompt_cache_retention`) and of `http-legacy-members`. Every
+Codex scenario now runs with `remote_compaction = "v2"`, and its requests
+carry `x-codex-beta-features: remote_compaction_v2`. The recorded requests
+use only current members, plus `max_tokens` (opencode Chat) and
+`client_metadata` (Codex).
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| omp-read | PASS | 3 requests, 46 s; `42`, then `7` |
+| opencode-read (Chat) | PASS | 4 requests, 66 s; `42`, then `7` |
+| opencode-responses-read | PASS | 4 requests, 62 s; `42`, then `7` |
+| codex-read (v2) | PASS | 4 requests, 55 s; `42`, then `7` |
+| codex-remote-compact | PASS | 23 requests, 368 s; seven `compaction_trigger` turns, each answered with one `compaction` item, 13 later requests replaying one, no local compaction; tests pass |
+| codex-remote-compact-manual | PASS | 5 requests, 23 s; `42`, the manual compaction turn, `7` |
+
+Evidence: `.scratch/artifacts/client-compat/request-surface` and
+`request-surface-codex`, and `request-surface-rebased` (the four read
+scenarios again, all passing, after rebasing onto video input); live `stop`, `verbosity` and unknown-member probes
+in `.scratch/artifacts/request-surface/live.json`.
+
 #### Long-context coding quality
 
 Each seed plants nine questions in a synthetic Python repository: at the
