@@ -5,12 +5,12 @@ use crate::bonsai_ngram::NgramSettings;
 
 #[test]
 fn requests_reject_truncation_overflow_and_invalid_ids() {
-    assert!(validate_request(&[5, 8, 12], 5, 8).is_ok());
-    assert!(validate_request(&[5, 8, 12], 6, 8).is_err());
-    assert!(validate_request(&[5], usize::MAX, 8).is_err());
-    assert!(validate_request(&[], 5, 8).is_err());
-    assert!(validate_request(&[VOCAB as u32], 1, 8).is_err());
-    assert!(validate_request(&[VOCAB as u32 - 1], 0, 1).is_ok());
+    assert!(validate_request(&[5, 8, 12], 5, 8, None).is_ok());
+    assert!(validate_request(&[5, 8, 12], 6, 8, None).is_err());
+    assert!(validate_request(&[5], usize::MAX, 8, None).is_err());
+    assert!(validate_request(&[], 5, 8, None).is_err());
+    assert!(validate_request(&[VOCAB as u32], 1, 8, None).is_err());
+    assert!(validate_request(&[VOCAB as u32 - 1], 0, 1, None).is_ok());
 }
 
 #[test]

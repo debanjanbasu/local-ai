@@ -193,6 +193,69 @@ fn chat_reasoning_effort_runs_at_the_nearest_template_level() {
 }
 
 #[test]
+fn responses_input_images_keep_their_place_and_detail() {
+    // "PNG" in base64: the bytes are only decoded by the engine.
+    let body = json!({"input":[
+        {"role":"user","content":[
+            {"type":"input_text","text":"what is "},
+            {"type":"input_image","image_url":"data:image/png;base64,UE5H","detail":"high"},
+            {"type":"input_text","text":"?"},
+        ]},
+        {"type":"function_call","call_id":"c1","name":"look","arguments":"{}"},
+        {"type":"function_call_output","call_id":"c1","output":[
+            {"type":"input_image","image_url":"data:image/png;base64,UE5H"},
+        ]},
+    ],"tools":[{"type":"function","name":"look","parameters":{"type":"object"}}]});
+    let request = prepare_responses(body.to_string().as_bytes(), true)
+        .expect("valid")
+        .request;
+    let images = request
+        .messages
+        .iter()
+        .map(|message| {
+            let placed = message.images.iter();
+            (
+                message.role.as_str(),
+                placed
+                    .map(|image| (image.offset, image.detail, &*image.data))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        images,
+        [
+            (
+                "user",
+                vec![(8, local_engine::ImageDetail::High, &b"PNG"[..])]
+            ),
+            ("assistant", vec![]),
+            (
+                "tool",
+                vec![(0, local_engine::ImageDetail::Auto, &b"PNG"[..])]
+            ),
+        ]
+    );
+    // file_id images need the Files store, and assistants show no images.
+    for (content, role, needle) in [
+        (
+            json!([{"type":"input_image","file_id":"file-1"}]),
+            "user",
+            "Files API",
+        ),
+        (json!([{"type":"input_image"}]), "user", "exactly one"),
+        (
+            json!([{"type":"input_image","image_url":"data:image/png;base64,UE5H"}]),
+            "assistant",
+            "assistant",
+        ),
+    ] {
+        let error = responses_error(&json!({"input":[{"role":role,"content":content}]}));
+        assert!(error.contains(needle), "{content}: {error}");
+    }
+}
+
+#[test]
 fn responses_reasoning_context_and_effort_reach_the_engine() {
     let prepare = |reasoning: Value| {
         let body = json!({"input":"hi","reasoning":reasoning});
@@ -863,7 +926,7 @@ fn responses_reject_what_they_cannot_honour() {
         (json!({"input":"hi","client_metadata":[]}), "expected a map"),
         (
             json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]}),
-            "text-only",
+            "must be a base64 data URL",
         ),
         (
             json!({"input":[{"type":"item_reference","id":"msg_1"}]}),

@@ -17,6 +17,8 @@ use crate::bonsai_model::{BonsaiEngine, BonsaiInfo, CancelToken, PromptCacheSour
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
 use crate::bonsai_tokenizer::{BonsaiTokenizer, ReasoningEffort};
+pub use crate::bonsai_vision::ImageDetail;
+use crate::bonsai_vision::{PromptImages, VisionEncoder};
 use crate::judgment::{Decision, DecisionCapture, DecisionRequest, JudgmentHead, PreparedDecision};
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
 use crate::runtime::{EVENT_BUFFER, PrefillProgress};
@@ -50,6 +52,23 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// For a `tool` message, the [`ToolCall::id`] this result answers.
     pub tool_call_id: Option<String>,
+    /// Images in `content`, each at a byte offset of it, in order. The
+    /// template renders each as `<|vision_start|><|image_pad|><|vision_end|>`
+    /// there; system and developer messages may not hold images. Needs the
+    /// vision projector installed.
+    pub images: Vec<ChatImage>,
+}
+
+/// An image part of a [`ChatMessage`].
+#[derive(Clone, Debug)]
+pub struct ChatImage {
+    /// Byte offset in the message content (a character boundary) where the
+    /// image sits; offsets never decrease along a message's images.
+    pub offset: usize,
+    /// The encoded file: JPEG, PNG, WebP, GIF (first frame) or BMP.
+    pub data: Arc<[u8]>,
+    /// Its pixel budget.
+    pub detail: ImageDetail,
 }
 
 /// Sampling controls for one generation.
@@ -114,6 +133,10 @@ pub struct Plan {
     pub prompt_cache_dir: Option<std::path::PathBuf>,
     /// Disk prompt-cache budget in bytes.
     pub prompt_cache_budget: u64,
+    /// Whether image input is available (the vision projector loaded).
+    pub vision: bool,
+    /// Why image input is or is not available.
+    pub vision_reason: String,
 }
 
 /// Loaded engine information and startup policy.
@@ -235,6 +258,7 @@ enum Delivered {
 pub struct Engine {
     inner: BonsaiEngine,
     info: EngineInfo,
+    vision: Option<Arc<VisionEncoder>>,
     not_sync: std::marker::PhantomData<Cell<()>>,
 }
 
@@ -278,6 +302,11 @@ impl Engine {
             resources.disk_budget_bytes,
             resources.prompt_cache_write_bytes_per_second,
         )?;
+        let vision = resources
+            .vision
+            .as_deref()
+            .map(|path| VisionEncoder::open(path, inner.input_signs()?).map(Arc::new))
+            .transpose()?;
         let plan = Plan {
             model: resources.model.clone(),
             model_reason: resources.model_reason.clone(),
@@ -285,6 +314,8 @@ impl Engine {
             speculation_reason: resources.mtp_reason.clone(),
             prompt_cache_dir: resources.prompt_cache_dir.clone(),
             prompt_cache_budget: resources.disk_budget_bytes,
+            vision: vision.is_some(),
+            vision_reason: resources.vision_reason.clone(),
         };
         let model = inner.info().clone();
         let json =
@@ -292,6 +323,7 @@ impl Engine {
         Ok(Self {
             inner,
             info: EngineInfo { plan, model, json },
+            vision,
             not_sync: std::marker::PhantomData,
         })
     }
@@ -344,7 +376,7 @@ impl Engine {
     /// compiled), and the count is not checked against the context window.
     /// CPU-only; no GPU work is submitted.
     pub fn count_chat_tokens(&self, request: &ChatRequest) -> crate::Result<usize> {
-        count_chat(self.inner.tokenizer(), request)
+        count_chat(self.inner.tokenizer(), self.vision.as_deref(), request)
     }
 
     /// Chat with one user prompt and collect the final answer and statistics.
@@ -417,15 +449,21 @@ impl Engine {
         progress: &mut dyn FnMut(PrefillProgress),
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
-        let (ids, tools) = chat_prompt_ids(self.inner.tokenizer(), request)?;
         let grammar = chat_grammar(self.inner.tokenizer(), request)?;
+        let prompt = chat_prompt(
+            self.inner.tokenizer(),
+            self.vision.as_deref(),
+            None,
+            request,
+        )?;
         self.generate(
-            &ids,
+            &prompt.ids,
+            prompt.images,
             request.max_tokens,
             &request.sampling,
             request.session.as_deref(),
             request.thinking,
-            tools,
+            prompt.tools,
             grammar,
             cancel,
             progress,
@@ -437,6 +475,7 @@ impl Engine {
     fn generate(
         &mut self,
         ids: &[u32],
+        images: Option<Arc<PromptImages>>,
         max_tokens: usize,
         sampling: &Sampling,
         session: Option<&str>,
@@ -458,6 +497,7 @@ impl Engine {
             cancel,
             progress,
             grammar,
+            images,
         )?;
         let reasoning_tokens = crate::bonsai_tokenizer::answer_start(&output.token_ids, thinking)
             .unwrap_or(output.token_ids.len());
@@ -566,6 +606,9 @@ impl Engine {
 struct ChatJob {
     request: ChatRequest,
     grammar: Option<Grammar>,
+    /// The tokenized prompt of a request with images, encoded on the
+    /// submitting thread; the worker tokenizes every other request itself.
+    prompt: Option<ChatPrompt>,
     events: async_mpsc::Sender<Delivered>,
     cancel: CancelToken,
 }
@@ -599,6 +642,8 @@ pub struct EngineHandle {
     activity: Arc<crate::activity::EngineActivity>,
     /// Closes the worker engine's prompt-cache disk writer at shutdown.
     prompt_cache: crate::prompt_cache::Closer,
+    /// The vision tower, run on the submitting thread.
+    vision: Option<Arc<VisionEncoder>>,
 }
 
 impl EngineHandle {
@@ -617,6 +662,7 @@ impl EngineHandle {
     fn new(engine: Engine) -> Self {
         let tokenizer = engine.inner.tokenizer().clone();
         let prompt_cache = engine.inner.prompt_cache_closer();
+        let vision = engine.vision.clone();
         let (sender, receiver) = async_mpsc::channel::<Job>(SERVE_QUEUE);
         let activity = Arc::new(crate::activity::EngineActivity::default());
         let published = Arc::clone(&activity);
@@ -626,6 +672,7 @@ impl EngineHandle {
             tokenizer,
             activity,
             prompt_cache,
+            vision,
         }
     }
 
@@ -658,7 +705,7 @@ impl EngineHandle {
     /// work, so it succeeds even when the queue is full. Tokenizing a long
     /// prompt is CPU-bound; async callers should run it on a blocking pool.
     pub fn count_chat_tokens(&self, request: &ChatRequest) -> crate::Result<usize> {
-        count_chat(&self.tokenizer, request)
+        count_chat(&self.tokenizer, self.vision.as_deref(), request)
     }
 
     /// Queue a chat request and return a blocking event iterator.
@@ -683,12 +730,28 @@ impl EngineHandle {
     /// }
     /// # Ok::<(), local_engine::Error>(())
     /// ```
+    ///
+    /// A request with images is rendered, tokenized and run through the
+    /// vision tower here as well (each image's embedding is cached for
+    /// reuse), yielding to running decode steps between GPU submissions;
+    /// an undecodable image or a missing projector fails this call.
     pub fn chat(&self, request: ChatRequest) -> crate::Result<EventStream> {
         let grammar = chat_grammar(&self.tokenizer, &request)?;
+        let prompt = has_images(&request)
+            .then(|| {
+                chat_prompt(
+                    &self.tokenizer,
+                    self.vision.as_deref(),
+                    Some(&self.activity),
+                    &request,
+                )
+            })
+            .transpose()?;
         self.submit(|events, cancel| {
             Job::Chat(Box::new(ChatJob {
                 request,
                 grammar,
+                prompt,
                 events,
                 cancel,
             }))
@@ -1158,13 +1221,71 @@ fn encode_prompt(tokenizer: &BonsaiTokenizer, prompt: &str) -> crate::Result<Vec
     tokenizer.encode(prompt)
 }
 
-/// Validate, render and tokenize a chat request.
-fn chat_prompt_ids(
-    tokenizer: &BonsaiTokenizer,
+/// A validated, rendered and tokenized chat request.
+struct ChatPrompt {
+    ids: Vec<u32>,
+    images: Option<Arc<PromptImages>>,
+    tools: Option<Arc<ToolSet>>,
+}
+
+fn has_images(request: &ChatRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| !message.images.is_empty())
+}
+
+fn vision_required(vision: Option<&VisionEncoder>) -> crate::Result<&VisionEncoder> {
+    vision.ok_or_else(|| {
+        crate::Error::InvalidArgument(format!(
+            "image input needs the Bonsai vision projector {}, which is not installed beside \
+             the model",
+            crate::bonsai_vision::VISION_PROJECTOR_FILE
+        ))
+    })
+}
+
+/// Decode and resize every image of `request`, in prompt order.
+fn prepare_images(
     request: &ChatRequest,
-) -> crate::Result<(Vec<u32>, Option<Arc<ToolSet>>)> {
+) -> crate::Result<Vec<crate::bonsai_vision::PreparedImage>> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.images)
+        .map(|image| crate::bonsai_vision::prepare_image(&image.data, image.detail))
+        .collect()
+}
+
+/// Validate, render and tokenize a chat request, encoding its images (with
+/// `activity`, yielding to its decode steps between GPU submissions).
+fn chat_prompt(
+    tokenizer: &BonsaiTokenizer,
+    vision: Option<&VisionEncoder>,
+    activity: Option<&crate::activity::EngineActivity>,
+    request: &ChatRequest,
+) -> crate::Result<ChatPrompt> {
     let (prompt, tools) = prepare_chat(request)?;
-    Ok((encode_prompt(tokenizer, &prompt)?, tools))
+    let ids = encode_prompt(tokenizer, &prompt)?;
+    if !has_images(request) {
+        return Ok(ChatPrompt {
+            ids,
+            images: None,
+            tools,
+        });
+    }
+    let vision = vision_required(vision)?;
+    let prepared = prepare_images(request)?;
+    let encoded = prepared
+        .iter()
+        .map(|image| Ok((image, vision.encode(image, activity)?)))
+        .collect::<crate::Result<Vec<_>>>()?;
+    let (ids, images) = crate::bonsai_vision::expand_prompt(&ids, vision.digest(), &encoded)?;
+    Ok(ChatPrompt {
+        ids,
+        images: Some(Arc::new(images)),
+        tools,
+    })
 }
 
 /// Compile a chat request's constraint: from `</think>` on with thinking,
@@ -1202,8 +1323,18 @@ fn chat_grammar(
         .map(Some)
 }
 
-fn count_chat(tokenizer: &BonsaiTokenizer, request: &ChatRequest) -> crate::Result<usize> {
-    chat_prompt_ids(tokenizer, request).map(|(ids, _)| ids.len())
+fn count_chat(
+    tokenizer: &BonsaiTokenizer,
+    vision: Option<&VisionEncoder>,
+    request: &ChatRequest,
+) -> crate::Result<usize> {
+    let (prompt, _) = prepare_chat(request)?;
+    let ids = encode_prompt(tokenizer, &prompt)?;
+    if !has_images(request) {
+        return Ok(ids.len());
+    }
+    vision_required(vision)?;
+    crate::bonsai_vision::expanded_len(&ids, &prepare_images(request)?)
 }
 
 fn render_messages(
@@ -1212,17 +1343,53 @@ fn render_messages(
     preserve_thinking: bool,
     tools: &ToolSet,
 ) -> crate::Result<String> {
+    let contents = messages
+        .iter()
+        .map(content_with_images)
+        .collect::<crate::Result<Vec<_>>>()?;
     let turns = messages
         .iter()
-        .map(|message| Turn {
+        .zip(&contents)
+        .map(|(message, content)| Turn {
             role: &message.role,
-            content: &message.content,
+            content,
             reasoning_content: message.reasoning_content.as_deref(),
             tool_calls: &message.tool_calls,
             tool_call_id: message.tool_call_id.as_deref(),
         })
         .collect::<Vec<_>>();
     crate::tools::render(&turns, thinking, preserve_thinking, tools)
+}
+
+/// A message's content with the template's placeholder at each image, as
+/// the template's `render_content` writes list content.
+fn content_with_images(message: &ChatMessage) -> crate::Result<std::borrow::Cow<'_, str>> {
+    if message.images.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(&message.content));
+    }
+    if matches!(message.role.as_str(), "system" | "developer") {
+        return Err(crate::Error::InvalidArgument(format!(
+            "{} messages cannot contain images",
+            message.role
+        )));
+    }
+    let content = &message.content;
+    let mut rendered = String::with_capacity(
+        content.len() + message.images.len() * crate::bonsai_vision::IMAGE_PLACEHOLDER.len(),
+    );
+    let mut done = 0;
+    for image in &message.images {
+        let text = content.get(done..image.offset).ok_or_else(|| {
+            crate::Error::InvalidArgument(
+                "image offsets must be increasing character boundaries of the content".into(),
+            )
+        })?;
+        rendered.push_str(text);
+        rendered.push_str(crate::bonsai_vision::IMAGE_PLACEHOLDER);
+        done = image.offset;
+    }
+    rendered.push_str(content.get(done..).unwrap_or_default());
+    Ok(std::borrow::Cow::Owned(rendered))
 }
 
 /// Splits generated text into reasoning, content and (when the request has

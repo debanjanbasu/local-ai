@@ -414,11 +414,12 @@ fn a_chat_count_is_the_length_of_the_prompt_generation_would_prefill() {
         let request = tool_history(thinking);
         let rendered = Engine::render_chat_with_tools(&request.messages, thinking, &request.tools)
             .expect("render");
-        let (ids, tools) = super::chat_prompt_ids(&tokenizer, &request).expect("prepare");
+        let super::ChatPrompt { ids, tools, .. } =
+            super::chat_prompt(&tokenizer, None, None, &request).expect("prepare");
         assert!(tools.is_some());
         assert_eq!(ids, tokenizer.encode(&rendered).expect("encode"));
         assert_eq!(
-            super::count_chat(&tokenizer, &request).expect("count"),
+            super::count_chat(&tokenizer, None, &request).expect("count"),
             ids.len()
         );
 
@@ -431,14 +432,14 @@ fn a_chat_count_is_the_length_of_the_prompt_generation_would_prefill() {
         let mut with_tools = without_tools.clone();
         with_tools.tools.clone_from(&request.tools);
         assert!(
-            super::count_chat(&tokenizer, &with_tools).expect("with tools")
-                > super::count_chat(&tokenizer, &without_tools).expect("without tools")
+            super::count_chat(&tokenizer, None, &with_tools).expect("with tools")
+                > super::count_chat(&tokenizer, None, &without_tools).expect("without tools")
         );
     }
     // Reasoning mode changes the rendered system prompt and suffix.
     assert_ne!(
-        super::count_chat(&tokenizer, &tool_history(true)).expect("thinking"),
-        super::count_chat(&tokenizer, &tool_history(false)).expect("plain")
+        super::count_chat(&tokenizer, None, &tool_history(true)).expect("thinking"),
+        super::count_chat(&tokenizer, None, &tool_history(false)).expect("plain")
     );
 }
 
@@ -455,11 +456,50 @@ fn an_invalid_chat_fails_counting_exactly_as_it_fails_generation() {
         let expected = super::prepare_chat(&request)
             .expect_err("generation rejects it")
             .to_string();
-        let counted = super::count_chat(&tokenizer, &request)
+        let counted = super::count_chat(&tokenizer, None, &request)
             .expect_err("counting rejects it")
             .to_string();
         assert_eq!(counted, expected);
     }
+}
+
+#[test]
+fn images_render_as_the_templates_vision_markers_where_they_sit() {
+    let image = |offset| super::ChatImage {
+        offset,
+        data: std::sync::Arc::from(&b"not decoded while rendering"[..]),
+        detail: super::ImageDetail::Auto,
+    };
+    let mut user = message("user", "Compare  and ");
+    user.images = vec![image(8), image(13), image(13)];
+    let tools = crate::tools::ToolSet::default();
+    let rendered =
+        super::render_messages(std::slice::from_ref(&user), None, false, &tools).expect("render");
+    let marker = crate::bonsai_vision::IMAGE_PLACEHOLDER;
+    assert!(
+        rendered.contains(&format!("Compare {marker} and {marker}{marker}<|im_end|>")),
+        "{rendered}"
+    );
+
+    // Images must follow the text in order, and system prompts hold none.
+    let mut backwards = user.clone();
+    backwards.images.swap(0, 1);
+    let mut system = user.clone();
+    system.role = "system".into();
+    for messages in [vec![backwards], vec![system, message("user", "hi")]] {
+        assert!(super::render_messages(&messages, None, false, &tools).is_err());
+    }
+
+    // Without the projector, image prompts fail to count as to generate.
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
+    let mut request = tool_history(false);
+    request.messages = vec![user];
+    let counted = super::count_chat(&tokenizer, None, &request).expect_err("no projector");
+    let Err(generated) = super::chat_prompt(&tokenizer, None, None, &request) else {
+        panic!("generation needs the projector");
+    };
+    assert_eq!(counted.to_string(), generated.to_string());
+    assert!(counted.to_string().contains("mmproj"), "{counted}");
 }
 
 #[test]
@@ -553,8 +593,8 @@ fn default_tool_settings_need_no_compiler_and_native_ones_compile_up_front() {
         default.parallel_tool_calls = true;
         default.tools[0].strict = false;
         assert_eq!(
-            super::count_chat(&plain, &native).expect("count"),
-            super::count_chat(&plain, &default).expect("count")
+            super::count_chat(&plain, None, &native).expect("count"),
+            super::count_chat(&plain, None, &default).expect("count")
         );
     }
     // Choices that cannot apply fail before any compiling.

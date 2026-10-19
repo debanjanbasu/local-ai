@@ -20,6 +20,7 @@ fn main() {
         "draft.metal",
         "embedding.metal",
         "embedding_vision.metal",
+        "bonsai_vision.metal",
         "embedding_audio.metal",
         "kokoro.metal",
         "whisper.metal",

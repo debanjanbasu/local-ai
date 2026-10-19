@@ -167,6 +167,16 @@ impl SuffixSession {
             if continuation_end <= location.end {
                 continue;
             }
+            // Image tokens are prompt-only: a draft never proposes one.
+            if let Some(image) = source[location.end..continuation_end]
+                .iter()
+                .position(|&token| crate::bonsai_vision::is_image_token(token))
+            {
+                continuation_end = location.end + image;
+                if image == 0 {
+                    continue;
+                }
+            }
             if matched > best_match {
                 best_match = matched;
                 candidates.clear();

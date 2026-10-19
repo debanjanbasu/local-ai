@@ -18,6 +18,7 @@ pub mod bonsai_ngram;
 #[doc(hidden)]
 #[allow(clippy::too_long_first_doc_paragraph)]
 pub mod bonsai_tokenizer;
+pub mod bonsai_vision;
 pub mod compaction;
 pub mod embedding;
 pub mod judgment;
@@ -33,8 +34,9 @@ pub mod transcription;
 
 mod error;
 pub use api::{
-    CancelHandle, ChatMessage, ChatOutput, ChatRequest, Engine, EngineHandle, EngineInfo, Event,
-    EventRelay, EventStream, PendingDecision, Plan, Sampling, Signal, Stats, ToolOutput,
+    CancelHandle, ChatImage, ChatMessage, ChatOutput, ChatRequest, Engine, EngineHandle,
+    EngineInfo, Event, EventRelay, EventStream, ImageDetail, PendingDecision, Plan, Sampling,
+    Signal, Stats, ToolOutput,
 };
 pub use bonsai_tokenizer::ReasoningEffort;
 pub use error::Error;

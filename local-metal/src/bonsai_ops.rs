@@ -94,6 +94,23 @@ impl AttentionKernel {
     }
 }
 
+/// Rotary positions of the rows one attention-prep dispatch writes (the
+/// checkpoint's interleaved M-RoPE: sections t/h/w of 11/11/10 pairs).
+#[derive(Clone, Copy)]
+pub enum Rope<'a> {
+    /// Text rows: the row at cache position `p` rotates by `p + delta` in
+    /// every section, which is plain `RoPE`.
+    Text(i32),
+    /// Explicit `(t, h, w, unused)` `u32` positions, one row per dispatched
+    /// token, from a byte offset of the buffer.
+    Rows(&'a MetalBuffer, usize),
+}
+
+impl Rope<'_> {
+    /// Text at its cache positions.
+    pub const TEXT: Self = Self::Text(0);
+}
+
 #[derive(Clone, Copy)]
 pub struct RmsNormParams {
     pub dimension: u32,
@@ -467,6 +484,31 @@ impl BonsaiOps {
 }
 fn arg(s: &str) -> Error {
     Error::InvalidArgument(s.into())
+}
+
+/// The rope buffer binding (`fallback` when no rows are read) and the
+/// kernel's mode and delta for `tokens` rows from cache `position`.
+fn rope_binding<'a>(
+    rope: Rope<'a>,
+    fallback: &'a MetalBuffer,
+    position: u32,
+    tokens: u32,
+) -> crate::Result<((&'a MetalBuffer, usize), u32, u32)> {
+    match rope {
+        Rope::Text(delta) => {
+            if i64::from(position) + i64::from(delta) < 0 {
+                return Err(arg("RoPE delta moves a row before position zero"));
+            }
+            Ok(((fallback, 0), 0, delta.cast_unsigned()))
+        }
+        Rope::Rows(buffer, offset) => {
+            need(buffer, offset + tokens as usize * 16)?;
+            if !offset.is_multiple_of(16) {
+                return Err(arg("RoPE rows must be 16-byte aligned"));
+            }
+            Ok(((buffer, offset), 1, 0))
+        }
+    }
 }
 fn matrix_bytes(rows: u32, columns: u32, element_size: usize) -> crate::Result<usize> {
     (rows as usize)

@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod bonsai;
 pub mod bonsai_ops;
+pub mod bonsai_vision;
 pub mod buffer;
 pub mod context;
 pub mod draft;

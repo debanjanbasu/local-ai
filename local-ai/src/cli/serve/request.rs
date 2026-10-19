@@ -264,7 +264,18 @@ pub(super) struct PreparedGeneration {
 }
 
 /// Parse a Chat Completions request body.
+#[cfg(test)]
 pub(super) fn prepare_generation(body: &[u8], thinking: bool) -> crate::Result<PreparedGeneration> {
+    prepare_generation_with(body, thinking, None)
+}
+
+/// Parse a Chat Completions request body, resolving `file_id` images
+/// against `files`.
+pub(super) fn prepare_generation_with(
+    body: &[u8],
+    thinking: bool,
+    files: Option<&local_services::Store>,
+) -> crate::Result<PreparedGeneration> {
     reject_deprecated(body, CHAT_DEPRECATED, "Chat Completions")?;
     let request: GenerateRequest = serde_json::from_slice(body)
         .map_err(|error| crate::Error::InvalidArgument(format!("invalid JSON request: {error}")))?;
@@ -283,7 +294,7 @@ pub(super) fn prepare_generation(body: &[u8], thinking: bool) -> crate::Result<P
         .ok_or_else(|| crate::Error::InvalidArgument("messages are required".into()))?;
     let messages = messages
         .iter()
-        .map(chat_message)
+        .map(|message| chat_message(message, files))
         .collect::<crate::Result<Vec<_>>>()?;
     let tools = request
         .tools
@@ -795,12 +806,15 @@ fn chat_tool(tool: &ChatTool) -> crate::Result<ToolDefinition> {
     )
 }
 
-fn chat_message(message: &Message) -> crate::Result<ChatMessage> {
+fn chat_message(
+    message: &Message,
+    files: Option<&local_services::Store>,
+) -> crate::Result<ChatMessage> {
     let nullable = matches!(message.role.as_str(), "assistant" | "tool");
-    let content = if nullable && message.content.is_null() {
-        String::new()
+    let parts = if nullable && message.content.is_null() {
+        super::images::Parts::default()
     } else {
-        message_text(&message.content)?
+        message_parts(&message.content, files)?
     };
     let tool_calls = message
         .tool_calls
@@ -849,10 +863,11 @@ fn chat_message(message: &Message) -> crate::Result<ChatMessage> {
     }
     Ok(ChatMessage {
         role: message.role.clone(),
-        content,
+        content: parts.text,
         reasoning_content: message.reasoning_content.clone(),
         tool_calls,
         tool_call_id: message.tool_call_id.clone(),
+        images: parts.images,
     })
 }
 
@@ -874,23 +889,71 @@ pub(super) fn tool_call(id: String, name: String, arguments: &Value) -> crate::R
     })
 }
 
-pub(super) fn message_text(value: &Value) -> crate::Result<String> {
+/// A message's `content`: a string, or `text`, `image_url` (a base64 data
+/// URL, with `detail`) and `file` (an uploaded image's `file_id`, or its
+/// base64 `file_data`) parts in order.
+pub(super) fn message_parts(
+    value: &Value,
+    files: Option<&local_services::Store>,
+) -> crate::Result<super::images::Parts> {
+    let invalid = |message: &str| crate::Error::InvalidArgument(message.into());
+    let mut parts = super::images::Parts::default();
     if let Some(text) = value.as_str() {
-        return Ok(text.to_owned());
+        parts.push_text(text);
+        return Ok(parts);
     }
     let items = value
         .as_array()
-        .ok_or_else(|| crate::Error::InvalidArgument("message content must be text".into()))?;
-    let mut text = String::new();
+        .ok_or_else(|| invalid("message content must be a text string or an array of parts"))?;
     for item in items {
-        if item.get("type").and_then(Value::as_str) != Some("text") {
-            return Err(crate::Error::InvalidArgument(
-                "media content is not supported; Bonsai 2 is text-only".into(),
-            ));
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => parts.push_text(
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid("text content requires a text string"))?,
+            ),
+            Some("image_url") => {
+                let image = item
+                    .get("image_url")
+                    .ok_or_else(|| invalid("an image_url part requires image_url"))?;
+                let (url, detail) = match image {
+                    Value::String(url) => (url.as_str(), None),
+                    Value::Object(image) => (
+                        image
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| invalid("image_url requires a url string"))?,
+                        image.get("detail"),
+                    ),
+                    _ => return Err(invalid("image_url must be an object with a url")),
+                };
+                parts.push_image(super::images::url(url)?, super::images::detail(detail)?);
+            }
+            Some("file") => {
+                let file = item
+                    .get("file")
+                    .ok_or_else(|| invalid("a file part requires file"))?;
+                let data = match (
+                    file.get("file_id").and_then(Value::as_str),
+                    file.get("file_data").and_then(Value::as_str),
+                ) {
+                    (Some(id), None) => super::images::file(files, id)?,
+                    (None, Some(data)) => super::images::data_url(data, true)?,
+                    _ => {
+                        return Err(invalid(
+                            "a file part needs exactly one of file_id and file_data",
+                        ));
+                    }
+                };
+                parts.push_image(data, local_engine::ImageDetail::Auto);
+            }
+            Some("input_audio") => {
+                return Err(invalid(
+                    "audio content is not supported; send text or images",
+                ));
+            }
+            _ => return Err(invalid("content parts must be text, image_url or file")),
         }
-        text.push_str(item.get("text").and_then(Value::as_str).ok_or_else(|| {
-            crate::Error::InvalidArgument("text content requires a text string".into())
-        })?);
     }
-    Ok(text)
+    Ok(parts)
 }

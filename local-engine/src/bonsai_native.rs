@@ -7,6 +7,7 @@
 //! with the target before emitting it. [`crate::bonsai_model::BonsaiEngine`]
 //! drives this model.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use local_metal::batch::{BufferCopyRequest, CommandBatch};
@@ -16,7 +17,7 @@ use local_metal::bonsai::{
 };
 use local_metal::bonsai_ops::{
     AttentionKernel, AttentionWorkspace, Bf16Matrix, BonsaiOps, GdnStateFormat, KvLayout,
-    MAX_PREFILL_TOKENS,
+    MAX_PREFILL_TOKENS, Rope,
 };
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::{DeviceCaps, MetalContext};
@@ -31,6 +32,7 @@ use crate::bonsai::{
 use crate::bonsai_model::{BonsaiInfo, CancelToken, SpeculativeBatch, draft_depth};
 use crate::bonsai_mtp::{BonsaiMtp, DRAFT_CHAIN_MIN_MARGIN, MtpSettings, Shared as MtpShared};
 use crate::bonsai_ngram::NgramSettings;
+use crate::bonsai_vision::PromptImages;
 use crate::sampler::{Sampler, SamplingResult, verify_greedy_drafts};
 use crate::{MtpStats, NgramStats, PrefillProgress};
 
@@ -378,6 +380,9 @@ struct Scratch {
     rotated_ffn: MetalBuffer,
     logits: MetalBuffer,
     attention: AttentionWorkspace,
+    /// Explicit `(t, h, w, 0)` rotary positions of a block that holds image
+    /// tokens.
+    rope: MetalBuffer,
 }
 
 impl Scratch {
@@ -423,6 +428,7 @@ impl Scratch {
             rotated_ffn: work_a,
             logits: MetalBuffer::empty(context.device(), VOCAB * size_of::<f32>())?,
             attention: AttentionWorkspace::new(context, kv_allocated as u32)?,
+            rope: MetalBuffer::empty(context.device(), tokens * 4 * size_of::<u32>())?,
         })
     }
 }
@@ -630,6 +636,8 @@ pub struct BonsaiModel {
     state_id: u64,
     /// Logits and greedy selection of batched decode, made on first use.
     batch: Option<batch::BatchScratch>,
+    /// Images of the resident sequence's prompt (see [`SequenceState`]).
+    images: Option<Arc<PromptImages>>,
 }
 
 impl BonsaiModel {
@@ -795,6 +803,7 @@ impl BonsaiModel {
             kv_initial: kv_allocated,
             state_id: 0,
             batch: None,
+            images: None,
             context,
             package,
         })
@@ -830,6 +839,12 @@ impl BonsaiModel {
 
     pub(crate) const fn position(&self) -> usize {
         self.position
+    }
+
+    /// Install the images of the resident sequence's prompt, which its image
+    /// tokens embed and its rotary positions follow.
+    pub(crate) fn set_images(&mut self, images: Option<Arc<PromptImages>>) {
+        self.images = images.filter(|images| !images.is_empty());
     }
 
     /// Install the token polled between GPU dispatches, dropping any stop the
@@ -1247,6 +1262,11 @@ impl BonsaiModel {
         Ok(())
     }
 
+    /// The logits the last block left for its final row.
+    pub(crate) fn last_logits(&self) -> Vec<f32> {
+        self.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec()
+    }
+
     /// Plain one-token decode step producing logits.
     pub(crate) fn decode(&mut self, token: u32) -> crate::Result<()> {
         self.forward(token, true)
@@ -1378,6 +1398,7 @@ impl BonsaiModel {
                 &self.package,
                 &inputs[..committed],
                 head.mtp.embedding_rows(committed)?,
+                None,
             )?;
             self.encode_head_rows(&mut batch, head, committed, start)?;
         }
@@ -1411,10 +1432,13 @@ fn cancelled_speculative_batch() -> SpeculativeBatch {
 }
 
 /// Decode PTQ1 embedding rows for `tokens` into consecutive F32 rows of `out`.
+/// With `images`, the tokens start at that position of a prompt whose image
+/// tokens take their rows from those images.
 fn decode_embeddings(
     package: &BonsaiPackage,
     tokens: &[u32],
     out: &mut [f32],
+    images: Option<(&PromptImages, usize)>,
 ) -> crate::Result<()> {
     let row_bytes = WIDTH / PTQ1_BLOCK_ELEMENTS * PTQ1_BLOCK_BYTES;
     let embeddings = package.bytes("token_embd.weight")?;
@@ -1422,7 +1446,13 @@ fn decode_embeddings(
         return invalid("embedding scratch is shorter than the token block");
     }
     let (rows, _) = out.as_chunks_mut::<WIDTH>();
-    for (&token, row) in tokens.iter().zip(rows) {
+    for (index, (&token, row)) in tokens.iter().zip(rows).enumerate() {
+        if token as usize >= VOCAB
+            && let Some(image) = images.and_then(|(images, start)| images.embedding(start + index))
+        {
+            row.copy_from_slice(image);
+            continue;
+        }
         let offset = token as usize * row_bytes;
         let bytes = embeddings.get(offset..offset + row_bytes).ok_or_else(|| {
             crate::Error::InvalidArgument("Bonsai token beyond vocabulary".into())

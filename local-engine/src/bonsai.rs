@@ -160,8 +160,18 @@ pub struct BonsaiPackage {
 impl BonsaiPackage {
     /// The inspected checkpoint inode must remain immutable for all returned views.
     /// Integrity hashes are verified separately by the pinned artifact installer.
-    #[allow(unsafe_code, clippy::too_many_lines)]
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
+        Self::open_architecture(path, "qwen35")
+    }
+
+    /// Open the vision projector (mmproj) GGUF: `general.architecture=clip`,
+    /// the same reader, no Hadamard metadata.
+    pub fn open_projector(path: impl AsRef<Path>) -> crate::Result<Self> {
+        Self::open_architecture(path, "clip")
+    }
+
+    #[allow(unsafe_code, clippy::too_many_lines)]
+    fn open_architecture(path: impl AsRef<Path>, expected: &str) -> crate::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         if file_len < 24 {
@@ -218,8 +228,10 @@ impl BonsaiPackage {
         let architecture = metadata
             .get("general.architecture")
             .ok_or_else(|| crate::Error::InvalidFormat("missing general.architecture".into()))?;
-        if scalar_string(&map, architecture)? != "qwen35" {
-            return invalid("Bonsai reader requires general.architecture=qwen35");
+        if scalar_string(&map, architecture)? != expected {
+            return invalid(format!(
+                "Bonsai reader requires general.architecture={expected}"
+            ));
         }
 
         // Grow only after actually reading descriptors, never reserve from an
@@ -307,7 +319,11 @@ impl BonsaiPackage {
             by_name.insert(tensor.name.clone(), tensors.len());
             tensors.push(tensor);
         }
-        let hadamard = parse_hadamard(&map, &metadata, &tensors, &by_name)?;
+        let hadamard = if expected == "qwen35" {
+            parse_hadamard(&map, &metadata, &tensors, &by_name)?
+        } else {
+            HadamardMetadata::default()
+        };
         Ok(Self {
             file,
             map,

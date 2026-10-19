@@ -334,17 +334,33 @@ kernel void bo_add_rms_fwht(
     }
 }
 
+// Interleaved M-RoPE over the first 64 dims (32 frequency pairs, sections
+// t/h/w = 11/11/10): pair % 3 == 1 rotates by the row (h), pair % 3 == 2 by
+// the column (w), the rest by the temporal position. Text rows carry the same
+// position in all three, which is plain RoPE.
 static inline float bonsai_text_rope(
     device const float *input, device const float *weights,
-    float inverse, uint coordinate, uint position, float base
+    float inverse, uint coordinate, uint3 position, float base
 ) {
     const float value = input[coordinate] * inverse * weights[coordinate];
     if (coordinate >= 64) return value;
     const uint pair = coordinate % 32, other = coordinate < 32 ? coordinate + 32 : coordinate - 32;
     const float other_value = input[other] * inverse * weights[other];
-    const float theta = float(position) * pow(base, -float(pair) / 32.0f);
+    const uint section = pair % 3;
+    const uint rotation = section == 1 ? position.y : (section == 2 ? position.z : position.x);
+    const float theta = float(rotation) * pow(base, -float(pair) / 32.0f);
     return coordinate < 32 ? value * cos(theta) - other_value * sin(theta)
                            : other_value * sin(theta) + value * cos(theta);
+}
+
+// Rotary position of row `token` of a prep dispatch whose first row is at
+// cache position `position`: text rows (mode 0) rotate by position + token +
+// delta in every section; mode 1 reads explicit (t, h, w) rows.
+static inline uint3 bonsai_rope_position(
+    device const uint4 *rope_rows, uint rope_mode, uint rope_delta, uint position, uint token
+) {
+    if (rope_mode != 0) return rope_rows[token].xyz;
+    return uint3(uint(int(position + token) + as_type<int>(rope_delta)));
 }
 
 // K/V cache storage formats. A token row is 4 KV heads x 256 dims; the
@@ -455,13 +471,16 @@ kernel void bo_attn_prep(
     device const float *value [[buffer(2)]], device const float *q_weights [[buffer(3)]],
     device const float *k_weights [[buffer(4)]], device float *query [[buffer(5)]],
     device float *gate [[buffer(6)]], device uchar *k_cache [[buffer(7)]],
-    device uchar *v_cache [[buffer(8)]], constant uint &position [[buffer(9)]],
-    constant uint &k_format [[buffer(10)]], constant uint &v_format [[buffer(11)]],
-    constant float &epsilon [[buffer(12)]], constant float &base [[buffer(13)]],
+    device uchar *v_cache [[buffer(8)]], device const uint4 *rope_rows [[buffer(9)]],
+    constant uint &position [[buffer(10)]],
+    constant uint &k_format [[buffer(11)]], constant uint &v_format [[buffer(12)]],
+    constant uint &rope_mode [[buffer(13)]], constant uint &rope_delta [[buffer(14)]],
+    constant float &epsilon [[buffer(15)]], constant float &base [[buffer(16)]],
     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
 ) {
     threadgroup float partial[8], scratch[256];
     const uint head = group % 24, token = group / 24, absolute_position = position + token;
+    const uint3 rope = bonsai_rope_position(rope_rows, rope_mode, rope_delta, position, token);
     // Quantized caches hold Hadamard-rotated rows, so queries rotate with them.
     const bool rotate = k_format != BONSAI_KV_F16;
     device const float *qg_row = qg + token * 12288;
@@ -469,7 +488,7 @@ kernel void bo_attn_prep(
     const float q = qg_row[head * 512 + tid];
     const float q_sum = bonsai_group_sum<256>(q * q, tid, partial);
     float roped = bonsai_text_rope(qg_row + head * 512, q_weights,
-        rsqrt(q_sum / 256.0f + epsilon), tid, absolute_position, base);
+        rsqrt(q_sum / 256.0f + epsilon), tid, rope, base);
     if (rotate) roped = bonsai_hadamard256(roped, tid, scratch);
     query[group * 256 + tid] = roped;
     gate[group * 256 + tid] = qg_row[head * 512 + 256 + tid];
@@ -479,7 +498,7 @@ kernel void bo_attn_prep(
         const float k = key_row[head * 256 + tid];
         const float k_sum = bonsai_group_sum<256>(k * k, tid, partial);
         float rotated = bonsai_text_rope(key_row + head * 256, k_weights,
-            rsqrt(k_sum / 256.0f + epsilon), tid, absolute_position, base);
+            rsqrt(k_sum / 256.0f + epsilon), tid, rope, base);
         float v = value[token * 1024 + head * 256 + tid];
         if (rotate) {
             rotated = bonsai_hadamard256(rotated, tid, scratch);
@@ -496,18 +515,21 @@ kernel void bo_attn_prep(
 kernel void bo_kv_prep(
     device const float *key [[buffer(0)]], device const float *value [[buffer(1)]],
     device const float *k_weights [[buffer(2)]], device uchar *k_cache [[buffer(3)]],
-    device uchar *v_cache [[buffer(4)]], constant uint &position [[buffer(5)]],
-    constant uint &k_format [[buffer(6)]], constant uint &v_format [[buffer(7)]],
-    constant float &epsilon [[buffer(8)]], constant float &base [[buffer(9)]],
+    device uchar *v_cache [[buffer(4)]], device const uint4 *rope_rows [[buffer(5)]],
+    constant uint &position [[buffer(6)]],
+    constant uint &k_format [[buffer(7)]], constant uint &v_format [[buffer(8)]],
+    constant uint &rope_mode [[buffer(9)]], constant uint &rope_delta [[buffer(10)]],
+    constant float &epsilon [[buffer(11)]], constant float &base [[buffer(12)]],
     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
 ) {
     threadgroup float partial[8], scratch[256];
     const uint head = group % 4, token = group / 4, absolute_position = position + token;
+    const uint3 rope = bonsai_rope_position(rope_rows, rope_mode, rope_delta, position, token);
     device const float *key_row = key + token * 1024;
     const float k = key_row[head * 256 + tid];
     const float k_sum = bonsai_group_sum<256>(k * k, tid, partial);
     float rotated = bonsai_text_rope(key_row + head * 256, k_weights,
-        rsqrt(k_sum / 256.0f + epsilon), tid, absolute_position, base);
+        rsqrt(k_sum / 256.0f + epsilon), tid, rope, base);
     float v = value[token * 1024 + head * 256 + tid];
     if (k_format != BONSAI_KV_F16) {
         rotated = bonsai_hadamard256(rotated, tid, scratch);

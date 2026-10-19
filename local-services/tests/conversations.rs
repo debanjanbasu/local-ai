@@ -296,7 +296,10 @@ fn an_invalid_item_rolls_back_the_whole_batch() {
         .expect("history")
         .items;
     let unsupported = [
-        json!({"role": "user", "content": [{"type": "input_image", "image_url": "https://x/y.png"}]}),
+        json!({"role": "user", "content": [{"type": "input_image", "image_url": "data:,", "file_id": "file-1"}]}),
+        json!({"role": "user", "content": [{"type": "input_image", "file_id": "file-1", "detail": "max"}]}),
+        json!({"role": "assistant", "content": [{"type": "input_image", "file_id": "file-1"}]}),
+        json!({"role": "user", "content": [{"type": "input_audio", "input_audio": {}}]}),
         json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
         json!({"type": "file_search_call", "queries": "q"}),
         json!({"type": "file_search_call", "queries": ["q"], "results": [{"file_id": "f"}]}),
@@ -345,6 +348,19 @@ fn an_invalid_item_rolls_back_the_whole_batch() {
         .expect("history");
     assert_eq!(after.items, kept);
     assert_eq!(after.conversation.version, conversation.version);
+
+    // A valid image part is kept in OpenAI's normalized form.
+    let image = json!({"role": "user", "content": [
+        {"type": "input_text", "text": "see"},
+        {"type": "input_image", "file_id": "file-1"},
+    ]});
+    let added = store
+        .add_items(&conversation.id, vec![image])
+        .expect("image added");
+    assert_eq!(
+        added.data[0].body["content"][1],
+        json!({"type": "input_image", "file_id": "file-1", "image_url": null, "detail": "auto"})
+    );
 }
 
 #[test]

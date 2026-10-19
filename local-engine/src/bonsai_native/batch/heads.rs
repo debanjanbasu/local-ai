@@ -269,7 +269,7 @@ impl BonsaiModel {
         let row_bytes = WIDTH * size_of::<f32>();
         let stage_tokens = |tokens: &[u32]| -> crate::Result<()> {
             let mut values = vec![0.0; tokens.len() * WIDTH];
-            decode_embeddings(&self.package, tokens, &mut values)?;
+            decode_embeddings(&self.package, tokens, &mut values, None)?;
             mtp.stage_embeddings(&values)
         };
         // Lags too long to ride beside the drafting rows go first, in

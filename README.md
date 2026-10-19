@@ -326,6 +326,7 @@ Weights are not included. The runtime validates these pinned files:
 | File | Bytes | SHA256 | Needed |
 | --- | ---: | --- | --- |
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` | always |
+| `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | 931,145,856 | `e287342d92332fa3577ed1d42e921dac9370c08da58ba9337fa450f6cc76cfd7` | for image input to chat and responses |
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | for MTP speculation |
 | `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
@@ -337,7 +338,10 @@ Weights are not included. The runtime validates these pinned files:
 
 The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
 not: without it speculation falls back to suffix lookup alone and the startup
-policy says why. The EmbeddingGemma 2 text encoder is optional too: it is
+policy says why. Neither is the BF16 vision projector: installed beside the
+GGUF, it adds image input to Chat Completions and Responses
+([docs/BONSAI.md](docs/BONSAI.md#image-input)); without it image parts are
+refused and the startup policy says why. The EmbeddingGemma 2 text encoder is optional too: it is
 converted from the Kaggle checkpoint by `tools/convert_embeddinggemma2.py`, and
 when installed the server adds `POST /v1/embeddings`
 ([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). With it, copying the committed
@@ -358,6 +362,11 @@ hf download prism-ml/Ternary-Bonsai-2-27B-gguf \
   --revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b \
   --include 'Ternary-Bonsai-2-27B-PTQ1_0.gguf' \
   --local-dir models/bonsai2-27b-ptq1
+# optional: image input
+hf download prism-ml/Ternary-Bonsai-2-27B-gguf \
+  --revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b \
+  --include 'Ternary-Bonsai-2-27B-mmproj-BF16.gguf' \
+  --local-dir models/bonsai2-27b-ptq1
 ```
 
 The `--include` filter is required. Without it `hf download` fetches the
@@ -370,13 +379,12 @@ above are ever opened, and the rest are not merely unused:
 | --- | ---: | --- |
 | `Ternary-Bonsai-2-27B-F16.gguf` | 53,808,408,928 | Unquantized; the runtime reads PTQ1 only |
 | `Ternary-Bonsai-2-27B-PQ2_0.gguf` | 7,206,168,928 | Wrong quantization; the runtime reads PTQ1 only |
-| `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | 931,145,856 | Vision projector; no multimodal path exists |
-| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | 629,246,976 | Vision projector; no multimodal path exists |
+| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | 629,246,976 | Lossy copy of the BF16 projector, which the runtime reads instead |
 
-There is no vision, clip, projector, mmproj, or image code anywhere in
-`local-engine/src` or `local-metal/src`, so the 1.45 GiB of projectors cannot be
-loaded. `local-engine/src/resources.rs` names the only two paths the runtime
-resolves, `MODEL_RELATIVE` and the head's `MTP_DIRECTORY`/`MTP_HEAD_ARTIFACT`.
+The runtime resolves only `MODEL_RELATIVE`, the head's
+`MTP_DIRECTORY`/`MTP_HEAD_ARTIFACT` and the projector beside the GGUF
+(`VISION_PROJECTOR_FILE`), all named in `local-engine/src/resources.rs` and
+`local-engine/src/bonsai_vision/tower.rs`.
 
 If Hugging Face is unavailable, stage a private CPU-only Kaggle job. Staging
 does not submit it; review the generated directory first.

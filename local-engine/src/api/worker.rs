@@ -34,6 +34,7 @@ fn reporter(sender: &async_mpsc::Sender<Delivered>) -> impl FnMut(PrefillProgres
 /// A request the worker has rendered and tokenized but not yet admitted.
 struct Prepared {
     ids: Vec<u32>,
+    images: Option<Arc<crate::bonsai_vision::PromptImages>>,
     params: GenerateParams,
     session: Option<String>,
     thinking: bool,
@@ -328,6 +329,7 @@ impl Worker {
                 prepared.session.as_deref(),
                 cancel,
                 prepared.grammar,
+                prepared.images,
             );
             match admitted {
                 Ok(id) => {
@@ -350,11 +352,22 @@ impl Worker {
                 let ChatJob {
                     request,
                     grammar,
+                    prompt,
                     events,
                     cancel,
                 } = *job;
+                let tokenizer = self.engine.inner.tokenizer();
+                // A request with images arrives tokenized and encoded.
+                let prompt = prompt.map_or_else(
+                    || {
+                        prepare_chat(&request).and_then(|(prompt, tools)| {
+                            Ok((encode_prompt(tokenizer, &prompt)?, None, tools))
+                        })
+                    },
+                    |prompt| Ok((prompt.ids, prompt.images, prompt.tools)),
+                );
                 (
-                    prepare_chat(&request),
+                    prompt,
                     request.max_tokens,
                     request.sampling,
                     request.session,
@@ -365,15 +378,13 @@ impl Worker {
                 )
             }
         };
-        let tokenizer = self.engine.inner.tokenizer();
-        let ids =
-            prompt.and_then(|(prompt, tools)| Ok((encode_prompt(tokenizer, &prompt)?, tools)));
-        match ids {
-            Ok((ids, tools)) => {
+        match prompt {
+            Ok((ids, images, tools)) => {
                 let mut params = sampling.0;
                 params.max_tokens = max_tokens;
                 Some(Pending::Generation(Prepared {
                     ids,
+                    images,
                     params,
                     session,
                     thinking,
@@ -441,6 +452,7 @@ mod tests {
             tokenizer: BonsaiTokenizer::tiny_for_tests(),
             activity: Arc::default(),
             prompt_cache: crate::prompt_cache::Closer::new(),
+            vision: None,
         };
         (handle, receiver)
     }

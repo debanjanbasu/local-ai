@@ -758,6 +758,7 @@ fn history_without_a_compaction_item_renders_as_before() {
         summary: None,
         items: vec![user("a"), assistant("b")],
         instructions: Some("sys".into()),
+        files: None,
     };
     let roles: Vec<String> = history
         .messages()

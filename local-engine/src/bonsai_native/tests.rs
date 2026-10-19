@@ -364,6 +364,7 @@ fn draft_logits(model: &mut BonsaiModel, seed: u32) -> Vec<f32> {
         &model.package,
         &[seed],
         speculation.mtp.embedding_rows(1).expect("embedding row"),
+        None,
     )
     .expect("seed embedding");
     let mut batch = CommandBatch::new(&model.context).expect("batch");
@@ -450,6 +451,7 @@ fn kv_only_ingestion_matches_full_head_cache_and_next_draft() {
             .mtp
             .embedding_rows(prefix.len())
             .expect("embedding rows"),
+        None,
     )
     .expect("prefix embeddings");
     {

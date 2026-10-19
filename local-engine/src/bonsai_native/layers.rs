@@ -1,6 +1,6 @@
 use super::{
     Bf16Matrix, BonsaiMetalTensor, BonsaiModel, CommandBatch, FullAttentionLayer,
-    HadamardDirection, Layer, MetalBuffer, RecurrentLayer, RollbackLayer, WIDTH,
+    HadamardDirection, Layer, MetalBuffer, RecurrentLayer, RollbackLayer, Rope, WIDTH,
 };
 
 /// Blocks up to this many rows (decode and speculative verification) take the
@@ -336,6 +336,7 @@ impl BonsaiModel {
         batch: &mut CommandBatch,
         layer: &FullAttentionLayer,
         tokens: u32,
+        rope: Rope<'_>,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
         let projections = [
@@ -377,6 +378,7 @@ impl BonsaiModel {
             self.epsilon,
             self.rope_base,
             tokens,
+            rope,
         )?;
         if tokens == 1 {
             self.ops.attention_row_kv(

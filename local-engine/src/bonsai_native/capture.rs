@@ -236,6 +236,7 @@ impl MtpCapture {
                     &self.model.package,
                     &[token],
                     speculation.mtp.embedding_rows(1)?,
+                    None,
                 )?;
                 let mtp = &speculation.mtp;
                 let hidden = if step == 0 {
@@ -297,6 +298,8 @@ impl BonsaiModel {
             )));
         }
         self.reset();
+        // Text only, from position zero: no earlier prompt's images apply.
+        self.images = None;
         let mut features = Vec::with_capacity(positions.len() * WIDTH);
         let mut next = 0;
         let mut start = 0;

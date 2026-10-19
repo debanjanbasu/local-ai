@@ -9,7 +9,7 @@ use super::{
     invalid, scalar_bool, scalar_string, scalar_u32,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct HadamardMetadata {
     signs: HashMap<u32, Arc<[f32]>>,
     directions: HashMap<String, HadamardDirection>,

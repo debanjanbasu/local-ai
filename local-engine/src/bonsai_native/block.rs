@@ -1,7 +1,22 @@
 use super::{
     AttentionLayer, BlockOutput, BonsaiModel, BufferCopyRequest, CommandBatch, HadamardDirection,
-    Selection, Speculation, VOCAB, WIDTH, decode_embeddings,
+    Rope, Selection, Speculation, VOCAB, WIDTH, decode_embeddings,
 };
+
+/// Write the `(t, h, w, 0)` rotary positions of `count` tokens from
+/// `position` to rows `row..` of `buffer`.
+pub(super) fn write_rope_rows(
+    buffer: &super::MetalBuffer,
+    images: &crate::bonsai_vision::PromptImages,
+    position: usize,
+    count: usize,
+    row: usize,
+) {
+    let rows = (0..count)
+        .map(|index| images.rope(position + index))
+        .collect::<Vec<_>>();
+    buffer.copy_from_bytes(bytemuck::cast_slice(&rows), row * size_of::<[u32; 4]>());
+}
 
 /// Submit the command buffer encoded so far before encoding these layers.
 /// The input rotation goes alone so the GPU's start-up latency (about 0.1 ms)
@@ -40,7 +55,8 @@ impl BonsaiModel {
     ) -> crate::Result<()> {
         if tokens.is_empty()
             || tokens.len() > self.block_rows
-            || tokens.iter().any(|&token| token as usize >= VOCAB)
+            || crate::bonsai_vision::check_tokens(tokens, self.position, self.images.as_deref())
+                .is_err()
             || self
                 .position
                 .checked_add(tokens.len())
@@ -70,17 +86,21 @@ impl BonsaiModel {
         let mut ingest = ingest;
         self.reserve_kv(self.position + tokens.len(), ingest.as_deref_mut())?;
         let count = tokens.len() as u32;
+        let images = self.images.as_deref().map(|images| (images, self.position));
         decode_embeddings(
             &self.package,
             tokens,
             self.scratch.embedding.as_mut_slice::<f32>(),
+            images,
         )?;
+        let rope_rows = self.write_rope(self.position, tokens.len(), 0);
         let ingest = match ingest {
             Some(speculation) => {
                 decode_embeddings(
                     &self.package,
                     tokens,
                     speculation.mtp.embedding_rows(tokens.len())?,
+                    images,
                 )?;
                 Some(&*speculation)
             }
@@ -94,6 +114,10 @@ impl BonsaiModel {
             CommandBatch::new(&self.context)?
         };
         let scratch = &self.scratch;
+        let rope = match rope_rows {
+            Ok(offset) => Rope::Text(offset),
+            Err(()) => Rope::Rows(&scratch.rope, 0),
+        };
         self.kernels.transform(
             &mut batch,
             &self.input_rotation,
@@ -130,7 +154,9 @@ impl BonsaiModel {
                     recurrent_index += 1;
                     self.recurrent(&mut batch, recurrent, count, rollback)?;
                 }
-                AttentionLayer::Full(full) => self.full_attention(&mut batch, full, count)?,
+                AttentionLayer::Full(full) => {
+                    self.full_attention(&mut batch, full, count, rope)?;
+                }
             }
             self.residual_normalize(
                 &mut batch,
@@ -231,6 +257,21 @@ impl BonsaiModel {
         Ok(())
     }
 
+    /// The rotary positions of `count` rows from `position` of the resident
+    /// sequence: `Ok(offset)` when they are all text at `position + offset`
+    /// (plain `RoPE`), else `Err` after writing explicit rows to
+    /// `scratch.rope` from row `row`.
+    pub(super) fn write_rope(&self, position: usize, count: usize, row: usize) -> Result<i32, ()> {
+        let Some(images) = self.images.as_deref() else {
+            return Ok(0);
+        };
+        if let Some(offset) = images.text_offset(position, count) {
+            return Ok(offset);
+        }
+        write_rope_rows(&self.scratch.rope, images, position, count, row);
+        Err(())
+    }
+
     /// Feed committed target rows to the MTP head in their own command batch:
     /// embeddings of `tokens` and the output-normalized hidden rows the last
     /// forward block left in `scratch.normalized`, ending at the current
@@ -262,6 +303,7 @@ impl BonsaiModel {
             &self.package,
             tokens,
             speculation.mtp.embedding_rows(tokens.len())?,
+            None,
         )?;
         let mut batch = CommandBatch::new(&self.context)?;
         self.encode_head_rows(&mut batch, speculation, tokens.len(), start)?;

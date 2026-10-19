@@ -2,7 +2,9 @@
 
 use local_metal::{
     batch::CommandBatch,
-    bonsai_ops::{AttentionWorkspace, Bf16Matrix, BonsaiOps, KvFormat, KvLayout, RmsNormParams},
+    bonsai_ops::{
+        AttentionWorkspace, Bf16Matrix, BonsaiOps, KvFormat, KvLayout, RmsNormParams, Rope,
+    },
     buffer::MetalBuffer,
     context::MetalContext,
     shaders::ShaderLibrary,
@@ -973,6 +975,7 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
             1e-6,
             10_000_000.0,
             tokens,
+            Rope::TEXT,
         )
         .expect("full preparation");
         ops.prepare_kv_rows_kv(
@@ -988,6 +991,7 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
             1e-6,
             10_000_000.0,
             tokens,
+            Rope::TEXT,
         )
         .expect("kv preparation");
         batch.commit_and_wait().expect("preparation completion");
