@@ -18,6 +18,11 @@
 //! model has no control for, become an instruction at the end of the system
 //! turn (see [`add_verbosity`]).
 //!
+//! `logprobs` and `top_logprobs` (0 to 20) report the answer's tokens with
+//! their log-probabilities under the model's raw distribution: before
+//! temperature, penalties, truncation and any response-format mask, as
+//! vLLM's `raw_logprobs`. Reasoning and tool-call tokens are not reported.
+//!
 //! Only the current specification is served. Of the members it marks
 //! deprecated, only `max_tokens` (which opencode sends) is honoured, as
 //! `max_completion_tokens`; the rest, like `functions` and `user`, are
@@ -71,11 +76,13 @@ struct GenerateRequest {
     /// `low`, `medium` or `high` (see [`add_verbosity`]).
     verbosity: Option<String>,
     response_format: Option<Value>,
+    /// Report the answer's token log-probabilities, with `top_logprobs` (at
+    /// most 20) alternatives each.
+    logprobs: Option<Value>,
+    top_logprobs: Option<u64>,
     // Options this server cannot honour. They are named so a request that
     // sets one fails instead of being answered as if it had not.
     n: Option<u64>,
-    logprobs: Option<Value>,
-    top_logprobs: Option<u64>,
     logit_bias: Option<Value>,
     store: Option<bool>,
     audio: Option<Value>,
@@ -118,6 +125,8 @@ impl GenerateRequest {
                         .or_else(|| seed.as_i64().map(i64::cast_unsigned))
                 })
                 .unwrap_or(defaults.seed),
+            logprobs: (self.logprobs == Some(Value::Bool(true)))
+                .then(|| self.top_logprobs.unwrap_or(0) as usize),
         }
     }
 
@@ -149,8 +158,19 @@ impl GenerateRequest {
                 ));
             }
         };
-        if logprobs || self.top_logprobs.is_some_and(|n| n > 0) {
-            return unsupported("logprobs", "token log-probabilities are not reported");
+        if self
+            .top_logprobs
+            .is_some_and(|n| n > local_engine::MAX_TOP_LOGPROBS as u64)
+        {
+            return Err(crate::Error::InvalidArgument(format!(
+                "top_logprobs must be between 0 and {}",
+                local_engine::MAX_TOP_LOGPROBS
+            )));
+        }
+        if !logprobs && self.top_logprobs.is_some_and(|n| n > 0) {
+            return Err(crate::Error::InvalidArgument(
+                "top_logprobs requires logprobs to be true".into(),
+            ));
         }
         if self.logit_bias.as_ref().is_some_and(|bias| !is_empty(bias)) {
             return unsupported("logit_bias", "the sampler has no per-token bias");

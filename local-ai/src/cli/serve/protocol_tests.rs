@@ -482,7 +482,11 @@ fn chat_rejects_options_it_cannot_honour() {
         (json!({"stop":7}), "stop must be a string or an array"),
         (json!({"stop":["a",1]}), "stop must be a string or an array"),
         (json!({"stop":["a","b","c","d","e"]}), "at most 4 strings"),
-        (json!({"logprobs":true}), "logprobs"),
+        (json!({"top_logprobs":3}), "top_logprobs requires logprobs"),
+        (
+            json!({"logprobs":true,"top_logprobs":21}),
+            "top_logprobs must be between 0 and 20",
+        ),
         (json!({"logprobs":5}), "logprobs must be a boolean"),
         (json!({"logit_bias":{"1":2}}), "logit_bias"),
         (json!({"service_tier":"flex"}), "service_tier"),
@@ -575,7 +579,10 @@ fn chat_history_errors_are_reported_before_generation() {
 
 fn chat_reply(include_usage: bool) -> Reply {
     Reply {
-        protocol: Protocol::Chat { include_usage },
+        protocol: Protocol::Chat {
+            include_usage,
+            logprobs: false,
+        },
         id: "chatcmpl-1".into(),
         created: 5,
         model: "m".into(),
@@ -761,6 +768,7 @@ fn chat_stream_error_is_one_terminal_server_error_frame() {
     let mut failed = Frames::new(Reply::new(
         Protocol::Chat {
             include_usage: false,
+            logprobs: false,
         },
         "m".into(),
     ));
@@ -1472,6 +1480,7 @@ fn route_preparation_maps_each_api_to_its_protocol() {
         protocol,
         Protocol::Chat {
             include_usage: true,
+            ..
         }
     ));
 }
@@ -1481,12 +1490,14 @@ fn reply_ids_are_prefixed_and_unique() {
     let a = Reply::new(
         Protocol::Chat {
             include_usage: false,
+            logprobs: false,
         },
         "m".into(),
     );
     let b = Reply::new(
         Protocol::Chat {
             include_usage: false,
+            logprobs: false,
         },
         "m".into(),
     );
@@ -1971,4 +1982,142 @@ fn an_unfinished_structured_answer_is_never_reported_complete() {
         let (tail, _) = frames.event(Event::Finished(structured_stats(stop, complete)));
         assert_eq!(parse_data(&tail[0])["choices"][0]["finish_reason"], reason);
     }
+}
+
+fn logprob(
+    token: u32,
+    text: &str,
+    logprob: f32,
+    top: &[(u32, &str, f32)],
+) -> local_engine::TokenLogprob {
+    local_engine::TokenLogprob {
+        token,
+        logprob,
+        bytes: text.as_bytes().to_vec(),
+        top: top
+            .iter()
+            .map(|&(token, text, logprob)| local_engine::TopLogprob {
+                token,
+                logprob,
+                bytes: text.as_bytes().to_vec(),
+            })
+            .collect(),
+    }
+}
+
+/// `logprobs`/`top_logprobs` (Chat) and `include`/`top_logprobs`
+/// (Responses) ask the engine for that many alternatives, and each API
+/// reports the tokens in `OpenAI`'s shape next to the text they produced.
+#[test]
+fn logprobs_reach_both_apis_in_the_openai_shape() {
+    let with = |body: Value| {
+        chat_request(&body, true)
+            .expect("valid")
+            .sampling
+            .0
+            .logprobs
+    };
+    assert_eq!(with(json!({"messages":[user()]})), None);
+    assert_eq!(with(json!({"messages":[user()],"logprobs":true})), Some(0));
+    assert_eq!(
+        with(json!({"messages":[user()],"logprobs":true,"top_logprobs":3})),
+        Some(3)
+    );
+    let responses = |body: Value| {
+        prepare_responses(body.to_string().as_bytes(), true)
+            .expect("valid")
+            .request
+            .sampling
+            .0
+            .logprobs
+    };
+    assert_eq!(responses(json!({"input":"hi"})), None);
+    assert_eq!(
+        responses(json!({"input":"hi","include":["message.output_text.logprobs"]})),
+        Some(0)
+    );
+    assert_eq!(responses(json!({"input":"hi","top_logprobs":2})), Some(2));
+    assert!(responses_error(&json!({"input":"hi","top_logprobs":21})).contains("between 0 and 20"));
+
+    let first = logprob(9, "Hi", -0.25, &[(9, "Hi", -0.25), (4, "Hey", -1.5)]);
+    // A split character: `token` is lossy, `bytes` exact.
+    let second = local_engine::TokenLogprob {
+        bytes: vec![0xe2, 0x82],
+        ..logprob(7, "", -2.0, &[])
+    };
+    let expected_first = json!({"token":"Hi","logprob":-0.25,"bytes":[72,105],"top_logprobs":[
+        {"token":"Hi","logprob":-0.25,"bytes":[72,105]},
+        {"token":"Hey","logprob":-1.5,"bytes":[72,101,121]}]});
+    let events = || {
+        [
+            Event::Reasoning("why".into()),
+            Event::Logprobs(vec![first.clone()]),
+            Event::Content("Hi".into()),
+            Event::Logprobs(vec![second.clone()]),
+            Event::Content("\u{20ac}".into()),
+        ]
+    };
+
+    // Chat stream: each content chunk carries its own tokens.
+    let reply = Reply {
+        protocol: Protocol::Chat {
+            include_usage: false,
+            logprobs: true,
+        },
+        ..chat_reply(false)
+    };
+    let mut frames = Frames::new(reply.clone());
+    let chunks = events()
+        .into_iter()
+        .flat_map(|event| frames.event(event).0)
+        .map(|frame| parse_data(&frame))
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 3, "{chunks:#?}");
+    assert_eq!(chunks[0]["choices"][0].get("logprobs"), None);
+    assert_eq!(
+        chunks[1]["choices"][0]["logprobs"],
+        json!({"content":[&expected_first],"refusal":null})
+    );
+    assert_eq!(
+        chunks[2]["choices"][0]["logprobs"]["content"][0]["token"],
+        "\u{fffd}"
+    );
+    assert_eq!(
+        chunks[2]["choices"][0]["logprobs"]["content"][0]["bytes"],
+        json!([226, 130])
+    );
+
+    // Chat body: every content token, in order.
+    let mut signals = events().into_iter().map(Signal::Event).collect::<Vec<_>>();
+    signals.push(Signal::Event(Event::Finished(stats(StopReason::Eos))));
+    let document: Value = serde_json::from_slice(&body_bytes(reply, signals)).expect("valid JSON");
+    let content = &document["choices"][0]["logprobs"]["content"];
+    assert_eq!(content.as_array().map(Vec::len), Some(2));
+    assert_eq!(content[0], expected_first);
+    assert_eq!(document["choices"][0]["message"]["content"], "Hi\u{20ac}");
+
+    // Responses: per delta, and the whole message's on its output_text.
+    let mut frames = Frames::new(responses_reply(
+        &json!({"input":"hi","include":["message.output_text.logprobs"],"top_logprobs":2}),
+    ));
+    let mut out = frames.start();
+    for event in events() {
+        out.extend(frames.event(event).0);
+    }
+    out.extend(frames.event(Event::Finished(stats(StopReason::Eos))).0);
+    let events = sse_events(&out);
+    let deltas = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_text.delta")
+        .collect::<Vec<_>>();
+    assert_eq!(deltas[0]["logprobs"], json!([&expected_first]));
+    assert_eq!(deltas[1]["logprobs"][0]["logprob"], -2.0);
+    let done = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("completed");
+    let part = &done["response"]["output"][1]["content"][0];
+    assert_eq!(part["text"], "Hi\u{20ac}");
+    assert_eq!(part["logprobs"].as_array().map(Vec::len), Some(2));
+    assert_eq!(part["logprobs"][0], expected_first);
 }

@@ -22,7 +22,7 @@ use local_metal::bonsai_ops::{
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::{DeviceCaps, MetalContext};
 use local_metal::draft::GreedyRows;
-use local_metal::sampling::GpuTopK;
+use local_metal::sampling::{GpuTopK, LogprobRows, TopKCandidate};
 use local_metal::shaders::ShaderLibrary;
 
 use crate::bonsai::{
@@ -580,6 +580,75 @@ enum Selection {
     Rows(usize),
 }
 
+/// Logits whose raw log-probability statistics [`Distributions`] holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Described {
+    None,
+    /// `scratch.logits`.
+    Last,
+    /// The first rows of the last verify block's `verify_logits`.
+    Rows(usize),
+    /// The last batched step's logits.
+    Batch,
+}
+
+/// Raw log-probability statistics of the logit rows the last block or
+/// batched step produced, computed in its own command buffer while a request
+/// asks for log-probabilities ([`BonsaiModel::set_logprobs`]). The workspace
+/// is made on first use, so requests without log-probabilities never pay
+/// for it.
+struct Distributions {
+    rows: Option<LogprobRows>,
+    described: Described,
+    /// Best logits each described row holds.
+    top: usize,
+}
+
+impl Distributions {
+    /// Make room for the statistics of `rows` rows.
+    fn reserve(&mut self, context: &MetalContext, rows: usize) -> crate::Result<()> {
+        if self
+            .rows
+            .as_ref()
+            .is_none_or(|workspace| workspace.max_rows() < rows)
+        {
+            let shaders = ShaderLibrary::new(context.device())?;
+            self.rows = Some(LogprobRows::new(
+                context,
+                &shaders,
+                VOCAB,
+                rows.max(batch::MAX_BATCH_ROWS),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Encode the statistics of the first `rows` rows of `logits`, with
+    /// their `top` best logits, after [`Self::reserve`]; the caller records
+    /// what they describe.
+    fn encode(
+        &self,
+        batch: &mut CommandBatch,
+        logits: &MetalBuffer,
+        rows: usize,
+        top: usize,
+    ) -> crate::Result<()> {
+        self.rows
+            .as_ref()
+            .ok_or_else(|| crate::Error::InvalidArgument("no log-probability workspace".into()))?
+            .encode(batch, logits, rows, top)
+            .map_err(Into::into)
+    }
+
+    /// Row `row` of `logits`: its log-sum-exp and best `top` logits, when
+    /// these statistics describe them.
+    fn row(&self, logits: Described, row: usize, top: usize) -> Option<(f32, &[TopKCandidate])> {
+        let workspace = self.rows.as_ref()?;
+        (self.described == logits && self.top >= top && row < workspace.max_rows())
+            .then(|| (workspace.log_sum_exp(row), workspace.top(row, top)))
+    }
+}
+
 /// The loaded native graph plus its per-request state.
 pub struct BonsaiModel {
     context: MetalContext,
@@ -609,6 +678,9 @@ pub struct BonsaiModel {
     device_greedy: bool,
     /// Which logits `greedy` currently describes.
     selection: Selection,
+    /// Alternatives per row while the request asks for log-probabilities.
+    logprobs: Option<usize>,
+    distributions: Distributions,
     epsilon: f32,
     rope_base: f32,
     position: usize,
@@ -793,6 +865,12 @@ impl BonsaiModel {
             greedy: GreedyRows::new(&context, &shaders, VOCAB, verify_depth + 1)?,
             device_greedy: false,
             selection: Selection::None,
+            logprobs: None,
+            distributions: Distributions {
+                rows: None,
+                described: Described::None,
+                top: 0,
+            },
             epsilon: package.metadata_f32("qwen35.attention.layer_norm_rms_epsilon")?,
             rope_base: package.metadata_f32("qwen35.rope.freq_base")?,
             position: 0,
@@ -1279,12 +1357,27 @@ impl BonsaiModel {
         self.device_greedy = enabled;
     }
 
+    /// Compute each produced logit row's raw log-probability statistics, with
+    /// its `top` best logits, inside the block's own command buffer from now
+    /// on, for a request that asks for log-probabilities; `None` stops.
+    pub(crate) const fn set_logprobs(&mut self, top: Option<usize>) {
+        self.logprobs = top;
+    }
+
     /// Sample from the logits of the newest committed token on the GPU.
     pub(crate) fn sample(&mut self, sampler: &mut Sampler) -> crate::Result<SamplingResult> {
-        if self.selection == Selection::Last && sampler.selects_argmax() {
-            return Ok(sampler.greedy_result(self.greedy.results(1)[0].best_id));
-        }
-        sampler.sample_buffer(&mut self.scratch.logits, 0, &self.context, &self.sampling)
+        let argmax = (self.selection == Selection::Last).then(|| self.greedy.results(1)[0].best_id);
+        let distribution = sampler
+            .logprobs()
+            .and_then(|top| self.distributions.row(Described::Last, 0, top));
+        sampler.select_row(
+            &mut self.scratch.logits,
+            0,
+            &self.context,
+            &self.sampling,
+            argmax,
+            distribution,
+        )
     }
 
     /// Verify `drafts` against the `rows` logit rows of the verify block just
@@ -1301,16 +1394,16 @@ impl BonsaiModel {
         // the row that selected `</think>`, and the rows after that must
         // not take the block's unmasked argmax.
         verify_greedy_drafts(sampler, drafts, |row, sampler| {
-            if let Some(results) = selected
-                && sampler.selects_argmax()
-            {
-                return Ok(sampler.greedy_result(results[row].best_id));
-            }
-            sampler.sample_buffer(
+            let distribution = sampler
+                .logprobs()
+                .and_then(|top| self.distributions.row(Described::Rows(rows), row, top));
+            sampler.select_row(
                 logits,
                 row * VOCAB * size_of::<f32>(),
                 &self.context,
                 &self.sampling,
+                selected.map(|results| results[row].best_id),
+                distribution,
             )
         })
     }

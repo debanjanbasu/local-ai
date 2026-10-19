@@ -316,6 +316,7 @@ fn reply() -> Reply {
     Reply {
         protocol: Protocol::Chat {
             include_usage: false,
+            logprobs: false,
         },
         id: "local".into(),
         created: 0,

@@ -22,6 +22,7 @@ use crate::bonsai_vision::{PromptImages, VisionEncoder};
 use crate::judgment::{Decision, DecisionCapture, DecisionRequest, JudgmentHead, PreparedDecision};
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
 use crate::runtime::{EVENT_BUFFER, PrefillProgress};
+use crate::sampler::TokenLogprob;
 use crate::structured::{Grammar, ResponseFormat};
 use crate::tools::{
     ToolCall, ToolCallDelta, ToolCallParser, ToolChoice, ToolDefinition, ToolSet, Turn,
@@ -216,6 +217,14 @@ pub enum Event {
     /// caller-driven tool loop through an [`EventRelay`]. The engine never
     /// produces one.
     ToolOutput(ToolOutput),
+    /// The raw log-probabilities of the tokens whose text the next
+    /// [`Event::Content`] holds, sent just before it, for a request whose
+    /// [`GenerateParams::logprobs`] asks for them. Only answer tokens are
+    /// reported: reasoning, `</think>`, tool-call markup and arguments, the
+    /// whitespace the answer drops around them and text from a stop sequence
+    /// on never are. A token whose text two content events share goes with
+    /// the first.
+    Logprobs(Vec<TokenLogprob>),
     /// Generated token IDs, emitted as a batch before [`Event::Finished`].
     TokenIds(Vec<u32>),
     /// Successful terminal event.
@@ -431,6 +440,7 @@ impl Engine {
                 Event::TokenIds(ids) => token_ids = ids,
                 Event::ToolCallDelta(_)
                 | Event::ToolOutput(_)
+                | Event::Logprobs(_)
                 | Event::Finished(_)
                 | Event::Error(_) => {}
             }
@@ -509,7 +519,7 @@ impl Engine {
             ids,
             &params,
             session,
-            |piece| splitter.emit(piece, &mut callback).is_continue(),
+            |piece, logprobs| splitter.emit(piece, logprobs, &mut callback).is_continue(),
             cancel,
             progress,
             grammar,
@@ -1451,6 +1461,10 @@ fn content_with_images(message: &ChatMessage) -> crate::Result<std::borrow::Cow<
 /// tools) validated tool calls. Reasoning is split off first, so tool-call
 /// markup is only recognised in the visible answer, and stop sequences are
 /// matched last, in the content that remains.
+///
+/// Every content event keeps where its text starts in the generated text,
+/// so the log-probabilities of the tokens that produced it can go with it
+/// (see [`Event::Logprobs`]).
 struct EventSplitter {
     /// Original template mode, retained after the reasoning delimiter for usage.
     thinking: bool,
@@ -1460,6 +1474,20 @@ struct EventSplitter {
     answer_started: bool,
     tools: Option<ToolCallParser>,
     stop: StopSequences,
+    /// Bytes of generated text so far.
+    generated: usize,
+    /// Where the tool parser's input starts in the generated text.
+    parsed_from: Option<usize>,
+    /// Log-probabilities not yet sent, oldest first.
+    logprobs: VecDeque<Spanned>,
+}
+
+/// Log-probabilities of the tokens that produced generated text
+/// `start..end`.
+struct Spanned {
+    start: usize,
+    end: usize,
+    tokens: Vec<TokenLogprob>,
 }
 
 impl EventSplitter {
@@ -1471,6 +1499,9 @@ impl EventSplitter {
             answer_started: !reasoning,
             tools: tools.map(ToolCallParser::new),
             stop: StopSequences::new(stop),
+            generated: 0,
+            parsed_from: None,
+            logprobs: VecDeque::new(),
         }
     }
 
@@ -1484,6 +1515,7 @@ impl EventSplitter {
         self.tools.as_mut().and_then(ToolCallParser::take_failure)
     }
 
+    /// Split `piece`, which ends the generated text so far.
     fn content(
         &mut self,
         piece: &str,
@@ -1498,18 +1530,36 @@ impl EventSplitter {
             return ControlFlow::Continue(());
         }
         self.answer_started = true;
+        let offset = self.generated - text.len();
+        let base = *self.parsed_from.get_or_insert(offset);
         let stop = &mut self.stop;
+        let logprobs = &mut self.logprobs;
+        let mut deliver = |event, at| deliver(logprobs, event, at, callback);
         match &mut self.tools {
-            Some(parser) => parser.feed(text, &mut |event| stop.event(event, callback)),
-            None => stop.content(text, callback),
+            Some(parser) => parser.feed(text, &mut |event, at| {
+                stop.event(event, base + at, &mut deliver)
+            }),
+            None => stop.content(text, offset, &mut deliver),
         }
     }
 
+    /// Split the next generated `piece`, which `logprobs` (empty unless the
+    /// request asked for them) are the tokens of.
     fn emit(
         &mut self,
         piece: &str,
+        logprobs: Vec<TokenLogprob>,
         callback: &mut impl FnMut(Event) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
+        let start = self.generated;
+        self.generated += piece.len();
+        if !logprobs.is_empty() {
+            self.logprobs.push_back(Spanned {
+                start,
+                end: self.generated,
+                tokens: logprobs,
+            });
+        }
         if !self.reasoning {
             return self.content(piece, callback);
         }
@@ -1541,6 +1591,11 @@ impl EventSplitter {
     ) -> ControlFlow<()> {
         let remainder = self.pending.split_off(length);
         let text = std::mem::replace(&mut self.pending, remainder);
+        // Tokens wholly in sent reasoning are never reported.
+        let sent = self.generated - self.pending.len();
+        while self.logprobs.front().is_some_and(|span| span.end <= sent) {
+            self.logprobs.pop_front();
+        }
         callback(Event::Reasoning(text))
     }
 
@@ -1553,26 +1608,32 @@ impl EventSplitter {
     ) -> ControlFlow<()> {
         if !self.pending.is_empty() {
             let text = std::mem::take(&mut self.pending);
+            let offset = self.generated - text.len();
             let event = if self.reasoning {
                 Event::Reasoning(text)
             } else {
                 Event::Content(text)
             };
-            if callback(event).is_break() {
+            if deliver(&mut self.logprobs, event, offset, callback).is_break() {
                 return ControlFlow::Break(());
             }
         }
+        let base = self.parsed_from.unwrap_or(self.generated);
         let stop = &mut self.stop;
+        let logprobs = &mut self.logprobs;
+        let mut deliver = |event, at| deliver(logprobs, event, at, callback);
         let flow = self
             .tools
             .as_mut()
             .map_or(ControlFlow::Continue(()), |parser| {
-                parser.finish(reason, &mut |event| stop.event(event, callback))
+                parser.finish(reason, &mut |event, at| {
+                    stop.event(event, base + at, &mut deliver)
+                })
             });
         if flow.is_break() {
             return flow;
         }
-        stop.flush(callback)
+        stop.flush(&mut deliver)
     }
 
     /// Close the stream of a generation the engine stopped for `reason`:
@@ -1603,14 +1664,42 @@ impl EventSplitter {
     }
 }
 
+/// Send `event`, which starts at `offset` of the generated text; content
+/// goes after the log-probabilities of the tokens whose text it holds.
+/// Tokens wholly before it were dropped from the answer and are discarded.
+fn deliver(
+    logprobs: &mut VecDeque<Spanned>,
+    event: Event,
+    offset: usize,
+    callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    if let Event::Content(text) = &event {
+        let end = offset + text.len();
+        let mut tokens = Vec::new();
+        while let Some(span) = logprobs.pop_front_if(|span| span.start < end) {
+            if span.end > offset {
+                tokens.extend(span.tokens);
+            }
+        }
+        if !tokens.is_empty() && callback(Event::Logprobs(tokens)).is_break() {
+            return ControlFlow::Break(());
+        }
+    }
+    callback(event)
+}
+
 /// Ends the visible answer at the first of [`ChatRequest::stop`].
 ///
 /// Content is held back while its end could still begin a sequence, so no
 /// part of a sequence is ever emitted; any other event releases what is held,
 /// since a call or the end of generation ends the text a sequence could span.
+/// Each event goes on with where its text starts in the generated text.
 struct StopSequences {
     sequences: Vec<String>,
     held: String,
+    /// Where `held` starts in the generated text. Held content is one
+    /// contiguous run: any other event flushes it.
+    held_from: usize,
     /// A sequence matched: the answer is over and nothing more is emitted.
     matched: bool,
 }
@@ -1621,6 +1710,7 @@ impl StopSequences {
         Self {
             sequences,
             held: String::new(),
+            held_from: 0,
             matched: false,
         }
     }
@@ -1628,32 +1718,37 @@ impl StopSequences {
     fn event(
         &mut self,
         event: Event,
-        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+        offset: usize,
+        callback: &mut impl FnMut(Event, usize) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         match event {
-            Event::Content(text) => self.content(&text, callback),
+            Event::Content(text) => self.content(&text, offset, callback),
             _ if self.matched => ControlFlow::Break(()),
             other => {
                 if self.flush(callback).is_break() {
                     return ControlFlow::Break(());
                 }
-                callback(other)
+                callback(other, offset)
             }
         }
     }
 
-    /// Emit `text`, holding back a possible start of a sequence; at a match,
-    /// emit only what precedes it and break.
+    /// Emit `text`, which starts at `offset`, holding back a possible start
+    /// of a sequence; at a match, emit only what precedes it and break.
     fn content(
         &mut self,
         text: &str,
-        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+        offset: usize,
+        callback: &mut impl FnMut(Event, usize) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         if self.matched {
             return ControlFlow::Break(());
         }
         if self.sequences.is_empty() {
-            return callback(Event::Content(text.to_owned()));
+            return callback(Event::Content(text.to_owned()), offset);
+        }
+        if self.held.is_empty() {
+            self.held_from = offset;
         }
         self.held.push_str(text);
         if let Some(at) = self
@@ -1691,15 +1786,23 @@ impl StopSequences {
         }
         let rest = self.held.split_off(ready);
         let text = std::mem::replace(&mut self.held, rest);
-        callback(Event::Content(text))
+        let from = self.held_from;
+        self.held_from += text.len();
+        callback(Event::Content(text), from)
     }
 
     /// Emit the held text, which no sequence can complete any more.
-    fn flush(&mut self, callback: &mut impl FnMut(Event) -> ControlFlow<()>) -> ControlFlow<()> {
+    fn flush(
+        &mut self,
+        callback: &mut impl FnMut(Event, usize) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
         if self.held.is_empty() {
             return ControlFlow::Continue(());
         }
-        callback(Event::Content(std::mem::take(&mut self.held)))
+        let text = std::mem::take(&mut self.held);
+        let from = self.held_from;
+        self.held_from += text.len();
+        callback(Event::Content(text), from)
     }
 }
 

@@ -13,7 +13,7 @@ use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, checked,
-    event_wait, usage_json,
+    event_wait, logprob_json, usage_json,
 };
 use super::responses::ResponsesState;
 
@@ -91,7 +91,11 @@ enum Document {
     /// A chat completion. Tool calls are complete objects that only exist once
     /// the engine has validated them, so they are kept here and written in the
     /// tail, after the streamed strings, like every other end-dependent member.
-    Chat { calls: Vec<ToolCall> },
+    /// So are the content tokens' log-probabilities, when the request asked.
+    Chat {
+        calls: Vec<ToolCall>,
+        logprobs: Option<Vec<Value>>,
+    },
     /// A Response object.
     ///
     /// Its `output` is an array of items whose number, order and kinds are only
@@ -170,7 +174,10 @@ impl Body {
         };
         let compressed = matches!(codec, Codec::Zstd(_));
         let document = match &reply.protocol {
-            Protocol::Chat { .. } => Document::Chat { calls: Vec::new() },
+            Protocol::Chat { logprobs, .. } => Document::Chat {
+                calls: Vec::new(),
+                logprobs: logprobs.then(Vec::new),
+            },
             Protocol::Responses(echo) => Document::Responses(Box::new(ResponsesState::new(
                 &reply,
                 std::sync::Arc::clone(echo),
@@ -260,9 +267,9 @@ impl Body {
         // Nothing streamed at all is still a complete document: every member the
         // head declared and every one after it is closed as the empty string.
         self.declare_rest();
-        let calls = match &mut self.document {
-            Document::Chat { calls } => std::mem::take(calls),
-            Document::Responses(_) => Vec::new(),
+        let (calls, logprobs) = match &mut self.document {
+            Document::Chat { calls, logprobs } => (std::mem::take(calls), logprobs.take()),
+            Document::Responses(_) => (Vec::new(), None),
         };
         if !self.open && !calls.is_empty() {
             // A turn that only called tools has no answer, which OpenAI spells
@@ -271,7 +278,7 @@ impl Body {
         } else {
             self.close_value();
         }
-        let tail = stream_tail(&self.reply, &calls, stats);
+        let tail = stream_tail(&self.reply, &calls, logprobs, stats);
         self.pending.extend_from_slice(&tail);
     }
 
@@ -378,8 +385,18 @@ pub(super) fn absorb(body: &mut Body, signal: Signal) -> Flow {
         }
         Signal::Event(Event::ToolCall(call)) => {
             // A Responses document took its events above; a chat keeps calls for its tail.
-            if let Document::Chat { calls } = &mut body.document {
+            if let Document::Chat { calls, .. } = &mut body.document {
                 calls.push(call);
+            }
+            Flow::Keep
+        }
+        Signal::Event(Event::Logprobs(tokens)) => {
+            if let Document::Chat {
+                logprobs: Some(logprobs),
+                ..
+            } = &mut body.document
+            {
+                logprobs.extend(tokens.iter().map(logprob_json));
             }
             Flow::Keep
         }
@@ -443,7 +460,12 @@ fn absorb_response(body: &mut Body, signal: Signal) -> Flow {
 /// Every member here is end-dependent, which is the other half of why the
 /// streamed strings come first: `role` and `finish_reason` are not known until
 /// the generation has stopped.
-fn stream_tail(reply: &Reply, calls: &[ToolCall], stats: &Stats) -> Vec<u8> {
+fn stream_tail(
+    reply: &Reply,
+    calls: &[ToolCall],
+    logprobs: Option<Vec<Value>>,
+    stats: &Stats,
+) -> Vec<u8> {
     let mut tail = Vec::new();
     let stop = json_string(chat_finish_reason(stats.stop_reason, !calls.is_empty()));
     if !calls.is_empty() {
@@ -464,7 +486,11 @@ fn stream_tail(reply: &Reply, calls: &[ToolCall], stats: &Stats) -> Vec<u8> {
     }
     // `message` is still open, and this brace is what ends it.
     tail.extend_from_slice(b",\"role\":\"assistant\"}");
-    tail.extend_from_slice(b",\"logprobs\":null");
+    tail.extend_from_slice(b",\"logprobs\":");
+    tail.extend_from_slice(&encode(&logprobs.map_or(
+        Value::Null,
+        |tokens| json!({"content":tokens,"refusal":null}),
+    )));
     tail.extend_from_slice(b",\"finish_reason\":");
     tail.extend_from_slice(stop.as_bytes());
     // These two bytes close the choice and the array `stream_head` opened; the brace at the end closes the document.

@@ -284,6 +284,28 @@ Responses has no `stop`; the engine supports it for any request, so accepting
 `stop` there as a vendor extension would be a few lines of parsing, but it is
 not offered.
 
+Both APIs report token log-probabilities in OpenAI's shape (`token`,
+`logprob`, `bytes`, `top_logprobs`), for harnesses that verify or route on
+confidence. Chat takes `logprobs: true` with `top_logprobs` (0 to 20; it
+needs `logprobs`) and reports `choices[].logprobs.content`, and on each
+streamed content chunk the tokens behind it. Responses takes `include:
+["message.output_text.logprobs"]` with `top_logprobs` (0 to 20; a
+`top_logprobs` above 0 alone also asks) and reports `output_text.logprobs`
+and each `response.output_text.delta`'s tokens. The probabilities are the
+model's raw distribution, its logits before temperature, penalties,
+`top_k`/`top_p`/`min_p` and any response-format or tool grammar mask (vLLM's
+`raw_logprobs`), so they compare across sampling settings, and the token
+sampling chose need not be the most likely one. Only answer tokens are
+reported: reasoning, `</think>`, tool-call markup and arguments, the
+whitespace the answer drops around them and text from a stop sequence on
+are not. Speculation never shows: every token is reported from the target
+model's own row that selected it (plain decode, MTP or lookup verification,
+batched decode), never from a draft. A fused Metal kernel computes each such
+row's log-sum-exp and best logits in the block's own command buffer, only
+for requests that ask; see [Performance](#log-probabilities) for its cost.
+A Response finished after a server restart (from its journal) reports empty
+`logprobs`.
+
 `verbosity` (Chat) and `text.verbosity` (Responses) accept `low`, `medium`
 (the default) and `high`. The model has no verbosity control of its own, so
 `low` and `high` add a short instruction at the end of the system turn, after
