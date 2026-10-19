@@ -576,9 +576,10 @@ This is **not the full OpenAI platform contract**. Schema keywords
 llguidance cannot enforce exactly, strict tool schemas the native grammar
 cannot enforce exactly (including any without `"additionalProperties": false`),
 built-in tools other than those of
-[docs/TOOLS.md](TOOLS.md) (MCP, `file_search` and the like; `web_search` is
-accepted but never offered to the model, which cannot search here),
-`include` values other than
+[docs/TOOLS.md](TOOLS.md) (MCP, code interpreter and the like; `web_search`
+is accepted but never offered to the model, which cannot search here, while
+`file_search` runs natively over the vector stores),
+`include` values other than `file_search_call.results` and
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
 log-probabilities, images and audio are rejected.
 `tool_choice` `auto`, `none`, `required` and a named function,
@@ -611,8 +612,9 @@ moderations, text to speech and transcription run on optional native models
 (EmbeddingGemma 2, its moderation heads, Kokoro-82M, Whisper large-v3; see the
 endpoint table), while image and audio input to generation still needs a
 multimodal generator.
-Client-executed `custom`/`local_shell`/`apply_patch` tools and opt-in
-sandboxed hosted tools are described in [docs/TOOLS.md](TOOLS.md); other
+Client-executed `custom`/`local_shell`/`apply_patch` tools, `file_search` over
+the vector stores and opt-in sandboxed hosted tools are described in
+[docs/TOOLS.md](TOOLS.md); other
 built-in tools and fine-tuning still need their own services; the
 Administration API is described in [docs/ADMIN.md](ADMIN.md). None is implemented by merely accepting its request fields.
 

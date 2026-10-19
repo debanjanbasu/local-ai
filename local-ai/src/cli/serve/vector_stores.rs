@@ -31,6 +31,9 @@
 //! the score mapping and what `rewrite_query` and `ranking_options` do. Attaching
 //! files answers at once with `in_progress` objects and wakes the indexer;
 //! clients follow the status as they would with `OpenAI`.
+//!
+//! The Responses `file_search` tool searches through this service too
+//! ([`VectorStores::file_search`]), under the same bound on blocking work.
 
 use std::sync::Arc;
 
@@ -42,9 +45,11 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 
 use local_services::Store;
+use local_services::tools::ToolError;
 use local_services::vector_stores::{
     Attributes, CreateFileBatch, CreateVectorStore, CreateVectorStoreFile, FileStatus, ListOrder,
-    ListQuery, SearchRequest, UpdateVectorStore, VectorIndex, VectorStoreIndexer,
+    ListQuery, Ranking, SearchRequest, SearchResults, StoreStatus, UpdateVectorStore, VectorIndex,
+    VectorStoreIndexer,
 };
 
 use super::AppState;
@@ -123,6 +128,71 @@ impl VectorStores {
     ) {
         self.index.set_embedder(Some(embedder));
         self.indexer.notify();
+    }
+
+    /// Whether an embedding model is installed.
+    pub(super) fn embeds(&self) -> bool {
+        self.index.embeds()
+    }
+
+    /// Refuse store IDs a `file_search` tool cannot search: unknown or
+    /// expired stores, with the reason.
+    pub(super) async fn check_searchable(&self, ids: Vec<String>) -> Result<(), String> {
+        self.blocking(move |index| {
+            for id in &ids {
+                let store = index
+                    .store()
+                    .get_vector_store(id)
+                    .map_err(|error| super::file_search::service_message(&error))?;
+                if store.status == StoreStatus::Expired {
+                    return Err(format!("vector store {id} has expired"));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(Err)
+    }
+
+    /// Search the stores `ids` together for a `file_search` call (see
+    /// [`VectorIndex::search_stores`]).
+    pub(super) async fn file_search(
+        &self,
+        ids: Vec<String>,
+        request: SearchRequest,
+        ranking: Option<Ranking>,
+    ) -> Result<SearchResults, ToolError> {
+        self.blocking(move |index| {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            index
+                .search_stores(&ids, &request, ranking)
+                .map_err(|error| match error {
+                    local_services::Error::InvalidArgument(message) => ToolError::Invalid(message),
+                    other => ToolError::Failed(super::file_search::service_message(&other)),
+                })
+        })
+        .await
+        .unwrap_or_else(|message| Err(ToolError::Failed(message)))
+    }
+
+    /// Run `work` on the blocking pool, at most [`MAX_BLOCKING`] at once;
+    /// `Err` when the service is shutting down or the task failed.
+    async fn blocking<T, F>(&self, work: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&VectorIndex) -> T + Send + 'static,
+    {
+        let permit = Arc::clone(&self.blocking)
+            .acquire_owned()
+            .await
+            .map_err(|_| "the vector stores are shutting down".to_owned())?;
+        let index = Arc::clone(&self.index);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(&index)
+        })
+        .await
+        .map_err(|error| format!("vector stores task failed: {error}"))
     }
 
     /// Wake the indexer after a change outside this adapter (deleting a

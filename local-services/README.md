@@ -221,7 +221,8 @@ contract, limits and semantics are the module docs; the essentials:
   over file attributes (at most 16 per file), bounded in depth and size.
 
 `VectorIndex::open(&store)` owns the index (an exclusive lock file; a second
-process gets a conflict) and is the native search API (`search`, used by a
+process gets a conflict) and is the native search API (`search`, and
+`search_stores`, which ranks several stores together for the Responses
 `file_search` tool); `VectorStoreIndexer` is the event-driven worker thread
 (woken by `notify`, never polling) that calls `collect_garbage`,
 `index_next` and then `embed_next`, the embedding backfill of completed

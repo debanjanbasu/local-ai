@@ -27,6 +27,7 @@ mod chunked;
 mod compaction;
 mod decisions;
 mod embeddings;
+mod file_search;
 mod hosted;
 mod http3;
 mod journal;
@@ -126,8 +127,9 @@ struct AppState {
     services: Option<Arc<services::Services>>,
     batches: Option<Arc<batches::Batches>>,
     vector_stores: Option<Arc<vector_stores::VectorStores>>,
-    /// Hosted tools this server may run for Responses; `None` grants none.
-    tools: Option<Arc<tool_loop::Tools>>,
+    /// Hosted tools this server may run for Responses: the toolbox grants
+    /// (none without `--tools-*` flags) and the tool loop's bounds.
+    tools: Arc<tool_loop::Tools>,
     /// Native text embeddings, when the embedding model is installed.
     embeddings: Option<Arc<embeddings::Embeddings>>,
     /// Native text to speech, when the speech model is installed.
@@ -443,6 +445,16 @@ async fn dispatch(
         echo.set_creator(caller.creator());
     }
     let reply = Reply::new(protocol, Arc::clone(&state.model));
+    if let Protocol::Responses(echo) = &reply.protocol
+        && let (Some(config), Some(vector_stores)) =
+            (echo.kinds().file_search(), &state.vector_stores)
+        && let Err(message) = vector_stores
+            .check_searchable(config.vector_store_ids.clone())
+            .await
+    {
+        let message = format!("file_search: {message}");
+        return error_response(StatusCode::BAD_REQUEST, &message, &state, &parts.headers).await;
+    }
     let tool_loop = match hosted_loop(&state, &reply, &mut request) {
         Ok(tool_loop) => tool_loop,
         Err(message) => {
@@ -594,10 +606,8 @@ fn responses_loop(
     if echo.kinds().all_hosted().next().is_none() {
         return Ok(None);
     }
-    tool_loop::check(state.tools.as_deref(), echo.kinds())?;
-    let Some(tools) = &state.tools else {
-        return Ok(None);
-    };
+    let tools = &state.tools;
+    tool_loop::check(tools, echo.kinds(), state.vector_stores.as_deref())?;
     let engine = state.engine.clone();
     // Every round renders the same growing conversation, so one prompt-cache
     // affinity lets each round reuse the previous one's prefix.
@@ -608,6 +618,7 @@ fn responses_loop(
         submit: Box::new(move |request| engine.chat(request)),
         request: request.clone(),
         toolbox: tools.toolbox.clone(),
+        vector_stores: state.vector_stores.clone(),
         kinds: echo.kinds().clone(),
         bounds: tools.bounds,
         max_calls: echo.max_tool_calls(),
@@ -1131,7 +1142,8 @@ async fn run_async(args: Args) -> crate::Result<()> {
         }
     };
     // Hosted tools are opened before the model loads too, so a bad root or
-    // domain fails in milliseconds; nothing is granted without a flag.
+    // domain fails in milliseconds; nothing on the machine is granted without
+    // a flag (file_search, which only reads the vector stores, needs none).
     let tools = open_tools(&args.tools)?;
     // Background `store: false` Responses are kept only in a private store of
     // this process; without one they are refused, and nothing else changes.
@@ -1319,11 +1331,9 @@ fn open_responses(dir: &std::path::Path) -> crate::Result<Arc<ResponseStore>> {
 /// is aborted and its temporary removed.
 const PROMPT_CACHE_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(2);
 
-/// The hosted tools `args` grant, or `None` when they grant nothing.
-fn open_tools(args: &options::ToolArgs) -> crate::Result<Option<Arc<tool_loop::Tools>>> {
-    if !args.any() {
-        return Ok(None);
-    }
+/// The hosted tools `args` grant (none without flags) and the tool loop's
+/// bounds, which tools needing no permission (`file_search`) run within.
+fn open_tools(args: &options::ToolArgs) -> crate::Result<Arc<tool_loop::Tools>> {
     let toolbox = local_services::tools::Toolbox::new(
         local_services::tools::Permissions {
             root: args.root.clone(),
@@ -1337,23 +1347,25 @@ fn open_tools(args: &options::ToolArgs) -> crate::Result<Option<Arc<tool_loop::T
         },
     )
     .map_err(|error| crate::Error::InvalidArgument(format!("hosted tools: {error}")))?;
-    eprintln!(
-        "hosted tools enabled: root={} write={} shell={} fetch={:?}",
-        toolbox
-            .root()
-            .map_or_else(|| "none".to_owned(), |root| root.display().to_string()),
-        toolbox.permissions().write,
-        toolbox.permissions().shell,
-        toolbox.permissions().fetch_domains
-    );
-    Ok(Some(Arc::new(tool_loop::Tools {
+    if toolbox.any() {
+        eprintln!(
+            "hosted tools enabled: root={} write={} shell={} fetch={:?}",
+            toolbox
+                .root()
+                .map_or_else(|| "none".to_owned(), |root| root.display().to_string()),
+            toolbox.permissions().write,
+            toolbox.permissions().shell,
+            toolbox.permissions().fetch_domains
+        );
+    }
+    Ok(Arc::new(tool_loop::Tools {
         toolbox,
         bounds: tool_loop::Bounds {
             max_iterations: args.max_iterations,
             budget: args.budget,
             call_timeout: args.call_timeout,
         },
-    })))
+    }))
 }
 
 /// Resolve on SIGINT or SIGTERM: both stop the server gracefully, so a

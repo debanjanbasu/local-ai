@@ -131,7 +131,8 @@ fn violations(value: &Value, schema: &Value, root: &Value, path: &str, out: &mut
     }
 }
 
-fn conforms(value: &Value, name: &str) {
+/// Require `value` to conform to the pinned schema `name`.
+pub(in crate::cli::serve) fn conforms(value: &Value, name: &str) {
     let root = schemas();
     assert!(root["schemas"].get(name).is_some(), "no schema {name}");
     let mut out = Vec::new();

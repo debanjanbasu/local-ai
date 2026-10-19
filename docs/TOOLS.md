@@ -1,7 +1,8 @@
 # Tools on the Responses API
 
 The model always chooses tools; Rust executes them, outside model execution.
-Two families exist. Tools are declared only in the current shapes: Responses
+The client runs some; this server runs `file_search` (no permission needed)
+and, with explicit permission, the hosted tools. Tools are declared only in the current shapes: Responses
 `tools`, and Chat Completions `tools` with `tool_choice`; Chat's deprecated
 `functions`/`function_call` are refused, as is every legacy or deprecated API
 ([supported OpenAI APIs](BONSAI.md#supported-openai-apis)).
@@ -55,13 +56,69 @@ tool) and `include: ["web_search_call.action.sources"]` are refused (400).
 `{"type":"custom","name":...}`, `{"type":"shell"}` and
 `{"type":"apply_patch"}` as well as the function forms.
 
+## File search (no permission needed)
+
+`{"type":"file_search","vector_store_ids":[...]}` runs here, natively, over
+this server's [vector stores](BONSAI.md#native-services), in the same
+server-side loop as the hosted tools below. It needs no flag: it only reads
+the vector stores of the server's own data directory, which the same callers
+can already search with `POST /v1/vector_stores/{id}/search`.
+
+| member | accepted |
+|---|---|
+| `vector_store_ids` | 1 to 16 store IDs; each must exist and not be expired, or the request is refused (400) before generation |
+| `max_num_results` | 1 to 50; **default 5** (results are chunks the model must read; see the cost below) |
+| `ranking_options.ranker` | `auto` (default: `EmbeddingGemma` 2 cosine ranking when the embedding model is installed, BM25 otherwise) or `none` (BM25 only, no GPU work); `default-2024-11-15` is refused |
+| `ranking_options.score_threshold` | 0 to 1, on the reported score |
+| `ranking_options.hybrid_search` | `embedding_weight` and `text_weight`: weighted reciprocal rank fusion of the two rankings (`k` = 60); needs the embedding model and ranker `auto` |
+| `filters` | the vector store attribute filters (`eq` ... `nin`, `and`/`or`) |
+
+The model sees one strict function, `file_search(queries)`, taking 1 to 16
+query strings. A call ranks the chunks of every declared store together
+(`VectorIndex::search_stores`: each query embedded once with the loaded
+model, one database snapshot, chunk text read from the database rather than
+the source files) and the model reads the results as numbered passages,
+`【n】 filename` and the chunk text, numbered across the Response's searches.
+`tool_choice: {"type":"file_search"}` forces a search.
+
+Each call is one `file_search_call` item: `queries`, `status` (`completed`,
+or `failed` with the error the model read, or `incomplete` if the Response
+ended first) and `results` (`file_id`, `filename`, `score`, `text`,
+`attributes`), which are listed only with
+`include: ["file_search_call.results"]` and are `null` otherwise. Streaming
+emits `response.output_item.added` (`in_progress`),
+`response.file_search_call.in_progress` and `.searching` when the model has
+made the call, and `.completed` and `response.output_item.done` once it ran.
+
+**Citations.** The model is asked to cite a passage by writing its marker
+after the text it supports. A marker naming one of this Response's results
+(`【1】`, `【1, 2】`, `【1†notes.md】`) is removed from the answer, with the
+whitespace before it, and becomes a `file_citation` annotation (`file_id`,
+`filename`, `index`) at that point of the final text, `index` counted in
+Unicode scalar values, announced by `response.output_text.annotation.added`.
+Anything else in lenticular brackets stays as written. Citations depend on
+the model writing markers; a model that does not still answers from the
+results, without annotations.
+
+**Replay.** `file_search_call` items round-trip through `input`,
+`previous_response_id` and conversations: the model reads each as its call
+and the passages it returned, without markers (they are not the new
+Response's to cite), or, when the item carries no `results`, a note that the
+results are not part of the conversation, so it can search again.
+
+**Cost.** A search itself is fast (measured below); reading the results is
+not free: each result is a chunk, about 800 words with the default chunking,
+roughly 1,000 tokens of prefill (about 8 s at 125 tok/s), which is why the
+default is 5 results. A smaller `chunking_strategy` or `max_num_results`
+answers sooner.
+
 ## Hosted tools (server permission required; default: none)
 
-The server runs these itself, in a loop: generation stops on the call, the
-tool runs, its result is appended and generation continues, all within one
-Response. A request declares them; the server must also have been started
-with the matching permission, or the request is refused with a 400 naming
-the flag.
+The server runs these itself, in the same loop: generation stops on the call,
+the tool runs, its result is appended and generation continues, all within
+one Response. A request declares them; the server must also have been
+started with the matching permission, or the request is refused with a 400
+naming the flag.
 
 | request tool | needs | output items |
 |---|---|---|
@@ -76,8 +133,9 @@ fetch tool (`file_search` is vector-store retrieval, `web_search` is search),
 so these are reported as what they are, a function call plus the output the
 server produced, not as a built-in tool they are not.
 
-Bounds (flags): `--tools-max-iterations` rounds of hosted calls per Response
-(default 8), `--tools-call-timeout` seconds per call (default 20),
+Bounds (flags, which also bound `file_search`): `--tools-max-iterations`
+rounds of hosted calls per Response (default 8), `--tools-call-timeout`
+seconds per call (default 20),
 `--tools-budget` seconds of tool time per Response (default 120), and the
 request's `max_tool_calls`. A call past a bound is not run, its output says
 so, and the model is asked once more with `tool_choice: none` for an answer.
@@ -187,3 +245,35 @@ fetch), scratch root holding `notes.txt` (3 lines) and `docs/readme.md`.
   is `error: invalid arguments: ... must be a relative path that stays inside
   the workspace` (status `incomplete`); the outside file's canary text
   appears nowhere in the Response, and the model reported the refusal.
+
+## Live check: `file_search` (2026-10-19, Apple Silicon, PTQ1 checkpoint)
+
+Server: `local-ai serve` with no `--tools-*` flag and the `EmbeddingGemma` 2
+text model installed; one vector store of three small Markdown files
+(a fictional station handbook, a travel policy and bread notes; facts the
+model cannot know).
+
+- Non-streaming, `include: ["file_search_call.results"]`, reasoning `low`
+  (HTTP 200, 20.5 s, 1,202 input and 319 output tokens): the model made one
+  call with three queries, the `file_search_call` item listed the three
+  files' results with scores, and the answer gave the right figures (41
+  hours, Ilse Varga, 37 euros) with three `file_citation` annotations, each
+  at the end of the sentence it supports and naming the right file.
+- Streaming (9.6 s): `output_item.added` (`in_progress`),
+  `file_search_call.in_progress`, `.searching`, `.completed`,
+  `output_item.done` (`completed`), then the answer (docking port C, Priya
+  Anand) with two `output_text.annotation.added` events; the concatenated
+  deltas equal the final text, markers removed.
+- A follow-up with `previous_response_id` answered from the replayed results
+  ("quillmark.md") without searching again; a Response in a conversation
+  appended its `file_search_call` item; an unknown store ID was a 400 naming
+  it, before generation.
+
+Measured search time inside the loop (call start to results, warm): 13 to
+15 ms with the embedding ranking (one or two queries, including embedding
+them; 46 ms for the first, three-query call), 2 ms with `ranker: none`
+(BM25). Through `POST /v1/vector_stores/{id}/search` on the same store:
+about 55 ms per HTTP request with embeddings and 1 ms with BM25. Whole
+Responses with a one-number answer and no reasoning took 2 to 6 s; what
+dominates is generation and the prefill of the returned chunks, not the
+search.

@@ -300,6 +300,57 @@ fn files_are_embedded_with_their_index_and_ranked_by_meaning() {
 }
 
 #[test]
+fn several_stores_are_searched_as_one_ranking() {
+    let root = TempRoot::new();
+    let fake = Fake::new("fake/1");
+    let (store, index) = root.open(Some(&fake));
+    let alpha = file(&store, "a.txt", "car repair manual");
+    let beta = file(&store, "b.txt", "garden tools and seeds");
+    let gamma = file(&store, "c.txt", "automobile engine oil");
+    let first = vector_store(&store, &[&alpha, &beta]);
+    let second = vector_store(&store, &[&gamma]);
+    index_all(&index);
+    let found = |stores: &[&str], ranking: Option<Ranking>| {
+        index
+            .search_stores(stores, &SearchRequest::new("automobile"), ranking)
+            .unwrap()
+            .data
+            .into_iter()
+            .map(|hit| (hit.file_id, hit.score))
+            .collect::<Vec<_>>()
+    };
+    // One dense ranking over both stores, best first, each chunk once even
+    // when a store is named twice; scores are those of a single-store search.
+    let both = found(&[&first, &second, &first], None);
+    let files: Vec<&str> = both.iter().map(|(file, _)| file.as_str()).collect();
+    assert_eq!(files.len(), 3, "{both:?}");
+    assert!(files.contains(&gamma.as_str()) && files.contains(&alpha.as_str()));
+    assert!(both.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+    let alone = search(&index, &second, "automobile", Ranker::Auto);
+    let gamma_score = both.iter().find(|(file, _)| *file == gamma).unwrap().1;
+    assert!((gamma_score - alone[0].1).abs() < 1e-9);
+    // An explicit ranking (the tool's hybrid_search weights) applies to all.
+    let fused = found(
+        &[&first, &second],
+        Some(Ranking::Fused {
+            k: 60.0,
+            text_weight: 1.0,
+            embedding_weight: 0.0,
+        }),
+    );
+    // Text weight only: just the chunk holding the word ranks, scored 1.
+    assert_eq!(fused[0], (gamma, 1.0));
+    assert!(matches!(
+        index.search_stores(&[], &SearchRequest::new("x"), None),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        index.search_stores(&[&first, "vs_missing"], &SearchRequest::new("x"), None),
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[test]
 fn ranking_options_are_validated_and_refused_honestly() {
     let root = TempRoot::new();
     let fake = Fake::new("fake/1");

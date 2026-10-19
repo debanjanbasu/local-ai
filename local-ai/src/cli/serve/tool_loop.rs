@@ -26,10 +26,15 @@
 //! budget (`max_output_tokens`) covers all rounds together, and reported
 //! usage is their sum.
 //!
+//! `file_search` calls run here too, on the vector stores (see
+//! [`super::file_search`]); they need no permission, and their results are
+//! numbered across the Response so citations name one result each.
+//!
 //! Cancellation — the client going away, `POST .../cancel`, shutdown —
 //! cancels the generation being forwarded and drops the running tool, which
 //! kills a shell command's process group.
 
+use std::future::Future;
 use std::pin::pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -37,11 +42,13 @@ use std::time::{Duration, Instant};
 use local_engine::bonsai_model::StopReason;
 use local_engine::{
     CancelHandle, ChatMessage, ChatRequest, Event, EventRelay, EventStream, PrefillProgress,
-    Signal, Stats, ToolCall, ToolChoice,
+    Signal, Stats, ToolCall, ToolChoice, ToolOutput,
 };
 use local_services::tools::{Output, ToolError, Toolbox, denial};
 
+use super::file_search;
 use super::hosted::{self, Hosted, Kinds};
+use super::vector_stores::VectorStores;
 
 /// How often a running tool reports liveness to the consumer, so a
 /// non-streaming body (whose stall budget is at least 10 s) keeps writing
@@ -60,32 +67,51 @@ pub(super) struct Bounds {
     pub(super) call_timeout: Duration,
 }
 
-/// The hosted tools a server was started with.
+/// The hosted tools a server was started with: the toolbox's grants (none
+/// by default) and the loop's bounds, which `file_search` also runs within.
 pub(super) struct Tools {
     pub(super) toolbox: Toolbox,
     pub(super) bounds: Bounds,
 }
 
-/// Refuse hosted tools in `kinds` that `tools` does not permit.
-pub(super) fn check(tools: Option<&Tools>, kinds: &Kinds) -> Result<(), String> {
-    let mut needed = kinds.all_hosted().peekable();
-    if needed.peek().is_none() {
-        return Ok(());
-    }
-    let Some(tools) = tools else {
-        return Err(
-            "hosted tools (shell, local_fs_*, local_web_fetch) are not supported: this \
-                    server was started without tool permissions (see --tools-root, \
-                    --tools-shell and --tools-fetch-domain)"
-                .into(),
-        );
-    };
-    for hosted in needed {
-        if !tools.toolbox.allows(hosted.capability()) {
-            return Err(format!(
-                "a declared tool is not permitted: {}",
-                denial(hosted.capability())
-            ));
+/// Refuse hosted tools in `kinds` that `tools` does not permit, and a
+/// `file_search` this server cannot run (`vector_stores` is `None` when it
+/// has none).
+pub(super) fn check(
+    tools: &Tools,
+    kinds: &Kinds,
+    vector_stores: Option<&VectorStores>,
+) -> Result<(), String> {
+    for hosted in kinds.all_hosted() {
+        match hosted.capability() {
+            Some(capability) if !tools.toolbox.allows(capability) => {
+                return Err(format!(
+                    "a declared tool is not permitted: {}",
+                    denial(capability)
+                ));
+            }
+            Some(_) => {}
+            None => {
+                let Some(vector_stores) = vector_stores else {
+                    return Err(
+                        "file_search is unavailable: this server has no vector stores \
+                                (no services store, or another local-ai process owns this data \
+                                directory's index)"
+                            .into(),
+                    );
+                };
+                if kinds
+                    .file_search()
+                    .is_some_and(file_search::Config::needs_embeddings)
+                    && !vector_stores.embeds()
+                {
+                    return Err(
+                        "file_search ranking_options.hybrid_search needs the embedding \
+                                model, which is not installed on this server"
+                            .into(),
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -99,6 +125,8 @@ pub(super) struct Loop {
     pub(super) submit: Submit,
     pub(super) request: ChatRequest,
     pub(super) toolbox: Toolbox,
+    /// What `file_search` calls search; `None` refuses them.
+    pub(super) vector_stores: Option<Arc<VectorStores>>,
     pub(super) kinds: Kinds,
     pub(super) bounds: Bounds,
     /// The request's `max_tool_calls`.
@@ -212,6 +240,8 @@ impl Driver {
     fn run(mut self, mut inner: EventStream) {
         let budget = self.tool_loop.request.max_tokens;
         let mut spent = Spent::default();
+        // The citation marker number of the next file search result.
+        let mut marker = 1;
         loop {
             let Some((turn, stats)) = self.forward(&mut inner) else {
                 return;
@@ -240,10 +270,9 @@ impl Driver {
             }
             let mut outputs = Vec::with_capacity(hosted.len());
             for (call, operation) in hosted {
-                let Some(result) = self.execute(&call, operation, &mut spent) else {
+                let Some(output) = self.run_call(&call, operation, &mut spent, &mut marker) else {
                     return;
                 };
-                let output = hosted::tool_output(&call, operation, &result);
                 if !self.send(Event::ToolOutput(output.clone())) {
                     return;
                 }
@@ -361,7 +390,41 @@ impl Driver {
             || spent.tool_time >= self.tool_loop.bounds.budget
     }
 
-    /// Run one hosted call within the bounds; `None` when the consumer
+    /// Run one hosted call and report its output; `None` when the consumer
+    /// cancelled while it ran. `marker` numbers file search results.
+    fn run_call(
+        &self,
+        call: &ToolCall,
+        operation: Hosted,
+        spent: &mut Spent,
+        marker: &mut usize,
+    ) -> Option<ToolOutput> {
+        if operation == Hosted::FileSearch {
+            let result = self.file_search(call, spent)?;
+            let output = file_search::output(call, &result, *marker);
+            *marker += file_search::numbered(&output);
+            Some(output)
+        } else {
+            let result = self.execute(call, operation, spent)?;
+            Some(hosted::tool_output(call, operation, &result))
+        }
+    }
+
+    /// Why no further call may run, once the bounds are used up.
+    fn denied(&self, spent: &Spent) -> Option<ToolError> {
+        self.exhausted(spent).then(|| {
+            ToolError::Denied(format!(
+                "not run: this response's tool budget is used up ({} rounds, {} calls, {:.1}s \
+                 of {}s); answer with what you have",
+                spent.rounds,
+                spent.calls,
+                spent.tool_time.as_secs_f64(),
+                self.tool_loop.bounds.budget.as_secs()
+            ))
+        })
+    }
+
+    /// Run one toolbox call within the bounds; `None` when the consumer
     /// cancelled while it ran.
     fn execute(
         &self,
@@ -369,20 +432,58 @@ impl Driver {
         operation: Hosted,
         spent: &mut Spent,
     ) -> Option<Result<Output, ToolError>> {
-        if self.exhausted(spent) {
-            return Some(Err(ToolError::Denied(format!(
-                "not run: this response's tool budget is used up ({} rounds, {} calls, {:.1}s \
-                 of {}s); answer with what you have",
-                spent.rounds,
-                spent.calls,
-                spent.tool_time.as_secs_f64(),
-                self.tool_loop.bounds.budget.as_secs()
-            ))));
+        if let Some(denied) = self.denied(spent) {
+            return Some(Err(denied));
         }
         let request = match hosted::request(operation, &call.arguments) {
             Ok(request) => request,
             Err(message) => return Some(Err(ToolError::Invalid(message))),
         };
+        let toolbox = &self.tool_loop.toolbox;
+        self.bounded(spent, |timeout| toolbox.run(request, timeout))
+    }
+
+    /// Run one `file_search` call within the bounds; `None` when the
+    /// consumer cancelled while it ran.
+    fn file_search(
+        &self,
+        call: &ToolCall,
+        spent: &mut Spent,
+    ) -> Option<Result<local_services::vector_stores::SearchResults, ToolError>> {
+        if let Some(denied) = self.denied(spent) {
+            return Some(Err(denied));
+        }
+        let (Some(config), Some(vector_stores)) = (
+            self.tool_loop.kinds.file_search(),
+            self.tool_loop.vector_stores.as_ref(),
+        ) else {
+            return Some(Err(ToolError::Denied(
+                "file_search is unavailable on this server".into(),
+            )));
+        };
+        let request = match config.request(&call.arguments) {
+            Ok(request) => request,
+            Err(message) => return Some(Err(ToolError::Invalid(message))),
+        };
+        let stores = config.vector_store_ids.clone();
+        let ranking = config.ranking();
+        self.bounded(spent, |timeout| async move {
+            tokio::time::timeout(timeout, vector_stores.file_search(stores, request, ranking))
+                .await
+                .unwrap_or(Err(ToolError::TimedOut(timeout)))
+        })
+    }
+
+    /// Run `work` (given its deadline) as one counted call, reporting
+    /// liveness while it runs; `None` when the consumer cancelled meanwhile.
+    fn bounded<T, F>(
+        &self,
+        spent: &mut Spent,
+        work: impl FnOnce(Duration) -> F,
+    ) -> Option<Result<T, ToolError>>
+    where
+        F: Future<Output = Result<T, ToolError>>,
+    {
         let timeout = self
             .tool_loop
             .bounds
@@ -391,7 +492,7 @@ impl Driver {
         spent.calls += 1;
         let started = Instant::now();
         let result = self.runtime.block_on(async {
-            let mut run = pin!(self.tool_loop.toolbox.run(request, timeout));
+            let mut run = pin!(work(timeout));
             let mut heartbeat = tokio::time::interval(HEARTBEAT);
             heartbeat.tick().await;
             loop {

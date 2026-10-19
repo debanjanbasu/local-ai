@@ -36,8 +36,11 @@
 //! - Function, `custom`, `local_shell` and `apply_patch` tools are returned
 //!   for the client to run; with server permission, `shell` and the
 //!   `local_fs_*`/`local_web_fetch` functions run here, in the loop of
-//!   [`super::tool_loop`] (see `docs/TOOLS.md`). Other built-in and MCP tools
-//!   need hosted services this server lacks. `tool_choice` (`auto`, `none`, `required` or
+//!   [`super::tool_loop`] (see `docs/TOOLS.md`), and so does `file_search`
+//!   over this server's vector stores, with no permission needed (see
+//!   [`super::file_search`]; `include: ["file_search_call.results"]` lists
+//!   its results). Other built-in and MCP tools need hosted services this
+//!   server lacks. `tool_choice` (`auto`, `none`, `required` or
 //!   `{"type":"function","name"}`), `parallel_tool_calls` and a tool's
 //!   `strict` map onto the engine's native tool grammar, which enforces them
 //!   on every sampled token, and are echoed back as accepted (`strict` as
@@ -238,6 +241,8 @@ pub(super) struct Echo {
     kinds: super::hosted::Kinds,
     /// `max_tool_calls`: hosted calls this Response may run.
     max_tool_calls: Option<u64>,
+    /// `include` lists `file_search_call.results`.
+    file_search_results: bool,
 }
 
 /// Runs one generation of the loaded model to its end, handing each piece of
@@ -447,6 +452,14 @@ impl ResponsesRequest {
             .any(|value| value == "reasoning.encrypted_content")
     }
 
+    /// Whether `include` asks for `file_search_call.results`.
+    fn includes_file_search_results(&self) -> bool {
+        self.include
+            .iter()
+            .flatten()
+            .any(|value| value == "file_search_call.results")
+    }
+
     /// Whether this is a background request kept only temporarily: `store`
     /// is `false`, explicitly or by default on a server without a store.
     fn temporary_background(&self, stored: bool) -> bool {
@@ -522,13 +535,16 @@ impl ResponsesRequest {
             }
         }
         if self.include.as_ref().is_some_and(|include| {
-            include
-                .iter()
-                .any(|value| value != "reasoning.encrypted_content" || !encrypted)
+            include.iter().any(|value| match value.as_str() {
+                "reasoning.encrypted_content" => !encrypted,
+                "file_search_call.results" => false,
+                _ => true,
+            })
         }) {
             return Err(unsupported(
                 "include",
-                "only reasoning.encrypted_content is implemented, and it requires --reasoning-key",
+                "only reasoning.encrypted_content (which requires --reasoning-key) and \
+                 file_search_call.results are implemented",
             ));
         }
         if self.top_logprobs.is_some_and(|n| n > 0) {
@@ -914,6 +930,7 @@ pub(super) fn prepare_responses_conversing(
         spent: Spent::default(),
         kinds,
         max_tool_calls: request.max_tool_calls,
+        file_search_results: request.includes_file_search_results(),
     };
     Ok(PreparedResponses {
         stream: request.stream.unwrap_or(false),
@@ -1644,27 +1661,33 @@ struct Turn {
     reasoning: Option<String>,
     content: Option<String>,
     calls: Vec<ToolCall>,
+    /// What calls that carry their own result (`file_search_call`)
+    /// returned, as tool messages after the turn's.
+    answers: Vec<ChatMessage>,
 }
 
 impl Turn {
     const fn is_empty(&self) -> bool {
         self.reasoning.is_none() && self.content.is_none() && self.calls.is_empty()
     }
-
-    fn into_message(self) -> ChatMessage {
-        ChatMessage {
-            role: "assistant".into(),
-            content: self.content.unwrap_or_default(),
-            reasoning_content: self.reasoning,
-            tool_calls: self.calls,
-            tool_call_id: None,
-        }
-    }
 }
 
 fn flush(turn: &mut Turn, messages: &mut Vec<ChatMessage>) {
     if !turn.is_empty() {
-        messages.push(std::mem::take(turn).into_message());
+        let Turn {
+            reasoning,
+            content,
+            calls,
+            answers,
+        } = std::mem::take(turn);
+        messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: content.unwrap_or_default(),
+            reasoning_content: reasoning,
+            tool_calls: calls,
+            tool_call_id: None,
+        });
+        messages.extend(answers);
     }
 }
 
@@ -1881,12 +1904,17 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
                     flush(turn, messages);
                     messages.push(plain("tool", content, Some(call_id)));
                 }
+                super::hosted::Input::Answered { call, content } => {
+                    turn.answers
+                        .push(plain("tool", content, Some(call.id.clone())));
+                    turn.calls.push(call);
+                }
             },
             None => {
                 return Err(unsupported(
                     &format!("input item type {other:?}"),
-                    "only messages, reasoning, and function, custom, shell, local_shell and \
-                     apply_patch calls and their outputs are accepted",
+                    "only messages, reasoning, file_search calls, and function, custom, shell, \
+                     local_shell and apply_patch calls and their outputs are accepted",
                 ));
             }
         },
@@ -1971,6 +1999,8 @@ struct Unfinished {
     part_done: bool,
     /// A reasoning item's summary part, once the journal opened it.
     summary: Option<SummaryPart>,
+    /// A message's citations the journal announced.
+    annotations: Vec<Value>,
 }
 
 /// The reasoning summary part a lost generation was streaming.
@@ -1987,6 +2017,10 @@ struct Open {
     id: String,
     index: usize,
     text: String,
+    /// Unicode scalar values in `text`, where the next citation points.
+    chars: usize,
+    /// A message's `file_citation` annotations so far.
+    annotations: Vec<Value>,
 }
 
 /// A `function_call` or `custom_tool_call` item whose arguments (or input)
@@ -2030,6 +2064,10 @@ pub(super) struct ResponsesState {
     flush: Option<Flush>,
     /// The extra generations run for this Response so far (see [`Spent`]).
     spent: Spent,
+    /// `file_search_call` items searching, by call ID: their output index.
+    searching: HashMap<String, usize>,
+    /// Citation markers of this Response's file search results.
+    citations: super::file_search::Citations,
 }
 
 impl ResponsesState {
@@ -2057,6 +2095,8 @@ impl ResponsesState {
             deferred: None,
             flush: None,
             spent,
+            searching: HashMap::new(),
+            citations: super::file_search::Citations::default(),
         }
     }
 
@@ -2188,6 +2228,11 @@ impl ResponsesState {
                 | "response.function_call_arguments.done"
                 | "response.custom_tool_call_input.done" => unfinished.text_done = true,
                 "response.content_part.done" => unfinished.part_done = true,
+                "response.output_text.annotation.added" => {
+                    if let Some(annotation) = event.get("annotation") {
+                        unfinished.annotations.push(annotation.clone());
+                    }
+                }
                 "response.reasoning_summary_part.added" => {
                     unfinished.summary = Some(SummaryPart::default());
                 }
@@ -2258,14 +2303,14 @@ impl ResponsesState {
         } else {
             "incomplete"
         };
-        let text = unfinished.text;
+        let (text, marks) = (unfinished.text, unfinished.annotations);
         let (part, done) = match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => (
                 Some(json!({"type":"reasoning_text","text":text})),
                 "response.reasoning_text.done",
             ),
             Some("message") => (
-                Some(json!({"type":"output_text","text":text,"annotations":[],"logprobs":[]})),
+                Some(json!({"type":"output_text","text":text,"annotations":marks,"logprobs":[]})),
                 "response.output_text.done",
             ),
             Some("function_call") => (None, "response.function_call_arguments.done"),
@@ -2433,12 +2478,32 @@ impl ResponsesState {
                 id,
                 index,
                 text: String::new(),
+                chars: 0,
+                annotations: Vec::new(),
             });
         }
+        if kind == ItemKind::Message && self.citations.active() {
+            for piece in self.citations.filter(piece) {
+                match piece {
+                    super::file_search::Piece::Text(text) => self.append(kind, &text),
+                    super::file_search::Piece::Cite(cited) => self.cite(cited),
+                }
+            }
+            return;
+        }
+        self.append(kind, piece);
+    }
+
+    /// Append `piece` to the open text item of `kind`.
+    fn append(&mut self, kind: ItemKind, piece: &str) {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        if piece.is_empty() {
+            return;
+        }
         open.text.push_str(piece);
+        open.chars += piece.chars().count();
         let (id, index) = (open.id.clone(), open.index);
         match kind {
             ItemKind::Reasoning => self.emit(
@@ -2452,11 +2517,44 @@ impl ResponsesState {
         }
     }
 
+    /// Annotate the open message, at the end of its text so far, with
+    /// citations of `cited` results (each file once per position).
+    fn cite(&mut self, cited: Vec<(String, String)>) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let mut added = Vec::new();
+        for (file_id, filename) in cited {
+            let annotation = json!({"type":"file_citation","file_id":file_id,"filename":filename,"index":open.chars});
+            if open.annotations.contains(&annotation) {
+                continue;
+            }
+            added.push((open.annotations.len(), annotation.clone()));
+            open.annotations.push(annotation);
+        }
+        let (id, index) = (open.id.clone(), open.index);
+        for (annotation_index, annotation) in added {
+            self.emit(
+                "response.output_text.annotation.added",
+                json!({"item_id":id,"output_index":index,"content_index":0,"annotation_index":annotation_index,"annotation":annotation}),
+            );
+        }
+    }
+
     /// Finish the open text item, if any, with `status`.
     fn close(&mut self, status: &str) {
         // A call the engine never completed (cut short) keeps what streamed.
         if let Some(call) = self.calling.take() {
             self.finish_streamed(call, None, "incomplete");
+        }
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.kind == ItemKind::Message)
+        {
+            // Whitespace held back in case a citation marker followed.
+            let held = self.citations.flush();
+            self.append(ItemKind::Message, &held);
         }
         let Some(open) = self.open.take() else {
             return;
@@ -2466,6 +2564,8 @@ impl ResponsesState {
             id,
             index,
             text,
+            annotations,
+            ..
         } = open;
         let item = match kind {
             ItemKind::Reasoning => {
@@ -2496,7 +2596,7 @@ impl ResponsesState {
                 item
             }
             ItemKind::Message => {
-                let part = json!({"type":"output_text","text":text,"annotations":[],"logprobs":[]});
+                let part = json!({"type":"output_text","text":text,"annotations":annotations,"logprobs":[]});
                 self.emit(
                     "response.output_text.done",
                     json!({"item_id":id,"output_index":index,"content_index":0,"text":text,"logprobs":[]}),
@@ -2621,14 +2721,15 @@ impl ResponsesState {
     /// The next part of a call's arguments while the engine generates it.
     ///
     /// A `function_call` (including hosted file and fetch calls) streams its
-    /// arguments and a `custom_tool_call` its raw input. Shell, local shell
-    /// and `apply_patch` calls are rendered whole when they complete.
+    /// arguments and a `custom_tool_call` its raw input. Shell, local shell,
+    /// `apply_patch` and file search calls are rendered whole when they
+    /// complete.
     fn call_delta(&mut self, delta: &ToolCallDelta) {
         let kind = self.echo.kinds.kind(&delta.name);
         let custom = kind == Kind::Custom;
         if matches!(
             kind,
-            Kind::Hosted(Hosted::Shell) | Kind::LocalShell | Kind::ApplyPatch
+            Kind::Hosted(Hosted::Shell | Hosted::FileSearch) | Kind::LocalShell | Kind::ApplyPatch
         ) {
             return;
         }
@@ -2756,6 +2857,12 @@ impl ResponsesState {
         let index = self.output.len();
         let kind = self.echo.kinds.kind(&call.name);
         let id = self.item_id(super::hosted::call_prefix(kind));
+        if kind == Kind::Hosted(Hosted::FileSearch) {
+            // Done once the search has run (see `tool_output`).
+            self.searching.insert(call.id.clone(), index);
+            self.push_rendered(super::file_search::started(&id, index, call));
+            return;
+        }
         if let Some(mut rendered) = super::hosted::call_item(kind, &id, index, call) {
             self.echo.kinds.qualify_rendered(&mut rendered);
             self.push_rendered(rendered);
@@ -2788,11 +2895,41 @@ impl ResponsesState {
     /// A hosted call's result, produced by this server between generations.
     fn tool_output(&mut self, output: &local_engine::ToolOutput) {
         self.close("completed");
+        if let Some(index) = self.searching.remove(&output.call_id) {
+            let include = self.echo.file_search_results;
+            let Some(item) = self.output.get_mut(index) else {
+                return;
+            };
+            let events = super::file_search::finished(item, index, output, include);
+            for (kind, fields) in events {
+                self.emit(kind, fields);
+            }
+            self.citations.add(output);
+            return;
+        }
         let index = self.output.len();
         let kind = self.echo.kinds.kind(&output.name);
         let id = self.item_id(super::hosted::output_prefix(kind));
         let rendered = super::hosted::output_item(kind, &id, index, output);
         self.push_rendered(rendered);
+    }
+
+    /// End the file searches still running (the Response is ending without
+    /// their results) as `incomplete`.
+    fn abandon_searches(&mut self) {
+        let mut searching: Vec<usize> = self.searching.drain().map(|(_, index)| index).collect();
+        searching.sort_unstable();
+        for index in searching {
+            let Some(item) = self.output.get_mut(index) else {
+                continue;
+            };
+            item["status"] = json!("incomplete");
+            let item = item.clone();
+            self.emit(
+                "response.output_item.done",
+                json!({"output_index":index,"item":item}),
+            );
+        }
     }
 
     fn push_rendered(&mut self, rendered: super::hosted::Rendered) {
@@ -2855,6 +2992,7 @@ impl ResponsesState {
             ),
         };
         self.close(item_status);
+        self.abandon_searches();
         if let Some(message) = self.encryption_error.take() {
             return self.fail(&message);
         }
@@ -2977,6 +3115,7 @@ impl ResponsesState {
 
     pub(super) fn fail(&mut self, message: &str) -> Value {
         self.close("incomplete");
+        self.abandon_searches();
         self.release(Vec::new());
         self.emit(
             "error",
@@ -3075,4 +3214,4 @@ mod conversation_response_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[path = "compaction_tests.rs"]
-mod compaction_tests;
+pub(super) mod compaction_tests;
