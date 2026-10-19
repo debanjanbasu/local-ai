@@ -21,7 +21,7 @@
 //! </tool_call>
 //! ```
 //!
-//! with the declared parameters in sorted order, each required one present and
+//! with the declared parameters in declared order, each required one present and
 //! each optional one present at most once. A string parameter's VALUE is raw
 //! text, constrained by a regular expression translated from its schema; any
 //! other parameter's VALUE is JSON from its own schema, in the template's
@@ -36,7 +36,7 @@
 //! ever allowed, and free text can never contain the opening tag in either
 //! form.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use llguidance::api::{GrammarWithLexer, TopLevelGrammar};
@@ -106,7 +106,7 @@ pub fn check_lark_grammar(grammar: &str) -> Result<(), String> {
 /// How a strict tool's arguments are spelled and read back.
 #[derive(Debug)]
 pub struct StrictTool {
-    /// Declared parameters in sorted (rendered) order.
+    /// Declared parameters in declared (rendered) order.
     pub(super) parameters: Vec<StrictParameter>,
 }
 
@@ -481,9 +481,8 @@ pub(super) fn classify(parameters: &Value) -> Result<StrictTool, String> {
         .filter(|(key, _)| matches!(key.as_str(), "$defs" | "definitions"))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<_, _>>();
-    let sorted: BTreeMap<&String, &Value> = declared.iter().collect();
-    let mut spelled = Vec::with_capacity(sorted.len());
-    for (name, schema) in sorted {
+    let mut spelled = Vec::with_capacity(declared.len());
+    for (name, schema) in &declared {
         let value = classify_parameter(parameters, schema, &definitions)
             .map_err(|error| format!("parameter {name:?}: {error}"))?;
         spelled.push(StrictParameter {

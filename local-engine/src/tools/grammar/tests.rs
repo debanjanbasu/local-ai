@@ -360,7 +360,7 @@ fn optional_parameters_utf8_raw_strings_and_nested_json_round_trip() {
             json!({"city": "\n", "days": 14}),
         ),
         (
-            "\n<function=plot>\n<parameter=note>\n[1, 2]\n</parameter>\n<parameter=rows>\n[[1, -2], [], [3]]\n</parameter>\n<parameter=tags>\n[\"</tool_call>\", \"a\\n</parameter>\", \"é\"]\n</parameter>\n</function>\n",
+            "\n<function=plot>\n<parameter=rows>\n[[1, -2], [], [3]]\n</parameter>\n<parameter=tags>\n[\"</tool_call>\", \"a\\n</parameter>\", \"é\"]\n</parameter>\n<parameter=note>\n[1, 2]\n</parameter>\n</function>\n",
             json!({"tags": ["</tool_call>", "a\n</parameter>", "é"], "note": "[1, 2]", "rows": [[1, -2], [], [3]]}),
         ),
     ];
@@ -394,7 +394,7 @@ fn optional_parameters_utf8_raw_strings_and_nested_json_round_trip() {
     feed_text(
         &mut grammar,
         &tokenizer,
-        "\n<function=plot>\n<parameter=note>\nn\n</parameter>\n<parameter=rows>\n[]\n</parameter>\n<parameter=tags>\n[\"a\"",
+        "\n<function=plot>\n<parameter=rows>\n[]\n</parameter>\n<parameter=tags>\n[\"a\"",
     )
     .expect("prefix");
     assert!(feed_text(&mut grammar, &tokenizer, ",\"b\"").is_err());

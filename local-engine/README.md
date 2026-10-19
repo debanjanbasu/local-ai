@@ -335,9 +335,9 @@ references work; network/file retrieval and unknown dialects are rejected.
 Annotations such as `title`, `description` and `default` do not constrain values.
 Ambiguous raw parameter text remains a string when its declared schema accepts
 strings, including nullable strings; the harness should avoid ambiguous unions.
-Object keys in rendered schemas and replayed arguments are in sorted order
-rather than client order, whether or not `serde_json`'s `preserve_order` is
-enabled.
+Object keys in rendered schemas and replayed arguments keep the client's
+order, as the template's `tojson` prints them under `transformers`, vLLM and
+llama.cpp (the engine enables `serde_json`'s `preserve_order`).
 
 ### Constrained tool calling
 
@@ -372,7 +372,7 @@ undeclared tool, is `Error::InvalidArgument` before queueing.
 A non-strict tool inside a grammar only has its call framing enforced; its
 arguments are still parsed and validated once the call is complete, as
 without a grammar. A `strict: true` tool has its arguments enforced token by
-token in the template's layout: declared parameters in sorted order, every
+token in the template's layout: declared parameters in declared order, every
 required one exactly once, optional ones at most once. Its schema must be a
 closed object (`"additionalProperties": false`) that the engine can enforce
 exactly:
