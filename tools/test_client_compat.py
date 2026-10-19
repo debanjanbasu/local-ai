@@ -3,6 +3,7 @@ import http.server
 import json
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -177,7 +178,10 @@ class Upstream(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        for event in ({"type": "response.created"}, COMPLETED):
+        for event in ({"type": "response.created"}, {"type": "response.output_text.delta", "delta": "4"}, COMPLETED):
+            if body.get("slow") and event["type"].endswith(".delta"):
+                self.wfile.flush()
+                time.sleep(0.3)
             data = sse(event).encode()
             self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
         self.wfile.write(b"0\r\n\r\n")
@@ -225,6 +229,17 @@ class RecorderTest(unittest.TestCase):
         self.assertTrue(self.recorder.first_chunk.is_set())
         logged = [json.loads(line) for line in (Path(self.tmp.name) / "x.jsonl").read_text().splitlines()]
         self.assertEqual(len(logged), 3)
+
+    def test_first_token_time_and_injected_members(self):
+        self.recorder.inject = {"seed": 7}
+        start = self.recorder.begin("s")
+        self.request({"input": "hi", "slow": True})
+        self.request({"input": "hi", "seed": 3})
+        slow, explicit = self.recorder.since(start)
+        # Time to first token is the first delta, not the headers or `response.created`.
+        self.assertGreaterEqual(slow["first_token_seconds"] - slow["first_byte_seconds"], 0.25)
+        self.assertEqual(slow["request_body"]["seed"], 7)
+        self.assertEqual(explicit["request_body"]["seed"], 3)
 
 
 if __name__ == "__main__":
