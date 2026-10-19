@@ -1790,19 +1790,33 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
         if kind == "reasoning" && !item.contains_key("summary") {
             item.insert("summary".into(), json!([]));
         }
+        let encrypted = kind == "reasoning" && present(item.get("encrypted_content"));
         let id = match item.get("id").and_then(Value::as_str) {
-            Some(id) if !seen.contains(id) => id.to_owned(),
-            _ if kind == "reasoning" && present(item.get("encrypted_content")) => {
+            Some(id) if !seen.contains(id) => Some(id.to_owned()),
+            Some(_) => None,
+            // A sealed item replayed without its `id` (the AI SDK sends none
+            // with `store: false`) takes the one its envelope carries, which
+            // opening the envelope authenticates.
+            None if encrypted || kind == COMPACTION => item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .and_then(ReasoningCipher::sealed_item_id)
+                .filter(|id| !seen.contains(id)),
+            None => Some(new_id(prefix)),
+        };
+        let id = match id {
+            Some(id) => id,
+            None if encrypted => {
                 return Err(invalid(
                     "encrypted reasoning requires its original unique item id",
                 ));
             }
-            _ if kind == COMPACTION => {
+            None if kind == COMPACTION => {
                 return Err(invalid(
                     "a compaction item requires its original unique item id",
                 ));
             }
-            _ => new_id(prefix),
+            None => new_id(prefix),
         };
         seen.insert(id.clone());
         item.insert("id".into(), json!(id));

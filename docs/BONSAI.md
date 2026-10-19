@@ -532,10 +532,14 @@ file, a file owned by another user, a file with group or other access, or a
 malformed key is refused at startup. Reasoning output items of a request whose
 `include` lists `reasoning.encrypted_content` then carry an
 AES-256-GCM envelope (fresh random nonce per item) whose associated data binds
-the envelope version, the model ID and the reasoning item's ID. A client may
-send the item back, with its original `id`, in a later stateless request; the
-authenticated text replaces any plaintext beside it, and an altered envelope,
-one from another key, model or item, or an unknown version fails the request.
+the envelope version, the model ID and the reasoning item's ID; the envelope
+also carries that ID in the clear. A client may send the item back in a later
+stateless request, with its original `id` or without one (the AI SDK omits it
+with `store: false`, since `OpenAI`'s envelopes need none), when the ID the
+envelope carries is used; the authenticated text replaces any plaintext
+beside it, and an altered envelope, one from another key, model or item, or an
+unknown version fails the request. Envelopes from before the ID was carried
+still open with their `id`. Compaction items are sealed the same way.
 `include: ["reasoning.encrypted_content"]` is accepted only with a key and is
 the only `include` value implemented; without a key it, and any
 `encrypted_content` input, are refused. A request that does not ask for it gets

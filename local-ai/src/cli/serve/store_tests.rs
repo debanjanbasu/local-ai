@@ -723,17 +723,17 @@ fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
         saved.input_items[1]["content"],
         response["output"][0]["content"]
     );
-    let mut missing = follow.clone();
-    missing["input"][1]
+    // Replayed without its id, as the AI SDK does with `store: false`, the
+    // item takes the one its envelope carries and still authenticates.
+    let mut anonymous = follow.clone();
+    anonymous["input"][1]
         .as_object_mut()
         .expect("item")
         .remove("id");
-    assert!(
-        replay(&missing)
-            .err()
-            .expect("missing id rejected")
-            .to_string()
-            .contains("item id")
+    let request = replay(&anonymous).expect("id-less replay").request;
+    assert_eq!(
+        request.messages[1].reasoning_content.as_deref(),
+        Some("Check α before choosing.")
     );
     let mut duplicate = follow.clone();
     duplicate["input"][0]["id"] = duplicate["input"][1]["id"].clone();

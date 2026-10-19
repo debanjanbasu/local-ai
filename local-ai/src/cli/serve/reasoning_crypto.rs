@@ -17,12 +17,18 @@
 //! regular files owned by the current user with no group or other access.
 //!
 //! Envelope layout, base64url without padding:
-//! `version (1 byte) || nonce (12 bytes) || ciphertext || tag (16 bytes)`.
-//! Associated data: `DOMAIN || version || len(model_id) || model_id ||
-//! len(item_id) || item_id`, lengths as big-endian `u64`, so distinct
-//! `(model_id, item_id)` pairs never share an encoding. Compaction items'
-//! payloads use the same layout under their own `DOMAIN`, so neither kind of
-//! envelope opens as the other.
+//! `version (1 byte) || nonce (12 bytes) || len(item_id) (1 byte) || item_id
+//! || ciphertext || tag (16 bytes)`. Associated data: `DOMAIN || version ||
+//! len(model_id) || model_id || len(item_id) || item_id`, lengths as
+//! big-endian `u64`, so distinct `(model_id, item_id)` pairs never share an
+//! encoding. Compaction items' payloads use the same layout under their own
+//! `DOMAIN`, so neither kind of envelope opens as the other.
+//!
+//! The item ID travels in the envelope, in the clear and authenticated, so a
+//! client that replays an item without its `id` (the AI SDK does, with
+//! `store: false`, because `OpenAI`'s envelopes need none) still names the
+//! item it was sealed for ([`ReasoningCipher::sealed_item_id`]). Version 1
+//! envelopes, which carried no ID, still open when the ID is given.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -38,7 +44,11 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 /// Envelope format version; bound into the associated data.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+/// The format before the item ID was carried in the envelope.
+const VERSION_WITHOUT_ID: u8 = 1;
+/// Longest item ID an envelope carries; server item IDs are 35 bytes.
+const MAX_ITEM_ID_BYTES: usize = u8::MAX as usize;
 /// Domain separation for the associated data.
 const DOMAIN: &[u8] = b"local-ai/reasoning-envelope";
 /// Domain separation for compaction envelopes, so a reasoning envelope never
@@ -59,7 +69,8 @@ const OPEN_ATTEMPTS: usize = 4;
 /// Largest reasoning text, in bytes, that may be sealed or unsealed.
 pub const MAX_REASONING_BYTES: usize = 16 * 1024 * 1024;
 /// Largest envelope, in characters, accepted by [`ReasoningCipher::unseal`].
-const MAX_ENVELOPE_CHARS: usize = (HEADER_LEN + MAX_REASONING_BYTES + TAG_LEN).div_ceil(3) * 4;
+const MAX_ENVELOPE_CHARS: usize =
+    (HEADER_LEN + 1 + MAX_ITEM_ID_BYTES + MAX_REASONING_BYTES + TAG_LEN).div_ceil(3) * 4;
 
 /// Errors from loading the key or sealing and opening envelopes.
 ///
@@ -240,7 +251,7 @@ impl ReasoningCipher {
         item_id: &str,
         reasoning: &str,
     ) -> Result<String> {
-        if reasoning.len() > MAX_REASONING_BYTES {
+        if reasoning.len() > MAX_REASONING_BYTES || item_id.len() > MAX_ITEM_ID_BYTES {
             return Err(ReasoningCryptoError::PayloadTooLarge);
         }
         let mut nonce = [0_u8; NONCE_LEN];
@@ -248,16 +259,20 @@ impl ReasoningCipher {
             .fill(&mut nonce)
             .map_err(|_| ReasoningCryptoError::Randomness)?;
         let aad = associated_data(domain, VERSION, model_id, item_id);
-        let mut sealed = Vec::with_capacity(HEADER_LEN + reasoning.len() + TAG_LEN);
+        let start = HEADER_LEN + 1 + item_id.len();
+        let mut sealed = Vec::with_capacity(start + reasoning.len() + TAG_LEN);
         sealed.push(VERSION);
         sealed.extend_from_slice(&nonce);
+        // Checked against `MAX_ITEM_ID_BYTES` above.
+        sealed.push(u8::try_from(item_id.len()).map_err(|_| ReasoningCryptoError::Cipher)?);
+        sealed.extend_from_slice(item_id.as_bytes());
         sealed.extend_from_slice(reasoning.as_bytes());
         let tag = self
             .key
             .seal_in_place_separate_tag(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::from(aad.as_slice()),
-                &mut sealed[HEADER_LEN..],
+                &mut sealed[start..],
             )
             .map_err(|_| ReasoningCryptoError::Cipher)?;
         sealed.extend_from_slice(tag.as_ref());
@@ -284,13 +299,17 @@ impl ReasoningCipher {
         let mut sealed = URL_SAFE_NO_PAD
             .decode(envelope)
             .map_err(|_| ReasoningCryptoError::MalformedEnvelope)?;
-        let version = *sealed
-            .first()
-            .ok_or(ReasoningCryptoError::MalformedEnvelope)?;
-        if version != VERSION {
-            return Err(ReasoningCryptoError::UnsupportedVersion(version));
-        }
-        if sealed.len() < HEADER_LEN + TAG_LEN {
+        let (version, start) = match split_item_id(&sealed)? {
+            (VERSION_WITHOUT_ID, None) => (VERSION_WITHOUT_ID, HEADER_LEN),
+            // The carried ID is authenticated through the associated data
+            // too; comparing it first only gives a mismatch its own path.
+            (VERSION, Some(carried)) if carried == item_id.as_bytes() => {
+                (VERSION, HEADER_LEN + 1 + carried.len())
+            }
+            (VERSION, Some(_)) => return Err(ReasoningCryptoError::Authentication),
+            (other, _) => return Err(ReasoningCryptoError::UnsupportedVersion(other)),
+        };
+        if sealed.len() < start + TAG_LEN {
             return Err(ReasoningCryptoError::MalformedEnvelope);
         }
         let mut nonce = [0_u8; NONCE_LEN];
@@ -301,12 +320,48 @@ impl ReasoningCipher {
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::from(aad.as_slice()),
-                &mut sealed[HEADER_LEN..],
+                &mut sealed[start..],
             )
             .map_err(|_| ReasoningCryptoError::Authentication)?;
         // Only text from `seal` authenticates, so this cannot fail in practice.
         String::from_utf8(plaintext.to_vec()).map_err(|_| ReasoningCryptoError::Authentication)
     }
+}
+
+impl ReasoningCipher {
+    /// The item ID `envelope` says it was sealed for, read without the key,
+    /// or `None` for an envelope that carries none. Unauthenticated until
+    /// [`unseal`](Self::unseal) succeeds with it.
+    pub fn sealed_item_id(envelope: &str) -> Option<String> {
+        if envelope.len() > MAX_ENVELOPE_CHARS {
+            return None;
+        }
+        let sealed = URL_SAFE_NO_PAD.decode(envelope).ok()?;
+        match split_item_id(&sealed).ok()? {
+            (VERSION, Some(id)) => String::from_utf8(id.to_vec()).ok(),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded envelope's version and, for the current version, the item ID
+/// it carries.
+fn split_item_id(sealed: &[u8]) -> Result<(u8, Option<&[u8]>)> {
+    let version = *sealed
+        .first()
+        .ok_or(ReasoningCryptoError::MalformedEnvelope)?;
+    if version != VERSION {
+        return Ok((version, None));
+    }
+    let len = usize::from(
+        *sealed
+            .get(HEADER_LEN)
+            .ok_or(ReasoningCryptoError::MalformedEnvelope)?,
+    );
+    let id = sealed
+        .get(HEADER_LEN + 1..HEADER_LEN + 1 + len)
+        .ok_or(ReasoningCryptoError::MalformedEnvelope)?;
+    Ok((version, Some(id)))
 }
 
 /// The associated data binding an envelope to its version, model and item.
@@ -484,7 +539,13 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{MAX_REASONING_BYTES, ReasoningCipher, ReasoningCryptoError};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ring::aead::{Aad, NONCE_LEN, Nonce};
+
+    use super::{
+        DOMAIN, HEADER_LEN, MAX_REASONING_BYTES, ReasoningCipher, ReasoningCryptoError,
+        VERSION_WITHOUT_ID, associated_data,
+    };
 
     const MODEL: &str = "bonsai-2-27b";
     const ITEM: &str = "rs_0123456789abcdef";
@@ -686,14 +747,14 @@ mod tests {
         let scratch = Scratch::new();
         let cipher = open(&scratch.key());
         let envelope = cipher.seal(MODEL, ITEM, "text").expect("seals");
-        // Version 1 encodes as a leading 'A'; 'B' turns the byte into 5.
+        // Version 2 encodes as a leading 'A'; 'B' turns the byte into 6.
         assert!(envelope.starts_with('A'));
         let altered: String = std::iter::once('B')
             .chain(envelope.chars().skip(1))
             .collect();
         assert!(matches!(
             cipher.unseal(MODEL, ITEM, &altered),
-            Err(ReasoningCryptoError::UnsupportedVersion(5))
+            Err(ReasoningCryptoError::UnsupportedVersion(6))
         ));
     }
 
@@ -720,6 +781,54 @@ mod tests {
             cipher.unseal("a", "bc", &envelope),
             Err(ReasoningCryptoError::Authentication)
         ));
+    }
+
+    /// The envelope names its item, so an item replayed without its `id`
+    /// can be opened; a carried ID altered to another item's fails, and a
+    /// version 1 envelope (no carried ID) still opens with its ID.
+    #[test]
+    fn envelopes_carry_their_authenticated_item_id() {
+        let scratch = Scratch::new();
+        let cipher = open(&scratch.key());
+        let envelope = cipher.seal(MODEL, ITEM, "carried").expect("seals");
+        let carried = ReasoningCipher::sealed_item_id(&envelope).expect("carries an ID");
+        assert_eq!(carried, ITEM);
+        assert_eq!(
+            cipher.unseal(MODEL, &carried, &envelope).expect("unseals"),
+            "carried"
+        );
+        let mut sealed = URL_SAFE_NO_PAD.decode(&envelope).expect("base64url");
+        let last = HEADER_LEN + ITEM.len();
+        sealed[last] = b'X';
+        let renamed = URL_SAFE_NO_PAD.encode(&sealed);
+        let claimed = ReasoningCipher::sealed_item_id(&renamed).expect("still parses");
+        assert_ne!(claimed, ITEM);
+        assert!(matches!(
+            cipher.unseal(MODEL, &claimed, &renamed),
+            Err(ReasoningCryptoError::Authentication)
+        ));
+        assert_eq!(ReasoningCipher::sealed_item_id("not an envelope"), None);
+
+        let nonce = [7_u8; NONCE_LEN];
+        let aad = associated_data(DOMAIN, VERSION_WITHOUT_ID, MODEL, ITEM);
+        let mut legacy = vec![VERSION_WITHOUT_ID];
+        legacy.extend_from_slice(&nonce);
+        legacy.extend_from_slice(b"older");
+        let tag = cipher
+            .key
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(aad.as_slice()),
+                &mut legacy[HEADER_LEN..],
+            )
+            .expect("seals");
+        legacy.extend_from_slice(tag.as_ref());
+        let legacy = URL_SAFE_NO_PAD.encode(&legacy);
+        assert_eq!(ReasoningCipher::sealed_item_id(&legacy), None);
+        assert_eq!(
+            cipher.unseal(MODEL, ITEM, &legacy).expect("unseals"),
+            "older"
+        );
     }
 
     #[test]

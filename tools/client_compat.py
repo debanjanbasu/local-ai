@@ -696,7 +696,10 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
             catalog = (codex_home / "models.json").resolve()
             env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
             catalog.write_text(json.dumps(codex_catalog(ctx.codex_bin, env), indent=2))
-        compact_limit = 6000 if variant == "compact" else None
+        # Above Codex's first request (about 6,000 tokens, nearly all its own
+        # instructions and tools), so it compacts once tool results pile up;
+        # a limit under it compacts after every turn and never finishes.
+        compact_limit = 9000 if variant == "compact" else None
         (codex_home / "config.toml").write_text(
             codex_config(ctx.proxy_port, effort, compat, catalog, compact_limit))
         env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
