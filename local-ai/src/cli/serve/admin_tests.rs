@@ -89,9 +89,7 @@ const API_PATHS: &[&str] = &[
     "/v1/uploads",
     "/v1/batches",
     "/v1/vector_stores",
-    "/v1/evals",
     "/v1/decisions",
-    "/v1/experimental/decisions",
     "/v1/moderations",
     "/v1/audio/speech",
     "/v1/audio/transcriptions",
@@ -938,7 +936,7 @@ fn out_of_band_generations_are_recorded_as_completions() {
         unreachable!()
     };
     meter.generation(&stats);
-    // A batch line (an eval run's included) of an unattributed batch.
+    // A batch line of an unattributed batch.
     let mut line = UsageRecord::new(UsageKind::Completions);
     line.model = Some("bonsai".into());
     line.batch = true;

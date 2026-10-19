@@ -22,8 +22,6 @@ grep-searcher = "0.1.17"
 grep-matcher = "0.1.9"
 tantivy = { version = "=0.26.2", default-features = false, features = ["mmap", "stemmer"] }
 md5 = "0.8"
-# Eval item schemas: the engine's version, offline (no `$ref` retrieval).
-jsonschema = { version = "0.58.6", default-features = false }
 # OS randomness for identifiers; already in the lock through rustls.
 ring = "0.17"
 half.workspace = true

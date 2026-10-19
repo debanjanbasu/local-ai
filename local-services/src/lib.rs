@@ -11,7 +11,6 @@ pub mod admin;
 pub mod batches;
 pub mod compaction;
 pub mod conversations;
-pub mod evals;
 pub mod files;
 pub mod tools;
 pub mod vector_stores;
@@ -92,7 +91,6 @@ impl Store {
         files::initialize(&mut connection)?;
         batches::initialize(&mut connection)?;
         vector_stores::initialize(&mut connection)?;
-        evals::initialize(&mut connection)?;
         admin::initialize(&mut connection)?;
         Ok(store)
     }

@@ -167,12 +167,6 @@ pub enum Endpoint {
     Responses,
     #[serde(rename = "/v1/chat/completions")]
     ChatCompletions,
-    /// The legacy Completions API, which this server no longer serves. Never
-    /// accepted for a new batch; it exists only so a batch created before it
-    /// was removed still reads back as it was created. Its pending lines fail
-    /// rather than run.
-    #[serde(rename = "/v1/completions")]
-    RetiredCompletions,
 }
 
 impl Endpoint {
@@ -182,15 +176,6 @@ impl Endpoint {
         match self {
             Self::Responses => "/v1/responses",
             Self::ChatCompletions => "/v1/chat/completions",
-            Self::RetiredCompletions => "/v1/completions",
-        }
-    }
-
-    /// An endpoint read back from a stored batch, the retired one included.
-    fn stored(value: &str) -> Result<Self> {
-        match value {
-            "/v1/completions" => Ok(Self::RetiredCompletions),
-            other => other.parse(),
         }
     }
 }
@@ -850,38 +835,6 @@ impl Store {
         Ok(Some(ending))
     }
 
-    /// The newest batch whose metadata maps `key` to `value`, if any: how a
-    /// service that creates batches finds one it created before a crash.
-    pub(crate) fn find_batch(&self, key: &str, value: &str) -> Result<Option<String>> {
-        let connection = self.connection()?;
-        Ok(connection
-            .query_row(
-                "SELECT id FROM batches WHERE json_extract(metadata, ?1) = ?2
-                 ORDER BY seq DESC LIMIT 1",
-                params![format!("$.\"{key}\""), value],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    /// The `custom_id` and result record of every settled line of batch
-    /// `id`, in input order.
-    pub(crate) fn batch_results(&self, id: &str) -> Result<Vec<(String, Value)>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT custom_id, result FROM batch_lines
-             WHERE batch_id = ?1 AND state != 'pending' AND result IS NOT NULL ORDER BY line",
-        )?;
-        let rows = statement
-            .query_map([id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter()
-            .map(|(custom_id, result)| Ok((custom_id, serde_json::from_str(&result)?)))
-            .collect()
-    }
-
     /// Refuse a lease another store (another root) granted.
     fn check_lease(&self, lease: &BatchLease) -> Result<()> {
         if Arc::ptr_eq(&self.root, &lease.root) || self.root == lease.root {
@@ -1250,7 +1203,7 @@ impl Raw {
         ] = self.times;
         let [total, completed, failed] = self.counts;
         Ok(Batch {
-            endpoint: Endpoint::stored(&self.endpoint)?,
+            endpoint: self.endpoint.parse()?,
             status: BatchStatus::parse(&self.status)?,
             errors: self
                 .errors

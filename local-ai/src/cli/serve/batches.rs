@@ -159,10 +159,9 @@ impl Batches {
         let services = state.services.as_ref().ok_or_else(|| {
             crate::Error::InvalidArgument("batches need the native services store".into())
         })?;
-        // Lines (eval-run generations included) are recorded as batch
-        // completions of the project key that created the batch (or the
-        // eval run), which is stored with it: a batch outlives its creator's
-        // request.
+        // Lines are recorded as batch completions of the project key that
+        // created the batch, which is stored with it: a batch outlives its
+        // creator's request.
         let mut record = UsageRecord::new(UsageKind::Completions);
         record.model = Some(state.model.to_string());
         record.batch = true;
@@ -191,7 +190,6 @@ impl Batches {
                 ..Control::default()
             }),
             wake: Condvar::new(),
-            observers: Mutex::default(),
         });
         let (done, finished) = watch::channel(false);
         let running = Arc::clone(&worker);
@@ -213,26 +211,6 @@ impl Batches {
     /// Idempotent; never blocks on the engine.
     pub(super) fn close(&self) {
         self.worker.close();
-    }
-
-    /// Ask the worker to scan for runnable batches (one was just created).
-    pub(super) fn notify(&self) {
-        self.worker.notify();
-    }
-
-    /// Interrupt the running line of `batch`, which was just cancelled in
-    /// the store, so it stops at once.
-    pub(super) fn interrupt(&self, batch: &str) {
-        self.worker.cancelled(batch);
-    }
-
-    /// Call `observer` each time the worker has finished with a batch.
-    pub(super) fn on_finish(&self, observer: Observer) {
-        self.worker
-            .observers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(observer);
     }
 
     /// Wait until the worker has let go of the engine, its lease and the
@@ -357,12 +335,7 @@ struct Worker {
     control: Mutex<Control>,
     /// Signalled on every change to `control`.
     wake: Condvar,
-    /// Told after each batch the worker has finished with.
-    observers: Mutex<Vec<Observer>>,
 }
-
-/// Called after the worker has finished with a batch.
-pub(super) type Observer = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct Control {
@@ -463,14 +436,6 @@ impl Worker {
                             );
                         }
                         self.lock().cancelled.remove(&id);
-                        let observers = self
-                            .observers
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .clone();
-                        for observer in observers {
-                            observer();
-                        }
                     }
                     // Another live server owns it.
                     Ok(None) => {}
@@ -508,20 +473,10 @@ impl Worker {
         let api = match line.endpoint {
             Endpoint::Responses => Api::Responses,
             Endpoint::ChatCompletions => Api::Chat,
-            // A batch created before the legacy endpoint was removed: its
-            // lines fail as a request to it would now.
-            Endpoint::RetiredCompletions => {
-                return Some(failed(
-                    StatusCode::NOT_FOUND,
-                    "/v1/completions is the legacy Completions API, which this server does not \
-                     serve; use /v1/responses or /v1/chat/completions",
-                ));
-            }
         };
         let config = &self.config;
         // A line naming another local model (stored by another server)
-        // never runs. Any other name does, including the file path an
-        // earlier version named the model by.
+        // never runs. Any other name does.
         let model = line.body.get("model").and_then(Value::as_str);
         if let Some(refusal) = model.and_then(super::models::generation_refusal) {
             return Some(failed(

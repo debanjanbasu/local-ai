@@ -659,37 +659,6 @@ async fn a_resumed_line_for_another_local_model_fails_without_generating() {
     assert!(seen.lock().expect("seen").is_empty());
 }
 
-#[tokio::test]
-async fn a_line_stored_with_the_legacy_path_model_id_still_runs() {
-    let scratch = Scratch::new();
-    let legacy = "/Users/me/local-ai/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
-    let mut line = chat("a", "hello");
-    line["body"]["model"] = json!(legacy);
-    // Stored by an earlier version, which named the model by its path.
-    let stored = scratch
-        .store
-        .create_batch(
-            &CreateBatch {
-                input_file_id: scratch.input(&[line]),
-                endpoint: "/v1/chat/completions".to_owned(),
-                completion_window: "24h".to_owned(),
-                metadata: local_services::Metadata::new(),
-            },
-            legacy,
-        )
-        .expect("batch created");
-    let (submit, seen, _) = fake(false);
-    let batches = start(&scratch.store, submit);
-    let done = settled(&scratch.store, &stored.id).await;
-    assert_eq!(
-        done["request_counts"],
-        json!({"total":1,"completed":1,"failed":0}),
-        "{done}"
-    );
-    stop(&batches).await;
-    assert_eq!(*seen.lock().expect("seen"), ["hello"]);
-}
-
 /// Completions usage written by batch lines, grouped by project and key.
 fn batch_usage(admin: &Admin) -> Vec<Value> {
     let page = admin

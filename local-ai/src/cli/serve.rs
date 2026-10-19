@@ -27,13 +27,11 @@ mod chunked;
 mod compaction;
 mod decisions;
 mod embeddings;
-mod evals;
 mod hosted;
 mod http3;
 mod journal;
 mod models;
 mod moderations;
-mod openai_decisions;
 mod options;
 mod reasoning_crypto;
 mod request;
@@ -83,9 +81,6 @@ struct Args {
     /// Where Responses are kept: the user's data directory by default.
     response_store: options::ResponseStoreArg,
     reasoning_key: Option<PathBuf>,
-    /// `--experimental-decision-head`: the judgment head that enables
-    /// `POST /v1/experimental/decisions`. `None` serves no decisions.
-    decision_head: Option<PathBuf>,
     /// `--decisions-artifact`: the evaluated head, gate and calibration that
     /// enable `POST /v1/decisions`. `None` refuses that route.
     decisions_artifact: Option<PathBuf>,
@@ -124,17 +119,13 @@ struct AppState {
     /// Where background `store: false` Responses are kept briefly; `None`
     /// when no private temporary store could be created.
     temporary: Option<Arc<Temporary>>,
-    /// The opt-in experimental decision service; `None` without
-    /// `--experimental-decision-head`.
+    /// The calibrated `POST /v1/decisions` service; `None` without an
+    /// artifact (`--decisions-artifact` or an installed `models/decisions-v2`).
     decisions: Option<Arc<decisions::Decisions>>,
-    /// The calibrated `POST /v1/decisions` service; `None` without
-    /// `--decisions-artifact`.
-    openai_decisions: Option<Arc<openai_decisions::OpenAiDecisions>>,
     /// Native durable services, available automatically in the user's data directory.
     services: Option<Arc<services::Services>>,
     batches: Option<Arc<batches::Batches>>,
     vector_stores: Option<Arc<vector_stores::VectorStores>>,
-    evals: Option<Arc<evals::Evals>>,
     /// Hosted tools this server may run for Responses; `None` grants none.
     tools: Option<Arc<tool_loop::Tools>>,
     /// Native text embeddings, when the embedding model is installed.
@@ -272,9 +263,6 @@ async fn dispatch(
     if vector_stores::matches(parts.uri.path()) {
         return vector_stores::handle(&state, &parts, body).await;
     }
-    if evals::matches(parts.uri.path()) {
-        return evals::handle(&state, &parts, body, &caller).await;
-    }
     if parts.method == Method::GET && parts.uri.path() == "/health" {
         return json_response(
             StatusCode::OK,
@@ -326,9 +314,6 @@ async fn dispatch(
     }
     if parts.method == Method::POST && parts.uri.path() == decisions::ROUTE {
         return decisions::handle(&state, &parts.headers, body).await;
-    }
-    if parts.method == Method::POST && parts.uri.path() == openai_decisions::ROUTE {
-        return openai_decisions::handle(&state, &parts.headers, body).await;
     }
     // Authentication has already passed, so a stored response is never read or
     // deleted for a caller without the key.
@@ -1148,8 +1133,6 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // Hosted tools are opened before the model loads too, so a bad root or
     // domain fails in milliseconds; nothing is granted without a flag.
     let tools = open_tools(&args.tools)?;
-    // Also before the model loads: a wrong head fails in milliseconds.
-    let decisions = decisions::Decisions::start(args.decision_head.as_deref())?;
     // Background `store: false` Responses are kept only in a private store of
     // this process; without one they are refused, and nothing else changes.
     let temporary = Temporary::create()
@@ -1173,7 +1156,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
             .map(|models_dir| models_dir.join("decisions-v2"))
             .filter(|dir| dir.is_dir())
     });
-    let openai_decisions = openai_decisions::OpenAiDecisions::start(decisions_artifact.as_deref())?;
+    let decisions = decisions::Decisions::start(decisions_artifact.as_deref())?;
     let model: Arc<str> = models::BONSAI_MODEL_ID.into();
     // Envelopes an earlier version sealed for the checkpoint's path still open.
     let legacy_model = resources.model.to_string_lossy().into_owned();
@@ -1229,11 +1212,9 @@ async fn run_async(args: Args) -> crate::Result<()> {
         background: Arc::default(),
         temporary: temporary.clone(),
         decisions: decisions.clone(),
-        openai_decisions: openai_decisions.clone(),
         services: Some(services),
         batches: None,
         vector_stores: vector_stores.clone(),
-        evals: None,
         tools,
         embeddings,
         speech,
@@ -1244,8 +1225,6 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let batches = batches::Batches::start(&state)?;
     state.batches = Some(Arc::clone(&batches));
-    let evals = evals::Evals::start(&state, &batches)?;
-    state.evals = Some(Arc::clone(&evals));
     let h3_task = if let Some((cert, key)) = resources.tls {
         Some(tokio::spawn(serve_h3(address, state.clone(), cert, key)))
     } else {
@@ -1271,28 +1250,21 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // while axum is still draining foreground connections.
     let closing = Arc::clone(&background);
     let closing_decisions = decisions.clone();
-    let closing_openai_decisions = openai_decisions.clone();
     let closing_batches = Arc::clone(&batches);
-    let closing_evals = Arc::clone(&evals);
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown().await;
-            closing_evals.close();
             closing_batches.close();
             // Waiting decisions end at once, cancelling their engine work,
             // so they never hold up the drain.
             decisions::close(closing_decisions.as_deref());
-            openai_decisions::close(closing_openai_decisions.as_deref());
             let _ = tokio::task::spawn_blocking(move || closing.close()).await;
         })
         .await
         .map_err(crate::Error::Io);
     // Again, for a server that stopped without the signal; settling is idempotent.
     decisions::close(decisions.as_deref());
-    openai_decisions::close(openai_decisions.as_deref());
-    evals.close();
     batches.close();
-    evals.drained().await;
     batches.drained().await;
     // The indexer finishes its current file; an unfinished one resumes on start.
     if let Some(vector_stores) = vector_stores {

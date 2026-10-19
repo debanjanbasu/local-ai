@@ -517,13 +517,12 @@ impl Engine {
     /// blocks, FP16-rounded and scored. The result carries the head's
     /// probabilities per caller option, the argmax and, for scores, the
     /// probability-weighted level index — no confidence, threshold or
-    /// refusal. It reports the head's own `calibration_scope` metadata, or
-    /// [`UNKNOWN_CALIBRATION_SCOPE`](crate::judgment::UNKNOWN_CALIBRATION_SCOPE)
-    /// when the artifact declares none.
+    /// refusal ([`CalibratedHead`](crate::judgment::CalibratedHead) adds
+    /// those).
     ///
     /// Invalid requests (including text spelling a special token) and a head
-    /// whose width is not the model's, or whose declared renderer is outside
-    /// [`DECISION_RENDERERS`](crate::judgment::DECISION_RENDERERS), fail with
+    /// whose width is not the model's, or whose declared renderer is not
+    /// [`DECISION_RENDERER`](crate::judgment::DECISION_RENDERER), fail with
     /// [`crate::Error::InvalidArgument`] before any GPU work. A single-level
     /// score is answered without GPU work. Capture overwrites one sequence
     /// buffer set; the GPU prompt-cache tier is preserved when a free set

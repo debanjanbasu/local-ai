@@ -156,7 +156,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         stall: Duration::from_secs(DEFAULT_STALL_SECONDS),
         response_store: ResponseStoreArg::Default,
         reasoning_key: None,
-        decision_head: None,
         decisions_artifact: None,
         tools: ToolArgs::default(),
         allowed_origins: Vec::new(),
@@ -198,7 +197,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 | "--stall-timeout"
                 | "--response-store"
                 | "--reasoning-key"
-                | "--experimental-decision-head"
                 | "--decisions-artifact"
                 | "--tools-root"
                 | "--tools-fetch-domain"
@@ -222,12 +220,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                     return Err("--reasoning-key requires a file path".into());
                 }
                 parsed.reasoning_key = Some(value.into());
-            }
-            "--experimental-decision-head" => {
-                if value.is_empty() {
-                    return Err("--experimental-decision-head requires a file path".into());
-                }
-                parsed.decision_head = Some(value.into());
             }
             "--decisions-artifact" => {
                 if value.is_empty() {

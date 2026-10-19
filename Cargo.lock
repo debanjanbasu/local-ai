@@ -1786,7 +1786,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ignore",
- "jsonschema",
  "libc",
  "md5",
  "ring",
