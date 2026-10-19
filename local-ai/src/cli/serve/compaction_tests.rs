@@ -615,9 +615,19 @@ fn the_context_budget_decides_when_and_how_much_is_kept() {
     assert!(should_compact(65_300, None, 256, 65_536));
     let scratch = Scratch::new();
     let cipher = scratch.cipher();
-    let body = json!({"input":transcript(),"context_management":[{"type":"compaction","compact_threshold":1000}]});
+    let body = json!({"input":transcript(),"text":{"verbosity":"low"},
+        "context_management":[{"type":"compaction","compact_threshold":1000}]});
     let mut prepared = prepare(&body, None, Some(&cipher)).expect("valid");
     let before = prepared.request.messages.len();
+    let verbosity = |prepared: &PreparedResponses| {
+        prepared
+            .request
+            .messages
+            .iter()
+            .filter(|message| message.content.starts_with("Verbosity is set to low."))
+            .count()
+    };
+    assert_eq!(verbosity(&prepared), 1);
     let keep = 3;
     let pass = prepared
         .history
@@ -637,6 +647,11 @@ fn the_context_budget_decides_when_and_how_much_is_kept() {
         .expect("seals");
     prepared.compacted(item.clone(), history).expect("renders");
     assert!(prepared.request.messages.len() < before);
+    assert_eq!(
+        verbosity(&prepared),
+        1,
+        "the compacted prompt keeps text.verbosity"
+    );
     assert_eq!(prepared.echo.compaction.as_ref(), Some(&item));
     // An empty summary would lose the history, so it fails instead.
     let pass = prepared

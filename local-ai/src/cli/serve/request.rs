@@ -12,6 +12,12 @@
 //! [`ToolChoice`], `parallel_tool_calls` and [`ToolDefinition::strict`],
 //! which the engine enforces with its tool grammar (see [`tool_policy`]).
 //!
+//! `stop` (a string or up to four) maps onto [`ChatRequest::stop`], which
+//! ends the visible answer at the first match, as `OpenAI` does: reasoning
+//! and tool calls are never matched. `verbosity` `low` and `high`, which the
+//! model has no control for, become an instruction at the end of the system
+//! turn (see [`add_verbosity`]).
+//!
 //! Members the `OpenAI` specification marks deprecated are honoured, because
 //! harnesses and older SDKs still send them: `max_tokens` is
 //! `max_completion_tokens`, `seed` seeds the sampler, `functions` and
@@ -68,16 +74,18 @@ struct GenerateRequest {
     /// vLLM's and llama.cpp's template switches; `enable_thinking` turns
     /// reasoning off (`false`) or leaves it to `reasoning_effort` (`true`).
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// A string or up to [`MAX_STOP_SEQUENCES`] strings (see [`stop_sequences`]).
+    stop: Option<Value>,
+    /// `low`, `medium` or `high` (see [`verbosity_instruction`]).
+    verbosity: Option<String>,
+    response_format: Option<Value>,
     // Options this server cannot honour. They are named so a request that
     // sets one fails instead of being answered as if it had not.
     n: Option<u64>,
-    stop: Option<Value>,
     logprobs: Option<Value>,
     top_logprobs: Option<u64>,
     logit_bias: Option<Value>,
     store: Option<bool>,
-    verbosity: Option<String>,
-    response_format: Option<Value>,
     audio: Option<Value>,
     modalities: Option<Vec<String>>,
     prediction: Option<Value>,
@@ -140,9 +148,6 @@ impl GenerateRequest {
         if self.n.is_some_and(|n| n != 1) {
             return unsupported("n", "this server generates exactly one choice");
         }
-        if self.stop.as_ref().is_some_and(|stop| !is_empty(stop)) {
-            return unsupported("stop", "stop sequences are not implemented");
-        }
         let logprobs = match self.logprobs.as_ref() {
             None | Some(Value::Null) => false,
             Some(Value::Bool(enabled)) => *enabled,
@@ -160,9 +165,6 @@ impl GenerateRequest {
         }
         if self.store == Some(true) {
             return unsupported("store", "this server stores no completions");
-        }
-        if !matches!(self.verbosity.as_deref(), None | Some("medium")) {
-            return unsupported("verbosity", "only the default, medium, is produced");
         }
         if self.audio.as_ref().is_some_and(|audio| !audio.is_null()) {
             return unsupported("audio", "Bonsai 2 is text-only");
@@ -199,6 +201,76 @@ pub(super) fn repetition_penalty(repetition: Option<f32>, frequency: Option<f32>
     repetition
         .or_else(|| frequency.map(|value| 1.0 + value.max(0.0)))
         .unwrap_or_else(|| GenerateParams::default().repetition_penalty)
+}
+
+/// The most `stop` sequences a Chat request may set, as `OpenAI` allows.
+const MAX_STOP_SEQUENCES: usize = 4;
+
+/// Chat's `stop`: absent, `null`, one string, or an array of at most
+/// [`MAX_STOP_SEQUENCES`] strings, for [`ChatRequest::stop`], which matches
+/// them in the visible answer only (an empty one never matches).
+fn stop_sequences(value: Option<&Value>) -> crate::Result<Vec<String>> {
+    let invalid = || {
+        crate::Error::InvalidArgument(format!(
+            "stop must be a string or an array of at most {MAX_STOP_SEQUENCES} strings"
+        ))
+    };
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(sequence)) => Ok(vec![sequence.clone()]),
+        Some(Value::Array(items)) if items.len() <= MAX_STOP_SEQUENCES => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect(),
+        Some(_) => Err(invalid()),
+    }
+}
+
+/// A verbosity `level` (Chat `verbosity`, Responses `text.verbosity`, named
+/// `field` in errors): `low`, `medium` (the default) or `high`.
+pub(super) fn verbosity_level(level: Option<&str>, field: &str) -> crate::Result<&'static str> {
+    match level {
+        None | Some("medium") => Ok("medium"),
+        Some("low") => Ok("low"),
+        Some("high") => Ok("high"),
+        Some(other) => Err(crate::Error::InvalidArgument(format!(
+            "{field} must be low, medium or high, not {other:?}"
+        ))),
+    }
+}
+
+/// Ask for verbosity `level` in words, since the model has no control for
+/// it: `low` and `high` add an instruction as a system message after the
+/// leading `system`/`developer` ones, which the template joins into its one
+/// system turn. It ends that turn, after the tools and the client's own
+/// instructions, so the prompt prefix before it is unchanged. `medium` adds
+/// nothing.
+pub(super) fn add_verbosity(messages: &mut Vec<ChatMessage>, level: &str) {
+    let instruction = match level {
+        "low" => {
+            "Verbosity is set to low. Be concise: keep the final answer short and direct, with \
+             only what was asked and no preamble, restatement or optional detail."
+        }
+        "high" => {
+            "Verbosity is set to high. Be thorough: make the final answer long, detailed and \
+             complete, explaining the reasoning behind it, covering the relevant details and \
+             caveats, and including examples where they help. This is about the answer, not \
+             the thinking: brief reasoning still ends in a full answer."
+        }
+        _ => return,
+    };
+    let at = messages
+        .iter()
+        .take_while(|message| matches!(message.role.as_str(), "system" | "developer"))
+        .count();
+    messages.insert(
+        at,
+        ChatMessage {
+            role: "system".into(),
+            content: instruction.to_owned(),
+            ..ChatMessage::default()
+        },
+    );
 }
 
 fn is_empty(value: &Value) -> bool {
@@ -307,11 +379,15 @@ pub(super) fn prepare_generation_with(
     // The ID of the last deprecated assistant `function_call`, which the
     // `function` message after it answers.
     let mut pending = None;
-    let messages = messages
+    let mut messages = messages
         .iter()
         .enumerate()
         .map(|(index, message)| chat_message(message, index, &mut pending, files))
         .collect::<crate::Result<Vec<_>>>()?;
+    add_verbosity(
+        &mut messages,
+        verbosity_level(request.verbosity.as_deref(), "verbosity")?,
+    );
     let functions = request.functions.is_some();
     let (tools, tool_choice) = match (&request.functions, &request.tools) {
         (Some(_), Some(_)) => {
@@ -385,6 +461,7 @@ pub(super) fn prepare_generation_with(
             // A deprecated function call is always the only one.
             parallel_tool_calls: !functions && request.parallel_tool_calls.unwrap_or(true),
             response_format,
+            stop: stop_sequences(request.stop.as_ref())?,
         },
     })
 }

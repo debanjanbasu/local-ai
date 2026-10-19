@@ -51,6 +51,7 @@ fn long_prompt(marker: u128, max_tokens: usize) -> super::ChatRequest {
         tool_choice: crate::ToolChoice::Auto,
         parallel_tool_calls: true,
         response_format: crate::ResponseFormat::default(),
+        stop: Vec::new(),
     }
 }
 
@@ -166,7 +167,7 @@ fn split(
     tools: Option<std::sync::Arc<crate::tools::ToolSet>>,
     pieces: &[&str],
 ) -> (Vec<Event>, Option<String>) {
-    let mut splitter = super::EventSplitter::new(thinking, tools);
+    let mut splitter = super::EventSplitter::new(thinking, tools, Vec::new());
     let mut events = Vec::new();
     let mut sink = |event| {
         events.push(event);
@@ -210,7 +211,7 @@ fn delivery(
     let delivery = super::Delivery {
         events,
         cancel: crate::bonsai_model::CancelToken::new(),
-        splitter: super::EventSplitter::new(false, tools),
+        splitter: super::EventSplitter::new(false, tools, Vec::new()),
         outbox: std::collections::VecDeque::new(),
     };
     (delivery, receiver)
@@ -263,7 +264,7 @@ fn usage_counts_reasoning_tokens_including_the_delimiter_not_text_chunks() {
         (true, "", vec![], 0),
     ] {
         let (mut delivery, _receiver) = delivery(None);
-        delivery.splitter = super::EventSplitter::new(thinking, None);
+        delivery.splitter = super::EventSplitter::new(thinking, None, Vec::new());
         assert!(delivery.emit(text));
         let mut output = generation();
         output.token_ids = tokens;
@@ -352,6 +353,184 @@ fn a_call_cut_off_by_the_budget_is_dropped_and_the_stop_reason_stands() {
     }
 }
 
+/// Stop sequences end the visible answer at their first match, excluding
+/// it, and never stream part of one; reasoning and tool-call markup are not
+/// matched, and a refusal that was not a match is the consumer cancelling.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stop_sequences_end_the_visible_answer_without_streaming_part_of_one() {
+    use crate::bonsai_model::StopReason;
+    struct Case {
+        thinking: bool,
+        tools: bool,
+        stop: &'static [&'static str],
+        pieces: &'static [&'static str],
+        /// The engine's own stop reason when every piece was accepted.
+        engine: StopReason,
+        content: &'static [&'static str],
+        reasoning: &'static str,
+        calls: usize,
+        reason: StopReason,
+    }
+    let cases = [
+        // A match split across pieces: its first half is held, never sent.
+        Case {
+            thinking: false,
+            tools: false,
+            stop: &["\n\nUser:"],
+            pieces: &["Hello\n\nUs", "er: next", " ignored"],
+            engine: StopReason::Eos,
+            content: &["Hello"],
+            reasoning: "",
+            calls: 0,
+            reason: StopReason::Stopped,
+        },
+        // A held start that does not become a sequence is released whole.
+        Case {
+            thinking: false,
+            tools: false,
+            stop: &["\n\nUser:"],
+            pieces: &["a\n\nUs", "e it"],
+            engine: StopReason::Eos,
+            content: &["a", "\n\nUse it"],
+            reasoning: "",
+            calls: 0,
+            reason: StopReason::Eos,
+        },
+        // The earliest of several sequences wins, across multibyte text.
+        Case {
+            thinking: false,
+            tools: false,
+            stop: &["", "END", "→E"],
+            pieces: &["x →", "END"],
+            engine: StopReason::TokenLimit,
+            content: &["x "],
+            reasoning: "",
+            calls: 0,
+            reason: StopReason::Stopped,
+        },
+        // Reasoning is never matched.
+        Case {
+            thinking: true,
+            tools: false,
+            stop: &["Paris"],
+            pieces: &["Paris?</think>\n\nOK"],
+            engine: StopReason::Eos,
+            content: &["OK"],
+            reasoning: "Paris?",
+            calls: 0,
+            reason: StopReason::Eos,
+        },
+        // Nor are a call's arguments: the call stands.
+        Case {
+            thinking: false,
+            tools: true,
+            stop: &["Paris"],
+            pieces: &["Checking.\n\n", CALL],
+            engine: StopReason::Eos,
+            content: &["Checking."],
+            reasoning: "",
+            calls: 1,
+            reason: StopReason::Eos,
+        },
+        // A match before a call means the call is never made.
+        Case {
+            thinking: false,
+            tools: true,
+            stop: &["king"],
+            pieces: &["Checking.\n\n", CALL],
+            engine: StopReason::Eos,
+            content: &["Chec"],
+            reasoning: "",
+            calls: 0,
+            reason: StopReason::Stopped,
+        },
+        // Text after a call is matched; the call made before it stands.
+        Case {
+            thinking: false,
+            tools: true,
+            stop: &["Done"],
+            pieces: &[CALL, "\nAll Done."],
+            engine: StopReason::Eos,
+            content: &["All "],
+            reasoning: "",
+            calls: 1,
+            reason: StopReason::Stopped,
+        },
+        // Text the tool parser holds to the end is matched when flushed.
+        Case {
+            thinking: false,
+            tools: true,
+            stop: &["<tool"],
+            pieces: &["Done <tool"],
+            engine: StopReason::Eos,
+            content: &["Done", " "],
+            reasoning: "",
+            calls: 0,
+            reason: StopReason::Stopped,
+        },
+        // A refusal without a match is the consumer stopping.
+        Case {
+            thinking: false,
+            tools: false,
+            stop: &[],
+            pieces: &["partial"],
+            engine: StopReason::Stopped,
+            content: &["partial"],
+            reasoning: "",
+            calls: 0,
+            reason: StopReason::Cancelled,
+        },
+    ];
+    for case in cases {
+        let tools = case.tools.then(weather_tools);
+        let (mut delivery, _receiver) = delivery(None);
+        delivery.splitter = super::EventSplitter::new(
+            case.thinking,
+            tools,
+            case.stop.iter().map(|&stop| stop.to_owned()).collect(),
+        );
+        let mut engine = case.engine;
+        for piece in case.pieces {
+            if !delivery.emit(piece) {
+                // What the engine does when a piece is refused.
+                engine = StopReason::Stopped;
+                break;
+            }
+        }
+        let mut output = generation();
+        output.stop_reason = engine;
+        delivery.complete(Ok(output));
+        let events = outbox_events(&delivery);
+        let label = format!("{:?} in {:?}: {events:?}", case.stop, case.pieces);
+        let content: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, case.content, "{label}");
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, case.reasoning, "{label}");
+        let calls = events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolCall(_)))
+            .count();
+        assert_eq!(calls, case.calls, "{label}");
+        assert!(
+            matches!(events.last(), Some(Event::Finished(stats)) if stats.stop_reason == case.reason),
+            "{label}"
+        );
+    }
+}
+
 fn message(role: &str, content: &str) -> super::ChatMessage {
     super::ChatMessage {
         role: role.into(),
@@ -404,6 +583,7 @@ fn tool_history(thinking: bool) -> super::ChatRequest {
         tool_choice: crate::ToolChoice::Auto,
         parallel_tool_calls: true,
         response_format: crate::ResponseFormat::default(),
+        stop: Vec::new(),
     }
 }
 

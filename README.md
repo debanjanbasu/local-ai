@@ -186,6 +186,7 @@ let request = ChatRequest {
     tool_choice: ToolChoice::Auto,
     parallel_tool_calls: true,
     response_format: ResponseFormat::Text,
+    stop: Vec::new(),
 };
 engine.chat_with(&request, |event| {
     if let Event::Content(text) = event { print!("{text}"); }

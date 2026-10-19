@@ -142,6 +142,12 @@ pub enum StopReason {
     Eos,
     TokenLimit,
     Cancelled,
+    /// The consumer refused a piece. The sequence stops at a token boundary
+    /// with its state intact, as at a token limit, so unlike
+    /// [`Self::Cancelled`] the prompt cache is kept. The engine API reports
+    /// it only for a matched [`crate::ChatRequest::stop`] sequence; any other
+    /// refusal is reported as [`Self::Cancelled`].
+    Stopped,
 }
 
 pub struct BonsaiGeneration {
