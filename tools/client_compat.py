@@ -34,7 +34,12 @@ SDK's `@ai-sdk/openai-compatible` package, so it speaks Chat Completions;
 `codex-apply-patch` gives Codex a model catalog (`model_catalog_json`) that
 marks this model freeform, so Codex edits through its own `apply_patch`
 grammar tool; `codex-compact` lowers Codex's auto-compaction limit so its
-local compaction runs mid-task.
+local compaction runs mid-task; `codex-remote-compact` does the same with the
+provider capability `remote_compaction = "v2"`, so Codex compacts with a
+`compaction_trigger` turn and replays the sealed `compaction` item, and
+`codex-remote-compact-manual` drives `codex app-server` to request that
+compaction by hand (`thread/compact/start`, the TUI's `/compact`) between
+two turns.
 
 Scenario kinds:
 
@@ -470,9 +475,11 @@ CODEX_COMPACTION_PROMPT = "CONTEXT CHECKPOINT COMPACTION"
 
 
 def codex_config(proxy_port: int, effort: str, compat: bool, catalog: Path | None = None,
-                 compact_limit: int | None = None) -> str:
+                 compact_limit: int | None = None, remote_compaction: bool = False) -> str:
     """config.toml for a scratch CODEX_HOME. `compat` keeps only function tools;
-    `catalog` is a `model_catalog_json`; `compact_limit` an auto-compaction limit."""
+    `catalog` is a `model_catalog_json`; `compact_limit` an auto-compaction limit;
+    `remote_compaction` sets the provider capability `remote_compaction = "v2"`,
+    so Codex compacts with a `compaction_trigger` turn instead of locally."""
     lines = [
         f'model = "{MODEL_ID}"',
         'model_provider = "localai"',
@@ -511,6 +518,8 @@ def codex_config(proxy_port: int, effort: str, compat: bool, catalog: Path | Non
         'wire_api = "responses"',
         "",
     ]
+    if remote_compaction:
+        lines += ["[model_providers.localai.capabilities]", 'remote_compaction = "v2"', ""]
     return "\n".join(lines)
 
 
@@ -705,9 +714,12 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
         # instructions and tools), so it compacts once tool results pile up;
         # a limit under it compacts after every turn and never finishes, and
         # the fix task ends near 7,700 tokens, so 9,000 is never reached.
-        compact_limit = 7000 if variant == "compact" else None
+        # The same limit drives remote compaction; `remote-manual` compacts
+        # only when asked to (app-server `thread/compact/start`).
+        compact_limit = 7000 if variant in ("compact", "remote-compact") else None
+        remote = variant in ("remote-compact", "remote-manual")
         (codex_home / "config.toml").write_text(
-            codex_config(ctx.proxy_port, effort, compat, catalog, compact_limit))
+            codex_config(ctx.proxy_port, effort, compat, catalog, compact_limit, remote))
         env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
     elif client == "opencode":
         config = home / ".config" / "opencode"
@@ -891,11 +903,156 @@ def client_scenario(kind: str, client: str, effort: str, compat: bool = True,
             result.extra["compaction_turn"] = compacted
             result.task_ok = result.task_ok and compacted
             result.detail += f", compaction turn seen={compacted}"
+        if variant == "remote-compact":
+            ok, detail = check_remote_compaction(result, exchanges)
+            result.task_ok = result.task_ok and ok
+            result.detail += f", {detail}"
         result.passed = result.protocol_ok and result.task_ok and code == 0
         if code != 0:
             result.detail += f"; client exit {code}"
 
     return run
+
+
+def check_remote_compaction(result: Result, exchanges: list[dict]) -> tuple[bool, str]:
+    """Codex's remote compaction v2: each request whose input ends with a
+    `compaction_trigger` item is answered with exactly one output item, a
+    `compaction` item carrying `encrypted_content`; a later request replays
+    that item; and Codex never fell back to its local summarization prompt."""
+    triggers, sealed, replayed, local = 0, [], 0, 0
+    for exchange in exchanges:
+        body = exchange.get("request_body")
+        if not isinstance(body, dict) or not isinstance(body.get("input"), list):
+            continue
+        items = [i for i in body["input"] if isinstance(i, dict)]
+        if CODEX_COMPACTION_PROMPT in json.dumps(items[-1:]):
+            local += 1
+        if items and items[-1].get("type") == "compaction_trigger":
+            triggers += 1
+            output = (response_object(exchange) or {}).get("output") or []
+            if len(output) == 1 and output[0].get("type") == "compaction" \
+                    and isinstance(output[0].get("encrypted_content"), str):
+                sealed.append(output[0]["encrypted_content"])
+            continue
+        if any(i.get("type") == "compaction" and i.get("encrypted_content") in sealed for i in items):
+            replayed += 1
+    result.extra.update(compaction_triggers=triggers, compaction_items=len(sealed),
+                        compaction_replays=replayed, local_compactions=local)
+    ok = triggers >= 1 and len(sealed) == triggers and replayed >= 1 and local == 0
+    return ok, (f"compaction_trigger turns={triggers}, compaction items={len(sealed)}, "
+                f"requests replaying one={replayed}, local compactions={local}")
+
+
+class AppServer:
+    """`codex app-server` over stdio (newline-delimited JSON-RPC), enough to
+    run turns and a manual compaction (`thread/compact/start`, the `/compact`
+    command of Codex's TUI), which `codex exec` cannot request."""
+
+    def __init__(self, command: list[str], repo: Path, env: dict, log: Path):
+        self.log = log.open("ab")
+        self.process = subprocess.Popen(
+            command, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=self.log, start_new_session=True, text=True, bufsize=1)
+        self.next_id = 0
+
+    def _send(self, message: dict) -> None:
+        assert self.process.stdin
+        self.log.write(f">> {json.dumps(message)}\n".encode())
+        self.process.stdin.write(json.dumps(message) + "\n")
+        self.process.stdin.flush()
+
+    def _read(self, deadline: float) -> dict:
+        # One blocking read per message; the deadline is enforced by
+        # stopping the process from a timer, since a pipe read has no timeout.
+        assert self.process.stdout
+        timer = threading.Timer(max(0.0, deadline - time.monotonic()), self.stop)
+        timer.start()
+        try:
+            line = self.process.stdout.readline()
+        finally:
+            timer.cancel()
+        if not line:
+            raise RuntimeError("codex app-server exited or timed out")
+        self.log.write(f"<< {line.rstrip()[:2000]}\n".encode())
+        message = json.loads(line)
+        if "method" in message and "id" in message:
+            # A request from the server (an approval): refused, never expected
+            # with approval_policy "never".
+            self._send({"id": message["id"], "error": {"code": -32601, "message": "not supported"}})
+        return message
+
+    def request(self, method: str, params: dict, timeout: float) -> dict:
+        self.next_id += 1
+        ident = self.next_id
+        self._send({"id": ident, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            message = self._read(deadline)
+            if message.get("id") == ident and "method" not in message:
+                if "error" in message:
+                    raise RuntimeError(f"{method}: {message['error']}")
+                return message.get("result") or {}
+
+    def notify(self, method: str) -> None:
+        self._send({"method": method})
+
+    def wait_for(self, method: str, timeout: float) -> dict:
+        deadline = time.monotonic() + timeout
+        while True:
+            message = self._read(deadline)
+            if message.get("method") == method:
+                return message.get("params") or {}
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            signal_group(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(10)
+            except subprocess.TimeoutExpired:
+                signal_group(self.process.pid, signal.SIGKILL)
+                self.process.wait()
+
+
+def codex_manual_compact(ctx: Context, result: Result) -> None:
+    """Codex's manual remote compaction: a read turn, `thread/compact/start`
+    (Codex's `/compact`), then a follow-up that needs the compacted context
+    ("that same file"), through `codex app-server` with `remote_compaction = "v2"`."""
+    assert ctx.codex_bin
+    repo, base, env = prepare_client(ctx, "codex", result.name, "none", variant="remote-manual")
+    write_files(repo, READ_FILES)
+    git_init(repo)
+    start = ctx.recorder.begin(result.name)
+    began = time.monotonic()
+    server = AppServer([ctx.codex_bin, "app-server"], repo, env, base / "client.log")
+    answers, compacted = [], False
+    try:
+        server.request("initialize", {"clientInfo": {"name": "client_compat", "version": "1"}}, 60)
+        server.notify("initialized")
+        thread = server.request("thread/start", {"cwd": str(repo.resolve())}, 60)["thread"]["id"]
+        for prompt in (READ_PROMPT, None, FOLLOWUP_PROMPT):
+            mark = len(ctx.recorder.since(0))
+            if prompt is None:
+                server.request("thread/compact/start", {"threadId": thread}, 60)
+                turn = server.wait_for("turn/completed", ctx.timeout).get("turn") or {}
+                compacted = turn.get("status") == "completed"
+                continue
+            server.request("turn/start", {"threadId": thread,
+                                          "input": [{"type": "text", "text": prompt}]}, 60)
+            server.wait_for("turn/completed", ctx.timeout)
+            answers.append(final_answer(ctx.recorder.since(mark)))
+    except (RuntimeError, ValueError) as error:
+        result.detail = f"app-server: {error}; "
+    finally:
+        server.stop()
+    exchanges = ctx.recorder.since(start)
+    summarize_exchanges(result, exchanges)
+    result.seconds = time.monotonic() - began
+    result.extra["answers"] = answers
+    ok, detail = check_remote_compaction(result, exchanges)
+    read = len(answers) == 2 and "42" in answers[0] and "7" in answers[1]
+    result.task_ok = ok and read and compacted
+    result.detail += f"answers={answers!r}, compaction turn completed={compacted}, {detail}"
+    result.passed = result.protocol_ok and result.task_ok
 
 
 def signal_group(pid: int, signum: int) -> None:
@@ -1262,6 +1419,11 @@ def scenarios() -> list[Scenario]:
     items.append(Scenario(
         "codex-compact", "codex", "none", "compaction",
         client_scenario("fix", "codex", "none", variant="compact"), "codex"))
+    items.append(Scenario(
+        "codex-remote-compact", "codex", "none", "compaction",
+        client_scenario("fix", "codex", "none", variant="remote-compact"), "codex"))
+    items.append(Scenario("codex-remote-compact-manual", "codex", "none", "compaction",
+                          codex_manual_compact, "codex"))
     for kind, effort in (("fix", "none"), ("read", "none"), ("fix", "xhigh")):
         name = f"opencode-responses-{kind}" + ("-xhigh" if effort == "xhigh" else "")
         items.append(Scenario(

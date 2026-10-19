@@ -483,14 +483,23 @@ async fn dispatch(
     // queueing (about half a second the first time, building the tokenizer's
     // grammar tables), so it runs on the blocking pool, never on a runtime
     // worker. A dropped request drops the stream, which cancels the job.
-    let engine = state.engine.clone();
-    let events = tokio::task::spawn_blocking(move || engine.chat(request))
-        .await
-        .unwrap_or_else(|error| {
-            Err(crate::Error::Generation(format!(
-                "request submission failed: {error}"
-            )))
-        });
+    let compaction_turn = match &reply.protocol {
+        Protocol::Responses(echo) => echo.compaction_turn().cloned(),
+        Protocol::Chat { .. } => None,
+    };
+    let events = if let Some(stats) = compaction_turn {
+        // A `compaction_trigger` turn already ran its one generation.
+        Ok(compaction::finished(stats).await)
+    } else {
+        let engine = state.engine.clone();
+        tokio::task::spawn_blocking(move || engine.chat(request))
+            .await
+            .unwrap_or_else(|error| {
+                Err(crate::Error::Generation(format!(
+                    "request submission failed: {error}"
+                )))
+            })
+    };
     let events = match events {
         Ok(events) => admin::meter(
             &state,

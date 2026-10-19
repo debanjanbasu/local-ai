@@ -747,6 +747,144 @@ fn a_compacted_conversation_survives_a_restart() {
     assert!(!rendered.contains(&("assistant", "Reading the file.")));
 }
 
+/// Codex's remote compaction: a `compaction_trigger` turn is answered with
+/// exactly one compaction item (its stream announcing it with
+/// `output_item.done` before `response.completed`), and Codex's replacement
+/// history — retained user messages, then that item, then the next turn —
+/// renders from the item.
+#[test]
+fn a_compaction_trigger_turn_answers_with_one_replayable_compaction_item() {
+    let scratch = Scratch::new();
+    let cipher = scratch.cipher();
+    let trigger = json!({"type":"compaction_trigger"});
+    conforms(&trigger, "CompactionTriggerItemParam");
+    let mut input = transcript();
+    input.push(trigger.clone());
+    let body = json!({"model":"m","input":input,"instructions":"sys","stream":true,
+        "store":false,"include":["reasoning.encrypted_content"]});
+    let mut prepared = prepare(&body, None, Some(&cipher)).expect("valid");
+    assert!(prepared.compaction_trigger);
+    // The trigger is a request, never history: nothing renders or keeps it.
+    assert!(
+        !prepared
+            .history
+            .messages()
+            .expect("renders")
+            .iter()
+            .any(|message| message.content.contains("compaction_trigger"))
+    );
+    let pass = prepared
+        .history
+        .compaction(3, Vec::new(), None, by_messages)
+        .expect("plans")
+        .expect("something to summarize");
+    let (item, _) = pass
+        .finish(
+            "Parser written; quoting asked.",
+            &prepared.history,
+            &cipher,
+            "m",
+        )
+        .expect("seals");
+    // A summary cut short by its budget still compacted.
+    prepared.answer_with_compaction(item, *stats(StopReason::TokenLimit));
+    // What the server finishes the Response with, generating nothing else.
+    let finished = prepared.echo.compaction_turn().cloned().expect("a turn");
+    let (response, events) = run(prepared, vec![Event::Finished(Box::new(finished))], true);
+    assert_eq!(response["status"], "completed", "{response}");
+    conforms(&response, "Response");
+    let output = response["output"].as_array().expect("output");
+    assert_eq!(output.len(), 1, "{output:?}");
+    assert_eq!(output[0]["type"], "compaction");
+    assert_eq!(response["usage"]["output_tokens"], 12);
+    assert_eq!(
+        kinds(&events),
+        [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+    let done = &events[3];
+    conforms(done, "ResponseOutputItemDoneEvent");
+    let item = done["item"].clone();
+    assert!(item["encrypted_content"].is_string());
+
+    // Codex retains the user messages, appends the item last, then the next
+    // turn; the item stands for everything before it.
+    let replay = json!({"model":"m","instructions":"sys","input":[
+        user("Build a CSV parser in src/lib.rs."),
+        user("Now add quoted-field support."),
+        item,
+        user("Run the tests."),
+    ]});
+    let next = prepare(&replay, None, Some(&cipher)).expect("replays");
+    assert!(!next.compaction_trigger);
+    let rendered: Vec<&str> = next
+        .request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    assert!(rendered[1].ends_with("Parser written; quoting asked."));
+    assert_eq!(rendered.last(), Some(&"Run the tests."));
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|text| **text == "Now add quoted-field support.")
+            .count(),
+        1,
+        "{rendered:?}"
+    );
+    // Without a key there is nothing to seal with; a trigger before the end
+    // is not a request, and is dropped.
+    let keyless = json!({"input":[user("hi"), trigger]});
+    assert!(error(&keyless, None).contains("compaction_trigger"));
+    let background = json!({"input":[user("hi"), trigger],"background":true});
+    assert!(error(&background, Some(&cipher)).contains("background"));
+    let stale = prepare(
+        &json!({"input":[json!({"type":"compaction_trigger"}), user("hi")]}),
+        None,
+        Some(&cipher),
+    )
+    .expect("valid");
+    assert!(!stale.compaction_trigger);
+    assert_eq!(stale.request.messages.len(), 1);
+}
+
+/// When nothing would shorten the history, a compaction turn still answers
+/// with one item: one that renders exactly as the history did.
+#[test]
+fn a_history_sealed_whole_renders_unchanged() {
+    let scratch = Scratch::new();
+    let cipher = scratch.cipher();
+    let body = json!({"input":transcript(),"instructions":"sys"});
+    let original = prepare(&body, None, Some(&cipher)).expect("valid");
+    let item = original.history.sealed(&cipher, "m").expect("seals");
+    let replay = prepare(
+        &json!({"input":[item],"instructions":"sys"}),
+        None,
+        Some(&cipher),
+    )
+    .expect("replays");
+    assert_eq!(
+        pairs(&replay.request.messages),
+        pairs(&original.request.messages)
+    );
+    let contents = |messages: &[ChatMessage]| -> Vec<(String, String)> {
+        messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect()
+    };
+    assert_eq!(
+        contents(&replay.request.messages),
+        contents(&original.request.messages)
+    );
+}
+
 #[test]
 fn history_without_a_compaction_item_renders_as_before() {
     let history = History {

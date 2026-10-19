@@ -3,7 +3,9 @@
 //!
 //! `POST /v1/responses/compact` answers with a `response.compaction` object;
 //! a `POST /v1/responses` with `context_management` is compacted here, before
-//! its generation is queued, when its prompt is due; a Response with
+//! its generation is queued, when its prompt is due; one whose input ends
+//! with a `compaction_trigger` is compacted here and answered with the
+//! compaction item instead of a generation; a Response with
 //! `reasoning.summary` gets the engine-backed [`Summarizer`]. Each summary is
 //! one more generation of the loaded model, queued like any request.
 
@@ -15,7 +17,10 @@ use axum::response::Response;
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use tokio_stream::StreamExt;
 
-use local_engine::{ChatMessage, ChatRequest, EngineHandle, Event, Stats};
+use local_engine::bonsai_model::{PromptCacheSource, StopReason};
+use local_engine::{
+    ChatMessage, ChatRequest, EngineHandle, Event, EventStream, GenerationStats, Signal, Stats,
+};
 use local_services::compaction::should_compact;
 
 use super::admin::Meter;
@@ -155,7 +160,9 @@ pub(super) async fn prepare_responses(
     })
     .await
     .map_err(|error| crate::Error::Generation(format!("request preparation failed: {error}")))??;
-    if let Some(entry) = prepared.context_compaction {
+    if prepared.compaction_trigger {
+        prepared = compact_on_trigger(state, prepared).await?;
+    } else if let Some(entry) = prepared.context_compaction {
         prepared = compact_if_due(state, prepared, entry.threshold, meter).await?;
     }
     if prepared.echo.summarizes() {
@@ -220,6 +227,75 @@ async fn compact_if_due(
         prepared.compacted(item, history)?;
     }
     Ok(prepared)
+}
+
+/// Compact `prepared`, a `compaction_trigger` turn, whatever its length, and
+/// make the compaction item its whole answer.
+///
+/// The newest quarter of the prompt is kept verbatim, as by
+/// `/responses/compact`. The client asked for exactly one compaction item,
+/// so when nothing can be summarized, the summary comes back empty, or it
+/// would not shorten the prompt, the item holds the history unchanged
+/// instead. The summary generation is metered as this Response's own, from
+/// its `Finished` event.
+async fn compact_on_trigger(
+    state: &AppState,
+    prepared: PreparedResponses,
+) -> crate::Result<PreparedResponses> {
+    let cipher = state.cipher.clone().ok_or_else(|| {
+        crate::Error::InvalidArgument("compaction_trigger needs --reasoning-key".into())
+    })?;
+    let engine = state.engine.clone();
+    let (mut prepared, pass, tokens) = tokio::task::spawn_blocking(move || {
+        let count = counter(engine, prepared.request.clone());
+        let tokens = count(prepared.request.messages.clone())?;
+        let pass = prepared.history.compaction(
+            tokens / KEEP_DIVISOR,
+            prepared.request.tools.clone(),
+            prepared.request.session.clone(),
+            count,
+        )?;
+        Ok::<_, crate::Error>((prepared, pass, tokens))
+    })
+    .await
+    .map_err(|error| crate::Error::Generation(error.to_string()))??;
+    let mut usage = Stats {
+        stop_reason: StopReason::Eos,
+        cache_source: PromptCacheSource::None,
+        reasoning_tokens: 0,
+        generation: GenerationStats::default(),
+    };
+    let mut item = None;
+    if let Some(pass) = pass {
+        let _admitted = state.depth.admit();
+        let (summary, measured) = generate(&state.engine, pass.request.clone()).await?;
+        usage = measured;
+        if let Ok((compacted, history)) =
+            pass.finish(&summary, &prepared.history, &cipher, &state.model)
+            && shrinks(&state.engine, prepared.request.clone(), &history, tokens).await?
+        {
+            item = Some(compacted);
+        }
+    }
+    let item = match item {
+        Some(item) => item,
+        None => prepared.history.sealed(&cipher, &state.model)?,
+    };
+    prepared.answer_with_compaction(item, usage);
+    Ok(prepared)
+}
+
+/// The events of a `compaction_trigger` turn's Response: its one
+/// `Finished`, carrying the summary generation's measurements, since the
+/// compaction ran before the Response began and nothing else is generated.
+pub(super) async fn finished(stats: Stats) -> EventStream {
+    let (relay, events) = EventStream::relay();
+    // The stream's buffer has room for the one event, so this never waits;
+    // dropping the relay then ends the stream.
+    let _ = relay
+        .send(Signal::Event(Event::Finished(Box::new(stats))))
+        .await;
+    events
 }
 
 /// `POST /v1/responses/compact`.
