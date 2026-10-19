@@ -33,13 +33,14 @@ SDK's `@ai-sdk/openai-compatible` package, so it speaks Chat Completions;
 `opencode-responses-*` use `@ai-sdk/openai`, which speaks Responses.
 `codex-apply-patch` gives Codex a model catalog (`model_catalog_json`) that
 marks this model freeform, so Codex edits through its own `apply_patch`
-grammar tool; `codex-compact` lowers Codex's auto-compaction limit so its
-local compaction runs mid-task; `codex-remote-compact` does the same with the
-provider capability `remote_compaction = "v2"`, so Codex compacts with a
-`compaction_trigger` turn and replays the sealed `compaction` item, and
-`codex-remote-compact-manual` drives `codex app-server` to request that
-compaction by hand (`thread/compact/start`, the TUI's `/compact`) between
-two turns.
+grammar tool. Every Codex scenario sets the provider capability
+`remote_compaction = "v2"`, the recommended configuration, so Codex compacts
+with a `compaction_trigger` turn and replays the sealed `compaction` item;
+`codex-remote-compact` lowers Codex's auto-compaction limit so that runs
+mid-task, `codex-remote-compact-manual` drives `codex app-server` to request
+it by hand (`thread/compact/start`, the TUI's `/compact`) between two turns,
+and `codex-compact`, the one scenario without v2, tests Codex's local
+compaction at the same limit.
 
 Scenario kinds:
 
@@ -49,10 +50,7 @@ Scenario kinds:
   the answer; `protocol_ok` requires that no proxied exchange failed.
 - `http-*`: direct protocol probes of request shapes those clients send
   (hosted and custom tools, reasoning summaries, compaction, encrypted
-  reasoning replay, disconnect and background cancellation), and
-  `http-legacy-members`: the legacy Completions route is a 404, while the
-  deprecated request members harnesses still send (`max_tokens`,
-  `functions`, `user`) are honoured.
+  reasoning replay, disconnect and background cancellation).
 
 Each result names the workstream that owns a failure, so a rerun after a
 merge shows which gaps closed. Output: `results.json`, `summary.md`,
@@ -475,11 +473,12 @@ CODEX_COMPACTION_PROMPT = "CONTEXT CHECKPOINT COMPACTION"
 
 
 def codex_config(proxy_port: int, effort: str, compat: bool, catalog: Path | None = None,
-                 compact_limit: int | None = None, remote_compaction: bool = False) -> str:
+                 compact_limit: int | None = None, remote_compaction: bool = True) -> str:
     """config.toml for a scratch CODEX_HOME. `compat` keeps only function tools;
     `catalog` is a `model_catalog_json`; `compact_limit` an auto-compaction limit;
-    `remote_compaction` sets the provider capability `remote_compaction = "v2"`,
-    so Codex compacts with a `compaction_trigger` turn instead of locally."""
+    `remote_compaction` (the default) sets the provider capability
+    `remote_compaction = "v2"`, so Codex compacts with a `compaction_trigger`
+    turn instead of locally."""
     lines = [
         f'model = "{MODEL_ID}"',
         'model_provider = "localai"',
@@ -717,7 +716,8 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
         # The same limit drives remote compaction; `remote-manual` compacts
         # only when asked to (app-server `thread/compact/start`).
         compact_limit = 7000 if variant in ("compact", "remote-compact") else None
-        remote = variant in ("remote-compact", "remote-manual")
+        # Remote compaction v2 everywhere but the scenario testing local compaction.
+        remote = variant != "compact"
         (codex_home / "config.toml").write_text(
             codex_config(ctx.proxy_port, effort, compat, catalog, compact_limit, remote))
         env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
@@ -1353,43 +1353,6 @@ def invalid_then_valid(ctx: Context, result: Result) -> None:
     result.detail = f"invalid effort -> {bad} {json.dumps(body)[:200]}; valid -> {good}"
 
 
-# The legacy Completions route is not found, but the deprecated members
-# harnesses still send are honoured: `max_tokens` (Aider's cache warming,
-# opencode's AI SDK), legacy `functions` answered as `function_call`, and
-# Responses `user`.
-SAY_OK = [{"role": "user", "content": "Say OK."}]
-LEGACY_MEMBERS: list[tuple[str, dict, int]] = [
-    ("/v1/completions", {"model": MODEL_ID, "prompt": "Say OK.", "max_tokens": 4}, 404),
-    ("/v1/chat/completions", {"messages": SAY_OK, "max_tokens": 4, "seed": 7, "user": "u",
-                              "reasoning_effort": "none"}, 200),
-    ("/v1/chat/completions", {
-        "messages": [{"role": "user", "content": "What is the weather in Oslo? Use the function."}],
-        "functions": [{"name": "weather", "parameters": {
-            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
-        "function_call": {"name": "weather"}, "max_tokens": 64, "reasoning_effort": "none"}, 200),
-    ("/v1/responses", {**SIMPLE, "user": "u", "truncation": "disabled"}, 200),
-]
-
-
-def legacy_members(ctx: Context, result: Result) -> None:
-    start = ctx.recorder.begin(result.name)
-    answers = [post(ctx.proxy_port, path, body) for path, body, _ in LEGACY_MEMBERS]
-    statuses = [status for status, _, _ in answers]
-    exchanges = ctx.recorder.since(start)
-    result.requests = len(exchanges)
-    result.seconds = sum(seconds for _, _, seconds in answers)
-    message = ((answers[2][1] or {}).get("choices") or [{}])[0] if isinstance(answers[2][1], dict) else {}
-    function_call = (message.get("message") or {}).get("function_call") or {}
-    result.protocol_ok = statuses[1:] == [200, 200, 200]
-    result.task_ok = (statuses == [expected for _, _, expected in LEGACY_MEMBERS]
-                      and function_call.get("name") == "weather"
-                      and message.get("finish_reason") == "function_call")
-    result.passed = result.protocol_ok and result.task_ok
-    result.detail = "; ".join(
-        f"{path} -> {status}" for (path, _, _), status in zip(LEGACY_MEMBERS, statuses, strict=True)
-    ) + f"; function_call={json.dumps(function_call)[:120]}"
-
-
 # ---------------------------------------------------------------- registry
 
 
@@ -1437,7 +1400,6 @@ def scenarios() -> list[Scenario]:
     items.append(Scenario("http-stream-disconnect", "http", "none", "protocol", stream_disconnect))
     items.append(Scenario("http-background-cancel", "http", "none", "background", background_cancel))
     items.append(Scenario("http-invalid-then-valid", "http", "none", "protocol", invalid_then_valid))
-    items.append(Scenario("http-legacy-members", "http", "none", "protocol", legacy_members))
     return items
 
 

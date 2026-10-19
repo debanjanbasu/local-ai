@@ -231,28 +231,24 @@ Conversations, Files, Uploads, Batches, Vector Stores, Decisions and the
 Administration API; with the optional models installed, Embeddings,
 Moderations, Audio speech, and Audio transcriptions and translations.
 `/health` is this server's own.
-Compatibility with the clients that call them comes before strictness about
-members the specification has retired:
+Only the current specification is served:
 
 - The legacy Completions API, `POST /v1/completions`, is a 404 like any
   unknown route, and a batch cannot target it.
-- Request members the specification marks deprecated are accepted, because
-  coding harnesses and older SDKs still send them (opencode's AI SDK sends
-  Chat `max_tokens` on every request, LiteLLM and Aider send `max_tokens`,
-  `seed` and `user`). Where they mean something they are honoured: Chat
-  `max_tokens` is `max_completion_tokens` (which wins when both are set),
-  `seed` seeds the sampler (any JSON integer; a negative one keeps its 64
-  bits), `functions` and `function_call` are function `tools` and
-  `tool_choice` with at most one call, answered in their own shape
-  (`message.function_call` or a `function_call` delta, finish reason
-  `function_call`), and a history's assistant `function_call` and `function`
-  message are a call and its result; Responses `reasoning.generate_summary`
-  is `reasoning.summary` when that is absent; this server's former
-  `session_id` is `prompt_cache_key` on both. Where nothing applies they are
-  accepted and change nothing: `user`, `prompt_cache_retention` (also on
-  `compact`) and Responses `truncation` (`auto` or `disabled`, on
+- Of the request members the specification marks deprecated, only Chat
+  `max_tokens` is honoured, because opencode's AI SDK sends it on every
+  request: it is `max_completion_tokens`, which wins when both are set. The
+  rest (Chat `functions`, `function_call` and the `function` history role,
+  `user`, `reasoning.generate_summary`, `prompt_cache_retention`, this
+  server's former `session_id` alias) are not supported: as members they are
+  ignored like any unknown member (use `tools`, `tool_choice`,
+  `reasoning.summary` and `prompt_cache_key`), and a `function` message is
+  an unsupported role. Codex, Oh My Pi and opencode send none of them.
+- Responses `truncation` is current: `auto` or `disabled`, on
   `input_tokens` too; the engine never drops input, so an over-long request
-  fails either way, and a Response reports `disabled`).
+  fails either way, and a Response reports `disabled`. `seed` (any JSON
+  integer on Chat; a negative one keeps its 64 bits) is a sampling
+  extension, like `top_k`.
 
 ### Generation requests
 
@@ -1045,25 +1041,21 @@ name = "local-ai"
 base_url = "http://127.0.0.1:8080/v1"
 wire_api = "responses"
 # with authentication on: env_key = "LOCAL_AI_API_KEY"
-```
 
-Codex sends `store: false` with the whole conversation in `input` and asks for
-`reasoning.encrypted_content` (sealed with the reasoning key created on first
-start). By default it compacts locally: at 90% of the window it sends its
-summarization prompt as an ordinary Response and continues from the summary.
-To have this server compact instead, add the provider capability:
-
-```toml
 [model_providers.local-ai.capabilities]
 remote_compaction = "v2"   # compaction_trigger turns, for automatic compaction and /compact
 ```
 
-Codex then sends a `compaction_trigger` turn and replays the sealed
-`compaction` item it gets back
+Codex sends `store: false` with the whole conversation in `input` and asks for
+`reasoning.encrypted_content` (sealed with the reasoning key created on first
+start). With `remote_compaction = "v2"` it compacts through this server: at
+90% of the window (or on `/compact`) it sends a `compaction_trigger` turn and
+replays the sealed `compaction` item it gets back
 ([compaction](#compaction-and-reasoning-summaries)). The summary is written
 with the server's own compaction prompt, and the item keeps the newest tool
-calls and results verbatim, where Codex's local compaction keeps only user
-messages and its summary. Codex 0.163 has no `"v1"` value, so it never calls
+calls and results verbatim, where Codex's local compaction (what it does
+without the capability: its summarization prompt as an ordinary Response)
+keeps only user messages and its summary. Codex 0.163 has no `"v1"` value, so it never calls
 `/v1/responses/compact`. Codex declares its freeform `apply_patch` tool (a `custom` tool
 with a Lark grammar, enforced while the patch is generated) only for models
 its catalog marks freeform; for any other model it edits through
@@ -1143,8 +1135,8 @@ the rendering of a summary belong to `local_engine::compaction`; the server
 only adapts them ([engine contract](../local-engine/README.md#compaction-and-reasoning-summaries)).
 
 `POST /v1/responses/compact` takes `model`, `input`, `previous_response_id`,
-`instructions` and `prompt_cache_key` (`prompt_cache_options` is refused, the
-deprecated `prompt_cache_retention` is ignored, `service_tier` as elsewhere) and returns
+`instructions` and `prompt_cache_key` (`prompt_cache_options` is refused,
+`service_tier` as elsewhere, and unknown members are ignored) and returns
 a `response.compaction` object. It counts the resolved window, keeps the
 newest items up to a quarter of that count verbatim, and summarizes the rest.
 `output` is the kept items, then one `compaction` item whose
@@ -1206,8 +1198,7 @@ in a field named `encrypted_content`: the item carries the conversation's
 content, the contract calls it encrypted, and plaintext under that name would
 mislead.
 
-`reasoning.summary` (`auto`, `concise` or `detailed`; the deprecated
-`generate_summary` is read when `summary` is absent) runs after the answer's generation ends: the raw
+`reasoning.summary` (`auto`, `concise` or `detailed`) runs after the answer's generation ends: the raw
 reasoning is quoted to the model, which writes the summary as visible content.
 It streams as `response.reasoning_summary_part.added`,
 `response.reasoning_summary_text.delta`, `.done` and

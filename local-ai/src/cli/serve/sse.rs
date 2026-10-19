@@ -9,8 +9,7 @@ use local_engine::{Event, EventStream};
 use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
-    Protocol, Reply, arguments_text, chat_finish_reason, chat_tool_call, checked,
-    legacy_finish_reason, legacy_function_call, usage_json,
+    Protocol, Reply, arguments_text, chat_finish_reason, chat_tool_call, checked, usage_json,
 };
 use super::responses::{ResponsesState, sse_frame};
 
@@ -139,8 +138,6 @@ pub(super) enum Frames {
     Chat {
         reply: Reply,
         include_usage: bool,
-        /// Calls go out as the deprecated `function_call`.
-        functions: bool,
         /// Whether a chunk has carried `role` yet; `OpenAI` sends it once, first.
         announced: bool,
         /// Calls begun so far, which is also the next call's `index`.
@@ -155,13 +152,9 @@ pub(super) enum Frames {
 impl Frames {
     pub(super) fn new(reply: Reply) -> Self {
         match reply.protocol.clone() {
-            Protocol::Chat {
-                include_usage,
-                functions,
-            } => Self::Chat {
+            Protocol::Chat { include_usage } => Self::Chat {
                 reply,
                 include_usage,
-                functions,
                 announced: false,
                 calls: 0,
                 open: None,
@@ -191,13 +184,12 @@ impl Frames {
             Self::Chat {
                 reply,
                 include_usage,
-                functions,
                 announced,
                 calls,
                 open,
             } => chat_frames(
                 reply,
-                (*include_usage, *functions),
+                *include_usage,
                 announced,
                 (calls, open),
                 checked(event),
@@ -221,7 +213,7 @@ fn error_frame(error: &str) -> String {
 
 fn chat_frames(
     reply: &Reply,
-    (include_usage, functions): (bool, bool),
+    include_usage: bool,
     announced: &mut bool,
     (calls, open): (&mut usize, &mut Option<(String, usize)>),
     event: Event,
@@ -263,8 +255,7 @@ fn chat_frames(
             }
         },
         Event::Finished(stats) => {
-            let finish =
-                legacy_finish_reason(chat_finish_reason(stats.stop_reason, *calls > 0), functions);
+            let finish = chat_finish_reason(stats.stop_reason, *calls > 0);
             let mut frames = vec![data(&chunk(json!({}), Some(finish)))];
             if include_usage {
                 frames.push(data(&json!({"id":reply.id,"object":"chat.completion.chunk","created":reply.created,"model":reply.model.as_ref(),"choices":[],"usage":usage_json(&stats)})));
@@ -276,12 +267,6 @@ fn chat_frames(
         // Hosted tool results only run in the Responses loop.
         Event::TokenIds(_) | Event::ToolOutput(_) => return Vec::new(),
     };
-    if functions
-        && let Value::Object(map) = &mut delta
-        && let Some(calls) = map.remove("tool_calls")
-    {
-        map.insert("function_call".into(), legacy_function_call(&calls[0]));
-    }
     if !*announced {
         *announced = true;
         if let Value::Object(map) = &mut delta {
