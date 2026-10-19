@@ -95,6 +95,10 @@ class ConfigTest(unittest.TestCase):
         default = tomllib.loads(cc.codex_config(9999, "xhigh", compat=False))
         self.assertNotIn("features", default)
         self.assertEqual(default["model_reasoning_effort"], "xhigh")
+        # Remote compaction v2 is the default; local compaction is opt-out.
+        self.assertEqual(default["model_providers"]["localai"]["capabilities"]["remote_compaction"], "v2")
+        local = tomllib.loads(cc.codex_config(9999, "none", compat=True, remote_compaction=False))
+        self.assertNotIn("capabilities", local["model_providers"]["localai"])
 
     def test_default_config_flag_drops_the_compat_config(self):
         with tempfile.TemporaryDirectory() as scratch:

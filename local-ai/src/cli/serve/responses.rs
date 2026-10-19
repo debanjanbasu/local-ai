@@ -168,12 +168,8 @@ struct ResponsesRequest {
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
-    // Deprecated members, accepted because clients still send them:
-    // `session_id` (this server's former spelling) is `prompt_cache_key`,
-    // and `truncation` is checked by `reject_unsupported`. `user` and
-    // `prompt_cache_retention` change nothing here and are ignored like any
-    // other unknown member, as Codex's `client_metadata` telemetry is.
-    session_id: Option<String>,
+    /// Checked by `reject_unsupported`. Codex's `client_metadata` telemetry
+    /// is ignored like any other member this server does not know.
     truncation: Option<String>,
 }
 
@@ -181,8 +177,6 @@ struct ResponsesRequest {
 struct Reasoning {
     effort: Option<String>,
     summary: Option<String>,
-    /// The deprecated spelling of `summary`, used when `summary` is absent.
-    generate_summary: Option<String>,
     context: Option<String>,
     mode: Option<String>,
 }
@@ -610,11 +604,7 @@ fn summary_detail(reasoning: Option<&Reasoning>) -> crate::Result<Option<Summary
     let Some(reasoning) = reasoning else {
         return Ok(None);
     };
-    let Some(name) = reasoning
-        .summary
-        .as_ref()
-        .or(reasoning.generate_summary.as_ref())
-    else {
+    let Some(name) = &reasoning.summary else {
         return Ok(None);
     };
     SummaryDetail::parse(name).map(Some).ok_or_else(|| {
@@ -946,10 +936,7 @@ pub(super) fn prepare_responses_conversing(
         } else {
             "current_turn"
         },
-        prompt_cache_key: request
-            .prompt_cache_key
-            .clone()
-            .or_else(|| request.session_id.clone()),
+        prompt_cache_key: request.prompt_cache_key.clone(),
         safety_identifier: request.safety_identifier.clone(),
         previous_response_id: request.previous_response_id.clone(),
         // Reasoning is sealed only on request, as `OpenAI` does: a key on
@@ -982,7 +969,7 @@ pub(super) fn prepare_responses_conversing(
             thinking,
             effort: reasoning.unwrap_or_default(),
             preserve_thinking,
-            session: request.prompt_cache_key.or(request.session_id),
+            session: request.prompt_cache_key,
             tools,
             tool_choice: choice,
             parallel_tool_calls,
@@ -1243,7 +1230,6 @@ impl PreparedResponses {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CompactRequest {
     /// Required by the contract; checked by
     /// [`super::models::check_generation_value`], the loaded model answers.
@@ -1254,9 +1240,6 @@ struct CompactRequest {
     prompt_cache_key: Option<String>,
     prompt_cache_options: Option<Value>,
     service_tier: Option<String>,
-    /// Deprecated, and nothing to set here: prompt caching is automatic.
-    #[allow(dead_code)]
-    prompt_cache_retention: Option<Value>,
 }
 
 /// A parsed `POST /v1/responses/compact`.

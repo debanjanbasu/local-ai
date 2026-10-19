@@ -3,10 +3,7 @@
 The model always chooses tools; Rust executes them, outside model execution.
 The client runs some; this server runs `file_search` (no permission needed)
 and, with explicit permission, the hosted tools. Tools are declared as
-Responses `tools`, or Chat Completions `tools` with `tool_choice`; Chat's
-deprecated `functions`/`function_call` are function tools too, answered in
-their own `function_call` shape
-([supported OpenAI APIs](BONSAI.md#supported-openai-apis)).
+Responses `tools`, or Chat Completions `tools` with `tool_choice`.
 
 ## Client-executed tools (no permission needed)
 

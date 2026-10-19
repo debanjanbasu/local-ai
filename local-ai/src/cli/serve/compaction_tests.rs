@@ -524,7 +524,6 @@ fn compaction_needs_the_key_and_an_authentic_sealed_item() {
         .unwrap_or_default();
     assert!(refused.contains("--reasoning-key"), "{refused}");
     for (body, needle) in [
-        (json!({"input":"hi","extra":1}), "unknown field"),
         (json!({"model":"m"}), "input is required"),
         (
             json!({"input":"hi","previous_response_id":"resp_1"}),
@@ -1076,11 +1075,6 @@ fn summary_failure_fails_and_cancellation_skips_the_summary() {
 fn reasoning_summary_options_are_validated() {
     let body = |reasoning: Value| json!({"input":"hi","reasoning":reasoning});
     assert!(error(&body(json!({"summary":"verbose"})), None).contains("auto, concise or detailed"));
-    // The deprecated `generate_summary` is validated as `summary` is.
-    assert!(
-        error(&body(json!({"generate_summary":"verbose"})), None)
-            .contains("auto, concise or detailed")
-    );
     let background = json!({"input":"hi","background":true,"reasoning":{"summary":"auto"}});
     let message = error(&background, None);
     assert!(!message.contains("reasoning.summary"), "{message}");

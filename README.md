@@ -35,13 +35,11 @@ Embeddings, Moderations, Audio speech (`/v1/audio/speech`) and Audio
 transcriptions and translations (`/v1/audio/transcriptions`,
 `/v1/audio/translations`). The legacy Completions API
 (`POST /v1/completions`) is not served (a 404, and batches cannot target
-it). Request members the OpenAI specification marks deprecated are accepted,
-because coding harnesses and older SDKs still send them: Chat's `max_tokens`,
-`seed` and `functions`/`function_call` (answered as `function_call`) and
-Responses' `reasoning.generate_summary` are honoured, and `user`,
-`truncation` and `prompt_cache_retention` change nothing. The full list, and
-the vLLM-style `repetition_penalty` and `chat_template_kwargs` Chat also
-takes, is in [docs/BONSAI.md](docs/BONSAI.md#supported-openai-apis);
+it). Only the current specification is served: of the members it marks
+deprecated, only Chat `max_tokens` (which opencode sends) is honoured, and
+members the server does not know are ignored. The details, and the
+`seed`, `repetition_penalty` and `chat_template_kwargs` extensions Chat also
+takes, are in [docs/BONSAI.md](docs/BONSAI.md#supported-openai-apis);
 configurations for Codex, opencode and Oh My Pi are in
 [docs/BONSAI.md](docs/BONSAI.md#coding-client-configuration).
 

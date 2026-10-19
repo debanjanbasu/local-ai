@@ -760,7 +760,6 @@ fn prepare_retaining(
             let prepared = request::prepare_generation_with(body, thinking, conversations)?;
             let protocol = Protocol::Chat {
                 include_usage: prepared.include_usage,
-                functions: prepared.functions,
             };
             Ok((prepared.stream, prepared.request, protocol))
         }
