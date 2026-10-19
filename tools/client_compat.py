@@ -548,14 +548,15 @@ def omp_models_yml(proxy_port: int, context_window: int = 65536) -> str:
 """
 
 
-def opencode_config(proxy_port: int, responses: bool, effort: str, context_window: int = 65536) -> str:
+def opencode_config(proxy_port: int, responses: bool, effort: str, context_window: int = 65536,
+                    subagents: bool = False) -> str:
     """opencode.json with this server as a custom AI SDK provider.
 
     `@ai-sdk/openai-compatible` speaks Chat Completions; `@ai-sdk/openai`
     speaks Responses (and needs some `apiKey`, though the server checks none).
     The effort is a model option (`reasoningEffort`); without one the server
-    reasons at its default. No web fetch and no sub-agents, as for the other
-    clients."""
+    reasons at its default. No web fetch, and no sub-agents (the `task` tool)
+    unless `subagents`."""
     options: dict = {"baseURL": f"http://127.0.0.1:{proxy_port}/v1"}
     if responses:
         options["apiKey"] = "local"
@@ -566,7 +567,7 @@ def opencode_config(proxy_port: int, responses: bool, effort: str, context_windo
         "model": f"local-ai/{MODEL_ID}",
         "small_model": f"local-ai/{MODEL_ID}",
         "permission": {"edit": "allow", "bash": "allow", "webfetch": "deny"},
-        "tools": {"webfetch": False, "task": False},
+        "tools": {"webfetch": False, "task": subagents},
         "provider": {"local-ai": {
             "npm": "@ai-sdk/openai" if responses else "@ai-sdk/openai-compatible",
             "name": "local-ai",
@@ -675,6 +676,13 @@ RECOVERY_PROMPT = (
     "docs/notes.md instead. Reply with only the code word written in whichever file you could read."
 )
 RECOVERY_ERROR = re.compile(r"no such file|not found|ENOENT|does not exist|cannot (?:open|read)", re.IGNORECASE)
+FANOUT_FILES = {"alpha.txt": "ALPHA = 17\n", "beta.txt": "BETA = 25\n", "gamma.txt": "GAMMA = 58\n"}
+FANOUT_PROMPT = (
+    "Use sub-agents for this task. Start three sub-agents at the same time, in parallel: one "
+    "reads alpha.txt, one reads beta.txt and one reads gamma.txt, and each reports the number "
+    "its file assigns. Do not read the files yourself. When all three have reported, reply "
+    "with only the sum of the three numbers."
+)
 CANCEL_PROMPT = (
     "Without using any tools, write a detailed 1500-word explanation of how TCP congestion "
     "control works, with numbered sections."
@@ -724,7 +732,8 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
     elif client == "opencode":
         config = home / ".config" / "opencode"
         config.mkdir(parents=True)
-        (config / "opencode.json").write_text(opencode_config(ctx.proxy_port, variant == "responses", effort))
+        (config / "opencode.json").write_text(opencode_config(
+            ctx.proxy_port, variant == "responses", effort, subagents=variant == "fanout"))
         env = client_env(
             home, TMPDIR=scratch_tmp, XDG_CONFIG_HOME=str(home / ".config"),
             XDG_DATA_HOME=str(home / ".local/share"), XDG_CACHE_HOME=str(home / ".cache"),
@@ -843,7 +852,8 @@ def client_scenario(kind: str, client: str, effort: str, compat: bool = True,
                     variant: str = "") -> Callable[[Context, Result], None]:
     def run(ctx: Context, result: Result) -> None:
         repo, base, env = prepare_client(ctx, client, result.name, effort, compat, variant)
-        files = {"fix": BUG_FILES, "read": READ_FILES, "recover": RECOVERY_FILES, "cancel": {"README.md": "scratch\n"}}[kind]
+        files = {"fix": BUG_FILES, "read": READ_FILES, "recover": RECOVERY_FILES, "fanout": FANOUT_FILES,
+                 "cancel": {"README.md": "scratch\n"}}[kind]
         write_files(repo, files)
         git_init(repo)
         log = base / "client.log"
@@ -851,7 +861,7 @@ def client_scenario(kind: str, client: str, effort: str, compat: bool = True,
         if kind == "cancel":
             cancel_run(ctx, result, client, effort, repo, env, log)
             return
-        prompt = {"fix": BUG_PROMPT, "read": READ_PROMPT, "recover": RECOVERY_PROMPT}[kind]
+        prompt = {"fix": BUG_PROMPT, "read": READ_PROMPT, "recover": RECOVERY_PROMPT, "fanout": FANOUT_PROMPT}[kind]
         code, seconds = run_client(ctx, client_command(ctx, client, prompt, effort, repo), repo, env, log)
         answers = [final_answer(ctx.recorder.since(start))]
         if kind == "read" and code == 0:
@@ -880,6 +890,21 @@ def client_scenario(kind: str, client: str, effort: str, compat: bool = True,
             ok = len(answers) == 2 and "42" in answers[0] and "7" in answers[1] and tool_results >= 1
             result.task_ok = ok
             result.detail = f"answers={answers!r}, tool results={tool_results}"
+        elif kind == "fanout":
+            # Model requests in flight at once: sub-agents fanned out against
+            # the server only if their requests overlap.
+            model = [e for e in exchanges if e.get("path", "").split("?")[0]
+                     in ("/v1/responses", "/v1/chat/completions")]
+            edges = sorted([(e["started"], 1) for e in model]
+                           + [(e["started"] + e.get("duration_seconds", 0), -1) for e in model])
+            peak = running = 0
+            for _, delta in edges:
+                running += delta
+                peak = max(peak, running)
+            result.extra["peak_concurrent_requests"] = peak
+            result.task_ok = "100" in answers[0]
+            result.detail = (f"answer={answers[0]!r}, model requests={len(model)}, "
+                             f"peak concurrent={peak}")
         else:
             # The failed read must reach the model as a tool result; a client may
             # recover in the same call (Codex: `cat missing || cat notes`).
@@ -1387,6 +1412,12 @@ def scenarios() -> list[Scenario]:
         client_scenario("fix", "codex", "none", variant="remote-compact"), "codex"))
     items.append(Scenario("codex-remote-compact-manual", "codex", "none", "compaction",
                           codex_manual_compact, "codex"))
+    # Sub-agents on (Codex's defaults; opencode's `task` tool): whether the
+    # client fans out requests that overlap at the server.
+    items.append(Scenario("codex-fanout", "codex", "none", "concurrency",
+                          client_scenario("fanout", "codex", "none", compat=False), "codex"))
+    items.append(Scenario("opencode-fanout", "opencode", "none", "concurrency",
+                          client_scenario("fanout", "opencode", "none", variant="fanout"), "opencode"))
     for kind, effort in (("fix", "none"), ("read", "none"), ("fix", "xhigh")):
         name = f"opencode-responses-{kind}" + ("-xhigh" if effort == "xhigh" else "")
         items.append(Scenario(
