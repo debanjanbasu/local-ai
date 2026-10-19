@@ -53,6 +53,9 @@ fn conversations_persist_across_reopen_in_normalized_form() {
                     json!({"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"}),
                     json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
                     json!({"type": "reasoning", "content": [{"type": "reasoning_text", "text": "hm"}]}),
+                    json!({"type": "file_search_call", "queries": ["q"], "results": [
+                        {"file_id": "file-1", "filename": "a.md", "score": 0.5, "text": "t", "attributes": {}}
+                    ]}),
                 ],
             )
             .expect("created")
@@ -81,7 +84,8 @@ fn conversations_persist_across_reopen_in_normalized_form() {
             "message",
             "function_call",
             "function_call_output",
-            "reasoning"
+            "reasoning",
+            "file_search_call"
         ]
     );
     let first = serde_json::to_value(&history.items[0]).expect("serializes");
@@ -98,6 +102,9 @@ fn conversations_persist_across_reopen_in_normalized_form() {
     );
     assert_eq!(reply["status"], "completed");
     assert_eq!(history.items[4].body["summary"], json!([]));
+    assert!(history.items[5].id.starts_with("fs_"));
+    assert_eq!(history.items[5].body["status"], "completed");
+    assert_eq!(history.items[5].body["results"][0]["file_id"], "file-1");
     assert_eq!(
         store
             .get_item(&created.id, &history.items[2].id)
@@ -291,6 +298,9 @@ fn an_invalid_item_rolls_back_the_whole_batch() {
     let unsupported = [
         json!({"role": "user", "content": [{"type": "input_image", "image_url": "https://x/y.png"}]}),
         json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+        json!({"type": "file_search_call", "queries": "q"}),
+        json!({"type": "file_search_call", "queries": ["q"], "results": [{"file_id": "f"}]}),
+        json!({"type": "file_search_call", "queries": ["q"], "status": "done"}),
         json!({"role": "robot", "content": "hi"}),
         json!({"role": "user", "content": "hi", "extra": true}),
         json!({"type": "function_call", "call_id": "", "name": "f", "arguments": "{}"}),

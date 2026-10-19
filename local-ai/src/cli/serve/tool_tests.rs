@@ -14,11 +14,15 @@ use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{
     ChatRequest, Event, EventStream, GenerationStats, Signal, Stats, ToolCall, ToolChoice,
 };
+use local_services::Store;
+use local_services::files::{CreateFile, FilePurpose};
 use local_services::tools::{Limits, Permissions, Toolbox};
+use local_services::vector_stores::CreateVectorStore;
 
 use super::super::hosted::{Hosted, Kind};
 use super::super::response::{Protocol, Reply};
 use super::super::responses::{ResponsesState, prepare_responses};
+use super::super::vector_stores::VectorStores;
 use super::{Bounds, Loop, Tools, check, start};
 
 fn stats(stop_reason: StopReason, generated: usize) -> Box<Stats> {
@@ -180,23 +184,27 @@ fn toolbox(root: &std::path::Path, write: bool, shell: bool) -> Toolbox {
 fn hosted_tools_need_server_permission() {
     let prepared = prepare(TOOLS, &json!({}));
     let kinds = prepared.echo.kinds();
-    let error = check(None, kinds).expect_err("no tools configured");
+    let none = Tools {
+        toolbox: Toolbox::new(Permissions::default(), Limits::default()).expect("toolbox"),
+        bounds: bounds(4),
+    };
+    let error = check(&none, kinds, None).expect_err("no tools granted");
     assert!(error.contains("--tools-root"), "{error}");
     let root = tempfile::tempdir().expect("root");
     let read_only = Tools {
         toolbox: toolbox(root.path(), false, false),
         bounds: bounds(4),
     };
-    let error = check(Some(&read_only), kinds).expect_err("shell and write refused");
+    let error = check(&read_only, kinds, None).expect_err("shell and write refused");
     assert!(error.contains("not permitted"), "{error}");
     let everything = Tools {
         toolbox: toolbox(root.path(), true, true),
         bounds: bounds(4),
     };
-    check(Some(&everything), kinds).expect("permitted");
+    check(&everything, kinds, None).expect("permitted");
     // A request without hosted tools needs nothing.
     let plain = prepare(r#"[{"type":"local_shell"}]"#, &json!({}));
-    check(None, plain.echo.kinds()).expect("client tools only");
+    check(&none, plain.echo.kinds(), None).expect("client tools only");
 }
 
 #[test]
@@ -285,6 +293,7 @@ fn fake_loop(
         }),
         request: prepared.request,
         toolbox,
+        vector_stores: None,
         kinds: prepared.echo.kinds().clone(),
         bounds,
         max_calls: None,
@@ -599,7 +608,7 @@ fn hosted_tools_are_opt_in_server_flags() {
     let args =
         |list: &[&str]| -> Vec<String> { list.iter().map(|arg| (*arg).to_owned()).collect() };
     let parsed = parse(&args(&[])).expect("defaults");
-    assert!(!parsed.tools.any());
+    assert!(parsed.tools.root.is_none() && parsed.tools.fetch_domains.is_empty());
     assert!(!parsed.tools.write && !parsed.tools.shell);
     let error = parse(&args(&["--tools-shell"])).expect_err("shell needs a root");
     assert!(error.contains("--tools-root"), "{error}");
@@ -621,7 +630,7 @@ fn hosted_tools_are_opt_in_server_flags() {
         "5",
     ]))
     .expect("granted");
-    assert!(parsed.tools.any() && parsed.tools.shell && !parsed.tools.write);
+    assert!(parsed.tools.root.is_some() && parsed.tools.shell && !parsed.tools.write);
     assert_eq!(parsed.tools.fetch_domains, ["example.com"]);
     assert_eq!(parsed.tools.call_timeout, Duration::from_secs(5));
 }
@@ -782,4 +791,300 @@ fn web_search_is_never_forced_or_reported_as_searched() {
         &json!({}),
     );
     assert_eq!(prepared.request.tools.len(), 0);
+}
+
+/// A real vector store service in a scratch directory holding `files`
+/// (name, text) in one store; returns the service, the store ID and the
+/// file IDs.
+fn searchable(
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, Arc<VectorStores>, String, Vec<String>) {
+    let dir = tempfile::tempdir().expect("scratch");
+    // SQLite refuses a database path through a symlink (macOS `/var`).
+    let root = dir
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .join("services");
+    let store = Store::open(&root).expect("store");
+    let ids: Vec<String> = files
+        .iter()
+        .map(|(name, text)| {
+            store
+                .create_file(
+                    &CreateFile {
+                        filename: (*name).to_owned(),
+                        purpose: FilePurpose::Assistants,
+                        expires_after: None,
+                    },
+                    text.as_bytes(),
+                )
+                .expect("file")
+                .id
+        })
+        .collect();
+    let vector_store = store
+        .create_vector_store(&CreateVectorStore {
+            file_ids: ids.clone(),
+            ..CreateVectorStore::default()
+        })
+        .expect("vector store")
+        .id;
+    let service = VectorStores::start(&store).expect("vector stores");
+    service.notify();
+    service.wait_idle();
+    (dir, service, vector_store, ids)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn file_search_runs_without_permissions_and_answers_with_citations() {
+    let (_dir, service, store_id, files) = searchable(&[
+        ("notes.md", "The launch code is 7421. Keep it secret."),
+        ("garden.md", "Tomatoes need full sun and steady watering."),
+    ]);
+    let tools = format!(r#"[{{"type":"file_search","vector_store_ids":["{store_id}"]}}]"#);
+    let prepared = prepare(&tools, &json!({}));
+    assert_eq!(prepared.request.tools[0].name, "file_search");
+    let forced = prepare(&tools, &json!({"tool_choice":{"type":"file_search"}}));
+    assert_eq!(
+        forced.request.tool_choice,
+        ToolChoice::Function("file_search".into())
+    );
+    let none = Tools {
+        toolbox: Toolbox::new(Permissions::default(), Limits::default()).expect("toolbox"),
+        bounds: bounds(4),
+    };
+    check(&none, prepared.echo.kinds(), Some(&service)).expect("no permission needed");
+    let error = check(&none, prepared.echo.kinds(), None).expect_err("no vector stores");
+    assert!(error.contains("file_search is unavailable"), "{error}");
+    let error = service
+        .check_searchable(vec![store_id.clone(), "vs_missing".into()])
+        .await
+        .expect_err("unknown store");
+    assert!(error.contains("vs_missing"), "{error}");
+    service
+        .check_searchable(vec![store_id.clone()])
+        .await
+        .expect("searchable");
+
+    let answer = "The code is 7421 【1】 and tomatoes need sun 【2】.";
+    let (mut tool_loop, first, submitted) = fake_loop(
+        &tools,
+        none.toolbox.clone(),
+        bounds(4),
+        vec![
+            vec![
+                Event::ToolCall(call(
+                    "s1",
+                    "file_search",
+                    json!({"queries":["launch code"]}),
+                )),
+                Event::Finished(stats(StopReason::Eos, 2)),
+            ],
+            vec![
+                Event::ToolCall(call("s2", "file_search", json!({"queries":["tomatoes"]}))),
+                Event::Finished(stats(StopReason::Eos, 2)),
+            ],
+            vec![
+                Event::Content(answer.into()),
+                Event::Finished(stats(StopReason::Eos, 9)),
+            ],
+        ],
+    );
+    tool_loop.vector_stores = Some(Arc::clone(&service));
+    let events = drain(start(tool_loop, first)).await;
+    let results = outputs(&events);
+    assert_eq!(results.len(), 2);
+    // Numbered across the Response: the second search's first result is 2.
+    assert!(
+        results[0]
+            .content
+            .contains("【1】 notes.md\nThe launch code is 7421."),
+        "{}",
+        results[0].content
+    );
+    assert!(
+        !results[0].content.contains("garden.md"),
+        "{}",
+        results[0].content
+    );
+    assert!(
+        results[1].content.contains("【2】 garden.md\nTomatoes"),
+        "{}",
+        results[1].content
+    );
+    let submitted = std::mem::take(&mut *submitted.lock().expect("lock"));
+    assert_eq!(submitted.len(), 2);
+    let read = submitted[0].messages.last().expect("tool message");
+    assert_eq!(read.tool_call_id.as_deref(), Some("s1"));
+    assert_eq!(read.content, results[0].content);
+
+    // Rendered: two file_search_call items, then the answer with its
+    // markers turned into citations; results only when included.
+    for include in [false, true] {
+        let extra = if include {
+            json!({"include":["file_search_call.results"]})
+        } else {
+            json!({})
+        };
+        let echo = Arc::new(prepare(&tools, &extra).echo);
+        let reply = Reply::new(Protocol::Responses(Arc::clone(&echo)), Arc::from("bonsai"));
+        let mut state = ResponsesState::new(&reply, echo, true);
+        state.start();
+        let mut response = None;
+        for event in events.clone() {
+            response = state.event(event).or(response);
+        }
+        let response = response.expect("finished");
+        super::super::responses::compaction_tests::conforms(&response, "Response");
+        let output = response["output"].as_array().expect("output");
+        let types: Vec<&str> = output
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(types, ["file_search_call", "file_search_call", "message"]);
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[0]["queries"], json!(["launch code"]));
+        assert!(output[0]["id"].as_str().expect("id").starts_with("fs_"));
+        if include {
+            assert_eq!(output[0]["results"][0]["file_id"], files[0]);
+            assert_eq!(output[0]["results"][0]["filename"], "notes.md");
+            assert!(
+                output[0]["results"][0]["text"]
+                    .as_str()
+                    .expect("text")
+                    .contains("7421")
+            );
+            assert!(output[0]["results"][0]["score"].as_f64().expect("score") > 0.0);
+        } else {
+            assert_eq!(output[0]["results"], Value::Null);
+        }
+        let part = &output[2]["content"][0];
+        let text = "The code is 7421 and tomatoes need sun.";
+        assert_eq!(part["text"], text);
+        let at = |prefix: &str| prefix.chars().count();
+        assert_eq!(
+            part["annotations"],
+            json!([
+                {"type":"file_citation","file_id":files[0],"filename":"notes.md","index":at("The code is 7421")},
+                {"type":"file_citation","file_id":files[1],"filename":"garden.md","index":at("The code is 7421 and tomatoes need sun")}
+            ])
+        );
+        let events = state.take_events();
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .filter(|kind| kind.contains("file_search") || kind.contains("annotation"))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "response.file_search_call.in_progress",
+                "response.file_search_call.searching",
+                "response.file_search_call.completed",
+                "response.file_search_call.in_progress",
+                "response.file_search_call.searching",
+                "response.file_search_call.completed",
+                "response.output_text.annotation.added",
+                "response.output_text.annotation.added",
+            ]
+        );
+        let added = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.added")
+            .expect("added");
+        assert_eq!(added["item"]["status"], "in_progress");
+        let deltas: String = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_text.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect();
+        assert_eq!(deltas, text);
+
+        // Replayed, each search is the call and the passages the model
+        // read, without markers (they are not this Response's to cite), or
+        // a note that its results are not part of the conversation.
+        let mut input = vec![json!({"role":"user","content":"what is the code?"})];
+        input.extend(output.iter().cloned());
+        let body =
+            json!({"input":input,"tools":serde_json::from_str::<Value>(&tools).expect("tools")});
+        let next = prepare_responses(body.to_string().as_bytes(), true).expect("replayed");
+        let messages = &next.request.messages;
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool", "assistant"]);
+        assert_eq!(messages[1].tool_calls.len(), 2);
+        assert_eq!(messages[1].tool_calls[0].name, "file_search");
+        assert_eq!(
+            messages[1].tool_calls[0].arguments,
+            json!({"queries":["launch code"]})
+        );
+        assert_eq!(
+            messages[2].tool_call_id.as_deref(),
+            output[0]["id"].as_str()
+        );
+        if include {
+            assert!(
+                messages[2]
+                    .content
+                    .contains("notes.md\nThe launch code is 7421.")
+            );
+            assert!(!messages[2].content.contains('【'));
+        } else {
+            assert!(messages[2].content.contains("not part of the conversation"));
+        }
+        assert_eq!(messages[4].content, text);
+    }
+}
+
+#[tokio::test]
+async fn a_failed_search_is_reported_to_the_model_and_as_a_failed_item() {
+    let (dir, service, store_id, _) = searchable(&[("a.md", "alpha")]);
+    let tools = format!(r#"[{{"type":"file_search","vector_store_ids":["{store_id}"]}}]"#);
+    let (mut tool_loop, first, _) = fake_loop(
+        &tools,
+        Toolbox::new(Permissions::default(), Limits::default()).expect("toolbox"),
+        bounds(4),
+        vec![
+            vec![
+                Event::ToolCall(call("s1", "file_search", json!({"queries":["alpha"]}))),
+                Event::Finished(stats(StopReason::Eos, 2)),
+            ],
+            vec![
+                Event::Content("gone".into()),
+                Event::Finished(stats(StopReason::Eos, 1)),
+            ],
+        ],
+    );
+    tool_loop.vector_stores = Some(Arc::clone(&service));
+    // Deleted after the request was accepted: the search fails, the
+    // Response does not.
+    let store = Store::open(
+        dir.path()
+            .canonicalize()
+            .expect("canonical")
+            .join("services"),
+    )
+    .expect("store");
+    store.delete_vector_store(&store_id).expect("deleted");
+    let events = drain(start(tool_loop, first)).await;
+    let results = outputs(&events);
+    assert!(
+        results[0].content.starts_with("error: "),
+        "{}",
+        results[0].content
+    );
+    let echo = Arc::new(prepare(&tools, &json!({})).echo);
+    let reply = Reply::new(Protocol::Responses(Arc::clone(&echo)), Arc::from("bonsai"));
+    let mut state = ResponsesState::new(&reply, echo, false);
+    let mut response = None;
+    for event in events {
+        response = state.event(event).or(response);
+    }
+    let response = response.expect("finished");
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["output"][0]["status"], "failed");
 }

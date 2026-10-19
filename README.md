@@ -86,10 +86,12 @@ Strict tools need closed schemas the engine can enforce exactly; anything else
 is refused with 400 rather than partly enforced.
 
 The Responses API also round-trips client-executed `custom` (text or regex
-grammar), `local_shell` and `apply_patch` tools, and can run hosted tools
-itself (sandboxed `shell`, `local_fs_*` file access, allowlisted
-`local_web_fetch`) in a server-side loop, but only when `serve` is started
-with explicit `--tools-*` permissions; by default none are available. The
+grammar), `local_shell` and `apply_patch` tools, and runs tools itself in a
+server-side loop: `file_search` over the server's vector stores (BM25 or
+EmbeddingGemma 2 ranking, `file_search_call` items and `file_citation`
+annotations) always, and sandboxed `shell`, `local_fs_*` file access and
+allowlisted `local_web_fetch` only when `serve` is started with explicit
+`--tools-*` permissions; by default none of those is available. The
 permission model, bounds and known gaps are in [docs/TOOLS.md](docs/TOOLS.md).
 
 `POST /v1/decisions` is served whenever

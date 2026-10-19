@@ -270,23 +270,50 @@ impl VectorIndex {
         &self.store
     }
 
+    /// Whether an embedding model is installed (see [`Self::set_embedder`]).
+    #[must_use]
+    pub fn embeds(&self) -> bool {
+        self.embedder().is_some()
+    }
+
     /// Rank the completed files' chunks of store `store_id` against the
     /// request (see the parent module docs) and mark the store active.
-    ///
-    /// This is the native search a `file_search` tool calls.
     pub fn search(&self, store_id: &str, request: &SearchRequest) -> Result<SearchResults> {
+        self.search_stores(&[store_id], request, None)
+    }
+
+    /// [`Self::search`] over the chunks of several stores at once, ranked
+    /// together (each query is embedded once; BM25 statistics are already
+    /// server-wide, so scores compare across stores), marking every store
+    /// active. A repeated ID counts once. `ranking` overrides what the
+    /// request's `ranker` selects (the `file_search` tool's `hybrid_search`
+    /// weights are a [`Ranking::Fused`]).
+    ///
+    /// This is the native search the Responses `file_search` tool calls.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::search`], for any of the stores; [`Error::InvalidArgument`]
+    /// without a store; [`Error::Conflict`] for a dense or fused `ranking`
+    /// without an embedding model.
+    pub fn search_stores(
+        &self,
+        store_ids: &[&str],
+        request: &SearchRequest,
+        ranking: Option<Ranking>,
+    ) -> Result<SearchResults> {
         let plan = SearchPlan::new(request)?;
-        let ranking = match plan.ranker {
-            Ranker::Auto if self.embedder().is_some() => Ranking::AUTO,
-            _ => Ranking::Lexical,
+        let (ranking, auto) = match ranking {
+            Some(ranking) => (ranking, false),
+            None => (
+                match plan.ranker {
+                    Ranker::Auto if self.embedder().is_some() => Ranking::AUTO,
+                    _ => Ranking::Lexical,
+                },
+                plan.ranker == Ranker::Auto,
+            ),
         };
-        self.search_planned(
-            store_id,
-            request,
-            &plan,
-            ranking,
-            plan.ranker == Ranker::Auto,
-        )
+        self.search_planned(store_ids, request, &plan, ranking, auto)
     }
 
     /// [`Self::search`] with an explicit ranking, whatever the request's
@@ -305,20 +332,29 @@ impl VectorIndex {
         ranking: Ranking,
     ) -> Result<SearchResults> {
         let plan = SearchPlan::new(request)?;
-        self.search_planned(store_id, request, &plan, ranking, false)
+        self.search_planned(&[store_id], request, &plan, ranking, false)
     }
 
-    /// Search with `ranking`; with `auto`, a dense ranking over admitted
-    /// files of which some have no vectors yet becomes [`Ranking::HYBRID`],
-    /// which finds those through BM25.
+    /// Search the stores `store_ids` with `ranking`; with `auto`, a dense
+    /// ranking over admitted files of which some have no vectors yet becomes
+    /// [`Ranking::HYBRID`], which finds those through BM25.
     fn search_planned(
         &self,
-        store_id: &str,
+        store_ids: &[&str],
         request: &SearchRequest,
         plan: &SearchPlan,
         mut ranking: Ranking,
         auto: bool,
     ) -> Result<SearchResults> {
+        let mut stores: Vec<&str> = Vec::with_capacity(store_ids.len());
+        for id in store_ids {
+            if !stores.contains(id) {
+                stores.push(id);
+            }
+        }
+        if stores.is_empty() {
+            return Err(invalid("at least one vector store is required"));
+        }
         // Queries are embedded first, outside the database snapshot.
         let dense = match ranking {
             Ranking::Lexical => None,
@@ -333,24 +369,31 @@ impl VectorIndex {
             }
         };
         let mut connection = self.store.connection()?;
-        // One database snapshot for the store, its searchable files and
+        // One database snapshot for the stores, their searchable files and
         // their text.
         let snapshot = connection.transaction()?;
-        let target = writable_store(&snapshot, store_id)?;
         let now = crate::now()?;
-        if target
-            .last_active_at
-            .is_none_or(|at| now.saturating_sub(at) >= ACTIVITY_GRANULARITY_SECONDS)
-        {
-            // A write (and its fsync) at most once per granularity period.
-            let writer = self.store.connection()?;
-            touch(&writer, store_id)?;
+        let mut files = Vec::new();
+        let mut embedded = HashSet::new();
+        for store_id in stores {
+            let target = writable_store(&snapshot, store_id)?;
+            if target
+                .last_active_at
+                .is_none_or(|at| now.saturating_sub(at) >= ACTIVITY_GRANULARITY_SECONDS)
+            {
+                // A write (and its fsync) at most once per granularity period.
+                let writer = self.store.connection()?;
+                touch(&writer, store_id)?;
+            }
+            files.extend(searchable_files(
+                &snapshot,
+                store_id,
+                request.filters.as_ref(),
+            )?);
+            if let Some((space, _)) = &dense {
+                embedded.extend(embedded_files(&snapshot, store_id, space)?);
+            }
         }
-        let files = searchable_files(&snapshot, store_id, request.filters.as_ref())?;
-        let embedded = match &dense {
-            Some((space, _)) => embedded_files(&snapshot, store_id, space)?,
-            None => HashSet::new(),
-        };
         if auto && ranking == Ranking::Dense && files.iter().any(|file| !embedded.contains(file)) {
             ranking = Ranking::HYBRID;
         }
@@ -925,6 +968,18 @@ impl VectorIndex {
 /// A chunk's identity in the index and the database: its attachment and
 /// its ordinal in the attachment's file.
 type ChunkKey = (String, u64);
+
+impl SearchRequest {
+    /// Check the request as a search would (queries, `max_num_results`,
+    /// `ranking_options`, filters) without searching.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] naming the first problem.
+    pub fn validate(&self) -> Result<()> {
+        SearchPlan::new(self).map(drop)
+    }
+}
 
 /// A validated search request.
 struct SearchPlan {

@@ -705,6 +705,7 @@ async fn the_hosted_tool_marker_is_recorded_once_before_any_call_runs() {
             }),
             request: prepared.request,
             toolbox: toolbox.clone(),
+            vector_stores: None,
             kinds: prepared.echo.kinds().clone(),
             bounds: Bounds {
                 max_iterations: 2,

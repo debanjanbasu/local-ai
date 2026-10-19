@@ -14,13 +14,16 @@
 //! | `apply_patch`                         | client      | `apply_patch_call`                         |
 //! | `shell` (local environment)           | this server | `shell_call` + `shell_call_output`         |
 //! | `function` named `local_fs_*`/`local_web_fetch`, no parameters | this server | `function_call` + `function_call_output` |
+//! | `file_search` (this server's vector stores)    | this server | `file_search_call` (see [`super::file_search`]) |
 //!
 //! The spec has no hosted filesystem or fetch tool (`file_search` is vector
 //! store retrieval and `web_search` is search, neither of which these are),
 //! so those are reported as what they are: a function call and the output
-//! the server produced for it. Hosted tools are only offered when the request
-//! asks for them *and* the server was started with the matching permission;
-//! otherwise the request is refused before generation.
+//! the server produced for it. Hosted tools that act on the machine (the
+//! filesystem, the shell, fetch) are only offered when the request asks for
+//! them *and* the server was started with the matching permission; otherwise
+//! the request is refused before generation. `file_search` needs no
+//! permission: it only reads this server's own vector stores.
 //!
 //! A `namespace` groups client function and custom tools; each member reaches
 //! the model as its own native function named `NAMESPACE.NAME`, and its calls
@@ -42,6 +45,8 @@ use serde_json::{Map, Value, json};
 use local_engine::{ToolCall, ToolChoice, ToolDefinition, ToolOutput};
 use local_services::tools::shell::{CommandRun, Outcome};
 use local_services::tools::{Capability, Output, Request, SearchMode, ToolError};
+
+use super::file_search;
 
 /// Exit status reported for a shell call that was refused or failed before
 /// any command ran (the shell's own "cannot execute").
@@ -72,6 +77,7 @@ pub(super) enum Hosted {
     Edit,
     Fetch,
     Shell,
+    FileSearch,
 }
 
 impl Hosted {
@@ -91,13 +97,14 @@ impl Hosted {
             .map(|(_, hosted)| *hosted)
     }
 
-    /// The permission this operation needs.
-    pub(super) const fn capability(self) -> Capability {
+    /// The permission this operation needs, if any.
+    pub(super) const fn capability(self) -> Option<Capability> {
         match self {
-            Self::List | Self::Read | Self::Search => Capability::Read,
-            Self::Write | Self::Edit => Capability::Write,
-            Self::Fetch => Capability::Fetch,
-            Self::Shell => Capability::Shell,
+            Self::List | Self::Read | Self::Search => Some(Capability::Read),
+            Self::Write | Self::Edit => Some(Capability::Write),
+            Self::Fetch => Some(Capability::Fetch),
+            Self::Shell => Some(Capability::Shell),
+            Self::FileSearch => None,
         }
     }
 
@@ -141,6 +148,7 @@ impl Hosted {
                 "Fetch one http(s) URL on the server's allowlist and return its status and text.",
                 closed(json!({"url":{"type":"string"}}), &["url"]),
             ),
+            Self::FileSearch => unreachable!("file_search is declared by file_search::Config"),
             Self::Shell => (
                 "Run shell commands, in order, in the workspace directory under a sandbox with no \
                  network access. Each command's output and exit status is returned.",
@@ -174,19 +182,21 @@ fn strict(name: &str, description: &str, parameters: Value) -> ToolDefinition {
 /// the namespace and own name of every namespaced tool.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Kinds {
-    kinds: HashMap<String, Kind>,
+    by_name: HashMap<String, Kind>,
     namespaced: HashMap<String, (String, String)>,
+    /// The declared `file_search` tool.
+    file_search: Option<file_search::Config>,
 }
 
 impl Kinds {
     pub(super) fn insert(&mut self, name: &str, kind: Kind) {
         if kind != Kind::Function {
-            self.kinds.insert(name.to_owned(), kind);
+            self.by_name.insert(name.to_owned(), kind);
         }
     }
 
     pub(super) fn kind(&self, name: &str) -> Kind {
-        self.kinds.get(name).copied().unwrap_or(Kind::Function)
+        self.by_name.get(name).copied().unwrap_or(Kind::Function)
     }
 
     /// Report a call item of a namespaced tool with the spec's `namespace`
@@ -229,7 +239,7 @@ impl Kinds {
     /// `function_call`/`function_call_output`.
     pub(super) fn reports_other_items(&self) -> bool {
         !self.namespaced.is_empty()
-            || self.kinds.values().any(|kind| {
+            || self.by_name.values().any(|kind| {
                 matches!(
                     kind,
                     Kind::Custom
@@ -240,9 +250,14 @@ impl Kinds {
             })
     }
 
+    /// The declared `file_search` tool, if any.
+    pub(super) const fn file_search(&self) -> Option<&file_search::Config> {
+        self.file_search.as_ref()
+    }
+
     /// Every hosted operation declared.
     pub(super) fn all_hosted(&self) -> impl Iterator<Item = Hosted> + '_ {
-        self.kinds.values().filter_map(|kind| match kind {
+        self.by_name.values().filter_map(|kind| match kind {
             Kind::Hosted(hosted) => Some(*hosted),
             _ => None,
         })
@@ -306,6 +321,12 @@ pub(super) fn declare(
     let kind = tool.get("type").and_then(Value::as_str).unwrap_or_default();
     match (kind, object) {
         ("namespace", Some(object)) => namespace(object, function, tools, kinds),
+        (file_search::NAME, Some(object)) => {
+            let (config, definition, echo) = file_search::Config::declare(object)?;
+            add(tools, kinds, definition, Kind::Hosted(Hosted::FileSearch))?;
+            kinds.file_search = Some(config);
+            Ok(echo)
+        }
         // Accepted, never offered to the model: see the module documentation.
         ("web_search" | "web_search_2025_08_26", Some(object)) => {
             only(
@@ -630,7 +651,7 @@ pub(super) fn tool_choice(choice: Option<&Value>) -> Option<crate::Result<(ToolC
                 )));
             }
         },
-        kind @ ("shell" | "apply_patch") if object.len() == 1 => kind.to_owned(),
+        kind @ ("shell" | "apply_patch" | "file_search") if object.len() == 1 => kind.to_owned(),
         _ => return None,
     };
     Some(Ok((
@@ -648,6 +669,7 @@ pub(super) struct Rendered {
 /// The ID prefix of a call item of `kind`.
 pub(super) const fn call_prefix(kind: Kind) -> &'static str {
     match kind {
+        Kind::Hosted(Hosted::FileSearch) => "fs",
         Kind::Function | Kind::Hosted(_) => "fc",
         Kind::Custom => "ctc",
         Kind::LocalShell => "lsh",
@@ -679,7 +701,8 @@ pub(super) fn call_item(kind: Kind, id: &str, index: usize, call: &ToolCall) -> 
             | Hosted::Search
             | Hosted::Write
             | Hosted::Edit
-            | Hosted::Fetch,
+            | Hosted::Fetch
+            | Hosted::FileSearch,
         ) => return None,
         Kind::Hosted(Hosted::Shell) => {
             let commands: Vec<String> = arguments
@@ -808,7 +831,15 @@ pub(super) fn output_item(kind: Kind, id: &str, index: usize, output: &ToolOutpu
 /// output.
 pub(super) enum Input {
     Call(ToolCall),
-    Output { call_id: String, content: String },
+    Output {
+        call_id: String,
+        content: String,
+    },
+    /// A call together with what it returned (a `file_search_call`).
+    Answered {
+        call: ToolCall,
+        content: String,
+    },
 }
 
 /// Convert an input item of type `kind`, or `None` when it is not one of
@@ -833,6 +864,9 @@ pub(super) fn input_item(kind: &str, item: &Value) -> Option<crate::Result<Input
     };
     let action = item.get("action").cloned().unwrap_or(Value::Null);
     Some(match kind {
+        "file_search_call" => {
+            file_search::input(item).map(|(call, content)| Input::Answered { call, content })
+        }
         "shell_call" => {
             let mut arguments =
                 json!({"commands":action.get("commands").cloned().unwrap_or_else(|| json!([]))});
@@ -982,6 +1016,7 @@ pub(super) fn request(hosted: Hosted, arguments: &Value) -> Result<Request, Stri
         Hosted::Fetch => Request::Fetch {
             url: required("url")?,
         },
+        Hosted::FileSearch => return Err("file_search does not run in the toolbox".to_owned()),
         Hosted::Shell => {
             let commands = arguments
                 .get("commands")

@@ -3,7 +3,8 @@
 //! A conversation is an ordered, append-mostly list of items. Items are
 //! validated and normalized on the way in, against exactly the forms local
 //! generation implements (text messages, function calls and outputs,
-//! reasoning, and the compaction items of [`crate::compaction`]); anything
+//! reasoning, `file_search_call` items, and the compaction items of
+//! [`crate::compaction`]); anything
 //! else, such as images or files, is refused rather than stored and silently
 //! ignored later. A prompt built from a conversation starts at its latest
 //! compaction item, so appending one compacts the conversation durably while
@@ -78,7 +79,7 @@ pub struct Item {
 
 impl Item {
     /// The item's `type`: `message`, `function_call`, `function_call_output`,
-    /// `reasoning` or `compaction`.
+    /// `file_search_call`, `reasoning` or `compaction`.
     #[must_use]
     pub fn kind(&self) -> &str {
         self.body
@@ -660,6 +661,10 @@ fn normalize_item(item: Value) -> Result<Item> {
             normalize_reasoning(&mut body, id.is_some())?;
             "rs_"
         }
+        "file_search_call" => {
+            normalize_file_search(&mut body)?;
+            "fs_"
+        }
         crate::compaction::COMPACTION => {
             // Sealed for its item id, so it cannot be stored under a new one.
             only_keys(&body, &["encrypted_content", "created_by"])?;
@@ -678,7 +683,7 @@ fn normalize_item(item: Value) -> Result<Item> {
         other => {
             return Err(invalid(format!(
                 "item type {other:?} is not supported; only message, function_call, \
-                 function_call_output, reasoning and compaction items are"
+                 function_call_output, file_search_call, reasoning and compaction items are"
             )));
         }
     };
@@ -732,6 +737,58 @@ fn normalize_message(body: &mut Map<String, Value>) -> Result<()> {
         _ => return Err(invalid("message content must be a string or an array")),
     }
     default_status(body)
+}
+
+/// A `file_search_call`: its `queries` (strings), a `status` of the spec's
+/// (`completed` by default), and `results`, absent, `null` or an array of
+/// objects with a string `file_id`, `filename` and `text`, a numeric `score`
+/// and, optionally, `attributes` (an object or `null`).
+fn normalize_file_search(body: &mut Map<String, Value>) -> Result<()> {
+    only_keys(body, &["queries", "status", "results"])?;
+    match body.get("queries") {
+        Some(Value::Array(queries)) if queries.iter().all(Value::is_string) => {}
+        _ => return Err(invalid("queries must be an array of strings")),
+    }
+    match body.get("results") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(results)) => {
+            for result in results {
+                let Value::Object(result) = result else {
+                    return Err(invalid("a file search result must be an object"));
+                };
+                only_keys(
+                    result,
+                    &["file_id", "filename", "score", "text", "attributes"],
+                )?;
+                for key in ["file_id", "filename", "text"] {
+                    required_string(result, key, true)?;
+                }
+                if !result.get("score").is_some_and(Value::is_number) {
+                    return Err(invalid("a file search result score must be a number"));
+                }
+                if result
+                    .get("attributes")
+                    .is_some_and(|attributes| !attributes.is_object() && !attributes.is_null())
+                {
+                    return Err(invalid("file search result attributes must be an object"));
+                }
+            }
+        }
+        Some(_) => return Err(invalid("results must be an array or null")),
+    }
+    let status = body
+        .entry("status")
+        .or_insert_with(|| Value::String("completed".to_owned()));
+    if matches!(
+        status.as_str(),
+        Some("in_progress" | "searching" | "completed" | "incomplete" | "failed")
+    ) {
+        Ok(())
+    } else {
+        Err(invalid(
+            "status must be in_progress, searching, completed, incomplete or failed",
+        ))
+    }
 }
 
 fn normalize_reasoning(body: &mut Map<String, Value>, has_id: bool) -> Result<()> {

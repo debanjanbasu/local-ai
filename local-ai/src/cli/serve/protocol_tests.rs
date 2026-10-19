@@ -828,7 +828,7 @@ fn responses_reject_what_they_cannot_honour() {
         ),
         (json!({"input":"hi","background":true}), "background"),
         (
-            json!({"input":"hi","tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]}),
+            json!({"input":"hi","tools":[{"type":"code_interpreter","container":{"type":"auto"}}]}),
             "tool type",
         ),
         (

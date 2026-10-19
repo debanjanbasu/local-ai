@@ -50,13 +50,6 @@ impl Default for ToolArgs {
     }
 }
 
-impl ToolArgs {
-    /// Whether any hosted capability was granted.
-    pub(super) const fn any(&self) -> bool {
-        self.root.is_some() || !self.fetch_domains.is_empty()
-    }
-}
-
 /// Default seconds a client may stop taking frames before its generation is
 /// dropped.
 ///
@@ -119,7 +112,9 @@ pub(super) fn usage() {
          calibration (default: models/decisions-v2 when installed)"
     );
     eprintln!();
-    eprintln!("  Hosted tools (Responses API; default: none; see docs/TOOLS.md):");
+    eprintln!(
+        "  Hosted tools (Responses API; default: none; file_search needs no flag; see docs/TOOLS.md):"
+    );
     eprintln!(
         "  --tools-root DIR   Let requests list, read and search files under DIR \
          (local_fs_list/read/search)"
