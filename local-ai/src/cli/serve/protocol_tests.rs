@@ -118,40 +118,145 @@ fn chat_session_is_prompt_cache_key_alone() {
     );
 }
 
-/// Every member the specification deprecates (and this server's own
-/// superseded `session_id`) is refused by name with its replacement, while
-/// `null`, which sets nothing, is accepted.
+/// Members the specification deprecates are honoured where they mean
+/// something here, and accepted where they change nothing.
 #[test]
-fn chat_refuses_deprecated_parameters() {
-    for (member, value, instead) in [
-        ("max_tokens", json!(7), "max_completion_tokens"),
-        ("seed", json!(3), "fixed seed"),
-        ("user", json!("u"), "prompt_cache_key"),
-        ("functions", json!([{"name":"f"}]), "use tools"),
-        ("function_call", json!("auto"), "use tool_choice"),
-        ("prompt_cache_retention", json!("24h"), "automatic"),
-        ("session_id", json!("s"), "prompt_cache_key"),
-    ] {
+fn chat_honours_deprecated_parameters() {
+    let with = |extra: Value| {
         let mut body = json!({"messages":[user()]});
-        body[member] = value;
-        let error = chat_error(&body);
-        assert!(
-            error.contains(&format!("{member} is deprecated")) && error.contains(instead),
-            "{member}: {error}"
-        );
-        body[member] = Value::Null;
-        assert!(
-            chat_request(&body, true).is_ok(),
-            "{member}: null is accepted"
-        );
+        body.as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        chat_request(&body, true)
+    };
+    assert_eq!(with(json!({"max_tokens":7})).expect("valid").max_tokens, 7);
+    assert_eq!(
+        with(json!({"max_tokens":7,"max_completion_tokens":9}))
+            .expect("valid")
+            .max_tokens,
+        9,
+        "the current member wins"
+    );
+    assert_eq!(with(json!({"seed":3})).expect("valid").sampling.0.seed, 3);
+    assert_eq!(
+        with(json!({"seed":-1})).expect("valid").sampling.0.seed,
+        u64::MAX,
+        "a negative seed keeps its 64 bits"
+    );
+    assert!(chat_error(&json!({"messages":[user()],"seed":1.5})).contains("integer"));
+    assert_eq!(
+        with(json!({"session_id":"s"}))
+            .expect("valid")
+            .session
+            .as_deref(),
+        Some("s")
+    );
+    assert_eq!(
+        with(json!({"session_id":"s","prompt_cache_key":"k"}))
+            .expect("valid")
+            .session
+            .as_deref(),
+        Some("k")
+    );
+    for ignored in [
+        json!({"user":"u"}),
+        json!({"prompt_cache_retention":"24h"}),
+        json!({"functions":null,"function_call":null}),
+    ] {
+        assert!(with(ignored.clone()).is_ok(), "{ignored}");
     }
-    let error = chat_error(&json!({"messages":[
-        user(),
-        {"role":"assistant","content":null,"function_call":{"name":"f","arguments":"{}"}}
-    ]}));
+}
+
+/// `functions` and `function_call` are function tools and a tool choice,
+/// with one call at most, and a legacy history (an assistant
+/// `function_call` answered by a `function` message) is a call and its
+/// result.
+#[test]
+fn chat_maps_deprecated_functions_onto_tools() {
+    let request = chat_request(
+        &json!({
+            "messages":[
+                user(),
+                {"role":"assistant","content":null,"function_call":{"name":"weather","arguments":"{\"city\":\"Oslo\"}"}},
+                {"role":"function","name":"weather","content":"12C"},
+                {"role":"user","content":"and tomorrow?"}
+            ],
+            "functions":[{"name":"weather","parameters":{"type":"object"}}],
+            "function_call":{"name":"weather"}
+        }),
+        true,
+    )
+    .expect("valid");
+    assert_eq!(request.tools[0].name, "weather");
+    assert_eq!(request.tool_choice, ToolChoice::Function("weather".into()));
+    assert!(!request.parallel_tool_calls);
+    let assistant = &request.messages[1];
+    assert_eq!(assistant.tool_calls[0].name, "weather");
+    assert_eq!(assistant.tool_calls[0].arguments, json!({"city":"Oslo"}));
+    let result = &request.messages[2];
+    assert_eq!(result.role, "tool");
+    assert_eq!(
+        result.tool_call_id.as_deref(),
+        Some(assistant.tool_calls[0].id.as_str())
+    );
+    assert_eq!(result.content, "12C");
+    for (choice, expected) in [
+        (json!("none"), ToolChoice::None),
+        (json!("auto"), ToolChoice::Auto),
+    ] {
+        let request = chat_request(
+            &json!({"messages":[user()],"functions":[{"name":"f"}],"function_call":choice}),
+            true,
+        )
+        .expect("valid");
+        assert_eq!(request.tool_choice, expected);
+    }
+    for (body, needle) in [
+        (
+            json!({"messages":[user()],"functions":[{"name":"f"}],"tools":[{"type":"function","function":{"name":"g"}}]}),
+            "not both",
+        ),
+        (
+            json!({"messages":[user()],"function_call":"auto"}),
+            "tool_choice",
+        ),
+        (
+            json!({"messages":[user(),{"role":"function","name":"f","content":"x"}]}),
+            "answers no assistant function_call",
+        ),
+        (
+            json!({"messages":[user()],"functions":[{"name":"f"}],"function_call":{"name":"g"}}),
+            "not declared",
+        ),
+    ] {
+        let error = chat_error(&body);
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+}
+
+/// vLLM- and llama.cpp-style members harnesses send to local servers.
+#[test]
+fn chat_accepts_local_server_extensions() {
+    let request = chat_request(
+        &json!({"messages":[user()],"frequency_penalty":0.5,"repetition_penalty":1.3,
+                "chat_template_kwargs":{"enable_thinking":false}}),
+        true,
+    )
+    .expect("valid");
+    assert!((request.sampling.0.repetition_penalty - 1.3).abs() < f32::EPSILON);
     assert!(
-        error.contains("messages[].function_call is deprecated") && error.contains("tool_calls"),
-        "{error}"
+        !request.thinking,
+        "enable_thinking false turns reasoning off"
+    );
+    let request = chat_request(
+        &json!({"messages":[user()],"reasoning_effort":"low",
+                "chat_template_kwargs":{"enable_thinking":true}}),
+        true,
+    )
+    .expect("valid");
+    assert_eq!(
+        request.thinking.then_some(request.effort),
+        Some(ReasoningEffort::Low)
     );
 }
 
@@ -502,7 +607,10 @@ fn chat_history_errors_are_reported_before_generation() {
 
 fn chat_reply(include_usage: bool) -> Reply {
     Reply {
-        protocol: Protocol::Chat { include_usage },
+        protocol: Protocol::Chat {
+            include_usage,
+            functions: false,
+        },
         id: "chatcmpl-1".into(),
         created: 5,
         model: "m".into(),
@@ -688,6 +796,7 @@ fn chat_stream_error_is_one_terminal_server_error_frame() {
     let mut failed = Frames::new(Reply::new(
         Protocol::Chat {
             include_usage: false,
+            functions: false,
         },
         "m".into(),
     ));
@@ -750,6 +859,66 @@ fn chat_body_lists_calls_with_null_content_and_tool_calls_finish() {
     );
     assert_eq!(document["id"], "chatcmpl-1");
     assert_eq!(document["created"], 5);
+}
+
+/// A request that declared deprecated `functions` reads its call where such
+/// a client looks: `function_call` in the stream and the message, finishing
+/// with `function_call`.
+#[test]
+fn chat_answers_deprecated_functions_in_their_own_shape() {
+    let reply = || Reply {
+        protocol: Protocol::Chat {
+            include_usage: false,
+            functions: true,
+        },
+        id: "chatcmpl-1".into(),
+        created: 5,
+        model: "m".into(),
+    };
+    let mut frames = Frames::new(reply());
+    let mut out = Vec::new();
+    for event in [
+        delta("c1", "weather", "{\"city\":\"Os", Some(("city", "Os"))),
+        delta("c1", "weather", "lo", Some(("city", "lo"))),
+        Event::ToolCall(call("c1", "weather", json!({"city":"Oslo"}))),
+        Event::Finished(stats(StopReason::Eos)),
+    ] {
+        out.extend(frames.event(event).0);
+    }
+    let deltas: Vec<Value> = out
+        .iter()
+        .map(|frame| parse_data(frame)["choices"][0].clone())
+        .collect();
+    assert_eq!(
+        deltas[0]["delta"],
+        json!({"role":"assistant","function_call":{"name":"weather","arguments":"{\"city\":\"Os"}})
+    );
+    assert_eq!(
+        deltas[1]["delta"],
+        json!({"function_call":{"arguments":"lo"}})
+    );
+    assert_eq!(
+        deltas[2]["delta"],
+        json!({"function_call":{"arguments":"\"}"}})
+    );
+    assert_eq!(deltas[3]["finish_reason"], "function_call");
+    let signals = vec![
+        Signal::Event(Event::ToolCall(call(
+            "c1",
+            "weather",
+            json!({"city":"Oslo"}),
+        ))),
+        Signal::Event(Event::Finished(stats(StopReason::Eos))),
+    ];
+    let document: Value =
+        serde_json::from_slice(&body_bytes(reply(), signals)).expect("valid JSON");
+    let choice = &document["choices"][0];
+    assert_eq!(choice["finish_reason"], "function_call");
+    assert_eq!(
+        choice["message"]["function_call"],
+        json!({"name":"weather","arguments":"{\"city\":\"Oslo\"}"})
+    );
+    assert!(choice["message"].get("tool_calls").is_none(), "{choice}");
 }
 
 #[test]
@@ -844,32 +1013,48 @@ fn responses_string_input_is_one_user_message_and_instructions_lead() {
     );
 }
 
-/// The members the specification deprecates on `POST /v1/responses` (and
-/// the superseded `session_id`) are refused by name with their replacement.
+/// The members the specification deprecates on `POST /v1/responses` are
+/// accepted: `session_id` is the cache key, `generate_summary` asks for a
+/// summary, and `user`, `prompt_cache_retention` and either `truncation`
+/// change nothing (the engine never drops input).
 #[test]
-fn responses_refuse_deprecated_parameters() {
-    for (member, value, instead) in [
-        ("user", json!("u"), "prompt_cache_key"),
-        ("truncation", json!("disabled"), "never drops input"),
-        ("truncation", json!("auto"), "never drops input"),
-        ("prompt_cache_retention", json!("24h"), "automatic"),
-        ("session_id", json!("s"), "prompt_cache_key"),
+fn responses_accept_deprecated_parameters() {
+    let prepared =
+        |body: Value| prepare_responses(body.to_string().as_bytes(), true).expect("valid request");
+    for extra in [
+        json!({"user":"u"}),
+        json!({"prompt_cache_retention":"24h"}),
+        json!({"truncation":"disabled"}),
+        json!({"truncation":"auto"}),
     ] {
         let mut body = json!({"input":"hi"});
-        body[member] = value;
-        let error = responses_error(&body);
-        assert!(
-            error.contains(&format!("{member} is deprecated")) && error.contains(instead),
-            "{member}: {error}"
-        );
+        body.as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        let _ = prepared(body);
     }
-    let error = responses_error(&json!({"input":"hi","reasoning":{"generate_summary":"auto"}}));
-    assert!(
-        error.contains("reasoning.generate_summary is deprecated")
-            && error.contains("reasoning.summary"),
-        "{error}"
+    assert!(responses_error(&json!({"input":"hi","truncation":"middle"})).contains("truncation"));
+    assert_eq!(
+        prepared(json!({"input":"hi","session_id":"s"}))
+            .request
+            .session
+            .as_deref(),
+        Some("s")
     );
-    let mut frames = Frames::new(responses_reply(&json!({"input":"hi"})));
+    assert!(
+        prepared(json!({"input":"hi","reasoning":{"generate_summary":"concise"}}))
+            .echo
+            .summarizes()
+    );
+    let penalties =
+        prepared(json!({"input":"hi","presence_penalty":0.5,"frequency_penalty":0.25,"seed":9}))
+            .request
+            .sampling
+            .0;
+    assert!((penalties.presence_penalty - 0.5).abs() < f32::EPSILON);
+    assert!((penalties.repetition_penalty - 1.25).abs() < f32::EPSILON);
+    assert_eq!(penalties.seed, 9);
+    let mut frames = Frames::new(responses_reply(&json!({"input":"hi","user":"u"})));
     let _ = frames.start();
     let (out, _) = frames.event(Event::Finished(stats(StopReason::Eos)));
     let response = &sse_events(&out).last().expect("terminal").clone()["response"];
@@ -1381,7 +1566,8 @@ fn route_preparation_maps_each_api_to_its_protocol() {
     assert!(matches!(
         protocol,
         Protocol::Chat {
-            include_usage: true
+            include_usage: true,
+            functions: false
         }
     ));
 }
@@ -1391,12 +1577,14 @@ fn reply_ids_are_prefixed_and_unique() {
     let a = Reply::new(
         Protocol::Chat {
             include_usage: false,
+            functions: false,
         },
         "m".into(),
     );
     let b = Reply::new(
         Protocol::Chat {
             include_usage: false,
+            functions: false,
         },
         "m".into(),
     );

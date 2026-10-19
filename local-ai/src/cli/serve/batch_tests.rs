@@ -346,11 +346,11 @@ async fn responses_answer_in_their_own_shape_and_legacy_apis_are_refused() {
             .is_some_and(|message| message.contains("legacy Completions")),
         "{refused}"
     );
-    // A Chat line with a deprecated member fails as the HTTP route would.
-    let mut deprecated = chat("d", "hi");
-    deprecated["body"]["max_tokens"] = json!(4);
-    let deprecated = scratch.input(&[deprecated]);
-    let (_, third) = create(&batches, &deprecated, "/v1/chat/completions").await;
+    // A Chat line the HTTP route would refuse fails as it would.
+    let mut refusable = chat("d", "hi");
+    refusable["body"]["n"] = json!(2);
+    let refusable = scratch.input(&[refusable]);
+    let (_, third) = create(&batches, &refusable, "/v1/chat/completions").await;
 
     let done = settled(&scratch.store, first["id"].as_str().expect("id")).await;
     assert_eq!(done["status"], "completed", "{done}");
@@ -365,7 +365,7 @@ async fn responses_answer_in_their_own_shape_and_legacy_apis_are_refused() {
     assert!(
         errors[0]["response"]["body"]["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("max_tokens is deprecated")),
+            .is_some_and(|message| message.contains("n is not supported")),
         "{errors:?}"
     );
     stop(&batches).await;

@@ -33,14 +33,17 @@ Batches, Vector Stores, Decisions and the Administration API
 [docs/ADMIN.md](docs/ADMIN.md)); with the optional models installed,
 Embeddings, Moderations, Audio speech (`/v1/audio/speech`) and Audio
 transcriptions and translations (`/v1/audio/transcriptions`,
-`/v1/audio/translations`). Legacy and deprecated
-APIs are intentionally not served: the legacy Completions API
-(`POST /v1/completions`) is a 404, batches cannot target it, and request
-members the OpenAI specification marks deprecated (Chat's `max_tokens`,
-`seed`, `user`, `functions`/`function_call`; Responses' `user`, `truncation`,
-`reasoning.generate_summary`; `prompt_cache_retention` on both) are a 400
-naming the replacement. The full list is in
-[docs/BONSAI.md](docs/BONSAI.md#supported-openai-apis).
+`/v1/audio/translations`). The legacy Completions API
+(`POST /v1/completions`) is not served (a 404, and batches cannot target
+it). Request members the OpenAI specification marks deprecated are accepted,
+because coding harnesses and older SDKs still send them: Chat's `max_tokens`,
+`seed` and `functions`/`function_call` (answered as `function_call`) and
+Responses' `reasoning.generate_summary` are honoured, and `user`,
+`truncation` and `prompt_cache_retention` change nothing. The full list, and
+the vLLM-style `repetition_penalty` and `chat_template_kwargs` Chat also
+takes, is in [docs/BONSAI.md](docs/BONSAI.md#supported-openai-apis);
+configurations for Codex, opencode and Oh My Pi are in
+[docs/BONSAI.md](docs/BONSAI.md#coding-client-configuration).
 
 A client that stops reading its
 socket without closing it is invisible to TCP, so `serve`
@@ -151,8 +154,8 @@ summary loses detail; see
 [docs/BONSAI.md](docs/BONSAI.md#compaction-and-reasoning-summaries).
 `POST /v1/responses/input_tokens`
 returns the exact templated prompt-token count without generating. This is a
-subset of the public OpenAI contract, not a drop-in Codex provider; the gaps
-are listed in [docs/BONSAI.md](docs/BONSAI.md#server-api).
+subset of the public OpenAI contract; the gaps are listed in
+[docs/BONSAI.md](docs/BONSAI.md#server-api).
 
 ## Library use
 

@@ -231,34 +231,45 @@ Conversations, Files, Uploads, Batches, Vector Stores, Decisions and the
 Administration API; with the optional models installed, Embeddings,
 Moderations, Audio speech, and Audio transcriptions and translations.
 `/health` is this server's own.
-Legacy and deprecated APIs are intentionally not served:
+Compatibility with the clients that call them comes before strictness about
+members the specification has retired:
 
 - The legacy Completions API, `POST /v1/completions`, is a 404 like any
   unknown route, and a batch cannot target it.
-- Request members the specification marks deprecated are a 400 that names
-  the replacement: on Chat Completions `max_tokens` (use
-  `max_completion_tokens`), `seed`, `user` (use `prompt_cache_key` and
-  `safety_identifier`), `functions` and `function_call` (use `tools` and
-  `tool_choice`), `prompt_cache_retention`, the `function` message role and an
-  assistant message's `function_call` (use `tool_calls`); on Responses
-  `user`, `truncation`, `prompt_cache_retention` and
-  `reasoning.generate_summary` (use `reasoning.summary`), on `input_tokens`
-  too; on `compact`, `prompt_cache_retention`. This server's own superseded
-  `session_id` alias is refused the same way in favor of `prompt_cache_key`.
-  Chat accepts any of them as `null`, which sets nothing; Responses, whose
-  parser refuses unknown members, refuses even that.
+- Request members the specification marks deprecated are accepted, because
+  coding harnesses and older SDKs still send them (opencode's AI SDK sends
+  Chat `max_tokens` on every request, LiteLLM and Aider send `max_tokens`,
+  `seed` and `user`). Where they mean something they are honoured: Chat
+  `max_tokens` is `max_completion_tokens` (which wins when both are set),
+  `seed` seeds the sampler (any JSON integer; a negative one keeps its 64
+  bits), `functions` and `function_call` are function `tools` and
+  `tool_choice` with at most one call, answered in their own shape
+  (`message.function_call` or a `function_call` delta, finish reason
+  `function_call`), and a history's assistant `function_call` and `function`
+  message are a call and its result; Responses `reasoning.generate_summary`
+  is `reasoning.summary` when that is absent; this server's former
+  `session_id` is `prompt_cache_key` on both. Where nothing applies they are
+  accepted and change nothing: `user`, `prompt_cache_retention` (also on
+  `compact`) and Responses `truncation` (`auto` or `disabled`, on
+  `input_tokens` too; the engine never drops input, so an over-long request
+  fails either way, and a Response reports `disabled`).
 
 ### Generation requests
 
 Generation accepts `temperature`, `top_p`, `top_k`, `min_p`,
-`presence_penalty`, `frequency_penalty` and `stream`; Responses also takes a
-`seed`, an extension of this server (Chat Completions samples with a fixed
-one). Chat limits output with `max_completion_tokens`, Responses with
-`max_output_tokens`. Cache affinity is `prompt_cache_key`. Chat Completions
-and Responses bodies are limited to 64 MiB, since they may carry base64
-images ([image input](#image-input)); other JSON bodies to 2 MiB (multipart
-file and upload-part bodies have their own streamed limits). Audio input is
-rejected.
+`presence_penalty`, `frequency_penalty`, `seed` and `stream` on both APIs
+(`top_k`, `min_p`, the penalties and the Responses `seed` are extensions),
+and vLLM's multiplicative `repetition_penalty`, which replaces the one
+`frequency_penalty` maps to. Chat also takes vLLM's and llama.cpp's
+`chat_template_kwargs`, of which `enable_thinking: false` turns reasoning off
+(other keys are ignored), and, like any Chat member it does not know, a
+vendor field such as `extra_body` is ignored; the Responses parser still
+refuses unknown members. Chat limits output with `max_completion_tokens` (or
+`max_tokens`), Responses with `max_output_tokens`. Cache affinity is
+`prompt_cache_key`. Chat Completions and Responses bodies are limited to
+64 MiB, since they may carry base64 images ([image input](#image-input));
+other JSON bodies to 2 MiB (multipart file and upload-part bodies have their
+own streamed limits). Audio input is rejected.
 
 Chat supports function `tools`, assistant `tool_calls`, and tool-result messages
 with `tool_call_id`. Native rendering and validation belong to `local-engine`
@@ -845,6 +856,105 @@ compares a download of its output (`bench IMAGE [detail]` times the tower):
   HF's exactly. The card's text (`BONSAI 27B`, `Vision test 2026`,
   `Invoice #4821`, …) is read back verbatim.
 
+### Coding client configuration
+
+Codex, opencode and Oh My Pi drive `local-ai serve` end to end with the
+configurations below, each recorded against the real model in
+[client runs](#coding-clients-and-long-context-coding-quality). Use the
+`context_length` that `GET /v1/models` reports for the context window (65,536
+here); a client that assumes a larger one compacts too late and gets a
+context-overflow 400 instead.
+
+**Codex** (`~/.codex/config.toml`; Codex 0.163 accepts only
+`wire_api = "responses"` for a custom provider):
+
+```toml
+model = "ternary-bonsai-2-27b"
+model_provider = "local-ai"
+model_reasoning_effort = "xhigh"   # low, medium, xhigh (high also runs at xhigh), or none
+model_reasoning_summary = "none"   # "auto" adds a summary generation after every reasoning answer
+model_context_window = 65536       # Codex assumes 272,000 for a model it does not know
+# model_catalog_json = "/Users/you/.codex/bonsai.json"  # optional, see below
+
+[model_providers.local-ai]
+name = "local-ai"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+# with authentication on: env_key = "LOCAL_AI_API_KEY"
+```
+
+Codex sends `store: false` with the whole conversation in `input`, asks for
+`reasoning.encrypted_content` (sealed with the reasoning key created on first
+start), and compacts locally: at 90% of the window it sends its summarization
+prompt as an ordinary Response and continues from the summary. Leave its
+provider capability `remote_compaction` at its default, `unsupported`: `v2`
+sends a `compaction_trigger` input item, which this server does not
+implement. Codex declares its freeform `apply_patch` tool (a `custom` tool
+with a Lark grammar, enforced while the patch is generated) only for models
+its catalog marks freeform; for any other model it edits through
+`exec_command`. To give it the tool, copy its own catalog entry for a
+freeform model, whose base instructions are written for that tool, and
+point `model_catalog_json` at the result:
+
+```bash
+codex debug models | jq '{models: [.models[] | select(.slug == "gpt-5.5")
+  | .slug = "ternary-bonsai-2-27b" | .display_name = "Ternary Bonsai 2 27B (local-ai)"
+  | .supported_reasoning_levels = (["low", "medium", "xhigh"] | map({effort: ., description: .}))
+  | .default_reasoning_level = "xhigh" | .default_reasoning_summary = "none"
+  | .support_verbosity = false | .default_verbosity = null | .model_messages = null
+  | .upgrade = null | .service_tiers = [] | .additional_speed_tiers = []
+  | .web_search_tool_type = "text" | .supports_search_tool = false
+  | .input_modalities = ["text"] | .supports_image_detail_original = false
+  | .context_window = 65536 | .max_context_window = 65536]}' > ~/.codex/bonsai.json
+```
+
+The copied instructions introduce the assistant as Codex based on GPT-5;
+nothing else in them is specific to OpenAI's models.
+
+**opencode** (`~/.config/opencode/opencode.json`, or `opencode.json` in a
+project). Its custom providers are AI SDK packages:
+`@ai-sdk/openai-compatible` speaks Chat Completions and `@ai-sdk/openai`
+speaks Responses; both work.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local-ai/ternary-bonsai-2-27b",
+  "small_model": "local-ai/ternary-bonsai-2-27b",
+  "provider": {
+    "local-ai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "local-ai",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "ternary-bonsai-2-27b": {
+          "name": "Ternary Bonsai 2 27B (local-ai)",
+          "reasoning": true,
+          "tool_call": true,
+          "limit": { "context": 65536, "output": 8192 },
+          "options": { "reasoningEffort": "xhigh" }
+        }
+      }
+    }
+  }
+}
+```
+
+Through Chat Completions opencode sends `max_tokens` (the model's
+`limit.output`), `stream_options.include_usage`, its tools with `tool_choice:
+"auto"`, and `reasoning_effort` from the model's `reasoningEffort` option
+(`none`, `low`, `medium`, `high` or `xhigh`; without one the server reasons at
+`xhigh`); it reads `reasoning_content` deltas as reasoning and replays the
+history as Chat messages. For Responses, use `"npm": "@ai-sdk/openai"` and
+add `"apiKey"` to `options` (the package refuses to start without one; the
+server checks it only when authentication is on); it sends `store: false`,
+asks for `reasoning.encrypted_content` and, on its title request,
+`reasoning.summary: "auto"`.
+
+**Oh My Pi**: the `models.yml` provider in the
+[engine README](../local-engine/README.md#oh-my-pi-custom-provider) (Responses, efforts
+`low`, `medium` and `xhigh`).
+
 ### Compaction and reasoning summaries
 
 Both run on the one loaded checkpoint as ordinary, queued generations with
@@ -855,7 +965,7 @@ only adapts them ([engine contract](../local-engine/README.md#compaction-and-rea
 
 `POST /v1/responses/compact` takes `model`, `input`, `previous_response_id`,
 `instructions` and `prompt_cache_key` (`prompt_cache_options` is refused, the
-deprecated `prompt_cache_retention` too, `service_tier` as elsewhere) and returns
+deprecated `prompt_cache_retention` is ignored, `service_tier` as elsewhere) and returns
 a `response.compaction` object. It counts the resolved window, keeps the
 newest items up to a quarter of that count verbatim, and summarizes the rest.
 `output` is the kept items, then one `compaction` item whose
@@ -898,7 +1008,7 @@ content, the contract calls it encrypted, and plaintext under that name would
 mislead.
 
 `reasoning.summary` (`auto`, `concise` or `detailed`; the deprecated
-`generate_summary` is refused) runs after the answer's generation ends: the raw
+`generate_summary` is read when `summary` is absent) runs after the answer's generation ends: the raw
 reasoning is quoted to the model, which writes the summary as visible content.
 It streams as `response.reasoning_summary_part.added`,
 `response.reasoning_summary_text.delta`, `.done` and
