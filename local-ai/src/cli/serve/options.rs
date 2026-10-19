@@ -91,6 +91,11 @@ pub(super) fn usage() {
         "  --api-key KEY      Require bearer authentication; KEY authorizes every API but \
          /v1/organization (admin keys: `local-ai admin create-key`, docs/ADMIN.md)"
     );
+    eprintln!(
+        "  --allow-origin ORIGIN  Admit browser requests from ORIGIN (e.g. \
+         https://chat.example.com) while authentication is off; repeatable; * for every origin, \
+         null for file: pages (default: loopback pages and local apps only; see docs/BONSAI.md)"
+    );
     eprintln!("  --no-thinking      Disable thinking");
     eprintln!(
         "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \
@@ -154,6 +159,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         decision_head: None,
         decisions_artifact: None,
         tools: ToolArgs::default(),
+        allowed_origins: Vec::new(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -188,6 +194,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
             "--host"
                 | "--port"
                 | "--api-key"
+                | "--allow-origin"
                 | "--stall-timeout"
                 | "--response-store"
                 | "--reasoning-key"
@@ -208,6 +215,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
             "--host" => parsed.host = value.parse().map_err(|_| "invalid --host")?,
             "--port" => parsed.port = value.parse().map_err(|_| "invalid --port")?,
             "--api-key" => parsed.api_key = Some(value.clone()),
+            "--allow-origin" => parsed.allowed_origins.push(allowed_origin(value)?),
             "--stall-timeout" => parsed.stall = stall_timeout(value)?,
             "--reasoning-key" => {
                 if value.is_empty() {
@@ -242,6 +250,24 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         return Err("--tools-allow-write and --tools-shell need --tools-root DIR".into());
     }
     Ok(parsed)
+}
+
+/// An `--allow-origin` value: `*`, `null`, or an origin as browsers send it
+/// (`scheme://host[:port]`, no path), compared exactly.
+fn allowed_origin(value: &str) -> Result<String, String> {
+    let origin = value.strip_suffix('/').unwrap_or(value);
+    let valid = matches!(origin, "*" | "null")
+        || origin.split_once("://").is_some_and(|(scheme, host)| {
+            !scheme.is_empty() && !host.is_empty() && !host.contains('/')
+        });
+    if valid {
+        Ok(origin.to_ascii_lowercase())
+    } else {
+        Err(format!(
+            "--allow-origin must be *, null or an origin such as https://chat.example.com, not \
+             {value:?}"
+        ))
+    }
 }
 
 /// Apply a hosted-tool flag that takes `value`.

@@ -29,6 +29,32 @@ fn defaults_and_bounds() {
     }
 }
 #[test]
+fn allowed_origins_are_normalized_origins() {
+    let parsed = parse(&args(&[
+        "--allow-origin",
+        "https://Chat.Example.com/",
+        "--allow-origin",
+        "*",
+        "--allow-origin",
+        "null",
+    ]))
+    .expect("options");
+    assert_eq!(
+        parsed.allowed_origins,
+        ["https://chat.example.com", "*", "null"]
+    );
+    assert_eq!(
+        parse(&args(&[])).expect("defaults").allowed_origins,
+        [] as [String; 0]
+    );
+    for invalid in ["chat.example.com", "https://chat.example.com/app", ""] {
+        assert!(
+            parse(&args(&["--allow-origin", invalid])).is_err(),
+            "{invalid}"
+        );
+    }
+}
+#[test]
 fn thinking_is_not_a_flag_because_it_already_is_the_default() {
     // Reasoning is on unless the flag turns it off, so a positive spelling
     // could only ever be a no-op. The parser used to accept it anyway, which

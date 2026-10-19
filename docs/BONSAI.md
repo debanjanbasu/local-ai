@@ -118,6 +118,9 @@ local-ai serve [options]
   --host IP          bind address (default 127.0.0.1)
   --port N           TCP and UDP port (default 8080)
   --api-key KEY      require Bearer authentication
+  --allow-origin ORIGIN  admit browser requests from ORIGIN while
+                     authentication is off; repeatable, * for every origin,
+                     null for file: pages (see docs/ADMIN.md#browsers)
   --no-thinking      disable reasoning
   --stall-timeout N  drop a generation whose client stopped reading; seconds,
                      default 30, accepted 10 to 3600
