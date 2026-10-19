@@ -185,7 +185,7 @@ fn stall_timeout_defaults_to_thirty_seconds_and_rejects_nonsense() {
 fn only_waits_after_the_first_event_are_bounded() {
     // The premise of the exemption, so the reasoning recorded next to
     // `event_wait` cannot rot unnoticed: one prefill chunk of silence.
-    assert_eq!(local_engine::resources::PREFILL_CHUNK, 128);
+    assert_eq!(local_engine::resources::PREFILL_CHUNK, 512);
     let configured = parse(&args(&[])).expect("defaults").stall;
     // Time to first token is the model working, not a stalled consumer, so the
     // budget cannot apply to it. `Unbounded` is a separate outcome rather than

@@ -779,7 +779,7 @@ comes from a measurement rather than from taste; see
 [Tried and rejected](#tried-and-rejected).
 
 The budget starts only after the first event arrives, so it does not bound
-time-to-first-token. Prefill now reports a boundary at every 128-token block (or
+time-to-first-token. Prefill now reports a boundary at every 512-token block (or
 every chunk of 24 to 32 tokens while other requests decode; see
 [Concurrent requests](#concurrent-requests)) and the boundary is written to the
 client, but it deliberately does not start a clock. On the M2 these
@@ -1439,7 +1439,7 @@ turn instead of batching measured 32.7 tok/s aggregate at two streams against
 
 Admission only restores a request's reusable prompt prefix. Its prefill then
 runs inside the engine's steps, one prompt per step: the one with the fewest
-tokens left. A prompt of at most 128 tokens to prefill (one block; a typical
+tokens left. A prompt of at most 128 tokens to prefill (a typical
 chat turn) goes whole, in a pass of its own after the step's decode round. A
 longer one, beside two or more decoding requests, prefills inside their
 batched pass: its chunk's rows are stacked after theirs, run every layer with
@@ -1688,7 +1688,7 @@ All choices and reasons are reported in startup JSON.
   fits 90% of Metal's recommended working set.
 - **K/V:** Hadamard-rotated Q8 for the target, always (see
   [K/V cache](#kv-cache)); the MTP head's one-layer cache is F16.
-- **Prefill:** fixed 128-token chunks with Metal 4 kernels where supported;
+- **Prefill:** fixed 512-token chunks with Metal 4 kernels where supported;
   beside two or more decoding requests, a long prompt prefills 24 to 31
   tokens per step inside their batched pass, and 32 per step in a pass of its
   own beside one.
@@ -1960,8 +1960,8 @@ medians, ~204 MB snapshots:
 The request tail is checkpointed at the penultimate chat token because the
 next rendered turn diverges at the assistant opener. One reusable boundary is
 also materialized per prefill: a newly observed shared-prefix divergence is
-preferred, otherwise the end of the system turn. Boundaries shorter than one
-128-token prefill chunk are skipped. Shared boundaries receive eviction
+preferred, otherwise the end of the system turn. Boundaries shorter than 128
+tokens are skipped. Shared boundaries receive eviction
 priority over request-tail snapshots and can be reused across sessions. When
 the budget cannot hold both, a boundary that extends a kept boundary by
 fewer tokens than that boundary holds is the one evicted (and is then not

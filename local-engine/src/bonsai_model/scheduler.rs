@@ -59,7 +59,7 @@ const PREFILL_FOLD_MIN: usize = 24;
 /// so their last block does not stall the others either.
 const PREFILL_WHOLE_DECODING: usize = 128;
 
-/// Prompt tokens one step prefills while nothing decodes: four full blocks.
+/// Prompt tokens one step prefills while nothing decodes: one full block.
 /// Bounded only so a request arriving behind a long prompt is admitted, and
 /// can start its own shorter prefill, within about five seconds.
 const PREFILL_CHUNK_ALONE: usize = 512;

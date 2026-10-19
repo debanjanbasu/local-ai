@@ -23,7 +23,8 @@ pub const EVENT_BUFFER: usize = 64;
 /// Prefill is the only phase of a generation that emits nothing per token. The
 /// chunk is one forward pass over up to `PREFILL_CHUNK` tokens, so a prompt
 /// longer than one chunk is silent for the whole of that pass — about 35 s per
-/// 128 tokens on this M2, or roughly 14 minutes for a 3000-token prompt. A
+/// 128 tokens on this M2 (over two minutes per 512-token chunk), or roughly 14
+/// minutes for a 3000-token prompt. A
 /// consumer that watches only for generated text cannot tell a working engine
 /// from an abandoned socket during it, so each boundary is reported instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

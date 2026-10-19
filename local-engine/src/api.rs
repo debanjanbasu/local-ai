@@ -1081,9 +1081,9 @@ impl EventStream {
     /// them and sees them once.
     ///
     /// `timeout` of `None` parks until something arrives. That is the honest
-    /// budget for the first item of a request: `PREFILL_CHUNK` is 128 tokens and
-    /// this M2 prefills at 3.6-4.2 tok/s, so one chunk is about 35 s of work and a
-    /// prompt over 128 tokens is ordinary. It is unbounded here for the same
+    /// budget for the first item of a request: `PREFILL_CHUNK` is 512 tokens and
+    /// this M2 prefills at 3.6-4.2 tok/s, so one chunk is over two minutes of work
+    /// and a prompt over 512 tokens is ordinary. It is unbounded here for the same
     /// reason it is unbounded in [`Self::next_timeout`]: a deadline under one
     /// chunk would cancel long prompts that were never stalled.
     ///
