@@ -268,7 +268,9 @@ Contract:
   tool, validated against its schema. A non-strict tool's schema guides the
   model but is not enforced: its call is emitted with the arguments as
   generated, for the harness or client to validate and answer with an error
-  result. Ordinary text still streams; only a possible `<tool_call>`
+  result, and so is a call to a tool the request does not declare (the
+  harness answers it as unknown; Codex's instructions name `apply_patch`
+  even when its tool set has none). Ordinary text still streams; only a possible `<tool_call>`
   prefix and trailing whitespace are held back.
 - While a call is generated, `Event::ToolCallDelta` reports the part of its
   arguments that can no longer change, once the call names a configured tool:
@@ -279,7 +281,7 @@ Contract:
   raw text in `text`; any other value arrives whole when it ends. Deltas are
   progress only: the call is still validated at `</tool_call>`, and a call
   that fails or is cut short has no `Event::ToolCall`.
-- A malformed, unknown, strict-schema-violating or EOS-truncated call ends the generation:
+- A malformed, strict-schema-violating or EOS-truncated call ends the generation:
   `EventStream` yields `Event::Error` and no `Event::Finished`; `Engine::chat_with`
   returns `Err`. Earlier valid calls in the same answer have already been emitted.
   Deltas of the failed call may have been emitted too.
@@ -294,9 +296,10 @@ Contract:
   `tool` message per call with `tool_call_id`. Consecutive results render as one
   user turn of `<tool_response>` blocks, reordered by ID into call order because
   Bonsai's template has no model-visible IDs. Duplicate IDs, unanswered calls,
-  unmatched or repeated results, unknown tools, arguments that violate a strict
-  tool's schema and invalid schemas are rejected with `Error::InvalidArgument`
-  before generation; a non-strict call replays as it was generated.
+  unmatched or repeated results, arguments that violate a strict tool's schema
+  and invalid schemas are rejected with `Error::InvalidArgument` before
+  generation; a non-strict call replays as it was generated, and so does a
+  call to a tool the request no longer declares.
 - `developer` is accepted like `system` and fills the template's single
   system slot. Consecutive leading `system`/`developer` messages are joined
   there in order, separated by a blank line; one renders exactly as before,

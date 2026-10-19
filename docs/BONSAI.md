@@ -896,7 +896,11 @@ sends a `compaction_trigger` input item, which this server does not
 implement. Codex declares its freeform `apply_patch` tool (a `custom` tool
 with a Lark grammar, enforced while the patch is generated) only for models
 its catalog marks freeform; for any other model it edits through
-`exec_command`. To give it the tool, copy its own catalog entry for a
+`exec_command`. Its fallback instructions still mention `apply_patch`, so the
+model sometimes calls it anyway: the server returns that call like any other
+(a call to an undeclared tool is not an error), Codex answers it `unsupported
+call: apply_patch`, and the model edits with `exec_command` instead. To give
+it the tool, copy its own catalog entry for a
 freeform model, whose base instructions are written for that tool, and
 point `model_catalog_json` at the result:
 
@@ -2930,17 +2934,19 @@ general coding-quality claim follows from these contract checks.
 
 ### Coding clients and long-context coding quality
 
-`tools/client_compat.py` runs Codex CLI and Oh My Pi against `local-ai serve`
-through a recording proxy, in disposable scratch repositories with scratch
-`HOME`/`CODEX_HOME` (Oh My Pi inside a `sandbox-exec` write jail, Codex in its
-own `workspace-write` sandbox, no network). Each scenario records pass/fail,
+`tools/client_compat.py` runs Codex CLI, Oh My Pi and opencode against
+`local-ai serve` through a recording proxy, in disposable scratch repositories
+with scratch `HOME`/`CODEX_HOME`/XDG directories (Oh My Pi and opencode inside
+a `sandbox-exec` write jail, Codex in its own `workspace-write` sandbox, no
+network). Each scenario records pass/fail,
 the first failing request/response, the server-log slice and the owning
 workstream. `tools/context_eval.py` measures seeded coding questions inside
 synthetic repositories of increasing size. Both are reruns, not fixtures:
 run them again after a merge and compare.
 
 ```bash
-# client scenarios (≈10 GPU-minutes); Codex 0.162.1 installed under .scratch/codex
+# client scenarios (≈10 GPU-minutes per group); Codex installed under .scratch/codex
+# (npm install @openai/codex), omp and opencode on PATH
 CODEX=$PWD/.scratch/codex/node_modules/.bin/codex
 lockf -k /tmp/local-ai-gpu.lock python3 tools/client_compat.py --codex-bin "$CODEX" \
     --timeout 420 --out .scratch/artifacts/client-compat/<run>
@@ -3073,6 +3079,62 @@ has been exercised by unit tests only. Codex declares its freeform
 `apply_patch` only for catalog models marked freeform, so the Codex runs above
 edited files through `exec_command`; the probe sends Codex's declaration
 itself. Evidence: `.scratch/artifacts/codextools/client-compat/codextools`.
+
+**Codex, opencode and Oh My Pi end to end** (branch `harness-compat`,
+2026-10-19; Codex CLI 0.163.0, opencode 1.19.3, Oh My Pi 18.12.2, each with
+the configuration in [Coding client configuration](#coding-client-configuration);
+server with `--reasoning-key`). opencode runs both of its providers:
+`opencode-*` through `@ai-sdk/openai-compatible` (Chat Completions),
+`opencode-responses-*` through `@ai-sdk/openai` (Responses, `store: false`).
+`codex-apply-patch` uses a catalog copied from `codex debug models`, so Codex
+declares its freeform `apply_patch`; `codex-compact` sets
+`model_auto_compact_token_limit = 7000`, so Codex compacts mid-task.
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| opencode-fix / opencode-fix-xhigh (Chat) | PASS | 6 requests, 68 s / 95 s; tests pass, test file untouched; xhigh replays `reasoning_content` |
+| opencode-read + `--continue` second turn (Chat) | PASS | `42`, then `7` |
+| opencode-recover (Chat) | PASS | `PERIWINKLE-42` after the failed read's tool result |
+| opencode-responses-fix / -read | PASS | 5 requests, 65 s; `42`, then `7` |
+| opencode-responses-fix-xhigh | PASS | 5 requests, 90 s; 3 encrypted reasoning items replayed without `id` |
+| opencode-cancel | PASS | SIGTERM (its `run` ignores SIGINT while the title request streams); upstream closed, follow-up 200 in 0.4 s |
+| codex-fix | PASS | 6 requests, 70 s; one `apply_patch` call to an undeclared tool, answered `unsupported call: apply_patch`, then `sed` |
+| codex-read + `exec resume --last`, codex-recover, codex-default-config | PASS | `42`/`7`; `PERIWINKLE-42` |
+| codex-fix-xhigh | PASS | 6 requests, 102 s |
+| codex-apply-patch | PASS | 5 requests, 79 s; 2 freeform `apply_patch` results |
+| codex-compact | PASS | 14 requests, 236 s; 3 local compactions, tests pass |
+| codex-cancel, omp-cancel | PASS | exited 0.0 s after SIGINT, follow-up 200 |
+| omp-fix / omp-read / omp-recover / omp-fix-xhigh | PASS | 5 requests, 53 s; `42`/`7`; `PERIWINKLE-42`; 8 requests, 89 s |
+| http-legacy-members | PASS | `/v1/completions` 404; Chat with `max_tokens`, `seed`, `user` 200; legacy `functions` answered as `function_call`; Responses `user` 200 |
+| every other `http-*` probe | PASS | as above |
+
+Gaps these runs found, all fixed on the branch:
+
+- **Deprecated request members.** opencode's Chat provider sends
+  `max_tokens` on every request, which was a 400, so no opencode Chat
+  request succeeded; Aider, LiteLLM and Continue send `max_tokens`, `seed`
+  and `user` too. They are now honoured or ignored (see
+  [Supported OpenAI APIs](#supported-openai-apis)).
+- **Id-less encrypted reasoning.** The AI SDK replays reasoning items
+  without their `id` under `store: false`, so opencode's Responses provider
+  failed every xhigh turn after the first with 400 `encrypted reasoning
+  requires its original unique item id`. Envelopes now carry the id they
+  are bound to.
+- **Calls to undeclared tools.** Codex's fallback instructions name
+  `apply_patch`, which its default tool set lacks; the model's call failed
+  the Response (`invalid tool call: unknown tool "apply_patch"`) and Codex
+  retried. Such a call is now returned to the client, which answers it.
+- **Harness.** The cancel scenario waits for a streamed agent turn (opencode's
+  title request streams first) and stops opencode with SIGTERM; the compaction
+  limit sits between Codex's first request (about 6,000 tokens) and the end
+  of the task (about 7,700).
+
+Not implemented: Codex's `remote_compaction = "v2"` (`compaction_trigger`
+input item), Chat `stop` sequences and `text.verbosity` other than `medium`.
+Evidence: `.scratch/artifacts/client-compat/final-a` (Codex, opencode
+Responses; its `codex-fix`, `codex-compact` and `opencode-cancel` predate the
+fixes above), `final-b` (Oh My Pi, Codex reruns, HTTP probes), `final-c`
+(opencode cancel, invalid-then-valid), `final-d` (opencode Chat).
 
 #### Long-context coding quality
 

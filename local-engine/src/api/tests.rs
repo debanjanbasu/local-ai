@@ -278,7 +278,7 @@ fn usage_counts_reasoning_tokens_including_the_delimiter_not_text_chunks() {
 
 #[test]
 fn the_worker_reports_invalid_and_truncated_calls_without_finishing() {
-    let invalid = CALL.replace("get_weather", "get_forecast");
+    let invalid = CALL.replace("get_weather", "get weather");
     let truncated = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar";
     for (output, stops) in [(invalid.as_str(), true), (truncated, false)] {
         let (mut delivery, _receiver) = delivery(Some(weather_tools()));
@@ -448,11 +448,11 @@ fn an_invalid_chat_fails_counting_exactly_as_it_fails_generation() {
     let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
     let mut unanswered = tool_history(true);
     unanswered.messages.remove(3);
-    let mut undefined_tool = tool_history(true);
-    undefined_tool.messages[2].tool_calls[0].name = "get_time".into();
+    let mut not_object = tool_history(true);
+    not_object.messages[2].tool_calls[0].arguments = serde_json::json!("Paris");
     let mut empty = tool_history(false);
     empty.messages.clear();
-    for request in [unanswered, undefined_tool, empty] {
+    for request in [unanswered, not_object, empty] {
         let expected = super::prepare_chat(&request)
             .expect_err("generation rejects it")
             .to_string();

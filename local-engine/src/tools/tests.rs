@@ -420,10 +420,6 @@ fn rejects_unpaired_duplicate_and_invalid_tool_history() {
             vec![user, assistant(&one), turn("tool", "x")],
         ),
         (
-            "unknown tool",
-            vec![user, assistant(&unknown), result("a", "x")],
-        ),
-        (
             "non-object arguments",
             vec![user, assistant(&not_object), result("a", "x")],
         ),
@@ -455,6 +451,9 @@ fn rejects_unpaired_duplicate_and_invalid_tool_history() {
         result("a", "y"),
     ];
     assert!(render(&reused, true, &set).is_err());
+    // A call to a tool the request does not declare (any more) replays.
+    let undeclared = [user, assistant(&unknown), result("a", "x")];
+    assert!(render(&undeclared, true, &set).is_ok());
 }
 
 fn parse(tools: &[ToolDefinition], pieces: &[&str]) -> (Vec<Event>, Option<String>) {
@@ -557,7 +556,7 @@ fn parsed_calls_render_back_to_the_generated_text() {
 #[test]
 fn malformed_invalid_and_truncated_calls_never_become_events() {
     let cases = [
-        "<tool_call>\n<function=unknown>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=bad name>\n</function>\n</tool_call>",
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</tool_call>",
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
@@ -811,7 +810,7 @@ fn a_string_value_streams_before_it_ends_and_a_cut_call_reports_nothing_more() {
 }
 
 #[test]
-fn a_strict_raw_string_streams_and_an_unknown_tool_never_does() {
+fn a_strict_raw_string_streams_and_an_undeclared_tool_call_arrives_whole() {
     let patch = ToolDefinition {
         name: "apply_patch".into(),
         description: None,
@@ -836,6 +835,15 @@ fn a_strict_raw_string_streams_and_an_unknown_tool_never_does() {
     assert_eq!(raw, input);
     let unknown = "<tool_call>\n<function=nope>\n<parameter=input>\nx\n</parameter>\n</function>\n</tool_call>";
     let (events, failure) = parse_in(&[patch], unknown, 1);
-    assert!(failure.is_some());
-    assert_eq!(streamed(&events).0, Vec::<&super::ToolCallDelta>::new());
+    // An undeclared tool's call goes to the client, untyped, without deltas.
+    assert_eq!(failure, None);
+    let (deltas, calls) = streamed(&events);
+    assert_eq!(deltas, Vec::<&super::ToolCallDelta>::new());
+    let [call] = calls[..] else {
+        panic!("{calls:?}")
+    };
+    assert_eq!(
+        (call.name.as_str(), &call.arguments),
+        ("nope", &json!({"input":"x"}))
+    );
 }

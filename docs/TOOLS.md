@@ -165,7 +165,13 @@ refused or not run.
 A plain (non-strict) `function` tool's schema is not enforced: a call whose
 arguments miss it (for example, without a required property) is returned to
 the client as generated, for the client to reject in its
-`function_call_output`, rather than failing the Response.
+`function_call_output`, rather than failing the Response. So is a call to a
+tool the request does not declare (Codex's instructions name `apply_patch`
+even when its default tool set has none, and the model sometimes calls it):
+it is reported as a `function_call` for the client to answer as unknown, and
+history that replays a call to a tool no longer declared is accepted, since
+harnesses change their tool sets between turns. Only a malformed call layout
+still fails the Response.
 
 ## Permission model and its limits
 

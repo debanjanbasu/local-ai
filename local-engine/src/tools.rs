@@ -81,7 +81,7 @@ pub struct ToolDefinition {
     /// partially. Not shown to the model. Defaults to `false`: the schema
     /// guides the model but is not enforced, and a call is returned with its
     /// arguments as generated for the client to validate (a malformed call
-    /// layout or an unknown tool still fails).
+    /// layout still fails).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strict: bool,
 }
@@ -450,24 +450,18 @@ fn validate_history(turns: &[Turn<'_>], tools: &ToolSet) -> crate::Result<()> {
                     for key in arguments.keys() {
                         check_parameter_name(key).map_err(crate::Error::InvalidArgument)?;
                     }
-                    if !tools.is_empty() {
-                        let Some(tool) = tools.get(&call.name) else {
-                            return invalid(format!(
-                                "tool call {:?} names unknown tool {:?}",
-                                call.id, call.name
-                            ));
-                        };
-                        // A non-strict call is replayed as it was generated,
-                        // even when it missed the schema and its result is
-                        // the client's error report.
-                        if tool.strict.is_some() {
-                            validate_arguments(tool, &call.arguments).map_err(|error| {
-                                crate::Error::InvalidArgument(format!(
-                                    "tool call {:?}: {error}",
-                                    call.id
-                                ))
-                            })?;
-                        }
+                    // A non-strict call is replayed as it was generated,
+                    // even when it missed the schema and its result is the
+                    // client's error report, and so is a call to a tool the
+                    // request no longer (or never) declared: harnesses change
+                    // their tool sets between turns.
+                    if let Some(tool) = tools.get(&call.name).filter(|tool| tool.strict.is_some()) {
+                        validate_arguments(tool, &call.arguments).map_err(|error| {
+                            crate::Error::InvalidArgument(format!(
+                                "tool call {:?}: {error}",
+                                call.id
+                            ))
+                        })?;
                     }
                     pending.push(&call.id);
                 }
@@ -1197,9 +1191,12 @@ fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
         .trim_end()
         .strip_suffix("</function>")
         .ok_or("missing </function>")?;
-    let tool = tools
-        .get(name)
-        .ok_or_else(|| format!("unknown tool {name:?}"))?;
+    // A call to a tool this request did not declare goes to the client like
+    // any other: harnesses answer it with an error result the model can act
+    // on (Codex's default tools have no `apply_patch`, yet its instructions
+    // name it), where failing the response leaves nothing to correct.
+    check_tool_name(name)?;
+    let tool = tools.get(name);
     let mut arguments = Map::new();
     loop {
         rest = rest.trim_start();
@@ -1222,8 +1219,7 @@ fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
             return Err(format!("duplicate parameter {key:?}"));
         }
         let parameter = tool
-            .schema
-            .as_ref()
+            .and_then(|tool| tool.schema.as_ref())
             .and_then(|schema| schema.properties.get(key).or(schema.additional.as_ref()));
         let value = convert(raw, parameter);
         arguments.insert(key.to_owned(), value);
@@ -1238,7 +1234,7 @@ fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
     // response instead leaves a client nothing to correct (Oh My Pi retried
     // the identical request until it gave up). Only a strict tool promises
     // arguments that satisfy its schema.
-    if tool.strict.is_some() {
+    if let Some(tool) = tool.filter(|tool| tool.strict.is_some()) {
         validate_arguments(tool, &arguments).map_err(|error| format!("{name}: {error}"))?;
     }
     Ok(ToolCall {
