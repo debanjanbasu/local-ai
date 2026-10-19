@@ -30,8 +30,9 @@ prompts, and numerics that a candidate's kernel changes legitimately alter.
 
 The model is loaded by `serve`, so hold the shared GPU lock for the whole run:
 
+    # Codex 0.163.0: npm install --prefix .amp/in/codex @openai/codex@0.163.0
     lockf /tmp/local-ai-gpu.lock python3 tools/agent_bench.py \\
-        --codex-bin .scratch/codex/node_modules/.bin/codex --label baseline-b09e22f
+        --codex-bin .amp/in/codex/node_modules/.bin/codex --label baseline-b09e22f
     tools/agent_bench.py --list
     tools/agent_bench.py --compare A/results.json B/results.json
 
@@ -1062,7 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
         if not getattr(args, f"{kind}_bin"):
             parser.error(f"--{kind}-bin is required (not on PATH)")
     seeds = [None if s == "default" else int(s) for s in args.seeds.split(",")]
-    out = (args.out or ROOT / ".scratch/artifacts/agent-bench" / time.strftime("run-%Y%m%dT%H%M%S")).resolve()
+    out = (args.out or ROOT / ".amp/in/artifacts/agent-bench" / time.strftime("run-%Y%m%dT%H%M%S")).resolve()
     out.mkdir(parents=True, exist_ok=True)
     work = args.work.resolve()
     if work.exists():
