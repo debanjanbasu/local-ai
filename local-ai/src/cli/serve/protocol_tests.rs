@@ -567,13 +567,18 @@ fn chat_parallel_tool_calls_and_strict_reach_the_engine() {
 fn chat_rejects_options_it_cannot_honour() {
     for (extra, needle) in [
         (json!({"n":2}), "n is not supported"),
-        (json!({"stop":["\n"]}), "stop"),
+        (json!({"stop":7}), "stop must be a string or an array"),
+        (json!({"stop":["a",1]}), "stop must be a string or an array"),
+        (json!({"stop":["a","b","c","d","e"]}), "at most 4 strings"),
         (json!({"logprobs":true}), "logprobs"),
         (json!({"logprobs":5}), "logprobs must be a boolean"),
         (json!({"logit_bias":{"1":2}}), "logit_bias"),
         (json!({"service_tier":"flex"}), "service_tier"),
         (json!({"store":true}), "store"),
-        (json!({"verbosity":"high"}), "verbosity"),
+        (
+            json!({"verbosity":"loud"}),
+            "verbosity must be low, medium or high",
+        ),
         (json!({"tools":[{"type":"web_search"}]}), "tool type"),
         (
             json!({"tools":[{"type":"function"}]}),
@@ -592,6 +597,57 @@ fn chat_rejects_options_it_cannot_honour() {
         "response_format":{"type":"text"},"parallel_tool_calls":true,"service_tier":"auto",
         "stream":null});
     assert!(chat_request(&accepted, true).is_ok());
+}
+
+/// `stop` is the engine's stop sequences; `verbosity` `low` and `high`
+/// end the system turn with an instruction, after the client's own.
+#[test]
+fn chat_maps_stop_and_verbosity() {
+    let with = |extra: Value| {
+        let mut body = json!({"messages":[{"role":"system","content":"S"},
+            {"role":"developer","content":"D"},user()]});
+        body.as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        chat_request(&body, true).expect("valid")
+    };
+    assert_eq!(with(json!({})).stop, Vec::<String>::new());
+    assert_eq!(with(json!({"stop":"END"})).stop, ["END"]);
+    assert_eq!(
+        with(json!({"stop":["a","\n\nUser:","c","d"]})).stop,
+        ["a", "\n\nUser:", "c", "d"]
+    );
+    let roles = |request: &ChatRequest| {
+        request
+            .messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect::<Vec<_>>()
+    };
+    let plain = roles(&with(json!({})));
+    assert_eq!(roles(&with(json!({"verbosity":"medium"}))), plain);
+    let mut lengths = Vec::new();
+    for level in ["low", "high"] {
+        let messages = roles(&with(json!({"verbosity":level})));
+        assert_eq!(messages.len(), plain.len() + 1, "{messages:?}");
+        assert_eq!(messages[..2], plain[..2], "the client's instructions lead");
+        assert_eq!(messages[2].0, "system");
+        assert_eq!(messages[3..], plain[2..]);
+        lengths.push(messages[2].1.clone());
+    }
+    assert_ne!(lengths[0], lengths[1]);
+    // With no instructions of its own, the instruction is the system turn.
+    let bare = chat_request(&json!({"messages":[user()],"verbosity":"low"}), true).expect("valid");
+    assert_eq!(roles(&bare)[0], ("system".to_owned(), lengths[0].clone()));
+    // A stop sequence that ends the text after calls still reports them.
+    assert_eq!(
+        super::response::chat_finish_reason(StopReason::Stopped, true),
+        "tool_calls"
+    );
+    assert_eq!(
+        super::response::chat_finish_reason(StopReason::Stopped, false),
+        "stop"
+    );
 }
 
 #[test]
@@ -1103,12 +1159,22 @@ fn responses_reject_what_they_cannot_honour() {
             json!({"input":"hi","include":["reasoning.encrypted_content"]}),
             "include",
         ),
-        (json!({"input":"hi","frobnicate":1}), "unknown field"),
         (
-            json!({"input":"hi","client_metadata":{"turn_id":42}}),
-            "expected a string",
+            json!({"input":"hi","text":{"verbosity":"loud"}}),
+            "text.verbosity must be low, medium or high",
         ),
-        (json!({"input":"hi","client_metadata":[]}), "expected a map"),
+        (
+            json!({"input":"hi","text":{"format":{"type":"text","extra":1}}}),
+            "unknown field text.format.extra",
+        ),
+        (
+            json!({"input":"hi","reasoning":{"effort":7,"vendor":1}}),
+            "invalid JSON request",
+        ),
+        (
+            json!({"input":"hi","temperature":"hot"}),
+            "invalid JSON request",
+        ),
         (
             json!({"input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]}),
             "must be a base64 data URL",
@@ -1144,6 +1210,13 @@ fn responses_reject_what_they_cannot_honour() {
         "tool_choice":"auto","parallel_tool_calls":true,"service_tier":"default",
         "reasoning":{"effort":"xhigh","summary":null},"conversation":null,"client_metadata":null});
     assert!(prepare_responses(accepted.to_string().as_bytes(), true).is_ok());
+    // Members this server does not know are ignored, as on Chat, at the top
+    // level and inside the objects it reads.
+    let vendor = json!({"input":"hi","frobnicate":1,"client_metadata":[],"extra_body":{"x":1},
+        "reasoning":{"effort":"low","vendor":true},"text":{"verbosity":"low","vendor":1},
+        "stream_options":{"vendor":1}});
+    let prepared = prepare_responses(vendor.to_string().as_bytes(), true).expect("ignored");
+    assert_eq!(prepared.request.effort, ReasoningEffort::Low);
 }
 
 fn responses_reply(body: &Value) -> Reply {
@@ -1919,8 +1992,27 @@ fn responses_text_format_maps_and_is_echoed_as_accepted() {
     let plain = json!({"input":"hi"});
     assert_eq!(
         terminal(&plain)["response"]["text"],
-        json!({"format":{"type":"text"}})
+        json!({"format":{"type":"text"},"verbosity":"medium"})
     );
+    // `low` and `high` are echoed and asked for after the instructions.
+    let plain_messages = prepare_responses(plain.to_string().as_bytes(), true)
+        .expect("valid")
+        .request
+        .messages;
+    for level in ["low", "high"] {
+        let body = json!({"input":"hi","instructions":"sys","text":{"verbosity":level}});
+        assert_eq!(terminal(&body)["response"]["text"]["verbosity"], level);
+        let messages = prepare_responses(body.to_string().as_bytes(), true)
+            .expect("valid")
+            .request
+            .messages;
+        assert_eq!(messages.len(), plain_messages.len() + 2, "{messages:?}");
+        assert_eq!(
+            (messages[0].content.as_str(), messages[1].role.as_str()),
+            ("sys", "system")
+        );
+        assert_eq!(messages[2].content, "hi");
+    }
     let object = json!({"input":"hi","text":{"format":{"type":"json_object"}}});
     let prepared = prepare_responses(object.to_string().as_bytes(), true).expect("valid");
     assert_eq!(prepared.request.response_format, ResponseFormat::JsonObject);
@@ -2050,6 +2142,8 @@ fn an_unfinished_structured_answer_is_never_reported_complete() {
     for (stop, complete, reason) in [
         (StopReason::TokenLimit, false, "length"),
         (StopReason::Eos, true, "stop"),
+        // A stop sequence the client asked for cut the document short.
+        (StopReason::Stopped, false, "stop"),
     ] {
         let mut frames = Frames::new(chat_reply(false));
         let _ = frames.event(Event::Content("{".into()));

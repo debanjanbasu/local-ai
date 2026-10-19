@@ -383,7 +383,7 @@ impl BonsaiEngine {
             if let Some(piece) = tokenizer.stream_step(&mut generation.decoder, sample.token_id)?
                 && !emit(&piece)
             {
-                generation.stop_reason = StopReason::Cancelled;
+                generation.stop_reason = StopReason::Stopped;
                 generation.stats.sampled_tokens += generation.pending.len();
                 generation.done = true;
                 break;

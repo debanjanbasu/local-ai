@@ -212,14 +212,15 @@ pub(super) fn add_alt_svc(response: &mut Response, state: &AppState) {
 
 pub(super) const fn finish_reason(reason: crate::bonsai_model::StopReason) -> &'static str {
     match reason {
-        crate::bonsai_model::StopReason::Eos => "stop",
+        crate::bonsai_model::StopReason::Eos | crate::bonsai_model::StopReason::Stopped => "stop",
         crate::bonsai_model::StopReason::TokenLimit => "length",
         crate::bonsai_model::StopReason::Cancelled => "cancelled",
     }
 }
 
 /// Chat finish reason, which reports `tool_calls` when the model ended its turn
-/// on one or more complete calls.
+/// on one or more complete calls, or a stop sequence ended the text after them
+/// (the calls still have to run).
 ///
 /// A token limit still wins: a call that was emitted before the budget ran out
 /// is complete, but the turn was cut short and the client has to know.
@@ -228,7 +229,11 @@ pub(super) const fn chat_finish_reason(
     called: bool,
 ) -> &'static str {
     match reason {
-        crate::bonsai_model::StopReason::Eos if called => "tool_calls",
+        crate::bonsai_model::StopReason::Eos | crate::bonsai_model::StopReason::Stopped
+            if called =>
+        {
+            "tool_calls"
+        }
         other => finish_reason(other),
     }
 }

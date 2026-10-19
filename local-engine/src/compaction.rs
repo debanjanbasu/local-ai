@@ -128,6 +128,7 @@ fn summary_request(
         tools,
         parallel_tool_calls: true,
         response_format: ResponseFormat::Text,
+        stop: Vec::new(),
     }
 }
 

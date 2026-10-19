@@ -30,6 +30,7 @@ fn main() -> local_engine::Result<()> {
         tool_choice: local_engine::ToolChoice::Auto,
         parallel_tool_calls: true,
         response_format: local_engine::ResponseFormat::Text,
+        stop: Vec::new(),
     };
     engine.chat_with(&request, |event| {
         if let Event::Content(text) = event {

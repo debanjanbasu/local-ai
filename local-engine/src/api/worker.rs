@@ -39,6 +39,8 @@ struct Prepared {
     session: Option<String>,
     thinking: bool,
     tools: Option<Arc<ToolSet>>,
+    /// The request's stop sequences, matched in its visible answer.
+    stop: Vec<String>,
     grammar: Option<Grammar>,
     events: async_mpsc::Sender<Delivered>,
     cancel: CancelToken,
@@ -113,7 +115,10 @@ impl Delivery {
     }
 
     pub(super) fn emit(&mut self, piece: &str) -> bool {
-        let mut splitter = std::mem::replace(&mut self.splitter, EventSplitter::new(false, None));
+        let mut splitter = std::mem::replace(
+            &mut self.splitter,
+            EventSplitter::new(false, None, Vec::new()),
+        );
         let flow = splitter.emit(piece, &mut |event| self.push(event));
         self.splitter = splitter;
         flow.is_continue()
@@ -132,12 +137,12 @@ impl Delivery {
                 return;
             }
         };
-        let mut splitter = std::mem::replace(&mut self.splitter, EventSplitter::new(false, None));
-        let finished = if splitter.failed() {
-            ControlFlow::Break(())
-        } else {
-            splitter.finish(output.stop_reason, &mut |event| self.push(event))
-        };
+        let mut splitter = std::mem::replace(
+            &mut self.splitter,
+            EventSplitter::new(false, None, Vec::new()),
+        );
+        let (finished, stop_reason) =
+            splitter.close(output.stop_reason, &mut |event| self.push(event));
         if let Some(failure) = splitter.take_failure() {
             // A parse failure is terminal: report it, never `Finished`.
             self.outbox
@@ -151,7 +156,7 @@ impl Delivery {
             return;
         }
         let stats = Stats {
-            stop_reason: output.stop_reason,
+            stop_reason,
             cache_source: output.cache_source,
             reasoning_tokens,
             generation: output.stats,
@@ -319,7 +324,7 @@ impl Worker {
             let mut delivery = Delivery {
                 events: prepared.events,
                 cancel: prepared.cancel,
-                splitter: EventSplitter::new(prepared.thinking, prepared.tools),
+                splitter: EventSplitter::new(prepared.thinking, prepared.tools, prepared.stop),
                 outbox: VecDeque::new(),
             };
             let cancel = delivery.cancel.clone();
@@ -346,38 +351,40 @@ impl Worker {
     /// Render and tokenize a job, answering it at once if that fails.
     /// Decisions were prepared when they were queued.
     fn prepare(&self, job: Job) -> Option<Pending> {
-        let (prompt, max_tokens, sampling, session, thinking, grammar, events, cancel) = match job {
-            Job::Decision(job) => return Some(Pending::Decision(job)),
-            Job::Chat(job) => {
-                let ChatJob {
-                    request,
-                    grammar,
-                    prompt,
-                    events,
-                    cancel,
-                } = *job;
-                let tokenizer = self.engine.inner.tokenizer();
-                // A request with images arrives tokenized and encoded.
-                let prompt = prompt.map_or_else(
-                    || {
-                        prepare_chat(&request).and_then(|(prompt, tools)| {
-                            Ok((encode_prompt(tokenizer, &prompt)?, None, tools))
-                        })
-                    },
-                    |prompt| Ok((prompt.ids, prompt.images, prompt.tools)),
-                );
-                (
-                    prompt,
-                    request.max_tokens,
-                    request.sampling,
-                    request.session,
-                    request.thinking,
-                    grammar,
-                    events,
-                    cancel,
-                )
-            }
-        };
+        let (prompt, max_tokens, sampling, session, thinking, stop, grammar, events, cancel) =
+            match job {
+                Job::Decision(job) => return Some(Pending::Decision(job)),
+                Job::Chat(job) => {
+                    let ChatJob {
+                        request,
+                        grammar,
+                        prompt,
+                        events,
+                        cancel,
+                    } = *job;
+                    let tokenizer = self.engine.inner.tokenizer();
+                    // A request with images arrives tokenized and encoded.
+                    let prompt = prompt.map_or_else(
+                        || {
+                            prepare_chat(&request).and_then(|(prompt, tools)| {
+                                Ok((encode_prompt(tokenizer, &prompt)?, None, tools))
+                            })
+                        },
+                        |prompt| Ok((prompt.ids, prompt.images, prompt.tools)),
+                    );
+                    (
+                        prompt,
+                        request.max_tokens,
+                        request.sampling,
+                        request.session,
+                        request.thinking,
+                        request.stop,
+                        grammar,
+                        events,
+                        cancel,
+                    )
+                }
+            };
         match prompt {
             Ok((ids, images, tools)) => {
                 let mut params = sampling.0;
@@ -389,6 +396,7 @@ impl Worker {
                     session,
                     thinking,
                     tools,
+                    stop,
                     grammar,
                     events,
                     cancel,

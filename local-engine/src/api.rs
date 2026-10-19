@@ -120,6 +120,15 @@ pub struct ChatRequest {
     /// answer is either a call or (unless a call is required) the final
     /// answer in this format, both enforced by one grammar.
     pub response_format: ResponseFormat,
+    /// Sequences that end the visible answer, as `OpenAI`'s Chat `stop`
+    /// does. Only answer text is matched: reasoning and tool-call markup and
+    /// arguments never are, though the text between calls is. Generation
+    /// stops at the first match, the content ends before it (the sequence is
+    /// never emitted, and no text that might still begin one is emitted
+    /// until it cannot), and [`Stats::stop_reason`] is
+    /// [`StopReason::Stopped`]. A call already made stands; a match before a
+    /// call means it is never made. Empty sequences never match.
+    pub stop: Vec<String>,
 }
 
 /// Typed automatic startup decisions.
@@ -408,6 +417,7 @@ impl Engine {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: true,
             response_format: ResponseFormat::Text,
+            stop: Vec::new(),
         };
         let mut content = String::new();
         let mut reasoning = String::new();
@@ -468,6 +478,7 @@ impl Engine {
             request.session.as_deref(),
             request.thinking,
             prompt.tools,
+            &request.stop,
             grammar,
             cancel,
             progress,
@@ -485,6 +496,7 @@ impl Engine {
         session: Option<&str>,
         thinking: bool,
         tools: Option<Arc<ToolSet>>,
+        stop: &[String],
         grammar: Option<Grammar>,
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
@@ -492,7 +504,7 @@ impl Engine {
     ) -> crate::Result<Stats> {
         let mut params = sampling.0.clone();
         params.max_tokens = max_tokens;
-        let mut splitter = EventSplitter::new(thinking, tools);
+        let mut splitter = EventSplitter::new(thinking, tools, stop.to_vec());
         let output = self.inner.generate_constrained(
             ids,
             &params,
@@ -505,11 +517,7 @@ impl Engine {
         )?;
         let reasoning_tokens = crate::bonsai_tokenizer::answer_start(&output.token_ids, thinking)
             .unwrap_or(output.token_ids.len());
-        let finished = if splitter.failed() {
-            ControlFlow::Break(())
-        } else {
-            splitter.finish(output.stop_reason, &mut callback)
-        };
+        let (finished, stop_reason) = splitter.close(output.stop_reason, &mut callback);
         if let Some(failure) = splitter.take_failure() {
             return Err(crate::Error::Generation(failure));
         }
@@ -530,7 +538,7 @@ impl Engine {
             });
         }
         let stats = Stats {
-            stop_reason: output.stop_reason,
+            stop_reason,
             cache_source: output.cache_source,
             reasoning_tokens,
             generation: output.stats,
@@ -728,7 +736,7 @@ impl EngineHandle {
     /// ```no_run
     /// # use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
     /// let handle = Engine::open()?.into_handle();
-    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, effort: local_engine::ReasoningEffort::default(), preserve_thinking: true, session: None, tools: Vec::new(), tool_choice: local_engine::ToolChoice::Auto, parallel_tool_calls: true, response_format: local_engine::ResponseFormat::Text };
+    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, effort: local_engine::ReasoningEffort::default(), preserve_thinking: true, session: None, tools: Vec::new(), tool_choice: local_engine::ToolChoice::Auto, parallel_tool_calls: true, response_format: local_engine::ResponseFormat::Text, stop: Vec::new() };
     /// for event in handle.chat(request)? {
     ///     if let Event::Content(text) = event { print!("{text}"); }
     /// }
@@ -1099,6 +1107,7 @@ impl EventStream {
     ///     tool_choice: local_engine::ToolChoice::Auto,
     ///     parallel_tool_calls: true,
     ///     response_format: local_engine::ResponseFormat::Text,
+    ///     stop: Vec::new(),
     /// })?;
     /// // Prefill has started, and the model has produced no text yet.
     /// assert!(matches!(
@@ -1440,7 +1449,8 @@ fn content_with_images(message: &ChatMessage) -> crate::Result<std::borrow::Cow<
 
 /// Splits generated text into reasoning, content and (when the request has
 /// tools) validated tool calls. Reasoning is split off first, so tool-call
-/// markup is only recognised in the visible answer.
+/// markup is only recognised in the visible answer, and stop sequences are
+/// matched last, in the content that remains.
 struct EventSplitter {
     /// Original template mode, retained after the reasoning delimiter for usage.
     thinking: bool,
@@ -1449,16 +1459,18 @@ struct EventSplitter {
     /// The chat template puts `\n\n` after `</think>`; drop it from the answer.
     answer_started: bool,
     tools: Option<ToolCallParser>,
+    stop: StopSequences,
 }
 
 impl EventSplitter {
-    fn new(reasoning: bool, tools: Option<Arc<ToolSet>>) -> Self {
+    fn new(reasoning: bool, tools: Option<Arc<ToolSet>>, stop: Vec<String>) -> Self {
         Self {
             thinking: reasoning,
             reasoning,
             pending: String::new(),
             answer_started: !reasoning,
             tools: tools.map(ToolCallParser::new),
+            stop: StopSequences::new(stop),
         }
     }
 
@@ -1486,9 +1498,10 @@ impl EventSplitter {
             return ControlFlow::Continue(());
         }
         self.answer_started = true;
+        let stop = &mut self.stop;
         match &mut self.tools {
-            Some(parser) => parser.feed(text, callback),
-            None => callback(Event::Content(text.to_owned())),
+            Some(parser) => parser.feed(text, &mut |event| stop.event(event, callback)),
+            None => stop.content(text, callback),
         }
     }
 
@@ -1549,11 +1562,144 @@ impl EventSplitter {
                 return ControlFlow::Break(());
             }
         }
-        self.tools
+        let stop = &mut self.stop;
+        let flow = self
+            .tools
             .as_mut()
             .map_or(ControlFlow::Continue(()), |parser| {
-                parser.finish(reason, callback)
+                parser.finish(reason, &mut |event| stop.event(event, callback))
+            });
+        if flow.is_break() {
+            return flow;
+        }
+        stop.flush(callback)
+    }
+
+    /// Close the stream of a generation the engine stopped for `reason`:
+    /// whether the consumer still listens, and the reason the engine API
+    /// reports. A stop sequence that matched, before or in the held text
+    /// flushed now, is [`StopReason::Stopped`], and what followed it is
+    /// dropped; any other refusal is the consumer stopping, [`StopReason::Cancelled`].
+    fn close(
+        &mut self,
+        reason: StopReason,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> (ControlFlow<()>, StopReason) {
+        if self.failed() {
+            return (ControlFlow::Break(()), reason);
+        }
+        if !self.stop.matched {
+            let reason = if reason == StopReason::Stopped {
+                StopReason::Cancelled
+            } else {
+                reason
+            };
+            let flow = self.finish(reason, callback);
+            if !self.stop.matched {
+                return (flow, reason);
+            }
+        }
+        (ControlFlow::Continue(()), StopReason::Stopped)
+    }
+}
+
+/// Ends the visible answer at the first of [`ChatRequest::stop`].
+///
+/// Content is held back while its end could still begin a sequence, so no
+/// part of a sequence is ever emitted; any other event releases what is held,
+/// since a call or the end of generation ends the text a sequence could span.
+struct StopSequences {
+    sequences: Vec<String>,
+    held: String,
+    /// A sequence matched: the answer is over and nothing more is emitted.
+    matched: bool,
+}
+
+impl StopSequences {
+    fn new(mut sequences: Vec<String>) -> Self {
+        sequences.retain(|sequence| !sequence.is_empty());
+        Self {
+            sequences,
+            held: String::new(),
+            matched: false,
+        }
+    }
+
+    fn event(
+        &mut self,
+        event: Event,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        match event {
+            Event::Content(text) => self.content(&text, callback),
+            _ if self.matched => ControlFlow::Break(()),
+            other => {
+                if self.flush(callback).is_break() {
+                    return ControlFlow::Break(());
+                }
+                callback(other)
+            }
+        }
+    }
+
+    /// Emit `text`, holding back a possible start of a sequence; at a match,
+    /// emit only what precedes it and break.
+    fn content(
+        &mut self,
+        text: &str,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        if self.matched {
+            return ControlFlow::Break(());
+        }
+        if self.sequences.is_empty() {
+            return callback(Event::Content(text.to_owned()));
+        }
+        self.held.push_str(text);
+        if let Some(at) = self
+            .sequences
+            .iter()
+            .filter_map(|sequence| self.held.find(sequence.as_str()))
+            .min()
+        {
+            self.held.truncate(at);
+            self.matched = true;
+            // The consumer's answer to the text before the match does not
+            // matter: generation is over either way.
+            let _ = self.flush(callback);
+            return ControlFlow::Break(());
+        }
+        // The longest end of `held` that begins a sequence. It starts where
+        // a sequence's first character does, so on a character boundary.
+        let partial = self
+            .sequences
+            .iter()
+            .filter_map(|sequence| {
+                (1..sequence.len().min(self.held.len() + 1))
+                    .rev()
+                    .find(|&length| {
+                        sequence
+                            .get(..length)
+                            .is_some_and(|prefix| self.held.ends_with(prefix))
+                    })
             })
+            .max()
+            .unwrap_or(0);
+        let ready = self.held.len() - partial;
+        if ready == 0 {
+            return ControlFlow::Continue(());
+        }
+        let rest = self.held.split_off(ready);
+        let text = std::mem::replace(&mut self.held, rest);
+        callback(Event::Content(text))
+    }
+
+    /// Emit the held text, which no sequence can complete any more.
+    fn flush(&mut self, callback: &mut impl FnMut(Event) -> ControlFlow<()>) -> ControlFlow<()> {
+        if self.held.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        callback(Event::Content(std::mem::take(&mut self.held)))
     }
 }
 

@@ -3,9 +3,11 @@
 //!
 //! Schema source: <https://developers.openai.com/api/reference/resources/responses/methods/create>
 //! and its streaming-events page. What is implemented is implemented to that
-//! shape; everything else is refused with a 400 naming the option, because a
-//! request answered as if an option were honoured when it was not is worse
-//! than one that fails:
+//! shape. A known option this server cannot honour is refused with a 400
+//! naming it, because a request answered as if an option were honoured when
+//! it was not is worse than one that fails, and so is a malformed value of a
+//! member it reads. Members it does not know are ignored, as on Chat
+//! Completions, so vendor extensions and newer fields do not break clients:
 //!
 //! - Storage is opt-in. Without `--response-store` nothing is kept: `store`
 //!   is reported as `false`, and `store: true` and `previous_response_id`
@@ -55,6 +57,9 @@
 //!   An answer the format did not complete is never `completed`: a token
 //!   limit is `incomplete` (`max_output_tokens`), and an end of turn during
 //!   reasoning, before any answer, is `failed`.
+//! - `text.verbosity` `low` and `high` add an instruction at the end of the
+//!   system turn (see [`super::request::add_verbosity`]), which the model has
+//!   no other control for; the Response echoes the level.
 //! - Text only: image, file and audio parts fail.
 //! - `reasoning.effort` runs at the checkpoint template's `low`, `medium` or
 //!   `xhigh` (`minimal` at `low`, `high` at `xhigh`; the Response reports the
@@ -107,8 +112,9 @@ use super::background::Temporary;
 use super::hosted::{Hosted, Kind};
 use super::reasoning_crypto::ReasoningCipher;
 use super::request::{
-    effective_reasoning, function_definition, repetition_penalty, responses_text_format,
-    responses_tool_choice, service_tier, tool_call, tool_policy,
+    add_verbosity, effective_reasoning, function_definition, repetition_penalty,
+    responses_text_format, responses_tool_choice, service_tier, tool_call, tool_policy,
+    verbosity_level,
 };
 use super::response::{Reply, arguments_text, new_id, unix_now};
 use super::store::{ResponseStore, StoredResponse};
@@ -121,7 +127,6 @@ use crate::GenerateParams;
 const COMPACTION_TRIGGER: &str = "compaction_trigger";
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ResponsesRequest {
     /// Checked by [`super::models::check_generation`]; the loaded model answers.
     model: Option<String>,
@@ -131,9 +136,6 @@ struct ResponsesRequest {
     /// Bounds the hosted tool calls this server runs for the Response.
     max_tool_calls: Option<u64>,
     metadata: Option<Value>,
-    /// Opaque client telemetry (Codex extension), never model input or stored.
-    #[allow(dead_code)]
-    client_metadata: Option<HashMap<String, String>>,
     parallel_tool_calls: Option<bool>,
     previous_response_id: Option<String>,
     reasoning: Option<Reasoning>,
@@ -167,19 +169,15 @@ struct ResponsesRequest {
     frequency_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
     // Deprecated members, accepted because clients still send them:
-    // `user` and `prompt_cache_retention` change nothing here, `session_id`
-    // (this server's former spelling) is `prompt_cache_key`, and
-    // `truncation` is checked by `reject_unsupported`.
-    #[allow(dead_code)]
-    user: Option<String>,
-    #[allow(dead_code)]
-    prompt_cache_retention: Option<Value>,
+    // `session_id` (this server's former spelling) is `prompt_cache_key`,
+    // and `truncation` is checked by `reject_unsupported`. `user` and
+    // `prompt_cache_retention` change nothing here and are ignored like any
+    // other unknown member, as Codex's `client_metadata` telemetry is.
     session_id: Option<String>,
     truncation: Option<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Reasoning {
     effort: Option<String>,
     summary: Option<String>,
@@ -190,13 +188,11 @@ struct Reasoning {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StreamOptions {
     include_obfuscation: Option<bool>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TextConfig {
     format: Option<Value>,
     verbosity: Option<String>,
@@ -210,6 +206,8 @@ pub(super) struct Echo {
     metadata: Value,
     /// The accepted `text.format`, as the Response reports it.
     text_format: Value,
+    /// The accepted `text.verbosity`, `medium` by default.
+    verbosity: &'static str,
     /// The accepted `tool_choice`: a mode string or the named function.
     tool_choice: Value,
     parallel_tool_calls: bool,
@@ -588,15 +586,6 @@ impl ResponsesRequest {
                 "not implemented",
             ));
         }
-        if let Some(text) = &self.text {
-            // `text.format` is parsed, strictly, in `prepare_responses_with`.
-            if !matches!(text.verbosity.as_deref(), None | Some("medium")) {
-                return Err(unsupported(
-                    "text.verbosity",
-                    "only the default, medium, is produced",
-                ));
-            }
-        }
         service_tier(self.service_tier.as_deref())
     }
 
@@ -865,6 +854,13 @@ pub(super) fn prepare_responses_conversing(
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let (response_format, text_format) =
         responses_text_format(request.text.as_ref().and_then(|text| text.format.as_ref()))?;
+    let verbosity = verbosity_level(
+        request
+            .text
+            .as_ref()
+            .and_then(|text| text.verbosity.as_deref()),
+        "text.verbosity",
+    )?;
     let empty_input = json!([]);
     let continues = request.previous_response_id.is_some() || conversation_id.is_some();
     let input = request
@@ -920,7 +916,8 @@ pub(super) fn prepare_responses_conversing(
         model,
         conversations,
     )?;
-    let messages = history.messages()?;
+    let mut messages = history.messages()?;
+    add_verbosity(&mut messages, verbosity);
     // Refused now, before generation, rather than when the append fails.
     let conversation = snapshot
         .map(|(conversations, id, version)| conversing(conversations, id, version, new_input))
@@ -937,6 +934,7 @@ pub(super) fn prepare_responses_conversing(
         max_output_tokens: request.max_output_tokens,
         metadata: request.metadata.clone().unwrap_or_else(|| json!({})),
         text_format,
+        verbosity,
         tool_choice: echoed_choice,
         parallel_tool_calls,
         tools: echoed_tools,
@@ -989,6 +987,7 @@ pub(super) fn prepare_responses_conversing(
             tool_choice: choice,
             parallel_tool_calls,
             response_format,
+            stop: Vec::new(),
         },
         echo,
         context_compaction,
@@ -1236,6 +1235,7 @@ impl PreparedResponses {
     /// `item` as the Response's first output item.
     pub(super) fn compacted(&mut self, item: Value, history: History) -> crate::Result<()> {
         self.request.messages = history.messages()?;
+        add_verbosity(&mut self.request.messages, self.echo.verbosity);
         self.history = history;
         self.echo.compaction = Some(item);
         Ok(())
@@ -3147,7 +3147,10 @@ impl ResponsesState {
             return self.fail(message);
         }
         let (kind, overall, item_status, incomplete, error) = match stats.stop_reason {
-            StopReason::Eos => ("response.completed", "completed", "completed", None, None),
+            // `Stopped` (a stop sequence) needs the `stop` Responses lacks.
+            StopReason::Eos | StopReason::Stopped => {
+                ("response.completed", "completed", "completed", None, None)
+            }
             StopReason::TokenLimit => (
                 "response.incomplete",
                 "incomplete",
@@ -3346,7 +3349,7 @@ impl ResponsesState {
             "access_programs":null,
             "service_tier":"default",
             "temperature":echo.temperature,
-            "text":{"format":echo.text_format},
+            "text":{"format":echo.text_format,"verbosity":echo.verbosity},
             "tool_choice":echo.tool_choice,
             "tools":echo.tools,
             "top_p":echo.top_p,

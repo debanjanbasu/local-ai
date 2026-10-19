@@ -955,7 +955,7 @@ impl ToolCallParser {
                         Some("invalid tool call: generation ended before </tool_call>".into());
                     return ControlFlow::Break(());
                 }
-                StopReason::TokenLimit | StopReason::Cancelled => {
+                StopReason::TokenLimit | StopReason::Cancelled | StopReason::Stopped => {
                     self.pending.clear();
                     self.in_call = false;
                     self.streamed = None;

@@ -101,7 +101,7 @@ rendered (messages, replayed tool calls and results, tool definitions and
 `thinking`) and tokenized, special tokens included, by the same code as
 `chat_with`, so the count equals `prompt_tokens` in the generation statistics,
 cached prefix included, and invalid prompt content fails with the error
-generation would return. `max_tokens`, `sampling`, `session`, `response_format`, `tool_choice`,
+generation would return. `max_tokens`, `sampling`, `session`, `response_format`, `stop`, `tool_choice`,
 `parallel_tool_calls` and tool `strict` are ignored (none of them changes the
 prompt); no schema or tool grammar is compiled and the count is not checked
 against the context window.
@@ -156,6 +156,22 @@ let mixed = model.embed_multimodal(&[vec![MediaPart::Text("Trail shoes. "), Medi
 # let _ = (photo, clip, mixed);
 # Ok::<(), local_engine::Error>(())
 ```
+
+## Stop sequences
+
+`ChatRequest::stop` lists sequences that end the visible answer, as `OpenAI`'s
+Chat `stop` does. Only answer text is matched: reasoning (up to `</think>`)
+and tool-call markup and arguments never are, but the text before, between
+and after calls is. At the first match generation stops, the content ends
+just before the sequence, and `Stats::stop_reason` is `StopReason::Stopped`.
+Content that could still be the start of a sequence is held back until it
+cannot, so no part of a sequence is ever emitted, even when it spans
+several tokens; held text is released before a tool call and at the end.
+A call made before the match stands; a match before a call means the call
+is never made. A JSON answer under a `response_format` is cut short like any
+other text (`response_format_complete` is `Some(false)`). Empty sequences
+never match. The engine stops at a token boundary with its state intact, as
+at a token limit, so the prompt cache keeps the turn.
 
 ## Structured output
 
@@ -249,6 +265,7 @@ let request = ChatRequest {
     tool_choice: ToolChoice::Auto,
     parallel_tool_calls: true,
     response_format: local_engine::ResponseFormat::Text,
+    stop: Vec::new(),
 };
 engine.chat_with(&request, |event| {
     if let Event::ToolCall(call) = event {

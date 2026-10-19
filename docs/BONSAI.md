@@ -262,10 +262,34 @@ Generation accepts `temperature`, `top_p`, `top_k`, `min_p`,
 and vLLM's multiplicative `repetition_penalty`, which replaces the one
 `frequency_penalty` maps to. Chat also takes vLLM's and llama.cpp's
 `chat_template_kwargs`, of which `enable_thinking: false` turns reasoning off
-(other keys are ignored), and, like any Chat member it does not know, a
-vendor field such as `extra_body` is ignored; the Responses parser still
-refuses unknown members. Chat limits output with `max_completion_tokens` (or
-`max_tokens`), Responses with `max_output_tokens`. Cache affinity is
+(other keys are ignored). Both APIs ignore members they do not know, at the
+top level and inside the objects they read (`reasoning`, `text`,
+`stream_options`), so a vendor field such as `extra_body` or a newer OpenAI
+member does not fail the request; a malformed value of a member they do read
+is still a 400, and so is an option they know but cannot honour. Chat limits
+output with `max_completion_tokens` (or `max_tokens`), Responses with
+`max_output_tokens`.
+
+Chat `stop` (a string or up to four strings) ends the visible answer at the
+first match: the content stops just before the sequence and `finish_reason`
+is `stop` (`tool_calls` when calls were made before it). As on OpenAI, only
+answer text is matched. Reasoning is never matched, so a sequence the model
+thinks about does not end its turn, and neither are tool-call markup and
+arguments, so a sequence inside a call's JSON cannot corrupt it; text before,
+between and after calls is. A call made before the match stands, and a match
+before a call means it is never made. Streaming holds back text that could
+still be the start of a sequence until it cannot, so a partial match is never
+sent. A JSON answer under `response_format` is cut short like any other text.
+Responses has no `stop`; the engine supports it for any request, so accepting
+`stop` there as a vendor extension would be a few lines of parsing, but it is
+not offered.
+
+`verbosity` (Chat) and `text.verbosity` (Responses) accept `low`, `medium`
+(the default) and `high`. The model has no verbosity control of its own, so
+`low` and `high` add one sentence at the end of the system turn, after the
+tools and the client's instructions (so the cached prefix before it is
+unchanged), asking for a concise or a thorough final answer; `medium` adds
+nothing. Responses echoes the level in `text.verbosity`. Cache affinity is
 `prompt_cache_key`. Chat Completions and Responses bodies are limited to
 64 MiB, since they may carry base64 images ([image input](#image-input));
 other JSON bodies to 2 MiB (multipart file and upload-part bodies have their
@@ -637,9 +661,9 @@ Administration API is described in [docs/ADMIN.md](ADMIN.md). None is implemente
 
 [Codex at 4aa94dc](https://github.com/openai/codex/tree/4aa94dce270de668eff6e2fa8585c82385e84455)
 uses stateless Responses, requests `reasoning.encrypted_content`, and sends
-`client_metadata` (an extension absent from the pinned public spec). Responses
-creation accepts that field as an optional string-to-string map, matching
-[Codex's request type](https://github.com/openai/codex/blob/4aa94dce270de668eff6e2fa8585c82385e84455/codex-rs/codex-api/src/common.rs#L278-L304).
+`client_metadata` (an extension absent from the pinned public spec; see
+[Codex's request type](https://github.com/openai/codex/blob/4aa94dce270de668eff6e2fa8585c82385e84455/codex-rs/codex-api/src/common.rs#L278-L304)).
+Responses creation ignores it like any member it does not know.
 It is opaque tracking data: discarded, not echoed or persisted, and never
 used for prompts, sampling or cache-session selection. It is distinct from
 the public `metadata` field, which is retained on the response. With
@@ -659,7 +683,7 @@ summary events separately; raw reasoning is not relabeled as a summary.
 The Oh My Pi example in the engine README configures that client to use only
 implemented capabilities.
 
-Chat rejects `store:true` and non-default `verbosity`.
+Chat rejects `store:true`.
 Error envelopes include nullable `code` and `param`; choices include nullable
 `logprobs`; Responses includes nullable `access_programs`. The model's `created`
 timestamp is its registration time at server startup, not its training date.
@@ -3280,7 +3304,8 @@ Gaps these runs found, all fixed on the branch:
   of the task (about 7,700).
 
 Not implemented: Codex's `remote_compaction = "v2"` (`compaction_trigger`
-input item), Chat `stop` sequences and `text.verbosity` other than `medium`.
+input item). Chat `stop` sequences and `verbosity` `low`/`high` were added
+afterwards (see [Generation requests](#generation-requests)).
 Evidence: `.scratch/artifacts/client-compat/final-a` (Codex, opencode
 Responses; its `codex-fix`, `codex-compact` and `opencode-cancel` predate the
 fixes above), `final-b` (Oh My Pi, Codex reruns, HTTP probes), `final-c`
