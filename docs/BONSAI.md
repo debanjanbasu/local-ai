@@ -268,7 +268,11 @@ top level and inside the objects they read (`reasoning`, `text`,
 member does not fail the request; a malformed value of a member they do read
 is still a 400, and so is an option they know but cannot honour. Chat limits
 output with `max_completion_tokens` (or `max_tokens`), Responses with
-`max_output_tokens`.
+`max_output_tokens`. Cache affinity is `prompt_cache_key`. Chat Completions
+and Responses bodies are limited to 64 MiB, since they may carry base64
+images ([image input](#image-input)); other JSON bodies to 2 MiB (multipart
+file and upload-part bodies have their own streamed limits). Audio input is
+rejected.
 
 Chat `stop` (a string or up to four strings) ends the visible answer at the
 first match: the content stops just before the sequence and `finish_reason`
@@ -286,14 +290,27 @@ not offered.
 
 `verbosity` (Chat) and `text.verbosity` (Responses) accept `low`, `medium`
 (the default) and `high`. The model has no verbosity control of its own, so
-`low` and `high` add one sentence at the end of the system turn, after the
-tools and the client's instructions (so the cached prefix before it is
-unchanged), asking for a concise or a thorough final answer; `medium` adds
-nothing. Responses echoes the level in `text.verbosity`. Cache affinity is
-`prompt_cache_key`. Chat Completions and Responses bodies are limited to
-64 MiB, since they may carry base64 images ([image input](#image-input));
-other JSON bodies to 2 MiB (multipart file and upload-part bodies have their
-own streamed limits). Audio input is rejected.
+`low` and `high` add a short instruction at the end of the system turn, after
+the tools and the client's instructions (so the cached prefix before it is
+unchanged): `low` asks for a few sentences or a short list without preamble
+or optional detail (code stays complete), `high` for a long answer in several
+sections with explanations, caveats and worked examples. `medium` adds
+nothing. Responses echoes the level in `text.verbosity`. A `high` answer can
+run to thousands of tokens, so a small output limit may leave it incomplete.
+Measured answer length in words on three prompts, at the default `xhigh`
+reasoning and with reasoning off, seed 7 (low / medium / high):
+
+| Prompt | xhigh | reasoning off |
+|---|---|---|
+| What is a hash table? | 42 / 256 / 742 | 43 / 563 / 738 |
+| Why is the sky blue? | 77 / 135 / 195 | 64 / 241 / 471 |
+| How do I reverse a list in Python? | 64 / 72 / 258 | 36 / 239 / 315 |
+
+With seed 11 at `xhigh` the same instructions gave 34 / 218 / 1989,
+41 / 126 / 346 and 56 / 113 / 181. Earlier wordings ("Be concise" alone, or
+"Verbosity is set to ..." without the concrete shape) moved `high` little at
+`xhigh` and sometimes left it below `medium`. Evidence:
+`.scratch/artifacts/request-surface/verbosity-*.json`.
 
 Chat supports function `tools`, assistant `tool_calls`, and tool-result messages
 with `tool_call_id`. Native rendering and validation belong to `local-engine`

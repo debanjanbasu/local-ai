@@ -248,14 +248,15 @@ pub(super) fn verbosity_level(level: Option<&str>, field: &str) -> crate::Result
 pub(super) fn add_verbosity(messages: &mut Vec<ChatMessage>, level: &str) {
     let instruction = match level {
         "low" => {
-            "Verbosity is set to low. Be concise: keep the final answer short and direct, with \
-             only what was asked and no preamble, restatement or optional detail."
+            "Verbosity is set to low. Be concise: answer in a few sentences or a short list, \
+             with only what was asked and no preamble, restatement, headings or optional \
+             detail. Code stays complete."
         }
         "high" => {
-            "Verbosity is set to high. Be thorough: make the final answer long, detailed and \
-             complete, explaining the reasoning behind it, covering the relevant details and \
-             caveats, and including examples where they help. This is about the answer, not \
-             the thinking: brief reasoning still ends in a full answer."
+            "Verbosity is set to high. Be thorough: give a long, comprehensive final answer \
+             organised in several sections. Explain how and why, cover related details, edge \
+             cases and caveats, and include worked examples; do not stop at a summary. However \
+             briefly you think, the answer itself is full length."
         }
         _ => return,
     };
