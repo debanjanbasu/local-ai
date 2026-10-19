@@ -30,6 +30,7 @@ mod embeddings;
 mod file_search;
 mod hosted;
 mod http3;
+mod images;
 mod journal;
 mod models;
 mod moderations;
@@ -48,7 +49,7 @@ mod transcription;
 mod vector_stores;
 
 #[cfg(test)]
-use self::request::message_text;
+use self::request::message_parts;
 #[cfg(test)]
 use axum::http::HeaderMap;
 #[cfg(test)]
@@ -59,6 +60,7 @@ use self::chunked::start_chunked;
 use self::http3::serve_h3;
 use self::options::{parse, usage};
 use self::reasoning_crypto::ReasoningCipher;
+#[cfg(test)]
 use self::request::prepare_generation;
 use self::response::{
     Protocol, Reply, add_alt_svc, error_response, error_status, error_status_message,
@@ -70,6 +72,8 @@ use self::sse::start_stream;
 use self::store::{ItemPage, PageError, ResponseStore};
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+/// Chat Completions and Responses bodies, which may carry base64 images.
+const MAX_GENERATION_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 struct Args {
@@ -343,7 +347,10 @@ async fn dispatch(
         )
         .await;
     };
-    let body = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
+    let body = match Limited::new(body, MAX_GENERATION_REQUEST_BYTES)
+        .collect()
+        .await
+    {
         Ok(value) => value.to_bytes().to_vec(),
         Err(error) => {
             let status = if error.is::<LengthLimitError>() {
@@ -741,7 +748,7 @@ fn prepare_retaining(
 ) -> crate::Result<(bool, ChatRequest, Protocol)> {
     match api {
         Api::Chat => {
-            let prepared = prepare_generation(body, thinking)?;
+            let prepared = request::prepare_generation_with(body, thinking, conversations)?;
             let protocol = Protocol::Chat {
                 include_usage: prepared.include_usage,
             };

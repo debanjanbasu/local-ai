@@ -1,4 +1,7 @@
-use super::{BonsaiOps, CommandBatch, KvLayout, MetalBuffer, arg, need, no_alias, sequence_bytes};
+use super::{
+    BonsaiOps, CommandBatch, KvLayout, MetalBuffer, Rope, arg, need, no_alias, rope_binding,
+    sequence_bytes,
+};
 
 impl BonsaiOps {
     pub fn prepare_attention(
@@ -60,6 +63,7 @@ impl BonsaiOps {
             epsilon,
             rope_base,
             tokens,
+            Rope::TEXT,
         )
     }
 
@@ -83,6 +87,7 @@ impl BonsaiOps {
         epsilon: f32,
         rope_base: f32,
         tokens: u32,
+        rope: Rope<'_>,
     ) -> crate::Result<()> {
         if capacity == 0
             || capacity > 262_144
@@ -96,6 +101,7 @@ impl BonsaiOps {
         {
             return Err(arg("invalid attention prep parameters"));
         }
+        let (rope_rows, rope_mode, rope_delta) = rope_binding(rope, q_norm, position, tokens)?;
         let codes = layout.codes();
         need(qg, sequence_bytes(tokens, 12288)?)?;
         need(k, sequence_bytes(tokens, 1024)?)?;
@@ -129,8 +135,9 @@ impl BonsaiOps {
                 (gate_out, 0),
                 (k_cache, 0),
                 (v_cache, 0),
+                rope_rows,
             ],
-            &[position, codes[0], codes[1]],
+            &[position, codes[0], codes[1], rope_mode, rope_delta],
             &[epsilon, rope_base],
             24 * tokens as usize,
             256,
@@ -166,6 +173,7 @@ impl BonsaiOps {
             epsilon,
             rope_base,
             tokens,
+            Rope::TEXT,
         )
     }
 
@@ -187,6 +195,7 @@ impl BonsaiOps {
         epsilon: f32,
         rope_base: f32,
         tokens: u32,
+        rope: Rope<'_>,
     ) -> crate::Result<()> {
         if capacity == 0
             || capacity > 262_144
@@ -200,6 +209,7 @@ impl BonsaiOps {
         {
             return Err(arg("invalid KV prep parameters"));
         }
+        let (rope_rows, rope_mode, rope_delta) = rope_binding(rope, k_norm, position, tokens)?;
         let codes = layout.codes();
         need(k, sequence_bytes(tokens, 1024)?)?;
         need(v, sequence_bytes(tokens, 1024)?)?;
@@ -211,8 +221,15 @@ impl BonsaiOps {
         self.go(
             b,
             15,
-            &[(k, 0), (v, 0), (k_norm, 0), (k_cache, 0), (v_cache, 0)],
-            &[position, codes[0], codes[1]],
+            &[
+                (k, 0),
+                (v, 0),
+                (k_norm, 0),
+                (k_cache, 0),
+                (v_cache, 0),
+                rope_rows,
+            ],
+            &[position, codes[0], codes[1], rope_mode, rope_delta],
             &[epsilon, rope_base],
             4 * tokens as usize,
             256,

@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
@@ -63,11 +64,48 @@ fn thinking_is_not_a_flag_because_it_already_is_the_default() {
     assert_eq!(error, "unknown option: --thinking", "{error}");
 }
 #[test]
-fn rejects_media_message_parts() {
-    assert!(message_text(&json!([{"type":"image_url"}])).is_err());
+fn image_parts_keep_their_place_in_the_text() {
+    let png = base64::engine::general_purpose::STANDARD.encode([137, 80, 78, 71]);
+    let parts = message_parts(
+        &json!([
+            {"type":"text","text":"before "},
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png}"),"detail":"low"}},
+            {"type":"text","text":"after"},
+            {"type":"file","file":{"file_data":png}},
+        ]),
+        None,
+    )
+    .expect("parts");
+    assert_eq!(parts.text, "before after");
+    let placed = parts
+        .images
+        .iter()
+        .map(|image| (image.offset, image.detail, image.data.len()))
+        .collect::<Vec<_>>();
     assert_eq!(
-        message_text(&json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]))
-            .expect("text"),
+        placed,
+        [
+            (7, local_engine::ImageDetail::Low, 4),
+            (12, local_engine::ImageDetail::Auto, 4)
+        ]
+    );
+    for refused in [
+        json!([{"type":"image_url"}]),
+        json!([{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]),
+        json!([{"type":"image_url","image_url":{"url":"data:image/png,abc"}}]),
+        json!([{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png}"),"detail":"max"}}]),
+        json!([{"type":"file","file":{"file_id":"file-1"}}]),
+        json!([{"type":"input_audio","input_audio":{}}]),
+    ] {
+        assert!(message_parts(&refused, None).is_err(), "{refused}");
+    }
+    assert_eq!(
+        message_parts(
+            &json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            None
+        )
+        .expect("text")
+        .text,
         "ab"
     );
 }

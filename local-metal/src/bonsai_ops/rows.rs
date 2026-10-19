@@ -10,8 +10,8 @@
 //! block kernels on a buffer holding only that row.
 
 use super::{
-    Bf16Matrix, BonsaiOps, CommandBatch, GDN_HEADS, GdnStateFormat, KvLayout, MetalBuffer, arg,
-    need, no_alias,
+    Bf16Matrix, BonsaiOps, CommandBatch, GDN_HEADS, GdnStateFormat, KvLayout, MetalBuffer, Rope,
+    arg, need, no_alias, rope_binding,
 };
 
 const QKV: usize = 10_240;
@@ -168,6 +168,7 @@ impl BonsaiOps {
         epsilon: f32,
         rope_base: f32,
         row: u32,
+        rope: Rope<'_>,
     ) -> crate::Result<()> {
         let [qg, k, v] = projections;
         let [q_norm, k_norm] = norms;
@@ -183,6 +184,7 @@ impl BonsaiOps {
         {
             return Err(arg("invalid attention prep parameters"));
         }
+        let (rope_rows, rope_mode, rope_delta) = rope_binding(rope, q_norm, position, 1)?;
         let (query_gate, query_gate_end) = row_extent(row, 2 * MIXED);
         let (kv, kv_end) = row_extent(row, 1024);
         let (mixed, mixed_end) = row_extent(row, MIXED);
@@ -219,8 +221,9 @@ impl BonsaiOps {
                 (gate_out, mixed),
                 (k_cache, 0),
                 (v_cache, 0),
+                rope_rows,
             ],
-            &[position, codes[0], codes[1]],
+            &[position, codes[0], codes[1], rope_mode, rope_delta],
             &[epsilon, rope_base],
             24,
             256,
@@ -448,6 +451,7 @@ impl BonsaiOps {
         constants: [f32; 2],
         row: u32,
         tokens: u32,
+        rope: Rope<'_>,
     ) -> crate::Result<()> {
         let [qg, k, v] = projections;
         let [q_norm, k_norm] = norms;
@@ -468,6 +472,7 @@ impl BonsaiOps {
         {
             return Err(arg("invalid attention prep parameters"));
         }
+        let (rope_rows, rope_mode, rope_delta) = rope_binding(rope, q_norm, position, tokens)?;
         let (query_gate, query_gate_end) = rows_extent(row, tokens, 2 * MIXED)?;
         let (kv, kv_end) = rows_extent(row, tokens, 1024)?;
         let (mixed, mixed_end) = rows_extent(row, tokens, MIXED)?;
@@ -504,8 +509,9 @@ impl BonsaiOps {
                 (gate_out, mixed),
                 (k_cache, 0),
                 (v_cache, 0),
+                rope_rows,
             ],
-            &[position, codes[0], codes[1]],
+            &[position, codes[0], codes[1], rope_mode, rope_delta],
             &[epsilon, rope_base],
             24 * tokens as usize,
             256,
@@ -527,6 +533,7 @@ impl BonsaiOps {
         constants: [f32; 2],
         row: u32,
         tokens: u32,
+        rope: Rope<'_>,
     ) -> crate::Result<()> {
         let [k, v] = projections;
         let [k_cache, v_cache] = caches;
@@ -545,6 +552,7 @@ impl BonsaiOps {
         {
             return Err(arg("invalid KV prep parameters"));
         }
+        let (rope_rows, rope_mode, rope_delta) = rope_binding(rope, k_norm, position, tokens)?;
         let (kv, kv_end) = rows_extent(row, tokens, 1024)?;
         need(k, kv_end)?;
         need(v, kv_end)?;
@@ -557,8 +565,15 @@ impl BonsaiOps {
         self.go(
             b,
             15,
-            &[(k, kv), (v, kv), (k_norm, 0), (k_cache, 0), (v_cache, 0)],
-            &[position, codes[0], codes[1]],
+            &[
+                (k, kv),
+                (v, kv),
+                (k_norm, 0),
+                (k_cache, 0),
+                (v_cache, 0),
+                rope_rows,
+            ],
+            &[position, codes[0], codes[1], rope_mode, rope_delta],
             &[epsilon, rope_base],
             4 * tokens as usize,
             256,

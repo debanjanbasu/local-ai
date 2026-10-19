@@ -880,7 +880,13 @@ pub(super) fn prepare_responses_conversing(
         Vec::new()
     };
     open_reasoning(&mut items, cipher, model)?;
-    let history = History::resolve(&items, request.instructions.clone(), cipher, model)?;
+    let history = History::resolve(
+        &items,
+        request.instructions.clone(),
+        cipher,
+        model,
+        conversations,
+    )?;
     let messages = history.messages()?;
     // Refused now, before generation, rather than when the append fails.
     let conversation = snapshot
@@ -1021,6 +1027,8 @@ pub(super) struct History {
     /// no compaction item, every item.
     items: Vec<Value>,
     instructions: Option<String>,
+    /// Where `input_image` parts naming a `file_id` read their bytes.
+    files: Option<ConversationStore>,
 }
 
 impl History {
@@ -1031,12 +1039,15 @@ impl History {
         instructions: Option<String>,
         cipher: Option<&Arc<ReasoningCipher>>,
         model: &str,
+        files: Option<&ConversationStore>,
     ) -> crate::Result<Self> {
+        let files = files.cloned();
         let Some(at) = latest(items) else {
             return Ok(Self {
                 summary: None,
                 items: items.to_vec(),
                 instructions,
+                files,
             });
         };
         let compacted = open_compaction(&items[at], cipher, model)?;
@@ -1047,6 +1058,7 @@ impl History {
             summary: Some(compacted.summary),
             items: kept,
             instructions,
+            files,
         })
     }
 
@@ -1059,8 +1071,11 @@ impl History {
     /// instructions. The summary follows the leading system and developer
     /// messages, which the template only takes first.
     fn messages_of(&self, items: &[Value]) -> crate::Result<Vec<ChatMessage>> {
-        let mut messages =
-            input_messages(&Value::Array(items.to_vec()), self.instructions.as_deref())?;
+        let mut messages = input_messages(
+            &Value::Array(items.to_vec()),
+            self.instructions.as_deref(),
+            self.files.as_ref(),
+        )?;
         if let Some(summary) = &self.summary {
             let at = messages
                 .iter()
@@ -1083,7 +1098,11 @@ impl History {
         count: impl Fn(Vec<ChatMessage>) -> crate::Result<usize>,
     ) -> crate::Result<Option<CompactionPass>> {
         let planned = plan(&self.items, keep_tokens, |slice| {
-            count(input_messages(&Value::Array(slice.to_vec()), None)?)
+            count(input_messages(
+                &Value::Array(slice.to_vec()),
+                None,
+                self.files.as_ref(),
+            )?)
         })?;
         let Some(planned) = planned else {
             return Ok(None);
@@ -1134,6 +1153,7 @@ impl CompactionPass {
             summary: Some(compacted.summary),
             items: compacted.items,
             instructions: from.instructions.clone(),
+            files: from.files.clone(),
         };
         Ok((item, history))
     }
@@ -1221,7 +1241,7 @@ pub(super) fn prepare_compact(
         _ => return Err(invalid("input is required")),
     }
     open_reasoning(&mut items, Some(cipher), model)?;
-    let history = History::resolve(&items, request.instructions, Some(cipher), model)?;
+    let history = History::resolve(&items, request.instructions, Some(cipher), model, None)?;
     // Invalid items fail here, before any generation.
     history.messages()?;
     Ok(PreparedCompact {
@@ -1376,6 +1396,7 @@ pub(super) fn prepare_resumed(
             prepared.history.instructions.clone(),
             cipher,
             model,
+            prepared.history.files.as_ref(),
         )?;
         prepared.compacted(item.clone(), history)?;
     }
@@ -1685,7 +1706,7 @@ fn flush(turn: &mut Turn, messages: &mut Vec<ChatMessage>) {
             content: content.unwrap_or_default(),
             reasoning_content: reasoning,
             tool_calls: calls,
-            tool_call_id: None,
+            ..ChatMessage::default()
         });
         messages.extend(answers);
     }
@@ -1695,9 +1716,8 @@ fn plain(role: &str, content: String, tool_call_id: Option<String>) -> ChatMessa
     ChatMessage {
         role: role.into(),
         content,
-        reasoning_content: None,
-        tool_calls: Vec::new(),
         tool_call_id,
+        ..ChatMessage::default()
     }
 }
 
@@ -1801,14 +1821,18 @@ fn normalize_input(input: &Value, items: &mut Vec<Value>) -> crate::Result<()> {
 }
 
 /// Convert already-authenticated `input` into the chat history the engine renders.
-fn input_messages(input: &Value, instructions: Option<&str>) -> crate::Result<Vec<ChatMessage>> {
+fn input_messages(
+    input: &Value,
+    instructions: Option<&str>,
+    files: Option<&ConversationStore>,
+) -> crate::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
     match input {
         Value::String(text) => messages.push(plain("user", text.clone(), None)),
         Value::Array(items) => {
             let mut turn = Turn::default();
             for item in items {
-                input_item(item, &mut turn, &mut messages)?;
+                input_item(item, &mut turn, &mut messages, files)?;
             }
             flush(&mut turn, &mut messages);
         }
@@ -1827,7 +1851,12 @@ fn input_messages(input: &Value, instructions: Option<&str>) -> crate::Result<Ve
     Ok(messages)
 }
 
-fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) -> crate::Result<()> {
+fn input_item(
+    item: &Value,
+    turn: &mut Turn,
+    messages: &mut Vec<ChatMessage>,
+    files: Option<&ConversationStore>,
+) -> crate::Result<()> {
     let kind = item.get("type").and_then(Value::as_str);
     match kind {
         None | Some("message") => {
@@ -1835,17 +1864,23 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
                 .get("role")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("a message input item requires a role"))?;
-            let content = item_text(item.get("content").unwrap_or(&Value::Null), role)?;
+            let parts = item_parts(item.get("content").unwrap_or(&Value::Null), role, files)?;
             match role {
                 "assistant" => {
+                    if !parts.images.is_empty() {
+                        return Err(invalid("assistant messages cannot contain images"));
+                    }
                     if turn.content.is_some() || !turn.calls.is_empty() {
                         flush(turn, messages);
                     }
-                    turn.content = Some(content);
+                    turn.content = Some(parts.text);
                 }
                 "user" | "system" | "developer" => {
                     flush(turn, messages);
-                    messages.push(plain(role, content, None));
+                    messages.push(ChatMessage {
+                        images: parts.images,
+                        ..plain(role, parts.text, None)
+                    });
                 }
                 other => return Err(invalid(format!("unsupported message role {other:?}"))),
             }
@@ -1878,11 +1913,15 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("a function_call_output item requires call_id"))?;
             let output = match item.get("output") {
-                Some(Value::String(text)) => text.clone(),
-                Some(parts @ Value::Array(_)) => item_text(parts, "tool")?,
+                Some(output @ (Value::String(_) | Value::Array(_))) => {
+                    item_parts(output, "tool", files)?
+                }
                 _ => return Err(invalid("function_call_output output must be text")),
             };
-            messages.push(plain("tool", output, Some(call_id.to_owned())));
+            messages.push(ChatMessage {
+                images: output.images,
+                ..plain("tool", output.text, Some(call_id.to_owned()))
+            });
         }
         Some("item_reference") => {
             return Err(unsupported(
@@ -1922,32 +1961,58 @@ fn input_item(item: &Value, turn: &mut Turn, messages: &mut Vec<ChatMessage>) ->
     Ok(())
 }
 
-/// Text of a message or tool output: a string, or text parts concatenated.
-fn item_text(content: &Value, role: &str) -> crate::Result<String> {
+/// Text and images of a message or tool output: a string, or text parts
+/// concatenated with each `input_image` (a base64 data URL `image_url` or
+/// an uploaded `file_id`, with `detail`) in its place.
+fn item_parts(
+    content: &Value,
+    role: &str,
+    files: Option<&ConversationStore>,
+) -> crate::Result<super::images::Parts> {
+    let mut out = super::images::Parts::default();
     match content {
-        Value::String(text) => Ok(text.clone()),
+        Value::String(text) => {
+            out.push_text(text);
+            Ok(out)
+        }
         Value::Array(parts) => {
-            let mut text = String::new();
             for part in parts {
                 let kind = part.get("type").and_then(Value::as_str).unwrap_or_default();
                 let field = match kind {
                     "input_text" | "output_text" => "text",
                     "refusal" if role == "assistant" => "refusal",
-                    "input_image" | "input_file" | "input_audio" => {
+                    "input_image" => {
+                        let data = match (
+                            part.get("image_url").and_then(Value::as_str),
+                            part.get("file_id").and_then(Value::as_str),
+                        ) {
+                            (Some(url), None) => super::images::url(url)?,
+                            (None, Some(id)) => super::images::file(files, id)?,
+                            _ => {
+                                return Err(invalid(
+                                    "an input_image part needs exactly one of image_url and \
+                                     file_id",
+                                ));
+                            }
+                        };
+                        out.push_image(data, super::images::detail(part.get("detail"))?);
+                        continue;
+                    }
+                    "input_file" | "input_audio" => {
                         return Err(unsupported(
                             &format!("content part {kind:?}"),
-                            "Bonsai 2 is text-only",
+                            "Bonsai 2 reads text and images (input_image)",
                         ));
                     }
                     other => {
                         return Err(invalid(format!("unsupported content part type {other:?}")));
                     }
                 };
-                text.push_str(part.get(field).and_then(Value::as_str).ok_or_else(|| {
+                out.push_text(part.get(field).and_then(Value::as_str).ok_or_else(|| {
                     invalid(format!("a {kind} content part requires a {field} string"))
                 })?);
             }
-            Ok(text)
+            Ok(out)
         }
         _ => Err(invalid(
             "message content must be a string or an array of parts",

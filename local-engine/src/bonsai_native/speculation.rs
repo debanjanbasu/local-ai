@@ -148,6 +148,7 @@ impl BonsaiModel {
                 &self.package,
                 committed_tokens,
                 speculation.mtp.embedding_rows(committed)?,
+                None,
             )?;
             self.encode_head_rows(&mut batch, speculation, committed, start)?;
         }
@@ -249,7 +250,12 @@ impl BonsaiModel {
         let mut drafts = Vec::with_capacity(depth);
         let mut token = seed;
         for step in 0..depth {
-            decode_embeddings(&self.package, &[token], speculation.mtp.embedding_rows(1)?)?;
+            decode_embeddings(
+                &self.package,
+                &[token],
+                speculation.mtp.embedding_rows(1)?,
+                None,
+            )?;
             let mtp = &speculation.mtp;
             let hidden = if step == 0 {
                 mtp.prev_hidden()

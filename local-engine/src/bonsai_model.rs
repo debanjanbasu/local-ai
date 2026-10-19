@@ -23,6 +23,7 @@ use crate::bonsai_ngram::{
     LookupPolicy, NgramSettings, SuffixSession, SuffixStore, fill_verify_tile,
 };
 use crate::bonsai_tokenizer::BonsaiTokenizer;
+use crate::bonsai_vision::PromptImages;
 use crate::prompt_cache::{self, DiskEntry};
 use crate::sampler::{Sampler, SamplingParams, SamplingResult};
 use crate::{GenerateParams, GenerationStats, MtpStats, NgramStats, PrefillProgress};
@@ -219,6 +220,16 @@ impl BonsaiEngine {
         }
     }
 
+    /// The decoder's input signs (width 5120), the basis image embeddings
+    /// are injected in.
+    #[doc(hidden)]
+    pub fn input_signs(&self) -> crate::Result<&[f32]> {
+        self.model
+            .package()
+            .hadamard()
+            .signs(crate::bonsai::WIDTH as u32)
+    }
+
     /// The tokenizer every prompt is encoded with; clone it to share it.
     pub const fn tokenizer(&self) -> &BonsaiTokenizer {
         &self.tokenizer
@@ -235,13 +246,67 @@ impl BonsaiEngine {
         prompt: &[u32],
         params: &GenerateParams,
     ) -> crate::Result<()> {
+        self.validate_with_images(prompt, params, None)
+    }
+
+    /// [`Self::validate_generation`] of a prompt whose image tokens `images`
+    /// describes.
+    pub(crate) fn validate_with_images(
+        &self,
+        prompt: &[u32],
+        params: &GenerateParams,
+        images: Option<&PromptImages>,
+    ) -> crate::Result<()> {
         crate::runtime::validate_generation_params(params)?;
-        validate_request(prompt, params.max_tokens, self.info.context)
+        validate_request(prompt, params.max_tokens, self.info.context, images)
     }
 }
 
-fn validate_request(prompt: &[u32], output: usize, context: usize) -> crate::Result<()> {
-    if prompt.is_empty() || prompt.iter().any(|&token| token as usize >= VOCAB) {
+impl BonsaiEngine {
+    /// Evaluation hook: the next-token logits after `prompt` (whose image
+    /// tokens `images` describes) and after each token of `continuation`
+    /// fed in turn, from empty state, bypassing every prompt cache.
+    #[doc(hidden)]
+    pub fn teacher_forced_logits(
+        &mut self,
+        prompt: &[u32],
+        images: Option<Arc<PromptImages>>,
+        continuation: &[u32],
+    ) -> crate::Result<Vec<Vec<f32>>> {
+        if !self.active.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "teacher forcing cannot run beside admitted generations".into(),
+            ));
+        }
+        validate_request(
+            prompt,
+            continuation.len(),
+            self.info.context,
+            images.as_deref(),
+        )?;
+        self.resident = None;
+        self.clear_gpu_cache();
+        self.model.reset();
+        self.model.set_images(images);
+        self.model.set_cancel(CancelToken::new());
+        self.model.set_device_greedy(false);
+        self.model.prefill(prompt, &mut |_| {})?;
+        let mut logits = vec![self.model.last_logits()];
+        for &token in continuation {
+            self.model.decode(token)?;
+            logits.push(self.model.last_logits());
+        }
+        Ok(logits)
+    }
+}
+
+fn validate_request(
+    prompt: &[u32],
+    output: usize,
+    context: usize,
+    images: Option<&PromptImages>,
+) -> crate::Result<()> {
+    if prompt.is_empty() || crate::bonsai_vision::check_tokens(prompt, 0, images).is_err() {
         return Err(crate::Error::InvalidArgument(
             "empty or invalid Bonsai prompt tokens".into(),
         ));

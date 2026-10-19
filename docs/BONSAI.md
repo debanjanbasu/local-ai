@@ -254,9 +254,11 @@ Generation accepts `temperature`, `top_p`, `top_k`, `min_p`,
 `presence_penalty`, `frequency_penalty` and `stream`; Responses also takes a
 `seed`, an extension of this server (Chat Completions samples with a fixed
 one). Chat limits output with `max_completion_tokens`, Responses with
-`max_output_tokens`. Cache affinity is `prompt_cache_key`. Requests are
-limited to 2 MiB (multipart file and upload-part bodies have their own
-streamed limits); media is rejected.
+`max_output_tokens`. Cache affinity is `prompt_cache_key`. Chat Completions
+and Responses bodies are limited to 64 MiB, since they may carry base64
+images ([image input](#image-input)); other JSON bodies to 2 MiB (multipart
+file and upload-part bodies have their own streamed limits). Audio input is
+rejected.
 
 Chat supports function `tools`, assistant `tool_calls`, and tool-result messages
 with `tool_call_id`. Native rendering and validation belong to `local-engine`
@@ -581,7 +583,7 @@ is accepted but never offered to the model, which cannot search here, while
 `file_search` runs natively over the vector stores),
 `include` values other than `file_search_call.results` and
 `reasoning.encrypted_content` (and that one without `--reasoning-key`),
-log-probabilities, images and audio are rejected.
+log-probabilities, remote image URLs and audio are rejected.
 `tool_choice` `auto`, `none`, `required` and a named function,
 `parallel_tool_calls` and tool `strict` are supported and enforced during
 decoding, as is a structured format beside tools; a grammar guarantees the
@@ -610,7 +612,8 @@ compaction and reasoning summaries are implemented with the loaded model
 evaluated scope ([below](#decisions)); embeddings,
 moderations, text to speech and transcription run on optional native models
 (EmbeddingGemma 2, its moderation heads, Kokoro-82M, Whisper large-v3; see the
-endpoint table), while image and audio input to generation still needs a
+endpoint table); image input to generation runs on the checkpoint's own
+vision tower ([image input](#image-input)), while audio input still needs a
 multimodal generator.
 Client-executed `custom`/`local_shell`/`apply_patch` tools, `file_search` over
 the vector stores and opt-in sandboxed hosted tools are described in
@@ -754,6 +757,93 @@ that detection. What it does now bound on this path is a request going
 undeliverable for longer than the budget, which a body that exists on the wire
 makes observable and a buffered body could not be at all. That buffered body is
 what one measured vanished client cost: 706 seconds of engine time.
+
+### Image input
+
+With Prism's BF16 vision projector installed beside the GGUF
+(`Ternary-Bonsai-2-27B-mmproj-BF16.gguf`, see the README's model install;
+size and SHA-256 are checked when it loads, in about 0.6 s), Chat Completions
+and Responses take images; without it an image part is a 400 naming the
+missing file, and the startup policy's `vision_reason` says why. There is no
+flag: the projector is discovered like the MTP head. The lossy Q8_0
+projector is not read.
+
+| API | Image parts |
+| --- | --- |
+| Chat Completions | `{"type":"image_url","image_url":{"url":"data:image/…;base64,…","detail":…}}` (or `image_url` as a bare string); `{"type":"file","file":{"file_id":…}}` or `{"file_data":"<base64>"}` |
+| Responses | `{"type":"input_image","image_url":"data:…","detail":…}` or `{"type":"input_image","file_id":…,"detail":…}`, in user messages and `function_call_output` |
+
+Images may sit anywhere among the text parts of user and tool messages and
+keep their place; system, developer and assistant messages cannot hold them,
+as in the checkpoint's chat template. `file_id` names an upload of the
+[Files API](#native-services) (at most 32 MiB per image). JPEG (decoded with
+libjpeg-turbo), PNG, WebP, GIF (first frame) and BMP are read. Remote
+`http(s)` URLs are refused rather than fetched: the server never fetches a
+URL a request names on its behalf, so send a data URL or upload the file.
+Conversations store `input_image` parts too (within the 4 MiB item limit,
+so larger images go by `file_id`).
+
+The template renders each image as
+`<|vision_start|><|image_pad|><|vision_end|>` exactly where the checkpoint's
+template does; the engine then replaces the pad with one token per merged
+2x2 patch group. `detail` sets the pixel budget the image is resized into
+(the processor's `smart_resize`: sides rounded to multiples of 32, at least
+65,536 pixels):
+
+| `detail` | Budget | Image tokens at most | Tower time, M4 Pro |
+| --- | ---: | ---: | --- |
+| `low` | 262,144 px | 256 | ≤ 0.2 s |
+| `auto` (default) | 4,194,304 px | 4,096 | 9 s at 4,015 tokens (a 2400x1800 photo) |
+| `high` | 16,777,216 px | 16,384 | attention grows with the square of the patches |
+
+`auto` is llama.cpp's mtmd limit for this architecture, the runtime Prism
+publishes the checkpoint for; `high` is the HF processor's own maximum.
+
+**Implementation.** The tower (`local-engine/src/bonsai_vision/`,
+`shaders/bonsai_vision.metal`) is the Qwen3.5 ViT: a 16x16 patch embedding
+over 2 temporal frames, bilinearly interpolated learned positions, 27
+pre-norm blocks of width 1152 (16 heads of 72, 2-D rotary positions,
+tanh-GELU MLP of 4304) and the 2x2 merger (LayerNorm, then an exact-erf
+GELU MLP to the decoder's width of 5120), all in F32 with BF16 weights widened exactly. Attention is
+bidirectional over the whole image, a flash-attention kernel with its online
+softmax on the score matrices' lanes, split into submissions of 2^24
+query-key pairs that yield to running decode steps, so a large image does
+not stall other streams. Encoded images are cached by content. Their rows
+enter the decoder in its signed-Hadamard input basis in place of token
+embeddings, and the decoder's interleaved M-RoPE takes `(t, h, w)` positions
+for image tokens; text after an image continues from the largest position
+plus one, as the HF model's `get_rope_index`.
+
+**Prompt caching.** Each image token has a virtual id above the vocabulary,
+derived from the projector digest, the digest of the resized pixels and its
+index, so every prompt-cache tier (GPU, host and disk snapshots) reuses a
+prefix only when the same image at the same resolution sits at the same
+place; a different image, or the same one at another `detail` that changes
+its size, misses from its first token. The n-gram drafter never proposes
+image tokens.
+
+**Parity.** References came from `bonsai-vision-ref`, a private Kaggle CPU
+job: HF transformers 5.20.1 `Qwen3_5VisionModel` in FP32 with the mmproj's
+weights, and llama.cpp mtmd from PrismML's fork on the pinned PTQ1 GGUF.
+`cargo run --release -p local-ai --bin bonsai-vision-eval -- tower|llama DIR`
+compares a download of its output (`bench IMAGE [detail]` times the tower):
+
+- Preprocessing against `Qwen2VLImageProcessorFast`: all pixels identical for
+  10 cases (a text card, four photos, one also at `low`, a 2400x1800 photo
+  at `auto`, 1600x96 and 96x1600 strips, a 7x5 image raised to the minimum).
+- Tower output against HF FP32: cosine 1.0000000 for every case (minimum
+  per-token cosine 1.000000), including the 4,015-token photo; per-block
+  outputs on the text card agree to cosine 1.0000000.
+- End to end against llama.cpp (five prompts: text only, text card, photo,
+  two images, multi-turn), next-token distributions over the first five
+  answer positions: KL ≤ 4.2e-4 nats (mostly ≤ 1e-4), top-1 identical at
+  every position, and greedy 24-token continuations identical in four of
+  five; the photo one diverges at token 18 between two wordings. With
+  llama.cpp's own image embeddings substituted for the native tower, all five
+  are identical, so the remaining difference is llama.cpp's tower: its
+  embeddings are 0.9991–0.99999 cosine from the native ones, which match
+  HF's exactly. The card's text (`BONSAI 27B`, `Vision test 2026`,
+  `Invoice #4821`, …) is read back verbatim.
 
 ### Compaction and reasoning summaries
 
@@ -1305,6 +1395,8 @@ All choices and reasons are reported in startup JSON.
 - **Speculation:** suffix lookup is enabled; the mixed ternary/int8 MTP head
   artifact, when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`,
   adds gated depth-3 drafting. Without it MTP is off and the policy says why.
+- **Vision:** image input whenever the BF16 projector sits beside the GGUF
+  ([image input](#image-input)); otherwise `vision_reason` says why.
 - **Prompt cache:** GPU checkpoint count (at most four) derives from
   working-set headroom. The disk budget is the smallest of the checkpoint's
   own size, an eighth of free disk and a quarter of physical memory; the
@@ -1722,6 +1814,13 @@ a 14-token prompt; 1.18 GB before the changes below). These footprint
 values count resident runtime memory; the 5.9 GB mapped checkpoint and the
 head remain file-backed, outside the footprint, and their resident pages vary
 with operating-system pressure.
+
+The vision projector's BF16 tensors are mapped the same way (931 MB file);
+only the summed F32 patch weights and the position table (14 MB) are copied.
+Encoding an image allocates about 48 KB of F32 activations per patch while it
+runs (0.8 GB for a 4,015-token image at `auto`, about 3 GB at the `high`
+maximum) and keeps recent embeddings (20 KB per image token) in a 512 MiB
+cache. The context fit does not count these transient buffers.
 
 Audit of one `bonsai --greedy --json --max-tokens 500` request on a
 15,920-token prompt (MTP and n-gram on, cold prompt cache), `footprint`

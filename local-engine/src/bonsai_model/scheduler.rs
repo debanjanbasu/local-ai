@@ -144,7 +144,7 @@ impl BonsaiEngine {
         session_id: Option<&str>,
         cancel: CancelToken,
     ) -> crate::Result<u64> {
-        self.admit_constrained(prompt, params, session_id, cancel, None)
+        self.admit_constrained(prompt, params, session_id, cancel, None, None)
     }
 
     /// [`Self::admit`] under a compiled response format, which every
@@ -156,6 +156,7 @@ impl BonsaiEngine {
         session_id: Option<&str>,
         cancel: CancelToken,
         grammar: Option<Grammar>,
+        images: Option<std::sync::Arc<crate::bonsai_vision::PromptImages>>,
     ) -> crate::Result<u64> {
         if self.active.len() >= MAX_BATCH_SEQUENCES {
             return Err(crate::Error::QueueFull);
@@ -164,7 +165,7 @@ impl BonsaiEngine {
         let id = self.next_generation;
         self.make_room_for(id)?;
         self.claim_gpu_cache();
-        match self.begin_generation(id, prompt, params, session_id, cancel, grammar) {
+        match self.begin_generation(id, prompt, params, session_id, cancel, grammar, images) {
             Ok(generation) => {
                 self.active.push(generation);
                 Ok(id)

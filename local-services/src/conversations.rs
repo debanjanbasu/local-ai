@@ -645,12 +645,10 @@ fn normalize_item(item: Value) -> Result<Item> {
             required_string(&body, "call_id", false)?;
             match body.get_mut("output") {
                 Some(Value::String(_)) => {}
-                Some(Value::Array(parts)) => {
-                    text_parts(parts, &["input_text"], "input_text", false)?;
-                }
+                Some(Value::Array(parts)) => input_parts(parts)?,
                 _ => {
                     return Err(invalid(
-                        "output must be a string or an array of input_text parts",
+                        "output must be a string or an array of input_text and input_image parts",
                     ));
                 }
             }
@@ -697,8 +695,9 @@ fn normalize_item(item: Value) -> Result<Item> {
     Ok(Item { id, body })
 }
 
-/// `user`, `system` and `developer` messages hold `input_text` parts;
-/// `assistant` messages hold `output_text` parts with annotations.
+/// `user`, `system` and `developer` messages hold `input_text` and
+/// `input_image` parts; `assistant` messages hold `output_text` parts with
+/// annotations.
 /// String content becomes a single part. Every returned message has a status.
 fn normalize_message(body: &mut Map<String, Value>) -> Result<()> {
     only_keys(body, &["role", "content", "status"])?;
@@ -733,7 +732,7 @@ fn normalize_message(body: &mut Map<String, Value>) -> Result<()> {
         Value::Array(parts) if assistant => {
             text_parts(parts, &["output_text", "input_text"], part, true)?;
         }
-        Value::Array(parts) => text_parts(parts, &["input_text"], part, false)?,
+        Value::Array(parts) => input_parts(parts)?,
         _ => return Err(invalid("message content must be a string or an array")),
     }
     default_status(body)
@@ -818,6 +817,49 @@ fn normalize_reasoning(body: &mut Map<String, Value>, has_id: bool) -> Result<()
         Some(_) => return Err(invalid("encrypted_content must be a string")),
     }
     check_status(body)
+}
+
+/// Check input parts: `input_text`, or `input_image` with exactly one of a
+/// string `image_url` or `file_id` (the other `null`) and a `detail` of
+/// `low`, `high` or `auto` (the default).
+fn input_parts(parts: &mut [Value]) -> Result<()> {
+    for part in parts {
+        let Value::Object(image) = &mut *part else {
+            return Err(invalid("a content part must be an object"));
+        };
+        if image.get("type").and_then(Value::as_str) != Some("input_image") {
+            text_parts(
+                std::slice::from_mut(part),
+                &["input_text", "input_image"],
+                "input_text",
+                false,
+            )?;
+            continue;
+        }
+        only_keys(image, &["type", "image_url", "file_id", "detail"])?;
+        let source = |key| match image.get(key) {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::String(value)) if !value.is_empty() => Ok(true),
+            _ => Err(invalid(format!("{key} must be a non-empty string or null"))),
+        };
+        if source("image_url")? == source("file_id")? {
+            return Err(invalid(
+                "an input_image part needs exactly one of image_url and file_id",
+            ));
+        }
+        for key in ["image_url", "file_id"] {
+            image.entry(key).or_insert(Value::Null);
+        }
+        match image
+            .entry("detail")
+            .or_insert_with(|| Value::String("auto".to_owned()))
+        {
+            Value::String(detail) if matches!(detail.as_str(), "low" | "high" | "auto") => {}
+            detail @ Value::Null => *detail = Value::String("auto".to_owned()),
+            _ => return Err(invalid("detail must be low, high or auto")),
+        }
+    }
+    Ok(())
 }
 
 /// Check text parts: each an object of an `accepted` type with a string

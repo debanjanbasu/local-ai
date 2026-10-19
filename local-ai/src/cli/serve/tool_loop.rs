@@ -302,15 +302,14 @@ impl Driver {
                 content: turn.content,
                 reasoning_content: (!turn.reasoning.is_empty()).then_some(turn.reasoning),
                 tool_calls: turn.calls,
-                tool_call_id: None,
+                ..ChatMessage::default()
             });
             for output in outputs {
                 request.messages.push(ChatMessage {
                     role: "tool".into(),
                     content: output.content,
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
                     tool_call_id: Some(output.call_id),
+                    ..ChatMessage::default()
                 });
             }
             request.max_tokens = left;

@@ -6,7 +6,10 @@ use super::{
     PromptPrefill, Sampler, SamplingParams, SamplingResult, SequenceState, StopReason,
     SuffixSession, VOCAB, fill_verify_tile,
 };
+use std::sync::Arc;
+
 use crate::bonsai_tokenizer::{BonsaiTokenizer, StreamDecodeState};
+use crate::bonsai_vision::PromptImages;
 use crate::structured::Grammar;
 
 /// Acceptance assumed for a sequence's first lookup drafts: a lookup fires
@@ -167,7 +170,9 @@ impl BonsaiEngine {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<BonsaiGeneration> {
-        self.generate_constrained(prompt, params, session_id, emit, cancel, progress, None)
+        self.generate_constrained(
+            prompt, params, session_id, emit, cancel, progress, None, None,
+        )
     }
 
     /// [`Self::generate_session_progress`] under a compiled response format.
@@ -181,13 +186,15 @@ impl BonsaiEngine {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
         grammar: Option<Grammar>,
+        images: Option<Arc<PromptImages>>,
     ) -> crate::Result<BonsaiGeneration> {
         if self.active_generations() != 0 {
             return Err(crate::Error::InvalidArgument(
                 "a single generation cannot run beside admitted ones".into(),
             ));
         }
-        let id = self.admit_constrained(prompt, params, session_id, cancel.clone(), grammar)?;
+        let id =
+            self.admit_constrained(prompt, params, session_id, cancel.clone(), grammar, images)?;
         loop {
             for (finished, result) in self.step(&mut |_, piece| emit(piece), &mut |_, report| {
                 progress(report);
@@ -202,6 +209,7 @@ impl BonsaiEngine {
     /// Validate a request whose sequence is resident in the model, restore
     /// its reusable prompt prefix and plan the rest of its prefill, which
     /// [`Self::prefill_round`] runs.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_generation(
         &mut self,
         id: u64,
@@ -210,11 +218,15 @@ impl BonsaiEngine {
         session_id: Option<&str>,
         cancel: CancelToken,
         grammar: Option<Grammar>,
+        images: Option<Arc<PromptImages>>,
     ) -> crate::Result<ActiveGeneration> {
         // Installed before anything can prefill, so the model always polls the
         // token belonging to the request in flight.
         self.model.set_cancel(cancel.clone());
-        self.validate_generation(prompt, params)?;
+        self.validate_with_images(prompt, params, images.as_deref())?;
+        // The resident sequence's prompt images, before any prefix restore
+        // or prefill reads them; they move with its buffers when parked.
+        self.model.set_images(images);
         let started = Instant::now();
         let stats = GenerationStats {
             prompt_tokens: prompt.len(),

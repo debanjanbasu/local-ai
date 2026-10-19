@@ -14,7 +14,7 @@
 
 use local_metal::batch::CommandBatch;
 use local_metal::bonsai::HadamardDirection;
-use local_metal::bonsai_ops::{AttentionWorkspace, KvLayout};
+use local_metal::bonsai_ops::{AttentionWorkspace, KvLayout, Rope};
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::MetalContext;
 
@@ -265,6 +265,7 @@ impl BonsaiMtp {
                 constants,
                 span.row as u32,
                 span.rows as u32,
+                Rope::TEXT,
             )?;
         }
         if drafts == 0 {
@@ -283,6 +284,7 @@ impl BonsaiMtp {
                 shared.epsilon,
                 shared.rope_base,
                 span.row as u32,
+                Rope::TEXT,
             )?;
         }
         // The sequences share one attention workspace, so they stay ordered.

@@ -24,6 +24,9 @@ pub struct Resources {
     pub model_reason: String,
     pub mtp: MtpMode,
     pub mtp_reason: String,
+    /// The vision projector beside the model, when installed.
+    pub vision: Option<PathBuf>,
+    pub vision_reason: String,
     pub prompt_cache_dir: Option<PathBuf>,
     pub disk_budget_bytes: u64,
     pub disk_reason: String,
@@ -77,6 +80,21 @@ impl Resources {
             let reason = "no MTP head artifact installed beside the model";
             (MtpMode::Off(Some(reason.into())), reason.into())
         };
+        // Image input whenever the projector is installed beside the model;
+        // the loader verifies it against the pinned export.
+        let vision = model
+            .parent()
+            .map(|dir| dir.join(crate::bonsai_vision::VISION_PROJECTOR_FILE))
+            .filter(|path| path.is_file());
+        let vision_reason = vision.as_ref().map_or_else(
+            || {
+                format!(
+                    "no {} installed beside the model; image input disabled",
+                    crate::bonsai_vision::VISION_PROJECTOR_FILE
+                )
+            },
+            |path| format!("vision projector {}", path.display()),
+        );
         let cache = std::env::var_os("HOME")
             .map(PathBuf::from)
             .map(|home| home.join("Library/Caches/local-ai/prompt-cache"));
@@ -116,6 +134,8 @@ impl Resources {
             model_reason,
             mtp,
             mtp_reason,
+            vision,
+            vision_reason,
             prompt_cache_dir,
             disk_budget_bytes,
             disk_reason,
@@ -132,6 +152,8 @@ impl Resources {
                 "model": self.model,
                 "model_reason": self.model_reason,
                 "mtp_reason": self.mtp_reason,
+                "vision": self.vision,
+                "vision_reason": self.vision_reason,
                 "physical_memory_bytes": self.physical_memory_bytes,
                 "prompt_cache_directory": self.prompt_cache_dir,
                 "prompt_cache_disk_budget_bytes": self.disk_budget_bytes,

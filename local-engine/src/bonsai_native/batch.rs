@@ -17,9 +17,10 @@
 //! for the rows of a prompt chunk prefilled in the same pass, and for its
 //! MTP heads drafting together (see `heads`).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use local_metal::bonsai_ops::AttentionWorkspace;
+use local_metal::bonsai_ops::{AttentionWorkspace, Rope};
 use local_metal::draft::GreedyRows;
 use local_metal::shaders::ShaderLibrary;
 
@@ -29,6 +30,7 @@ use super::{
     decode_embeddings, grow_cache, layers::decay_projection,
 };
 use crate::bonsai_mtp::HeadSequence;
+use crate::bonsai_vision::PromptImages;
 use crate::sampler::{Sampler, SamplingResult};
 
 mod heads;
@@ -60,6 +62,8 @@ pub struct SequenceState {
     position: usize,
     kv_allocated: usize,
     head: Option<HeadSequence>,
+    /// Images of this sequence's prompt.
+    images: Option<Arc<PromptImages>>,
 }
 
 impl SequenceState {
@@ -279,6 +283,10 @@ struct RowBuffers<'a> {
     /// Whether each sequence's rows advance its own state in place (a prompt
     /// chunk) rather than leave it for a commit to replay (verify rows).
     in_place: Vec<bool>,
+    /// Each sequence's rotary positions: `Ok(offset)` for text rows at
+    /// `position + offset`, `Err` for explicit rows in `scratch.rope` from
+    /// its first stacked row.
+    ropes: Vec<Result<i32, ()>>,
     /// Total stacked rows.
     rows: usize,
 }
@@ -328,6 +336,7 @@ impl BonsaiModel {
             position: 0,
             kv_allocated: self.kv_initial,
             head,
+            images: None,
         })
     }
 
@@ -353,6 +362,7 @@ impl BonsaiModel {
         std::mem::swap(&mut self.position, &mut parked.position);
         std::mem::swap(&mut self.kv_allocated, &mut parked.kv_allocated);
         std::mem::swap(&mut self.state_id, &mut parked.id);
+        std::mem::swap(&mut self.images, &mut parked.images);
         match (&mut self.speculation, &mut parked.head) {
             (Some(speculation), Some(head)) => {
                 speculation
@@ -441,8 +451,14 @@ impl BonsaiModel {
             || total > self.block_rows
             || residents > 1
             || prefill.as_ref().is_some_and(|chunk| {
+                let (position, images) = chunk
+                    .state
+                    .as_deref()
+                    .map_or((self.position, self.images.as_deref()), |state| {
+                        (state.position, state.images.as_deref())
+                    });
                 chunk.tokens.is_empty()
-                    || chunk.tokens.iter().any(|&token| token as usize >= VOCAB)
+                    || crate::bonsai_vision::check_tokens(chunk.tokens, position, images).is_err()
                     || self.speculation.as_ref().is_some_and(|speculation| {
                         chunk.tokens.len() > speculation.mtp.scratch_rows()
                     })
@@ -515,10 +531,24 @@ impl BonsaiModel {
                     .flat_map(|chunk| chunk.tokens.iter().copied()),
             )
             .collect::<Vec<_>>();
+        let prefill_images = prefill.as_ref().and_then(|chunk| {
+            chunk.state.as_deref().map_or_else(
+                || self.images.as_deref().map(|images| (images, self.position)),
+                |state| {
+                    state
+                        .images
+                        .as_deref()
+                        .map(|images| (images, state.position))
+                },
+            )
+        });
+        let embedding = self.scratch.embedding.as_mut_slice::<f32>();
+        decode_embeddings(&self.package, &tokens[..decoded], embedding, None)?;
         decode_embeddings(
             &self.package,
-            &tokens,
-            self.scratch.embedding.as_mut_slice::<f32>(),
+            &tokens[decoded..],
+            &mut embedding[decoded * WIDTH..],
+            prefill_images,
         )?;
         let buffers = self.row_buffers(rows, prefill.as_ref());
         let rows_u32 = total as u32;
@@ -958,6 +988,7 @@ impl BonsaiModel {
                     &self.package,
                     &lag.tokens[done..done + rows],
                     speculation.mtp.embedding_rows(rows)?,
+                    None,
                 )?;
                 let mut batch = CommandBatch::new(&self.context)?;
                 batch.blit_buffer_copies([BufferCopyRequest {
@@ -992,6 +1023,7 @@ impl BonsaiModel {
             capacities: Vec::new(),
             spans: Vec::new(),
             in_place: Vec::new(),
+            ropes: Vec::new(),
             rows: 0,
         };
         let sequences = rows
@@ -1038,6 +1070,18 @@ impl BonsaiModel {
             let (position, capacity) = state.map_or((self.position, self.kv_allocated), |state| {
                 (state.position, state.kv_allocated)
             });
+            let images = state.map_or(self.images.as_deref(), |state| state.images.as_deref());
+            buffers.ropes.push(images.map_or(Ok(0), |images| {
+                images.text_offset(position, length).ok_or_else(|| {
+                    super::block::write_rope_rows(
+                        &self.scratch.rope,
+                        images,
+                        position,
+                        length,
+                        buffers.rows,
+                    );
+                })
+            }));
             buffers.positions.push(position);
             buffers.capacities.push(capacity);
             buffers.spans.push((buffers.rows, length));
@@ -1071,7 +1115,16 @@ impl BonsaiModel {
         };
         let rows = chunk.tokens.len();
         let mut values = vec![0.0; rows * WIDTH];
-        decode_embeddings(&self.package, chunk.tokens, &mut values)?;
+        let images = chunk
+            .state
+            .as_deref()
+            .map_or(self.images.as_deref(), |state| state.images.as_deref());
+        decode_embeddings(
+            &self.package,
+            chunk.tokens,
+            &mut values,
+            images.map(|images| (images, position)),
+        )?;
         mtp.stage_embeddings(&values)?;
         let row_bytes = WIDTH * size_of::<f32>();
         let mut copies = vec![BufferCopyRequest {
@@ -1286,6 +1339,10 @@ impl BonsaiModel {
                 let (start, length) = buffers.spans[sequence];
                 let position = buffers.positions[sequence] as u32;
                 let capacity = buffers.capacities[sequence] as u32;
+                let rope = match buffers.ropes[sequence] {
+                    Ok(offset) => Rope::Text(offset),
+                    Err(()) => Rope::Rows(&scratch.rope, start * size_of::<[u32; 4]>()),
+                };
                 if length == 1 {
                     self.ops.prepare_attention_row_kv(
                         self.kv_layout,
@@ -1299,6 +1356,7 @@ impl BonsaiModel {
                         self.epsilon,
                         self.rope_base,
                         start as u32,
+                        rope,
                     )?;
                 } else {
                     self.ops.prepare_attention_rows_kv_at(
@@ -1312,6 +1370,7 @@ impl BonsaiModel {
                         [self.epsilon, self.rope_base],
                         start as u32,
                         length as u32,
+                        rope,
                     )?;
                 }
             }
