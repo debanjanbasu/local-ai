@@ -8,7 +8,9 @@ use local_engine::{Event, EventStream};
 
 use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
-use super::response::{Protocol, Reply, chat_finish_reason, chat_tool_call, checked, usage_json};
+use super::response::{
+    Protocol, Reply, arguments_text, chat_finish_reason, chat_tool_call, checked, usage_json,
+};
 use super::responses::{ResponsesState, sse_frame};
 
 /// Start a streaming response and hand the frame receiver to axum.
@@ -138,8 +140,11 @@ pub(super) enum Frames {
         include_usage: bool,
         /// Whether a chunk has carried `role` yet; `OpenAI` sends it once, first.
         announced: bool,
-        /// Complete calls sent so far, which is also the next call's `index`.
+        /// Calls begun so far, which is also the next call's `index`.
         calls: usize,
+        /// The call whose arguments are streaming: its ID and the bytes of
+        /// its arguments sent.
+        open: Option<(String, usize)>,
     },
     Responses(Box<ResponsesState>),
 }
@@ -152,6 +157,7 @@ impl Frames {
                 include_usage,
                 announced: false,
                 calls: 0,
+                open: None,
             },
             Protocol::Responses(echo) => {
                 Self::Responses(Box::new(ResponsesState::new(&reply, echo, true)))
@@ -180,7 +186,14 @@ impl Frames {
                 include_usage,
                 announced,
                 calls,
-            } => chat_frames(reply, *include_usage, announced, calls, checked(event)),
+                open,
+            } => chat_frames(
+                reply,
+                *include_usage,
+                announced,
+                (calls, open),
+                checked(event),
+            ),
             Self::Responses(state) => {
                 state.event(event);
                 state.take_events().iter().map(sse_frame).collect()
@@ -202,22 +215,45 @@ fn chat_frames(
     reply: &Reply,
     include_usage: bool,
     announced: &mut bool,
-    calls: &mut usize,
+    (calls, open): (&mut usize, &mut Option<(String, usize)>),
     event: Event,
 ) -> Vec<String> {
     let chunk = |delta: Value, finish: Option<&str>| json!({"id":reply.id,"object":"chat.completion.chunk","created":reply.created,"model":reply.model.as_ref(),"choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
     let mut delta = match event {
         Event::Content(piece) => json!({"content":piece}),
         Event::Reasoning(piece) => json!({"reasoning_content":piece}),
-        // The engine reports a call only once it is complete and validated, so
-        // the whole call — ID, name and every argument — goes out in one delta.
-        // That is buffering in the engine, not incremental argument streaming,
-        // and clients that concatenate `arguments` fragments read it unchanged.
-        Event::ToolCall(call) => {
-            let index = *calls;
-            *calls += 1;
-            json!({"tool_calls":[chat_tool_call(index, &call)]})
+        // A call streams as the engine writes it: its first delta carries the
+        // ID, type and name, every later one only more `arguments`, and the
+        // validated call then sends whatever its arguments still lack
+        // (usually the closing brace), so the fragments concatenate to them.
+        Event::ToolCallDelta(delta) => {
+            if open.as_ref().is_some_and(|(id, _)| *id == delta.id) {
+                if let Some((_, sent)) = open.as_mut() {
+                    *sent += delta.arguments.len();
+                }
+                json!({"tool_calls":[{"index":*calls - 1,"function":{"arguments":delta.arguments}}]})
+            } else {
+                *open = Some((delta.id.clone(), delta.arguments.len()));
+                *calls += 1;
+                json!({"tool_calls":[{"index":*calls - 1,"id":delta.id,"type":"function","function":{"name":delta.name,"arguments":delta.arguments}}]})
+            }
         }
+        Event::ToolCall(call) => match open.take() {
+            Some((id, sent)) if id == call.id => {
+                let arguments = arguments_text(&call);
+                debug_assert!(sent <= arguments.len(), "streamed past the arguments");
+                let rest = arguments.get(sent..).unwrap_or_default();
+                if rest.is_empty() {
+                    return Vec::new();
+                }
+                json!({"tool_calls":[{"index":*calls - 1,"function":{"arguments":rest}}]})
+            }
+            _ => {
+                let index = *calls;
+                *calls += 1;
+                json!({"tool_calls":[chat_tool_call(index, &call)]})
+            }
+        },
         Event::Finished(stats) => {
             let finish = chat_finish_reason(stats.stop_reason, *calls > 0);
             let mut frames = vec![data(&chunk(json!({}), Some(finish)))];

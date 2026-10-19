@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::ops::ControlFlow;
 
-use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
+use local_engine::{ChatMessage, ChatRequest, Engine, Event, ReasoningEffort, Sampling};
 
 fn main() -> local_engine::Result<()> {
     let mut engine = match Engine::open() {
@@ -23,6 +23,8 @@ fn main() -> local_engine::Result<()> {
         max_tokens: 128,
         sampling: Sampling::default(),
         thinking: true,
+        effort: ReasoningEffort::default(),
+        preserve_thinking: true,
         session: None,
         tools: Vec::new(),
         tool_choice: local_engine::ToolChoice::Auto,

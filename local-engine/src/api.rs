@@ -16,12 +16,14 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 use crate::bonsai_model::{BonsaiEngine, BonsaiInfo, CancelToken, PromptCacheSource, StopReason};
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
-use crate::bonsai_tokenizer::BonsaiTokenizer;
+use crate::bonsai_tokenizer::{BonsaiTokenizer, ReasoningEffort};
 use crate::judgment::{Decision, DecisionCapture, DecisionRequest, JudgmentHead, PreparedDecision};
 use crate::resources::{PREFILL_CHUNK, Resources, SERVE_QUEUE};
 use crate::runtime::{EVENT_BUFFER, PrefillProgress};
 use crate::structured::{Grammar, ResponseFormat};
-use crate::tools::{ToolCall, ToolCallParser, ToolChoice, ToolDefinition, ToolSet, Turn};
+use crate::tools::{
+    ToolCall, ToolCallDelta, ToolCallParser, ToolChoice, ToolDefinition, ToolSet, Turn,
+};
 use crate::{GenerateParams, GenerationStats};
 
 mod worker;
@@ -63,8 +65,15 @@ pub struct ChatRequest {
     pub max_tokens: usize,
     /// Sampling controls.
     pub sampling: Sampling,
-    /// Whether to ask the model for xhigh reasoning.
+    /// Whether the model reasons before answering.
     pub thinking: bool,
+    /// How hard it reasons when `thinking`; ignored otherwise.
+    pub effort: ReasoningEffort,
+    /// Whether assistant turns up to the last user query keep their
+    /// reasoning when rendered (the template's `preserve_thinking`, on by
+    /// default). `false` drops it, as `OpenAI`'s `reasoning.context:
+    /// "current_turn"` does; turns after that query always keep theirs.
+    pub preserve_thinking: bool,
     /// Optional prompt-cache affinity hint.
     pub session: Option<String>,
     /// Functions the model may call. Empty disables tool-call parsing, so
@@ -155,10 +164,14 @@ pub enum Event {
     Content(String),
     /// Hidden reasoning text when the template exposes it separately.
     Reasoning(String),
+    /// Part of a call's arguments while the call is generated (see
+    /// [`ToolCallDelta`]). Emitted only for requests with tools; a consumer
+    /// that only wants complete calls can ignore it.
+    ToolCallDelta(ToolCallDelta),
     /// A complete call whose name and arguments passed the tool's schema.
     ///
     /// Emitted only for requests with tools, once `</tool_call>` has been
-    /// generated and parsed; never partial. The engine does not execute it. A
+    /// generated and parsed, with the ID of the call's deltas. The engine does not execute it. A
     /// malformed, invalid or truncated call ends the generation with an error
     /// instead ([`Event::Error`] on a stream, `Err` from the synchronous API)
     /// and no [`Event::Finished`].
@@ -311,7 +324,12 @@ impl Engine {
         thinking: bool,
         tools: &[ToolDefinition],
     ) -> crate::Result<String> {
-        render_messages(messages, thinking, &ToolSet::new(tools)?)
+        render_messages(
+            messages,
+            thinking.then_some(ReasoningEffort::XHigh),
+            true,
+            &ToolSet::new(tools)?,
+        )
     }
 
     /// Count the prompt tokens `request` would prefill, without generating.
@@ -347,6 +365,8 @@ impl Engine {
             max_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
             sampling: Sampling::default(),
             thinking: true,
+            effort: ReasoningEffort::default(),
+            preserve_thinking: true,
             session: None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
@@ -363,7 +383,10 @@ impl Engine {
                 Event::Reasoning(piece) => reasoning.push_str(&piece),
                 Event::ToolCall(call) => tool_calls.push(call),
                 Event::TokenIds(ids) => token_ids = ids,
-                Event::ToolOutput(_) | Event::Finished(_) | Event::Error(_) => {}
+                Event::ToolCallDelta(_)
+                | Event::ToolOutput(_)
+                | Event::Finished(_)
+                | Event::Error(_) => {}
             }
             ControlFlow::Continue(())
         })?;
@@ -655,7 +678,7 @@ impl EngineHandle {
     /// ```no_run
     /// # use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
     /// let handle = Engine::open()?.into_handle();
-    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, session: None, tools: Vec::new(), tool_choice: local_engine::ToolChoice::Auto, parallel_tool_calls: true, response_format: local_engine::ResponseFormat::Text };
+    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, effort: local_engine::ReasoningEffort::default(), preserve_thinking: true, session: None, tools: Vec::new(), tool_choice: local_engine::ToolChoice::Auto, parallel_tool_calls: true, response_format: local_engine::ResponseFormat::Text };
     /// for event in handle.chat(request)? {
     ///     if let Event::Content(text) = event { print!("{text}"); }
     /// }
@@ -1003,6 +1026,8 @@ impl EventStream {
     ///     max_tokens: 8,
     ///     sampling: local_engine::Sampling::default(),
     ///     thinking: false,
+    ///     effort: local_engine::ReasoningEffort::default(),
+    ///     preserve_thinking: true,
     ///     session: None,
     ///     tools: Vec::new(),
     ///     tool_choice: local_engine::ToolChoice::Auto,
@@ -1119,7 +1144,12 @@ impl Drop for EventStream {
 /// synchronous [`Engine`] and the worker.
 fn prepare_chat(request: &ChatRequest) -> crate::Result<(String, Option<Arc<ToolSet>>)> {
     let tools = ToolSet::new(&request.tools)?;
-    let prompt = render_messages(&request.messages, request.thinking, &tools)?;
+    let prompt = render_messages(
+        &request.messages,
+        request.thinking.then_some(request.effort),
+        request.preserve_thinking,
+        &tools,
+    )?;
     Ok((prompt, (!tools.is_empty()).then(|| Arc::new(tools))))
 }
 
@@ -1179,7 +1209,8 @@ fn count_chat(tokenizer: &BonsaiTokenizer, request: &ChatRequest) -> crate::Resu
 
 fn render_messages(
     messages: &[ChatMessage],
-    thinking: bool,
+    thinking: Option<ReasoningEffort>,
+    preserve_thinking: bool,
     tools: &ToolSet,
 ) -> crate::Result<String> {
     let turns = messages
@@ -1192,7 +1223,7 @@ fn render_messages(
             tool_call_id: message.tool_call_id.as_deref(),
         })
         .collect::<Vec<_>>();
-    crate::tools::render(&turns, thinking, tools)
+    crate::tools::render(&turns, thinking, preserve_thinking, tools)
 }
 
 /// Splits generated text into reasoning, content and (when the request has

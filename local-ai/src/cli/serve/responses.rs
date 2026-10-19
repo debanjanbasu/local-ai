@@ -53,8 +53,12 @@
 //!   limit is `incomplete` (`max_output_tokens`), and an end of turn during
 //!   reasoning, before any answer, is `failed`.
 //! - Text only: image, file and audio parts fail.
-//! - `reasoning.effort` is `none` or `xhigh`, the checkpoint's only two modes,
-//!   and raw reasoning is returned as `reasoning_text` content, never as a
+//! - `reasoning.effort` runs at the checkpoint template's `low`, `medium` or
+//!   `xhigh` (`minimal` at `low`, `high` at `xhigh`; the Response reports the
+//!   level that ran) or not at all (`none`). `reasoning.context`
+//!   `current_turn` renders earlier turns without their reasoning, as the
+//!   template's `preserve_thinking: false` does; `auto` and `all_turns` keep
+//!   it (the template's default). Raw reasoning is returned as `reasoning_text` content, never as a
 //!   summary. `reasoning.summary` (`auto`, `concise` or `detailed`) runs a
 //!   second, short generation of the same model after the first ends, which
 //!   summarizes the raw reasoning into the reasoning item's `summary` with
@@ -84,15 +88,19 @@ use local_engine::bonsai_model::StopReason;
 use local_engine::compaction::{
     SummaryDetail, compaction_request, reasoning_summary_request, summary_message,
 };
-use local_engine::{ChatMessage, ChatRequest, Event, Sampling, Stats, ToolCall, ToolDefinition};
+use local_engine::{
+    ChatMessage, ChatRequest, Event, ReasoningEffort, Sampling, Stats, ToolCall, ToolCallDelta,
+    ToolDefinition,
+};
 use local_services::compaction::{COMPACTION, Compacted, latest, plan};
 use local_services::conversations::{MAX_APPEND_ITEMS, MAX_ID_CHARS};
 use local_services::{Append, Error as ServiceError, Store as ConversationStore};
 
 use super::background::Temporary;
+use super::hosted::{Hosted, Kind};
 use super::reasoning_crypto::ReasoningCipher;
 use super::request::{
-    deprecated_field, effective_thinking, function_definition, reject_deprecated,
+    deprecated_field, effective_reasoning, function_definition, reject_deprecated,
     responses_text_format, responses_tool_choice, service_tier, tool_call, tool_policy,
 };
 use super::response::{Reply, arguments_text, new_id, unix_now};
@@ -199,7 +207,10 @@ pub(super) struct Echo {
     tools: Vec<Value>,
     temperature: f32,
     top_p: f32,
+    /// The reasoning level that ran, as `reasoning.effort` reports it.
     effort: &'static str,
+    /// The effective `reasoning.context`.
+    context: &'static str,
     prompt_cache_key: Option<String>,
     safety_identifier: Option<String>,
     previous_response_id: Option<String>,
@@ -629,27 +640,30 @@ fn context_compaction(value: Option<&Value>) -> crate::Result<Option<ContextComp
     }
 }
 
-/// The effort to run at, refusing reasoning options this server cannot honour.
-fn reasoning_effort(reasoning: Option<&Reasoning>) -> crate::Result<Option<&str>> {
+/// The requested effort, and whether earlier turns keep their reasoning
+/// (`reasoning.context`: `current_turn` drops it; `auto`, the default, keeps
+/// it as the checkpoint template does), refusing options this server cannot
+/// honour.
+fn reasoning_options(reasoning: Option<&Reasoning>) -> crate::Result<(Option<&str>, bool)> {
     let Some(reasoning) = reasoning else {
-        return Ok(None);
+        return Ok((None, true));
     };
-    if !matches!(
-        reasoning.context.as_deref(),
-        None | Some("auto" | "all_turns")
-    ) {
-        return Err(unsupported(
-            "reasoning.context",
-            "earlier reasoning is rendered exactly as it is sent in input",
-        ));
-    }
+    let preserve = match reasoning.context.as_deref() {
+        None | Some("auto" | "all_turns") => true,
+        Some("current_turn") => false,
+        Some(other) => {
+            return Err(invalid(format!(
+                "reasoning.context {other:?} is not one of auto, current_turn or all_turns"
+            )));
+        }
+    };
     if !matches!(reasoning.mode.as_deref(), None | Some("standard")) {
         return Err(unsupported(
             "reasoning.mode",
             "only standard execution exists",
         ));
     }
-    Ok(reasoning.effort.as_deref())
+    Ok((reasoning.effort.as_deref(), preserve))
 }
 
 /// [`prepare_responses_with`] on a server with no response store.
@@ -787,7 +801,9 @@ pub(super) fn prepare_responses_conversing(
         conversations.is_some(),
     )?;
     let conversation_id = conversation_id(request.conversation.as_ref())?;
-    let thinking = effective_thinking(reasoning_effort(request.reasoning.as_ref())?, thinking)?;
+    let (effort, preserve_thinking) = reasoning_options(request.reasoning.as_ref())?;
+    let reasoning = effective_reasoning(effort, thinking)?;
+    let thinking = reasoning.is_some();
     let summary = summary_detail(request.reasoning.as_ref())?;
     let context_compaction = context_compaction(request.context_management.as_ref())?;
     let (choice, echoed_choice) = match super::hosted::tool_choice(request.tool_choice.as_ref()) {
@@ -871,7 +887,12 @@ pub(super) fn prepare_responses_conversing(
         tools: echoed_tools,
         temperature: params.temperature,
         top_p: params.top_p,
-        effort: if thinking { "xhigh" } else { "none" },
+        effort: reasoning.map_or("none", ReasoningEffort::name),
+        context: if preserve_thinking {
+            "all_turns"
+        } else {
+            "current_turn"
+        },
         prompt_cache_key: request.prompt_cache_key.clone(),
         safety_identifier: request.safety_identifier.clone(),
         previous_response_id: request.previous_response_id.clone(),
@@ -901,6 +922,8 @@ pub(super) fn prepare_responses_conversing(
             max_tokens: params.max_tokens,
             sampling: Sampling(params),
             thinking,
+            effort: reasoning.unwrap_or_default(),
+            preserve_thinking,
             session: request.prompt_cache_key,
             tools,
             tool_choice: choice,
@@ -1966,6 +1989,19 @@ struct Open {
     text: String,
 }
 
+/// A `function_call` or `custom_tool_call` item whose arguments (or input)
+/// are streaming from [`ToolCallDelta`]s.
+struct OpenCall {
+    call_id: String,
+    id: String,
+    index: usize,
+    custom: bool,
+    /// The item as `output_item.added` announced it.
+    item: Value,
+    /// The arguments streamed so far, or a custom tool's input.
+    streamed: String,
+}
+
 /// One Response being built from engine events.
 ///
 /// The same state machine serves the streaming and the buffered body, so the
@@ -1984,6 +2020,8 @@ pub(super) struct ResponsesState {
     events: Vec<Value>,
     output: Vec<Value>,
     open: Option<Open>,
+    /// The call whose arguments are streaming, until it is complete.
+    calling: Option<OpenCall>,
     encryption_error: Option<String>,
     /// The output index of the reasoning item whose `output_item.done` waits
     /// for its summary.
@@ -2014,6 +2052,7 @@ impl ResponsesState {
             events: Vec::new(),
             output,
             open: None,
+            calling: None,
             encryption_error: None,
             deferred: None,
             flush: None,
@@ -2138,14 +2177,16 @@ impl ResponsesState {
                 "response.content_part.added" => unfinished.part_added = true,
                 "response.reasoning_text.delta"
                 | "response.output_text.delta"
-                | "response.function_call_arguments.delta" => {
+                | "response.function_call_arguments.delta"
+                | "response.custom_tool_call_input.delta" => {
                     if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                         unfinished.text.push_str(delta);
                     }
                 }
                 "response.reasoning_text.done"
                 | "response.output_text.done"
-                | "response.function_call_arguments.done" => unfinished.text_done = true,
+                | "response.function_call_arguments.done"
+                | "response.custom_tool_call_input.done" => unfinished.text_done = true,
                 "response.content_part.done" => unfinished.part_done = true,
                 "response.reasoning_summary_part.added" => {
                     unfinished.summary = Some(SummaryPart::default());
@@ -2228,6 +2269,7 @@ impl ResponsesState {
                 "response.output_text.done",
             ),
             Some("function_call") => (None, "response.function_call_arguments.done"),
+            Some("custom_tool_call") => (None, "response.custom_tool_call_input.done"),
             _ => (None, ""),
         };
         if let Some(part) = &part {
@@ -2262,6 +2304,14 @@ impl ResponsesState {
                 );
             }
             item["arguments"] = json!(text);
+        } else if done == "response.custom_tool_call_input.done" {
+            if !unfinished.text_done {
+                self.emit(
+                    done,
+                    json!({"item_id":id,"output_index":index,"input":text}),
+                );
+            }
+            item["input"] = json!(text);
         }
         if let Some(summary) = unfinished.summary.filter(|_| reasoning) {
             item["summary"] = json!([self.close_summary(index, &id, &summary)]);
@@ -2404,6 +2454,10 @@ impl ResponsesState {
 
     /// Finish the open text item, if any, with `status`.
     fn close(&mut self, status: &str) {
+        // A call the engine never completed (cut short) keeps what streamed.
+        if let Some(call) = self.calling.take() {
+            self.finish_streamed(call, None, "incomplete");
+        }
         let Some(open) = self.open.take() else {
             return;
         };
@@ -2564,13 +2618,140 @@ impl ResponsesState {
         );
     }
 
-    /// A complete, validated call from the engine.
+    /// The next part of a call's arguments while the engine generates it.
     ///
-    /// The engine only reports a call once the whole of it has been generated
-    /// and validated, so the arguments arrive as one delta followed at once by
-    /// `done`. That is the honest shape of what happened: the arguments were
-    /// buffered by the engine, not streamed token by token.
+    /// A `function_call` (including hosted file and fetch calls) streams its
+    /// arguments and a `custom_tool_call` its raw input. Shell, local shell
+    /// and `apply_patch` calls are rendered whole when they complete.
+    fn call_delta(&mut self, delta: &ToolCallDelta) {
+        let kind = self.echo.kinds.kind(&delta.name);
+        let custom = kind == Kind::Custom;
+        if matches!(
+            kind,
+            Kind::Hosted(Hosted::Shell) | Kind::LocalShell | Kind::ApplyPatch
+        ) {
+            return;
+        }
+        if self
+            .calling
+            .as_ref()
+            .is_none_or(|open| open.call_id != delta.id)
+        {
+            self.close("completed");
+            let index = self.output.len();
+            let id = self.item_id(super::hosted::call_prefix(kind));
+            let mut item = if custom {
+                json!({"id":id,"type":"custom_tool_call","call_id":delta.id,"name":delta.name,"input":""})
+            } else {
+                json!({"id":id,"type":"function_call","status":"in_progress","call_id":delta.id,"name":delta.name,"arguments":""})
+            };
+            self.echo.kinds.qualify(&mut item);
+            self.emit(
+                "response.output_item.added",
+                json!({"output_index":index,"item":item}),
+            );
+            // The slot is reserved now so the next item's index follows it.
+            self.output.push(Value::Null);
+            self.calling = Some(OpenCall {
+                call_id: delta.id.clone(),
+                id,
+                index,
+                custom,
+                item,
+                streamed: String::new(),
+            });
+        }
+        let Some(open) = self.calling.as_mut() else {
+            return;
+        };
+        let piece = if open.custom {
+            match &delta.text {
+                Some((parameter, text)) if parameter == "input" => text.clone(),
+                _ => return,
+            }
+        } else {
+            delta.arguments.clone()
+        };
+        if piece.is_empty() {
+            return;
+        }
+        open.streamed.push_str(&piece);
+        let (id, index, custom) = (open.id.clone(), open.index, open.custom);
+        let kind = if custom {
+            "response.custom_tool_call_input.delta"
+        } else {
+            "response.function_call_arguments.delta"
+        };
+        self.emit(
+            kind,
+            json!({"item_id":id,"output_index":index,"delta":piece}),
+        );
+    }
+
+    /// Finish the streaming call: emit whatever its validated `call` adds to
+    /// what streamed, then `done` with `status`.
+    fn finish_streamed(&mut self, open: OpenCall, call: Option<&ToolCall>, status: &str) {
+        let OpenCall {
+            id,
+            index,
+            custom,
+            mut item,
+            streamed,
+            ..
+        } = open;
+        let whole = match call {
+            Some(call) if custom => call
+                .arguments
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            Some(call) => arguments_text(call),
+            None => streamed.clone(),
+        };
+        debug_assert!(whole.starts_with(&streamed), "streamed past the call");
+        let rest = whole.get(streamed.len()..).unwrap_or_default();
+        let (delta, done, field) = if custom {
+            (
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "input",
+            )
+        } else {
+            (
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "arguments",
+            )
+        };
+        if !rest.is_empty() {
+            self.emit(
+                delta,
+                json!({"item_id":id,"output_index":index,"delta":rest}),
+            );
+        }
+        self.emit(done, json!({"item_id":id,"output_index":index,field:whole}));
+        item[field] = json!(whole);
+        if !custom {
+            item["status"] = json!(status);
+        }
+        self.emit(
+            "response.output_item.done",
+            json!({"output_index":index,"item":item}),
+        );
+        if let Some(slot) = self.output.get_mut(index) {
+            *slot = item;
+        }
+    }
+
+    /// A complete, validated call from the engine: the end of the call its
+    /// deltas streamed, or, for a call the engine reported only whole, one
+    /// arguments delta followed at once by `done`.
     fn call(&mut self, call: &ToolCall) {
+        if let Some(open) = self.calling.take_if(|open| open.call_id == call.id) {
+            self.finish_streamed(open, Some(call), "completed");
+            return;
+        }
         self.close("completed");
         let index = self.output.len();
         let kind = self.echo.kinds.kind(&call.name);
@@ -2639,6 +2820,7 @@ impl ResponsesState {
         match event {
             Event::Reasoning(piece) => self.text(ItemKind::Reasoning, &piece),
             Event::Content(piece) => self.text(ItemKind::Message, &piece),
+            Event::ToolCallDelta(delta) => self.call_delta(&delta),
             Event::ToolCall(call) => self.call(&call),
             Event::ToolOutput(output) => self.tool_output(&output),
             Event::TokenIds(_) => {}
@@ -2841,7 +3023,7 @@ impl ResponsesState {
             "output":output,
             "parallel_tool_calls":echo.parallel_tool_calls,
             "previous_response_id":echo.previous_response_id,
-            "reasoning":{"effort":echo.effort,"summary":echo.summary.map(SummaryDetail::name),"context":"all_turns"},
+            "reasoning":{"effort":echo.effort,"summary":echo.summary.map(SummaryDetail::name),"context":echo.context},
             // Only a response that reached the store says so. A failed
             // foreground one, including one whose write failed, was never
             // stored; a background one is stored in every state it reports.

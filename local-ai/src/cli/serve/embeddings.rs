@@ -484,7 +484,7 @@ mod tests {
             json!({"input":[[]],"model":EMBEDDING_MODEL_ID}),
             json!({"input":[1,-2],"model":EMBEDDING_MODEL_ID}),
             json!({"input":["a",1],"model":EMBEDDING_MODEL_ID}),
-            json!({"input":"a","model":"text-embedding-3-small"}),
+            json!({"input":"a","model":"ternary-bonsai-2-27b"}),
             json!({"input":"a"}),
             json!({"input":"a","model":EMBEDDING_MODEL_ID,"dimensions":100}),
             json!({"input":"a","model":EMBEDDING_MODEL_ID,"encoding_format":"int8"}),
@@ -492,6 +492,13 @@ mod tests {
         ] {
             assert!(parse(&body(&request)).is_err(), "{request}");
         }
+        // OpenAI's embedding model names are aliases of the local model.
+        assert!(
+            parse(&body(
+                &json!({"input":"a","model":"text-embedding-3-small"})
+            ))
+            .is_ok()
+        );
         let too_many: Vec<&str> = vec!["x"; MAX_INPUTS + 1];
         assert!(parse(&body(&json!({"input":too_many,"model":EMBEDDING_MODEL_ID}))).is_err());
     }

@@ -14,7 +14,9 @@
 //! visible content and never its raw reasoning; a request is answered by
 //! collecting [`Event::Content`](crate::Event::Content) pieces only.
 
-use crate::{ChatMessage, ChatRequest, GenerateParams, ResponseFormat, Sampling, ToolChoice};
+use crate::{
+    ChatMessage, ChatRequest, GenerateParams, ReasoningEffort, ResponseFormat, Sampling, ToolChoice,
+};
 use crate::{ToolDefinition, runtime::DEFAULT_MAX_OUTPUT_TOKENS};
 
 /// The output budget of one compaction summary.
@@ -112,6 +114,8 @@ fn summary_request(
             ..GenerateParams::default()
         }),
         thinking: false,
+        effort: ReasoningEffort::default(),
+        preserve_thinking: true,
         session,
         // The conversation's tools are rendered, so the prompt shares its
         // prefix with the conversation's own turns and the prompt cache can

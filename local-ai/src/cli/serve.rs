@@ -79,8 +79,8 @@ struct Args {
     api_key: Option<String>,
     /// How long a client may stop consuming before its generation is dropped.
     stall: Duration,
-    /// `--response-store`: where Responses are kept. `None` keeps nothing.
-    response_store: Option<PathBuf>,
+    /// Where Responses are kept: the user's data directory by default.
+    response_store: options::ResponseStoreArg,
     reasoning_key: Option<PathBuf>,
     /// `--experimental-decision-head`: the judgment head that enables
     /// `POST /v1/experimental/decisions`. `None` serves no decisions.
@@ -1060,36 +1060,38 @@ async fn run_async(args: Args) -> crate::Result<()> {
             )));
         }
     };
-    let cipher = args
-        .reasoning_key
-        .as_ref()
-        .map(|path| {
-            ReasoningCipher::open(path)
-                .map_err(|error| crate::Error::InvalidArgument(error.to_string()))
-        })
-        .transpose()?;
+    // The key is created on first use; by default it lives beside the
+    // services store, so encrypted reasoning and compaction work out of the box.
+    let key = match &args.reasoning_key {
+        Some(path) => path.clone(),
+        None => services::data_dir()?.join("reasoning.key"),
+    };
+    let cipher = Some(
+        ReasoningCipher::open(&key)
+            .map_err(|error| crate::Error::InvalidArgument(error.to_string()))?,
+    );
     // Opened before the model loads, so a bad directory fails in milliseconds.
-    let responses = args
-        .response_store
-        .as_ref()
-        .map(|dir| {
-            ResponseStore::open(dir).map(Arc::new).map_err(|error| {
-                crate::Error::InvalidArgument(format!(
-                    "cannot open --response-store {}: {error}",
-                    dir.display()
-                ))
-            })
-        })
-        .transpose()?;
+    let responses = match &args.response_store {
+        options::ResponseStoreArg::Off => None,
+        options::ResponseStoreArg::Dir(dir) => Some(open_responses(dir)?),
+        options::ResponseStoreArg::Default => {
+            let store = open_responses(&services::data_dir()?.join("responses"))?;
+            match store.prune(RESPONSE_RETENTION) {
+                Ok(0) => {}
+                Ok(removed) => eprintln!(
+                    "removed {removed} stored responses older than {} days",
+                    RESPONSE_RETENTION.as_secs() / 86_400
+                ),
+                Err(error) => eprintln!("warning: old stored responses were not pruned: {error}"),
+            }
+            Some(store)
+        }
+    };
     // Hosted tools are opened before the model loads too, so a bad root or
     // domain fails in milliseconds; nothing is granted without a flag.
     let tools = open_tools(&args.tools)?;
     // Also before the model loads: a wrong head fails in milliseconds.
     let decisions = decisions::Decisions::start(args.decision_head.as_deref())?;
-    // The calibrated route's artifact is verified (hashes, acceptance, scope)
-    // before the model loads too.
-    let openai_decisions =
-        openai_decisions::OpenAiDecisions::start(args.decisions_artifact.as_deref())?;
     // Background `store: false` Responses are kept only in a private store of
     // this process; without one they are refused, and nothing else changes.
     let temporary = Temporary::create()
@@ -1103,6 +1105,17 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // One discovery serves both the engine and the TLS lookup: each one probes
     // the disk's write rate with a 16 MiB file, so a second is wasted startup.
     let resources = Resources::discover(None, true)?;
+    // Beside the Bonsai model's own folder: `models/embeddinggemma2-text`.
+    let models_dir = resources.model.parent().and_then(std::path::Path::parent);
+    // The calibrated route's artifact is verified (hashes, acceptance, scope)
+    // before the model loads: `--decisions-artifact`, or one installed as
+    // `models/decisions-v2`.
+    let decisions_artifact = args.decisions_artifact.clone().or_else(|| {
+        models_dir
+            .map(|models_dir| models_dir.join("decisions-v2"))
+            .filter(|dir| dir.is_dir())
+    });
+    let openai_decisions = openai_decisions::OpenAiDecisions::start(decisions_artifact.as_deref())?;
     let model: Arc<str> = models::BONSAI_MODEL_ID.into();
     // Envelopes an earlier version sealed for the checkpoint's path still open.
     let legacy_model = resources.model.to_string_lossy().into_owned();
@@ -1112,8 +1125,6 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let context = engine.info().model.context;
     let engine = engine.into_handle();
     let prompt_cache = engine.clone();
-    // Beside the Bonsai model's own folder: `models/embeddinggemma2-text`.
-    let models_dir = resources.model.parent().and_then(std::path::Path::parent);
     let embeddings = match models_dir {
         Some(models_dir) => embeddings::Embeddings::start(models_dir, engine.activity())?,
         None => None,
@@ -1256,6 +1267,19 @@ async fn run_async(args: Args) -> crate::Result<()> {
         );
     }
     served
+}
+
+/// How long the default response store keeps a settled response, as
+/// `OpenAI` retains stored responses for 30 days.
+const RESPONSE_RETENTION: Duration = Duration::from_hours(30 * 24);
+
+fn open_responses(dir: &std::path::Path) -> crate::Result<Arc<ResponseStore>> {
+    ResponseStore::open(dir).map(Arc::new).map_err(|error| {
+        crate::Error::InvalidArgument(format!(
+            "cannot open the response store {}: {error}",
+            dir.display()
+        ))
+    })
 }
 
 /// How long shutdown waits for accepted prompt-cache snapshots to commit.

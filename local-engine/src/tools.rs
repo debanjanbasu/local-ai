@@ -40,7 +40,7 @@ use serde_json::{Map, Value};
 
 use crate::api::Event;
 use crate::bonsai_model::StopReason;
-use crate::bonsai_tokenizer::DEFAULT_REASONING_INSTRUCTION;
+use crate::bonsai_tokenizer::ReasoningEffort;
 
 pub mod grammar;
 
@@ -105,6 +105,11 @@ pub enum ToolChoice {
     Required,
     /// One call to the named tool, as for [`Self::Required`].
     Function(String),
+    /// Calls only to the named tools (`OpenAI` `allowed_tools`): every tool
+    /// stays in the prompt, so its cached prefix is shared, but the grammar
+    /// admits only these. `required` makes a call mandatory as for
+    /// [`Self::Required`]; otherwise the model may also answer in text.
+    Allowed { tools: Vec<String>, required: bool },
 }
 
 /// A complete, validated call the model requested. The engine never runs it.
@@ -117,6 +122,29 @@ pub struct ToolCall {
     pub name: String,
     /// Arguments as a JSON object that satisfies the tool's schema.
     pub arguments: Value,
+}
+
+/// Part of a call's arguments, reported while the call is still being
+/// generated.
+///
+/// In order, a call's deltas spell a prefix of its final arguments, serialized
+/// as compact JSON in the order the model wrote them (that is the
+/// [`ToolCall::arguments`] the closing [`Event::ToolCall`] carries, with the
+/// same ID). String parameters whose schema accepts every string stream as
+/// they are written; any other value arrives whole once it ends. Nothing
+/// streams before the call names a configured tool, and a call that then
+/// fails validation or is cut short gets no [`Event::ToolCall`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallDelta {
+    /// The call's ID.
+    pub id: String,
+    /// The called tool.
+    pub name: String,
+    /// The next piece of the arguments' JSON text.
+    pub arguments: String,
+    /// When the piece continues one string parameter's value: that
+    /// parameter and the raw text the piece adds to it.
+    pub text: Option<(String, String)>,
 }
 
 /// A validated set of tool definitions with their schemas compiled once.
@@ -150,6 +178,9 @@ struct Parameter {
     validator: jsonschema::Validator,
     /// Accepts every JSON type, so the schema says nothing about raw text.
     unconstrained: bool,
+    /// Accepts every string, so its raw text is always the value and can be
+    /// streamed before the value ends.
+    any_string: bool,
 }
 
 impl ToolSet {
@@ -197,6 +228,15 @@ pub fn check_choice(tools: &[ToolDefinition], choice: &ToolChoice) -> crate::Res
         ToolChoice::Auto | ToolChoice::None | ToolChoice::Required => Ok(()),
         ToolChoice::Function(name) if tools.iter().any(|tool| tool.name == *name) => Ok(()),
         ToolChoice::Function(name) => invalid(format!("tool_choice names unknown tool {name:?}")),
+        ToolChoice::Allowed { tools: allowed, .. } if allowed.is_empty() => {
+            invalid("allowed_tools needs at least one tool")
+        }
+        ToolChoice::Allowed { tools: allowed, .. } => allowed
+            .iter()
+            .find(|name| !tools.iter().any(|tool| tool.name == **name))
+            .map_or(Ok(()), |name| {
+                invalid(format!("allowed_tools names unknown tool {name:?}"))
+            }),
     }
 }
 
@@ -211,14 +251,25 @@ pub struct Turn<'a> {
 }
 
 /// Render a conversation exactly as the pinned checkpoint template does with
-/// `add_generation_prompt=True` and `preserve_thinking` left at its default.
+/// `add_generation_prompt=True`, `enable_thinking` and `reasoning_effort` from
+/// `thinking` (`None` closes the thought block empty), and
+/// `preserve_thinking`.
+///
+/// Without `preserve_thinking`, assistant turns up to the last user query
+/// render with no thought block at all, as the template does; later ones
+/// (the current tool loop) keep theirs.
 ///
 /// `developer` is accepted as a leading message and rendered in the `system`
 /// slot: the template has no developer role and only one leading instruction
 /// turn, so consecutive leading `system`/`developer` messages (Codex sends
 /// several) are joined there in order, separated by a blank line. One leading
 /// message renders exactly as before.
-pub fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Result<String> {
+pub fn render(
+    turns: &[Turn<'_>],
+    thinking: Option<ReasoningEffort>,
+    preserve_thinking: bool,
+    tools: &ToolSet,
+) -> crate::Result<String> {
     if turns.is_empty() {
         return invalid("no messages provided");
     }
@@ -226,21 +277,23 @@ pub fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Res
         return invalid("message content is empty");
     }
     validate_history(turns, tools)?;
-    let has_query = turns.iter().any(|turn| {
+    let is_query = |turn: &Turn<'_>| {
         let content = turn.content.trim();
         turn.role == "user"
             && !(content.starts_with(TOOL_RESPONSE_START) && content.ends_with(TOOL_RESPONSE_END))
-    });
-    if !has_query {
+    };
+    if !turns.iter().any(is_query) {
         return invalid("no user query found in messages");
     }
     let turns = &order_results(turns)?;
+    let last_query = turns.iter().rposition(is_query).unwrap_or_default();
     let leading = turns
         .iter()
         .take_while(|turn| is_instruction(turn.role))
         .count();
     let system = leading_instructions(turns.get(..leading).unwrap_or_default());
-    let mut rendered = render_system(&system, thinking, tools);
+    let instruction = thinking.and_then(ReasoningEffort::instruction);
+    let mut rendered = render_system(&system, instruction, tools);
     for (index, turn) in turns.iter().enumerate() {
         let content = turn.content.trim();
         match turn.role {
@@ -258,9 +311,12 @@ pub fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Res
                 rendered.push_str("<|im_end|>\n");
             }
             "assistant" => {
-                rendered.push_str("<|im_start|>assistant\n<think>\n");
-                rendered.push_str(turn.reasoning_content.unwrap_or_default().trim());
-                rendered.push_str("\n</think>\n\n");
+                rendered.push_str("<|im_start|>assistant\n");
+                if preserve_thinking || index > last_query {
+                    rendered.push_str("<think>\n");
+                    rendered.push_str(turn.reasoning_content.unwrap_or_default().trim());
+                    rendered.push_str("\n</think>\n\n");
+                }
                 rendered.push_str(content);
                 for (position, call) in turn.tool_calls.iter().enumerate() {
                     if position > 0 {
@@ -290,7 +346,7 @@ pub fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Res
         }
     }
     rendered.push_str("<|im_start|>assistant\n");
-    if thinking {
+    if thinking.is_some() {
         rendered.push_str("<think>\n");
     } else {
         rendered.push_str("<think>\n\n</think>\n\n");
@@ -318,12 +374,12 @@ fn leading_instructions(turns: &[Turn<'_>]) -> String {
 
 /// The leading system turn: reasoning instructions, tools and the leading
 /// `system`/`developer` text `system`, in the template's order.
-fn render_system(system: &str, thinking: bool, tools: &ToolSet) -> String {
+fn render_system(system: &str, instruction: Option<&str>, tools: &ToolSet) -> String {
     let mut rendered = String::new();
     if !tools.is_empty() {
         rendered.push_str("<|im_start|>system\n");
-        if thinking {
-            rendered.push_str(DEFAULT_REASONING_INSTRUCTION);
+        if let Some(instruction) = instruction {
+            rendered.push_str(instruction);
             rendered.push_str("\n\n");
         }
         rendered.push_str(TOOLS_HEADER);
@@ -337,10 +393,10 @@ fn render_system(system: &str, thinking: bool, tools: &ToolSet) -> String {
             rendered.push_str(system);
         }
         rendered.push_str("<|im_end|>\n");
-    } else if thinking || !system.is_empty() {
+    } else if instruction.is_some() || !system.is_empty() {
         rendered.push_str("<|im_start|>system\n");
-        if thinking {
-            rendered.push_str(DEFAULT_REASONING_INSTRUCTION);
+        if let Some(instruction) = instruction {
+            rendered.push_str(instruction);
             if !system.is_empty() {
                 rendered.push_str("\n\n");
             }
@@ -623,7 +679,7 @@ fn compile_parameters(schema: &Value) -> Result<Option<ArgumentSchema>, String> 
         .add(SCHEMA_URI, schema.clone())
         .and_then(jsonschema::RegistryBuilder::prepare)
         .map_err(|error| format!("invalid schema: {error}"))?;
-    let parameter = |pointer: String| -> Result<Parameter, String> {
+    let parameter = |pointer: String, declared: &Value| -> Result<Parameter, String> {
         let mut reference = Map::new();
         if let Some(dialect) = map.get("$schema") {
             reference.insert("$schema".into(), dialect.clone());
@@ -649,18 +705,19 @@ fn compile_parameters(schema: &Value) -> Result<Option<ArgumentSchema>, String> 
         Ok(Parameter {
             validator,
             unconstrained,
+            any_string: accepts_every_string(declared),
         })
     };
     let mut properties = HashMap::new();
     if let Some(Value::Object(declared)) = map.get("properties") {
-        for name in declared.keys() {
+        for (name, schema) in declared {
             check_parameter_name(name)?;
             let pointer = format!("/properties/{}", fragment_segment(name));
-            properties.insert(name.clone(), parameter(pointer)?);
+            properties.insert(name.clone(), parameter(pointer, schema)?);
         }
     }
     let additional = match map.get("additionalProperties") {
-        Some(Value::Object(_)) => Some(parameter("/additionalProperties".into())?),
+        Some(schema @ Value::Object(_)) => Some(parameter("/additionalProperties".into(), schema)?),
         _ => None,
     };
     Ok(Some(ArgumentSchema {
@@ -668,6 +725,34 @@ fn compile_parameters(schema: &Value) -> Result<Option<ArgumentSchema>, String> 
         properties,
         additional,
     }))
+}
+
+/// Whether `schema` is a string type with nothing but annotations, which
+/// every string satisfies (formats are validated, so `format` constrains).
+fn accepts_every_string(schema: &Value) -> bool {
+    let Value::Object(map) = schema else {
+        return false;
+    };
+    let string = match map.get("type") {
+        Some(Value::String(kind)) => kind == "string",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "string"),
+        _ => false,
+    };
+    string
+        && map.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "type"
+                    | "description"
+                    | "title"
+                    | "examples"
+                    | "default"
+                    | "$comment"
+                    | "deprecated"
+                    | "readOnly"
+                    | "writeOnly"
+            )
+        })
 }
 
 fn schema_options<'i>() -> jsonschema::ValidationOptions<'i> {
@@ -742,15 +827,35 @@ fn next_call_id() -> String {
 ///
 /// Ordinary text streams as [`Event::Content`]; only a possible `<tool_call>`
 /// prefix and trailing whitespace (which the template puts before a call) are
-/// held back. A call is buffered until `</tool_call>`, then parsed and
-/// validated whole: it becomes one [`Event::ToolCall`] or a recorded failure,
-/// never a partial event.
+/// held back. While a call is generated, the part of its arguments that can
+/// no longer change streams as [`Event::ToolCallDelta`]s; at `</tool_call>`
+/// the call is parsed and validated whole and becomes one [`Event::ToolCall`]
+/// or a recorded failure.
 pub struct ToolCallParser {
     tools: Arc<ToolSet>,
     pending: String,
     in_call: bool,
     after_call: bool,
     failure: Option<String>,
+    /// The open call's streamed deltas, once it named a configured tool.
+    streamed: Option<Streamed>,
+}
+
+/// How much of the open call has been streamed: whole pieces, then bytes of
+/// the current piece's JSON and of its raw text.
+struct Streamed {
+    id: String,
+    name: String,
+    piece: usize,
+    json: usize,
+    text: usize,
+}
+
+/// One certain part of a call's arguments: the opening brace, or one
+/// parameter as far as it has been written.
+struct Piece {
+    json: String,
+    text: Option<(String, String)>,
 }
 
 impl ToolCallParser {
@@ -761,6 +866,7 @@ impl ToolCallParser {
             in_call: false,
             after_call: false,
             failure: None,
+            streamed: None,
         }
     }
 
@@ -786,7 +892,7 @@ impl ToolCallParser {
             if self.in_call {
                 let tools = Arc::clone(&self.tools);
                 let Some((end, marker, strict)) = call_end(&self.pending, &tools) else {
-                    return ControlFlow::Continue(());
+                    return self.stream(callback);
                 };
                 let rest = self.pending.split_off(end + marker.len());
                 let mut block = std::mem::replace(&mut self.pending, rest);
@@ -797,8 +903,12 @@ impl ToolCallParser {
                     || parse_call(&block, &tools),
                     |tool| parse_strict(&block, tool),
                 );
+                let streamed = self.streamed.take();
                 match parsed {
-                    Ok(call) => {
+                    Ok(mut call) => {
+                        if let Some(streamed) = streamed {
+                            call.id = streamed.id;
+                        }
                         if callback(Event::ToolCall(call)).is_break() {
                             return ControlFlow::Break(());
                         }
@@ -854,12 +964,53 @@ impl ToolCallParser {
                 StopReason::TokenLimit | StopReason::Cancelled => {
                     self.pending.clear();
                     self.in_call = false;
+                    self.streamed = None;
                     return ControlFlow::Continue(());
                 }
             }
         }
         let text = std::mem::take(&mut self.pending);
         self.text(&text, callback)
+    }
+
+    /// Report whatever more of the open call's arguments is now certain.
+    fn stream(&mut self, callback: &mut impl FnMut(Event) -> ControlFlow<()>) -> ControlFlow<()> {
+        let Some((name, pieces)) = pieces(&self.pending, &self.tools) else {
+            return ControlFlow::Continue(());
+        };
+        let streamed = self.streamed.get_or_insert_with(|| Streamed {
+            id: next_call_id(),
+            name: name.to_owned(),
+            piece: 0,
+            json: 0,
+            text: 0,
+        });
+        let last = pieces.len() - 1;
+        for (index, piece) in pieces.iter().enumerate().skip(streamed.piece) {
+            let arguments = piece.json.get(streamed.json..).unwrap_or_default();
+            let text = piece.text.as_ref().map(|(key, text)| {
+                (
+                    key.clone(),
+                    text.get(streamed.text..).unwrap_or_default().to_owned(),
+                )
+            });
+            let delta = ToolCallDelta {
+                id: streamed.id.clone(),
+                name: streamed.name.clone(),
+                arguments: arguments.to_owned(),
+                text,
+            };
+            if index < last {
+                (streamed.piece, streamed.json, streamed.text) = (index + 1, 0, 0);
+            } else {
+                streamed.json = piece.json.len();
+                streamed.text = piece.text.as_ref().map_or(0, |(_, text)| text.len());
+            }
+            if !delta.arguments.is_empty() && callback(Event::ToolCallDelta(delta)).is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     fn text(
@@ -922,6 +1073,120 @@ fn held_suffix(text: &str) -> usize {
     partial + head.len() - head.trim_end().len()
 }
 
+/// The certain pieces of the arguments of the call `block` (everything after
+/// `<tool_call>` so far) is writing, once it names a configured tool.
+///
+/// The text is read as [`parse_call`] and [`parse_strict`] read it, and
+/// each finished value is converted exactly as they convert it, so the
+/// pieces always spell a prefix of the arguments those produce. A raw string
+/// value streams only when it is certain to stay a string; it holds back any
+/// tail that could still turn out to be its closing `\n</parameter>`.
+/// Streaming stops at anything those parsers would refuse, and the call
+/// then fails when it ends.
+fn pieces<'b>(block: &'b str, tools: &ToolSet) -> Option<(&'b str, Vec<Piece>)> {
+    let (name, mut rest) = block
+        .trim_start()
+        .strip_prefix("<function=")?
+        .split_once('>')?;
+    let tool = tools.get(name)?;
+    let mut pieces = vec![Piece {
+        json: "{".into(),
+        text: None,
+    }];
+    let mut seen = HashSet::new();
+    loop {
+        rest = rest.trim_start();
+        let Some((key, after)) = rest
+            .strip_prefix("<parameter=")
+            .and_then(|after| after.split_once('>'))
+        else {
+            break;
+        };
+        let text_mode = match streams_text(tool, key) {
+            Some(text_mode) if check_parameter_name(key).is_ok() && seen.insert(key) => text_mode,
+            _ => break,
+        };
+        let mut json = if pieces.len() > 1 { "," } else { "" }.to_owned();
+        json.push_str(&Value::from(key).to_string());
+        json.push(':');
+        if after.is_empty() {
+            pieces.push(Piece { json, text: None });
+            break;
+        }
+        let value = after.strip_prefix('\n').unwrap_or(after);
+        if let Some((raw, next)) = value.split_once("</parameter>") {
+            let raw = raw.strip_suffix('\n').unwrap_or(raw);
+            let Some(converted) = finished_value(tool, key, raw) else {
+                break;
+            };
+            json.push_str(&converted.to_string());
+            let text = text_mode.then(|| (key.to_owned(), raw.to_owned()));
+            pieces.push(Piece { json, text });
+            rest = next;
+            continue;
+        }
+        let text = text_mode.then(|| {
+            let certain = value
+                .get(..value.len() - held_close(value))
+                .unwrap_or_default();
+            let quoted = Value::from(certain).to_string();
+            json.push_str(quoted.strip_suffix('"').unwrap_or_default());
+            (key.to_owned(), certain.to_owned())
+        });
+        pieces.push(Piece { json, text });
+        break;
+    }
+    Some((name, pieces))
+}
+
+/// Whether parameter `key` of `tool` is a string whatever its text (so it
+/// can stream raw), `Some(false)` when its value must be seen whole, and
+/// `None` when the call cannot be valid.
+fn streams_text(tool: &Tool, key: &str) -> Option<bool> {
+    match &tool.strict {
+        Some(Ok(strict)) => Some(matches!(strict.parameter(key)?.value, ValueKind::Raw(_))),
+        Some(Err(_)) => None,
+        None => Some(
+            tool.schema
+                .as_ref()
+                .and_then(|schema| schema.properties.get(key).or(schema.additional.as_ref()))
+                .is_some_and(|parameter| parameter.any_string),
+        ),
+    }
+}
+
+/// The value of parameter `key` with text `raw`, as the call's parser will
+/// convert it.
+fn finished_value(tool: &Tool, key: &str, raw: &str) -> Option<Value> {
+    match &tool.strict {
+        Some(Ok(strict)) => match &strict.parameter(key)?.value {
+            ValueKind::Raw(_) => Some(Value::from(raw)),
+            ValueKind::Json(_) => serde_json::from_str(raw).ok(),
+        },
+        Some(Err(_)) => None,
+        None => Some(convert(
+            raw,
+            tool.schema
+                .as_ref()
+                .and_then(|schema| schema.properties.get(key).or(schema.additional.as_ref())),
+        )),
+    }
+}
+
+/// Bytes at the end of a raw value that might still be the start of its
+/// closing `\n</parameter>`.
+fn held_close(text: &str) -> usize {
+    ["\n</parameter>", "</parameter>"]
+        .iter()
+        .filter_map(|tag| {
+            (1..tag.len())
+                .rev()
+                .find(|&length| tag.get(..length).is_some_and(|start| text.ends_with(start)))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
     let body = block
         .trim()
@@ -964,10 +1229,9 @@ fn parse_call(block: &str, tools: &ToolSet) -> Result<ToolCall, String> {
         arguments.insert(key.to_owned(), value);
         rest = after;
     }
-    let mut arguments = Value::Object(arguments);
-    // Preserve canonical argument strings for every adapter even when a
-    // dependency enables serde_json's preserve_order feature.
-    arguments.sort_all_objects();
+    // The order the model wrote, which streamed deltas already reported
+    // (`llguidance` enables serde_json's `preserve_order`).
+    let arguments = Value::Object(arguments);
     // A non-strict tool's schema guides the model but binds nobody: the call
     // goes to the client as generated, and the client validates it and
     // reports any error back as the call's result. Failing the whole
@@ -1026,8 +1290,7 @@ fn parse_strict(block: &str, tool: &Tool) -> Result<ToolCall, String> {
         arguments.insert(key.to_owned(), value);
         rest = after;
     }
-    let mut arguments = Value::Object(arguments);
-    arguments.sort_all_objects();
+    let arguments = Value::Object(arguments);
     validate_arguments(tool, &arguments).map_err(|error| format!("{name}: {error}"))?;
     Ok(ToolCall {
         id: next_call_id(),

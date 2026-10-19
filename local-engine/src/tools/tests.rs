@@ -3,8 +3,20 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use super::{ToolCall, ToolCallParser, ToolDefinition, ToolSet, Turn, render};
+use super::{ToolCall, ToolCallParser, ToolDefinition, ToolSet, Turn};
+use crate::ReasoningEffort;
 use crate::api::Event;
+
+/// Render with the template's defaults: xhigh reasoning when `thinking`, and
+/// earlier reasoning preserved.
+fn render(turns: &[Turn<'_>], thinking: bool, tools: &ToolSet) -> crate::Result<String> {
+    super::render(
+        turns,
+        thinking.then_some(ReasoningEffort::XHigh),
+        true,
+        tools,
+    )
+}
 
 /// Rendered by the pinned template itself (Jinja2 3.1.6, `trim_blocks` and
 /// `lstrip_blocks` as in `transformers`, `tojson` as `json.dumps(...,
@@ -82,6 +94,63 @@ fn renders_tools_calls_and_grouped_results_like_the_pinned_template() {
     ];
     let rendered = render(&turns, true, &tools(&[weather(), search()])).expect("render");
     assert_eq!(rendered, TOOLS_THINKING);
+}
+
+/// `reasoning_effort` and `preserve_thinking: false`, rendered by the pinned
+/// template itself like the fixtures above: earlier turns lose their thought
+/// block, the current tool loop keeps it, and `medium` adds no instruction.
+#[test]
+fn renders_reasoning_effort_and_current_turn_reasoning_like_the_pinned_template() {
+    let weather_call = [call("a", "get_weather", json!({"city":"Paris","days":1}))];
+    let search_call = [call("b", "search", json!({"query":"café"}))];
+    let turns = [
+        turn("system", "Be exact."),
+        turn("user", "Weather in Paris?"),
+        Turn {
+            reasoning_content: Some("Need weather."),
+            tool_calls: &weather_call,
+            ..turn("assistant", "")
+        },
+        result("a", "sunny"),
+        Turn {
+            reasoning_content: Some("Answer it."),
+            ..turn("assistant", "Sunny.")
+        },
+        turn("user", "And café news?"),
+        Turn {
+            reasoning_content: Some("Need search."),
+            tool_calls: &search_call,
+            ..turn("assistant", "Checking.")
+        },
+        result("b", "news"),
+    ];
+    let rendered = super::render(
+        &turns,
+        Some(ReasoningEffort::Low),
+        false,
+        &tools(&[weather(), search()]),
+    )
+    .expect("render");
+    assert_eq!(
+        rendered,
+        include_str!("fixtures/tools_low_current_turn.txt")
+    );
+    let turns = [
+        turn("user", "First"),
+        Turn {
+            reasoning_content: Some("r1"),
+            ..turn("assistant", "One")
+        },
+        turn("user", "Second"),
+    ];
+    let rendered = super::render(
+        &turns,
+        Some(ReasoningEffort::Medium),
+        false,
+        &ToolSet::default(),
+    )
+    .expect("render");
+    assert_eq!(rendered, include_str!("fixtures/medium_current_turn.txt"));
 }
 
 #[test]
@@ -442,11 +511,11 @@ fn streams_text_and_emits_validated_calls_one_character_at_a_time() {
         calls[1].arguments,
         json!({"query":"42","filters":{"z":{"b":2,"a":1},"lang":"fr"}})
     );
-    // HTTP argument strings keep their original canonical ordering, even
-    // when another dependency enables serde_json's preserve_order feature.
+    // Argument strings keep the order the model wrote, which streamed
+    // deltas have already reported.
     assert_eq!(
         calls[1].arguments.to_string(),
-        r#"{"filters":{"lang":"fr","z":{"a":1,"b":2}},"query":"42"}"#
+        r#"{"query":"42","filters":{"z":{"b":2,"a":1},"lang":"fr"}}"#
     );
     assert_ne!(calls[0].id, calls[1].id);
     assert!(calls[0].id.starts_with("call_"));
@@ -610,4 +679,163 @@ fn a_non_strict_call_that_misses_its_schema_is_returned_as_generated() {
     render(&turns, true, &tools(&[weather()])).expect("non-strict replay");
     // A strict tool's schema is the contract: a violating replay is refused.
     assert!(render(&turns, true, &tools(&[strict_weather()])).is_err());
+}
+
+/// The deltas and the completed calls of `events`.
+fn streamed(events: &[Event]) -> (Vec<&super::ToolCallDelta>, Vec<&ToolCall>) {
+    let deltas = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCallDelta(delta) => Some(delta),
+            _ => None,
+        })
+        .collect();
+    let calls = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .collect();
+    (deltas, calls)
+}
+
+/// Feed `text` in pieces of `size` characters.
+fn parse_in(tools: &[ToolDefinition], text: &str, size: usize) -> (Vec<Event>, Option<String>) {
+    let chars = text.chars().collect::<Vec<_>>();
+    let pieces = chars
+        .chunks(size)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>();
+    parse(
+        tools,
+        &pieces.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+}
+
+#[test]
+fn deltas_spell_the_final_arguments_in_the_order_the_model_wrote_them() {
+    let edit = ToolDefinition {
+        name: "edit".into(),
+        description: None,
+        parameters: json!({"type":"object","properties":{
+            "path":{"type":"string","description":"File."},
+            "mode":{"type":"string","enum":["a","b"]},
+            "count":{"type":"integer"}
+        }}),
+        strict: false,
+    };
+    // Unsorted keys, a value with quotes, backslashes, non-ASCII text and a
+    // line that starts like the closing tag, a trailing newline that is
+    // part of the value, an enum string, an integer and an untyped object.
+    let value = "say \"hi\" \\ café\n</param not yet\nend\n";
+    let text = format!(
+        "<tool_call>\n<function=edit>\n<parameter=path>\n{value}\n</parameter>\n<parameter=mode>\nb\n</parameter>\n<parameter=count>\n7\n</parameter>\n<parameter=extra>\n{{\"z\": 1, \"a\": [true]}}\n</parameter>\n</function>\n</tool_call>"
+    );
+    for size in [1, 2, 3, 7, 64] {
+        let (events, failure) = parse_in(std::slice::from_ref(&edit), &text, size);
+        assert_eq!(failure, None, "size {size}");
+        let (deltas, calls) = streamed(&events);
+        let [call] = calls[..] else {
+            panic!("size {size}: {calls:?}")
+        };
+        let arguments = deltas
+            .iter()
+            .map(|delta| delta.arguments.as_str())
+            .collect::<String>();
+        let whole = call.arguments.to_string();
+        assert_eq!(
+            whole,
+            r#"{"path":"say \"hi\" \\ café\n</param not yet\nend\n","mode":"b","count":7,"extra":{"z":1,"a":[true]}}"#
+        );
+        // The pieces streamed are a prefix of the arguments; the call that
+        // ends them brings the rest.
+        assert!(whole.starts_with(&arguments), "size {size}: {arguments}");
+        assert!(
+            deltas
+                .iter()
+                .all(|delta| delta.id == call.id && delta.name == "edit")
+        );
+        let raw = deltas
+            .iter()
+            .filter_map(|delta| delta.text.as_ref())
+            .map(|(key, text)| {
+                assert_eq!(key, "path");
+                text.as_str()
+            })
+            .collect::<String>();
+        assert!(value.starts_with(&raw), "size {size}: {raw:?}");
+        if size == 1 {
+            // Fed one character at a time, every value ended before the
+            // call did: only the closing brace is left, and the raw text of
+            // the string parameter (nothing else) streamed whole.
+            assert_eq!(format!("{arguments}}}"), whole);
+            assert_eq!(raw, value);
+        }
+    }
+}
+
+#[test]
+fn a_string_value_streams_before_it_ends_and_a_cut_call_reports_nothing_more() {
+    let half = "<tool_call>\n<function=search>\n<parameter=query>\nlong query text\n</para";
+    let mut parser = ToolCallParser::new(Arc::new(ToolSet::new(&[search()]).expect("tools")));
+    let events = std::cell::RefCell::new(Vec::new());
+    let mut sink = |event| {
+        events.borrow_mut().push(event);
+        ControlFlow::Continue(())
+    };
+    for piece in chars(half) {
+        let _ = parser.feed(&piece, &mut sink);
+    }
+    let arguments = streamed(&events.borrow())
+        .0
+        .iter()
+        .map(|delta| delta.arguments.as_str())
+        .collect::<String>();
+    // The newline and the partial tag might still close the value.
+    assert_eq!(arguments, r#"{"query":"long query text"#);
+    let _ = parser.feed("\nmore", &mut sink);
+    let _ = parser.finish(crate::bonsai_model::StopReason::TokenLimit, &mut sink);
+    assert_eq!(parser.take_failure(), None);
+    let events = events.into_inner();
+    let (deltas, calls) = streamed(&events);
+    assert_eq!(calls, Vec::<&ToolCall>::new());
+    assert_eq!(
+        deltas
+            .iter()
+            .map(|delta| delta.arguments.as_str())
+            .collect::<String>(),
+        // Once more text follows, the held tail was value after all.
+        "{\"query\":\"long query text\\n</para\\nmore"
+    );
+}
+
+#[test]
+fn a_strict_raw_string_streams_and_an_unknown_tool_never_does() {
+    let patch = ToolDefinition {
+        name: "apply_patch".into(),
+        description: None,
+        parameters: json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}),
+        strict: true,
+    };
+    let input = "*** Begin Patch\n+fn main() {}\n*** End Patch";
+    let text = format!(
+        "<tool_call>\n<function=apply_patch>\n<parameter=input>\n{input}\n</parameter>\n</function>\n</tool_call>"
+    );
+    let (events, failure) = parse_in(std::slice::from_ref(&patch), &text, 1);
+    assert_eq!(failure, None);
+    let (deltas, calls) = streamed(&events);
+    let [call] = calls[..] else {
+        panic!("{calls:?}")
+    };
+    assert_eq!(call.arguments, json!({"input":input}));
+    let raw = deltas
+        .iter()
+        .filter_map(|delta| delta.text.as_ref().map(|(_, text)| text.as_str()))
+        .collect::<String>();
+    assert_eq!(raw, input);
+    let unknown = "<tool_call>\n<function=nope>\n<parameter=input>\nx\n</parameter>\n</function>\n</tool_call>";
+    let (events, failure) = parse_in(&[patch], unknown, 1);
+    assert!(failure.is_some());
+    assert_eq!(streamed(&events).0, Vec::<&super::ToolCallDelta>::new());
 }

@@ -1,0 +1,8 @@
+<|im_start|>user
+First<|im_end|>
+<|im_start|>assistant
+One<|im_end|>
+<|im_start|>user
+Second<|im_end|>
+<|im_start|>assistant
+<think>

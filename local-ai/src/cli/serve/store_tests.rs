@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{Event, GenerationStats, Stats, ToolCall};
 
-use super::options::parse;
+use super::options::{ResponseStoreArg, parse};
 use super::response::{Protocol, Reply, new_id};
 use super::responses::{PreparedResponses, ResponsesState, prepare_responses_with};
 use super::store::{ItemPage, PageError, ResponseStore, query_pairs, valid_id};
@@ -108,13 +108,45 @@ fn ids(items: &[Value]) -> Vec<&str> {
 }
 
 #[test]
-fn store_flag_is_opt_in() {
+fn the_store_is_on_by_default_and_flags_move_or_disable_it() {
     let to_vec = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
-    assert_eq!(parse(&to_vec(&[])).expect("defaults").response_store, None);
+    assert_eq!(
+        parse(&to_vec(&[])).expect("defaults").response_store,
+        ResponseStoreArg::Default
+    );
     let parsed = parse(&to_vec(&["--response-store", "/tmp/r"])).expect("flag");
-    assert_eq!(parsed.response_store, Some(PathBuf::from("/tmp/r")));
+    assert_eq!(
+        parsed.response_store,
+        ResponseStoreArg::Dir(PathBuf::from("/tmp/r"))
+    );
+    let parsed = parse(&to_vec(&["--no-response-store"])).expect("flag");
+    assert_eq!(parsed.response_store, ResponseStoreArg::Off);
     assert!(parse(&to_vec(&["--response-store"])).is_err());
     assert!(parse(&to_vec(&["--response-store", ""])).is_err());
+}
+
+#[test]
+fn pruning_removes_settled_responses_past_retention_and_keeps_pending_ones() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let now = super::response::unix_now();
+    let day = 86_400;
+    for (id, background, status, age) in [
+        ("resp_old", false, "completed", 31 * day),
+        ("resp_recent", false, "completed", 29 * day),
+        ("resp_oldpending", true, "queued", 31 * day),
+    ] {
+        let mut response = record(id, background, status);
+        response["created_at"] = json!(now - age);
+        store.save(&response, &input()).expect("saved");
+    }
+    let removed = store
+        .prune(std::time::Duration::from_secs(30 * day))
+        .expect("pruned");
+    assert_eq!(removed, 1);
+    assert!(store.load("resp_old").expect("readable").is_none());
+    assert!(store.load("resp_recent").expect("readable").is_some());
+    assert!(store.load("resp_oldpending").expect("readable").is_some());
 }
 
 #[test]

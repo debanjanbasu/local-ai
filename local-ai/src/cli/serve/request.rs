@@ -20,7 +20,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use local_engine::{
-    ChatMessage, ChatRequest, ResponseFormat, Sampling, ToolCall, ToolChoice, ToolDefinition,
+    ChatMessage, ChatRequest, ReasoningEffort, ResponseFormat, Sampling, ToolCall, ToolChoice,
+    ToolDefinition,
 };
 
 use crate::GenerateParams;
@@ -294,6 +295,7 @@ pub(super) fn prepare_generation(body: &[u8], thinking: bool) -> crate::Result<P
     let tool_choice = chat_tool_choice(request.tool_choice.as_ref())?;
     tool_policy(&tools, &tool_choice)?;
     let response_format = chat_response_format(request.response_format.as_ref())?;
+    let reasoning = effective_reasoning(request.reasoning_effort.as_deref(), thinking)?;
     Ok(PreparedGeneration {
         stream,
         include_usage: stream && include_usage,
@@ -301,7 +303,9 @@ pub(super) fn prepare_generation(body: &[u8], thinking: bool) -> crate::Result<P
             messages,
             max_tokens: params.max_tokens,
             sampling: Sampling(params),
-            thinking: effective_thinking(request.reasoning_effort.as_deref(), thinking)?,
+            thinking: reasoning.is_some(),
+            effort: reasoning.unwrap_or_default(),
+            preserve_thinking: true,
             session: request.prompt_cache_key,
             tools,
             tool_choice,
@@ -497,28 +501,38 @@ const fn invalid_format(message: String) -> crate::Error {
     crate::Error::InvalidArgument(message)
 }
 
-/// Resolve a reasoning effort against the server's `--no-thinking` choice.
+/// Resolve a reasoning effort against the server's `--no-thinking` choice:
+/// the level the model reasons at, or `None` for no reasoning.
 ///
-/// The checkpoint has exactly two modes: its template either asks for `xhigh`
-/// reasoning or closes the thought block empty. Those are the only two efforts
-/// that describe what will really run, so every other level is refused rather
-/// than silently rounded to one of them. An operator who started the server
-/// with `--no-thinking` has decided, so a request cannot turn reasoning back on.
-pub(super) fn effective_thinking(effort: Option<&str>, server: bool) -> crate::Result<bool> {
-    match effort {
-        None => Ok(server),
-        Some("none") => Ok(false),
-        Some("xhigh") if server => Ok(true),
-        Some("xhigh") => Err(crate::Error::InvalidArgument(
-            "reasoning effort \"xhigh\" was requested but this server was started with \
-             --no-thinking"
-                .into(),
-        )),
-        Some(other) => Err(crate::Error::InvalidArgument(format!(
-            "reasoning effort {other:?} is not supported; Bonsai 2 reasons at \"xhigh\" or not at \
-             all (\"none\")"
-        ))),
+/// The checkpoint template knows `low`, `medium` and `xhigh`, or closes the
+/// thought block empty (`none`). `OpenAI`'s other levels run at the nearest
+/// one, `minimal` at `low` and `high` at `xhigh`, and a Response reports the
+/// level that ran. An operator who started the server with `--no-thinking`
+/// has decided, so a request cannot turn reasoning back on.
+pub(super) fn effective_reasoning(
+    effort: Option<&str>,
+    server: bool,
+) -> crate::Result<Option<ReasoningEffort>> {
+    let level = match effort {
+        None => return Ok(server.then_some(ReasoningEffort::XHigh)),
+        Some("none") => return Ok(None),
+        Some("minimal" | "low") => ReasoningEffort::Low,
+        Some("medium") => ReasoningEffort::Medium,
+        Some("high" | "xhigh") => ReasoningEffort::XHigh,
+        Some(other) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "reasoning effort {other:?} is not supported; use none, minimal, low, medium, \
+                 high or xhigh"
+            )));
+        }
+    };
+    if !server {
+        return Err(crate::Error::InvalidArgument(format!(
+            "reasoning effort {:?} was requested but this server was started with --no-thinking",
+            effort.unwrap_or_default()
+        )));
     }
+    Ok(Some(level))
 }
 
 /// Check `choice` against the declared `tools` before anything is queued.
@@ -539,8 +553,46 @@ pub(super) fn tool_policy(tools: &[ToolDefinition], choice: &ToolChoice) -> crat
                 "tool_choice names function {name:?}, which is not declared in tools"
             )))
         }
+        ToolChoice::Allowed { tools: allowed, .. } => allowed
+            .iter()
+            .find(|name| !tools.iter().any(|tool| tool.name == **name))
+            .map_or(Ok(()), |name| {
+                Err(crate::Error::InvalidArgument(format!(
+                    "tool_choice allowed_tools names {name:?}, which is not declared in tools"
+                )))
+            }),
         _ => Ok(()),
     }
+}
+
+/// An `allowed_tools` choice: `mode` (`auto`, the default, or `required`)
+/// and a non-empty `tools` list, each entry's tool name given by `name`.
+pub(super) fn allowed_tools(
+    mode: Option<&Value>,
+    tools: Option<&Value>,
+    name: impl Fn(&Value) -> crate::Result<String>,
+) -> crate::Result<ToolChoice> {
+    let required = match mode {
+        None | Some(Value::Null) => false,
+        Some(Value::String(mode)) if mode == "auto" => false,
+        Some(Value::String(mode)) if mode == "required" => true,
+        Some(other) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "allowed_tools mode must be \"auto\" or \"required\", not {other}"
+            )));
+        }
+    };
+    let tools = match tools {
+        Some(Value::Array(tools)) if !tools.is_empty() => {
+            tools.iter().map(name).collect::<crate::Result<Vec<_>>>()?
+        }
+        _ => {
+            return Err(crate::Error::InvalidArgument(
+                "allowed_tools needs a non-empty tools list".into(),
+            ));
+        }
+    };
+    Ok(ToolChoice::Allowed { tools, required })
 }
 
 /// A `tool_choice` mode string shared by both APIs.
@@ -576,11 +628,6 @@ fn choice_name(object: &Map<String, Value>, field: &str) -> crate::Result<String
 fn choice_kind<'a>(object: &'a Map<String, Value>, function_shape: &str) -> crate::Result<&'a str> {
     match object.get("type") {
         Some(Value::String(kind)) if kind == "function" => Ok(kind),
-        Some(Value::String(kind)) if kind == "allowed_tools" => Err(crate::Error::InvalidArgument(
-            "tool_choice type \"allowed_tools\" is not supported; send only the allowed tools \
-             in tools instead"
-                .into(),
-        )),
         Some(Value::String(kind)) => Err(crate::Error::InvalidArgument(format!(
             "tool_choice type {kind:?} is not supported; only function tools run here, named as \
              {function_shape}"
@@ -613,6 +660,28 @@ pub(super) fn chat_tool_choice(choice: Option<&Value>) -> crate::Result<ToolChoi
             )));
         }
     };
+    if object.get("type").and_then(Value::as_str) == Some("allowed_tools") {
+        only_members(object, &["type", "allowed_tools"], "tool_choice")?;
+        let allowed = object
+            .get("allowed_tools")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument("tool_choice.allowed_tools must be an object".into())
+            })?;
+        only_members(allowed, &["mode", "tools"], "tool_choice.allowed_tools")?;
+        return allowed_tools(allowed.get("mode"), allowed.get("tools"), |tool| {
+            let function = tool
+                .get("function")
+                .and_then(Value::as_object)
+                .filter(|_| tool.get("type").and_then(Value::as_str) == Some("function"))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "allowed_tools entries must be {CHAT_NAMED}"
+                    ))
+                })?;
+            choice_name(function, "allowed_tools.tools[].function")
+        });
+    }
     choice_kind(object, CHAT_NAMED)?;
     only_members(object, &["type", "function"], "tool_choice")?;
     let function = match object.get("function") {
@@ -653,6 +722,24 @@ pub(super) fn responses_tool_choice(choice: Option<&Value>) -> crate::Result<(To
             )));
         }
     };
+    if object.get("type").and_then(Value::as_str) == Some("allowed_tools") {
+        only_members(object, &["type", "mode", "tools"], "tool_choice")?;
+        // Each entry names a tool as a `tool_choice` would: a function, a
+        // custom tool, or a built-in type such as `shell`.
+        let choice = allowed_tools(object.get("mode"), object.get("tools"), |tool| {
+            let named = match super::hosted::tool_choice(Some(tool)) {
+                Some(named) => named?.0,
+                None => responses_tool_choice(Some(tool))?.0,
+            };
+            match named {
+                ToolChoice::Function(name) => Ok(name),
+                _ => Err(crate::Error::InvalidArgument(format!(
+                    "allowed_tools entries must name a tool, as {RESPONSES_NAMED} does"
+                ))),
+            }
+        })?;
+        return Ok((choice, Value::Object(object.clone())));
+    }
     choice_kind(object, RESPONSES_NAMED)?;
     only_members(object, &["type", "name"], "tool_choice")?;
     let name = choice_name(object, "tool_choice")?;

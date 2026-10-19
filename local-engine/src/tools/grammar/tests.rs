@@ -503,6 +503,24 @@ fn tool_choice_none_and_named_restrict_the_answer() {
     let mut named = constrained(&tools, &ToolChoice::Function("plot".into()), true);
     feed(&mut named, &[OPEN]).expect("open");
     feed_text(&mut named, &tokenizer, "\n<function=plot>").expect("named header");
+
+    // `allowed_tools` admits only its tools; in `auto` mode text may still
+    // end the answer, in `required` mode it may not.
+    let allowed = |required| ToolChoice::Allowed {
+        tools: vec!["plot".into()],
+        required,
+    };
+    let mut auto = constrained(&tools, &allowed(false), true);
+    assert!(allows(&mut auto, EOS));
+    feed(&mut auto, &[OPEN]).expect("open");
+    assert!(feed_text(&mut auto, &tokenizer, "\n<function=get_weather>").is_err());
+    let mut auto = constrained(&tools, &allowed(false), true);
+    feed(&mut auto, &[OPEN]).expect("open");
+    feed_text(&mut auto, &tokenizer, "\n<function=plot>").expect("allowed header");
+    let mut required = constrained(&tools, &allowed(true), true);
+    assert!(!allows(&mut required, EOS));
+    feed(&mut required, &[OPEN]).expect("open");
+    assert!(feed_text(&mut required, &tokenizer, "\n<function=get_weather>").is_err());
 }
 
 #[test]

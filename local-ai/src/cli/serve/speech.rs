@@ -484,7 +484,9 @@ mod tests {
             assert!(parse(&request(bad)).is_err(), "{bad}");
         }
         assert!(parse(&request(r#","instructions":"""#)).is_ok());
-        assert!(parse(br#"{"model":"tts-1","input":"Hi.","voice":"alloy"}"#).is_err());
+        // OpenAI's speech model names are aliases of the local model.
+        assert!(parse(br#"{"model":"tts-1","input":"Hi.","voice":"alloy"}"#).is_ok());
+        assert!(parse(br#"{"model":"whisper-1","input":"Hi.","voice":"alloy"}"#).is_err());
         assert!(parse(br#"{"model":"kokoro-82m","input":" ","voice":"alloy"}"#).is_err());
         let long = format!(
             r#"{{"model":"kokoro-82m","input":"{}","voice":"alloy"}}"#,

@@ -36,10 +36,11 @@ pub use api::{
     CancelHandle, ChatMessage, ChatOutput, ChatRequest, Engine, EngineHandle, EngineInfo, Event,
     EventRelay, EventStream, PendingDecision, Plan, Sampling, Signal, Stats, ToolOutput,
 };
+pub use bonsai_tokenizer::ReasoningEffort;
 pub use error::Error;
 pub use structured::ResponseFormat;
 pub use tools::grammar::{LARK_KEYWORD, check_lark_grammar};
-pub use tools::{ToolCall, ToolChoice, ToolDefinition};
+pub use tools::{ToolCall, ToolCallDelta, ToolChoice, ToolDefinition};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
