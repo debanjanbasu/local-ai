@@ -393,7 +393,7 @@ way (with `store: false` they are kept only temporarily). The server maps Chat
 `response_format` and Responses `text.format` onto `ResponseFormat`. See
 [server API](../docs/BONSAI.md#server-api) for storage, background streams,
 structured output, encrypted reasoning replay, token counting, the
-experimental decisions route and compatibility limits. Keep tool execution out
+decisions route and compatibility limits. Keep tool execution out
 of the engine; in particular, a retry must not repeat a partially successful
 batch's side effects. Do not change the pinned checkpoint template merely to
 match another Qwen model's conventions.
@@ -494,7 +494,7 @@ uses `input` and named question/answer arrays. At the pinned revision, Oh My Pi'
 [`openrouter-decisions` adapter](https://github.com/can1357/oh-my-pi/blob/dde3fc44ed16d3bbec292893c7a902e92d6ce00e/packages/ai/src/judgment/typesafe.ts)
 uses the older System One `state`, keyed questions/answers and `noul` predicate
 format. They require distinct adapters to the native judgment interface
-described [below](#experimental-native-decisions), which is not either of
+described [below](#native-decisions), which is not either of
 them. A judgment head is separate from the speculative MTP head: MTP accelerates
 generation and does not train classification, tool use or confidence calibration.
 
@@ -623,9 +623,9 @@ It is one seed and one in-domain dataset with balanced, sampled labels, and
 there is still no zero-shot Bonsai comparison. The scores describe
 this dataset's held-out split only.
 
-This head is **not installed** or discovered: the engine and server load it
-only when explicitly given its path (see
-[native decisions](#experimental-native-decisions)). It is not an
+This head is **not installed** or discovered: the engine loads it only when
+explicitly given its path (see [native decisions](#native-decisions)). It is
+not an
 implementation of `OpenAI` Decisions and not an MTP upgrade: it does not
 touch speculative decoding. No production judgment head is supplied. Frozen Bonsai
 features may not match Kev's adapter-trained representations; Kev's labels are
@@ -642,11 +642,10 @@ position-major rows: at least two option rows, then the decision row. Check
 `width()` against the capture model, and round captured values through FP16
 to match the training representation. The loader checks format metadata,
 dimensions, tensor byte ranges and finite values. It also keeps the
-artifact's optional `renderer` and `calibration_scope` metadata
-(`renderer()`, `calibration_scope()`; `None` when absent, never inferred).
-`--development` exports record both (the renderer only when every feature
-row agrees); the existing devtools-v1 head and default-mode exports record
-neither. The CPU scorer accepts any declared renderer. Native scoring matched an
+artifact's optional `renderer` metadata (`renderer()`; `None` when absent).
+`--development` exports record it when every feature row agrees; the
+existing devtools-v1 head, the `models/decisions-v2` head and default-mode
+exports do not. The CPU scorer accepts any declared renderer. Native scoring matched an
 independent Python reference on two real captured examples within 1e-12.
 This validates the scoring formula, not judgment quality on new tasks or
 the calibration of returned probabilities outside the evaluation dataset.
@@ -739,53 +738,33 @@ metrics agreed within 7e-8. Exported head SHA-256 values, in seed order:
 657cde86d4a8fa45fffbe9ffc4f18b087600cb4bc79cc5d82f7fcaf606079e2d
 ```
 
-### Experimental native decisions
+### Native decisions
 
 `Engine::decide(&head, &DecisionRequest)` and
 `EngineHandle::decide(Arc<JudgmentHead>, &DecisionRequest)` answer a typed
-text question with an explicitly loaded head. `DecisionRequest { state,
+text question with an explicitly loaded head; `POST /v1/decisions` uses them
+through `judgment::CalibratedHead` (see the
+[server API](../docs/BONSAI.md#decisions)). `DecisionRequest { state,
 question, kind }` is rendered exactly as `tools/judgment_prepare.py` renders
-devtools-v1 and hard-v1 rows (`State:`, `Question:`, lettered `Options:`,
-`Decision:`). The compatible identifiers in `judgment::DECISION_RENDERERS`
-are `kev-devtools-v1-judgment-render.v1`, `kev-hard-v1-judgment-render.v1`
-and `kev-hard-v1-judgment-render.v1-no-descriptions`. All use the same framing
-and byte endpoints; the caller supplies the prepared state and option text,
-including descriptions where training used them. `DecisionKind::Predicate` is
-`A) Yes` / `B) No`; `Choice` takes 2 to 26 distinct single-line values
-(strings or booleans) in the caller's order; `Score` takes 1 to 26 ordered
-labels. The option and decision rows are captured on the already loaded model
-(no second model) in 60-row blocks, the `mtp-capture` default the training
-features used, rounded through FP16 and scored on the CPU.
-
-All 8,479 prepared hard-v1 development rows reproduced their training prompt
-bytes and option/decision endpoints through native rendering and the real
-tokenizer (5,994 choices, 2,170 predicates and 315 scores), with no embedded
-special-token ambiguity. This verifies format compatibility, not a trained
-hard-v1 head's quality; the locked test split was not read.
-
-After training, six validation rows (143–330 tokens, 2/3/5/6 options) were
-checked with each of the three downloaded heads: text choices, a boolean
-choice ordered No/Yes, a Yes/No predicate, and a six-level score. All 36 native
-cases (MTP off/on) reproduced stored-feature logits and probabilities exactly;
-all 18 HTTP cases (MTP on) reproduced the native probabilities, selected values,
-score means, prompt counts and artifact-declared provenance. These checks ran
-serially on the M4 Pro in 122 seconds with normal memory pressure and zero swap
-use. They establish integration parity, not accuracy or long-context quality.
+training rows (`State:`, `Question:`, lettered `Options:`, `Decision:`), the
+renderer `judgment::DECISION_RENDERER` (`kev-devtools-v1-judgment-render.v1`).
+`DecisionKind::Predicate` is `A) Yes` / `B) No`; `Choice` takes 2 to 26
+distinct single-line values (strings or booleans) in the caller's order;
+`Score` takes 1 to 26 ordered labels. The option and decision rows are
+captured on the already loaded model (no second model) in 60-row blocks, the
+`mtp-capture` default the training features used, rounded through FP16 and
+scored on the CPU. `Engine::capture_decision` (the `judgment-capture` binary)
+returns the same rendering and features before any head. All 8,479 prepared
+hard-v1 development rows reproduced their training prompt bytes and
+option/decision endpoints through this renderer and the real tokenizer, with
+no embedded special-token ambiguity.
 
 A `Decision` carries the head's probability per option, the argmax and its
 value, for scores the probability-weighted mean level index, the prompt token
-count, the renderer, `renderer_declared` and the loaded head's
-`calibration_scope`. It has no confidence, threshold or refusal. Provenance
-comes from the loaded file only: a head declaring an unsupported renderer is
-refused; supported identifiers are returned unchanged. A legacy head declaring
-none is accepted with devtools-v1 assumed (`renderer_declared: false`), and a head
-declaring no `calibration_scope` reports `judgment::UNKNOWN_CALIBRATION_SCOPE`
-rather than a guessed training set. The existing devtools-v1 head is such a
-legacy file, so at run time it reports an assumed renderer and unknown
-calibration. Its scope was documented separately when it was evaluated: it
-was trained and temperature-fitted only on two-option Yes/No code-diff
-questions, so for other questions, states or more than two options its
-probabilities are the head's softmax output and nothing more.
+count and the scored `Decision:` row. It has no confidence, threshold or
+refusal; `CalibratedHead::judge` adds those for its declared scope. A head
+declaring a renderer other than `DECISION_RENDERER` is refused; one declaring
+none, such as the `models/decisions-v2` head, is rendered with it.
 
 Invalid requests, text that spells a special token, and a head whose width is
 not the model's or whose declared renderer is unsupported fail before
@@ -801,15 +780,13 @@ decision or stops a running capture before its next block, resolving to
 tier is kept when a free pooled set exists and cleared otherwise; host and
 disk snapshots are unaffected.
 
-`local-ai serve --experimental-decision-head FILE` exposes this as
-`POST /v1/experimental/decisions`; see the
-[server API](../docs/BONSAI.md#server-api). Unit tests cover rendering, token
-endpoints, validation, queueing, cancellation and score mapping with a
-synthetic head. Real-model native and HTTP checks reproduce stored-feature
-probabilities bit-for-bit for four rows covering both devtools tasks and both
-option orders, with and without MTP. Capture/cancellation preserve later
-generation token IDs and cache correctness. Capture measured about 115–130
-tokens/s on the M4 Pro; later generations wait behind it.
+Unit tests cover rendering, token endpoints, validation, queueing,
+cancellation and score mapping with a synthetic head. Real-model native and
+HTTP checks reproduce stored-feature probabilities bit-for-bit for four rows
+covering both devtools tasks and both option orders, with and without MTP.
+Capture/cancellation preserve later generation token IDs and cache
+correctness. Capture measured about 115–130 tokens/s on the M4 Pro; later
+generations wait behind it.
 
 Acceptance should exercise native calls as well as HTTP: a complete read/edit/
 tool-result turn, malformed and interrupted arguments that cannot execute,

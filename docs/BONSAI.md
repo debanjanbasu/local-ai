@@ -133,9 +133,6 @@ local-ai serve [options]
                      absent; default: the user's data directory
   --decisions-artifact DIR  serve POST /v1/decisions from DIR; default:
                      models/decisions-v2 when installed
-  --experimental-decision-head FILE  EXPERIMENTAL: serve
-                     POST /v1/experimental/decisions with this judgment head
-                     (probabilities only; default: off; not in --help)
 
 local-ai bonsai [options] <prompt>
   --max-tokens N     output cap (default 8192)
@@ -200,8 +197,6 @@ TLS and HTTP/3 are automatic runtime behavior, not a build option.
 | `POST` | `/v1/audio/speech` | Kokoro-82M text to speech (installed model only; [SPEECH.md](SPEECH.md)) |
 | `POST` | `/v1/audio/transcriptions`, `/v1/audio/translations` | Whisper large-v3 speech recognition and translation to English (installed model only; [TRANSCRIPTION.md](TRANSCRIPTION.md)) |
 | `GET`, `POST`, `DELETE` | `/v1/organization/*` | Administration API: admin keys, projects, service accounts, audit logs, usage (admin key only; [ADMIN.md](ADMIN.md)) |
-| `POST`, `GET`, `DELETE` | `/v1/evals[/{id}[/runs[/{run_id}[/cancel\|/output_items[/{item_id}]]]]]` | evals of the loaded model, run through batches |
-| `POST` | `/v1/experimental/decisions` | EXPERIMENTAL judgment-head probabilities (`--experimental-decision-head` only) |
 | `POST` | `/v1/decisions` | calibrated, scope-gated decisions (with `models/decisions-v2` or `--decisions-artifact`; 404 with an explanation otherwise) |
 
 ### Model ids
@@ -211,7 +206,7 @@ same table:
 
 | Model | Id | Also accepted | Routes |
 | --- | --- | --- | --- |
-| Ternary Bonsai 2 27B | `ternary-bonsai-2-27b` | none | Chat Completions, Responses, `input_tokens`, `compact`, decisions, batches, evals |
+| Ternary Bonsai 2 27B | `ternary-bonsai-2-27b` | none | Chat Completions, Responses, `input_tokens`, `compact`, decisions, batches |
 | EmbeddingGemma 2 | `embeddinggemma-2` | `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002` | `/v1/embeddings` |
 | moderation heads | `embeddinggemma-2-moderation-1` | `omni-moderation-latest`, `omni-moderation-2024-09-26`, `text-moderation-latest`, `text-moderation-stable` | `/v1/moderations` (`model` may be omitted) |
 | Kokoro-82M | `kokoro-82m` | `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts` | `/v1/audio/speech` |
@@ -224,34 +219,22 @@ local model there (for example `embeddinggemma-2` on Chat Completions) is a
 400 that names the right route. Batch lines follow the same rule (each line
 must name a model, all lines the same one, and the batch object reports it as
 given); a stored line naming another local model fails without generating.
-Evals still require exactly `ternary-bonsai-2-27b`.
 `GET /v1/models/{model}` answers an installed model by id or alias (an alias
 answers with the model's own id) and 404 otherwise.
-
-Earlier versions used the GGUF file path as the Bonsai id. It named one
-machine's layout, so it is no longer listed or retrieved (as a name of no
-other model, generation routes and batch lines accept it like any other name).
-What those versions stored keeps working: batch lines naming the path still
-run, and with the same
-`--reasoning-key`, reasoning and compaction envelopes sealed for the path
-still open (new ones are sealed for `ternary-bonsai-2-27b`). An eval run
-created before the change and still in progress fails when it starts its next
-batch; create the run again.
 
 ### Supported OpenAI APIs
 
 The server implements only current OpenAI APIs, as the pinned OpenAPI
 specification defines them: Chat Completions, Responses (with
 `input_tokens`, `compact`, retrieval, cancellation and input items), Models,
-Conversations, Files, Uploads, Batches, Vector Stores, Evals, Decisions and
-the Administration API; with the optional models installed, Embeddings,
+Conversations, Files, Uploads, Batches, Vector Stores, Decisions and the
+Administration API; with the optional models installed, Embeddings,
 Moderations, Audio speech, and Audio transcriptions and translations.
-`/health` and `/v1/experimental/decisions` are this server's own.
+`/health` is this server's own.
 Legacy and deprecated APIs are intentionally not served:
 
 - The legacy Completions API, `POST /v1/completions`, is a 404 like any
-  unknown route, and a batch cannot target it (a batch created before it was
-  removed reads back unchanged, and its pending lines fail with a 404).
+  unknown route, and a batch cannot target it.
 - Request members the specification marks deprecated are a 400 that names
   the replacement: on Chat Completions `max_tokens` (use
   `max_completion_tokens`), `seed`, `user` (use `prompt_cache_key` and
@@ -264,9 +247,6 @@ Legacy and deprecated APIs are intentionally not served:
   `session_id` alias is refused the same way in favor of `prompt_cache_key`.
   Chat accepts any of them as `null`, which sets nothing; Responses, whose
   parser refuses unknown members, refuses even that.
-- Evals sample a `completions` data source and run `score_model` graders
-  through Chat Completions, so their `sampling_params.seed` is refused; a
-  Chat-sampled item reports the server's fixed sampling seed.
 
 ### Generation requests
 
@@ -334,8 +314,7 @@ JSON. Each accepts `text` (the default), `json_object` (any JSON object) and
 `json_schema`. Chat nests the schema in a `json_schema` object; Responses puts
 `name`, `schema` and the optional `description` and `strict` directly in
 `format`. `name` (1 to 64 of `a-z`, `A-Z`, `0-9`, `_`, `-`) and an object
-`schema` are required, and unknown members are refused. Legacy Completions
-accepts only `{"type":"text"}`.
+`schema` are required, and unknown members are refused.
 
 ```bash
 curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -605,15 +584,9 @@ log-probabilities, images and audio are rejected.
 `tool_choice` `auto`, `none`, `required` and a named function,
 `parallel_tool_calls` and tool `strict` are supported and enforced during
 decoding, as is a structured format beside tools; a grammar guarantees the
-form of what is generated, not that the model chooses well. OpenAI Decisions
-is not implemented: the opt-in
-[experimental decisions](#experimental-decisions) route returns a head's
-probabilities without the confidence and refusal Decisions requires, and any
-calibration holds only within the loaded artifact's own evaluated scope (for
-example, the legacy devtools-v1 head's two-option Yes/No code-diff questions,
-or the development-only
-[hard-v1 results](../local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)).
-The MTP head and
+form of what is generated, not that the model chooses well. Decisions are
+answered only within the one evaluated scope of the installed artifact and
+refused otherwise ([decisions](#decisions)). The MTP head and
 next-token softmax are not calibrated decision probabilities either.
 
 The compatibility target is the public OpenAI contract, not a particular
@@ -632,14 +605,13 @@ durable conversations, files, uploads and text-endpoint batches
 ([native services](#native-services)) are now implemented as described;
 vector stores (BM25, or embedding-ranked with the embedding model) are implemented too ([native services](#native-services));
 compaction and reasoning summaries are implemented with the loaded model
-([below](#compaction-and-reasoning-summaries)); OpenAI-compatible Decisions needs
-a judgment head with evaluated confidence and refusal semantics; embeddings,
+([below](#compaction-and-reasoning-summaries)); decisions are served within one
+evaluated scope ([below](#decisions)); embeddings,
 moderations, text to speech and transcription run on optional native models
 (EmbeddingGemma 2, its moderation heads, Kokoro-82M, Whisper large-v3; see the
 endpoint table), while image and audio input to generation still needs a
 multimodal generator.
-Evals run on the batch worker ([native services](#native-services)), and
-client-executed `custom`/`local_shell`/`apply_patch` tools and opt-in
+Client-executed `custom`/`local_shell`/`apply_patch` tools and opt-in
 sandboxed hosted tools are described in [docs/TOOLS.md](TOOLS.md); other
 built-in tools and fine-tuning still need their own services; the
 Administration API is described in [docs/ADMIN.md](ADMIN.md). None is implemented by merely accepting its request fields.
@@ -668,14 +640,12 @@ summary events separately; raw reasoning is not relabeled as a summary.
 The Oh My Pi example in the engine README configures that client to use only
 implemented capabilities.
 
-Legacy Completions now rejects unsupported `stop`, `n`, `logprobs`, `logit_bias`,
-`best_of`, `echo`, `suffix` and streaming usage options rather than silently
-ignoring them. Chat also rejects `store:true` and non-default `verbosity`.
+Chat rejects `store:true` and non-default `verbosity`.
 Error envelopes include nullable `code` and `param`; choices include nullable
 `logprobs`; Responses includes nullable `access_programs`. The model's `created`
 timestamp is its registration time at server startup, not its training date.
 
-With `stream: true`, Chat/completions are `text/event-stream` chunks terminated by
+With `stream: true`, Chat Completions responses are `text/event-stream` chunks terminated by
 `data: [DONE]`. Chat separates `reasoning_content` from visible `content`.
 Non-streamed Chat/completion JSON includes token usage, cache source, timings, and speculation
 counters. JSON responses use zstd when `Accept-Encoding` contains `zstd`, at
@@ -985,24 +955,6 @@ preparation and generation blocking tasks, never on runtime workers.
   lock gives one server ownership of a batch. A restart reclaims batches with
   free leases and resumes their unsettled lines. A line interrupted before
   settling is generated again. Result files have stable `batch_output` IDs.
-- **Evals.** An eval has a `custom` data source config and testing criteria;
-  a run reads `jsonl`, `completions` or `responses` data sources from inline
-  `file_content` or an uploaded file (`file_id`), snapshotted at creation.
-  Every model call of a run (sampling, then `label_model` and `score_model`
-  grading, constrained to `{"result": ...}`) is a line of an ordinary batch,
-  so runs share the batch worker's queue, restart resumption and
-  cancellation; an eval worker advances runs at startup, on create or cancel
-  and when the batch worker finishes a batch, without polling. `string_check`
-  and the `text_similarity` metrics `fuzzy_match`, `bleu`, `gleu`, `rouge_1`
-  to `rouge_5` and `rouge_l` are computed to match `rapidfuzz`, `nltk` and
-  `rouge-score`. Refused: `python` graders (no sandbox), `multi` (not an eval
-  criterion), `cosine` (no validated embeddings), `meteor` (no WordNet), model
-  graders or sampling naming another model, `logs`/`stored_completions`
-  sources (`stored_completions` configs are also deprecated), and
-  `sampling_params.seed` wherever the call runs through Chat Completions,
-  which deprecated `seed` (`completions` sampling and `score_model` graders);
-  such samples report the server's fixed seed.
-
 - **Vector Stores.** Stores, store files, file batches (create, retrieve,
   cancel, list files), parsed file content and `search`, with the contract's
   pagination, expiry, file status lifecycle, `auto`/`static` chunking,
@@ -1030,44 +982,30 @@ resumption is a separate mechanism. Compaction's policy (when to compact,
 what is kept) lives here; its summary generation is the server's. They
 provide no training or change to the model.
 
-### Experimental decisions
+### Decisions
 
-`--experimental-decision-head FILE` enables `POST /v1/experimental/decisions`.
-Without the flag the route is a 404 and no head is loaded. The head is opened
-and its width checked before the model loads, so a wrong file fails startup,
-as does a head whose `renderer` metadata is outside the native engine's
-supported devtools-v1 and hard-v1 formats. The server announces the route as
-experimental together with what the loaded file declares: its renderer
-(declared, or assumed for a legacy head that declares none) and its
-`calibration_scope` metadata, or an explicit "unknown" when it has none. The
-route bridges to the engine's
-[native decisions](../local-engine/README.md#experimental-native-decisions)
-and sits behind `--api-key` like every other route.
-
-The body borrows the Decisions request vocabulary but accepts only what the
-native renderer reproduces exactly: `input` must be a non-empty text string
-(rendered as the `State:`); `questions` holds 1 to 200 questions of `type`
-`predicate`, `choice` (2 to 26 string or boolean `choices[].value`) or
-`score` (2 to 10 `levels[].label`), each with `instructions` and an optional
-`name`; `model` is read as on the other generation routes
-([model ids](#model-ids)) and `safety_identifier` is accepted and ignored. Message
-arrays, images, non-empty option or level descriptions and unknown fields are
-refused with 400 rather than approximated. A 200 response has
-`"object":"experimental.decision"` and one answer per question: a predicate's
-`probability` of Yes; a choice's argmax `choice` and per-value
-`probabilities`; a score's probability-weighted mean level index as `score`
-and per-level `probabilities`. `usage.input_tokens` sums the rendered prompt
-tokens (`output_tokens` is 0), and an `experimental` object repeats the
-`renderer`, `renderer_source` (`"artifact"` when the head declared it,
-`"assumed"` for a legacy head), the loaded head's `calibration_scope` (or the
-unknown-provenance text) and the limitations.
-
-Hard-v1 and devtools-v1 use identical prompt framing; compatibility does not
-prepare a caller's state or add training descriptions. To reproduce a described
-hard-v1 option, pass its full rendered label as a string choice (for example,
-`"Yes: Meets all constraints"`), not a bare predicate or a description field.
-Preserve training option order. This preserves prompt bytes, not calibration
-outside the artifact's recorded scope.
+`POST /v1/decisions` is served whenever the artifact is installed as
+`models/decisions-v2` or named with `--decisions-artifact DIR`
+(`head.safetensors`, `gate.safetensors`, `calibration.json`); without one the
+route is a 404 with an explanation. At startup the server checks the
+artifact's canonical-JSON content hash, the head and gate file hashes it
+pins, that its pre-registered acceptance passed and that its declared scope
+is the one the server implements; any mismatch stops it before the model
+loads. A `predicate` question is answered only when it is one of the declared
+questions (CodeReviewer "Does this change need a reviewer comment?",
+CommitPackFT "Does this commit message describe this diff? Message: "…"")
+over a text input starting `Diff:` or `Context before hunk:`; it then runs
+one [native decision](../local-engine/README.md#native-decisions), and is
+answered with the calibrated `probability` of Yes unless the prompt exceeds
+2048 tokens, the gate (PCA Mahalanobis distance of the `Decision:` hidden
+state, fitted on training rows) puts it out of distribution, its family has
+no threshold (CodeReviewer: always refused) or its top-label confidence is
+below the family's threshold. Every other question, and every question about
+a message or image input, is answered `{"type":"refusal"}` without GPU work.
+Results and limits are in [DECISIONS_EVALUATION.md](DECISIONS_EVALUATION.md)
+part 3; in short only commit-message match is answered, which says nothing
+about code review or coding quality. This is not a production judgment
+service.
 
 Questions run one after another over the same input, each taking one slot of
 the engine's bounded FIFO queue and running only once no generation is
@@ -1078,52 +1016,12 @@ queue gets the usual queue-full 503. A client that disconnects drops its
 pending decision, which cancels it, queued or running; shutdown refuses new
 requests and ends waiting ones with 503, cancelling their decisions the same
 way. These waits are futures woken by the engine or by shutdown, not polling.
-
-`POST /v1/experimental/decisions` is not the OpenAI Decisions API: OpenAI's
-responses require a `confidence` on every choice and score answer and may
-answer with a `refusal`, and this route's head produces neither.
-`POST /v1/decisions` is served separately, whenever the artifact is installed
-as `models/decisions-v2` or named with `--decisions-artifact DIR`
-(`head.safetensors`, `gate.safetensors`, `calibration.json`). At startup the
-server checks the artifact's canonical-JSON content hash, the head and gate
-file hashes it pins, that its pre-registered acceptance passed and that its
-declared scope is the one the server implements; any mismatch stops it before
-the model loads. A `predicate` question is answered only when it is one of the
-declared questions (CodeReviewer "Does this change need a reviewer comment?",
-CommitPackFT "Does this commit message describe this diff? Message: "…"")
-over a text input starting `Diff:` or `Context before hunk:`; it then runs one
-native decision, and is answered with the calibrated `probability` of Yes
-unless the prompt exceeds 2048 tokens, the gate (PCA Mahalanobis distance of
-the `Decision:` hidden state, fitted on training rows) puts it out of
-distribution, its family has no threshold (CodeReviewer: always refused) or
-its top-label confidence is below the family's threshold. Every other
-question, and every question about a message or image input, is answered
-`{"type":"refusal"}` without GPU work. Results and limits are in
-[DECISIONS_EVALUATION.md](DECISIONS_EVALUATION.md) part 3; in short only
-commit-message match is answered, which says nothing about code review or
-coding quality. The existing devtools-v1 head declares no renderer or
-calibration scope, so the route reports `renderer_source: "assumed"` and an
-unknown calibration scope for it; as measured when it was evaluated, its
-probabilities are calibrated only for the two-option Yes/No code-diff
-questions it was trained on, and are the head's softmax output for anything
-else. This is not a production judgment service. Real-model
-native and HTTP checks reproduced stored-feature probabilities bit-for-bit
-on four rows from both training tasks and both option orders, with and without
-MTP. Queue ordering, cancellation, and generation/cache parity after a decision
-also passed. Capture measured about 115–130 tokens/s on the M4 Pro, and later
-generations wait behind it. These checks establish implementation parity,
-not general judgment quality or calibration.
-
-The three development-only hard-v1 heads subsequently completed private CPU
-training, reaching 58.10–58.21% accuracy against a 30.12% majority baseline on
-the 883-row checkpoint-selection split. They remain uninstalled experimental
-artifacts, not production heads. Real-model checks passed for all three heads:
-36 native cases with MTP off/on and 18 HTTP cases with MTP on matched stored
-features exactly across choices, both boolean orders, predicates and scores.
-See the [hard-v1 results and limitations](../local-engine/README.md#kev-hard-v1-preparation-and-development-only-training)
-for calibration, provenance and weak task families. No locked test was scored;
-these synthetic results do not establish coding quality or Decisions confidence
-and refusal semantics.
+Real-model native and HTTP checks reproduced stored-feature probabilities
+bit-for-bit on four rows from both training tasks and both option orders,
+with and without MTP; queue ordering, cancellation, and generation/cache
+parity after a decision also passed. Capture measured about 115–130 tokens/s
+on the M4 Pro, and later generations wait behind it. These checks establish
+implementation parity, not general judgment quality or calibration.
 
 ### Concurrent requests
 
@@ -2802,7 +2700,7 @@ covered by CPU tests.
 
 Native constrained tool calling (`tool_choice`, `parallel_tool_calls`, tool
 `strict`, a format beside tools), temporary `store: false` background
-retention and the experimental decisions route were added after those live
+retention and native decisions were added after those live
 runs. CPU unit and HTTP-adapter tests cover grammar masks over synthetic
 vocabularies, an ignored CPU-only test against the real tokenizer's call tags,
 request parsing and echo, temporary-store expiry with an injected clock,

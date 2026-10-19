@@ -133,10 +133,9 @@ Implemented:
     including a client that went away: the generation is drained to its final
     count; each compaction and reasoning-summary generation as a record of its
     own), input, cached and output tokens;
-  - `completions` with `batch: true`: every batch line, eval-run generations
-    included, attributed to the project key that created the batch or eval
-    run (it is stored with them, since a batch outlives the request that
-    created it);
+  - `completions` with `batch: true`: every batch line, attributed to the
+    project key that created the batch (it is stored with it, since a batch
+    outlives the request that created it);
   - `embeddings`: input tokens of each `POST /v1/embeddings`;
   - `moderations`: input tokens (every scored window) of each
     `POST /v1/moderations`;
@@ -163,11 +162,10 @@ limits, data retention, model and hosted-tool permissions, external storage.
 ## Limits
 
 - Work that runs after its request ended is attributed to the project key
-  that created it, which is stored with it: batch lines and eval runs in the
-  services database (schema version 2 of each), and a pending durable
-  background Response in its record beside its request. Work stored by an
-  earlier version, and work created with the `--api-key` key or with
-  authentication off, is recorded unattributed.
+  that created it, which is stored with it: batch lines in the services
+  database, and a pending durable background Response in its record beside
+  its request. Work created with the `--api-key` key or with authentication
+  off is recorded unattributed.
 - A failed or cancelled speech, transcription, embeddings or moderations
   request records nothing; a generation records what it produced.
 - Usage records are kept indefinitely (one small row per request).

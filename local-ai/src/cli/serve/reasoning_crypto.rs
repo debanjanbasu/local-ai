@@ -177,9 +177,6 @@ type Result<T> = std::result::Result<T, ReasoningCryptoError>;
 pub struct ReasoningCipher {
     key: LessSafeKey,
     rng: SystemRandom,
-    /// A model ID envelopes were sealed for by an earlier version of this
-    /// server, also accepted when opening (see [`Self::with_legacy_model`]).
-    legacy_model: Option<String>,
 }
 
 impl fmt::Debug for ReasoningCipher {
@@ -203,30 +200,13 @@ impl ReasoningCipher {
         let rng = SystemRandom::new();
         for _ in 0..OPEN_ATTEMPTS {
             if let Some(key) = read_key(path)? {
-                return Ok(Self {
-                    key,
-                    rng,
-                    legacy_model: None,
-                });
+                return Ok(Self { key, rng });
             }
             if let Some(key) = create_key(path, &rng)? {
-                return Ok(Self {
-                    key,
-                    rng,
-                    legacy_model: None,
-                });
+                return Ok(Self { key, rng });
             }
         }
         Err(ReasoningCryptoError::KeyFileUnstable(path.to_path_buf()))
-    }
-
-    /// Also open envelopes sealed for `model_id`, the ID an earlier version
-    /// gave the same model (the server used to name Bonsai by its file
-    /// path). Sealing always uses the ID it is given.
-    #[must_use]
-    pub fn with_legacy_model(mut self, model_id: impl Into<String>) -> Self {
-        self.legacy_model = Some(model_id.into());
-        self
     }
 
     /// Encrypt `reasoning` for `item_id` produced by `model_id`, returning an
@@ -291,27 +271,7 @@ impl ReasoningCipher {
         self.unseal_in(DOMAIN, model_id, item_id, envelope)
     }
 
-    /// [`Self::open_for`] for `model_id`, then for the legacy model ID when
-    /// that fails authentication.
     fn unseal_in(
-        &self,
-        domain: &[u8],
-        model_id: &str,
-        item_id: &str,
-        envelope: &str,
-    ) -> Result<String> {
-        match self.open_for(domain, model_id, item_id, envelope) {
-            Err(ReasoningCryptoError::Authentication) => match &self.legacy_model {
-                Some(legacy) if legacy != model_id => self
-                    .open_for(domain, legacy, item_id, envelope)
-                    .map_err(|_| ReasoningCryptoError::Authentication),
-                _ => Err(ReasoningCryptoError::Authentication),
-            },
-            opened => opened,
-        }
-    }
-
-    fn open_for(
         &self,
         domain: &[u8],
         model_id: &str,
@@ -758,31 +718,6 @@ mod tests {
         let envelope = cipher.seal("ab", "c", "split").expect("seals");
         assert!(matches!(
             cipher.unseal("a", "bc", &envelope),
-            Err(ReasoningCryptoError::Authentication)
-        ));
-    }
-
-    #[test]
-    fn envelopes_sealed_for_the_legacy_model_id_still_open() {
-        let scratch = Scratch::new();
-        let legacy = "/models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
-        let old = open(&scratch.key())
-            .seal(legacy, ITEM, "old")
-            .expect("seals");
-        let other = open(&scratch.key())
-            .seal("other", ITEM, "x")
-            .expect("seals");
-        let cipher = open(&scratch.key()).with_legacy_model(legacy);
-        assert_eq!(cipher.unseal(MODEL, ITEM, &old).expect("legacy"), "old");
-        let new = cipher.seal(MODEL, ITEM, "new").expect("seals");
-        assert_eq!(cipher.unseal(MODEL, ITEM, &new).expect("current"), "new");
-        // Only that one other ID, and still bound to the item.
-        assert!(matches!(
-            cipher.unseal(MODEL, ITEM, &other),
-            Err(ReasoningCryptoError::Authentication)
-        ));
-        assert!(matches!(
-            cipher.unseal(MODEL, "rs_other", &old),
             Err(ReasoningCryptoError::Authentication)
         ));
     }

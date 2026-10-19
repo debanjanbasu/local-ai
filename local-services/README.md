@@ -1,21 +1,17 @@
 # local-services
 
 Durable native services shared by the `local-ai` server and native Rust
-callers: Conversations, Files and Uploads, Batches, Evals, Vector Stores
+callers: Conversations, Files and Uploads, Batches, Vector Stores
 (BM25, or embedding-ranked through a caller-supplied chunk embedder), the
 Administration API store (keys, projects, audit logs, usage), conversation compaction planning, sandboxed hosted tool executors
 (`tools`: workspace files, shell, allowlisted web fetch; see
 [docs/TOOLS.md](../docs/TOOLS.md)) and a read-only repository Workspace.
 Nothing here loads or needs a model. Only the web fetch tool reaches the
 network, and only for domains the server was started with. Batches only queue
-and record lines, and an eval's model calls are batch lines; the server's
-worker generates them on the one loaded model.
+and record lines; the server's worker generates them on the one loaded model.
 
 These services follow the current OpenAI APIs only: batches target
-`/v1/responses` or `/v1/chat/completions`, never the legacy `/v1/completions`;
-evals refuse the deprecated `stored_completions` config and, for generations
-that run through Chat Completions (`completions` data sources and
-`score_model` graders), the deprecated `seed`
+`/v1/responses` or `/v1/chat/completions`, never the legacy `/v1/completions`
 ([supported OpenAI APIs](../docs/BONSAI.md#supported-openai-apis)).
 
 There is one fixed implementation per job, not a set of optional backends:
@@ -168,8 +164,7 @@ anything. A file is at most 50,000 lines of up to 2 MiB each. Every line is
 characters at most), the batch's endpoint, one shared `body.model` that must
 be the caller's installed model, and neither `stream` nor `background`. Only
 `/v1/responses` and `/v1/chat/completions` are accepted; the legacy
-`/v1/completions` is refused (a batch stored before it was removed reads back
-as `Endpoint::RetiredCompletions`, and the server fails its pending lines).
+`/v1/completions` is refused.
 `completion_window` must be `24h`. A valid batch is created `in_progress`.
 There is no asynchronous `validating` phase.
 

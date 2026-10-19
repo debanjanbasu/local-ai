@@ -2076,8 +2076,8 @@ fn run_indexer(index: &VectorIndex, shared: &Shared) {
                 }
             }
         }
-        // Then embed completed files that lack vectors (stores created before
-        // embeddings, or while the model was absent), a batch at a time; a
+        // Then embed completed files that lack vectors (indexed while the
+        // model was absent), a batch at a time; a
         // new request ends the run after the batch, so newly attached files
         // are indexed first and the backfill resumes after them.
         let interrupted = || {
