@@ -28,7 +28,14 @@ pub const KV_HEADS: u32 = 4;
 pub const HEAD_DIM: u32 = 256;
 pub const GDN_HEADS: u32 = 48;
 pub const GDN_DIM: u32 = 128;
-pub const MAX_PREFILL_TOKENS: u32 = 128;
+/// Rows of the largest token block, the prefill chunk. Every per-row result is
+/// independent of the block's row count (projections reduce each row alone,
+/// attention walks absolute 32-key tiles, the recurrence steps row by row), so
+/// a larger block changes no output bit; it fills more of the GPU per
+/// dispatch. Cold `--no-speculation` prefill of an 8,201-token prompt on an
+/// M4 Pro: 122.4 tok/s at 128 rows, 128.7 at 256, 130.3 at 512 and 129.4 at
+/// 640, greedy tokens identical.
+pub const MAX_PREFILL_TOKENS: u32 = 512;
 const SPLIT: u32 = 128;
 /// Tokens per threadgroup of `bo_attn_split_tensor` (a multiple of its
 /// 64-key tile). Short prefixes use the small split so the four KV heads
@@ -518,7 +525,7 @@ fn matrix_bytes(rows: u32, columns: u32, element_size: usize) -> crate::Result<u
 }
 fn sequence_bytes(tokens: u32, width: u32) -> crate::Result<usize> {
     if !(1..=MAX_PREFILL_TOKENS).contains(&tokens) {
-        return Err(arg("Bonsai token block must be within 1..=128"));
+        return Err(arg("Bonsai token block exceeds MAX_PREFILL_TOKENS"));
     }
     matrix_bytes(tokens, width, 4)
 }

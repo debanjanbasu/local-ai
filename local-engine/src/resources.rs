@@ -9,7 +9,9 @@ use crate::bonsai_mtp::{DEFAULT_MTP_DEPTH, MTP_HEAD_ARTIFACT, MtpMode, MtpSettin
 const MODEL_RELATIVE: &str = "models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
 /// The MTP head's directory under the models root.
 const MTP_DIRECTORY: &str = "bonsai2-27b-mtp";
-pub const PREFILL_CHUNK: usize = 128;
+/// Prompt tokens per prefill block: the largest block the kernels take (see
+/// `local_metal::bonsai_ops::MAX_PREFILL_TOKENS`).
+pub const PREFILL_CHUNK: usize = local_metal::bonsai_ops::MAX_PREFILL_TOKENS as usize;
 pub const SERVE_QUEUE: usize = 8;
 /// Divisor on free disk in the prompt-cache disk budget, so a fuller disk
 /// shrinks it.

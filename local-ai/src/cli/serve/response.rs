@@ -72,8 +72,8 @@ pub(super) enum EventWait {
 /// The first *event* is deliberately unbounded, and the stall budget starts only
 /// once one has arrived. A prefill boundary does not count as one, which is the
 /// whole reason this is a named rule and not a flag someone can flip: nothing is
-/// emitted per token during prefill, `PREFILL_CHUNK` is 128 and this M2 prefills
-/// at 3.6-4.2 tok/s, so one chunk is about 35 s of working, and the
+/// emitted per token during prefill, `PREFILL_CHUNK` is 512 and this M2 prefills
+/// at 3.6-4.2 tok/s, so one chunk is over two minutes of working, and the
 /// `--stall-timeout` floor is 10 s. A boundary therefore says the engine is alive
 /// and is written to the client, but it does not start a clock, because arming
 /// that clock on it would cancel every prompt longer than one chunk.
