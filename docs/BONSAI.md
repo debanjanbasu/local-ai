@@ -2167,9 +2167,9 @@ an `UNTRUSTED` result. There is no background power-polling loop.
 | Plain short-prompt decode, six-prompt geomean | 30.4–32.3 tok/s | best-of-two A/B runs below, across recent kernel changes |
 | Default speculative decode, six-prompt geomean | 38.0–39.2 tok/s | same runs; 38.6 in the depth/margin sweep |
 | Two 600-token copy-edit prompts, suffix lookup | 89.8 and 90.5 tok/s | 5- to 128-row kernel change |
-| Cold prefill, 2K–8K tokens | 123–126 tok/s | large-batch kernel change |
-| Cold prefill, 32,767 tokens | 105.9 tok/s | same, one run |
-| 128K prefill | 56 tok/s | [original build](https://github.com/debanjanbasu/local-ai/commit/b389329); not re-measured |
+| Cold prefill, 2K–8K tokens | 123–126 tok/s; 130 at 8K with 512-row blocks | large-batch kernel change; 512-row blocks |
+| Cold prefill, 32,706 tokens | 109.2 → 115.2 tok/s | 512-row blocks, one interleaved run |
+| Cold prefill, 131,231 tokens | 70.9 → 76.4 tok/s | same (56 tok/s on the [original build](https://github.com/debanjanbasu/local-ai/commit/b389329)) |
 
 Decode spends 97–98% of wall time on the GPU. PTQ1 decode moves 5.65 GB of
 weights per token. The packed projections were ALU-bound, not bandwidth-bound:
@@ -2531,6 +2531,59 @@ KL against the small-batch kernels is 5.5e-6 and 2.1e-6 mean (2.1e-5 and
 run the same kernels as before: six prompts, 300 greedy tokens, plain decode
 30.52 against 30.39 tok/s geomean and speculative 38.02 against 38.12, text
 byte-identical in both modes (the six chat prompts are 27-45 tokens).
+
+Prefill blocks then grew from 128 to 512 rows (`PREFILL_CHUNK`,
+`MAX_PREFILL_TOKENS`). Rows are independent in every projection and attention
+kernel (attention walks absolute 32-key tiles and groups rows from the block's
+start), but the recurrence keeps its state in F32 registers for a whole block
+and rounds it to F16 when it stores it, so a 512-row block rounded a quarter as
+often. That moved a 2,051-token prompt's first greedy token in an A/B run, so
+`bonsai_gdn_rows` now rounds its registers every 128 rows from the block's
+first (`bonsai_gdn_round_rows`), which reproduces four 128-row blocks;
+`prefill_block_size_leaves_identical_logits` checks the logits bitwise after
+2,600 tokens. Verify blocks and folded prefill chunks are shorter than 128 rows
+and unchanged. Shared-prefix checkpoints keep their 128-token minimum
+(`SHARED_PREFIX_MIN_TOKENS`). Larger blocks fill more of the GPU per dispatch:
+the head-packed attention kernel runs four threadgroups per 4 tokens and KV
+head, so 128 rows made 1.6 waves on 80 resident threadgroups and 512 rows make
+6.4, and projection shapes such as 6144x5120 leave fewer partial waves.
+
+Cold prefill, `tools/benchmark.py --prefill`, raw repository text,
+`--no-speculation`, both builds interleaved in one run, one round (M4 Pro, on
+a machine shared with other GPU work behind a lock; the 128K run started under
+the corrected `lockf -k` lock, but some other jobs may still have held the old
+lock file, so treat the rates as indicative):
+
+| Prompt | 128-row blocks | 512-row blocks | Warm restart (disk restore), TTFT |
+| ---: | ---: | ---: | ---: |
+| 8,201 tokens (block-size sweep) | 122.4 tok/s | 130.3 tok/s (256: 128.7, 640: 129.4) | n/a |
+| 32,706 tokens | 109.2 tok/s (299.5 s) | 115.2 tok/s (284.0 s) | 1.15 s |
+| 131,231 tokens | 70.9 tok/s (1,850 s) | 76.4 tok/s (1,717 s) | 3.1-3.3 s |
+
+These 512-row numbers predate the 128-row rounding, which adds one branch per
+128 tokens per value row; greedy tokens matched base at 8K, 32K and 128K, and
+at 2,051 tokens they did not (first token only), which the rounding fixes. The
+2K/8K A/B with the rounding and both `--no-speculation` and `--mtp-depth 3`
+was queued and not run. Peak footprint for a cold 8,201-token prompt rose from
+1.56 to 1.90 GiB (`/usr/bin/time -l`): row scratch is sized for 512 rows.
+
+End to end through `serve`, `tools/benchmark.py --ttft` (a ~5.9K-token system
+prompt with six tool schemas, then a ~2K-token tool result, `reasoning_effort`
+`none`, time to first streamed delta), 128- against 512-row blocks:
+
+| Step | Prompt / reused tokens | 128 rows | 512 rows |
+| --- | ---: | ---: | ---: |
+| Cold first request | 5,875 / 0 | 46.6 s | 45.0 s |
+| New session, same system prompt and tools | 5,877 / 5,856 (GPU) | 0.47 s | 0.48 s |
+| Follow-up with a 2K tool result | 7,798 / 5,860 (GPU) | 16.2 s | 15.6 s |
+| After a restart: new session | 5,875 / 5,860 (disk) | 1.36 s | 1.14 s |
+| After a restart: the same follow-up | 7,798 / 7,797 (disk) | 0.48 s | 0.48 s |
+
+The disk tier already persists the system-prompt-and-tools boundary across
+restarts, so a restarted server's new session starts in about a second rather
+than 45. What an agent still pays is new text: a tool result prefills at the
+short-prompt rate (about 125-130 tok/s), and at 2K-8K tokens prefill is set by
+the ternary projections at about 85% of the 8x8 multiplies' measured peak.
 
 Single-token decode encodes 835 dispatches per token, down from 1,364, and
 every fused kernel is bitwise identical to the dispatches it replaces
