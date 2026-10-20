@@ -808,14 +808,39 @@ def run_compaction_group(port: int, out: Path, size: str, threshold: int | None,
         list(pool.map(run, pending[1:]))
 
 
+def stale_reuse(session: list[dict]) -> list[tuple[int, int, float]]:
+    """Per read step of one session (in order): tokens prefilled, tokens of
+    those a fresh snapshot of the previous read would have served, and the
+    step's wall time scaled to the tokens it should have prefilled.
+
+    A read step that follows another read can reuse that read's whole prompt
+    but its last token (the request tail snapshot); one that follows a
+    compaction starts a new prompt and is taken as measured.
+    """
+    result, previous = [], None
+    for step in session:
+        if step["kind"] == "compaction":
+            previous = None
+            continue
+        prefilled = step["input_tokens"] - step["cached_tokens"]
+        ideal = max(step["cached_tokens"], previous - 1) if previous else step["cached_tokens"]
+        stale = ideal - step["cached_tokens"]
+        should = step["input_tokens"] - ideal
+        result.append((prefilled, stale, step["wall_seconds"] * should / prefilled if prefilled else step["wall_seconds"]))
+        previous = step["input_tokens"]
+    return result
+
+
 def compaction_report(out: Path) -> str:
     rows = [r for r in load_rows(out / "compaction.jsonl", compaction_key) if not infrastructure_error(r)]
     path = out / "sessions.jsonl"
     steps = [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
     lines = [("| Size | Compact at | Effort | Seeds | Session: requests, compactions, wall s | Session TTFT s, median / max "
               "| Compaction s, median | Final prompt | Recall | Lookup | Fix | All (95% CI) | Reads per question "
-              "| Question compactions | Question wall s, median | Total wall s |"),
-             "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: |"]
+              "| Question compactions | Question wall s, median | Total wall s | Prefilled per read, median (stale) "
+              "| Total wall s without stale reuse |"),
+             "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: "
+             "| ---: | ---: |"]
     groups: dict[tuple, list] = {}
     for row in rows:
         groups.setdefault((row["size"], row["threshold"], row["effort"]), []).append(row)
@@ -844,6 +869,9 @@ def compaction_report(out: Path) -> str:
         low, high = wilson(passed, len(items))
         question_wall = sum(r["wall_seconds"] for r in items) / runs
         compaction_median = median(compactions)
+        reads = [r for seed in seeds for r in stale_reuse([s for s in session if s["seed"] == seed])]
+        stale_seconds = sum(s["wall_seconds"] for s in session if s["kind"] == "read") / runs \
+            - sum(r[2] for r in reads) / runs
         lines.append(
             f"| {size} | {threshold_label(threshold)} | {effort} | {','.join(map(str, seeds))} | "
             f"{sum(s['kind'] == 'read' for s in session) // runs}, {len(compactions) / runs:g}, {session_wall:,.0f} | "
@@ -853,7 +881,8 @@ def compaction_report(out: Path) -> str:
             + " | ".join(frac([r for r in items if r["task"] == t]) for t in ("recall", "lookup", "fix"))
             + f" | {frac(items)} ({low:.0%}–{high:.0%}) | {sum(len(r['reads']) for r in items) / len(items):.1f} | "
             f"{sum(len(r['compactions']) for r in items)} | {median([r['wall_seconds'] for r in items]):.1f} | "
-            f"{session_wall + question_wall:,.0f} |")
+            f"{session_wall + question_wall:,.0f} | {median([r[0] for r in reads]) or 0:,} "
+            f"({sum(r[1] for r in reads) // runs:,}) | {session_wall + question_wall - stale_seconds:,.0f} |")
     return "\n".join(lines) + "\n"
 
 
