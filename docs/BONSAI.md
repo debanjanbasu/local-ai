@@ -1517,6 +1517,61 @@ the folded pass:
 | Earlier kernels, chunk 48 | 123.0 s | 0.64 / 0.68 s | 6.2 |
 | Earlier kernels, chunk 128 | 103.3 s | 1.43 / 1.51 s | 2.9 |
 
+#### Concurrency measurements
+
+`tools/serve_concurrency.py` starts the server with a scratch HOME (cold
+prompt cache) and streams greedy Chat Completions with reasoning off. A gap
+is the wait between two engine steps that streamed a request text (chunks
+within 5 ms of each other count once). M4 Pro, shared with other work, one
+run each; `b09e22f` against this branch:
+
+| Streams, 300-token answers | Aggregate tok/s | Per stream | TTFT p50 | Gap p50 / p99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 32.0 / 35.4 | 33.6 / 37.0 | 0.45 / 0.39 s | 52 / 110 ms, 48 / 78 ms |
+| 2 | 47.3 / 50.6 | 50.1 / 53.4 | 0.63 / 0.60 s | 52 / 324 ms, 48 / 303 ms |
+| 4 | 55.5 / 59.8 | 31.2 / 33.8 | 1.06 / 1.00 s | 82 / 484 ms, 78 / 461 ms |
+| 8 | 73.8 / 74.8 | 14.3 / 14.7 | 1.70 / 1.64 s | 92 / 492 ms, 93 / 476 ms |
+
+The scheduling changes do not touch these steps; the spread is run-to-run
+noise. With N-1 streams decoding 512-token answers, a 6,607-token prompt
+arrives 3 s in (this branch; `b09e22f` within 2%):
+
+| Streams | Long prompt TTFT | Its prefill | Decoding streams before / during it | Gap p50 / p99 during it | Longest stall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (alone) | 51.9 s | 127 tok/s | | | |
+| 2 | 73.6 s | 90 tok/s | 42.2 / 5.3 tok/s | 354 / 393 ms | 0.44 s |
+| 4 | 70.2 s | 94 tok/s | 46.7 / 10.2 tok/s | 307 / 324 ms | 0.33 s |
+| 8 | 83.8 s | 79 tok/s | 18.8 / 22.9 tok/s | 315 / 333 ms | 0.56 s |
+
+No stream waits more than about half a second for its next token while a
+long prompt prefills; without chunking the same prompt stalled every stream
+for its whole prefill (the first table above). What fairness costs is
+throughput, on both sides: beside a lone stream the prompt takes a 32-token
+pass after each of that stream's speculative rounds (about 300 ms against
+about 40), so the stream keeps an eighth of its speed and the prompt 70% of
+its own. Folded passes beside four or eight streams sit close to what time
+slicing at full block efficiency would give both.
+
+Sub-agents fanned out at once usually share a long prefix that no earlier
+request cached (their instructions and tool schemas). Four requests 0.3 s
+apart sharing a 6.6K-token system prompt, each with its own question:
+
+| Build | TTFT first / mean / last | All four done |
+| --- | ---: | ---: |
+| `b09e22f` | 52.1 / 132.9 / 213.3 s | 214.5 s |
+| Prefix refresh | 51.8 / 52.6 / 53.5 s | 57.2 s |
+
+Each request restored what the cache held at admission, nothing, and
+prefilled the shared prefix again, one after another. Asking the cache again
+at a prompt's first prefill step finds the snapshot the first request wrote
+at the end of the system turn, so the others prefill only their question.
+Their text is byte-identical. Running a prompt's first chunk in a pass of its
+own, so it can restore first, costs one unfolded step per long prompt (the
+longest stall beside three streams 0.38 s against 0.33 s, the prompt's TTFT
+unchanged at 70.2 s); the different pass shapes moved one of those three
+streams' 512 greedy tokens to another continuation at a near-tie after 185
+chunks.
+
 #### Speculation in a batch
 
 A batched step verifies drafts too. Each sequence contributes its seed row
