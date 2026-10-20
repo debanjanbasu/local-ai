@@ -12,14 +12,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 HAVE_TORCH = all(importlib.util.find_spec(m) for m in ("numpy", "torch"))
 
 
-def write_shard(path, count, base=0, hdim=4, ktop=2):
+def write_shard(path, count, base=0, hdim=4, ktop=2, top1=None):
     import numpy as np
 
     with open(path, "wb") as f:
         f.write(struct.pack("<IIII", 0x4D545044, count, hdim, ktop))
         for p in range(count):
             f.write(struct.pack("<i", base + p))
-            f.write(np.zeros(ktop, np.int32).tobytes() + np.zeros(ktop, np.float32).tobytes())
+            ids = np.zeros(ktop, np.int32)
+            if top1 is not None:
+                ids[0] = top1[p]
+            f.write(ids.tobytes() + np.zeros(ktop, np.float32).tobytes())
             f.write(np.zeros(hdim, np.float16).tobytes())
 
 
@@ -56,6 +59,22 @@ class Tests(unittest.TestCase):
             for doc, count in enumerate(counts):
                 if count >= 256 and doc not in held_out:
                     self.assertTrue({doc * 10000 + p for p in range(count)} <= seen, doc)
+
+    def test_min_match_keeps_only_argmax_following_windows(self):
+        from data import DocBatcher
+
+        # Positions 0-127 are prompt text (the target predicted 0, never the
+        # next token); 128-255 are the target's own greedy continuation.
+        count = 256
+        top1 = [0] * 128 + [p + 1 for p in range(128, count)]
+        with tempfile.TemporaryDirectory() as tmp:
+            write_shard(os.path.join(tmp, "shard-000000.bin"), count, base=0, top1=top1)
+            batcher = DocBatcher(tmp, window=64, batch=1, val_fraction=0.0, min_match=0.9)
+            starts = sorted(int(positions[0, 0]) for *_, positions in batcher.train_batches())
+            self.assertEqual(starts, [128, 192])
+            batcher.min_match = 0.0
+            self.assertEqual(len(list(batcher.train_batches())), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
