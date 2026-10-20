@@ -60,7 +60,8 @@ from pathlib import Path
 from client_compat import ROOT, LocalServer
 
 POSITIONS = {"start": 0.04, "middle": 0.5, "end": 0.94}
-SIZES = {"short": 0, "8k": 8_000, "32k": 32_000, "64k": 64_000, "128k": 128_000, "250k": 250_000}
+SIZES = {"short": 0, "8k": 8_000, "16k": 16_000, "32k": 32_000, "48k": 48_000, "64k": 64_000, "96k": 96_000,
+         "128k": 128_000, "250k": 250_000}
 CHARS_PER_TOKEN = 3.84  # measured with `local-ai bonsai --raw --tokenize`; prompt_tokens is recorded
 MAX_TOKENS = {"none": 384, "xhigh": 4096}
 WORDS = [
@@ -409,16 +410,16 @@ def infrastructure_error(row: dict) -> bool:
     return row["why"].startswith("HTTP ")
 
 
-def load_rows(path: Path) -> list[dict]:
+def load_rows(path: Path, by=key) -> list[dict]:
     """One row per item: its last answered attempt, else its last attempt."""
     if not path.exists():
         return []
     rows: dict[tuple, dict] = {}
     for line in path.read_text().splitlines():
         row = json.loads(line)
-        previous = rows.get(key(row))
+        previous = rows.get(by(row))
         if previous is None or infrastructure_error(previous) or not infrastructure_error(row):
-            rows[key(row)] = row
+            rows[by(row)] = row
     return list(rows.values())
 
 
@@ -592,6 +593,299 @@ def run_group(port: int, out: Path, size: str, seed: int, effort: str, concurren
         list(pool.map(lambda job: run(job, width), jobs[1:]))
 
 
+# ---------------------------------------------------------------- compaction sweep
+#
+# `--compact-at` replays the repository as an agent session instead of a
+# system message: a user asks the model to read the whole repository, and
+# client-made `read_files` calls return it a few thousand tokens at a time,
+# one Responses request per call (store false, the whole history as input,
+# one output token, so each request is a prefill). The client compacts the
+# way Codex does with `remote_compaction = "v2"`: when the previous
+# response's `total_tokens` reached the threshold, it sends the history with
+# a `compaction_trigger` before the next request and replaces the history
+# with the one `compaction` item it gets back (the server keeps the newest
+# quarter verbatim and summarizes the rest). The same nine questions are
+# then asked from the session's final history, each with `read_files`
+# available, so a needle summarized away can be read again, as an agent
+# would; the client keeps compacting during the questions' tool loops.
+# Session rows (one per request) go to sessions.jsonl and question rows to
+# compaction.jsonl; finished sessions and questions are skipped on rerun.
+
+MODEL_ID = "ternary-bonsai-2-27b"
+SESSION_CHUNK_TOKENS = 3_000
+MAX_TOOL_ROUNDS = 4
+SESSION_SYSTEM = (
+    "You are answering questions about a Python repository. Read files with the read_files tool; each file "
+    "it returns starts with a line 'FILE <path>'. Files under legacy/ are deprecated and not used in production."
+)
+SESSION_TASK = "Read the whole repository with read_files so that you know it well. I will then ask you questions about it."
+READ_FILES = {
+    "type": "function", "name": "read_files",
+    "description": "Return the contents of repository files, each starting with a line 'FILE <path>'.",
+    "parameters": {"type": "object", "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+                   "required": ["paths"], "additionalProperties": False},
+}
+
+
+def repository_files(text: str) -> dict[str, str]:
+    """The files of a `build_context` repository, in order, as their `FILE` blocks."""
+    blocks = re.findall(r"^FILE (\S+)\n(.*?)(?=^FILE |\Z)", text, re.DOTALL | re.MULTILINE)
+    return {path: f"FILE {path}\n{body}" for path, body in blocks}
+
+
+def read_files(files: dict[str, str], arguments: str) -> str:
+    try:
+        paths = json.loads(arguments).get("paths") or []
+    except (ValueError, AttributeError):
+        return "error: arguments must be a JSON object with a list of paths"
+    if isinstance(paths, str):
+        paths = [paths]
+    return "".join(files.get(str(p).strip(), f"FILE {p}\nerror: no such file\n\n") for p in paths) or "no paths given"
+
+
+def session_items(files: dict[str, str], chunk_tokens: int = SESSION_CHUNK_TOKENS) -> list[list[dict]]:
+    """The session's read_files call/output pairs, each about `chunk_tokens` long."""
+    batches: list[list[str]] = [[]]
+    size = 0
+    for path, block in files.items():
+        if batches[-1] and size + len(block) > chunk_tokens * CHARS_PER_TOKEN:
+            batches.append([])
+            size = 0
+        batches[-1].append(path)
+        size += len(block)
+    steps = []
+    for index, paths in enumerate(batches):
+        call_id = f"call_read_{index}"
+        arguments = json.dumps({"paths": paths})
+        steps.append([
+            {"type": "function_call", "call_id": call_id, "name": "read_files", "arguments": arguments},
+            {"type": "function_call_output", "call_id": call_id, "output": read_files(files, arguments)},
+        ])
+    return steps
+
+
+def message(role: str, text: str) -> dict:
+    kind = "output_text" if role == "assistant" else "input_text"
+    return {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}
+
+
+def respond(port: int, history: list[dict], effort: str, max_tokens: int) -> dict:
+    body = {"model": MODEL_ID, "input": history, "tools": [READ_FILES], "store": False, "temperature": 0,
+            "max_output_tokens": max_tokens, "reasoning": {"effort": effort}}
+    return post(port, "/v1/responses", body)
+
+
+def compact(port: int, history: list[dict], effort: str) -> tuple[list[dict], dict]:
+    """Codex's remote compaction turn: the history then one `compaction` item."""
+    payload = respond(port, [*history, {"type": "compaction_trigger"}], effort, MAX_TOKENS[effort])
+    items = [i for i in payload.get("output") or [] if i.get("type") == "compaction"]
+    if payload.get("_status") != 200 or len(items) != 1:
+        raise RuntimeError(f"compaction turn failed: HTTP {payload.get('_status')} {str(payload)[:300]}")
+    return items, payload
+
+
+def usage_of(payload: dict) -> dict:
+    usage = payload.get("usage") or {}
+    return {"input_tokens": usage.get("input_tokens") or 0,
+            "cached_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0,
+            "output_tokens": usage.get("output_tokens") or 0, "total_tokens": usage.get("total_tokens") or 0,
+            "wall_seconds": round(payload.get("_wall_seconds") or 0, 2)}
+
+
+def threshold_label(threshold: int | None) -> str:
+    return f"{threshold // 1000}k" if threshold else "off"
+
+
+def session_path(out: Path, size: str, threshold: int | None, seed: int, effort: str) -> Path:
+    return out / "sessions" / f"{size}-{threshold_label(threshold)}-seed{seed}-{effort}.json"
+
+
+def run_session(port: int, out: Path, size: str, threshold: int | None, seed: int, effort: str) -> tuple[list[dict], dict]:
+    """Replay the repository as a session; the final history and the repository files."""
+    path = session_path(out, size, threshold, seed, effort)
+    text, _ = build_context(seed, size, make_needles(seed))
+    files = repository_files(text)
+    if path.exists():
+        return json.loads(path.read_text())["history"], files
+    history = [message("system", SESSION_SYSTEM), message("user", SESSION_TASK)]
+    label = (size, threshold_label(threshold), seed, effort)
+
+    def log(rows: list[dict]) -> None:
+        with (out / "sessions.jsonl").open("a") as handle:
+            handle.writelines(json.dumps({"size": size, "threshold": threshold, "seed": seed, "effort": effort,
+                                          **r, "finished_at": time.time()}) + "\n" for r in rows)
+
+    row = {"total_tokens": 0}
+    for step, pair in enumerate(session_items(files)):
+        # As Codex does: the previous response's call and its output are in
+        # the history before the limit is checked and the next request sent.
+        history += pair
+        rows = []
+        if threshold and row["total_tokens"] >= threshold:
+            history, compaction = compact(port, history, effort)
+            rows.append({"step": step, "kind": "compaction", **usage_of(compaction)})
+        payload = respond(port, history, effort, 1)
+        if payload.get("_status") != 200:
+            raise RuntimeError(f"session step {step} failed: HTTP {payload.get('_status')} {str(payload)[:300]}")
+        row = {"step": step, "kind": "read", **usage_of(payload)}
+        log([*rows, row])
+        print(f"session {label} step {step}: prompt={row['input_tokens']} cached={row['cached_tokens']} "
+              f"wall={row['wall_seconds']:.1f}s" + "".join(
+                  f" after compaction (prompt={r['input_tokens']} cached={r['cached_tokens']} out={r['output_tokens']} "
+                  f"{r['wall_seconds']:.1f}s)" for r in rows), flush=True)
+    if threshold and row["total_tokens"] >= threshold:
+        # Codex checks the limit before a new user turn too.
+        history, compaction = compact(port, history, effort)
+        log([{"step": row["step"] + 1, "kind": "compaction", **usage_of(compaction)}])
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"history": history}))
+    return history, files
+
+
+def ask(port: int, history: list[dict], files: dict[str, str], needle: Needle, threshold: int | None,
+        effort: str) -> dict:
+    """One question with read_files available, compacting as Codex would."""
+    history = [*history, message("user", needle.question)]
+    requests, compactions, reads = [], [], []
+    answer, status, payload = "", 200, {}
+    for _ in range(MAX_TOOL_ROUNDS + 1):
+        payload = respond(port, history, effort, MAX_TOKENS[effort])
+        status = payload.get("_status")
+        if status != 200:
+            break
+        requests.append(usage_of(payload))
+        output = [i for i in payload.get("output") or [] if i.get("type") in ("message", "function_call")]
+        calls = [i for i in output if i["type"] == "function_call"]
+        answer = "".join(part.get("text", "") for i in output if i["type"] == "message"
+                         for part in i.get("content") or [])
+        if not calls:
+            break
+        history += output
+        for call in calls:
+            reads.append(call.get("arguments"))
+            history.append({"type": "function_call_output", "call_id": call["call_id"],
+                            "output": read_files(files, call.get("arguments") or "")})
+        if threshold and requests[-1]["total_tokens"] >= threshold:
+            history, compaction = compact(port, history, effort)
+            compactions.append(usage_of(compaction))
+    if status == 200:
+        ok, why = score(needle, answer)
+    else:
+        ok, why = False, f"HTTP {status}: {payload.get('error')}"
+    walls = [r["wall_seconds"] for r in requests] + [c["wall_seconds"] for c in compactions]
+    return {"passed": ok, "why": why, "expected": needle.expected, "answer": answer[-600:], "reads": reads,
+            "requests": requests, "compactions": compactions, "first_wall_seconds": walls[0] if walls else None,
+            "wall_seconds": round(sum(walls), 2), "prompt_tokens": requests[0]["input_tokens"] if requests else 0}
+
+
+def compaction_key(row: dict) -> tuple:
+    return (row["size"], row["threshold"], row["seed"], row["effort"], row["task"], row["position"])
+
+
+def run_compaction_group(port: int, out: Path, size: str, threshold: int | None, seed: int, effort: str,
+                         concurrency: int) -> None:
+    results = out / "compaction.jsonl"
+    finished = {compaction_key(r) for r in load_rows(results, compaction_key) if not infrastructure_error(r)}
+    needles = make_needles(seed)
+    pending = [n for n in needles if (size, threshold, seed, effort, n.task, n.position) not in finished]
+    if not pending:
+        return
+    history, files = run_session(port, out, size, threshold, seed, effort)
+
+    def run(needle):
+        row = {"size": size, "threshold": threshold, "seed": seed, "effort": effort, "task": needle.task,
+               "position": needle.position, **ask(port, history, files, needle, threshold, effort),
+               "finished_at": time.time()}
+        with results.open("a") as handle:
+            handle.write(json.dumps(row) + "\n")
+        print(f"{size} compact@{threshold_label(threshold)} seed{seed} {effort:5} {needle.task:6} {needle.position:6} "
+              f"{'PASS' if row['passed'] else 'FAIL'} prompt={row['prompt_tokens']} reads={len(row['reads'])} "
+              f"compactions={len(row['compactions'])} wall={row['wall_seconds']:.1f}s {row['why'][:60]}", flush=True)
+
+    # The first question pays any cold prefill of the final history alone.
+    run(pending[0])
+    with concurrent.futures.ThreadPoolExecutor(max(1, concurrency)) as pool:
+        list(pool.map(run, pending[1:]))
+
+
+def stale_reuse(session: list[dict]) -> list[tuple[int, int, float]]:
+    """Per read step of one session (in order): tokens prefilled, tokens of
+    those a fresh snapshot of the previous read would have served, and the
+    step's wall time scaled to the tokens it should have prefilled.
+
+    A read step that follows another read can reuse that read's whole prompt
+    but its last token (the request tail snapshot); one that follows a
+    compaction starts a new prompt and is taken as measured.
+    """
+    result, previous = [], None
+    for step in session:
+        if step["kind"] == "compaction":
+            previous = None
+            continue
+        prefilled = step["input_tokens"] - step["cached_tokens"]
+        ideal = max(step["cached_tokens"], previous - 1) if previous else step["cached_tokens"]
+        stale = ideal - step["cached_tokens"]
+        should = step["input_tokens"] - ideal
+        result.append((prefilled, stale, step["wall_seconds"] * should / prefilled if prefilled else step["wall_seconds"]))
+        previous = step["input_tokens"]
+    return result
+
+
+def compaction_report(out: Path) -> str:
+    rows = [r for r in load_rows(out / "compaction.jsonl", compaction_key) if not infrastructure_error(r)]
+    path = out / "sessions.jsonl"
+    steps = [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+    lines = [("| Size | Compact at | Effort | Seeds | Session: requests, compactions, wall s | Session TTFT s, median / max "
+              "| Compaction s, median | Final prompt | Recall | Lookup | Fix | All (95% CI) | Reads per question "
+              "| Question compactions | Question wall s, median | Total wall s | Prefilled per read, median (stale) "
+              "| Total wall s without stale reuse |"),
+             "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: "
+             "| ---: | ---: |"]
+    groups: dict[tuple, list] = {}
+    for row in rows:
+        groups.setdefault((row["size"], row["threshold"], row["effort"]), []).append(row)
+
+    def frac(items):
+        return f"{sum(r['passed'] for r in items)}/{len(items)}" if items else "-"
+
+    def median(values):
+        values = sorted(v for v in values if v is not None)
+        return values[len(values) // 2] if values else None
+
+    order = list(SIZES)
+    for (size, threshold, effort), items in sorted(
+            groups.items(), key=lambda kv: (order.index(kv[0][0]), kv[0][1] or 10**9, kv[0][2])):
+        seeds = sorted({r["seed"] for r in items})
+        session = [s for s in steps if (s["size"], s["threshold"], s["effort"]) == (size, threshold, effort)
+                   and s["seed"] in seeds]
+        # A step's time to first token includes the compaction before it.
+        ttft: dict[tuple, float] = {}
+        for s in session:
+            ttft[(s["seed"], s["step"])] = ttft.get((s["seed"], s["step"]), 0) + s["wall_seconds"]
+        runs = max(1, len(seeds))
+        session_wall = sum(s["wall_seconds"] for s in session) / runs
+        compactions = [s["wall_seconds"] for s in session if s["kind"] == "compaction"]
+        passed = sum(r["passed"] for r in items)
+        low, high = wilson(passed, len(items))
+        question_wall = sum(r["wall_seconds"] for r in items) / runs
+        compaction_median = median(compactions)
+        reads = [r for seed in seeds for r in stale_reuse([s for s in session if s["seed"] == seed])]
+        stale_seconds = sum(s["wall_seconds"] for s in session if s["kind"] == "read") / runs \
+            - sum(r[2] for r in reads) / runs
+        lines.append(
+            f"| {size} | {threshold_label(threshold)} | {effort} | {','.join(map(str, seeds))} | "
+            f"{sum(s['kind'] == 'read' for s in session) // runs}, {len(compactions) / runs:g}, {session_wall:,.0f} | "
+            f"{median(ttft.values()) or 0:.1f} / {max(ttft.values(), default=0):.1f} | "
+            f"{f'{compaction_median:.0f}' if compaction_median is not None else '-'} | "
+            f"{median([r['prompt_tokens'] for r in items]):,} | "
+            + " | ".join(frac([r for r in items if r["task"] == t]) for t in ("recall", "lookup", "fix"))
+            + f" | {frac(items)} ({low:.0%}–{high:.0%}) | {sum(len(r['reads']) for r in items) / len(items):.1f} | "
+            f"{sum(len(r['compactions']) for r in items)} | {median([r['wall_seconds'] for r in items]):.1f} | "
+            f"{session_wall + question_wall:,.0f} | {median([r[0] for r in reads]) or 0:,} "
+            f"({sum(r[1] for r in reads) // runs:,}) | {session_wall + question_wall - stale_seconds:,.0f} |")
+    return "\n".join(lines) + "\n"
+
+
 def wilson(passed: int, total: int, z: float = 1.96) -> tuple[float, float]:
     """95% Wilson score interval of a pass rate."""
     if not total:
@@ -696,6 +990,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=ROOT / ".scratch/artifacts/context-eval")
     parser.add_argument("--stage-tokens", type=int, default=0,
                         help="only prefill this many tokens of each group's prompt as a staged prefix (see run_stage)")
+    parser.add_argument("--compact-at", default="",
+                        help="thresholds such as 16k,32k,off: replay each size as an agent session that compacts "
+                             "there (see run_session) instead of asking from a system message")
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -703,6 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     if args.report:
         print(report(args.out), end="")
+        print(compaction_report(args.out), end="")
         return 0
     sizes = [s for s in args.sizes.split(",") if s]
     seeds = [int(s) for s in args.seeds.split(",") if s]
@@ -710,6 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
     for size in sizes:
         if size not in SIZES:
             parser.error(f"unknown size {size}")
+    thresholds = [None if t == "off" else int(t.removesuffix("k")) * 1000 for t in args.compact_at.split(",") if t]
     if args.dry_run:
         for size in sizes:
             for seed in seeds:
@@ -726,14 +1025,17 @@ def main(argv: list[str] | None = None) -> int:
         for size in sizes:
             for seed in seeds:
                 for effort in efforts:
-                    if args.stage_tokens:
+                    if thresholds:
+                        for threshold in thresholds:
+                            run_compaction_group(args.port, args.out, size, threshold, seed, effort, args.concurrency)
+                    elif args.stage_tokens:
                         run_stage(args.server_bin, args.out, size, seed, effort, args.stage_tokens)
                     else:
                         run_group(args.port, args.out, size, seed, effort, args.concurrency)
     finally:
         if server:
             stop_server(server, 300)
-    print(report(args.out), end="")
+    print(compaction_report(args.out) if thresholds else report(args.out), end="")
     return 0
 
 
