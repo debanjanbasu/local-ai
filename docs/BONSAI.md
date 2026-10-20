@@ -1439,7 +1439,14 @@ turn instead of batching measured 32.7 tok/s aggregate at two streams against
 
 Admission only restores a request's reusable prompt prefix. Its prefill then
 runs inside the engine's steps, one prompt per step: the one with the fewest
-tokens left. A prompt of at most 128 tokens to prefill (one block; a typical
+tokens left. Its first chunk always runs in a pass of its own, which first
+asks the prompt cache again for a longer prefix than admission restored and
+restores that one when it gains at least one token in 64 of it: requests
+admitted together that share a long uncached prefix (sub-agents fanned out
+at once) prefill one after another, and each later one starts from the
+snapshot the first wrote at the end of that prefix, waiting for it if the
+write is still in flight, instead of prefilling it again (see
+[Concurrency measurements](#concurrency-measurements)). A prompt of at most 128 tokens to prefill (one block; a typical
 chat turn) goes whole, in a pass of its own after the step's decode round. A
 longer one, beside two or more decoding requests, prefills inside their
 batched pass: its chunk's rows are stacked after theirs, run every layer with
@@ -1458,8 +1465,11 @@ rounds, prefill 32 tokens in a pass of their own after the step's decode
 round, which handles the milestone (the GPU tier is claimed for the
 prefilling sequence's buffer set, so a checkpoint never describes another
 request's state) and takes the first sample. With nothing decoding, a step
-prefills up to 512 tokens, which only bounds how long a newly arrived request
-waits to be admitted. A cancellation between two chunks ends the request with
+prefills one block (128 tokens, about a second), so a request arriving behind
+a long prompt is admitted, and can start its own shorter prefill, within a
+block; each block is its own GPU round trip either way, so this costs the
+prompt nothing (6.6K tokens alone: 51.9 s against 52.1 s with four blocks a
+step). A cancellation between two chunks ends the request with
 no tokens and clears the prompt cache, as a cancelled single-pass prefill did.
 
 The chunk size trades the running requests' inter-token gap against the
