@@ -14,7 +14,7 @@ tasks are coding-agent turns with tool definitions, checked by applying the
 call (an edit must apply and the edited code must pass its test) or by its
 arguments; two prose prompts are controls.
 
-    lockf /tmp/local-ai-gpu.lock tools/mtp_code_bench.py ab \\
+    lockf -k /tmp/local-ai-gpu.lock tools/mtp_code_bench.py ab \\
         --head installed=models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin \\
         --head candidate=DIR/mtp-head-ptq1-v1.bin --rounds 2 --out RUN_DIR
     tools/mtp_code_bench.py summary RUN_DIR/*.jsonl
