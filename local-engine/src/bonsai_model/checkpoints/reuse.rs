@@ -76,19 +76,25 @@ impl BonsaiEngine {
         session_id: Option<&str>,
     ) -> crate::Result<(usize, PromptCacheSource)> {
         let mut rows_kept = true;
-        for (source, index, _) in self.candidates(prompt, bounds, session_id) {
-            let restored = match source {
-                // A failed snapshot restore may have overwritten the live K/V
-                // rows a checkpoint relies on.
-                PromptCacheSource::Gpu if !rows_kept => continue,
-                PromptCacheSource::Gpu => self.restore_gpu_checkpoint(index)?,
-                PromptCacheSource::Host => self.restore_host_snapshot(index)?,
-                _ => self.restore_disk_snapshot(index),
-            };
-            if let Some(position) = restored {
-                return Ok((position, source));
+        'retry: loop {
+            for (source, index, _) in self.candidates(prompt, bounds, session_id) {
+                let restored = match source {
+                    // A failed snapshot restore may have overwritten the live
+                    // K/V rows a checkpoint relies on.
+                    PromptCacheSource::Gpu if !rows_kept => continue,
+                    PromptCacheSource::Gpu => self.restore_gpu_checkpoint(index)?,
+                    PromptCacheSource::Host => self.restore_host_snapshot(index)?,
+                    _ => self.restore_disk_snapshot(index),
+                };
+                if let Some(position) = restored {
+                    return Ok((position, source));
+                }
+                rows_kept &= source == PromptCacheSource::Gpu;
+                // The failed entry is evicted, so ask again: a disk write in
+                // flight that it made not worth waiting for may now be.
+                continue 'retry;
             }
-            rows_kept &= source == PromptCacheSource::Gpu;
+            break;
         }
         self.model.reset();
         Ok((0, PromptCacheSource::None))
