@@ -1020,10 +1020,13 @@ image path's, whose end-to-end parity is above.
 
 Codex, opencode and Oh My Pi drive `local-ai serve` end to end with the
 configurations below, each recorded against the real model in
-[client runs](#coding-clients-and-long-context-coding-quality). Use the
-`context_length` that `GET /v1/models` reports for the context window (65,536
-here); a client that assumes a larger one compacts too late and gets a
-context-overflow 400 instead.
+[client runs](#coding-clients-and-long-context-coding-quality). Each sets a
+65,536-token context window and compacts at 32,000 prompt tokens, the
+[threshold sweep](#compaction-threshold)'s choice. `GET /v1/models` reports
+the admitted `context_length` (262,144 on a 48 GB Mac), but a client that
+compacts only near that limit runs long prompts whose prefill is about half as
+fast and whose exact lookups fail. A window larger than the admitted
+`context_length` gets a context-overflow 400 instead of a compaction.
 
 **Codex** (`~/.codex/config.toml`; Codex 0.163 accepts only
 `wire_api = "responses"` for a custom provider):
@@ -1034,6 +1037,7 @@ model_provider = "local-ai"
 model_reasoning_effort = "xhigh"   # low, medium, xhigh (high also runs at xhigh), or none
 model_reasoning_summary = "none"   # "auto" adds a summary generation after every reasoning answer
 model_context_window = 65536       # Codex assumes 272,000 for a model it does not know
+model_auto_compact_token_limit = 32000  # default 90% of the window; capped at 90% of it
 # model_catalog_json = "/Users/you/.codex/bonsai.json"  # optional, see below
 
 [model_providers.local-ai]
@@ -1048,8 +1052,10 @@ remote_compaction = "v2"   # compaction_trigger turns, for automatic compaction 
 
 Codex sends `store: false` with the whole conversation in `input` and asks for
 `reasoning.encrypted_content` (sealed with the reasoning key created on first
-start). With `remote_compaction = "v2"` it compacts through this server: at
-90% of the window (or on `/compact`) it sends a `compaction_trigger` turn and
+start). With `remote_compaction = "v2"` it compacts through this server: when
+a turn's total tokens reach `model_auto_compact_token_limit` (checked before
+each user turn and after each sampling round that continues with tool
+results), or on `/compact`, it sends a `compaction_trigger` turn and
 replays the sealed `compaction` item it gets back
 ([compaction](#compaction-and-reasoning-summaries)). The summary is written
 with the server's own compaction prompt, and the item keeps the newest tool
@@ -1102,14 +1108,19 @@ speaks Responses; both work.
           "name": "Ternary Bonsai 2 27B (local-ai)",
           "reasoning": true,
           "tool_call": true,
-          "limit": { "context": 65536, "output": 8192 },
+          "limit": { "context": 65536, "input": 40192, "output": 8192 },
           "options": { "reasoningEffort": "xhigh" }
         }
       }
     }
-  }
+  },
+  "compaction": { "reserved": 8192 }
 }
 ```
+
+opencode compacts when a turn's tokens reach `limit.input` less
+`compaction.reserved` (40,192 − 8,192 = 32,000 here); without `limit.input`
+it compacts at `limit.context` less `limit.output` (57,344 for this window).
 
 Through Chat Completions opencode sends `max_tokens` (the model's
 `limit.output`), `stream_options.include_usage`, its tools with `tool_choice:
@@ -1124,7 +1135,7 @@ asks for `reasoning.encrypted_content` and, on its title request,
 
 **Oh My Pi**: the `models.yml` provider in the
 [engine README](../local-engine/README.md#oh-my-pi-custom-provider) (Responses, efforts
-`low`, `medium` and `xhigh`).
+`low`, `medium` and `xhigh`), with `omp config set compaction.thresholdTokens 32000`.
 
 ### Compaction and reasoning summaries
 

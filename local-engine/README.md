@@ -448,10 +448,14 @@ providers:
         reasoning: true
         thinking: {mode: effort, efforts: [low, medium, xhigh], defaultLevel: xhigh, requiresEffort: false}
         input: [text]
-        contextWindow: 65536 # use context_length from GET /v1/models
+        contextWindow: 65536 # at most context_length from GET /v1/models
         maxTokens: 8192
         cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
 ```
+
+Oh My Pi compacts when a prompt exceeds `compaction.thresholdTokens`; set it
+to the 32,000 the [threshold sweep](../docs/BONSAI.md#compaction-threshold)
+chose with `omp config set compaction.thresholdTokens 32000`.
 
 The flags replace Oh My Pi defaults for an unrecognized host that this server
 refuses or would misread. The keys come from the
