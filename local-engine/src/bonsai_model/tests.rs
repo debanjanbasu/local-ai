@@ -2,6 +2,7 @@ use super::*;
 use crate::bonsai_mtp::MtpMode;
 use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
+use std::fmt::Write as _;
 
 #[test]
 fn requests_reject_truncation_overflow_and_invalid_ids() {
@@ -320,6 +321,9 @@ fn shared_system_prefix_reuses_across_sessions_and_restart() {
 /// divergence boundary that barely extends the previous turn's. Every turn
 /// must still restore the whole previous prompt from the GPU tier, not an
 /// older boundary the tier kept while the newer checkpoints were evicted.
+/// `b09e22f`, before the longest-prefix restore, also passes: the
+/// post-compaction stale reuse seen in a 64K agent session does not reproduce
+/// at this size.
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn agent_turns_keep_restoring_the_previous_prompt() {
@@ -359,20 +363,27 @@ fn agent_turns_keep_restoring_the_previous_prompt() {
             .expect("turn");
         if let Some(previous) = &previous {
             assert!(prompt.starts_with(previous), "turn {turn} extends the last");
-            assert_eq!(
-                (run.stats.reused_prompt_tokens, run.cache_source),
-                (previous.len() - 1, PromptCacheSource::Gpu),
-                "turn {turn} of {} tokens",
-                prompt.len()
+            // At least the previous prompt's reusable boundary, from the GPU
+            // tier; more when the previous answer's tokens match the
+            // re-rendered assistant turn.
+            assert!(
+                run.stats.reused_prompt_tokens >= previous.len() - 1
+                    && run.cache_source == PromptCacheSource::Gpu,
+                "turn {turn} of {} tokens reused {} from {:?}",
+                prompt.len(),
+                run.stats.reused_prompt_tokens,
+                run.cache_source
             );
         }
         last = Some((prompt.clone(), run.token_ids));
         previous = Some(prompt);
-        rendered.push_str(&format!(
+        write!(
+            rendered,
             "Noted: item {turn} sits in drawer {}.<|im_end|>\n<|im_start|>user\nFile item {}.<|im_end|>\n{opener}",
             turn * 7,
             turn + 1
-        ));
+        )
+        .expect("writes to a String");
     }
     let (prompt, tokens) = last.expect("turns ran");
     assert_eq!(

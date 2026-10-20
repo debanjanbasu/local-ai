@@ -387,7 +387,7 @@ fn cancelling_mid_prefill_leaves_the_rest_exact() {
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn requests_admitted_together_reuse_their_shared_prefix() {
-    let system = "Rust ownership, borrowing, lifetimes, traits, and safe concurrency. ".repeat(48);
+    let system = "Rust ownership, borrowing, lifetimes, traits, and safe concurrency. ".repeat(96);
     let rendered = |question: &str| {
         format!(
             "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -407,7 +407,10 @@ fn requests_admitted_together_reuse_their_shared_prefix() {
         .zip(&second)
         .take_while(|(a, b)| a == b)
         .count();
-    assert!(boundary >= 2 * DEFAULT_PREFILL_CHUNK, "{boundary} shared tokens");
+    assert!(
+        boundary >= 2 * DEFAULT_PREFILL_CHUNK,
+        "{boundary} shared tokens"
+    );
     let reference = engine
         .generate(&second, &params(16), |_| true)
         .expect("second alone")

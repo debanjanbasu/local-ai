@@ -963,10 +963,10 @@ def fmt(value, digits: int = 1) -> str:
 
 def summary_markdown(payload: dict) -> str:
     lines = [f"# Agent benchmark: {payload['label']}", "",
-             f"server {payload['server']}; clients {payload['versions']}; effort {payload['effort']}; "
-             f"seeds {payload['seeds']}", "",
-             "| Client | Runs | Success | Turns (mean) | Tool calls | wrong_tool | bad_args | loop | "
-             "Protocol errors | Timeouts | Wall s (total) | Wall s (median) | TTFT first (median) | TTFT all (median) |",
+             (f"server {payload['server']}; clients {payload['versions']}; effort {payload['effort']}; "
+             f"seeds {payload['seeds']}"), "",
+             ("| Client | Runs | Success | Turns (mean) | Tool calls | wrong_tool | bad_args | loop | "
+             "Protocol errors | Timeouts | Wall s (total) | Wall s (median) | TTFT first (median) | TTFT all (median) |"),
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for name, agg in payload["aggregate"].items():
         f = agg["tool_failures"]
@@ -975,8 +975,8 @@ def summary_markdown(payload: dict) -> str:
             f"{agg['tool_calls']} | {f['wrong_tool']} | {f['bad_args']} | {f['loop']} | {agg['protocol_errors']} | "
             f"{agg['timeouts']} | {fmt(agg['wall_seconds_total'], 0)} | {fmt(agg['wall_seconds_median'], 0)} | "
             f"{fmt(agg['ttft_first_median'])} | {fmt(agg['ttft_median'])} |")
-    lines += ["", "| Task | Client | Seed | Pass | Turns | Calls | wrong_tool | bad_args | loop | Wall s | "
-              "TTFT first | TTFT median | Max prompt tok | Failed checks / tool-call evidence |",
+    lines += ["", ("| Task | Client | Seed | Pass | Turns | Calls | wrong_tool | bad_args | loop | Wall s | "
+              "TTFT first | TTFT median | Max prompt tok | Failed checks / tool-call evidence |"),
               "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
     for r in payload["runs"]:
         f = r["tool_failures"]
@@ -1002,15 +1002,16 @@ def write_report(out: Path, payload: dict) -> None:
 def compare(baseline_path: Path, candidate_path: Path) -> str:
     """A Markdown comparison of two results.json files, per client and per run."""
     base, cand = (json.loads(Path(p).read_text()) for p in (baseline_path, candidate_path))
-    lines = [f"baseline {base['label']} ({base['server'].get('commit', '?')[:9]}) vs "
-             f"candidate {cand['label']} ({cand['server'].get('commit', '?')[:9]})", "",
-             "| Client | Success | Turns (mean) | wrong_tool | bad_args | loop | Wall s (total) | TTFT first (median) | "
-             "TTFT all (median) |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines = [(f"baseline {base['label']} ({base['server'].get('commit', '?')[:9]}) vs "
+             f"candidate {cand['label']} ({cand['server'].get('commit', '?')[:9]})"), "",
+             ("| Client | Success | Turns (mean) | wrong_tool | bad_args | loop | Wall s (total) | TTFT first (median) | "
+             "TTFT all (median) |"), "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for name in base["aggregate"]:
         a, b = base["aggregate"][name], cand["aggregate"].get(name)
         if not b:
             continue
-        cell = lambda key, digits=1: f"{fmt(a[key], digits)} → {fmt(b[key], digits)}"  # noqa: E731
+        def cell(key, digits=1, a=a, b=b):
+            return f"{fmt(a[key], digits)} → {fmt(b[key], digits)}"
         fails = " | ".join(f"{a['tool_failures'][k]} → {b['tool_failures'][k]}" for k in ("wrong_tool", "bad_args", "loop"))
         lines.append(f"| {name} | {a['successes']}/{a['runs']} → {b['successes']}/{b['runs']} | {cell('turns_mean')} | "
                      f"{fails} | {cell('wall_seconds_total', 0)} | {cell('ttft_first_median')} | {cell('ttft_median')} |")
@@ -1021,7 +1022,7 @@ def compare(baseline_path: Path, candidate_path: Path) -> str:
         c = keyed.get((r["task"], r["client"], r["seed"]))
         if not c:
             continue
-        verdict = lambda run: "PASS" if run["success"] else "FAIL"  # noqa: E731
+        verdict = lambda run: "PASS" if run["success"] else "FAIL"
         lines.append(f"| {r['task']} | {r['client']} | {r['seed']} | {verdict(r)} → {verdict(c)} | "
                      f"{r['turns']} → {c['turns']} | {sum(r['tool_failures'].values())} → {sum(c['tool_failures'].values())} | "
                      f"{fmt(r['wall_seconds'], 0)} → {fmt(c['wall_seconds'], 0)} | {fmt(r['ttft_first'])} → {fmt(c['ttft_first'])} |")

@@ -926,15 +926,19 @@ mod tests {
         let options = parse_features(&args(&["--validate-only", "r.jsonl"]));
         assert!(options.is_ok_and(|o| o.validate_only && o.out.is_none()));
         assert!(parse_features(&args(&["--validate-only"])).is_err());
+        let (max_rows, past_rows) = (
+            super::MtpCapture::MAX_ROWS.to_string(),
+            (super::MtpCapture::MAX_ROWS + 1).to_string(),
+        );
         for (flag, value) in [
             ("--rows", "2"),
-            ("--rows", "129"),
+            ("--rows", past_rows.as_str()),
             ("--max-tokens", "1"),
             ("--max-tokens", "262145"),
         ] {
             assert!(parse_features(&args(&["--validate-only", flag, value, "r.jsonl"])).is_err());
         }
-        for (rows, tokens) in [("3", "2"), ("128", "262144")] {
+        for (rows, tokens) in [("3", "2"), (max_rows.as_str(), "262144")] {
             assert!(
                 parse_features(&args(&[
                     "--validate-only",

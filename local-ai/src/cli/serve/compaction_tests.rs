@@ -259,6 +259,7 @@ fn plain(messages: Vec<ChatMessage>) -> local_engine::ChatRequest {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)] // the compaction callback's signature
 fn by_messages(messages: Vec<ChatMessage>) -> crate::Result<usize> {
     local_engine::Engine::render_chat_with_tools(&messages, false, &[])?;
     Ok(messages.len())

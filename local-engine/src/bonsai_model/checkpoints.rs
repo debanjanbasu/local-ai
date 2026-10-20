@@ -20,8 +20,8 @@ mod boundary;
 mod reuse;
 
 pub(super) use self::boundary::PromptPrefill;
-pub(super) use self::reuse::SHARED_PREFIX_MIN_TOKENS;
 use self::reuse::ReuseBounds;
+pub(super) use self::reuse::SHARED_PREFIX_MIN_TOKENS;
 
 impl BonsaiEngine {
     pub(super) fn save_prompt_checkpoint(

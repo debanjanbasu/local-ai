@@ -430,14 +430,14 @@ PROSE_TASKS = [
 def code_blocks(text, lang):
     aliases = {"python": ("python", "py"), "rust": ("rust", "rs"), "javascript": ("javascript", "js"),
                "go": ("go", "golang"), "sql": ("sql", "sqlite")}[lang]
-    blocks = re.findall(r"```([A-Za-z0-9_+-]*)[^\n]*\n(.*?)```", text or "", re.S)
+    blocks = re.findall(r"```([A-Za-z0-9_+-]*)[^\n]*\n(.*?)```", text or "", re.DOTALL)
     tagged = [body for tag, body in blocks if tag.lower() in aliases]
     return tagged or [body for _, body in blocks]
 
 
 def run(argv, cwd, timeout=120):
     try:
-        done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         return False, "timeout"
     return done.returncode == 0, (done.stdout + done.stderr)[-600:]

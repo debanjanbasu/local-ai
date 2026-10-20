@@ -14,7 +14,7 @@ from pathlib import Path
 import jsonschema
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-import client_compat as cc  # noqa: E402
+import client_compat as cc
 
 LEAK = re.compile(r"<tool_call>|</tool_call>|<function=|<parameter=|</function>")
 EXIT = re.compile(r"Process exited with code (\d+)")

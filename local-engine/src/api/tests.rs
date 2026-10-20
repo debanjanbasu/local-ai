@@ -39,7 +39,10 @@ fn long_prompt(marker: u128, max_tokens: usize) -> super::ChatRequest {
     super::ChatRequest {
         messages: vec![message(
             "user",
-            &format!("{} {marker}", "word ".repeat(3 * crate::resources::PREFILL_CHUNK)),
+            &format!(
+                "{} {marker}",
+                "word ".repeat(3 * crate::resources::PREFILL_CHUNK)
+            ),
         )],
         max_tokens,
         sampling: Sampling::default(),

@@ -217,6 +217,7 @@ pub fn reasoning_summary_request(reasoning: &str, detail: SummaryDetail) -> Chat
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::Engine;
@@ -255,7 +256,12 @@ mod tests {
             assert_eq!(request.tool_choice, ToolChoice::None, "no call may be made");
             assert_eq!(
                 request.max_tokens,
-                COMPACTION_MAX_TOKENS + if thinking { COMPACTION_REASONING_TOKENS } else { 0 }
+                COMPACTION_MAX_TOKENS
+                    + if thinking {
+                        COMPACTION_REASONING_TOKENS
+                    } else {
+                        0
+                    }
             );
             assert_eq!(request.session.as_deref(), Some("s"));
             let render = |request: &ChatRequest| {
@@ -265,7 +271,10 @@ mod tests {
             let (own, summary) = (render(&conversation), render(&request));
             // Everything but the generation opener is a prefix of the summary.
             let opener = own.rfind("<|im_start|>assistant").expect("opener");
-            assert!(summary.starts_with(&own[..opener]), "{summary}");
+            assert!(
+                summary.starts_with(own.get(..opener).expect("opener boundary")),
+                "{summary}"
+            );
             let ask = summary.find("Add quoting").unwrap_or(usize::MAX);
             let prompt = summary.find("CONTEXT CHECKPOINT").unwrap_or(0);
             assert!(ask < prompt, "{summary}");
