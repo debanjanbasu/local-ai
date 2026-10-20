@@ -1573,7 +1573,7 @@ fn memory_plan(
     }
     if !(1..=MAX_PREFILL_TOKENS as usize).contains(&prefill_chunk) {
         return Err(crate::Error::InvalidArgument(
-            "Bonsai prefill chunk must be within 1..=128".into(),
+            "Bonsai prefill chunk exceeds MAX_PREFILL_TOKENS".into(),
         ));
     }
     let tensor_bytes = package

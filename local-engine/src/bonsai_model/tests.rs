@@ -282,7 +282,7 @@ fn shared_system_prefix_reuses_across_sessions_and_restart() {
         .position(|&token| token == 248_046)
         .expect("system end")
         + 1;
-    assert!(boundary >= DEFAULT_PREFILL_CHUNK);
+    assert!(boundary >= super::checkpoints::SHARED_PREFIX_MIN_TOKENS);
     cached
         .generate_session(&first, &params, Some("first"), |_| true)
         .expect("prime shared prefix");
@@ -371,7 +371,7 @@ fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
 ///
 /// The trip is taken **during prefill**. With speculation and n-gram drafting
 /// off, decode calls `BonsaiModel::decode`, which polls nothing, so prefill's
-/// 128-token chunk loop is the only reachable `is_cancelled()` site and a trip
+/// chunk loop is the only reachable `is_cancelled()` site and a trip
 /// that arrived later would run the request to `TokenLimit` and fail loudly
 /// rather than pass silently. Prefill is GPU-paced — every chunk waits on its
 /// command buffer — so a 250 ms producer delay lands inside a request whose
@@ -384,7 +384,7 @@ fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
     let open = || {
         BonsaiEngine::open_with_options(
             Path::new(&path),
-            Some(1024),
+            Some(4096),
             DEFAULT_PREFILL_CHUNK,
             None,
             &MtpMode::Off(None),
@@ -406,7 +406,7 @@ fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
     let text = "Rust ownership, borrowing, lifetimes, traits, and safe concurrency. \
                 Explain briefly why a shared prefix cache cannot shorten the last \
                 prompt token. "
-        .repeat(48);
+        .repeat(96);
     let full = engine.encode_prompt(&text, true, false).expect("prompt");
     assert!(
         full.len() > 4 * DEFAULT_PREFILL_CHUNK,

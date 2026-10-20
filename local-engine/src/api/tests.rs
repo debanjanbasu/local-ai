@@ -32,14 +32,14 @@ fn a_silent_stream_times_out_without_closing_the_generation() {
     producer.join().expect("producer");
 }
 
-/// A chat request whose user turn is several prefill chunks long (400 words
-/// at `PREFILL_CHUNK` of 128), unique to `marker` so the prompt cache cannot
+/// A chat request whose user turn is several prefill chunks long (three
+/// words per `PREFILL_CHUNK` token), unique to `marker` so the prompt cache cannot
 /// already hold it, without reasoning.
 fn long_prompt(marker: u128, max_tokens: usize) -> super::ChatRequest {
     super::ChatRequest {
         messages: vec![message(
             "user",
-            &format!("{} {marker}", "word ".repeat(400)),
+            &format!("{} {marker}", "word ".repeat(3 * crate::resources::PREFILL_CHUNK)),
         )],
         max_tokens,
         sampling: Sampling::default(),
@@ -70,7 +70,7 @@ fn prefill_reports_every_chunk_before_the_first_event() {
         .duration_since(UNIX_EPOCH)
         .expect("clock after the epoch")
         .as_nanos();
-    // 400 words is several chunks at `PREFILL_CHUNK` of 128, and one generated
+    // The prompt is several chunks long, and one generated
     // token is enough because the assertion is about what arrives before it.
     let request = long_prompt(marker, 1);
     let mut events = handle.chat(request).expect("queue");

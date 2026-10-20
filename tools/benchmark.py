@@ -34,6 +34,16 @@ reported, not refused.
     tools/benchmark.py --sweep-depth
     tools/benchmark.py --rounds 3 -- '--no-thinking' '--greedy'
     tools/benchmark.py --check-only
+    tools/benchmark.py --prefill 2048,8192 --binary A --binary B -- --no-speculation
+    tools/benchmark.py --ttft
+
+`--prefill` times cold prefill of raw prompts of repository text and then a
+second process restoring the first one's disk snapshot (a restart), with the
+engine's disk prompt cache in a scratch `HOME`; every sample of a size must
+generate the same greedy tokens. `--ttft` times the first streamed delta
+through `local-ai serve` for an agent-shaped session (about 6K tokens of
+system prompt and tools, a ~2K-token tool result) across a server restart.
+Both load the model, so hold the shared GPU lock around them.
 
 Sleep is part of the same guard. A 7 tok/s run in this project's history was
 taken on battery with the lid closing, and the engine's own timing gave no hint
@@ -60,13 +70,17 @@ measure, 1 on a usage or runtime error. Power source never affects it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -220,10 +234,16 @@ class Config:
 
     name: str
     flags: tuple[str, ...] = ()
+    # None is the default build, read when the command is made so tests can
+    # patch `BINARY`; `--binary` names others to compare builds.
+    binary: Path | None = None
+
+    def executable(self) -> str:
+        return str(self.binary or BINARY)
 
     def argv(self, prompt: str, max_tokens: int) -> list[str]:
         return [
-            str(BINARY),
+            self.executable(),
             "bonsai",
             "--greedy",
             "--no-thinking",
@@ -464,6 +484,406 @@ def parse_configs(groups: list[str]) -> list[Config]:
     return configs
 
 
+def with_binaries(configs: list[Config], binaries: list[Path]) -> list[Config]:
+    """Every configuration once per `--binary`, labelled by its build."""
+    if not binaries:
+        return configs
+    return [
+        Config(
+            f"{binary.name} {config.name}" if len(binaries) > 1 else config.name,
+            config.flags,
+            binary,
+        )
+        for config in configs
+        for binary in binaries
+    ]
+
+
+# ---------------------------------------------------------------- prefill
+
+PREFILL_SIZES = "2048,8192,32768,131072"
+PREFILL_OUTPUT_TOKENS = 16
+# Prose first, then code. The order fixes the text each size reads, so builds
+# compared in one run prefill byte-identical prompts.
+CORPUS = (
+    "docs/BONSAI.md",
+    "README.md",
+    "docs/*.md",
+    "local-engine/src/**/*.rs",
+    "local-metal/src/**/*.rs",
+    "local-ai/src/**/*.rs",
+)
+
+
+def corpus(chars: int) -> str:
+    """The first `chars` characters of the repository text in `CORPUS` order."""
+    pieces: list[str] = []
+    seen: set[Path] = set()
+    total = 0
+    while total < chars:
+        before = total
+        for pattern in CORPUS:
+            for path in sorted(REPO.glob(pattern)):
+                if path in seen or not path.is_file():
+                    continue
+                seen.add(path)
+                pieces.append(path.read_text(errors="replace"))
+                total += len(pieces[-1]) + 1
+                if total >= chars:
+                    return "\n".join(pieces)[:chars]
+        if total == before:
+            # Everything was read once: repeat it.
+            seen.clear()
+            if not pieces:
+                raise RuntimeError("no corpus text found")
+    return "\n".join(pieces)[:chars]
+
+
+def count_tokens(binary: str, path: Path) -> int:
+    done = subprocess.run(
+        [binary, "bonsai", "--tokenize", "--raw", "--prompt-file", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
+    )
+    if done.returncode != 0:
+        raise RuntimeError(f"tokenize failed: {done.stderr.strip()[:400]}")
+    return int(json.loads(done.stdout)["prompt_tokens"])
+
+
+def prefill_prompt(binary: str, tokens: int, directory: Path) -> tuple[Path, int]:
+    """Write a raw prompt of about `tokens` tokens (within 0.2%) and count it."""
+    path = directory / f"prompt-{tokens}.txt"
+    chars = tokens * 4
+    count = 0
+    for _ in range(8):
+        path.write_text(corpus(chars))
+        count = count_tokens(binary, path)
+        if abs(count - tokens) <= max(4, tokens // 500):
+            break
+        chars = max(1, round(chars * tokens / count))
+    return path, count
+
+
+@dataclass
+class PrefillSample:
+    prompt_tokens: int
+    cached_tokens: int
+    prefill_tokens_per_second: float | None
+    first_token_seconds: float
+    load_seconds: float | None
+    token_ids: tuple[int, ...]
+
+
+def run_prefill(
+    config: Config, prompt: Path, home: Path, guard: PowerGuard | None
+) -> PrefillSample:
+    """One process: load, prefill `prompt` raw, decode a few greedy tokens.
+
+    `HOME` points the engine's disk prompt cache at `home`, so a fresh `home`
+    is a cold start and a second process on the same one restores what the
+    first persisted: a restart.
+    """
+    argv = [
+        config.executable(),
+        "bonsai",
+        "--raw",
+        "--greedy",
+        "--json",
+        "--max-tokens",
+        str(PREFILL_OUTPUT_TOKENS),
+        *config.flags,
+        "--prompt-file",
+        str(prompt),
+    ]
+    if guard is not None:
+        guard.observe_power(f"before a {config.name} prefill sample")
+    wall, steady = time.time(), time.monotonic()
+    done = subprocess.run(
+        keep_awake(argv),
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO,
+        env={**os.environ, "HOME": str(home)},
+    )
+    if guard is not None:
+        stage = f"during a {config.name} prefill sample"
+        guard.check_awake(stage, time.time() - wall, time.monotonic() - steady)
+        guard.observe_power(f"after a {config.name} prefill sample")
+    if done.returncode != 0:
+        raise RuntimeError(
+            f"{config.name} exited {done.returncode}: {done.stderr.strip()[-400:]}"
+        )
+    stats = json.loads(done.stdout)
+    load = None
+    for line in done.stderr.splitlines():
+        if '"load_seconds"' in line:
+            with contextlib.suppress(json.JSONDecodeError):
+                load = float(json.loads(line)["load_seconds"])
+    return PrefillSample(
+        prompt_tokens=int(stats["prompt_tokens"]),
+        cached_tokens=int(stats["cached_tokens"]),
+        prefill_tokens_per_second=stats["prefill_tokens_per_second"],
+        first_token_seconds=float(stats["first_token_seconds"]),
+        load_seconds=load,
+        token_ids=tuple(stats["token_ids"]),
+    )
+
+
+def measure_prefill(
+    configs: list[Config],
+    sizes: list[int],
+    rounds: int,
+    warmup: bool,
+    guard: PowerGuard,
+    directory: Path,
+) -> list[str]:
+    """Cold then warm (restarted) prefill per size, configurations interleaved.
+
+    Every sample of a size must generate the same greedy tokens, cold or warm
+    and in every configuration; the warm one must reuse the cold one's disk
+    snapshot.
+    """
+    rows: dict[tuple[int, str], list[tuple[PrefillSample, PrefillSample]]] = {}
+    if warmup:
+        prompt, _ = prefill_prompt(configs[0].executable(), 256, directory)
+        home = Path(tempfile.mkdtemp(dir=directory))
+        run_prefill(configs[0], prompt, home, None)
+        shutil.rmtree(home)
+    for size in sizes:
+        prompt, count = prefill_prompt(configs[0].executable(), size, directory)
+        print(f"  {size}: {count} prompt tokens", file=sys.stderr, flush=True)
+        reference: tuple[int, ...] | None = None
+        for round_index in range(rounds):
+            for config in configs:
+                home = Path(tempfile.mkdtemp(dir=directory))
+                try:
+                    cold = run_prefill(config, prompt, home, guard)
+                    warm = run_prefill(config, prompt, home, guard)
+                finally:
+                    shutil.rmtree(home, ignore_errors=True)
+                if cold.cached_tokens != 0:
+                    raise RuntimeError(
+                        f"{config.name}: a cold run reused {cold.cached_tokens} tokens"
+                    )
+                reference = reference or cold.token_ids
+                for label, sample in (("cold", cold), ("warm", warm)):
+                    if sample.token_ids != reference:
+                        raise RuntimeError(
+                            f"{config.name} {label} at {size} tokens generated "
+                            f"{list(sample.token_ids)}, not {list(reference)}: "
+                            "greedy output must not depend on the build or cache"
+                        )
+                rows.setdefault((size, config.name), []).append((cold, warm))
+                print(
+                    f"  {size} {config.name} round {round_index + 1}/{rounds}: "
+                    f"cold {cold.prefill_tokens_per_second or 0:.1f} tok/s, "
+                    f"TTFT {cold.first_token_seconds:.2f}s; warm reused "
+                    f"{warm.cached_tokens}, TTFT {warm.first_token_seconds:.2f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    width = max(len(name) for _, name in rows)
+    lines = [
+        f"{'tokens':>7}  {'config'.ljust(width)}  {'cold tok/s':>10}  {'median':>7}  "
+        f"{'cold TTFT':>9}  {'warm reused':>11}  {'warm TTFT':>9}  {'load':>5}"
+    ]
+    for (size, name), samples in rows.items():
+        rates = [cold.prefill_tokens_per_second or 0.0 for cold, _ in samples]
+        lines.append(
+            f"{samples[0][0].prompt_tokens:7d}  {name.ljust(width)}  {max(rates):10.1f}  "
+            f"{median(rates):7.1f}  "
+            f"{min(cold.first_token_seconds for cold, _ in samples):8.2f}s  "
+            f"{min(warm.cached_tokens for _, warm in samples):11d}  "
+            f"{min(warm.first_token_seconds for _, warm in samples):8.2f}s  "
+            f"{min(cold.load_seconds or 0.0 for cold, _ in samples):4.1f}s"
+        )
+    return lines
+
+
+# ------------------------------------------------------------------ TTFT
+
+TTFT_SYSTEM_TOKENS = 5000
+TTFT_TOOL_RESULT_TOKENS = 2000
+
+
+def ttft_prompts(binary: str, directory: Path) -> tuple[str, list[dict], str]:
+    """A coding-agent-shaped system prompt, tool schemas and one tool result.
+
+    About 6K prompt tokens with the tools rendered, as a Codex session's first
+    request; the tool result is about 2K tokens of source.
+    """
+    path, _ = prefill_prompt(binary, TTFT_SYSTEM_TOKENS + TTFT_TOOL_RESULT_TOKENS, directory)
+    text = path.read_text()
+    split = len(text) * TTFT_SYSTEM_TOKENS // (TTFT_SYSTEM_TOKENS + TTFT_TOOL_RESULT_TOKENS)
+    system = "You are a coding agent. Follow the project notes below.\n\n" + text[:split]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        key: {"type": "string", "description": f"The {key} to use."}
+                        for key in keys
+                    },
+                    "required": list(keys[:1]),
+                },
+            },
+        }
+        for name, description, keys in (
+            ("shell", "Run a shell command in the workspace and return its output.", ("command", "workdir")),
+            ("read_file", "Read a file, optionally a line range.", ("path", "range")),
+            ("apply_patch", "Apply a unified diff to the workspace.", ("patch",)),
+            ("search", "Search the repository with a regular expression.", ("pattern", "path", "glob")),
+            ("list_files", "List files under a directory.", ("path", "depth")),
+            ("web_fetch", "Fetch a URL and return it as Markdown.", ("url", "objective")),
+        )
+    ]
+    return system, tools, text[split:]
+
+
+def stream_ttft(port: int, body: dict) -> tuple[float, dict]:
+    """POST a streaming chat completion; return time to first delta and usage."""
+    import http.client
+
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
+    started = time.monotonic()
+    connection.request(
+        "POST",
+        "/v1/chat/completions",
+        json.dumps({**body, "stream": True, "stream_options": {"include_usage": True}}),
+        {"Content-Type": "application/json"},
+    )
+    response = connection.getresponse()
+    if response.status != 200:
+        raise RuntimeError(f"HTTP {response.status}: {response.read()[:400]!r}")
+    first: float | None = None
+    usage: dict = {}
+    for raw in response:
+        line = raw.decode().strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        chunk = json.loads(line[6:])
+        usage = chunk.get("usage") or usage
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta", {})
+            if first is None and any(
+                delta.get(key) for key in ("content", "reasoning_content", "reasoning", "tool_calls")
+            ):
+                first = time.monotonic() - started
+    connection.close()
+    if first is None:
+        raise RuntimeError("the response streamed no delta")
+    return first, usage
+
+
+def measure_ttft(config: Config, directory: Path) -> list[str]:
+    """End-to-end TTFT over HTTP for an agent session, across a restart.
+
+    Steps: a cold first request; a second session sharing the system prompt
+    and tools; a follow-up that adds one tool call and a ~2K-token result;
+    then, after restarting the server on the same prompt cache, a new session
+    and the follow-up again.
+    """
+    import socket
+
+    system, tools, result = ttft_prompts(config.executable(), directory)
+    home = Path(tempfile.mkdtemp(dir=directory))
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    def request(question: str, follow_up: bool = False) -> dict:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": question},
+        ]
+        if follow_up:
+            messages += [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": json.dumps({"path": "local-engine/src/lib.rs"}),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": result},
+            ]
+        return {
+            "model": "bonsai",
+            "messages": messages,
+            "tools": tools,
+            "max_completion_tokens": 16,
+            "temperature": 0,
+            "reasoning_effort": "none",
+        }
+
+    def serve() -> subprocess.Popen:
+        process = subprocess.Popen(
+            keep_awake([config.executable(), "serve", "--port", str(port), *config.flags]),
+            cwd=REPO,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert process.stderr is not None
+        # The listening line is the server's readiness signal.
+        for line in process.stderr:
+            if "server listening on http://" in line:
+                break
+        else:
+            raise RuntimeError("server exited before listening")
+        threading.Thread(target=process.stderr.read, daemon=True).start()
+        return process
+
+    def stop(process: subprocess.Popen) -> None:
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(300)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    steps = [
+        ("cold first request", "Where is prefill implemented?", False, False),
+        ("new session, shared system+tools", "How does the prompt cache evict?", False, False),
+        ("tool result follow-up (+2K)", "Where is prefill implemented?", True, False),
+        ("after restart: new session", "What does the scheduler batch?", False, True),
+        ("after restart: tool result follow-up", "Where is prefill implemented?", True, False),
+    ]
+    lines = [f"{'step':38}  {'TTFT':>7}  {'prompt':>6}  {'reused':>6}  source"]
+    process = serve()
+    try:
+        for name, question, follow_up, restart in steps:
+            if restart:
+                stop(process)
+                process = serve()
+            seconds, usage = stream_ttft(port, request(question, follow_up))
+            details = usage.get("prompt_tokens_details") or {}
+            lines.append(
+                f"{name:38}  {seconds:6.2f}s  {usage.get('prompt_tokens', 0):6d}  "
+                f"{details.get('cached_tokens', 0):6d}  {details.get('cache_source', '')}"
+            )
+            print(f"  {lines[-1]}", file=sys.stderr, flush=True)
+    finally:
+        stop(process)
+        shutil.rmtree(home, ignore_errors=True)
+    return lines
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -476,6 +896,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--sweep-depth",
         action="store_true",
         help="compare every --mtp-depth the engine accepts",
+    )
+    parser.add_argument(
+        "--prefill",
+        nargs="?",
+        const=PREFILL_SIZES,
+        metavar="SIZES",
+        help="measure cold and warm (restarted) prefill of raw prompts of these "
+        f"comma-separated token counts (default {PREFILL_SIZES}) instead of decode",
+    )
+    parser.add_argument(
+        "--ttft",
+        action="store_true",
+        help="measure end-to-end TTFT through `local-ai serve` for an "
+        "agent-shaped session across a restart, instead of decode",
+    )
+    parser.add_argument(
+        "--binary",
+        action="append",
+        type=Path,
+        default=[],
+        help="build to measure (repeat to compare builds); default "
+        "target/release/local-ai",
     )
     parser.add_argument(
         "--check-only",
@@ -519,9 +961,10 @@ def main(argv: list[str]) -> int:
     if args.check_only:
         return 0
 
-    if not BINARY.exists():
+    missing = [b for b in (args.binary or [BINARY]) if not b.exists()]
+    if missing:
         print(
-            f"error: {BINARY} not found; run `cargo build --release -p local-ai` first",
+            f"error: {missing[0]} not found; run `cargo build --release -p local-ai` first",
             file=sys.stderr,
         )
         return 1
@@ -537,11 +980,37 @@ def main(argv: list[str]) -> int:
             require_idle()
 
         configs = depth_sweep() if args.sweep_depth else parse_configs(args.configs)
+        configs = with_binaries(configs, args.binary)
         print(
             f"comparing {', '.join(config.name for config in configs)} "
             f"for {args.rounds} rounds",
             file=sys.stderr,
         )
+        if args.prefill or args.ttft:
+            with tempfile.TemporaryDirectory(prefix="local-ai-prefill-") as directory:
+                if args.prefill:
+                    sizes = [int(size) for size in args.prefill.split(",")]
+                    lines = measure_prefill(
+                        configs, sizes, args.rounds, not args.no_warmup, guard, Path(directory)
+                    )
+                else:
+                    lines = [
+                        line
+                        for config in configs
+                        for line in [f"[{config.name}]", *measure_ttft(config, Path(directory))]
+                    ]
+            print()
+            print("\n".join(lines))
+            print()
+            if args.prefill:
+                print(
+                    "cold tok/s is prefilled tokens over prefill time (best of rounds); "
+                    "TTFT is the engine's time to first token after load; warm runs "
+                    "are new processes restoring the cold run's disk snapshot."
+                )
+            for line in guard.power_summary():
+                print(line)
+            return 0
         # Prove the configurations do identical work before trusting any rate.
         check_identical(configs, args.prompt, min(args.max_tokens, 8))
         report = measure(

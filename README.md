@@ -244,11 +244,13 @@ Startup prints every decision and reason under `experimental_bonsai`.
   suffix-lookup drafts inside the batch: 37.9 against 34.9 tok/s aggregate
   at four streams for the previous build, byte-identical to each request
   alone.
-- Prefill (cold, no speculation): about 125 tok/s from 2K to 8K tokens and
-  106 tok/s at 32K on the large-batch kernels. The 56 tok/s at 128K was
-  measured on the original build and has not been re-measured.
+- Prefill (cold, no speculation), 512-token blocks: about 130 tok/s at 8K,
+  115 tok/s at 32K and 76 tok/s at 128K (122, 109 and 71 with the former
+  128-token blocks, interleaved in the same runs).
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
-  shared 6.7K-token prefix TTFT 1.2 s versus 73 s.
+  shared 6.7K-token prefix TTFT 1.2 s versus 73 s. After a server restart a
+  new session sharing a ~5.9K-token system prompt and tools reaches its first
+  token in 1.1-1.4 s against 45-47 s cold (`tools/benchmark.py --ttft`).
 - Memory: 0.8–0.9 GB peak for a short request and 2.09 GB peak footprint for
   a 16K-token prompt plus 500 generated tokens (F16 recurrent state, copy-free
   verify rollback, 4K-step K/V growth). File-backed weights remain

@@ -20,6 +20,7 @@ mod boundary;
 mod reuse;
 
 pub(super) use self::boundary::PromptPrefill;
+pub(super) use self::reuse::SHARED_PREFIX_MIN_TOKENS;
 use self::reuse::ReuseBounds;
 
 impl BonsaiEngine {

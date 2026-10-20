@@ -82,11 +82,11 @@ impl BonsaiEngine {
             },
         });
         self.info.policy["prompt_cache"]["reason"] = serde_json::json!(
-            "GPU checkpoints use memory headroom; host snapshots are skipped on measured fast storage; shared-prefix checkpoints start at one prefill chunk"
+            "GPU checkpoints use memory headroom; host snapshots are skipped on measured fast storage; shared-prefix checkpoints start at 128 tokens"
         );
         self.info.policy["prompt_cache"]["shared_prefix"] = serde_json::json!({
             "enabled": checkpoints > 0 || host_bytes > 0 || disk_budget_bytes > 0,
-            "minimum_tokens": self.info.prefill_chunk_size,
+            "minimum_tokens": super::checkpoints::SHARED_PREFIX_MIN_TOKENS,
             "boundaries": ["system_turn_end", "observed_divergence"],
             "checkpoints_per_prefill": 1,
             "eviction_priority": "shared_prefix_before_request_tail",
