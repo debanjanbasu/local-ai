@@ -54,21 +54,25 @@ the engine only phrases and renders the summary generation (see
 
 ### Compaction and reasoning summaries
 
-Both are ordinary generations of the one loaded checkpoint, with thinking off,
-so the summary is the generation's visible content and never its raw
-reasoning. `local_engine::compaction` owns only the model-facing half:
+Both are ordinary generations of the one loaded checkpoint, and the summary
+is the generation's visible content, never its raw reasoning.
+`local_engine::compaction` owns only the model-facing half:
 
-- `compaction_request(history, tools, session)` renders `history` exactly as
-  the conversation's own turns are, then a fixed checkpoint instruction asking
-  for goals, decisions, exact identifiers and results, tool outcomes and every
-  unresolved item. Pass the conversation's tools and session: the prompt then
-  shares the conversation's rendered prefix, so the prompt cache can serve it
-  (tools are rendered with `ToolChoice::None`, so no call can be made).
+- `compaction_request(&conversation)` is the conversation's own request (its
+  messages, tools, session and reasoning) followed by a fixed checkpoint
+  instruction asking for goals, decisions, exact identifiers and results,
+  tool outcomes and every unresolved item. Its prompt therefore extends the
+  one the conversation's last turn prefilled, and the prompt cache serves it
+  from that turn's snapshot; a summary of a shorter prefix, or rendered under
+  another system turn, would prefill the whole history again, because exact
+  prefixes are kept only at snapshot boundaries. Tools are rendered with
+  `ToolChoice::None`, so no call can be made; a conversation that reasons
+  gets a summary that reasons too, with 4,096 more output tokens for it.
 - `summary_message(summary)` is how a compacted summary is rendered back: one
   `user` message under a fixed `[Context compacted]` header, in place of the
   turns it replaced.
 - `reasoning_summary_request(reasoning, SummaryDetail)` quotes a generation's
-  raw reasoning and asks for an `auto` (one paragraph, at most 320 tokens),
+  raw reasoning (thinking off) and asks for an `auto` (one paragraph, at most 320 tokens),
   `concise` (one to three sentences, 160) or `detailed` (900) summary.
 
 The session half is model-free, in `local_services::compaction`: `plan`
@@ -83,9 +87,11 @@ the newest items are kept up to a token budget measured with
 `count_chat_tokens`. A harness counts, plans, runs `compaction_request` on the
 engine, collects `Event::Content`, and replaces the summarized items.
 
-Cost and risk: a compaction pass prefills the summarized history (served from
-the prompt cache when the conversation's own last turn left it there, prefilled
-again otherwise) and decodes up to 2,048 summary tokens; a reasoning summary
+Cost and risk: a compaction pass prefills only what follows the
+conversation's last turn when that turn left its prompt in the cache (the
+whole history otherwise), decodes up to 2,048 summary tokens (plus its
+reasoning, for a conversation that reasons), and the compacted prompt that
+follows is prefilled cold; a reasoning summary
 prefills the reasoning once more and decodes up to its budget, after the
 answer. Both are queued like any request. A summary is lossy: details the model
 leaves out (an exact error string, a file it read) are gone from the prompt,
@@ -442,10 +448,14 @@ providers:
         reasoning: true
         thinking: {mode: effort, efforts: [low, medium, xhigh], defaultLevel: xhigh, requiresEffort: false}
         input: [text]
-        contextWindow: 65536 # use context_length from GET /v1/models
+        contextWindow: 65536 # at most context_length from GET /v1/models
         maxTokens: 8192
         cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
 ```
+
+Oh My Pi compacts when a prompt exceeds `compaction.thresholdTokens`; set it
+to 32,000 (provisional until the
+[threshold sweep](../docs/BONSAI.md#compaction-threshold) finishes) with `omp config set compaction.thresholdTokens 32000`.
 
 The flags replace Oh My Pi defaults for an unrecognized host that this server
 refuses or would misread. The keys come from the

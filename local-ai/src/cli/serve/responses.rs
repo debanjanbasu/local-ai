@@ -79,8 +79,9 @@
 //!   `--reasoning-key` cipher, so both need one. A prompt is rendered from the
 //!   latest compaction item onward: the summary, then the items it kept, then
 //!   the items after it; anything before it is skipped. With
-//!   `context_management`, a prompt that reaches `compact_threshold`, or that
-//!   leaves less than `max_output_tokens` of the context, is compacted before
+//!   `context_management`, a prompt that reaches `compact_threshold` (null or
+//!   absent: the server's default, 32,000 tokens), or that leaves less than
+//!   `max_output_tokens` of the context, is compacted before
 //!   generation and the compaction item is the Response's first output item;
 //!   for `background`, before the job is admitted, and a resumed job reuses
 //!   the item its record holds. Both extra generations' tokens are added to
@@ -425,7 +426,9 @@ struct Persist {
 /// A `context_management` compaction entry.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ContextCompaction {
-    /// `compact_threshold`: the prompt tokens that make compaction due.
+    /// `compact_threshold`: the prompt tokens that make compaction due;
+    /// `None` (null or absent) is the server's default,
+    /// [`local_services::compaction::DEFAULT_COMPACT_THRESHOLD`].
     pub(super) threshold: Option<usize>,
 }
 
@@ -1113,13 +1116,14 @@ impl History {
 
     /// Plan a compaction pass that keeps about `keep_tokens` of the newest
     /// items verbatim, measuring with `count`; `None` when nothing can be
-    /// summarized. The summary request renders `tools` and uses `session`,
-    /// as the conversation's own turns do, so their cached prefix is reused.
+    /// summarized. `conversation` is the request this history renders as
+    /// (its messages are this history's); the summary request extends it,
+    /// so the prefix its turns already prefilled is reused (see
+    /// [`compaction_request`]).
     pub(super) fn compaction(
         &self,
         keep_tokens: usize,
-        tools: Vec<ToolDefinition>,
-        session: Option<String>,
+        conversation: &ChatRequest,
         count: impl Fn(Vec<ChatMessage>) -> crate::Result<usize>,
     ) -> crate::Result<Option<CompactionPass>> {
         let planned = plan(&self.items, keep_tokens, |slice| {
@@ -1132,9 +1136,8 @@ impl History {
         let Some(planned) = planned else {
             return Ok(None);
         };
-        let history = self.messages_of(self.items.get(..planned.split).unwrap_or_default())?;
         Ok(Some(CompactionPass {
-            request: compaction_request(history, tools, session),
+            request: compaction_request(conversation),
             kept: planned.kept,
         }))
     }

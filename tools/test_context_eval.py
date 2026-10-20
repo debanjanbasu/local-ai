@@ -84,6 +84,34 @@ class ContextTest(unittest.TestCase):
             for path in needle.files:
                 self.assertIn(path, text)
 
+    def test_session_replays_the_whole_repository_in_bounded_reads(self):
+        needles = ce.make_needles(1)
+        text, _ = ce.build_context(1, "16k", needles)
+        files = ce.repository_files(text)
+        steps = ce.session_items(files)
+        outputs = [output["output"] for _, output in steps]
+        self.assertEqual("".join(outputs), text[text.index("\nFILE ") + 1:])
+        self.assertTrue(all(len(o) <= ce.SESSION_CHUNK_TOKENS * ce.CHARS_PER_TOKEN for o in outputs))
+        self.assertGreater(len(steps), 4)
+        for call, output in steps:
+            self.assertEqual(call["call_id"], output["call_id"])
+            self.assertEqual(ce.read_files(files, call["arguments"]), output["output"])
+        fix = next(n for n in needles if n.task == "fix")
+        path = next(iter(fix.files))
+        self.assertEqual(ce.read_files(files, f'{{"paths": ["{path}"]}}'), f"FILE {path}\n{fix.files[path]}\n")
+        self.assertIn("no such file", ce.read_files(files, '{"paths": ["nope.py"]}'))
+
+    def test_stale_reuse_counts_what_the_previous_read_would_have_served(self):
+        def read(prompt, cached, wall):
+            return {"kind": "read", "input_tokens": prompt, "cached_tokens": cached, "wall_seconds": wall}
+        session = [read(3000, 0, 30.0), read(6000, 2999, 30.0),
+                   {"kind": "compaction", "input_tokens": 9000, "cached_tokens": 5999, "wall_seconds": 90.0},
+                   read(4000, 300, 37.0), read(7000, 3999, 30.0), read(10000, 3999, 60.0)]
+        rows = ce.stale_reuse(session)
+        self.assertEqual([r[:2] for r in rows], [(3000, 0), (3001, 0), (3700, 0), (3001, 0), (6001, 3000)])
+        # The stale step is charged for the 3,001 tokens it should have prefilled.
+        self.assertAlmostEqual(rows[-1][2], 60.0 * 3001 / 6001)
+
 
 class RecordTest(unittest.TestCase):
     def test_record_report_and_resume(self):

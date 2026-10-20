@@ -83,6 +83,12 @@ pub fn latest(items: &[Value]) -> Option<usize> {
     items.iter().rposition(is_compaction)
 }
 
+/// The prompt length at which a conversation is compacted when its caller
+/// names no threshold of its own (`context_management` without a
+/// `compact_threshold`). Chosen by the compaction threshold sweep in
+/// docs/BONSAI.md.
+pub const DEFAULT_COMPACT_THRESHOLD: usize = 32_000;
+
 /// Whether a prompt of `prompt_tokens` should be compacted before it is
 /// generated from: it has reached the caller's `threshold`, or it leaves less
 /// than `reserve` output tokens in a `context`-token window.
