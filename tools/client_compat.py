@@ -213,8 +213,18 @@ def function_outputs(request_body: object) -> list[dict]:
             and i.get("type") in ("function_call_output", "custom_tool_call_output")]
 
 
+# A streamed chunk carrying generated output: a Responses `*.delta` event, or
+# a Chat chunk with non-empty content, reasoning or a tool call. Its arrival
+# time is an exchange's `first_token_seconds` (time to first token).
+TOKEN_CHUNK = re.compile(rb'\.delta"|"(?:content|reasoning_content)":"[^"]|"tool_calls":\[')
+GENERATION_PATHS = ("/v1/responses", "/v1/chat/completions")
+
+
 class Recorder:
-    """A streaming reverse proxy that records every exchange it forwards."""
+    """A streaming reverse proxy that records every exchange it forwards.
+
+    `inject` holds members added to every JSON generation request that lacks
+    them (`agent_bench.py` pins `seed` this way)."""
 
     def __init__(self, upstream_port: int, log_path: Path, timeout: float = 7200.0):
         self.upstream_port = upstream_port
@@ -223,6 +233,7 @@ class Recorder:
         self.lock = threading.Lock()
         self.exchanges: list[dict] = []
         self.scenario = "-"
+        self.inject: dict = {}
         self.first_chunk = threading.Event()
         self.server: http.server.ThreadingHTTPServer | None = None
 
@@ -267,6 +278,10 @@ class Recorder:
 
             def _forward(self) -> None:
                 body = self._body()
+                if recorder.inject and self.command == "POST" and self.path.split("?")[0] in GENERATION_PATHS:
+                    parsed = parse_body(body)
+                    if isinstance(parsed, dict):
+                        body = json.dumps({**recorder.inject, **parsed}).encode()
                 exchange = {
                     "scenario": recorder.scenario,
                     "method": self.command,
@@ -308,6 +323,9 @@ class Recorder:
                         if not chunk:
                             break
                         received.extend(chunk)
+                        # The tail also covers a marker split across chunks.
+                        if "first_token_seconds" not in exchange and TOKEN_CHUNK.search(received[-len(chunk) - 64:]):
+                            exchange["first_token_seconds"] = time.time() - exchange["started"]
                         try:
                             self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                             self.wfile.flush()
@@ -364,11 +382,12 @@ class Recorder:
 class LocalServer:
     """`local-ai serve`, ready when it prints its listening line on stderr."""
 
-    def __init__(self, binary: Path, port: int, log_path: Path, args: list[str]):
+    def __init__(self, binary: Path, port: int, log_path: Path, args: list[str], env: dict | None = None):
         self.binary = binary
         self.port = port
         self.log_path = log_path
         self.args = args
+        self.env = env
         self.process: subprocess.Popen | None = None
         self.ready = threading.Event()
         self.lock = threading.Lock()
@@ -381,7 +400,7 @@ class LocalServer:
         with self.log_path.open("a") as log:
             log.write(f"$ {' '.join(command)}\n")
         self.process = subprocess.Popen(
-            command, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+            command, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=self.env
         )
         threading.Thread(target=self._pump, daemon=True).start()
         # The listening line is the server's only readiness signal; waiting on
