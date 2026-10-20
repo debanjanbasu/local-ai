@@ -1,6 +1,10 @@
 use crate::bonsai_model::{BonsaiEngine, PromptCacheSource};
 use crate::prompt_cache;
 
+/// Shortest reusable boundary a prefill checkpoints: a shorter prefix costs
+/// less to prefill again (about a second) than its snapshot does to copy.
+pub(in crate::bonsai_model) const SHARED_PREFIX_MIN_TOKENS: usize = 128;
+
 /// The reusable-prefix arithmetic for one rendered prompt.
 pub(super) struct ReuseBounds {
     /// Longest common prefix with the previously cached prompt.
@@ -13,8 +17,8 @@ pub(super) struct ReuseBounds {
     pub(super) penultimate: usize,
     // Recurrent state is valid only at an exact position. Materialize one
     // semantic checkpoint per prefill: prefer a newly observed divergence,
-    // otherwise the end of the system turn. The minimum follows the
-    // resource-selected prefill chunk, avoiding copies for short prefixes.
+    // otherwise the end of the system turn. The minimum
+    // (`SHARED_PREFIX_MIN_TOKENS`) avoids copies for short prefixes.
     pub(super) minimum: usize,
 }
 
@@ -43,7 +47,7 @@ impl BonsaiEngine {
             .zip(prompt)
             .take_while(|(cached, new)| cached == new)
             .count();
-        ReuseBounds::new(lcp, prompt.len(), self.info.prefill_chunk_size)
+        ReuseBounds::new(lcp, prompt.len(), SHARED_PREFIX_MIN_TOKENS)
     }
 
     /// The three-tier cascade: a live GPU checkpoint, then a host session

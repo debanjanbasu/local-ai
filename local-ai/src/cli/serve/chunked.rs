@@ -642,8 +642,8 @@ fn pump(
             return;
         };
         // Only generated text starts the clock, never a prefill boundary:
-        // `PREFILL_CHUNK` is 128 tokens and this M2 prefills at 3.6-4.2 tok/s, so
-        // one chunk is about 35 s of work while the `--stall-timeout` floor is
+        // `PREFILL_CHUNK` is 512 tokens and this M2 prefills at 3.6-4.2 tok/s, so
+        // one chunk is over two minutes of work while the `--stall-timeout` floor is
         // 10 s. Arming the budget on a boundary would cancel ordinary long
         // prompts, which is the failure this path exists to remove.
         first_seen |= matches!(signal, Signal::Event(_));

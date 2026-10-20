@@ -27,9 +27,9 @@ pub(super) async fn start_stream(
 ) -> Result<mpsc::Receiver<Result<Bytes, std::io::Error>>, String> {
     // The first event has no deadline, deliberately and not by accident: it is
     // prefill, not a stall. Nothing is emitted while the prompt is prefilled,
-    // `PREFILL_CHUNK` is 128 and this M2 prefills at 3.6-4.2 tok/s, so one
-    // chunk is about 35 s of complete silence and a prompt over 128 tokens is
-    // ordinary. A stall means the engine was producing and the client stopped
+    // `PREFILL_CHUNK` is 512 and this M2 prefills at 3.6-4.2 tok/s, so one
+    // chunk is over two minutes of complete silence and a prompt over 512
+    // tokens is ordinary. A stall means the engine was producing and the client stopped
     // consuming, which is only knowable once the engine has produced
     // something, so every budget on this path starts after this call returns.
     // `response::event_wait` is the same rule for the non-streaming path.
