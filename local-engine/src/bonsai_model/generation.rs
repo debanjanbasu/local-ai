@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::bonsai_tokenizer::{BonsaiTokenizer, StreamDecodeState};
 use crate::bonsai_vision::PromptImages;
+use crate::sampler::TokenLogprob;
 use crate::structured::Grammar;
 
 /// Acceptance assumed for a sequence's first lookup drafts: a lookup fires
@@ -41,6 +42,9 @@ pub(super) struct ActiveGeneration {
     pub(super) suffixes: SuffixSession,
     pub(super) lookup_policy: LookupPolicy,
     pub(super) pending: VecDeque<SamplingResult>,
+    /// Log-probabilities of emitted tokens whose text the decoder still
+    /// holds (an incomplete character), sent with the piece that holds it.
+    logprobs: Vec<TokenLogprob>,
     cache_source: PromptCacheSource,
     prompt_snapshot: Option<PromptCheckpoint>,
     persisted_reusable_boundary: bool,
@@ -170,8 +174,16 @@ impl BonsaiEngine {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<BonsaiGeneration> {
+        let mut emit = emit;
         self.generate_constrained(
-            prompt, params, session_id, emit, cancel, progress, None, None,
+            prompt,
+            params,
+            session_id,
+            |piece, _| emit(piece),
+            cancel,
+            progress,
+            None,
+            None,
         )
     }
 
@@ -182,7 +194,7 @@ impl BonsaiEngine {
         prompt: &[u32],
         params: &GenerateParams,
         session_id: Option<&str>,
-        mut emit: impl FnMut(&str) -> bool,
+        mut emit: impl FnMut(&str, Vec<TokenLogprob>) -> bool,
         cancel: &CancelToken,
         progress: &mut dyn FnMut(PrefillProgress),
         grammar: Option<Grammar>,
@@ -196,9 +208,12 @@ impl BonsaiEngine {
         let id =
             self.admit_constrained(prompt, params, session_id, cancel.clone(), grammar, images)?;
         loop {
-            for (finished, result) in self.step(&mut |_, piece| emit(piece), &mut |_, report| {
-                progress(report);
-            }) {
+            for (finished, result) in self.step(
+                &mut |_, piece, logprobs| emit(piece, logprobs),
+                &mut |_, report| {
+                    progress(report);
+                },
+            ) {
                 if finished == id {
                     return result;
                 }
@@ -248,6 +263,9 @@ impl BonsaiEngine {
         if let Some(grammar) = grammar {
             sampler.constrain(grammar);
         }
+        if let Some(top) = params.logprobs {
+            sampler.report_logprobs(top);
+        }
         let mut generation = ActiveGeneration {
             id,
             prompt: prompt.to_vec(),
@@ -264,6 +282,7 @@ impl BonsaiEngine {
             suffixes: self.suffix_store.session(&[], self.ngram.min_match),
             lookup_policy: LookupPolicy::new(self.ngram.max_drafts),
             pending: VecDeque::new(),
+            logprobs: Vec::new(),
             cache_source: PromptCacheSource::None,
             prompt_snapshot: None,
             persisted_reusable_boundary: false,
@@ -304,6 +323,7 @@ impl BonsaiEngine {
         self.model.set_cancel(generation.cancel.clone());
         self.model
             .set_device_greedy(generation.sampler.selects_argmax());
+        self.model.set_logprobs(generation.sampler.logprobs());
         let id = generation.id;
         let chunks = &mut generation.prefill_chunks;
         let mut report = |report: PrefillProgress| {
@@ -352,12 +372,13 @@ impl BonsaiEngine {
     }
 
     /// Emit every pending sample, stopping the generation at EOS, at its token
-    /// limit, or when `emit` refuses a piece. Leaves `seed` set when another
-    /// round is due.
+    /// limit, or when `emit` refuses a piece. Each piece goes with the
+    /// log-probabilities of the tokens that produced it, when the request
+    /// asked for them. Leaves `seed` set when another round is due.
     pub(super) fn drain_generation(
         tokenizer: &BonsaiTokenizer,
         generation: &mut ActiveGeneration,
-        emit: &mut dyn FnMut(&str) -> bool,
+        emit: &mut dyn FnMut(&str, Vec<TokenLogprob>) -> bool,
     ) -> crate::Result<()> {
         generation.seed = None;
         if let Some(failure) = generation.sampler.grammar_failure() {
@@ -367,6 +388,8 @@ impl BonsaiEngine {
             )));
         }
         while let Some(sample) = generation.pending.pop_front() {
+            // Samples and records pair one to one, in selection order.
+            let logprob = generation.sampler.take_logprob();
             let stats = &mut generation.stats;
             stats.sampled_tokens += 1;
             stats
@@ -380,8 +403,15 @@ impl BonsaiEngine {
             generation.token_ids.push(sample.token_id);
             generation.suffixes.append(sample.token_id);
             generation.sampler.observe(&[sample.token_id]);
+            if let Some(mut logprob) = logprob {
+                logprob.bytes = tokenizer.token_bytes(logprob.token);
+                for top in &mut logprob.top {
+                    top.bytes = tokenizer.token_bytes(top.token);
+                }
+                generation.logprobs.push(logprob);
+            }
             if let Some(piece) = tokenizer.stream_step(&mut generation.decoder, sample.token_id)?
-                && !emit(&piece)
+                && !emit(&piece, std::mem::take(&mut generation.logprobs))
             {
                 generation.stop_reason = StopReason::Stopped;
                 generation.stats.sampled_tokens += generation.pending.len();
@@ -419,6 +449,7 @@ impl BonsaiEngine {
         self.model.set_cancel(generation.cancel.clone());
         self.model
             .set_device_greedy(generation.sampler.selects_argmax());
+        self.model.set_logprobs(generation.sampler.logprobs());
         let head = self.model.speculation().is_some() && generation.lag.usable();
         if head && !generation.lag.is_empty() {
             self.model.catch_up_head(&mut generation.lag)?;

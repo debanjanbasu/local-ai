@@ -14,6 +14,7 @@ use crate::GenerateParams;
 use crate::bonsai_model::CancelToken;
 use crate::judgment::{Decision, JudgmentHead, PreparedDecision};
 use crate::runtime::PrefillProgress;
+use crate::sampler::TokenLogprob;
 use crate::structured::Grammar;
 use crate::tools::ToolSet;
 
@@ -114,12 +115,12 @@ impl Delivery {
         ControlFlow::Continue(())
     }
 
-    pub(super) fn emit(&mut self, piece: &str) -> bool {
+    pub(super) fn emit(&mut self, piece: &str, logprobs: Vec<TokenLogprob>) -> bool {
         let mut splitter = std::mem::replace(
             &mut self.splitter,
             EventSplitter::new(false, None, Vec::new()),
         );
-        let flow = splitter.emit(piece, &mut |event| self.push(event));
+        let flow = splitter.emit(piece, logprobs, &mut |event| self.push(event));
         self.splitter = splitter;
         flow.is_continue()
     }
@@ -246,11 +247,11 @@ impl Worker {
                 // `step` calls one of the two at a time, never both at once.
                 let running = std::cell::RefCell::new(&mut self.running);
                 let finished = self.engine.inner.step(
-                    &mut |id, piece| {
+                    &mut |id, piece, logprobs| {
                         running
                             .borrow_mut()
                             .get_mut(&id)
-                            .is_some_and(|delivery| delivery.emit(piece))
+                            .is_some_and(|delivery| delivery.emit(piece, logprobs))
                     },
                     &mut |id, progress| {
                         if let Some(delivery) = running.borrow().get(&id) {

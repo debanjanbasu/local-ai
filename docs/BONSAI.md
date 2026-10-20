@@ -343,6 +343,28 @@ Responses has no `stop`; the engine supports it for any request, so accepting
 `stop` there as a vendor extension would be a few lines of parsing, but it is
 not offered.
 
+Both APIs report token log-probabilities in OpenAI's shape (`token`,
+`logprob`, `bytes`, `top_logprobs`), for harnesses that verify or route on
+confidence. Chat takes `logprobs: true` with `top_logprobs` (0 to 20; it
+needs `logprobs`) and reports `choices[].logprobs.content`, and on each
+streamed content chunk the tokens behind it. Responses takes `include:
+["message.output_text.logprobs"]` with `top_logprobs` (0 to 20; a
+`top_logprobs` above 0 alone also asks) and reports `output_text.logprobs`
+and each `response.output_text.delta`'s tokens. The probabilities are the
+model's raw distribution, its logits before temperature, penalties,
+`top_k`/`top_p`/`min_p` and any response-format or tool grammar mask (vLLM's
+`raw_logprobs`), so they compare across sampling settings, and the token
+sampling chose need not be the most likely one. Only answer tokens are
+reported: reasoning, `</think>`, tool-call markup and arguments, the
+whitespace the answer drops around them and text from a stop sequence on
+are not. Speculation never shows: every token is reported from the target
+model's own row that selected it (plain decode, MTP or lookup verification,
+batched decode), never from a draft. A fused Metal kernel computes each such
+row's log-sum-exp and best logits in the block's own command buffer, only
+for requests that ask; see [Performance](#log-probabilities) for its cost.
+A Response finished after a server restart (from its journal) reports empty
+`logprobs`.
+
 `verbosity` (Chat) and `text.verbosity` (Responses) accept `low`, `medium`
 (the default) and `high`. The model has no verbosity control of its own, so
 `low` and `high` add a short instruction at the end of the system turn, after
@@ -2823,6 +2845,22 @@ decode 18.84 to 21.64 tok/s and speculative decode (`--mtp-depth 3`) 23.58 to
 cost: RMSNorm with rotation 3.4%, QKV/gate concatenation 4.0%, BF16 folding
 2.3%, SwiGLU 1.3%, convolution 0.8%. The BF16 load change alone took plain
 decode from 19.23 to 20.39 tok/s.
+
+### Log-probabilities
+
+A request that does not ask for log-probabilities encodes no extra kernel
+and copies no row, so Codex, Oh My Pi and opencode, which never ask, see no
+change. Two interleaved rounds of the server built without and with
+log-probabilities support (default speculation and sampling, 256-token
+answers, seed 11, `reasoning_effort: "none"`): decode median 105.69 and
+105.85 tok/s (8 runs each, every run 105.2-106.0), cold prefill of
+about 2.3K-token prompts median 129.59 and 129.58 tok/s (6 runs each,
+129.5-129.7), with byte-identical answers. Asking costs one two-pass
+reduction over the 248,320 logits of each selecting row: the same build
+decoded at 105.60 tok/s median with `top_logprobs: 0` and 105.51 with 20
+(−0.2% and −0.3%, within run-to-run spread), again with the same answer.
+Against an f64 reference the kernel's log-sum-exp is within 1e-5 relative
+and its top 20 are bit-exact, ties going to the lower id like argmax.
 
 ## Tried and rejected
 

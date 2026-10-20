@@ -3,7 +3,7 @@
 use local_metal::batch::CommandBatch;
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::MetalContext;
-use local_metal::sampling::{GpuTopK, MAX_TOP_K, TopKCandidate};
+use local_metal::sampling::{GpuTopK, LogprobRows, MAX_TOP_K, MAX_TOP_LOGPROBS, TopKCandidate};
 use local_metal::shaders::ShaderLibrary;
 
 /// `None` when this machine exposes no Metal device, so GPU tests skip
@@ -126,5 +126,58 @@ fn rejects_invalid_bounds_before_dispatch() {
         assert!(topk.encode(&mut batch, &short, 0, vocab, k).is_err());
         assert_eq!(batch.dispatch_count(), 0);
         batch.commit_and_wait().expect("wait");
+    }
+}
+
+/// Log-sum-exp in f64, independent of the kernel's grouping and order.
+fn reference_lse(values: &[f32]) -> f64 {
+    let top = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+    top + values
+        .iter()
+        .map(|&value| (f64::from(value) - top).exp())
+        .sum::<f64>()
+        .ln()
+}
+
+#[test]
+fn logprob_rows_match_a_float64_reference() {
+    let Some(context) = gpu_or_skip() else { return };
+    let shaders = ShaderLibrary::new(context.device()).expect("shaders");
+    for vocab in [17, 4_097, 248_320] {
+        let rows = 3;
+        let workspace = LogprobRows::new(&context, &shaders, vocab, 4).expect("workspace");
+        // Row 0: spread values, row 1: many exact ties (lowest id must win),
+        // row 2: one dominant logit whose probability is nearly 1.
+        let mut input = Vec::with_capacity(rows * vocab);
+        input.extend(values(vocab).iter().map(|value| value / 16.0));
+        input.extend((0..vocab).map(|i| (i % 7) as f32 - 30.0));
+        input.extend((0..vocab).map(|i| {
+            if i == vocab / 2 {
+                40.0
+            } else {
+                -(i as f32 % 13.0)
+            }
+        }));
+        let logits = MetalBuffer::from_slice(context.device(), &input).expect("logits");
+        for k in [0, 1, MAX_TOP_LOGPROBS] {
+            let mut batch = CommandBatch::new(&context).expect("batch");
+            workspace
+                .encode(&mut batch, &logits, rows, k)
+                .expect("encode");
+            batch.commit_and_wait().expect("wait");
+            for row in 0..rows {
+                let values = &input[row * vocab..(row + 1) * vocab];
+                let expected = reference_lse(values);
+                let actual = f64::from(workspace.log_sum_exp(row));
+                assert!(
+                    (actual - expected).abs() <= 1e-5 * expected.abs().max(1.0),
+                    "vocab {vocab} row {row}: lse {actual} vs {expected}"
+                );
+                assert_exact(
+                    workspace.top(row, k.min(vocab)),
+                    &reference(values, k.min(vocab)),
+                );
+            }
+        }
     }
 }

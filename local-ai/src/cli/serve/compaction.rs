@@ -59,6 +59,7 @@ async fn generate(engine: &EngineHandle, request: ChatRequest) -> crate::Result<
             | Event::ToolCallDelta(_)
             | Event::ToolCall(_)
             | Event::ToolOutput(_)
+            | Event::Logprobs(_)
             | Event::TokenIds(_) => {}
         }
     }
@@ -90,6 +91,7 @@ fn blocking_generate(engine: EngineHandle, meter: Meter) -> Generate {
                 | Event::ToolCallDelta(_)
                 | Event::ToolCall(_)
                 | Event::ToolOutput(_)
+                | Event::Logprobs(_)
                 | Event::TokenIds(_) => {}
             }
         }

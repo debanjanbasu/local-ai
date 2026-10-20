@@ -27,6 +27,7 @@ use super::{
     draft_depth,
 };
 use crate::bonsai_native::{HeadDraft, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState};
+use crate::sampler::TokenLogprob;
 use crate::structured::Grammar;
 
 mod policy;
@@ -193,7 +194,7 @@ impl BonsaiEngine {
     /// chunk boundary.
     pub fn step(
         &mut self,
-        emit: &mut dyn FnMut(u64, &str) -> bool,
+        emit: &mut dyn FnMut(u64, &str, Vec<TokenLogprob>) -> bool,
         progress: &mut dyn FnMut(u64, PrefillProgress),
     ) -> Vec<Finished> {
         let mut finished = Vec::new();
@@ -242,7 +243,7 @@ impl BonsaiEngine {
                 let drained = Self::drain_generation(
                     &self.tokenizer,
                     &mut self.active[index],
-                    &mut |piece| emit(id, piece),
+                    &mut |piece, logprobs| emit(id, piece, logprobs),
                 );
                 if let Err(error) = drained {
                     let generation = self.active.remove(index);
@@ -312,7 +313,7 @@ impl BonsaiEngine {
         for generation in &mut self.active {
             generation.mark_cancelled();
         }
-        self.step(&mut |_, _| false, &mut |_, _| {})
+        self.step(&mut |_, _, _| false, &mut |_, _| {})
     }
 
     fn step_alone(&mut self) -> crate::Result<()> {
@@ -446,6 +447,13 @@ impl BonsaiEngine {
             }
         }
         self.model.set_device_greedy(greedy);
+        // The most alternatives any participant reports; each takes its own.
+        self.model.set_logprobs(
+            participants
+                .iter()
+                .filter_map(|&index| self.active[index].sampler.logprobs())
+                .max(),
+        );
         let resident = self.resident;
         let mut rows = Vec::with_capacity(participants.len());
         let mut samplers = Vec::with_capacity(participants.len());

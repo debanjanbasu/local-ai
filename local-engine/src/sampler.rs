@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
+
 use llguidance::toktrie::SimpleVob;
 use local_metal::batch::CommandBatch;
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::MetalContext;
-use local_metal::sampling::GpuTopK;
+use local_metal::sampling::{GpuTopK, TopKCandidate};
 
 use crate::structured::Grammar;
 
@@ -24,6 +26,40 @@ pub struct SamplingResult {
     pub is_eos: bool,
 }
 
+/// One generated token's log-probability under the target model's raw
+/// distribution: its logits before temperature, penalties, top-k, top-p,
+/// min-p and any response-format mask (vLLM's `raw_logprobs`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprob {
+    pub token: u32,
+    /// Natural log of the token's probability.
+    pub logprob: f32,
+    /// The token's bytes, which need not be whole UTF-8 characters.
+    pub bytes: Vec<u8>,
+    /// The most likely tokens at this position, most likely first: as many
+    /// as the request's `top_logprobs` asked for.
+    pub top: Vec<TopLogprob>,
+}
+
+/// One of a position's most likely tokens (see [`TokenLogprob::top`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopLogprob {
+    pub token: u32,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+}
+
+/// A request's log-probability reporting.
+#[derive(Clone)]
+struct Logprobs {
+    /// Alternatives reported per token.
+    top: usize,
+    /// One record per target selection not yet taken, in selection order.
+    records: VecDeque<TokenLogprob>,
+    /// The raw logit row, kept while host selection overwrites the buffer.
+    raw: Vec<f32>,
+}
+
 #[derive(Clone)]
 pub struct Sampler {
     params: SamplingParams,
@@ -34,6 +70,9 @@ pub struct Sampler {
     /// The request's response format, when it has one. Only target
     /// selections consult it; [`Self::greedy_draft`] drops it.
     grammar: Option<Box<Grammar>>,
+    /// Set when the request asked for log-probabilities. Only target
+    /// selections record them; [`Self::greedy_draft`] drops it.
+    logprobs: Option<Box<Logprobs>>,
 }
 
 impl Sampler {
@@ -46,7 +85,30 @@ impl Sampler {
             observed: vec![false; vocab_size],
             candidates: Vec::with_capacity(vocab_size),
             grammar: None,
+            logprobs: None,
         }
+    }
+
+    /// Record the raw log-probability of every later target selection, with
+    /// its `top` most likely alternatives.
+    pub(crate) fn report_logprobs(&mut self, top: usize) {
+        self.logprobs = Some(Box::new(Logprobs {
+            top,
+            records: VecDeque::new(),
+            raw: Vec::new(),
+        }));
+    }
+
+    /// The alternatives each record reports, when the request asked for
+    /// log-probabilities.
+    #[must_use]
+    pub fn logprobs(&self) -> Option<usize> {
+        self.logprobs.as_ref().map(|logprobs| logprobs.top)
+    }
+
+    /// The record of the oldest target selection not yet taken.
+    pub(crate) fn take_logprob(&mut self) -> Option<TokenLogprob> {
+        self.logprobs.as_mut()?.records.pop_front()
     }
 
     /// Constrain every later selection to `grammar` (see [`crate::structured`]).
@@ -107,7 +169,114 @@ impl Sampler {
             candidates: self.candidates.clone(),
             rng: self.rng.clone(),
             grammar: None,
+            logprobs: None,
         }
+    }
+
+    /// The target selection from the logit row at `byte_offset` of `buffer`:
+    /// `argmax`, the row's argmax a block selected on the device, when the
+    /// selection is the plain argmax, else [`Self::sample_buffer`].
+    ///
+    /// When the request asked for log-probabilities, also records the row's
+    /// raw distribution: from `distribution` (its log-sum-exp and best logits,
+    /// at least [`Self::logprobs`] of them) when the GPU computed it, else on
+    /// the host. The row is read before selection overwrites it.
+    pub fn select_row(
+        &mut self,
+        buffer: &mut MetalBuffer,
+        byte_offset: usize,
+        context: &MetalContext,
+        topk: &GpuTopK,
+        argmax: Option<u32>,
+        distribution: Option<(f32, &[TopKCandidate])>,
+    ) -> crate::Result<SamplingResult> {
+        let Some(mut logprobs) = self.logprobs.take() else {
+            return self.select_plain(buffer, byte_offset, context, topk, argmax);
+        };
+        let result = self.select_recorded(
+            &mut logprobs,
+            buffer,
+            byte_offset,
+            context,
+            topk,
+            argmax,
+            distribution,
+        );
+        self.logprobs = Some(logprobs);
+        result
+    }
+
+    fn select_plain(
+        &mut self,
+        buffer: &mut MetalBuffer,
+        byte_offset: usize,
+        context: &MetalContext,
+        topk: &GpuTopK,
+        argmax: Option<u32>,
+    ) -> crate::Result<SamplingResult> {
+        match argmax {
+            Some(token_id) if self.selects_argmax() => Ok(self.greedy_result(token_id)),
+            _ => self.sample_buffer(buffer, byte_offset, context, topk),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_recorded(
+        &mut self,
+        logprobs: &mut Logprobs,
+        buffer: &mut MetalBuffer,
+        byte_offset: usize,
+        context: &MetalContext,
+        topk: &GpuTopK,
+        argmax: Option<u32>,
+        distribution: Option<(f32, &[TopKCandidate])>,
+    ) -> crate::Result<SamplingResult> {
+        let start = byte_offset / size_of::<f32>();
+        let Some(row) = buffer
+            .as_slice::<f32>()
+            .get(start..start + self.observed.len())
+        else {
+            return Err(crate::Error::Sampling(
+                "logit row offset exceeds the buffer".into(),
+            ));
+        };
+        // Device argmax leaves the row untouched; host selection does not.
+        let untouched = argmax.is_some() && self.selects_argmax();
+        if !untouched {
+            logprobs.raw.clear();
+            logprobs.raw.extend_from_slice(row);
+        }
+        let (log_sum_exp, top) = match distribution {
+            Some((log_sum_exp, top)) if top.len() >= logprobs.top => (
+                log_sum_exp,
+                top[..logprobs.top]
+                    .iter()
+                    .map(|candidate| (candidate.token_id, candidate.logit))
+                    .collect(),
+            ),
+            _ => raw_distribution(if untouched { row } else { &logprobs.raw }, logprobs.top),
+        };
+        let result = self.select_plain(buffer, byte_offset, context, topk, argmax)?;
+        let token = result.token_id as usize;
+        let logit = if untouched {
+            buffer.as_slice::<f32>()[start + token]
+        } else {
+            logprobs.raw[token]
+        };
+        logprobs.records.push_back(TokenLogprob {
+            token: result.token_id,
+            logprob: logit - log_sum_exp,
+            bytes: Vec::new(),
+            top: top
+                .into_iter()
+                .map(|(token, logit)| TopLogprob {
+                    token,
+                    logprob: logit - log_sum_exp,
+                    bytes: Vec::new(),
+                })
+                .collect(),
+        });
+        Ok(result)
     }
 
     /// Select on the GPU, but keep penalty arithmetic, filtering and RNG on the CPU.
@@ -495,6 +664,31 @@ fn forbid(mask: &SimpleVob, logits: &mut [f32]) {
             *logit = f32::NEG_INFINITY;
         }
     }
+}
+
+/// The log-sum-exp of `row` and its `k` best logits, best first with ties to
+/// the lower id: what the GPU's log-probability kernels compute.
+pub fn raw_distribution(row: &[f32], k: usize) -> (f32, Vec<(u32, f32)>) {
+    let top_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum = row
+        .iter()
+        .map(|&logit| f64::from(logit - top_logit).exp())
+        .sum::<f64>();
+    let log_sum_exp = top_logit + sum.ln() as f32;
+    let order = |a: &u32, b: &u32| {
+        row[*b as usize]
+            .total_cmp(&row[*a as usize])
+            .then_with(|| a.cmp(b))
+    };
+    let mut ids = (0..row.len() as u32).collect::<Vec<_>>();
+    let k = k.min(ids.len());
+    if k < ids.len() {
+        ids.select_nth_unstable_by(k, order);
+        ids.truncate(k);
+    }
+    ids.sort_unstable_by(order);
+    let top = ids.into_iter().map(|id| (id, row[id as usize])).collect();
+    (log_sum_exp, top)
 }
 
 fn argmax(values: &[f32]) -> u32 {

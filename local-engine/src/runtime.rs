@@ -47,7 +47,14 @@ pub struct GenerateParams {
     pub repetition_penalty: f32,
     pub max_tokens: usize,
     pub seed: u64,
+    /// Report each emitted token's raw log-probability with this many most
+    /// likely alternatives (at most [`MAX_TOP_LOGPROBS`]); `None` reports none.
+    pub logprobs: Option<usize>,
 }
+
+/// Most alternatives [`GenerateParams::logprobs`] may ask for, as `OpenAI`'s
+/// `top_logprobs` allows.
+pub const MAX_TOP_LOGPROBS: usize = local_metal::sampling::MAX_TOP_LOGPROBS;
 
 impl Default for GenerateParams {
     fn default() -> Self {
@@ -60,6 +67,7 @@ impl Default for GenerateParams {
             repetition_penalty: 1.0,
             max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             seed: 0x5eed_5eed_cafe_f00d,
+            logprobs: None,
         }
     }
 }
@@ -140,6 +148,11 @@ pub(crate) fn validate_generation_params(params: &GenerateParams) -> crate::Resu
             "presence penalty must be finite".into(),
         ));
     }
+    if params.logprobs.is_some_and(|top| top > MAX_TOP_LOGPROBS) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "top log-probabilities must be at most {MAX_TOP_LOGPROBS}"
+        )));
+    }
     Ok(())
 }
 
@@ -174,6 +187,10 @@ mod tests {
             },
             GenerateParams {
                 presence_penalty: f32::INFINITY,
+                ..defaults.clone()
+            },
+            GenerateParams {
+                logprobs: Some(MAX_TOP_LOGPROBS + 1),
                 ..defaults
             },
         ];

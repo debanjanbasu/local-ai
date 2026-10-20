@@ -251,3 +251,77 @@ fn empty_draft_uses_exactly_one_target_row_and_sampling_errors_propagate() {
         .is_err()
     );
 }
+
+/// Recording log-probabilities selects exactly the tokens selection without
+/// them does, and records the raw row's distribution, not the penalized,
+/// tempered or truncated one the sampler drew from, whether the GPU or the
+/// host computed it.
+#[test]
+fn recorded_logprobs_are_raw_and_leave_selection_unchanged() {
+    let Some(context) = gpu_or_skip() else {
+        return;
+    };
+    let shaders = ShaderLibrary::new(context.device()).expect("shaders");
+    let topk = GpuTopK::new(&context, &shaders, 4_099).expect("top-k");
+    let rows = local_metal::sampling::LogprobRows::new(&context, &shaders, 4_099, 1).expect("rows");
+    let vocab = 4_099;
+    for (temperature, gpu_distribution) in [(0.8, false), (0.8, true), (0.0, true)] {
+        let config = SamplingParams {
+            temperature,
+            ..params()
+        };
+        let mut plain = Sampler::new(vocab, config.clone());
+        let mut recorded = Sampler::new(vocab, config);
+        recorded.report_logprobs(3);
+        for step in 0..8 {
+            let history = [1, 1, (step * 19) as u32];
+            plain.observe(&history);
+            recorded.observe(&history);
+            let original = (0..vocab)
+                .map(|i| ((i * 173 + step * 13) % 719) as f32 / 113.0 - 3.0)
+                .collect::<Vec<_>>();
+            let mut a = MetalBuffer::from_slice(context.device(), &original).expect("logits");
+            let mut b = MetalBuffer::from_slice(context.device(), &original).expect("logits");
+            let mut batch = CommandBatch::new(&context).expect("batch");
+            rows.encode(&mut batch, &b, 1, 3).expect("encode");
+            batch.commit_and_wait().expect("wait");
+            let distribution = gpu_distribution.then(|| (rows.log_sum_exp(0), rows.top(0, 3)));
+            let expected = plain
+                .select_row(&mut a, 0, &context, &topk, None, None)
+                .expect("plain");
+            let actual = recorded
+                .select_row(&mut b, 0, &context, &topk, None, distribution)
+                .expect("recorded");
+            assert_eq!(actual, expected, "temperature={temperature} step={step}");
+            assert_eq!(plain.take_logprob(), None);
+            let record = recorded.take_logprob().expect("record");
+            assert_eq!(recorded.take_logprob(), None);
+            // Independent f64 reference over the untouched logits.
+            let top = f64::from(original.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+            let lse = top
+                + original
+                    .iter()
+                    .map(|&x| (f64::from(x) - top).exp())
+                    .sum::<f64>()
+                    .ln();
+            let logprob = |id: u32| f64::from(original[id as usize]) - lse;
+            assert_eq!(record.token, actual.token_id);
+            assert!((f64::from(record.logprob) - logprob(record.token)).abs() < 1e-5);
+            let mut best = (0..vocab as u32).collect::<Vec<_>>();
+            best.sort_by(|&x, &y| {
+                original[y as usize]
+                    .total_cmp(&original[x as usize])
+                    .then(x.cmp(&y))
+            });
+            assert_eq!(
+                record.top.iter().map(|t| t.token).collect::<Vec<_>>(),
+                best[..3]
+            );
+            for alternative in &record.top {
+                assert!((f64::from(alternative.logprob) - logprob(alternative.token)).abs() < 1e-5);
+            }
+            plain.observe(&[expected.token_id]);
+            recorded.observe(&[actual.token_id]);
+        }
+    }
+}

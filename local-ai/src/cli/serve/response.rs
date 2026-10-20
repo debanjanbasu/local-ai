@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use local_engine::bonsai_native::MAX_BATCH_SEQUENCES;
 use local_engine::resources::SERVE_QUEUE;
-use local_engine::{Stats, ToolCall};
+use local_engine::{Stats, TokenLogprob, ToolCall};
 
 use super::AppState;
 
@@ -303,6 +303,8 @@ pub(super) enum Protocol {
     Chat {
         /// `stream_options.include_usage`: a final chunk with `usage`.
         include_usage: bool,
+        /// `logprobs`: the choice reports its content tokens' log-probabilities.
+        logprobs: bool,
     },
     /// `POST /v1/responses`.
     Responses(Arc<super::responses::Echo>),
@@ -346,6 +348,21 @@ pub(super) fn usage_json(stats: &Stats) -> Value {
 /// than the model's exact spelling, which is the same document.
 pub(super) fn chat_tool_call(index: usize, call: &ToolCall) -> Value {
     json!({"index":index,"id":call.id,"type":"function","function":{"name":call.name,"arguments":arguments_text(call)}})
+}
+
+/// One generated token's log-probability in the `OpenAI` wire shape, which
+/// Chat (`logprobs.content`) and Responses (`output_text.logprobs`) share.
+/// `token` is the token's bytes as text, lossily for a split character;
+/// `bytes` is exact.
+pub(super) fn logprob_json(token: &TokenLogprob) -> Value {
+    let entry = |bytes: &[u8], logprob: f32| json!({"token":String::from_utf8_lossy(bytes),"logprob":logprob,"bytes":bytes});
+    let mut value = entry(&token.bytes, token.logprob);
+    value["top_logprobs"] = token
+        .top
+        .iter()
+        .map(|top| entry(&top.bytes, top.logprob))
+        .collect();
+    value
 }
 
 pub(super) fn arguments_text(call: &ToolCall) -> String {
