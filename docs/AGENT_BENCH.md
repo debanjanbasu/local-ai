@@ -18,12 +18,12 @@ server.
 npm install --prefix .amp/in/codex @openai/codex@0.163.0
 
 # baseline (about 25 minutes at effort none)
-lockf /tmp/local-ai-gpu.lock python3 tools/agent_bench.py \
+lockf -k /tmp/local-ai-gpu.lock python3 tools/agent_bench.py \
     --codex-bin "$PWD/.amp/in/codex/node_modules/.bin/codex" \
     --label baseline-b09e22f --out "$PWD/.amp/in/artifacts/agent-bench/baseline"
 
 # candidate: the same command with another server binary and label
-lockf /tmp/local-ai-gpu.lock python3 tools/agent_bench.py \
+lockf -k /tmp/local-ai-gpu.lock python3 tools/agent_bench.py \
     --codex-bin "$PWD/.amp/in/codex/node_modules/.bin/codex" \
     --server-bin /path/to/candidate/target/release/local-ai \
     --label candidate-xyz --out "$PWD/.amp/in/artifacts/agent-bench/candidate"
