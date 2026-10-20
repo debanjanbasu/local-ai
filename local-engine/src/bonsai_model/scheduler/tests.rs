@@ -210,7 +210,7 @@ fn cancelling_one_sequence_leaves_the_batch_exact() {
 
 /// A prompt of several hundred tokens: many prefill chunks.
 fn long_prompt(engine: &BonsaiEngine) -> Vec<u32> {
-    let items = (0..60)
+    let items = (0..130)
         .map(|index| format!("Entry {index}: the {index}th lighthouse keeper logged calm seas."))
         .collect::<Vec<_>>()
         .join("\n");
