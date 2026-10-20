@@ -19,9 +19,12 @@ run through the real client CLI behind the recording proxy of
 - wall-clock seconds of the client run, and per turn the time to first token
   (TTFT), prompt and cached tokens, output tokens and request duration.
 
-Determinism: task files and prompts are fixed; repositories live at fixed
-paths (`--work`, default /tmp/local-ai-agent-bench) so prompts that quote the
-working directory are identical between runs; the proxy pins `seed` on every
+Determinism: task files and prompts are fixed; each client works in one
+fixed repository path, HOME and TMPDIR (under `--work`, default
+/tmp/local-ai-agent-bench), wiped between tasks, so the system prompts that
+quote them are identical between tasks and runs (a client's first task
+prefills cold, the rest reuse the shared prefix, so compare full runs or the
+same `--tasks` subset); the proxy pins `seed` on every
 generation request (`--seeds`); the server runs with a fresh `HOME` per run,
 so its disk prompt cache, response store and reasoning key start empty; and
 opencode gets `--title`, so no title request runs beside its turns. Tasks run
@@ -877,7 +880,11 @@ def client_command(ctx: cc.Context, client: str, task: Task, repo: Path, base: P
 def run_one(ctx: cc.Context, out: Path, task: Task, client_name: str, effort: str, seed: int | None) -> dict:
     client, variant = CLIENTS[client_name]
     name = f"{client_name}-{task.name}"
-    repo, base, env = cc.prepare_client(ctx, client, name, effort, variant=variant)
+    # One fixed repository, HOME and TMPDIR per client, wiped and rebuilt for
+    # every task: the client's system prompt (which quotes them) is then the
+    # same for every task, as for a user who works in one project, so only a
+    # client's first task prefills it cold.
+    repo, base, env = cc.prepare_client(ctx, client, client_name, effort, variant=variant)
     cc.write_files(repo, task.files)
     cc.git_init(repo)
     ctx.recorder.inject = {"seed": seed} if seed is not None else {}
