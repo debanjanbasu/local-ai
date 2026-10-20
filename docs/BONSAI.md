@@ -1523,7 +1523,13 @@ the folded pass:
 prompt cache) and streams greedy Chat Completions with reasoning off. A gap
 is the wait between two engine steps that streamed a request text (chunks
 within 5 ms of each other count once). M4 Pro, shared with other work, one
-run each; `b09e22f` against this branch:
+run each between 11:00 and 12:20 AEDT on 2026-10-20, `b09e22f` against this
+branch. The shared GPU lock was then taken with plain `lockf`, which deletes
+its file on exit, so another thread's GPU job may have overlapped these runs:
+treat every timing in this section as provisional until it is rerun under
+`lockf -k` (a first run of the base build at 09:50, before the lock problem,
+measured 34.0, 48.9, 59.7 and 72.0 tok/s aggregate decode and the same mixed
+results within 2%).
 
 | Streams, 300-token answers | Aggregate tok/s | Per stream | TTFT p50 | Gap p50 / p99 |
 | ---: | ---: | ---: | ---: | ---: |
@@ -1571,6 +1577,20 @@ longest stall beside three streams 0.38 s against 0.33 s, the prompt's TTFT
 unchanged at 70.2 s); the different pass shapes moved one of those three
 streams' 512 greedy tokens to another continuation at a near-tie after 185
 chunks.
+
+Open items on this branch (`opt-parallel-sched`): rerun the tables above
+under `lockf -k` (`tools/serve_concurrency.py`, default phases plus
+`--phases shared --streams 2,4`, base `b09e22f` and the branch head
+back to back); run `tools/client_compat.py --scenarios
+codex-fanout,opencode-fanout` to see whether Codex 0.163 (the
+`multi_agent_v1` tools, up to six sub-agents, spawned one call at a time but
+running concurrently) and opencode 1.19 (several `task` calls in one turn run
+concurrently, no cap) fan out against this server, with peak concurrent
+requests and the prefix the sub-agents share; and measure a lone decoding
+stream beside a long prefill with a decode-only round between its prompt
+chunks (modelled: that stream 5.3 to about 9 tok/s, the prompt 90 to about
+86 tok/s), the one case where chunked prefill sits well below what time
+slicing would give both.
 
 #### Speculation in a batch
 
@@ -2001,14 +2021,20 @@ be asked in order, so any matching GPU checkpoint won over a longer disk
 snapshot. In a compacted 64K Codex-style session (one `xhigh` run) that pinned
 four turns of 19K–31K-token prompts to a 12,980-token checkpoint while disk
 held their predecessors' 16K–25K snapshots, and steps grew from 30 s to
-179 s. The GPU tier had stopped keeping new checkpoints: every turn after
+179 s. By a trace of the eviction rule (not yet confirmed on that session),
+the GPU tier had stopped keeping new checkpoints: every turn after
 the compaction re-rendered the last answer differently from what was
 generated, so each left a divergence boundary barely extending the previous
 turn's, those boundaries filled the four slots, and each new penultimate
 checkpoint, a request tail, was the eviction victim the moment it was saved.
 The two newest GPU checkpoints (the last request's boundary or penultimate
 token, and its end) are now never the victim; eviction picks among the
-others by the disk tier's rule below.
+others by the disk tier's rule below. Both are on `opt-parallel-sched` but not yet
+checked on the GPU: `agent_turns_keep_restoring_the_previous_prompt` (seven
+turns, each extending the last by a re-rendered answer) is written to fail on
+`b09e22f` at its fourth turn and pass with the fix, the existing prompt-cache
+and scheduler tests still need a run, and the compacted 64K `xhigh` session
+needs a rerun on the compaction branch with this engine.
 
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
