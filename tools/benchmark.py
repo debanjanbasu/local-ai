@@ -687,8 +687,8 @@ def measure_prefill(
                 )
     width = max(len(name) for _, name in rows)
     lines = [
-        f"{'tokens':>7}  {'config'.ljust(width)}  {'cold tok/s':>10}  {'median':>7}  "
-        f"{'cold TTFT':>9}  {'warm reused':>11}  {'warm TTFT':>9}  {'load':>5}"
+        (f"{'tokens':>7}  {'config'.ljust(width)}  {'cold tok/s':>10}  {'median':>7}  "
+        f"{'cold TTFT':>9}  {'warm reused':>11}  {'warm TTFT':>9}  {'load':>5}")
     ]
     for (size, name), samples in rows.items():
         rates = [cold.prefill_tokens_per_second or 0.0 for cold, _ in samples]

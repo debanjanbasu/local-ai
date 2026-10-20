@@ -8,49 +8,49 @@ import mtp_code_bench as bench
 # them apart would report task success the model did not earn.
 CODE = {
     "py-merge-intervals": (
-        "def merge_intervals(intervals):\n    out = []\n"
+        ("def merge_intervals(intervals):\n    out = []\n"
         "    for s, e in sorted(intervals):\n"
         "        if out and s <= out[-1][1]:\n            out[-1][1] = max(out[-1][1], e)\n"
-        "        else:\n            out.append([s, e])\n    return out\n",
+        "        else:\n            out.append([s, e])\n    return out\n"),
         # Touching intervals stay apart.
-        "def merge_intervals(intervals):\n    out = []\n"
+        ("def merge_intervals(intervals):\n    out = []\n"
         "    for s, e in sorted(intervals):\n"
         "        if out and s < out[-1][1]:\n            out[-1][1] = max(out[-1][1], e)\n"
-        "        else:\n            out.append([s, e])\n    return out\n",
+        "        else:\n            out.append([s, e])\n    return out\n"),
     ),
     "py-fix-binary-search": (
-        "def binary_search(items, target):\n    lo, hi = 0, len(items)\n    while lo < hi:\n"
+        ("def binary_search(items, target):\n    lo, hi = 0, len(items)\n    while lo < hi:\n"
         "        mid = (lo + hi) // 2\n        if items[mid] == target:\n            return mid\n"
         "        if items[mid] < target:\n            lo = mid + 1\n        else:\n"
-        "            hi = mid\n    return -1\n",
-        "def binary_search(items, target):\n    lo, hi = 0, len(items)\n    while lo < hi:\n"
+        "            hi = mid\n    return -1\n"),
+        ("def binary_search(items, target):\n    lo, hi = 0, len(items)\n    while lo < hi:\n"
         "        mid = (lo + hi) // 2\n        if items[mid] == target:\n            return mid\n"
         "        if items[mid] < target:\n            lo = mid + 1\n        else:\n"
-        "            hi = mid - 1\n    return -1\n",
+        "            hi = mid - 1\n    return -1\n"),
     ),
     "rs-top-k-frequent": (
-        "use std::collections::HashMap;\n"
+        ("use std::collections::HashMap;\n"
         "pub fn top_k_frequent(words: &[&str], k: usize) -> Vec<String> {\n"
         "    let mut c: HashMap<&str, usize> = HashMap::new();\n"
         "    for &w in words { *c.entry(w).or_insert(0) += 1; }\n"
         "    let mut v: Vec<_> = c.into_iter().collect();\n"
         "    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));\n"
-        "    v.into_iter().take(k).map(|(w, _)| w.to_string()).collect()\n}\n",
-        "pub fn top_k_frequent(words: &[&str], k: usize) -> Vec<String> {\n"
-        "    words.iter().take(k).map(|w| w.to_string()).collect()\n}\n",
+        "    v.into_iter().take(k).map(|(w, _)| w.to_string()).collect()\n}\n"),
+        ("pub fn top_k_frequent(words: &[&str], k: usize) -> Vec<String> {\n"
+        "    words.iter().take(k).map(|w| w.to_string()).collect()\n}\n"),
     ),
     "js-parse-csv-line": (
-        "function parseCsvLine(line) {\n  const out = []; let f = ''; let q = false;\n"
+        ("function parseCsvLine(line) {\n  const out = []; let f = ''; let q = false;\n"
         "  for (let i = 0; i < line.length; i++) {\n    const c = line[i];\n"
         "    if (q) { if (c === '\"') { if (line[i + 1] === '\"') { f += '\"'; i++; } else q = false; }"
         " else f += c; }\n"
         "    else if (c === '\"') q = true; else if (c === ',') { out.push(f); f = ''; } else f += c;\n"
-        "  }\n  out.push(f); return out;\n}\nmodule.exports = { parseCsvLine };\n",
+        "  }\n  out.push(f); return out;\n}\nmodule.exports = { parseCsvLine };\n"),
         "function parseCsvLine(line) { return line.split(','); }\nmodule.exports = { parseCsvLine };\n",
     ),
     "sql-top-earner": (
-        "SELECT dept, name FROM (SELECT dept, name, ROW_NUMBER() OVER (PARTITION BY dept "
-        "ORDER BY salary DESC, name) AS r FROM employees) WHERE r = 1 ORDER BY dept;",
+        ("SELECT dept, name FROM (SELECT dept, name, ROW_NUMBER() OVER (PARTITION BY dept "
+        "ORDER BY salary DESC, name) AS r FROM employees) WHERE r = 1 ORDER BY dept;"),
         "SELECT dept, name FROM employees GROUP BY dept HAVING salary = MAX(salary) ORDER BY dept;",
     ),
 }

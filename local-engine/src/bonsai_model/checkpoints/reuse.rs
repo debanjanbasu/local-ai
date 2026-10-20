@@ -133,7 +133,11 @@ impl BonsaiEngine {
                 )
             })
             .map(|(index, snapshot)| (index, snapshot.state.position()));
-        let held = gpu.into_iter().chain(host).map(|(_, position)| position).max();
+        let held = gpu
+            .into_iter()
+            .chain(host)
+            .map(|(_, position)| position)
+            .max();
         self.await_pending_disk_write(prompt, bounds, held.unwrap_or(0));
         let disk = self
             .disk_snapshots

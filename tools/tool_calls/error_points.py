@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Turns (scenario:index among agent requests) whose response made a call the
 audit flags: unknown tool, unknown parameter, schema error, or misuse."""
-import json, sys
+import json
+import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import audit, client_compat as cc
+import audit
+
 run = Path(sys.argv[1])
 exchanges = [json.loads(l) for l in (run / "exchanges.jsonl").open()]
 points = []

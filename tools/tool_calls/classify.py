@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Tally known-bad call patterns in replay records, per point and config."""
-import json, re, sys
+import json
+import re
+import sys
 from collections import defaultdict
+
 PATTERNS = {
     "gnu_sed": re.compile(r"sed -i (?!''|\"\")['\"]"),
     "cat_A": re.compile(r"cat -A"),
@@ -12,7 +15,9 @@ DECLARED = {"exec_command", "write_stdin", "request_user_input", "bash", "edit",
 GREP = {"pattern", "path", "include"}
 for path in sys.argv[1:]:
     table = defaultdict(lambda: defaultdict(int))
-    for r in json.load(open(path)):
+    with open(path) as handle:
+        records = json.load(handle)
+    for r in records:
         cell = table[(r["point"], r["config"])]
         cell["n"] += 1
         cell["stop"] += not r["calls"]

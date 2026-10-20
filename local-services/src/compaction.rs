@@ -83,10 +83,12 @@ pub fn latest(items: &[Value]) -> Option<usize> {
     items.iter().rposition(is_compaction)
 }
 
-/// The prompt length at which a conversation is compacted when its caller
-/// names no threshold of its own (`context_management` without a
-/// `compact_threshold`). Chosen by the compaction threshold sweep in
-/// docs/BONSAI.md.
+/// The default prompt length at which a conversation is compacted.
+///
+/// It applies when the caller names no threshold of its own
+/// (`context_management` without a `compact_threshold`). Provisional: only
+/// the 32K point of the compaction threshold sweep in docs/BONSAI.md has been
+/// measured.
 pub const DEFAULT_COMPACT_THRESHOLD: usize = 32_000;
 
 /// Whether a prompt of `prompt_tokens` should be compacted before it is

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import shutil
 import signal
@@ -244,7 +245,7 @@ def summarize_mixed(n: int, out: dict) -> dict:
         # Every wait for a next step that overlaps the prefill; the stall is
         # the longest of them.
         steps = arrivals(times)
-        gaps = [b - a for a, b in zip(steps, steps[1:]) if b > arrive and a < first]
+        gaps = [b - a for a, b in itertools.pairwise(steps) if b > arrive and a < first]
         during += gaps
         if gaps:
             stalls.append(max(gaps))

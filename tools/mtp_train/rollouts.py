@@ -107,11 +107,11 @@ AGENT_ASKS = [
     "There may be an unhandled error path in `{symbol}`. Check and fix it if so.",
 ]
 SYSTEMS = [
-    "You are a coding agent working in a Git repository. Use the tools to inspect and change "
+    ("You are a coding agent working in a Git repository. Use the tools to inspect and change "
     "files; never guess file contents you have not read. Make the smallest correct change, "
-    "verify it, and then reply with a short summary.",
-    "You are an expert software engineer operating inside the user's repository through tools. "
-    "Investigate before you edit, keep changes minimal, and finish with a concise report.",
+    "verify it, and then reply with a short summary."),
+    ("You are an expert software engineer operating inside the user's repository through tools. "
+    "Investigate before you edit, keep changes minimal, and finish with a concise report."),
 ]
 
 
@@ -185,13 +185,13 @@ API_TOOLS = [
 ]
 API_REQUESTS = [
     "What's the weather going to be in Melbourne for the next three days, in Celsius?",
-    "Set up a 45 minute design review called 'Checkout redesign' next Tuesday at 2pm with "
-    "priya@example.com and tom@example.com in room Kestrel.",
-    "Email the team (dev-team@example.com) that the release is postponed to Friday because of "
-    "a failing migration, and cc ops@example.com.",
+    ("Set up a 45 minute design review called 'Checkout redesign' next Tuesday at 2pm with "
+    "priya@example.com and tom@example.com in room Kestrel."),
+    ("Email the team (dev-team@example.com) that the release is postponed to Friday because of "
+    "a failing migration, and cc ops@example.com."),
     "How many orders did we get per day last week? The table is orders(created_at, total).",
-    "Open a critical ticket: payments API returns 502 for 30% of requests since 10:05, "
-    "component payments-gateway, assign it to on-call.",
+    ("Open a critical ticket: payments API returns 502 for 30% of requests since 10:05, "
+    "component payments-gateway, assign it to on-call."),
     "Find our docs about rotating API keys for the Billing product, top 5.",
     "How much is 1,250 US dollars in Australian dollars?",
     "Remind me every Monday at 9am to review the on-call handover notes.",
@@ -201,8 +201,8 @@ API_REQUESTS = [
     "Update record CUST-88213: set status to churn-risk and owner to Maria Chen.",
     "Is it going to rain in Seattle tomorrow? Use Fahrenheit.",
     "Schedule a 30 minute 1:1 with sam@example.com tomorrow at 10:30.",
-    "Which 10 customers had the highest total spend this year? customers(id, name), "
-    "orders(customer_id, total, created_at).",
+    ("Which 10 customers had the highest total spend this year? customers(id, name), "
+    "orders(customer_id, total, created_at)."),
     "Deploy auth-service 5.0.0 to staging.",
     "Convert 99.95 euros to Japanese yen.",
     "Create a low-severity ticket for the typo on the pricing page footer, component website.",
@@ -218,8 +218,8 @@ API_REQUESTS = [
 class Overlay:
     """A repository seen read-only, with writes kept in memory."""
 
-    ALLOWED = {"ls", "cat", "head", "tail", "wc", "rg", "grep", "find", "git"}
-    GIT_ALLOWED = {"log", "status", "diff", "show", "ls-files", "grep", "blame"}
+    ALLOWED = frozenset({"ls", "cat", "head", "tail", "wc", "rg", "grep", "find", "git"})
+    GIT_ALLOWED = frozenset({"log", "status", "diff", "show", "ls-files", "grep", "blame"})
 
     def __init__(self, root):
         self.root = Path(root).resolve()
@@ -258,7 +258,7 @@ class Overlay:
     def run(self, argv):
         try:
             done = subprocess.run(argv, cwd=self.root, capture_output=True, text=True,
-                                  timeout=20)
+                                  timeout=20, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             return f"Error: {error}"
         out = (done.stdout + done.stderr)[:6000]
@@ -508,7 +508,7 @@ def main():
             job = futures[future]
             try:
                 record = future.result()
-            except Exception as error:  # one failed job must not lose the others
+            except Exception as error:  # noqa: BLE001 -- one failed job must not lose the others
                 print(f"{job['id']}: {error}", flush=True)
                 continue
             with lock, open(out, "a") as handle:

@@ -839,8 +839,8 @@ def compaction_report(out: Path) -> str:
               "| Compaction s, median | Final prompt | Recall | Lookup | Fix | All (95% CI) | Reads per question "
               "| Question compactions | Question wall s, median | Total wall s | Prefilled per read, median (stale) "
               "| Total wall s without stale reuse |"),
-             "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: "
-             "| ---: | ---: |"]
+             ("| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: "
+             "| ---: | ---: |")]
     groups: dict[tuple, list] = {}
     for row in rows:
         groups.setdefault((row["size"], row["threshold"], row["effort"]), []).append(row)

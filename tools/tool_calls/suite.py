@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
-import client_compat as cc  # noqa: E402
+import client_compat as cc
 
 TASKS: dict[str, dict] = {
     "fix": {"files": cc.BUG_FILES, "prompt": cc.BUG_PROMPT},
