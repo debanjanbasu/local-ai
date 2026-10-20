@@ -3426,6 +3426,87 @@ Evidence: `.scratch/artifacts/client-compat/request-surface` and
 scenarios again, all passing, after rebasing onto video input); live `stop`, `verbosity` and unknown-member probes
 in `.scratch/artifacts/request-surface/live.json`.
 
+#### Tool-call reliability (2026-10-20, branch `opt-tool-calls`, base `b09e22f`)
+
+Work in progress; tooling and raw data are in `tools/tool_calls/` (scratch
+scripts, kept so the work can resume: `suite.py` runs real Codex 0.163.0 and
+opencode 1.19.3 Chat/Responses sessions through `client_compat`'s proxy,
+`audit.py` classifies every call, `replay.py` resends recorded requests under
+several seeds and sampling settings, `classify.py`/`error_points.py` tally
+known-bad calls; `data/` holds the second baseline's exchanges and the replay
+results). The agent benchmark (`opt-agent-bench`, `tools/agent_bench.py`)
+supersedes `suite.py` for whole-session A/B runs once it lands.
+
+Method: four small tasks (fix a bug, rename across files, change a config
+value, implement from a docstring) × Codex, opencode Chat, opencode
+Responses, at reasoning effort `none`; then *decision-point replays*: a
+recorded request resent with seeds 0–5 (or 0–7) per setting, so a failure
+seen once in a session becomes a rate. Seeds pair the settings (common random
+numbers). These are correctness counts, not timings; some replays may have
+overlapped another GPU job (the shared lock was unreliable before about
+12:30), which cannot change sampled outputs.
+
+What the requests are: Codex sends `tool_choice: auto`,
+`parallel_tool_calls: true` and non-strict function tools, opencode sends
+`auto` and non-strict tools, and none sends sampling parameters. So real
+client traffic is **not** grammar constrained (`needs_grammar` is false) and
+runs at the server defaults (temperature 1.0, top-p 0.95, top-k 20, fixed
+default seed), also at effort `none`.
+
+Findings:
+
+- **Syntax is not the problem.** Zero leaked call markup, zero `invalid tool
+  call` failures, zero non-JSON or schema-violating arguments in about 320
+  session calls (two baselines) and 487 replayed calls.
+- **Bad arguments are semantic, mostly Codex assuming a GNU/Linux shell** on
+  macOS: `cat -A`, `sed -i 's/…/'` without `''`, `python` (only `python3`
+  exists), `rg --limit`, and once a hallucinated `sed` that inserted unrelated
+  code. 2 of 4 Codex sessions in each baseline had at least one. Replayed at
+  the turn where it happened, the GNU `sed -i` recurs in 1/8 seeds at the
+  default settings, 1/8 at T 0.7/top-p 0.8, 2/8 at T 0.6, and 1/8 with a
+  "this machine runs macOS (BSD userland, `sed -i ''`, `python3`)" note
+  appended to the instructions: rare per turn, frequent per session, and
+  neither sampling nor that note removed it. Codex's `environment_context`
+  says the shell is zsh but not the OS; opencode's prompt says darwin and
+  showed none of these.
+- **Wrong tool**: Codex called the undeclared `apply_patch` once (8 Codex
+  sessions), in the `{"command": [...]}` form its fallback instructions
+  describe; it got `unsupported call` and recovered. The `model_catalog_json`
+  recipe in [Coding client configuration](#coding-client-configuration)
+  declares the tool.
+- **Invented parameters**: opencode `grep` with `i`/`glob` (Claude Code's
+  names) in both opencode config sessions, because both ran the same default
+  seed; replayed, 1/10 calls at default sampling, 0 at T 0.7.
+- **Loops**: in the first baseline (raw data lost to a directory deletion),
+  2 of 4 Codex sessions finished the task and then kept "verifying" for 100+
+  turns until the 600 s timeout; the second baseline had none, opencode none.
+  Lower temperature makes this worse, not better: at turns right after the
+  tests passed, Codex stopped in 3/6 seeds at T 1.0, 1/6 at T 0.7/top-p 0.8
+  and 0/6 greedy (rename task); 2/6, 1/6, 0/6 (config task). So the model
+  card's instruct settings (T 0.7, top-p 0.8) were **not** adopted for
+  effort `none`.
+- **Prompt rendering**: the renderer sorted keys in tool schemas and replayed
+  arguments, while the GGUF's template rendered with `transformers`' `tojson`
+  (and vLLM, llama.cpp) keeps the client's order; fixed on this branch
+  (fixtures re-verified against the template). Replays: 48 of 138 outputs
+  changed, no category changed; neutral so far.
+- **Harness**: `client_compat.run_client` left Codex's native agent running
+  after a timeout, and it kept sending requests during later scenarios
+  (also affects `agent_bench.py`); fixed on this branch.
+- Not a client issue today, but noted: the sampler counts prompt tokens for
+  `presence_penalty` (vLLM and OpenAI count only output tokens), so the model
+  card's instruct `presence_penalty: 1.5` would penalize every token of a
+  coding prompt.
+
+Remaining: replay the other error points (`cat -A`, `python`, `apply_patch`,
+opencode `grep`, `oldString`) under the same settings and at effort `medium`
+(`tools/tool_calls/round2.sh`; stopped part-way); measure whether reasoning
+(`medium`/`xhigh`, the documented Codex default) removes the verification
+loops and GNU-isms; rerun whole sessions with several seeds on the agent
+benchmark for the key-order change; decide whether a client-side note
+(Codex `developer_instructions`) is worth documenting — the one tested did not
+help.
+
 #### Long-context coding quality
 
 Each seed plants nine questions in a synthetic Python repository: at the
