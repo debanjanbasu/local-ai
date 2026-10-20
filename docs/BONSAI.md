@@ -1995,6 +1995,21 @@ layout, MTP configuration, tokens, recurrent state, and target and head K/V.
    startup too, so a store a previous process left over budget is trimmed
    before the first request).
 
+A request restores the longest prefix any tier holds, the cheaper tier on a
+tie, and a failed restore falls back to the next longest. The tiers used to
+be asked in order, so any matching GPU checkpoint won over a longer disk
+snapshot. In a compacted 64K Codex-style session (one `xhigh` run) that pinned
+four turns of 19K–31K-token prompts to a 12,980-token checkpoint while disk
+held their predecessors' 16K–25K snapshots, and steps grew from 30 s to
+179 s. The GPU tier had stopped keeping new checkpoints: every turn after
+the compaction re-rendered the last answer differently from what was
+generated, so each left a divergence boundary barely extending the previous
+turn's, those boundaries filled the four slots, and each new penultimate
+checkpoint, a request tail, was the eviction victim the moment it was saved.
+The two newest GPU checkpoints (the last request's boundary or penultimate
+token, and its end) are now never the victim; eviction picks among the
+others by the disk tier's rule below.
+
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
 and trim run behind the request. A snapshot is indexed for reuse only after
