@@ -380,6 +380,56 @@ fn cancelling_mid_prefill_leaves_the_rest_exact() {
     assert_same("long after cancellation", &again.token_ids, &long_reference);
 }
 
+/// Two requests admitted together that share a long system prompt nobody has
+/// cached, as sub-agents fanned out at once: the second prefills after the
+/// first and starts from the snapshot the first left at the shared prefix,
+/// and still produces exactly its tokens alone.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn requests_admitted_together_reuse_their_shared_prefix() {
+    let system = "Rust ownership, borrowing, lifetimes, traits, and safe concurrency. ".repeat(48);
+    let rendered = |question: &str| {
+        format!(
+            "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+    };
+    let mut engine = open(&MtpMode::Off(None));
+    let first = engine
+        .tokenizer
+        .encode(&rendered("Explain Arc briefly."))
+        .expect("first prompt");
+    let second = engine
+        .tokenizer
+        .encode(&rendered("Explain Pin briefly."))
+        .expect("second prompt");
+    let boundary = first
+        .iter()
+        .zip(&second)
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert!(boundary >= 2 * DEFAULT_PREFILL_CHUNK, "{boundary} shared tokens");
+    let reference = engine
+        .generate(&second, &params(16), |_| true)
+        .expect("second alone")
+        .token_ids;
+    // Disk tier only, as on a fast SSD: the GPU tier describes one buffer
+    // set, so it cannot carry a prefix from one request to another.
+    let cache = tempfile::tempdir().expect("cache directory");
+    let mut engine = open(&MtpMode::Off(None));
+    engine.set_session_cache(0, Some(cache.path().to_owned()));
+    let first_id = admit_ids(&mut engine, &first, 16, CancelToken::new());
+    let second_id = admit_ids(&mut engine, &second, 16, CancelToken::new());
+    let observed = observe(&mut engine, |_, _| {});
+    let second_run = &observed.outcomes[&second_id];
+    assert_eq!(observed.outcomes[&first_id].stats.reused_prompt_tokens, 0);
+    assert!(
+        second_run.stats.reused_prompt_tokens + DEFAULT_PREFILL_CHUNK > boundary,
+        "reused {} of {boundary} shared tokens",
+        second_run.stats.reused_prompt_tokens
+    );
+    assert_same("second", &second_run.token_ids, &reference);
+}
+
 /// Batched steps that verify every available draft — suffix-lookup drafts
 /// of copying prompts, MTP drafts otherwise — produce each prompt's tokens
 /// alone, and do verify more than one token per step.

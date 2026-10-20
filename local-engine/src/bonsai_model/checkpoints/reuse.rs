@@ -47,10 +47,13 @@ impl BonsaiEngine {
     }
 
     /// The longest prefix of `prompt` [`Self::restore_reusable_prefix`]
-    /// would restore into the resident set now, without restoring it.
+    /// would restore into the resident set now, without restoring it. Waits,
+    /// as that cascade does, for a disk write in flight that would beat every
+    /// committed snapshot for this prompt.
     pub(in crate::bonsai_model) fn reusable_prefix(&mut self, prompt: &[u32]) -> usize {
         self.collect_disk_writes();
         let bounds = self.reuse_bounds(prompt);
+        self.await_pending_disk_write(prompt, &bounds);
         let gpu = if self.cache_state == self.model.state_id() {
             self.prompt_checkpoints
                 .iter()
