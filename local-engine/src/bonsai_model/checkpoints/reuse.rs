@@ -47,114 +47,73 @@ impl BonsaiEngine {
     }
 
     /// The longest prefix of `prompt` [`Self::restore_reusable_prefix`]
-    /// would restore into the resident set now, without restoring it. Waits,
-    /// as that cascade does, for a disk write in flight that would beat every
-    /// committed snapshot for this prompt.
+    /// would restore into the resident set now, without restoring it.
     pub(in crate::bonsai_model) fn reusable_prefix(&mut self, prompt: &[u32]) -> usize {
         self.collect_disk_writes();
         let bounds = self.reuse_bounds(prompt);
-        self.await_pending_disk_write(prompt, &bounds);
-        let gpu = if self.cache_state == self.model.state_id() {
-            self.prompt_checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.state.position)
-                .filter(|&position| position <= bounds.reusable)
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let host = self
-            .session_snapshots
+        self.candidates(prompt, &bounds, None)
             .iter()
-            .filter(|snapshot| {
-                snapshot.state.position() <= bounds.snapshot_reusable
-                    && snapshot.tokens.as_slice() == &prompt[..snapshot.state.position()]
-            })
-            .map(|snapshot| snapshot.state.position())
+            .map(|&(_, _, position)| position)
             .max()
-            .unwrap_or(0);
-        let disk = self
-            .disk_snapshots
-            .iter()
-            .filter(|snapshot| {
-                snapshot.tokens.len() <= bounds.snapshot_reusable
-                    && prompt.starts_with(&snapshot.tokens)
-            })
-            .map(|snapshot| snapshot.tokens.len())
-            .max()
-            .unwrap_or(0);
-        gpu.max(host).max(disk)
+            .unwrap_or(0)
     }
 
-    /// The three-tier cascade: a live GPU checkpoint, then a host session
-    /// snapshot, then a disk snapshot, which always resolves.
+    /// Restore the longest reusable prefix any tier holds: a live GPU
+    /// checkpoint, a host session snapshot or a disk snapshot, the cheaper
+    /// restore first on a tie. A tier holding a shorter prefix never shadows
+    /// a longer one in a slower tier: after a compaction the GPU tier can hold
+    /// an old boundary of the conversation while disk holds snapshots turns
+    /// newer. A restore that fails falls back to the next candidate, and with
+    /// none the sequence starts empty.
     pub(super) fn restore_reusable_prefix(
         &mut self,
         prompt: &[u32],
         bounds: &ReuseBounds,
         session_id: Option<&str>,
     ) -> crate::Result<(usize, PromptCacheSource)> {
-        if let Some(reused) = self.restore_from_gpu_tier(prompt, bounds)? {
-            return Ok(reused);
-        }
-        if let Some(reused) = self.restore_from_host_tier(prompt, bounds, session_id)? {
-            return Ok(reused);
-        }
-        Ok(self.restore_from_disk_tier(prompt, bounds, session_id))
-    }
-
-    /// Tier 1: live GPU checkpoints, newest first. One the model refuses is
-    /// evicted and the tier reports no reuse.
-    fn restore_from_gpu_tier(
-        &mut self,
-        prompt: &[u32],
-        bounds: &ReuseBounds,
-    ) -> crate::Result<Option<(usize, PromptCacheSource)>> {
-        let selected = self
-            .prompt_checkpoints
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, checkpoint)| {
-                checkpoint.state.position <= bounds.reusable
-                    && checkpoint.tokens.as_slice() == &prompt[..checkpoint.state.position]
-            })
-            .map(|(index, _)| index);
-        let selected = if let Some(index) = selected {
-            if self
-                .model
-                .restore_prompt_checkpoint(&self.prompt_checkpoints[index].state)?
-            {
-                Some(index)
-            } else {
-                self.prompt_checkpoints.remove(index);
-                None
+        let mut rows_kept = true;
+        for (source, index, _) in self.candidates(prompt, bounds, session_id) {
+            let restored = match source {
+                // A failed snapshot restore may have overwritten the live K/V
+                // rows a checkpoint relies on.
+                PromptCacheSource::Gpu if !rows_kept => continue,
+                PromptCacheSource::Gpu => self.restore_gpu_checkpoint(index)?,
+                PromptCacheSource::Host => self.restore_host_snapshot(index)?,
+                _ => self.restore_disk_snapshot(index),
+            };
+            if let Some(position) = restored {
+                return Ok((position, source));
             }
-        } else {
-            None
-        };
-        let Some(index) = selected else {
-            return Ok(None);
-        };
-        self.prompt_checkpoints.rotate_left(index + 1);
-        let checkpoint = self
-            .prompt_checkpoints
-            .pop()
-            .ok_or_else(|| crate::Error::Generation("prompt checkpoint disappeared".into()))?;
-        let position = checkpoint.state.position;
-        self.prompt_checkpoints.push(checkpoint);
-        Ok(Some((position, PromptCacheSource::Gpu)))
+            rows_kept &= source == PromptCacheSource::Gpu;
+        }
+        self.model.reset();
+        Ok((0, PromptCacheSource::None))
     }
 
-    /// Tier 2: host session snapshots, best key first. One the model refuses
-    /// is evicted and the tier reports no reuse.
-    fn restore_from_host_tier(
+    /// Each tier's best entry for `prompt` as (tier, index, position),
+    /// longest first and in tier order on a tie. Waits for a disk write in
+    /// flight that would beat all of them, then counts it.
+    fn candidates(
         &mut self,
         prompt: &[u32],
         bounds: &ReuseBounds,
         session_id: Option<&str>,
-    ) -> crate::Result<Option<(usize, PromptCacheSource)>> {
+    ) -> Vec<(PromptCacheSource, usize, usize)> {
+        // Checkpoints describe the buffer set `cache_state` names: their K/V
+        // rows are that set's live caches.
+        let gpu = (self.cache_state == self.model.state_id())
+            .then(|| {
+                self.prompt_checkpoints
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, checkpoint)| {
+                        checkpoint.state.position <= bounds.reusable
+                            && checkpoint.tokens.as_slice() == &prompt[..checkpoint.state.position]
+                    })
+                    .max_by_key(|&(index, checkpoint)| (checkpoint.state.position, index))
+                    .map(|(index, checkpoint)| (index, checkpoint.state.position))
+            })
+            .flatten();
         let host = self
             .session_snapshots
             .iter()
@@ -169,46 +128,16 @@ impl BonsaiEngine {
                     snapshot.session_id.as_deref() == session_id,
                 )
             })
-            .map(|(index, _)| index);
-        let host = if let Some(index) = host {
-            if self
-                .model
-                .restore_host_prompt_snapshot(&self.session_snapshots[index].state)?
-            {
-                Some(index)
-            } else {
-                self.session_snapshots.remove(index);
-                None
-            }
-        } else {
-            None
-        };
-        let Some(index) = host else {
-            return Ok(None);
-        };
-        let position = self.session_snapshots[index].state.position();
-        let snapshot = self.session_snapshots.remove(index);
-        self.session_snapshots.push(snapshot);
-        self.prompt_checkpoints.clear();
-        Ok(Some((position, PromptCacheSource::Host)))
-    }
-
-    /// Tier 3: disk snapshots, best key first. This tier always resolves, so
-    /// it hands back a prefix rather than reporting no reuse.
-    fn restore_from_disk_tier(
-        &mut self,
-        prompt: &[u32],
-        bounds: &ReuseBounds,
-        session_id: Option<&str>,
-    ) -> (usize, PromptCacheSource) {
-        self.await_pending_disk_write(prompt, bounds);
+            .map(|(index, snapshot)| (index, snapshot.state.position()));
+        let held = gpu.into_iter().chain(host).map(|(_, position)| position).max();
+        self.await_pending_disk_write(prompt, bounds, held.unwrap_or(0));
         let disk = self
             .disk_snapshots
             .iter()
             .enumerate()
             .filter(|(_, snapshot)| {
                 snapshot.tokens.len() <= bounds.snapshot_reusable
-                    && snapshot.tokens.as_slice() == &prompt[..snapshot.tokens.len()]
+                    && prompt.starts_with(&snapshot.tokens)
             })
             .max_by_key(|(_, snapshot)| {
                 (
@@ -216,39 +145,82 @@ impl BonsaiEngine {
                     snapshot.session_id.as_deref() == session_id,
                 )
             })
-            .map(|(index, _)| index);
-        if let Some(index) = disk {
-            let snapshot = prompt_cache::load(
-                &self.disk_snapshots[index].path,
-                &self.prompt_cache_model_key,
-            );
-            // A snapshot that fails to load or restore is a cache miss,
-            // never a failed request.
-            if let Ok(snapshot) = snapshot
-                && self.model.restore_prompt_snapshot(&snapshot).is_ok()
-            {
-                self.prompt_checkpoints.clear();
-                (snapshot.position, PromptCacheSource::Disk)
-            } else {
-                self.disk_snapshots.remove(index);
-                self.model.reset();
-                (0, PromptCacheSource::None)
-            }
-        } else {
-            self.model.reset();
-            (0, PromptCacheSource::None)
+            .map(|(index, snapshot)| (index, snapshot.tokens.len()));
+        let mut candidates = [
+            (PromptCacheSource::Gpu, gpu),
+            (PromptCacheSource::Host, host),
+            (PromptCacheSource::Disk, disk),
+        ]
+        .into_iter()
+        .filter_map(|(source, entry)| entry.map(|(index, position)| (source, index, position)))
+        .collect::<Vec<_>>();
+        // Stable: equal lengths keep tier order.
+        candidates.sort_by_key(|&(_, _, position)| std::cmp::Reverse(position));
+        candidates
+    }
+
+    /// Restore GPU checkpoint `index`. One the model refuses (purged) is
+    /// evicted and restores nothing.
+    fn restore_gpu_checkpoint(&mut self, index: usize) -> crate::Result<Option<usize>> {
+        if !self
+            .model
+            .restore_prompt_checkpoint(&self.prompt_checkpoints[index].state)?
+        {
+            self.prompt_checkpoints.remove(index);
+            return Ok(None);
         }
+        self.prompt_checkpoints.rotate_left(index + 1);
+        let position = self.prompt_checkpoints[self.prompt_checkpoints.len() - 1]
+            .state
+            .position;
+        Ok(Some(position))
+    }
+
+    /// Restore host session snapshot `index`. One the model refuses is
+    /// evicted and restores nothing.
+    fn restore_host_snapshot(&mut self, index: usize) -> crate::Result<Option<usize>> {
+        if !self
+            .model
+            .restore_host_prompt_snapshot(&self.session_snapshots[index].state)?
+        {
+            self.session_snapshots.remove(index);
+            return Ok(None);
+        }
+        let snapshot = self.session_snapshots.remove(index);
+        let position = snapshot.state.position();
+        self.session_snapshots.push(snapshot);
+        self.prompt_checkpoints.clear();
+        Ok(Some(position))
+    }
+
+    /// Restore disk snapshot `index`. One that fails to load or restore is a
+    /// cache miss, never a failed request: it is dropped from the index.
+    fn restore_disk_snapshot(&mut self, index: usize) -> Option<usize> {
+        let snapshot = prompt_cache::load(
+            &self.disk_snapshots[index].path,
+            &self.prompt_cache_model_key,
+        );
+        if let Ok(snapshot) = snapshot
+            && self.model.restore_prompt_snapshot(&snapshot).is_ok()
+        {
+            self.prompt_checkpoints.clear();
+            return Some(snapshot.position);
+        }
+        self.disk_snapshots.remove(index);
+        self.model.reset();
+        None
     }
 
     /// Wait for a disk write still in flight when it would beat every
-    /// committed snapshot for this prompt, then index it.
+    /// committed snapshot for this prompt and the `held` tokens a faster tier
+    /// holds, then index it.
     ///
     /// Writes run in the background, so a request that arrives right behind
-    /// the one that queued a snapshot — and misses the GPU and host tiers —
-    /// could otherwise find it absent and prefill from further back. Waiting
-    /// costs at most the rest of that one write; it is never paid when a
-    /// committed snapshot is already as long, nor when no write is pending.
-    fn await_pending_disk_write(&mut self, prompt: &[u32], bounds: &ReuseBounds) {
+    /// the one that queued a snapshot could otherwise find it absent and
+    /// prefill from further back. Waiting costs at most the rest of that one
+    /// write; it is never paid when a committed snapshot or a faster tier
+    /// already holds as long a prefix, nor when no write is pending.
+    fn await_pending_disk_write(&mut self, prompt: &[u32], bounds: &ReuseBounds, held: usize) {
         let Some(writer) = &self.disk_writer else {
             return;
         };
@@ -259,10 +231,10 @@ impl BonsaiEngine {
             .iter()
             .filter(|snapshot| usable(&snapshot.tokens))
             .map(|snapshot| snapshot.tokens.len())
-            .max();
-        writer.wait_for(|tokens| {
-            committed.is_none_or(|length| tokens.len() > length) && usable(tokens)
-        });
+            .max()
+            .unwrap_or(0)
+            .max(held);
+        writer.wait_for(|tokens| tokens.len() > committed && usable(tokens));
         self.collect_disk_writes();
     }
 }
