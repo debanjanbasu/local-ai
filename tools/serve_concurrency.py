@@ -6,7 +6,7 @@ the user's cache is untouched), runs the phases below over streaming Chat
 Completions, stops it, and writes `results.json` and `summary.md`. The model
 is loaded by `serve`, so hold the shared GPU lock for the whole run:
 
-    lockf /tmp/local-ai-gpu.lock tools/serve_concurrency.py --out DIR
+    lockf -k /tmp/local-ai-gpu.lock tools/serve_concurrency.py --out DIR
 
 Phases, for each stream count N (default 1, 2, 4, 8):
 
