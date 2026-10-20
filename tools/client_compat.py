@@ -800,13 +800,16 @@ def run_client(ctx: Context, command: list[str], repo: Path, env: dict, log: Pat
     with log.open("ab") as out:
         out.write(f"$ {' '.join(command)}\n".encode())
         out.flush()
+        process = subprocess.Popen(
+            command, cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True,
+        )
         try:
-            completed = subprocess.run(  # noqa: PLW1510 -- the exit code is the result
-                command, cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                timeout=ctx.timeout, start_new_session=True,
-            )
-            code = completed.returncode
+            code = process.wait(ctx.timeout)
         except subprocess.TimeoutExpired:
+            # The whole process group: Codex's npm launcher has a native child
+            # that otherwise keeps sending requests during the next scenarios.
+            signal_group(process.pid, signal.SIGKILL)
+            process.wait()
             code = -999
     return code, time.monotonic() - started
 
