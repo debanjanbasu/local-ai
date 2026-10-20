@@ -9,7 +9,8 @@ use local_engine::{Event, EventStream};
 use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
-    Protocol, Reply, arguments_text, chat_finish_reason, chat_tool_call, checked, usage_json,
+    Protocol, Reply, arguments_text, chat_finish_reason, chat_tool_call, checked, logprob_json,
+    usage_json,
 };
 use super::responses::{ResponsesState, sse_frame};
 
@@ -145,6 +146,8 @@ pub(super) enum Frames {
         /// The call whose arguments are streaming: its ID and the bytes of
         /// its arguments sent.
         open: Option<(String, usize)>,
+        /// Log-probabilities of the tokens behind the next content chunk.
+        logprobs: Vec<Value>,
     },
     Responses(Box<ResponsesState>),
 }
@@ -152,12 +155,13 @@ pub(super) enum Frames {
 impl Frames {
     pub(super) fn new(reply: Reply) -> Self {
         match reply.protocol.clone() {
-            Protocol::Chat { include_usage } => Self::Chat {
+            Protocol::Chat { include_usage, .. } => Self::Chat {
                 reply,
                 include_usage,
                 announced: false,
                 calls: 0,
                 open: None,
+                logprobs: Vec::new(),
             },
             Protocol::Responses(echo) => {
                 Self::Responses(Box::new(ResponsesState::new(&reply, echo, true)))
@@ -187,11 +191,12 @@ impl Frames {
                 announced,
                 calls,
                 open,
+                logprobs,
             } => chat_frames(
                 reply,
                 *include_usage,
                 announced,
-                (calls, open),
+                (calls, open, logprobs),
                 checked(event),
             ),
             Self::Responses(state) => {
@@ -215,12 +220,23 @@ fn chat_frames(
     reply: &Reply,
     include_usage: bool,
     announced: &mut bool,
-    (calls, open): (&mut usize, &mut Option<(String, usize)>),
+    (calls, open, logprobs): (&mut usize, &mut Option<(String, usize)>, &mut Vec<Value>),
     event: Event,
 ) -> Vec<String> {
     let chunk = |delta: Value, finish: Option<&str>| json!({"id":reply.id,"object":"chat.completion.chunk","created":reply.created,"model":reply.model.as_ref(),"choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+    let mut tokens = None;
     let mut delta = match event {
-        Event::Content(piece) => json!({"content":piece}),
+        // Always just before the content chunk they go with.
+        Event::Logprobs(records) => {
+            logprobs.extend(records.iter().map(logprob_json));
+            return Vec::new();
+        }
+        Event::Content(piece) => {
+            if !logprobs.is_empty() {
+                tokens = Some(std::mem::take(logprobs));
+            }
+            json!({"content":piece})
+        }
         Event::Reasoning(piece) => json!({"reasoning_content":piece}),
         // A call streams as the engine writes it: its first delta carries the
         // ID, type and name, every later one only more `arguments`, and the
@@ -273,5 +289,9 @@ fn chat_frames(
             map.insert("role".into(), json!("assistant"));
         }
     }
-    vec![data(&chunk(delta, None))]
+    let mut frame = chunk(delta, None);
+    if let Some(tokens) = tokens {
+        frame["choices"][0]["logprobs"] = json!({"content":tokens,"refusal":null});
+    }
+    vec![data(&frame)]
 }

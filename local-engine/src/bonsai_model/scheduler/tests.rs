@@ -75,7 +75,7 @@ fn drain(
 ) {
     let mut steps = 0;
     while engine.active_generations() > 0 {
-        for (id, result) in engine.step(&mut |_, _| true, &mut |_, _| {}) {
+        for (id, result) in engine.step(&mut |_, _, _| true, &mut |_, _| {}) {
             outcomes.insert(id, result.expect("generation"));
         }
         steps += 1;
@@ -265,7 +265,7 @@ fn observe(
         let mut emitted = HashMap::new();
         let mut prefilled = Vec::new();
         let finished = engine.step(
-            &mut |id, _| {
+            &mut |id, _, _| {
                 *emitted.entry(id).or_insert(0) += 1;
                 true
             },
@@ -603,7 +603,7 @@ fn batched_prose_throughput() {
                     started = Some(std::time::Instant::now());
                 }
                 let finished = engine.step(
-                    &mut |_, _| {
+                    &mut |_, _, _| {
                         if started.is_some() {
                             tokens += 1;
                         }
@@ -631,4 +631,152 @@ fn batched_prose_throughput() {
         }
     }
     println!("{}", serde_json::json!({"prose_throughput": lines}));
+}
+
+/// Generate each prompt (with `logprobs` where its entry asks), together
+/// when `batched`, else one at a time: every prompt's tokens and records.
+fn generate_recorded(
+    engine: &mut BonsaiEngine,
+    base: &GenerateParams,
+    logprobs: &[Option<usize>],
+    batched: bool,
+) -> Vec<(Vec<u32>, Vec<crate::sampler::TokenLogprob>, usize)> {
+    let mut records: HashMap<u64, Vec<crate::sampler::TokenLogprob>> = HashMap::new();
+    let mut outcomes = HashMap::new();
+    let mut ids = Vec::new();
+    for (index, &top) in logprobs.iter().enumerate() {
+        let params = GenerateParams {
+            logprobs: top,
+            ..base.clone()
+        };
+        let prompt = prompt(engine, index);
+        ids.push(
+            engine
+                .admit(&prompt, &params, None, CancelToken::new())
+                .expect("admit"),
+        );
+        if batched && index + 1 < logprobs.len() {
+            continue;
+        }
+        while engine.active_generations() > 0 {
+            for (id, result) in engine.step(
+                &mut |id, _, tokens| {
+                    records.entry(id).or_default().extend(tokens);
+                    true
+                },
+                &mut |_, _| {},
+            ) {
+                outcomes.insert(id, result.expect("generation"));
+            }
+        }
+    }
+    ids.iter()
+        .map(|id| {
+            let output: BonsaiGeneration = outcomes.remove(id).expect("outcome");
+            (
+                output.token_ids,
+                records.remove(id).unwrap_or_default(),
+                output.stats.reused_prompt_tokens,
+            )
+        })
+        .collect()
+}
+
+/// Every target-selection path (plain decode, MTP and n-gram verification,
+/// host sampling with penalties, batched decode) reports the raw
+/// distribution of the very row that selected each token, and asking for
+/// log-probabilities changes no token.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
+fn logprobs_are_the_raw_distribution_of_each_selecting_row() {
+    // The reference re-prefills each prompt from scratch and decodes one
+    // row at a time; a restored prompt prefix, verify blocks and batched
+    // rows reach the same logits by a different float order.
+    const TOLERANCE: f32 = 0.05;
+    let top = 5;
+    let greedy = params(48);
+    let sampled = GenerateParams {
+        temperature: 0.8,
+        top_p: 0.95,
+        presence_penalty: 0.3,
+        repetition_penalty: 1.1,
+        seed: 7,
+        ..params(48)
+    };
+    let mut errors = Vec::new();
+    for (label, mtp, ngram, base) in [
+        ("plain", MtpMode::Off(None), false, &greedy),
+        ("mtp+ngram", MtpMode::default(), true, &greedy),
+        ("sampled mtp+ngram", MtpMode::default(), true, &sampled),
+    ] {
+        let mut engine = open_with(&mtp, ngram);
+        for batched in [false, true] {
+            let without = generate_recorded(&mut engine, base, &[None; 3], batched);
+            let with = generate_recorded(&mut engine, base, &[Some(top), Some(top), None], batched);
+            for (index, ((plain, none, _), (tokens, records, reused))) in
+                without.iter().zip(&with).enumerate()
+            {
+                let case = format!("{label} batched={batched} prompt {index}");
+                assert!(none.is_empty(), "{case}: records without logprobs");
+                assert_same(&case, tokens, plain);
+                if index == 2 {
+                    assert!(records.is_empty(), "{case}: records it did not ask for");
+                    continue;
+                }
+                // Every emitted token, in order; a trailing partial
+                // character may still be held.
+                assert!(
+                    records.len() + 1 >= tokens.len(),
+                    "{case}: {} records",
+                    records.len()
+                );
+                let recorded = records
+                    .iter()
+                    .map(|record| record.token)
+                    .collect::<Vec<_>>();
+                assert_eq!(recorded, tokens[..records.len()], "{case}");
+                let mut worst = (0.0_f32, 0);
+                let prompt = prompt(&engine, index);
+                let rows = engine
+                    .teacher_forced_logits(&prompt, None, &tokens[..records.len()])
+                    .expect("teacher forcing");
+                for (position, (record, row)) in records.iter().zip(&rows).enumerate() {
+                    let (lse, best) = crate::sampler::raw_distribution(row, top);
+                    let error = (record.logprob - (row[record.token as usize] - lse)).abs();
+                    if error > worst.0 {
+                        worst = (error, position);
+                    }
+                    assert_eq!(record.top.len(), top, "{case} @{position}");
+                    for (reported, (id, logit)) in record.top.iter().zip(&best) {
+                        let error = (reported.logprob - (row[reported.token as usize] - lse)).abs();
+                        if error > worst.0 {
+                            worst = (error, position);
+                        }
+                        // Rank by rank, up to near-ties between the paths.
+                        assert!(
+                            reported.token == *id
+                                || (logit - row[reported.token as usize]).abs() < 0.05,
+                            "{case} @{position}: top {} vs {id}",
+                            reported.token
+                        );
+                        assert!(!reported.bytes.is_empty() || reported.token >= 248_000);
+                    }
+                    if base.temperature == 0.0 {
+                        // Greedy takes the row's own best token.
+                        assert_eq!(record.top[0].token, record.token, "{case} @{position}");
+                    }
+                }
+                eprintln!(
+                    "{case}: worst |logprob - reference| = {:e} at token {} of {}, {reused} prompt tokens reused",
+                    worst.0,
+                    worst.1,
+                    records.len()
+                );
+                errors.push((case, worst.0));
+            }
+        }
+    }
+    for (case, worst) in errors {
+        assert!(worst <= TOLERANCE, "{case}: {worst}");
+    }
 }

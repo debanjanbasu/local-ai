@@ -1,6 +1,6 @@
 use super::{
-    AttentionLayer, BlockOutput, BonsaiModel, BufferCopyRequest, CommandBatch, HadamardDirection,
-    Rope, Selection, Speculation, VOCAB, WIDTH, decode_embeddings,
+    AttentionLayer, BlockOutput, BonsaiModel, BufferCopyRequest, CommandBatch, Described,
+    HadamardDirection, Rope, Selection, Speculation, VOCAB, WIDTH, decode_embeddings,
 };
 
 /// Write the `(t, h, w, 0)` rotary positions of `count` tokens from
@@ -83,6 +83,7 @@ impl BonsaiModel {
         // Whatever the block writes, the previous selection no longer
         // describes the logits the caller will read.
         self.selection = Selection::None;
+        self.distributions.described = Described::None;
         let mut ingest = ingest;
         self.reserve_kv(self.position + tokens.len(), ingest.as_deref_mut())?;
         let count = tokens.len() as u32;
@@ -231,6 +232,17 @@ impl BonsaiModel {
             produced.filter(|&(_, rows, _)| self.device_greedy && rows <= self.greedy.max_rows());
         if let Some((logits, rows, _)) = selected {
             self.greedy.encode(&mut batch, logits, rows)?;
+        }
+        if let (Some(top), Some((logits, rows, selection))) = (self.logprobs, produced) {
+            let described = match selection {
+                Selection::Last => Described::Last,
+                Selection::Rows(rows) => Described::Rows(rows),
+                Selection::None => Described::None,
+            };
+            self.distributions.reserve(&self.context, rows)?;
+            self.distributions.encode(&mut batch, logits, rows, top)?;
+            self.distributions.described = described;
+            self.distributions.top = top;
         }
         if let Some(speculation) = ingest {
             self.encode_head_rows(&mut batch, speculation, tokens.len(), self.position)?;

@@ -117,7 +117,7 @@ use super::request::{
     responses_text_format, responses_tool_choice, service_tier, tool_call, tool_policy,
     verbosity_level,
 };
-use super::response::{Reply, arguments_text, new_id, unix_now};
+use super::response::{Reply, arguments_text, logprob_json, new_id, unix_now};
 use super::store::{ResponseStore, StoredResponse};
 use crate::GenerateParams;
 
@@ -557,21 +557,24 @@ impl ResponsesRequest {
         if self.include.as_ref().is_some_and(|include| {
             include.iter().any(|value| match value.as_str() {
                 "reasoning.encrypted_content" => !encrypted,
-                "file_search_call.results" => false,
+                "file_search_call.results" | LOGPROBS_INCLUDE => false,
                 _ => true,
             })
         }) {
             return Err(unsupported(
                 "include",
-                "only reasoning.encrypted_content (which requires --reasoning-key) and \
-                 file_search_call.results are implemented",
+                "only reasoning.encrypted_content (which requires --reasoning-key), \
+                 file_search_call.results and message.output_text.logprobs are implemented",
             ));
         }
-        if self.top_logprobs.is_some_and(|n| n > 0) {
-            return Err(unsupported(
-                "top_logprobs",
-                "log-probabilities are not reported",
-            ));
+        if self
+            .top_logprobs
+            .is_some_and(|n| n > local_engine::MAX_TOP_LOGPROBS as u64)
+        {
+            return Err(invalid(format!(
+                "top_logprobs must be between 0 and {}",
+                local_engine::MAX_TOP_LOGPROBS
+            )));
         }
         if self
             .stream_options
@@ -597,9 +600,25 @@ impl ResponsesRequest {
             seed: self.seed.unwrap_or(defaults.seed),
             presence_penalty: self.presence_penalty.unwrap_or(defaults.presence_penalty),
             repetition_penalty: repetition_penalty(self.repetition_penalty, self.frequency_penalty),
+            logprobs: self.logprobs(),
         }
     }
+
+    /// The alternatives each answer token reports, when `include` asks for
+    /// `message.output_text.logprobs` or `top_logprobs` asks for any.
+    fn logprobs(&self) -> Option<usize> {
+        let included = self
+            .include
+            .iter()
+            .flatten()
+            .any(|value| value == LOGPROBS_INCLUDE);
+        let top = self.top_logprobs.unwrap_or(0);
+        (included || top > 0).then_some(top as usize)
+    }
 }
+
+/// The `include` entry that reports `output_text` log-probabilities.
+const LOGPROBS_INCLUDE: &str = "message.output_text.logprobs";
 
 /// The detail `reasoning.summary` asks the raw reasoning to be summarized at,
 /// if any.
@@ -2179,6 +2198,8 @@ struct Open {
     chars: usize,
     /// A message's `file_citation` annotations so far.
     annotations: Vec<Value>,
+    /// A message's token log-probabilities so far, when the request asked.
+    logprobs: Vec<Value>,
 }
 
 /// A `function_call` or `custom_tool_call` item whose arguments (or input)
@@ -2226,6 +2247,8 @@ pub(super) struct ResponsesState {
     searching: HashMap<String, usize>,
     /// Citation markers of this Response's file search results.
     citations: super::file_search::Citations,
+    /// Log-probabilities of the tokens behind the next message text.
+    logprobs: Vec<Value>,
 }
 
 impl ResponsesState {
@@ -2255,6 +2278,7 @@ impl ResponsesState {
             spent,
             searching: HashMap::new(),
             citations: super::file_search::Citations::default(),
+            logprobs: Vec::new(),
         }
     }
 
@@ -2638,6 +2662,7 @@ impl ResponsesState {
                 text: String::new(),
                 chars: 0,
                 annotations: Vec::new(),
+                logprobs: Vec::new(),
             });
         }
         if kind == ItemKind::Message && self.citations.active() {
@@ -2668,10 +2693,14 @@ impl ResponsesState {
                 "response.reasoning_text.delta",
                 json!({"item_id":id,"output_index":index,"content_index":0,"delta":piece}),
             ),
-            ItemKind::Message => self.emit(
-                "response.output_text.delta",
-                json!({"item_id":id,"output_index":index,"content_index":0,"delta":piece,"logprobs":[]}),
-            ),
+            ItemKind::Message => {
+                let tokens = std::mem::take(&mut self.logprobs);
+                open.logprobs.extend(tokens.iter().cloned());
+                self.emit(
+                    "response.output_text.delta",
+                    json!({"item_id":id,"output_index":index,"content_index":0,"delta":piece,"logprobs":tokens}),
+                );
+            }
         }
     }
 
@@ -2723,6 +2752,7 @@ impl ResponsesState {
             index,
             text,
             annotations,
+            logprobs,
             ..
         } = open;
         let item = match kind {
@@ -2754,10 +2784,10 @@ impl ResponsesState {
                 item
             }
             ItemKind::Message => {
-                let part = json!({"type":"output_text","text":text,"annotations":annotations,"logprobs":[]});
+                let part = json!({"type":"output_text","text":text,"annotations":annotations,"logprobs":logprobs});
                 self.emit(
                     "response.output_text.done",
-                    json!({"item_id":id,"output_index":index,"content_index":0,"text":text,"logprobs":[]}),
+                    json!({"item_id":id,"output_index":index,"content_index":0,"text":text,"logprobs":logprobs}),
                 );
                 self.emit(
                     "response.content_part.done",
@@ -3118,6 +3148,7 @@ impl ResponsesState {
             Event::ToolCallDelta(delta) => self.call_delta(&delta),
             Event::ToolCall(call) => self.call(&call),
             Event::ToolOutput(output) => self.tool_output(&output),
+            Event::Logprobs(tokens) => self.logprobs.extend(tokens.iter().map(logprob_json)),
             Event::TokenIds(_) => {}
             Event::Finished(stats) => return Some(self.finish(&stats, sink)),
             Event::Error(message) => return Some(self.fail(&message)),
