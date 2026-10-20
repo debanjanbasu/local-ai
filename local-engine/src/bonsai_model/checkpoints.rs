@@ -40,9 +40,14 @@ impl BonsaiEngine {
         });
         if self.prompt_checkpoints.len() > self.max_prompt_checkpoints {
             // The disk tier's policy: a boundary a few tokens past a kept one
-            // goes before the boundary every sharing request restores.
-            let entries = self
-                .prompt_checkpoints
+            // goes before the boundary every sharing request restores. The
+            // two newest checkpoints (the request's boundary or penultimate
+            // token, and its end) are what its next turn restores, so they
+            // are never the victim: an agent session's turns each leave a
+            // boundary that barely extends the last, and once boundaries
+            // filled the tier, every new penultimate checkpoint went at once.
+            let protected = self.max_prompt_checkpoints.min(2);
+            let entries = self.prompt_checkpoints[..self.prompt_checkpoints.len() - protected]
                 .iter()
                 .map(|entry| (entry.tokens.as_slice(), entry.reusable_boundary))
                 .collect::<Vec<_>>();
