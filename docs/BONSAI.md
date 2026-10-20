@@ -1021,8 +1021,8 @@ image path's, whose end-to-end parity is above.
 Codex, opencode and Oh My Pi drive `local-ai serve` end to end with the
 configurations below, each recorded against the real model in
 [client runs](#coding-clients-and-long-context-coding-quality). Each sets a
-65,536-token context window and compacts at 32,000 prompt tokens, the
-[threshold sweep](#compaction-threshold)'s choice. `GET /v1/models` reports
+65,536-token context window and compacts at 32,000 prompt tokens
+(provisional until the [threshold sweep](#compaction-threshold) finishes). `GET /v1/models` reports
 the admitted `context_length` (262,144 on a 48 GB Mac), but a client that
 compacts only near that limit runs long prompts whose prefill is about half as
 fast and whose exact lookups fail. A window larger than the admitted
@@ -1171,8 +1171,8 @@ store and the conversation keep every original item while the prompt shrinks.
 
 `context_management: [{"type":"compaction","compact_threshold":N}]` on
 `POST /v1/responses` (one entry, `N` at least 1000, or null or absent for the
-server's default of 32,000, chosen by the
-[threshold sweep](#compaction-threshold)) compacts before
+server's default of 32,000, provisional until the
+[threshold sweep](#compaction-threshold) finishes) compacts before
 generation when the exact prompt count reaches `N`, or when the prompt leaves
 less than `max_output_tokens` (default 8,192) of the admitted context, which is
 the output space the harness reserves. The kept budget is a quarter of `N` (or
@@ -1286,6 +1286,95 @@ deltas and `.done` events from 8.38 s to 9.54 s: the summary added 1.16 s to a
 9.54 s response. The item's `summary` held one `summary_text` part ("I checked
 divisibility by primes up to the square root of 391 and found it is divisible
 by 17. ...") and its content stayed the raw `reasoning_text`.
+
+### Compaction threshold
+
+**Status: unfinished.** The 32,000-token default and client settings above
+are provisional: only the 32K point of the sweep has been measured. The
+no-compaction, 48K and 16K points and the agent-bench confirmation were queued
+but not run.
+
+Why compact early: the [long-context eval](#coding-clients-and-long-context-coding-quality)
+keeps recall at every size, but lookups at effort `none` fall from 7/9 at 32K
+and 64K to 2/9 at 128K and 0/6 at about 250K (xhigh: 27/27 at all three
+sizes), and cold prefill falls from about 106 tok/s to 32K to about 54 tok/s
+marginal between 72K and 128K.
+
+Method: `tools/context_eval.py --compact-at T` replays the eval repository as
+an agent session, `read_files` call/output pairs of about 3K tokens, each one
+`store: false` Responses request with a 1-token output. Before the next
+request, when the previous one's `total_tokens` reached `T`, it compacts the
+Codex way (a `compaction_trigger` turn), and once more before the questions.
+Then it asks the nine questions with a `read_files` tool and up to four tool
+rounds. The report adds the median prefilled tokens per read step, the stale
+tokens re-prefilled (see below) and the total wall time less those tokens at
+the session's prefill rate. Run one size, seed and effort per GPU-lock hold
+(`lockf -k /tmp/local-ai-gpu.lock`), with a fresh `HOME` per group so no group
+reuses another's prompt cache, for example
+`HOME=/tmp/ct/64k-32k python3 tools/context_eval.py --out OUT --server-bin
+target/release/local-ai --sizes 64k --seeds 0 --efforts xhigh --compact-at
+32k`, and `--report --out OUT` for the table. At effort `none` the model often
+re-reads the same files until it runs out of tool rounds, so lookups there are
+noisy; xhigh is the informative effort.
+
+Results (2026-10-20, Apple M4 Pro 48 GB, this branch's server at `4fa819f`,
+one seed). Timing may have overlapped another thread's GPU job (the shared
+lock was racy until about 13:20 that day), so treat seconds as approximate;
+the quality columns are unaffected.
+
+| Size | Compact at | Effort | Session: requests, compactions, wall s | TTFT s, median / max | Compaction s | Final prompt | Recall | Lookup | Fix | Question wall s, median | Total wall s | Prefilled per read, median (stale) | Total wall s without stale reuse |
+| --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: |
+| 64k | 32k | xhigh | 23, 2, 1,811 | 32.1 / 355.2 | 207, 289 | 13,007 | 3/3 | 3/3 | 3/3 | 18.1 | 2,076 | 3,257 (62,036) | 1,497 |
+| 16k | 8k | none | 6, 1, 215 | 26.7 / 94.3 | 78 | 7,535 | 3/3 | 0/3 | 3/3 | 16.9 | 833 | 3,184 (0) | 833 |
+| 16k | 8k | none (main `b09e22f`) | 6, 1, 176 | 26.7 / 55.3 | 49 | 6,236 | 3/3 | 1/3 | 3/3 | 9.2 | 367 | 3,184 (0) | 367 |
+
+Findings so far:
+
+- At 32K the 64K session kept 9/9 at xhigh. Facts compacted away were not in
+  the summary, but the model re-read the files they came from (0.7 reads per
+  question), as an agent would.
+- Both xhigh compactions used their whole 6,144-token output budget (4,096
+  reasoning plus 2,048 summary), 207 s and 289 s, mostly decode. The
+  summary request extended the conversation's prompt and was served from the
+  cache (34,775 of 37,959 tokens cached), where main's summary request, a
+  different rendering of a shorter prefix, re-prefilled the whole history (an
+  earlier main run: 326 of 9,982 tokens cached, 108 s for a 10K history;
+  about 35K uncached tokens, roughly 6 minutes, for a 32K one, estimated, not
+  measured). In the 16K smoke rows nothing was kept verbatim, so both servers
+  reused the prefix and main's shorter, non-reasoning summary was faster.
+- Stale prefix reuse (a prompt-cache bug in main, handed to the
+  parallel-sched branch, not fixed here): after a compaction, consecutive
+  read steps restored an old snapshot (12,980 cached tokens for four steps
+  while the cache held 16,086 to 25,318-token prefixes), so those steps grew
+  from 30 s to 179 s. The 62,036 stale tokens cost about 580 s of the 2,076 s
+  total.
+- Expected trade-off, not yet measured: each compaction costs about 250 s at
+  xhigh, plus a cold prefill of the summary and kept quarter, so fewer,
+  later compactions (48K to 64K) may cost less wall time for sessions under
+  about 200K, while quality holds through 64K in the static eval and prefill
+  per step grows with the prompt.
+
+Remaining work:
+
+1. Run 64K xhigh with compaction off, at 48K and at 16K (one hold each), and
+   at 32K on main for the before row; report the stale-free columns too, and
+   rerun 32K if its timing is suspect. The stale-reuse candidate fix is
+   opt-parallel-sched `5b2b4a7` (restore the longest prefix in any cache tier;
+   GPU eviction spares the two newest checkpoints; not yet GPU-verified). Once
+   it is approved to combine, rerun the sweep on this branch merged with it;
+   its stale column should drop to about 0.
+2. Choose the threshold from quality, TTFT and total wall time with and
+   without stale reuse; set `DEFAULT_COMPACT_THRESHOLD` in
+   `local-services/src/compaction.rs` and update the number in this file,
+   `local-ai/src/cli/serve/responses.rs` and the engine README.
+3. Confirm with the agent bench (branch `opt-agent-bench`,
+   `tools/agent_bench.py`): its tasks peak near 9K prompt tokens, so add a
+   client mapped to client_compat's `remote-compact` variant (Codex limit
+   7,000) and compare this branch with main using `--compare`.
+4. Consider rendering the summary request with thinking off but the
+   conversation's effort instruction kept in the system turn, which keeps
+   prefix reuse without the reasoning decode (estimated 90 s instead of
+   about 250 s per compaction; needs an engine API change).
 
 ### Temporary background responses
 

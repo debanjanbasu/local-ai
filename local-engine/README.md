@@ -454,8 +454,8 @@ providers:
 ```
 
 Oh My Pi compacts when a prompt exceeds `compaction.thresholdTokens`; set it
-to the 32,000 the [threshold sweep](../docs/BONSAI.md#compaction-threshold)
-chose with `omp config set compaction.thresholdTokens 32000`.
+to 32,000 (provisional until the
+[threshold sweep](../docs/BONSAI.md#compaction-threshold) finishes) with `omp config set compaction.thresholdTokens 32000`.
 
 The flags replace Oh My Pi defaults for an unrecognized host that this server
 refuses or would misread. The keys come from the
