@@ -55,7 +55,8 @@ class DocBatcher:
       positions[w]            absolute positions (RoPE)
     """
 
-    def __init__(self, capture_dir, window=256, batch=8, seed=0, val_fraction=0.02):
+    def __init__(self, capture_dir, window=256, batch=8, seed=0, val_fraction=0.02,
+                 min_match=0.0):
         self.paths = sorted(glob.glob(capture_dir + "/shard-*.bin"))
         if not self.paths:
             raise SystemExit(f"no shard-*.bin in {capture_dir}")
@@ -67,6 +68,12 @@ class DocBatcher:
         self.window = window
         self.batch = batch
         self.rng = rng
+        # Greedy self-generated text follows the target's argmax at every
+        # position; prompt text (system prompts, tool schemas, tool results)
+        # does not. A window whose share of argmax-following positions is
+        # below `min_match` is skipped, so transcripts train on what the
+        # target generated rather than on what it was shown.
+        self.min_match = min_match
 
     def _windows(self, paths, shuffle=True):
         order = list(paths)
@@ -92,6 +99,9 @@ class DocBatcher:
             for start in starts:
                 end = min(start + self.window, count)
                 if end - start < 64:
+                    continue
+                if self.min_match and np.mean(
+                        tokens[start + 1:end] == top_ids[start:end - 1, 0]) < self.min_match:
                     continue
                 item = (tokens[start:end], top_ids[start:end], top_logits[start:end],
                         hidden[start:end], start)

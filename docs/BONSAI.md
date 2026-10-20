@@ -105,6 +105,65 @@ ingestion of prefill chunks, take even chunks of at most eight rows. Single-row 
 another, and gate/up use one fused SwiGLU when both share a format; a mixed
 gate/up pair runs as two projections and the elementwise SwiGLU.
 
+#### Fine-tuning the shipped head on code and tool calls (in progress)
+
+Goal: raise draft acceptance on coding-agent output (code, tool-call
+arguments, the reasoning around them) by training the installed head further
+on the target's own greedy transcripts. Status: tooling done and checked; no
+GPU measurement, training run or candidate head exists yet (the shared GPU
+queue never reached these jobs, and a baseline run that started was lost
+with its worktree and may have overlapped another GPU job, so it is not
+reported). Prior attempts above (corpus fine-tuning, general self-rollouts)
+left live acceptance flat or lower, so a win is not assumed.
+
+What works:
+
+- `convert.py from-head HEAD.bin DIR` unpacks the installed head into
+  `DIR/model_mtp_ternary.safetensors`; `--export mtp-head=DIR` re-packs it
+  byte for byte (`83cc7227…`, payload `fb05507f…`). `convert.py to-qat`
+  turns that into a `train_ternary.py --init` checkpoint whose step-0 export
+  is again byte-identical, and `from-ternary` gives a dense copy to use as
+  `--teacher`. The community teacher is not needed (Hugging Face is
+  unreachable from this network; the Kaggle job fetches it if wanted).
+- `tools/mtp_train/rollouts.py` collects greedy transcripts from a running
+  `serve` (code writing in eight languages, real source excerpts from
+  `--repo` checkouts, multi-turn agents over those repositories with
+  read-only tools and in-memory writes, general JSON tool calls), never
+  reusing the bench tasks. `mtp-capture capture` now renders transcript
+  lines (`tools`, replayed `tool_calls`, `reasoning_content`, `thinking`)
+  exactly as the server does; `mtp-capture render` prints them without a
+  model.
+- `train_ternary.py --min-match 0.9` keeps only windows that follow the
+  target's argmax (the generated spans), not prompts or tool output.
+- `tools/mtp_code_bench.py ab` A/Bs heads (ABBA rounds, each served from a
+  scratch root whose `models/` holds only that head, so the installed file is
+  never touched) on 9 code tasks run against tests, 9 agent tool-call turns
+  (edits must apply and pass their test) and 2 prose controls; `summary`
+  prints acceptance, accepted per round, decode tok/s, first-token and total
+  latency, task checks and output identity.
+
+To resume (GPU steps under `lockf -k /tmp/local-ai-gpu.lock`; `W` the
+checkout, `R=$W/.scratch/mtp`):
+
+```bash
+target/release/mtp-capture signs $R/signs && target/release/mtp-capture tables $R/tables
+python tools/mtp_train/convert.py from-head models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin $R/v1-src
+python tools/mtp_train/convert.py to-qat $R/v1-src/model_mtp_ternary.safetensors $R/v1-qat.safetensors
+python tools/mtp_train/convert.py from-ternary $R/v1-src/model_mtp_ternary.safetensors $R/v1-dense.safetensors --signs $R/signs
+# 1. baseline: tools/mtp_code_bench.py ab --head installed=models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin --rounds 1 --out ...
+# 2. rollouts: serve --no-response-store, then rollouts.py --out $R/rollouts.jsonl --repo . --repo <open-source checkouts>
+# 3. target/release/mtp-capture capture --out $R/capture --max-doc-tokens 8192 $R/rollouts.jsonl
+# 4. train_ternary.py --capture $R/capture --tables $R/tables --teacher $R/v1-dense.safetensors \
+#      --signs $R/signs --init $R/v1-qat.safetensors --min-match 0.9 --kl-weight 1 --target-weight 1 \
+#      --epochs 2 --batch 4 --grad-accum 2 --lr 3e-5   (Kaggle T4 approved by the user; private only)
+# 5. convert.py to-ternary qat-final.safetensors CAND --signs $R/signs; local-ai bonsai --export mtp-head=CAND
+# 6. mtp_code_bench.py ab --head installed=... --head cand=CAND/mtp-head-ptq1-v1.bin --rounds 2
+```
+
+Adopting a winner means a new release asset and pin in
+`tools/fetch_mtp_head.py` plus the digests at the top of this section, which
+needs approval to publish.
+
 ## Commands
 
 ```text
