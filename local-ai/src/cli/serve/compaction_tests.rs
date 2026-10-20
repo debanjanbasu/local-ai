@@ -241,6 +241,24 @@ fn summarizer(pieces: &'static [&'static str], seen: Arc<Mutex<Vec<ChatRequest>>
 /// One token per rendered message: enough to drive the budget. What is
 /// counted must render as a prompt, as the engine's count requires.
 #[allow(clippy::needless_pass_by_value)]
+/// A tool-free conversation without reasoning, rendering `messages`.
+fn plain(messages: Vec<ChatMessage>) -> local_engine::ChatRequest {
+    local_engine::ChatRequest {
+        messages,
+        max_tokens: 1,
+        sampling: local_engine::Sampling::default(),
+        thinking: false,
+        effort: local_engine::ReasoningEffort::default(),
+        preserve_thinking: true,
+        session: None,
+        tools: Vec::new(),
+        tool_choice: local_engine::ToolChoice::Auto,
+        parallel_tool_calls: true,
+        response_format: local_engine::ResponseFormat::Text,
+        stop: Vec::new(),
+    }
+}
+
 fn by_messages(messages: Vec<ChatMessage>) -> crate::Result<usize> {
     local_engine::Engine::render_chat_with_tools(&messages, false, &[])?;
     Ok(messages.len())
@@ -320,7 +338,11 @@ fn compact(
         .expect("compact request is valid");
     let pass = prepared
         .history
-        .compaction(keep, Vec::new(), None, by_messages)
+        .compaction(
+            keep,
+            &plain(prepared.history.messages().expect("renders")),
+            by_messages,
+        )
         .expect("plans")
         .expect("something to summarize");
     let request = pass.request.clone();
@@ -630,7 +652,7 @@ fn the_context_budget_decides_when_and_how_much_is_kept() {
     let keep = 3;
     let pass = prepared
         .history
-        .compaction(keep, Vec::new(), None, by_messages)
+        .compaction(keep, &prepared.request, by_messages)
         .expect("plans")
         .expect("due");
     // The kept tail fits the budget, apart from the always-kept instructions
@@ -655,7 +677,7 @@ fn the_context_budget_decides_when_and_how_much_is_kept() {
     // An empty summary would lose the history, so it fails instead.
     let pass = prepared
         .history
-        .compaction(0, Vec::new(), None, by_messages)
+        .compaction(0, &prepared.request, by_messages)
         .expect("plans")
         .expect("due");
     assert!(
@@ -679,7 +701,7 @@ fn a_compacted_conversation_survives_a_restart() {
         let mut prepared = prepare(&body, Some(&conversations), Some(&cipher)).expect("valid");
         let pass = prepared
             .history
-            .compaction(2, Vec::new(), None, by_messages)
+            .compaction(2, &prepared.request, by_messages)
             .expect("plans")
             .expect("due");
         let (item, history) = pass
@@ -789,7 +811,7 @@ fn a_compaction_trigger_turn_answers_with_one_replayable_compaction_item() {
     );
     let pass = prepared
         .history
-        .compaction(3, Vec::new(), None, by_messages)
+        .compaction(3, &prepared.request, by_messages)
         .expect("plans")
         .expect("something to summarize");
     let (item, _) = pass

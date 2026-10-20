@@ -21,7 +21,7 @@ use local_engine::bonsai_model::{PromptCacheSource, StopReason};
 use local_engine::{
     ChatMessage, ChatRequest, EngineHandle, Event, EventStream, GenerationStats, Signal, Stats,
 };
-use local_services::compaction::should_compact;
+use local_services::compaction::{DEFAULT_COMPACT_THRESHOLD, should_compact};
 
 use super::admin::Meter;
 use super::response::{Protocol, error_response, error_status, json_response};
@@ -177,8 +177,9 @@ pub(super) async fn prepare_responses(
     ))
 }
 
-/// Compact `prepared` when its prompt has reached `threshold` or leaves less
-/// than its `max_output_tokens` of the context, before it is generated.
+/// Compact `prepared` when its prompt has reached `threshold` (by default
+/// [`DEFAULT_COMPACT_THRESHOLD`]) or leaves less than its `max_output_tokens`
+/// of the context, before it is generated.
 async fn compact_if_due(
     state: &AppState,
     prepared: PreparedResponses,
@@ -195,16 +196,14 @@ async fn compact_if_due(
         let count = counter(engine, prepared.request.clone());
         let tokens = count(prepared.request.messages.clone())?;
         let reserve = prepared.request.max_tokens;
-        if !should_compact(tokens, threshold, reserve, context) {
+        let threshold = threshold.unwrap_or(DEFAULT_COMPACT_THRESHOLD);
+        if !should_compact(tokens, Some(threshold), reserve, context) {
             return Ok((prepared, None, tokens));
         }
-        let budget = threshold.unwrap_or_else(|| context.saturating_sub(reserve));
-        let pass = prepared.history.compaction(
-            budget / KEEP_DIVISOR,
-            prepared.request.tools.clone(),
-            prepared.request.session.clone(),
-            count,
-        )?;
+        let budget = threshold.min(context.saturating_sub(reserve));
+        let pass = prepared
+            .history
+            .compaction(budget / KEEP_DIVISOR, &prepared.request, count)?;
         Ok::<_, crate::Error>((prepared, pass, tokens))
     })
     .await
@@ -249,12 +248,9 @@ async fn compact_on_trigger(
     let (mut prepared, pass, tokens) = tokio::task::spawn_blocking(move || {
         let count = counter(engine, prepared.request.clone());
         let tokens = count(prepared.request.messages.clone())?;
-        let pass = prepared.history.compaction(
-            tokens / KEEP_DIVISOR,
-            prepared.request.tools.clone(),
-            prepared.request.session.clone(),
-            count,
-        )?;
+        let pass = prepared
+            .history
+            .compaction(tokens / KEEP_DIVISOR, &prepared.request, count)?;
         Ok::<_, crate::Error>((prepared, pass, tokens))
     })
     .await
@@ -334,19 +330,27 @@ async fn compact(
     let (engine, model) = (state.engine.clone(), Arc::clone(&state.model));
     let (prepared, pass, template, tokens) = tokio::task::spawn_blocking(move || {
         let prepared = prepare_compact(&body, store.as_ref(), cipher.as_ref(), &model)?;
-        let template = local_engine::compaction::compaction_request(
-            Vec::new(),
-            Vec::new(),
-            prepared.session.clone(),
-        );
+        // The window as a tool-free conversation without reasoning: this
+        // endpoint takes neither.
+        let template = ChatRequest {
+            messages: prepared.history.messages()?,
+            max_tokens: 1,
+            sampling: local_engine::Sampling::default(),
+            thinking: false,
+            effort: local_engine::ReasoningEffort::default(),
+            preserve_thinking: true,
+            session: prepared.session.clone(),
+            tools: Vec::new(),
+            tool_choice: local_engine::ToolChoice::Auto,
+            parallel_tool_calls: true,
+            response_format: local_engine::ResponseFormat::Text,
+            stop: Vec::new(),
+        };
         let count = counter(engine, template.clone());
-        let tokens = count(prepared.history.messages()?)?;
-        let pass = prepared.history.compaction(
-            tokens / KEEP_DIVISOR,
-            Vec::new(),
-            prepared.session.clone(),
-            count,
-        )?;
+        let tokens = count(template.messages.clone())?;
+        let pass = prepared
+            .history
+            .compaction(tokens / KEEP_DIVISOR, &template, count)?;
         Ok::<_, crate::Error>((prepared, pass, template, tokens))
     })
     .await
