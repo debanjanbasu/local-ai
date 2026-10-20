@@ -951,7 +951,10 @@ fn out_of_band_generations_are_recorded_as_completions() {
             cancel: Arc::new(|| {}),
         })
     });
-    let request = local_engine::compaction::compaction_request(Vec::new(), Vec::new(), None);
+    let request = local_engine::compaction::reasoning_summary_request(
+        "thought",
+        local_engine::compaction::SummaryDetail::Auto,
+    );
     let mut generation = super::super::batches::metered(
         submit(request).unwrap(),
         super::Meter::into_store(Some(&admin), line),

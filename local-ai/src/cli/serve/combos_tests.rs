@@ -560,7 +560,7 @@ fn compacted(
     let mut prepared = prepared(&body, store, Some(cipher));
     let pass = prepared
         .history
-        .compaction(2, Vec::new(), None, by_messages)
+        .compaction(2, &prepared.request, by_messages)
         .expect("plans")
         .expect("something to summarize");
     let (item, history) = pass

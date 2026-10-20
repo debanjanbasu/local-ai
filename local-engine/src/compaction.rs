@@ -10,9 +10,11 @@
 //! [`EngineHandle::count_chat_tokens`](crate::EngineHandle::count_chat_tokens)
 //! against the context in [`EngineInfo`](crate::EngineInfo).
 //!
-//! Both requests run with thinking off, so the summary is the generation's
-//! visible content and never its raw reasoning; a request is answered by
-//! collecting [`Event::Content`](crate::Event::Content) pieces only.
+//! A reasoning summary runs with thinking off, and a compaction summary
+//! reasons only when the conversation it summarizes does; either way the
+//! summary is the generation's visible content and never its raw reasoning:
+//! a request is answered by collecting
+//! [`Event::Content`](crate::Event::Content) pieces only.
 
 use crate::{
     ChatMessage, ChatRequest, GenerateParams, ReasoningEffort, ResponseFormat, Sampling, ToolChoice,
@@ -22,6 +24,10 @@ use crate::{ToolDefinition, runtime::DEFAULT_MAX_OUTPUT_TOKENS};
 /// The output budget of one compaction summary.
 pub const COMPACTION_MAX_TOKENS: usize = 2_048;
 
+/// The extra output budget of a compaction summary of a reasoning
+/// conversation, for the reasoning before it.
+pub const COMPACTION_REASONING_TOKENS: usize = 4_096;
+
 /// Sampling temperature for summaries: low, because a summary should restate,
 /// not invent.
 const SUMMARY_TEMPERATURE: f32 = 0.3;
@@ -29,10 +35,11 @@ const SUMMARY_TEMPERATURE: f32 = 0.3;
 /// The instruction that ends a compaction request, after the history it
 /// summarizes.
 pub const COMPACTION_PROMPT: &str = "\
-CONTEXT CHECKPOINT COMPACTION. The conversation above will be removed from your context \
-and replaced by what you write now, so write a summary that lets you continue the task \
-without it. If the conversation begins with an earlier summary, fold it in. Record, \
-precisely and without inventing anything:
+CONTEXT CHECKPOINT COMPACTION. The older part of the conversation above will be removed from \
+your context and replaced by what you write now; its most recent turns stay after your summary \
+verbatim. Write a summary that lets you continue the task without the removed part. If the \
+conversation begins with an earlier summary, fold it in. Record, precisely and without \
+inventing anything:
 - the user's goals, requirements and constraints;
 - decisions made, and why;
 - work completed, with the exact file paths, names, identifiers, commands, values and \
@@ -132,25 +139,43 @@ fn summary_request(
     }
 }
 
-/// The request that summarizes `history` for a context checkpoint.
+/// The request that summarizes `conversation`'s history for a context
+/// checkpoint: its messages (an earlier summary first, as
+/// [`summary_message`] renders it), then [`COMPACTION_PROMPT`].
 ///
-/// `history` is rendered exactly as the conversation's own turns are (an
-/// earlier summary first, as [`summary_message`] renders it), followed by
-/// [`COMPACTION_PROMPT`]. `tools` and `session` should be the conversation's,
-/// so the prompt cache can reuse the prefix those turns already prefilled.
-/// The summary is the visible content of the generation.
+/// It renders exactly as `conversation` does, with the same tools, session
+/// and reasoning, so its prompt extends the conversation's: the prompt cache
+/// keeps exact prefixes only at snapshot boundaries (the previous request's
+/// tail among them), and a summary of a shorter prefix, or under another
+/// system turn, would prefill the whole history again. The whole history is
+/// summarized, including the newest items a caller keeps verbatim. When the
+/// conversation reasons, the summary does too, with
+/// [`COMPACTION_REASONING_TOKENS`] more output; the summary is the visible
+/// content of the generation either way.
 #[must_use]
-pub fn compaction_request(
-    mut history: Vec<ChatMessage>,
-    tools: Vec<ToolDefinition>,
-    session: Option<String>,
-) -> ChatRequest {
-    history.push(ChatMessage {
+pub fn compaction_request(conversation: &ChatRequest) -> ChatRequest {
+    let mut messages = conversation.messages.clone();
+    messages.push(ChatMessage {
         role: "user".into(),
         content: COMPACTION_PROMPT.into(),
         ..ChatMessage::default()
     });
-    summary_request(history, tools, session, COMPACTION_MAX_TOKENS)
+    let reasoning = if conversation.thinking {
+        COMPACTION_REASONING_TOKENS
+    } else {
+        0
+    };
+    ChatRequest {
+        thinking: conversation.thinking,
+        effort: conversation.effort,
+        preserve_thinking: conversation.preserve_thinking,
+        ..summary_request(
+            messages,
+            conversation.tools.clone(),
+            conversation.session.clone(),
+            COMPACTION_MAX_TOKENS + reasoning,
+        )
+    }
 }
 
 /// How a compacted `summary` is rendered back into a prompt: one user
@@ -197,8 +222,13 @@ mod tests {
     use crate::Engine;
 
     #[test]
-    fn compaction_requests_render_the_history_then_the_prompt_without_thinking() {
-        let history = vec![
+    fn compaction_requests_extend_the_conversations_prompt() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "Be careful.".into(),
+                ..ChatMessage::default()
+            },
             summary_message("Earlier: the user wants a CSV parser."),
             ChatMessage {
                 role: "user".into(),
@@ -206,19 +236,40 @@ mod tests {
                 ..ChatMessage::default()
             },
         ];
-        let request = compaction_request(history, Vec::new(), Some("s".into()));
-        assert!(!request.thinking);
-        assert_eq!(request.max_tokens, COMPACTION_MAX_TOKENS);
-        assert_eq!(request.session.as_deref(), Some("s"));
-        assert_eq!(request.messages.len(), 3);
-        assert!(request.messages[0].content.starts_with(SUMMARY_HEADER));
-        let rendered =
-            Engine::render_chat_with_tools(&request.messages, request.thinking, &request.tools)
-                .unwrap_or_default();
-        let summary = rendered.find("CSV parser").unwrap_or(usize::MAX);
-        let ask = rendered.find("Add quoting").unwrap_or(0);
-        let prompt = rendered.find("CONTEXT CHECKPOINT").unwrap_or(0);
-        assert!(summary < ask && ask < prompt, "{rendered}");
+        let tool = ToolDefinition {
+            name: "read".into(),
+            description: Some("Read a file.".into()),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+            strict: false,
+        };
+        for thinking in [false, true] {
+            let conversation = ChatRequest {
+                messages: messages.clone(),
+                thinking,
+                effort: ReasoningEffort::Medium,
+                ..summary_request(Vec::new(), vec![tool.clone()], Some("s".into()), 64)
+            };
+            let request = compaction_request(&conversation);
+            assert_eq!(request.thinking, thinking);
+            assert_eq!(request.effort, ReasoningEffort::Medium);
+            assert_eq!(request.tool_choice, ToolChoice::None, "no call may be made");
+            assert_eq!(
+                request.max_tokens,
+                COMPACTION_MAX_TOKENS + if thinking { COMPACTION_REASONING_TOKENS } else { 0 }
+            );
+            assert_eq!(request.session.as_deref(), Some("s"));
+            let render = |request: &ChatRequest| {
+                Engine::render_chat_with_tools(&request.messages, request.thinking, &request.tools)
+                    .expect("renders")
+            };
+            let (own, summary) = (render(&conversation), render(&request));
+            // Everything but the generation opener is a prefix of the summary.
+            let opener = own.rfind("<|im_start|>assistant").expect("opener");
+            assert!(summary.starts_with(&own[..opener]), "{summary}");
+            let ask = summary.find("Add quoting").unwrap_or(usize::MAX);
+            let prompt = summary.find("CONTEXT CHECKPOINT").unwrap_or(0);
+            assert!(ask < prompt, "{summary}");
+        }
     }
 
     #[test]
