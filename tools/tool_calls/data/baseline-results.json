@@ -1,0 +1,134 @@
+[
+  {
+    "name": "codex-fix-0",
+    "client": "codex",
+    "task": "fix",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 160.3,
+    "requests": 5,
+    "diff": "calc.py | 2 +-;  1 file changed, 1 insertion(+), 1 deletion(-)"
+  },
+  {
+    "name": "opencode-fix-0",
+    "client": "opencode",
+    "task": "fix",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 112.0,
+    "requests": 6,
+    "diff": "calc.py | 2 +-;  1 file changed, 1 insertion(+), 1 deletion(-)"
+  },
+  {
+    "name": "opencode-responses-fix-0",
+    "client": "opencode-responses",
+    "task": "fix",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 82.5,
+    "requests": 6,
+    "diff": "calc.py | 2 +-;  1 file changed, 1 insertion(+), 1 deletion(-)"
+  },
+  {
+    "name": "codex-rename-0",
+    "client": "codex",
+    "task": "rename",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 66.6,
+    "requests": 7,
+    "diff": "app/models.py    | 4 ++--;  app/views.py     | 2 +-;  utils/strings.py | 2 +-;  3 files changed, 4 insertions(+), 4 deletions(-)"
+  },
+  {
+    "name": "opencode-rename-0",
+    "client": "opencode",
+    "task": "rename",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 81.3,
+    "requests": 6,
+    "diff": "app/models.py    | 4 ++--;  app/views.py     | 2 +-;  utils/strings.py | 2 +-;  3 files changed, 4 insertions(+), 4 deletions(-)"
+  },
+  {
+    "name": "opencode-responses-rename-0",
+    "client": "opencode-responses",
+    "task": "rename",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 78.9,
+    "requests": 7,
+    "diff": "app/models.py    | 4 ++--;  app/views.py     | 2 +-;  utils/strings.py | 2 +-;  3 files changed, 4 insertions(+), 4 deletions(-)"
+  },
+  {
+    "name": "codex-config-0",
+    "client": "codex",
+    "task": "config",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 81.9,
+    "requests": 11,
+    "diff": "service/settings/network.py | 2 +-;  1 file changed, 1 insertion(+), 1 deletion(-)"
+  },
+  {
+    "name": "opencode-config-0",
+    "client": "opencode",
+    "task": "config",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 70.7,
+    "requests": 5,
+    "diff": "service/settings/network.py | 2 +-;  1 file changed, 1 insertion(+), 1 deletion(-)"
+  },
+  {
+    "name": "opencode-responses-config-0",
+    "client": "opencode-responses",
+    "task": "config",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 66.5,
+    "requests": 7,
+    "diff": "service/settings/network.py | 2 +-;  1 file changed, 1 insertion(+), 1 deletion(-)"
+  },
+  {
+    "name": "codex-implement-0",
+    "client": "codex",
+    "task": "implement",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 68.7,
+    "requests": 6,
+    "diff": "textstats.py | 10 +++++++++-;  1 file changed, 9 insertions(+), 1 deletion(-)"
+  },
+  {
+    "name": "opencode-implement-0",
+    "client": "opencode",
+    "task": "implement",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 73.6,
+    "requests": 6,
+    "diff": "textstats.py | 6 +++++-;  1 file changed, 5 insertions(+), 1 deletion(-)"
+  },
+  {
+    "name": "opencode-responses-implement-0",
+    "client": "opencode-responses",
+    "task": "implement",
+    "repeat": 0,
+    "task_ok": true,
+    "exit": 0,
+    "seconds": 64.5,
+    "requests": 5,
+    "diff": "textstats.py | 8 +++++++-;  1 file changed, 7 insertions(+), 1 deletion(-)"
+  }
+]
