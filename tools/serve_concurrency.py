@@ -17,8 +17,8 @@ Phases, for each stream count N (default 1, 2, 4, 8):
   Reports its TTFT, and for the decoding streams the gaps while it prefilled
   (p50, p99 and the longest stall) and their tok/s during the prefill against
   before it. With N = 1 the long prompt runs alone.
-- `late`: the long prompt first, alone, and N-1 short requests arriving
-  0.7 s apart while it prefills; reports their TTFT (N > 1).
+- `late`: the long prompt first, alone, and N-1 one-token requests
+  arriving 2.3 s apart while it prefills; reports their TTFT (N > 1).
 - `shared` (not run by default): N requests 0.3 s apart sharing that long
   prompt as their system message, none cached, each with its own question,
   as sub-agents fanned out at once; reports their TTFTs.
@@ -332,10 +332,11 @@ def requests_for(phase: str, n: int, args: argparse.Namespace) -> list:
         return [(f"s{i}", shared_prompt(tag, i, args.long_chars), 64, 0.3 * i) for i in range(n)]
     if n == 1:
         return []
-    # `late`: short requests arriving while the long one prefills with nothing
-    # else running.
+    # `late`: short requests arriving 2.3 s apart while the long one prefills
+    # with nothing else running; each ends at its first token, so the next
+    # finds the long one alone again.
     return [("long", long_prompt(tag, args.long_chars), 64, 0.0),
-            *((f"s{i}", short_prompt(tag, i), 64, args.long_delay + 0.7 * i)
+            *((f"s{i}", short_prompt(tag, i), 1, args.long_delay + 2.3 * i)
               for i in range(n - 1))]
 
 
