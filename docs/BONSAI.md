@@ -2673,6 +2673,22 @@ cost: RMSNorm with rotation 3.4%, QKV/gate concatenation 4.0%, BF16 folding
 2.3%, SwiGLU 1.3%, convolution 0.8%. The BF16 load change alone took plain
 decode from 19.23 to 20.39 tok/s.
 
+### Log-probabilities
+
+A request that does not ask for log-probabilities encodes no extra kernel
+and copies no row, so Codex, Oh My Pi and opencode, which never ask, see no
+change. Two interleaved rounds of the server built without and with
+log-probabilities support (default speculation and sampling, 256-token
+answers, seed 11, `reasoning_effort: "none"`): decode median 105.69 and
+105.85 tok/s (8 runs each, every run 105.2-106.0), cold prefill of
+about 2.3K-token prompts median 129.59 and 129.58 tok/s (6 runs each,
+129.5-129.7), with byte-identical answers. Asking costs one two-pass
+reduction over the 248,320 logits of each selecting row: the same build
+decoded at 105.60 tok/s median with `top_logprobs: 0` and 105.51 with 20
+(−0.2% and −0.3%, within run-to-run spread), again with the same answer.
+Against an f64 reference the kernel's log-sum-exp is within 1e-5 relative
+and its top 20 are bit-exact, ties going to the lower id like argmax.
+
 ## Tried and rejected
 
 Entries are measured on the build current when they were tried. Decode rates

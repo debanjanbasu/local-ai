@@ -2006,10 +2006,9 @@ fn logprob(
 }
 
 /// `logprobs`/`top_logprobs` (Chat) and `include`/`top_logprobs`
-/// (Responses) ask the engine for that many alternatives, and each API
-/// reports the tokens in `OpenAI`'s shape next to the text they produced.
+/// (Responses) ask the engine for that many alternatives.
 #[test]
-fn logprobs_reach_both_apis_in_the_openai_shape() {
+fn logprobs_requests_ask_for_their_alternatives() {
     let with = |body: Value| {
         chat_request(&body, true)
             .expect("valid")
@@ -2038,7 +2037,12 @@ fn logprobs_reach_both_apis_in_the_openai_shape() {
     );
     assert_eq!(responses(json!({"input":"hi","top_logprobs":2})), Some(2));
     assert!(responses_error(&json!({"input":"hi","top_logprobs":21})).contains("between 0 and 20"));
+}
 
+/// Each API reports the tokens in `OpenAI`'s shape next to the text they
+/// produced.
+#[test]
+fn logprobs_reach_both_apis_in_the_openai_shape() {
     let first = logprob(9, "Hi", -0.25, &[(9, "Hi", -0.25), (4, "Hey", -1.5)]);
     // A split character: `token` is lossy, `bytes` exact.
     let second = local_engine::TokenLogprob {
