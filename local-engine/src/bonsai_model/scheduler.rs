@@ -60,11 +60,6 @@ const PREFILL_FOLD_MIN: usize = 24;
 /// so their last block does not stall the others either.
 const PREFILL_WHOLE_DECODING: usize = 128;
 
-/// Prompt tokens one step prefills while nothing decodes: one full block.
-/// Bounded only so a request arriving behind a long prompt is admitted, and
-/// can start its own shorter prefill, within about five seconds.
-const PREFILL_CHUNK_ALONE: usize = 512;
-
 /// Free sequence buffer sets kept for the next request instead of being
 /// released: one avoids reallocating ~80 MB of state per request under a
 /// steady stream of overlapping requests.
@@ -188,7 +183,7 @@ impl BonsaiEngine {
     /// round's pass when it is long (see [`Self::fold_candidate`]), else after
     /// the round, whole if it had at most [`PREFILL_WHOLE_DECODING`] tokens
     /// to prefill, else one [`PREFILL_CHUNK_DECODING`]-token chunk, while
-    /// others decode, and up to [`PREFILL_CHUNK_ALONE`] tokens while none do.
+    /// others decode, and one prefill block while none do.
     /// `emit`
     /// receives each generation's text with its id, `progress` each prefill
     /// chunk boundary.
@@ -282,7 +277,11 @@ impl BonsaiEngine {
             .min_by_key(|&(_, remaining)| remaining)?;
         let short = self.active[index].prefill_total() <= PREFILL_WHOLE_DECODING;
         let budget = if running == 0 {
-            PREFILL_CHUNK_ALONE
+            // One prefill block, each its own GPU round trip either way: a
+            // request arriving behind a long prompt is admitted, and can start
+            // its own shorter prefill, after at most one block (about four
+            // seconds for 512 tokens).
+            self.info.prefill_chunk_size
         } else if short {
             remaining
         } else {
@@ -291,7 +290,9 @@ impl BonsaiEngine {
         let id = self.active[index].id;
         let result = self.make_resident(index).and_then(|()| {
             let mut generation = self.active.swap_remove(index);
-            let result = self.prefill_round(&mut generation, budget, progress);
+            let result = self
+                .refresh_prefix(&mut generation)
+                .and_then(|()| self.prefill_round(&mut generation, budget, progress));
             self.active.push(generation);
             result
         });
@@ -592,10 +593,13 @@ impl BonsaiEngine {
         {
             return None;
         }
-        let run = generation
-            .prefill
-            .as_ref()?
-            .plain_run(generation.prompt.len());
+        let plan = generation.prefill.as_ref()?;
+        // A prompt's first chunk goes through `step_prefill`, which first
+        // looks for a longer cached prefix than the one admission restored.
+        if plan.done() == plan.reused {
+            return None;
+        }
+        let run = plan.plain_run(generation.prompt.len());
         let chunk = (seeds + PREFILL_FOLD_MIN).next_multiple_of(8) - seeds;
         let limit = self
             .model

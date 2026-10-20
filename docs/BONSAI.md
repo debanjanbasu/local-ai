@@ -1634,7 +1634,14 @@ turn instead of batching measured 32.7 tok/s aggregate at two streams against
 
 Admission only restores a request's reusable prompt prefix. Its prefill then
 runs inside the engine's steps, one prompt per step: the one with the fewest
-tokens left. A prompt of at most 128 tokens to prefill (a typical
+tokens left. Its first chunk always runs in a pass of its own, which first
+asks the prompt cache again for a longer prefix than admission restored and
+restores that one when it gains at least one token in 64 of it: requests
+admitted together that share a long uncached prefix (sub-agents fanned out
+at once) prefill one after another, and each later one starts from the
+snapshot the first wrote at the end of that prefix, waiting for it if the
+write is still in flight, instead of prefilling it again (see
+[Concurrency measurements](#concurrency-measurements)). A prompt of at most 128 tokens to prefill (a typical
 chat turn) goes whole, in a pass of its own after the step's decode round. A
 longer one, beside two or more decoding requests, prefills inside their
 batched pass: its chunk's rows are stacked after theirs, run every layer with
@@ -1653,8 +1660,12 @@ rounds, prefill 32 tokens in a pass of their own after the step's decode
 round, which handles the milestone (the GPU tier is claimed for the
 prefilling sequence's buffer set, so a checkpoint never describes another
 request's state) and takes the first sample. With nothing decoding, a step
-prefills up to 512 tokens, which only bounds how long a newly arrived request
-waits to be admitted. A cancellation between two chunks ends the request with
+prefills one block (512 tokens, about four seconds), so a request arriving
+behind a long prompt is admitted, and can start its own shorter prefill,
+within a block; each block is its own GPU round trip either way, so this
+costs the prompt nothing (measured with 128-token blocks, before blocks grew
+to 512: 6.6K tokens alone, 51.9 s at one block a step against 52.1 s at
+four). A cancellation between two chunks ends the request with
 no tokens and clears the prompt cache, as a cancelled single-pass prefill did.
 
 The chunk size trades the running requests' inter-token gap against the
@@ -1701,6 +1712,81 @@ the folded pass:
 | Earlier kernels, one pass | 96.9 s | 97 s stall | 0.04 |
 | Earlier kernels, chunk 48 | 123.0 s | 0.64 / 0.68 s | 6.2 |
 | Earlier kernels, chunk 128 | 103.3 s | 1.43 / 1.51 s | 2.9 |
+
+#### Concurrency measurements
+
+`tools/serve_concurrency.py` starts the server with a scratch HOME (cold
+prompt cache) and streams greedy Chat Completions with reasoning off. A gap
+is the wait between two engine steps that streamed a request text (chunks
+within 5 ms of each other count once). M4 Pro, shared with other work, one
+run each between 11:00 and 12:20 AEDT on 2026-10-20, `b09e22f` against this
+branch. The shared GPU lock was then taken with plain `lockf`, which deletes
+its file on exit, so another thread's GPU job may have overlapped these runs:
+treat every timing in this section as provisional until it is rerun under
+`lockf -k` (a first run of the base build at 09:50, before the lock problem,
+measured 34.0, 48.9, 59.7 and 72.0 tok/s aggregate decode and the same mixed
+results within 2%).
+
+| Streams, 300-token answers | Aggregate tok/s | Per stream | TTFT p50 | Gap p50 / p99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 32.0 / 35.4 | 33.6 / 37.0 | 0.45 / 0.39 s | 52 / 110 ms, 48 / 78 ms |
+| 2 | 47.3 / 50.6 | 50.1 / 53.4 | 0.63 / 0.60 s | 52 / 324 ms, 48 / 303 ms |
+| 4 | 55.5 / 59.8 | 31.2 / 33.8 | 1.06 / 1.00 s | 82 / 484 ms, 78 / 461 ms |
+| 8 | 73.8 / 74.8 | 14.3 / 14.7 | 1.70 / 1.64 s | 92 / 492 ms, 93 / 476 ms |
+
+The scheduling changes do not touch these steps; the spread is run-to-run
+noise. With N-1 streams decoding 512-token answers, a 6,607-token prompt
+arrives 3 s in (this branch; `b09e22f` within 2%):
+
+| Streams | Long prompt TTFT | Its prefill | Decoding streams before / during it | Gap p50 / p99 during it | Longest stall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (alone) | 51.9 s | 127 tok/s | | | |
+| 2 | 73.6 s | 90 tok/s | 42.2 / 5.3 tok/s | 354 / 393 ms | 0.44 s |
+| 4 | 70.2 s | 94 tok/s | 46.7 / 10.2 tok/s | 307 / 324 ms | 0.33 s |
+| 8 | 83.8 s | 79 tok/s | 18.8 / 22.9 tok/s | 315 / 333 ms | 0.56 s |
+
+No stream waits more than about half a second for its next token while a
+long prompt prefills; without chunking the same prompt stalled every stream
+for its whole prefill (the first table above). What fairness costs is
+throughput, on both sides: beside a lone stream the prompt takes a 32-token
+pass after each of that stream's speculative rounds (about 300 ms against
+about 40), so the stream keeps an eighth of its speed and the prompt 70% of
+its own. Folded passes beside four or eight streams sit close to what time
+slicing at full block efficiency would give both.
+
+Sub-agents fanned out at once usually share a long prefix that no earlier
+request cached (their instructions and tool schemas). Four requests 0.3 s
+apart sharing a 6.6K-token system prompt, each with its own question:
+
+| Build | TTFT first / mean / last | All four done |
+| --- | ---: | ---: |
+| `b09e22f` | 52.1 / 132.9 / 213.3 s | 214.5 s |
+| Prefix refresh | 51.8 / 52.6 / 53.5 s | 57.2 s |
+
+Each request restored what the cache held at admission, nothing, and
+prefilled the shared prefix again, one after another. Asking the cache again
+at a prompt's first prefill step finds the snapshot the first request wrote
+at the end of the system turn, so the others prefill only their question.
+Their text is byte-identical. Running a prompt's first chunk in a pass of its
+own, so it can restore first, costs one unfolded step per long prompt (the
+longest stall beside three streams 0.38 s against 0.33 s, the prompt's TTFT
+unchanged at 70.2 s); the different pass shapes moved one of those three
+streams' 512 greedy tokens to another continuation at a near-tie after 185
+chunks.
+
+Open items on this branch (`opt-parallel-sched`): rerun the tables above
+under `lockf -k` (`tools/serve_concurrency.py`, default phases plus
+`--phases shared --streams 2,4`, base `b09e22f` and the branch head
+back to back); run `tools/client_compat.py --scenarios
+codex-fanout,opencode-fanout` to see whether Codex 0.163 (the
+`multi_agent_v1` tools, up to six sub-agents, spawned one call at a time but
+running concurrently) and opencode 1.19 (several `task` calls in one turn run
+concurrently, no cap) fan out against this server, with peak concurrent
+requests and the prefix the sub-agents share; and measure a lone decoding
+stream beside a long prefill with a decode-only round between its prompt
+chunks (modelled: that stream 5.3 to about 9 tok/s, the prompt 90 to about
+86 tok/s), the one case where chunked prefill sits well below what time
+slicing would give both.
 
 #### Speculation in a batch
 
@@ -2124,6 +2210,27 @@ layout, MTP configuration, tokens, recurrent state, and target and head K/V.
    discovered at startup, and trimmed within the automatic disk budget (at
    startup too, so a store a previous process left over budget is trimmed
    before the first request).
+
+A request restores the longest prefix any tier holds, the cheaper tier on a
+tie, and a failed restore falls back to the next longest. The tiers used to
+be asked in order, so any matching GPU checkpoint won over a longer disk
+snapshot. In a compacted 64K Codex-style session (one `xhigh` run) that pinned
+four turns of 19K–31K-token prompts to a 12,980-token checkpoint while disk
+held their predecessors' 16K–25K snapshots, and steps grew from 30 s to
+179 s. By a trace of the eviction rule (not yet confirmed on that session),
+the GPU tier had stopped keeping new checkpoints: every turn after
+the compaction re-rendered the last answer differently from what was
+generated, so each left a divergence boundary barely extending the previous
+turn's, those boundaries filled the four slots, and each new penultimate
+checkpoint, a request tail, was the eviction victim the moment it was saved.
+The two newest GPU checkpoints (the last request's boundary or penultimate
+token, and its end) are now never the victim; eviction picks among the
+others by the disk tier's rule below. Both are on `opt-parallel-sched` but not yet
+checked on the GPU: `agent_turns_keep_restoring_the_previous_prompt` (seven
+turns, each extending the last by a re-rendered answer) is written to fail on
+`b09e22f` at its fourth turn and pass with the fix, the existing prompt-cache
+and scheduler tests still need a run, and the compacted 64K `xhigh` session
+needs a rerun on the compaction branch with this engine.
 
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename

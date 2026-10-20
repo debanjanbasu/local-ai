@@ -442,7 +442,7 @@ pub fn barely_extends(child: &[u32], parent: &[u32]) -> bool {
 /// 3. else the oldest boundary.
 ///
 /// The disk tier applies it until its byte budget holds, the GPU tier when
-/// it holds one checkpoint too many.
+/// it holds one checkpoint too many, to all but its two newest checkpoints.
 pub fn next_victim(entries: &[(&[u32], bool)]) -> Option<usize> {
     let near_duplicate = |&(tokens, boundary): &(&[u32], bool)| {
         boundary
