@@ -1138,7 +1138,8 @@ only adapts them ([engine contract](../local-engine/README.md#compaction-and-rea
 `instructions` and `prompt_cache_key` (`prompt_cache_options` is refused,
 `service_tier` as elsewhere, and unknown members are ignored) and returns
 a `response.compaction` object. It counts the resolved window, keeps the
-newest items up to a quarter of that count verbatim, and summarizes the rest.
+newest items up to a quarter of that count verbatim, and replaces the rest by
+a summary (written from the whole window, kept items included).
 `output` is the kept items, then one `compaction` item whose
 `encrypted_content` is the summary *and* the kept items, sealed with the
 `--reasoning-key` cipher under its own domain and bound to the model and item
@@ -1158,7 +1159,9 @@ everything after it. Items before it are skipped, so the client, the response
 store and the conversation keep every original item while the prompt shrinks.
 
 `context_management: [{"type":"compaction","compact_threshold":N}]` on
-`POST /v1/responses` (one entry, `N` at least 1000 or null) compacts before
+`POST /v1/responses` (one entry, `N` at least 1000, or null or absent for the
+server's default of 32,000, chosen by the
+[threshold sweep](#compaction-threshold)) compacts before
 generation when the exact prompt count reaches `N`, or when the prompt leaves
 less than `max_output_tokens` (default 8,192) of the admitted context, which is
 the output space the harness reserves. The kept budget is a quarter of `N` (or
@@ -1216,16 +1219,27 @@ before the next is generated, so a subscriber or a replay sees it at once,
 and a cancel, delete or shutdown during it stops it at its next piece
 (`cancelled`, or `failed` saying why). Its output budget is 160, 320 or 900 tokens by detail.
 
-Cost: a compaction prefills the summarized history again unless the prompt
-cache still holds it (the summary request renders the conversation's own
-tools and session to share that prefix) and decodes up to 2,048 tokens; a
+Cost: the summary request is the conversation's own request (its messages,
+tools, session and reasoning effort) with the compaction prompt appended as
+one more user turn, so its prompt extends the one the conversation's last
+turn prefilled, and the prompt cache serves everything up to that turn's
+snapshot. The cache keeps exact prefixes only at snapshot boundaries (the
+recurrent layers' state cannot be rewound), so a summary of a shorter prefix,
+or one rendered under another system turn (thinking off for a conversation
+that reasons, whose effort instruction leads the system turn), would prefill
+the whole history again: before this change a 32K-token compaction cost about
+five minutes of prefill. A compaction of a conversation that reasons reasons
+too (at its effort, with 4,096 more output tokens for it); the summary is the
+answer either way, up to 2,048 tokens. The prompt after a compaction (summary
+and kept quarter) is new and is prefilled cold. A
 reasoning summary prefills the reasoning plus about 70 tokens and decodes up
 to its budget. Both run for the Response, so both are in its `usage`: the
 pinned `ResponseUsage` has no field of its own for them, so their prompt
 tokens are added to `input_tokens` (their reused prefix to `cached_tokens`),
 their generated tokens to `output_tokens`, and `total_tokens` stays
-`input_tokens + output_tokens`; `reasoning_tokens` is the answer's own, as
-neither reasons. A compaction discarded for not shortening the prompt still
+`input_tokens + output_tokens`; `reasoning_tokens` is the answer's own (a
+compaction's reasoning counts only in `output_tokens`; a `compaction_trigger`
+turn's usage is the summary generation's, reasoning tokens included). A compaction discarded for not shortening the prompt still
 counts. Risk: a summary is
 lossy and is believed by every later turn; an exact string the model left out
 is gone from the prompt, and a mistaken summary is not detectable from it.
