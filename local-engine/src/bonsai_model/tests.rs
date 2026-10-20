@@ -315,6 +315,75 @@ fn shared_system_prefix_reuses_across_sessions_and_restart() {
     );
 }
 
+/// An agent session after a compaction: every turn re-renders the last
+/// answer differently from what was generated, so each one leaves a
+/// divergence boundary that barely extends the previous turn's. Every turn
+/// must still restore the whole previous prompt from the GPU tier, not an
+/// older boundary the tier kept while the newer checkpoints were evicted.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn agent_turns_keep_restoring_the_previous_prompt() {
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
+    let open = || {
+        BonsaiEngine::open_with_options(
+            Path::new(&path),
+            Some(1024),
+            DEFAULT_PREFILL_CHUNK,
+            None,
+            &MtpMode::Off(None),
+            NgramSettings::default(),
+            KvOptions::default(),
+        )
+        .expect("load model")
+    };
+    let params = GenerateParams {
+        temperature: 0.0,
+        max_tokens: 8,
+        ..GenerateParams::default()
+    };
+    let system = "You are a careful filing clerk who keeps an inventory. ".repeat(24);
+    let opener = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    let mut rendered = format!(
+        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\nFile item 1.<|im_end|>\n{opener}"
+    );
+    let cache = tempfile::tempdir().expect("cache directory");
+    let mut engine = open();
+    engine.set_prompt_cache_checkpoints(4).expect("checkpoints");
+    engine.set_session_cache(0, Some(cache.path().to_owned()));
+    let mut previous: Option<Vec<u32>> = None;
+    let mut last = None;
+    for turn in 1..=7 {
+        let prompt = engine.tokenizer.encode(&rendered).expect("prompt");
+        let run = engine
+            .generate_session(&prompt, &params, Some("agent"), |_| true)
+            .expect("turn");
+        if let Some(previous) = &previous {
+            assert!(prompt.starts_with(previous), "turn {turn} extends the last");
+            assert_eq!(
+                (run.stats.reused_prompt_tokens, run.cache_source),
+                (previous.len() - 1, PromptCacheSource::Gpu),
+                "turn {turn} of {} tokens",
+                prompt.len()
+            );
+        }
+        last = Some((prompt.clone(), run.token_ids));
+        previous = Some(prompt);
+        rendered.push_str(&format!(
+            "Noted: item {turn} sits in drawer {}.<|im_end|>\n<|im_start|>user\nFile item {}.<|im_end|>\n{opener}",
+            turn * 7,
+            turn + 1
+        ));
+    }
+    let (prompt, tokens) = last.expect("turns ran");
+    assert_eq!(
+        tokens,
+        open()
+            .generate(&prompt, &params, |_| true)
+            .expect("cold reference")
+            .token_ids
+    );
+}
+
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {

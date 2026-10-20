@@ -308,6 +308,40 @@ impl BonsaiEngine {
         Ok(generation)
     }
 
+    /// Restore a longer prompt prefix into the resident `generation`, which
+    /// has prefilled nothing yet, when the prompt cache gained one after its
+    /// admission: requests admitted together that share a long uncached
+    /// prefix (sub-agents fanned out at once) prefill one at a time, and each
+    /// later one then starts from the snapshot the first left at that prefix
+    /// instead of prefilling it again.
+    pub(super) fn refresh_prefix(
+        &mut self,
+        generation: &mut ActiveGeneration,
+    ) -> crate::Result<()> {
+        let Some(plan) = &generation.prefill else {
+            return Ok(());
+        };
+        let reused = plan.reused;
+        if plan.done() != reused {
+            return Ok(());
+        }
+        let best = self.reusable_prefix(&generation.prompt);
+        // A restore costs in proportion to the prefix it copies, prefill in
+        // proportion to the tokens it saves (about 8 ms against 0.1 ms each).
+        if best <= reused || (best - reused) * 64 < best {
+            return Ok(());
+        }
+        self.model.take_gpu_time();
+        self.claim_gpu_cache();
+        let (plan, cache_source) =
+            self.begin_prompt(&generation.prompt, generation.session_id.as_deref())?;
+        generation.stats.reused_prompt_tokens = plan.reused;
+        generation.cache_source = cache_source;
+        generation.prefill = Some(plan);
+        generation.stats.gpu += self.model.take_gpu_time();
+        Ok(())
+    }
+
     /// Prefill up to `budget` more prompt tokens of the resident `generation`
     /// and, once its prompt is complete, take its first sample.
     pub(super) fn prefill_round(
