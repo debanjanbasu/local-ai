@@ -1185,3 +1185,42 @@ fn large_batch_prefill_tracks_small_batch_next_token_distribution() {
         assert!(agree >= 63, "{prompt_tokens}: top-1 {agree}/{steps}");
     }
 }
+
+/// A prompt prefilled in 512-row blocks leaves exactly the logits 128-row
+/// blocks leave: rows are independent in every projection and attention
+/// kernel, and the recurrence rounds its state every 128 rows whatever the
+/// block (as each 128-row block once did when it stored it). 2,600 tokens
+/// cross the K/V growth step, the head-packed attention threshold and a
+/// short remainder block.
+#[test]
+#[ignore = "requires the pinned model"]
+fn prefill_block_size_leaves_identical_logits() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let prompt = tokenizer.encode(&text).expect("encode")[..2600].to_vec();
+    let mut model = BonsaiModel::load(
+        package,
+        4096,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    let mut logits = Vec::new();
+    for chunk in [128, 512] {
+        model.info.prefill_chunk_size = chunk;
+        model.reset();
+        model.prefill(&prompt, &mut |_| {}).expect("prefill");
+        logits.push(model.last_logits());
+    }
+    let differing = logits[0]
+        .iter()
+        .zip(&logits[1])
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(differing, 0, "{differing} of {VOCAB} logits differ");
+}

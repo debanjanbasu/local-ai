@@ -12,6 +12,20 @@ static inline void bonsai_store_state(device half &state, float value) {
 }
 static inline void bonsai_store_state(device bfloat &state, float value) { state = bfloat(value); }
 
+// The F32 register rounded as `bonsai_store_state` would store it into `like`'s
+// type; `like` only selects the overload.
+static inline float bonsai_round_state(device float &, float value) { return value; }
+static inline float bonsai_round_state(device half &, float value) {
+    return float(half(clamp(value, -65504.0f, 65504.0f)));
+}
+static inline float bonsai_round_state(device bfloat &, float value) { return float(bfloat(value)); }
+
+// Rows of state a prefill block carries in F32 between roundings to the stored
+// type. Prefill blocks were 128 rows, and each stored its state at its end;
+// longer blocks round every 128 rows from their first, so a 512-row block
+// produces the bits of four 128-row blocks.
+constant constexpr uint bonsai_gdn_round_rows = 128;
+
 // Independent value rows share Q/K and scalar gates within one SIMD. Retain
 // the original per-row FMA and SIMD reduction order; the state is stored in
 // whatever element type the accessors name and computed in F32 registers.
@@ -53,6 +67,14 @@ static inline void bonsai_gdn_rows(
             }
             result = simd_sum(result);
             if (lane == 0) output[token * 6144 + first_row + r] = result * 0.08838834764831845f;
+        }
+        if ((token + 1) % bonsai_gdn_round_rows == 0 && token + 1 < tokens) {
+            for (uint r = 0; r < rows; ++r) {
+                for (uint i = 0; i < 4; ++i) {
+                    values[r][i] = bonsai_round_state(
+                        final_state[(first_row + r) * 128 + lane + i * 32], values[r][i]);
+                }
+            }
         }
     }
     for (uint r = 0; r < rows; ++r) {
