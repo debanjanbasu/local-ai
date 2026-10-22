@@ -579,6 +579,7 @@ TASKS = [PAGINATION, SLUGIFY, RENAME, LOCATE, LINECOUNT, LARGE_FILE, CHECK_SCRIP
 CLIENTS = {
     "codex": ("codex", ""),
     "codex-apply-patch": ("codex", "apply-patch"),
+    "codex-remote-compact": ("codex", "remote-compact"),
     "opencode": ("opencode", ""),
     "opencode-responses": ("opencode", "responses"),
 }
