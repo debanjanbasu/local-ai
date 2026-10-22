@@ -1718,32 +1718,37 @@ the folded pass:
 `tools/serve_concurrency.py` starts the server with a scratch HOME (cold
 prompt cache) and streams greedy Chat Completions with reasoning off. A gap
 is the wait between two engine steps that streamed a request text (chunks
-within 5 ms of each other count once). M4 Pro, shared with other work, one
-run each between 11:00 and 12:20 AEDT on 2026-10-20, `b09e22f` against this
-branch. The shared GPU lock was then taken with plain `lockf`, which deletes
-its file on exit, so another thread's GPU job may have overlapped these runs:
-treat every timing in this section as provisional until it is rerun under
-`lockf -k` (a first run of the base build at 09:50, before the lock problem,
-measured 34.0, 48.9, 59.7 and 72.0 tok/s aggregate decode and the same mixed
-results within 2%).
+within 5 ms of each other count once). M4 Pro, 2026-10-22, `b09e22f` against
+main `a4cf247` back to back, one run each, with no other GPU job running
+(every job held `lockf -k /tmp/local-ai-gpu.lock`). Cells read `b09e22f` /
+main.
 
 | Streams, 300-token answers | Aggregate tok/s | Per stream | TTFT p50 | Gap p50 / p99 |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 32.0 / 35.4 | 33.6 / 37.0 | 0.45 / 0.39 s | 52 / 110 ms, 48 / 78 ms |
-| 2 | 47.3 / 50.6 | 50.1 / 53.4 | 0.63 / 0.60 s | 52 / 324 ms, 48 / 303 ms |
-| 4 | 55.5 / 59.8 | 31.2 / 33.8 | 1.06 / 1.00 s | 82 / 484 ms, 78 / 461 ms |
-| 8 | 73.8 / 74.8 | 14.3 / 14.7 | 1.70 / 1.64 s | 92 / 492 ms, 93 / 476 ms |
+| 1 | 34.8 / 34.9 | 36.5 / 36.5 | 0.39 / 0.39 s | 49 / 78 ms, 49 / 79 ms |
+| 2 | 50.1 / 50.0 | 53.1 / 53.0 | 0.59 / 0.59 s | 49 / 302 ms, 49 / 306 ms |
+| 4 | 59.2 / 59.2 | 33.5 / 33.6 | 0.99 / 0.99 s | 78 / 461 ms, 78 / 464 ms |
+| 8 | 74.2 / 74.0 | 14.6 / 14.5 | 1.62 / 1.63 s | 94 / 467 ms, 95 / 472 ms |
 
-The scheduling changes do not touch these steps; the spread is run-to-run
-noise. With N-1 streams decoding 512-token answers, a 6,607-token prompt
-arrives 3 s in (this branch; `b09e22f` within 2%):
+The scheduling changes do not touch these steps, and the two builds agree
+within 0.5%; 43 of 44 outputs were byte-identical across builds (the other,
+one of four streams beside a long prompt, moved at a near-tie, as below).
+The earlier, possibly contended run of the same table read 32.0–35.4,
+47.3–50.6, 55.5–59.8 and 73.8–74.8 tok/s aggregate. With N-1 streams decoding
+512-token answers, a 6,736-token prompt arrives 3 s in:
 
 | Streams | Long prompt TTFT | Its prefill | Decoding streams before / during it | Gap p50 / p99 during it | Longest stall |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 (alone) | 51.9 s | 127 tok/s | | | |
-| 2 | 73.6 s | 90 tok/s | 42.2 / 5.3 tok/s | 354 / 393 ms | 0.44 s |
-| 4 | 70.2 s | 94 tok/s | 46.7 / 10.2 tok/s | 307 / 324 ms | 0.33 s |
-| 8 | 83.8 s | 79 tok/s | 18.8 / 22.9 tok/s | 315 / 333 ms | 0.56 s |
+| 1 (alone) | 52.9 / 51.0 s | 127 / 132 tok/s | | | |
+| 2 | 75.6 / 75.9 s | 89 / 89 tok/s | 42.1 / 5.3 tok/s (both builds) | 356 / 392 ms, 359 / 399 ms | 0.44 / 0.44 s |
+| 4 | 72.0 / 72.1 s | 94 / 93 tok/s | 46.6 / 10.1, 46.3 / 10.0 tok/s | 309 / 327 ms, 309 / 327 ms | 0.33 / 0.38 s |
+| 8 | 86.0 / 86.2 s | 78 / 78 tok/s | 18.8 / 22.7, 18.8 / 22.6 tok/s | 316 / 337 ms, 318 / 336 ms | 0.56 / 0.55 s |
+
+A one-token request arriving while that prompt prefills alone waits 1.27
+/ 1.19 s (p50) beside one other request and 3.3 / 3.1 s at most beside seven.
+The long prompt alone prefills 4% faster on main (512-row blocks); beside
+decoding streams it prefills in chunks folded into their passes, which the
+block size does not affect.
 
 No stream waits more than about half a second for its next token while a
 long prompt prefills; without chunking the same prompt stalled every stream
@@ -1755,13 +1760,14 @@ its own. Folded passes beside four or eight streams sit close to what time
 slicing at full block efficiency would give both.
 
 Sub-agents fanned out at once usually share a long prefix that no earlier
-request cached (their instructions and tool schemas). Four requests 0.3 s
-apart sharing a 6.6K-token system prompt, each with its own question:
+request cached (their instructions and tool schemas). Requests 0.3 s apart
+sharing a 6.8K-token system prompt, each with its own question
+(`--phases shared --streams 2,4`, same conditions):
 
-| Build | TTFT first / mean / last | All four done |
+| Build | Two: TTFT first / mean / last, all done | Four: TTFT first / mean / last, all done |
 | --- | ---: | ---: |
-| `b09e22f` | 52.1 / 132.9 / 213.3 s | 214.5 s |
-| Prefix refresh | 51.8 / 52.6 / 53.5 s | 57.2 s |
+| `b09e22f` | 53.1 / 80.8 / 108.4 s, 109.9 s | 53.1 / 133.4 / 213.9 s, 215.1 s |
+| main (prefix refresh) | 51.4 / 51.6 / 51.8 s, 54.1 s | 51.5 / 52.5 / 53.5 s, 55.6 s |
 
 Each request restored what the cache held at admission, nothing, and
 prefilled the shared prefix again, one after another. Asking the cache again
@@ -1770,23 +1776,17 @@ at the end of the system turn, so the others prefill only their question.
 Their text is byte-identical. Running a prompt's first chunk in a pass of its
 own, so it can restore first, costs one unfolded step per long prompt (the
 longest stall beside three streams 0.38 s against 0.33 s, the prompt's TTFT
-unchanged at 70.2 s); the different pass shapes moved one of those three
-streams' 512 greedy tokens to another continuation at a near-tie after 185
-chunks.
+unchanged at 72.1 s); the different pass shapes moved one of those three
+streams' 512 greedy tokens to another continuation at a near-tie.
 
-Open items on this branch (`opt-parallel-sched`): rerun the tables above
-under `lockf -k` (`tools/serve_concurrency.py`, default phases plus
-`--phases shared --streams 2,4`, base `b09e22f` and the branch head
-back to back); run `tools/client_compat.py --scenarios
-codex-fanout,opencode-fanout` to see whether Codex 0.163 (the
-`multi_agent_v1` tools, up to six sub-agents, spawned one call at a time but
-running concurrently) and opencode 1.19 (several `task` calls in one turn run
-concurrently, no cap) fan out against this server, with peak concurrent
-requests and the prefix the sub-agents share; and measure a lone decoding
-stream beside a long prefill with a decode-only round between its prompt
-chunks (modelled: that stream 5.3 to about 9 tok/s, the prompt 90 to about
-86 tok/s), the one case where chunked prefill sits well below what time
-slicing would give both.
+Not measured yet: whether Codex 0.163 (the `multi_agent_v1` tools, up to six
+sub-agents, spawned one call at a time but running concurrently) and opencode
+1.19 (several `task` calls in one turn run concurrently, no cap) fan out
+against this server (`tools/client_compat.py --scenarios
+codex-fanout,opencode-fanout`), and a lone decoding stream beside a long
+prefill with a decode-only round between its prompt chunks (modelled: that
+stream 5.3 to about 9 tok/s, the prompt 89 to about 86 tok/s), the one case
+where chunked prefill sits well below what time slicing would give both.
 
 #### Speculation in a batch
 
@@ -2469,9 +2469,9 @@ an `UNTRUSTED` result. There is no background power-polling loop.
 | Plain short-prompt decode, six-prompt geomean | 30.4–32.3 tok/s | best-of-two A/B runs below, across recent kernel changes |
 | Default speculative decode, six-prompt geomean | 38.0–39.2 tok/s | same runs; 38.6 in the depth/margin sweep |
 | Two 600-token copy-edit prompts, suffix lookup | 89.8 and 90.5 tok/s | 5- to 128-row kernel change |
-| Cold prefill, 2K–8K tokens | 123–126 tok/s; 130 at 8K with 512-row blocks | large-batch kernel change; 512-row blocks |
-| Cold prefill, 32,706 tokens | 109.2 → 115.2 tok/s | 512-row blocks, one interleaved run |
-| Cold prefill, 131,231 tokens | 70.9 → 76.4 tok/s | same (56 tok/s on the [original build](https://github.com/debanjanbasu/local-ai/commit/b389329)) |
+| Cold prefill, 2K–8K tokens | 133.7 and 131.4 tok/s (128-row blocks: 128.3 and 125.7) | 512-row blocks, uncontended A/B against `b09e22f` (2026-10-22) |
+| Cold prefill, 32,796 tokens | 110.0 → 115.6 tok/s | same |
+| Cold prefill, 131,146 tokens | 69.7 → 74.8 tok/s | same, one round (56 tok/s on the [original build](https://github.com/debanjanbasu/local-ai/commit/b389329)) |
 
 Decode spends 97–98% of wall time on the GPU. PTQ1 decode moves 5.65 GB of
 weights per token. The packed projections were ALU-bound, not bandwidth-bound:
@@ -2851,35 +2851,42 @@ head, so 128 rows made 1.6 waves on 80 resident threadgroups and 512 rows make
 6.4, and projection shapes such as 6144x5120 leave fewer partial waves.
 
 Cold prefill, `tools/benchmark.py --prefill`, raw repository text,
-`--no-speculation`, both builds interleaved in one run, one round (M4 Pro, on
-a machine shared with other GPU work behind a lock; the 128K run started under
-the corrected `lockf -k` lock, but some other jobs may still have held the old
-lock file, so treat the rates as indicative):
+`--no-speculation`, `b09e22f` (128-row blocks) against main `a4cf247`
+(512-row blocks with the 128-row rounding), interleaved, best of two rounds
+(128K: one round), M4 Pro, 2026-10-22, with no other GPU job running (every
+job held `lockf -k /tmp/local-ai-gpu.lock`). Every sample of a size, both
+builds, cold and restored, generated the same 16 greedy tokens:
 
 | Prompt | 128-row blocks | 512-row blocks | Warm restart (disk restore), TTFT |
 | ---: | ---: | ---: | ---: |
-| 8,201 tokens (block-size sweep) | 122.4 tok/s | 130.3 tok/s (256: 128.7, 640: 129.4) | n/a |
-| 32,706 tokens | 109.2 tok/s (299.5 s) | 115.2 tok/s (284.0 s) | 1.15 s |
-| 131,231 tokens | 70.9 tok/s (1,850 s) | 76.4 tok/s (1,717 s) | 3.1-3.3 s |
+| 2,047 tokens | 128.3 tok/s (16.0 s) | 133.7 tok/s (15.3 s) | 0.54 s |
+| 8,204 tokens | 125.7 tok/s (65.3 s) | 131.4 tok/s (62.4 s) | 0.66–0.68 s |
+| 32,796 tokens | 110.0 tok/s (298.1 s) | 115.6 tok/s (283.6 s) | 1.15 s |
+| 131,146 tokens | 69.7 tok/s (1,882 s) | 74.8 tok/s (1,754 s) | 3.8–4.0 s |
 
-These 512-row numbers predate the 128-row rounding, which adds one branch per
-128 tokens per value row; greedy tokens matched base at 8K, 32K and 128K, and
-at 2,051 tokens they did not (first token only), which the rounding fixes. The
-2K/8K A/B with the rounding and both `--no-speculation` and `--mtp-depth 3`
-was queued and not run. Peak footprint for a cold 8,201-token prompt rose from
-1.56 to 1.90 GiB (`/usr/bin/time -l`): row scratch is sized for 512 rows.
+So 512-row blocks prefill 4–5% faster to 32K and 7% faster at 128K (one
+round); the earlier numbers
+(8,201 tokens 122.4 → 130.3, 32,706 tokens 109.2 → 115.2, 131,231 tokens 70.9
+→ 76.4, taken while another GPU job could overlap) were within a few percent
+of these. Round to round, one build varied by up to 6% at 8K (118.1 and 125.7
+tok/s for `b09e22f`), so read single-round differences below that as noise.
+An earlier block-size sweep at 8,201 tokens (possibly contended) measured
+128.7 tok/s at 256 rows, 130.3 at 512 and 129.4 at 640. Peak footprint for a
+cold 8,201-token prompt rose from 1.56 to 1.90 GiB (`/usr/bin/time -l`): row
+scratch is sized for 512 rows.
 
 End to end through `serve`, `tools/benchmark.py --ttft` (a ~5.9K-token system
 prompt with six tool schemas, then a ~2K-token tool result, `reasoning_effort`
-`none`, time to first streamed delta), 128- against 512-row blocks:
+`none`, time to first streamed delta), 128- against 512-row blocks, one run
+each, same conditions:
 
 | Step | Prompt / reused tokens | 128 rows | 512 rows |
 | --- | ---: | ---: | ---: |
-| Cold first request | 5,875 / 0 | 46.6 s | 45.0 s |
-| New session, same system prompt and tools | 5,877 / 5,856 (GPU) | 0.47 s | 0.48 s |
-| Follow-up with a 2K tool result | 7,798 / 5,860 (GPU) | 16.2 s | 15.6 s |
-| After a restart: new session | 5,875 / 5,860 (disk) | 1.36 s | 1.14 s |
-| After a restart: the same follow-up | 7,798 / 7,797 (disk) | 0.48 s | 0.48 s |
+| Cold first request | 5,881 / 0 | 46.9 s | 44.9 s |
+| New session, same system prompt and tools | 5,883 / 5,862 (GPU) | 0.48 s | 0.47 s |
+| Follow-up with a 2K tool result | 7,799 / 5,866 (GPU) | 16.2 s | 15.5 s |
+| After a restart: new session | 5,881 / 5,866 (disk) | 1.02 s | 1.01 s |
+| After a restart: the same follow-up | 7,799 / 7,798 (disk) | 0.53 s | 0.53 s |
 
 The disk tier already persists the system-prompt-and-tools boundary across
 restarts, so a restarted server's new session starts in about a second rather
@@ -3010,9 +3017,15 @@ decode from 19.23 to 20.39 tok/s.
 
 A request that does not ask for log-probabilities encodes no extra kernel
 and copies no row, so Codex, Oh My Pi and opencode, which never ask, see no
-change. Two interleaved rounds of the server built without and with
+change. Uncontended (2026-10-22, every GPU job under `lockf -k`),
+`tools/benchmark.py --rounds 3 --max-tokens 256` decoded its default prompt
+(209 greedy tokens to end of turn, default speculation) at 36.93 tok/s best
+on `b09e22f`, before log-probabilities support, and 36.89 on main `a4cf247`
+(medians 36.90 and 36.85, every run 36.75–36.93), with identical text. An
+earlier run of two interleaved rounds of the server built without and with
 log-probabilities support (default speculation and sampling, 256-token
-answers, seed 11, `reasoning_effort: "none"`): decode median 105.69 and
+answers, seed 11, `reasoning_effort: "none"`, possibly overlapping another
+GPU job): decode median 105.69 and
 105.85 tok/s (8 runs each, every run 105.2-106.0), cold prefill of
 about 2.3K-token prompts median 129.59 and 129.58 tok/s (6 runs each,
 129.5-129.7), with byte-identical answers. Asking costs one two-pass

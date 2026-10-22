@@ -237,20 +237,20 @@ Startup prints every decision and reason under `experimental_bonsai`.
   [docs/BONSAI.md](docs/BONSAI.md#performance).
 - Server: concurrent requests decode in one batched pass per step, their MTP
   heads drafting together in one head pass per depth; 300-token chat
-  requests reach about 39, 56 and 74 tok/s aggregate at 2, 4 and 8 streams
-  against 33 for one. A 9.2K-token prompt arriving beside four streams
+  requests reach 50, 59 and 74 tok/s aggregate at 2, 4 and 8 streams
+  against 35 for one (uncontended, 2026-10-22). A 9.2K-token prompt arriving beside four streams
   prefills inside their passes: they keep a token every 0.32 s (p50; 0.36 s
   p99) and its first token comes at 106 s. Copy-edit requests verify
   suffix-lookup drafts inside the batch: 37.9 against 34.9 tok/s aggregate
   at four streams for the previous build, byte-identical to each request
   alone.
-- Prefill (cold, no speculation), 512-token blocks: about 130 tok/s at 8K,
-  115 tok/s at 32K and 76 tok/s at 128K (122, 109 and 71 with the former
-  128-token blocks, interleaved in the same runs).
+- Prefill (cold, no speculation), 512-token blocks: 131 tok/s at 8K,
+  116 tok/s at 32K and 75 tok/s at 128K (126, 110 and 70 with the former
+  128-token blocks, interleaved in the same uncontended runs).
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s. After a server restart a
   new session sharing a ~5.9K-token system prompt and tools reaches its first
-  token in 1.1-1.4 s against 45-47 s cold (`tools/benchmark.py --ttft`).
+  token in about 1.0 s against 45-47 s cold (`tools/benchmark.py --ttft`).
 - Memory: 0.8–0.9 GB peak for a short request and 2.09 GB peak footprint for
   a 16K-token prompt plus 500 generated tokens (F16 recurrent state, copy-free
   verify rollback, 4K-step K/V growth). File-backed weights remain
