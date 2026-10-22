@@ -316,14 +316,16 @@ fn shared_system_prefix_reuses_across_sessions_and_restart() {
     );
 }
 
-/// An agent session after a compaction: every turn re-renders the last
-/// answer differently from what was generated, so each one leaves a
-/// divergence boundary that barely extends the previous turn's. Every turn
-/// must still restore the whole previous prompt from the GPU tier, not an
-/// older boundary the tier kept while the newer checkpoints were evicted.
-/// `b09e22f`, before the longest-prefix restore, also passes: the
-/// post-compaction stale reuse seen in a 64K agent session does not reproduce
-/// at this size.
+/// An agent session of thinking requests: each prompt ends with the
+/// generation opener `<think>\n`, which the next turn's history re-renders
+/// without, so every turn diverges from the last prompt just before its end
+/// and checkpoints a divergence boundary that barely extends the previous
+/// one. Once such boundaries filled the GPU tier, `b09e22f` evicted every
+/// new checkpoint at once and restored the newest boundary it still held, a
+/// few turns old, ahead of the newer one on disk, so each turn prefilled
+/// more of the conversation again (seen after a compaction in a 64K
+/// session: steps grew from 30 s to 179 s). Each turn must restore the
+/// boundary the previous turn checkpointed, from whichever tier holds it.
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn agent_turns_keep_restoring_the_previous_prompt() {
@@ -331,7 +333,7 @@ fn agent_turns_keep_restoring_the_previous_prompt() {
     let open = || {
         BonsaiEngine::open_with_options(
             Path::new(&path),
-            Some(1024),
+            Some(2048),
             DEFAULT_PREFILL_CHUNK,
             None,
             &MtpMode::Off(None),
@@ -342,46 +344,49 @@ fn agent_turns_keep_restoring_the_previous_prompt() {
     };
     let params = GenerateParams {
         temperature: 0.0,
-        max_tokens: 8,
+        max_tokens: 1,
         ..GenerateParams::default()
     };
     let system = "You are a careful filing clerk who keeps an inventory. ".repeat(24);
-    let opener = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-    let mut rendered = format!(
-        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\nFile item 1.<|im_end|>\n{opener}"
+    let mut history = format!(
+        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\nFile the items.<|im_end|>\n"
     );
     let cache = tempfile::tempdir().expect("cache directory");
     let mut engine = open();
     engine.set_prompt_cache_checkpoints(4).expect("checkpoints");
     engine.set_session_cache(0, Some(cache.path().to_owned()));
-    let mut previous: Option<Vec<u32>> = None;
+    let common = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let mut prompts: Vec<Vec<u32>> = Vec::new();
     let mut last = None;
-    for turn in 1..=7 {
-        let prompt = engine.tokenizer.encode(&rendered).expect("prompt");
+    for turn in 1..=10 {
+        let prompt = engine
+            .tokenizer
+            .encode(&format!("{history}<|im_start|>assistant\n<think>\n"))
+            .expect("prompt");
         let run = engine
             .generate_session(&prompt, &params, Some("agent"), |_| true)
             .expect("turn");
-        if let Some(previous) = &previous {
-            assert!(prompt.starts_with(previous), "turn {turn} extends the last");
-            // At least the previous prompt's reusable boundary, from the GPU
-            // tier; more when the previous answer's tokens match the
-            // re-rendered assistant turn.
+        if let [.., before, previous] = prompts.as_slice() {
+            // The boundary the previous turn checkpointed, where it diverged
+            // from the turn before it.
+            let boundary = common(before, previous);
             assert!(
-                run.stats.reused_prompt_tokens >= previous.len() - 1
-                    && run.cache_source == PromptCacheSource::Gpu,
-                "turn {turn} of {} tokens reused {} from {:?}",
+                run.stats.reused_prompt_tokens >= boundary,
+                "turn {turn} of {} tokens reused {} from {:?}, the previous boundary is {boundary}",
                 prompt.len(),
                 run.stats.reused_prompt_tokens,
                 run.cache_source
             );
         }
         last = Some((prompt.clone(), run.token_ids));
-        previous = Some(prompt);
+        prompts.push(prompt);
         write!(
-            rendered,
-            "Noted: item {turn} sits in drawer {}.<|im_end|>\n<|im_start|>user\nFile item {}.<|im_end|>\n{opener}",
+            history,
+            "<|im_start|>assistant\nNoted: item {turn} sits in drawer {}.<|im_end|>\n\
+             <|im_start|>user\nItem {} arrived; it is a box of {} pencils.<|im_end|>\n",
             turn * 7,
-            turn + 1
+            turn + 1,
+            turn * 12
         )
         .expect("writes to a String");
     }
