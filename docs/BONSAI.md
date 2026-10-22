@@ -2214,23 +2214,25 @@ layout, MTP configuration, tokens, recurrent state, and target and head K/V.
 A request restores the longest prefix any tier holds, the cheaper tier on a
 tie, and a failed restore falls back to the next longest. The tiers used to
 be asked in order, so any matching GPU checkpoint won over a longer disk
-snapshot. In a compacted 64K Codex-style session (one `xhigh` run) that pinned
-four turns of 19K–31K-token prompts to a 12,980-token checkpoint while disk
-held their predecessors' 16K–25K snapshots, and steps grew from 30 s to
-179 s. By a trace of the eviction rule (not yet confirmed on that session),
-the GPU tier had stopped keeping new checkpoints: every turn after
-the compaction re-rendered the last answer differently from what was
-generated, so each left a divergence boundary barely extending the previous
-turn's, those boundaries filled the four slots, and each new penultimate
-checkpoint, a request tail, was the eviction victim the moment it was saved.
-The two newest GPU checkpoints (the last request's boundary or penultimate
-token, and its end) are now never the victim; eviction picks among the
-others by the disk tier's rule below. Both are on `opt-parallel-sched` but not yet
-checked on the GPU: `agent_turns_keep_restoring_the_previous_prompt` (seven
-turns, each extending the last by a re-rendered answer) is written to fail on
-`b09e22f` at its fourth turn and pass with the fix, the existing prompt-cache
-and scheduler tests still need a run, and the compacted 64K `xhigh` session
-needs a rerun on the compaction branch with this engine.
+snapshot. In a compacted 64K Codex-style session (one `xhigh` run on
+`b09e22f`'s engine) that pinned four turns of 19K–31K-token prompts to a
+12,980-token checkpoint while disk held their predecessors' 16K–25K
+snapshots, and steps grew from 30 s to 179 s. The cause: a thinking request's
+prompt ends with the generation opener `<think>\n`, which the next turn's
+history re-renders without, so every turn diverges from the last prompt just
+before its end and checkpoints a divergence boundary that barely extends the
+previous turn's. Those boundaries filled the four GPU slots; from then on
+each new checkpoint, boundary or request tail, was the eviction victim the
+moment it was saved, and the GPU tier kept restoring the newest boundary it
+still held, a few turns old. `agent_turns_keep_restoring_the_previous_prompt`
+reproduces it in ten 300–600-token turns: on `b09e22f` the sixth turn
+restores 357 tokens from the GPU tier where the previous boundary is 395.
+Now the two newest GPU checkpoints (the last request's boundary or
+penultimate token, and its end) are never the victim, eviction picks among
+the others by the disk tier's rule below, and the longest prefix wins across
+tiers: in the same test every turn restores the previous boundary, two turns
+in three from the GPU tier and every third from disk, where the boundary the
+GPU tier evicted (the newest one that barely extends another) was persisted.
 
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
