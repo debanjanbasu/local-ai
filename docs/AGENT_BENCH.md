@@ -34,7 +34,9 @@ python3 tools/agent_bench.py --compare \
 ```
 
 Options: `--clients codex,opencode` (also `codex-apply-patch`, Codex with its
-freeform `apply_patch` grammar tool, and `opencode-responses`), `--tasks`
+freeform `apply_patch` grammar tool, `codex-remote-compact`, Codex compacting
+through the server whenever a turn reaches 7,000 tokens, and
+`opencode-responses`), `--tasks`
 (a comma-separated subset), `--effort none|low|medium|xhigh` (default
 `none`), `--seeds 1,2,3` (each seed runs the whole matrix), `--timeout`
 (per run, default 600 s), and `--no-serve` (use a server that is already
@@ -117,68 +119,57 @@ floating-point differences that a candidate's kernel changes legitimately
 introduce, which can change sampled tokens and therefore the agent's path.
 The same-build rerun below measures the remaining noise.
 
-## Status (2026-10-20): baseline not yet measured
+## Baseline (2026-10-22, main `a4cf247`)
 
-The harness, the tasks, the checks and the report and compare modes are
-complete and unit-tested (`cd tools && python3 -m unittest test_agent_bench
-test_client_compat`; the fixture tests need no GPU). The full baseline on main
-`b09e22f` has **not** been measured yet. Its run waited more than two hours
-for the shared GPU lock and was stopped at wrap-up after it had started its
-first task. No baseline numbers exist yet.
+Effort `none`, seed 1, Codex 0.163.0 and opencode 1.19.3, M4 Pro 48 GB, no
+other GPU job (the run held `lockf -k /tmp/local-ai-gpu.lock` throughout),
+about 25 minutes per run. The same command twice on the same build:
 
-### Smoke run (indicative only)
+```bash
+lockf -k /tmp/local-ai-gpu.lock python3 tools/agent_bench.py \
+    --codex-bin "$PWD/.amp/in/codex/node_modules/.bin/codex" \
+    --server-bin "$PWD/.amp/in/bins/a4cf247/local-ai" \
+    --label main-a4cf247 --out "$PWD/.amp/in/artifacts/agent-bench/baseline-a4cf247"
+```
 
-On 2026-10-20 at about 10:55 AEDT, two tasks per client ran at effort `none`
-against a release build of `b09e22f`'s Rust sources (`--tasks
-locate-answer,fix-pagination`). The run used plain `lockf` without `-k`,
-which can let two GPU jobs run at once, so treat the timings as suspect. It
-also predates the change to one fixed repository and HOME per client, so
-every task's first turn prefilled cold.
+| Client | Success | Turns (mean) | Tool calls | wrong_tool | bad_args | loop | Timeouts | Wall s (total) | TTFT first / all (median) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| codex, run 1 | 6/7 | 18.9 | 130 | 4 | 0 | 2 | 1 | 1,197 | 1.3 / 3.4 s |
+| codex, run 2 | 7/7 | 14.9 | 99 | 3 | 2 | 1 | 0 | 862 | 1.2 / 2.6 s |
+| opencode, run 1 | 7/7 | 6.4 | 60 | 0 | 0 | 1 | 0 | 309 | 1.1 / 1.1 s |
+| opencode, run 2 | 7/7 | 6.4 | 60 | 0 | 0 | 1 | 0 | 309 | 1.1 / 1.1 s |
 
-| Task | Client | Pass | Turns | Tool calls | wrong_tool | bad_args | loop | Wall s | TTFT first | TTFT median |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| fix-pagination | codex | PASS | 15 | 14 | 1 | 0 | 0 | 221 | 51.2 | 1.3 |
-| locate-answer | codex | PASS | 4 | 3 | 0 | 0 | 0 | 60 | 46.5 | 2.1 |
-| fix-pagination | opencode | PASS | 7 | 7 | 0 | 0 | 0 | 90 | 51.4 | 2.7 |
-| locate-answer | opencode | PASS | 4 | 5 | 0 | 0 | 0 | 78 | 51.1 | 3.8 |
+| Task | Codex run 1: pass, turns, wall s | Codex run 2 | opencode (both runs) |
+| --- | --- | --- | --- |
+| fix-pagination | FAIL, 50, 600 (timeout) | PASS, 17, 234 | PASS, 6, 72 |
+| implement-slugify | PASS, 12, 94 | PASS, 14, 116 | PASS, 7, 35 |
+| rename-function | PASS, 22, 149 | PASS, 14, 74 | PASS, 5, 37 |
+| locate-answer | PASS, 4, 10 | PASS, 4, 10 | PASS, 4, 15 |
+| add-cli-flag | PASS, 22, 187 | PASS, 24, 208 | PASS, 8, 37 |
+| fix-large-file | PASS, 9, 72 | PASS, 15, 104 | PASS, 6, 87 |
+| make-check-pass | PASS, 13, 85 | PASS, 16, 117 | PASS, 9, 25 |
 
-What the smoke run showed:
+What the baseline shows:
 
-- The harness works end to end with both clients, and every metric was
-  populated. The single `wrong_tool` was Codex calling `apply_patch`, which
-  the function-tools configuration does not declare, as `docs/BONSAI.md`
-  predicts. Codex answered `unsupported call` and the model then edited with
-  `sed`.
-- First-turn TTFT is about 46 to 51 s for a cold prompt of about 5,800
-  tokens (Codex) or 6,300 tokens (opencode), roughly 115 to 125 tokens/s of
-  prefill. Later turns reuse 85 to 99 % of the prompt from the cache, and
-  their TTFT is 0.5 to 6 s. Cold prefill of the client's own system prompt
-  dominates the wall time of short tasks.
-- With a per-task HOME, every task's first turn had **0 cached tokens**,
-  even though the clients' instructions are identical. Codex's second
-  developer message names the skills directory under `CODEX_HOME`, and
-  opencode's `bash` tool description names its TMPDIR. The server joins
-  the leading developer messages into one system turn, so a path difference
-  inside that turn defeats the shared-prefix checkpoint at `system_turn_end`.
-  This matters to the prompt-cache work, because any change of HOME, TMPDIR
-  or (for opencode) working directory costs a full cold prefill. The
-  benchmark now uses fixed paths per client, so only a client's first task
-  is cold.
-- The first byte and the first token arrived together, so the server sends
-  its response headers only once generation starts. TTFT therefore matches
-  the time to the first byte here.
-
-### Remaining
-
-1. Measure the baseline. Build release from `b09e22f`'s Rust sources (this
-   branch changes only `tools/` and `docs/`; `CARGO_BUILD_JOBS=4 cargo build
-   --release -p local-ai --bin local-ai`), install Codex 0.163.0 (see
-   above), then run the baseline command above under `lockf -k`. Expect
-   about 25 minutes at effort `none`.
-2. Run the same command again on the same build and `--compare` the two
-   runs to measure the noise floor (whether pinned seeds give identical
-   agent paths, and how much wall time and TTFT vary). Record both here.
-3. Optionally measure a baseline at `--effort xhigh`, the documented client
-   configuration.
-4. Replace this section with the baseline tables (`summary.md`) and the exact
-   command, then share them with the optimization threads.
+- **opencode is deterministic, Codex is not.** Both opencode runs made the
+  same calls in the same order, and every wall time agreed within a second.
+  Codex diverged at its fifth call of the first task (a different
+  `apply_patch` hunk) and took a different path in five of seven tasks,
+  although the proxy pins the seed. So one Codex run is a sample: run 1
+  failed `fix-pagination` after 50 turns spent debugging Python's import
+  cache when its edit had not landed, and run 2 passed it in 17. Compare
+  Codex with several seeds (`--seeds 1,2,3`) or repeated runs, and read a
+  single-run Codex difference of one task or a few hundred seconds as noise.
+- **Tool-call failures are rare and the same kind every time.** Every
+  `wrong_tool` is Codex calling the undeclared `apply_patch` (it gets
+  `unsupported call` and edits with `exec_command`); the two `bad_args` in
+  run 2 are `write_stdin` calls without the required `session_id`. No call
+  had malformed JSON or leaked markup.
+- **GNU-userland commands on macOS** (not a bench metric; counted by a
+  scratch script over the call signatures and the tool outputs): Codex used
+  `sed -i 's/…/'` without the `''` backup suffix 3 and 5 times, and `cat -A`
+  twice and once; opencode ran a bare `python` once in each run. Each one
+  failed and the model retried with a working command.
+- **TTFT**: a client's first task prefills its roughly 6,000-token prompt
+  cold (45 to 48 s); every later first turn restores it from the cache
+  (0.8 to 3.5 s), and the median turn starts streaming in 1.1 to 3.4 s.
