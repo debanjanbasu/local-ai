@@ -105,16 +105,37 @@ ingestion of prefill chunks, take even chunks of at most eight rows. Single-row 
 another, and gate/up use one fused SwiGLU when both share a format; a mixed
 gate/up pair runs as two projections and the elementwise SwiGLU.
 
-#### Fine-tuning the shipped head on code and tool calls (in progress)
+#### Fine-tuning the shipped head on code and tool calls (not adopted)
 
 Goal: raise draft acceptance on coding-agent output (code, tool-call
 arguments, the reasoning around them) by training the installed head further
-on the target's own greedy transcripts. Status: tooling done and checked; no
-GPU measurement, training run or candidate head exists yet (the shared GPU
-queue never reached these jobs, and a baseline run that started was lost
-with its worktree and may have overlapped another GPU job, so it is not
-reported). Prior attempts above (corpus fine-tuning, general self-rollouts)
-left live acceptance flat or lower, so a win is not assumed.
+on the target's own greedy transcripts. Prior attempts above (corpus
+fine-tuning, general self-rollouts) left live acceptance flat or lower, and
+so did this one: the candidate is not adopted.
+
+Run (2026-10-22/23): 120 rollouts (32 code, 32 context, 32 agent, 24 API
+calls; 146K generated tokens) over this repository and the open-source
+`dioxus`, `tailwindcss` and `veilid` checkouts, captured as 104 documents
+and 321,318 positions (16 agent transcripts ending on an unanswered tool call
+were skipped), then two epochs of the recipe below from the installed head
+on a private Kaggle T4 x2 job (244 steps, 27 minutes). On the 2% held-out
+windows draft accuracy rose at every depth: 0.660 → 0.692, 0.499 → 0.528
+and 0.432 → 0.451 (best at step 100: 0.692, 0.535, 0.477). Live, it did not:
+
+| Head | Tasks ok | MTP accepted/proposed (code, tool, prose) | Accepted per round | Decode tok/s, geomean |
+| --- | --- | --- | ---: | ---: |
+| installed (`83cc7227…`) | 16/20 | 73.6% (71.5%, 82.7%, 81.9%) | 1.07 | 40.98 |
+| candidate (`dbadd150…`) | 15/20 | 73.9% (72.1%, 83.3%, 80.9%) | 1.04 | 40.92 |
+
+`tools/mtp_code_bench.py ab --rounds 2` (ABBA), the fixed-build server, M4
+Pro; unrelated builds shared the CPU during the run, alike for both heads. Outputs were identical on 17 of 20 tasks; of the three that differ
+(verify near-ties), one, `sql-top-earner`, fails its test with the candidate.
+The 0.3-point acceptance gain is within run-to-run noise and buys no decode
+speed, so the installed head stays. The candidate is kept beside it as
+`models/bonsai2-27b-mtp/mtp-head-ptq1-code-cand.bin` (never installed over
+it; the dataset and kernel are private on Kaggle). As with the earlier
+attempts, held-out accuracy on captured windows did not predict live
+acceptance.
 
 What works:
 
