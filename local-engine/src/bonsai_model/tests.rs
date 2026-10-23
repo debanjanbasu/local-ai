@@ -400,6 +400,87 @@ fn agent_turns_keep_restoring_the_previous_prompt() {
     );
 }
 
+/// A request that restores a shared boundary and checkpoints a new one fills
+/// the GPU tier: its boundary, penultimate token, end and output end, beside
+/// the restored boundary. The next turn re-renders the last prompt token, so
+/// it needs the penultimate checkpoint, and the disk tier has none (a request
+/// that persisted a boundary does not persist its penultimate snapshot).
+/// With the prompt's end also checkpointed, the penultimate checkpoint was
+/// the oldest request tail outside the two newest and was evicted, and the
+/// turn restored the new boundary instead (three steps after a compaction in
+/// a 64K session prefilled one turn too many).
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn a_turn_after_a_new_boundary_restores_the_penultimate_checkpoint() {
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
+    let open = || {
+        BonsaiEngine::open_with_options(
+            Path::new(&path),
+            Some(2048),
+            DEFAULT_PREFILL_CHUNK,
+            None,
+            &MtpMode::Off(None),
+            NgramSettings::default(),
+            KvOptions::default(),
+        )
+        .expect("load model")
+    };
+    let params = GenerateParams {
+        temperature: 0.0,
+        max_tokens: 1,
+        ..GenerateParams::default()
+    };
+    let system = "You are a careful filing clerk who keeps an inventory. ".repeat(24);
+    let task = format!(
+        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{}",
+        "File every item in the order it arrives, and note its drawer. ".repeat(8)
+    );
+    let cache = tempfile::tempdir().expect("cache directory");
+    let mut engine = open();
+    engine.set_prompt_cache_checkpoints(4).expect("checkpoints");
+    engine.set_session_cache(0, Some(cache.path().to_owned()));
+    let encode = |engine: &BonsaiEngine, text: &str| engine.tokenizer.encode(text).expect("prompt");
+    // The conversation before a compaction, then the compacted one: they
+    // share the system turn and the task, so the second restores the
+    // system-turn boundary and checkpoints its divergence from the first.
+    let before = encode(
+        &engine,
+        &format!("{task}Item 1 is a stapler.<|im_end|>\n<|im_start|>assistant\n"),
+    );
+    let compacted = encode(
+        &engine,
+        &format!("{task}Summary: three items are filed.<|im_end|>\n<|im_start|>assistant\n"),
+    );
+    for prompt in [&before, &compacted] {
+        engine
+            .generate_session(prompt, &params, Some("agent"), |_| true)
+            .expect("turn");
+    }
+    let mut next = compacted[..compacted.len() - 1].to_vec();
+    next.extend(encode(
+        &engine,
+        " Item 4 is a lamp.<|im_end|>\n<|im_start|>assistant\n",
+    ));
+    let run = engine
+        .generate_session(&next, &params, Some("agent"), |_| true)
+        .expect("next turn");
+    assert!(
+        run.stats.reused_prompt_tokens >= compacted.len() - 1
+            && run.cache_source == PromptCacheSource::Gpu,
+        "reused {} from {:?}, the penultimate checkpoint is at {}",
+        run.stats.reused_prompt_tokens,
+        run.cache_source,
+        compacted.len() - 1
+    );
+    assert_eq!(
+        run.token_ids,
+        open()
+            .generate(&next, &params, |_| true)
+            .expect("cold reference")
+            .token_ids
+    );
+}
+
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {

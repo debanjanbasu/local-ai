@@ -117,7 +117,7 @@ impl BonsaiEngine {
                 self.reach_penultimate(&prompt[..plan.done], plan)?;
             }
             if plan.done == prompt.len() {
-                self.finish_prompt(prompt)?;
+                self.finish_prompt(prompt, plan.checkpoint_penultimate)?;
                 return Ok(true);
             }
             if budget == 0 {
@@ -183,7 +183,20 @@ impl BonsaiEngine {
         Ok(())
     }
 
-    fn finish_prompt(&mut self, prompt: &[u32]) -> crate::Result<()> {
+    /// `penultimate_checkpointed`: the prompt's end is then not checkpointed.
+    /// A later prompt restores the end only if it extends this whole prompt,
+    /// and the penultimate checkpoint serves it for one more token of
+    /// prefill. Kept as well, the end was one of the two newest checkpoints
+    /// with the output end, so the penultimate one went first once the tier
+    /// filled: the next agent turn, which diverges at the last prompt token,
+    /// then restored an older boundary (seen after a compaction in a 64K
+    /// session: three steps each prefilled one turn too many, 50–78 s instead
+    /// of about 27 s).
+    fn finish_prompt(
+        &mut self,
+        prompt: &[u32],
+        penultimate_checkpointed: bool,
+    ) -> crate::Result<()> {
         self.claim_gpu_cache();
         self.cached_tokens.clear();
         self.cached_tokens.extend_from_slice(prompt);
@@ -191,6 +204,9 @@ impl BonsaiEngine {
             checkpoint.tokens.len() <= prompt.len()
                 && checkpoint.tokens.as_slice() == &prompt[..checkpoint.tokens.len()]
         });
+        if penultimate_checkpointed {
+            return Ok(());
+        }
         self.save_prompt_checkpoint(prompt, false)
     }
 

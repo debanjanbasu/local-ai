@@ -2234,6 +2234,24 @@ tiers: in the same test every turn restores the previous boundary, two turns
 in three from the GPU tier and every third from disk, where the boundary the
 GPU tier evicted (the newest one that barely extends another) was persisted.
 
+A request used to checkpoint its prompt's end beside its penultimate token
+and its output end. The end serves only a next prompt that extends the whole
+prompt, and the penultimate checkpoint serves that one for one more token of
+prefill, so the end is no longer checkpointed when the penultimate token was.
+With it, the two newest checkpoints were the end and the output end, and once
+the tier filled the penultimate checkpoint was the oldest request tail left
+to evict. The next agent turn, which diverges at the last prompt token, then
+restored an older boundary, and the disk tier had no penultimate snapshot to
+fall back on (a request that persisted a boundary does not persist one). After
+a compaction in a 64K `xhigh` session (a cold prompt restoring the system-turn
+boundary from the GPU tier and checkpointing its divergence) three read steps
+in a row each prefilled one turn too many: 367, 7,474 and 10,456 tokens
+cached instead of 7,474, 10,456 and 13,562, 78, 50 and 53 s instead of 26 to
+29 s, 13,195 stale tokens in all. With the change the same session has none.
+`a_turn_after_a_new_boundary_restores_the_penultimate_checkpoint` reproduces
+it in three requests: without the change the third restores 385 tokens from
+the GPU tier where the penultimate checkpoint is at 396.
+
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
 and trim run behind the request. A snapshot is indexed for reuse only after
