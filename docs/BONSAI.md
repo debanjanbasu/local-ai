@@ -4069,3 +4069,36 @@ on `0c9ec76`. The raw rows of the second and third runs were deleted; those
 of the ~250K `none` run (answers, token counts, timings, cache hits, seed 1's
 stages, prompts, server log and `holds.log` with the snapshot files after
 each item) are in `.scratch/artifacts/context-eval/`.
+
+Why lookups fail at effort `none` (2026-10-23): the model, not the engine.
+A lookup asks for `min(units * FACTOR + FEE * weight, CAP)` with the three
+constants in a config module and the formula in a service file, as one
+integer. A decomposition probe (seed 0, effort `none`, greedy, Q8 K/V, the
+eval's own repository text at about 1.7K, 64K and 128K tokens, each lookup
+split into five questions) gives the same result at every length:
+
+| Question (three per length) | ~1.7K | 64K | 128K |
+| --- | --- | --- | --- |
+| the original lookup, integer only | 0/3 | 0/3 | 0/3 |
+| the three constants | 3/3 | 3/3 | 3/3 |
+| quote the function body | 3/3 | 3/3 | 3/3 |
+| the lookup, writing constants and arithmetic first | 3/3 | 3/3 | 3/3 |
+| the recall needle | 3/3 | 3/3 | 3/3 |
+
+Retrieval is exact at 128K (every constant, every formula), and the model
+computes the answer correctly whenever it may write the steps. Asked for the
+bare integer, it answers without them and is wrong at every length,
+including the 1.7K control: at 128K 130, 137 and 122 for 182, 239 and 438
+(130 is the first term, 26 × 5, alone), at 1.7K 130 and 100 (answers were
+capped at 8 tokens, so the third, and two at 64K that began explaining,
+were cut off before an integer). The same
+arithmetic with no repository at all (`Compute min(26 * 5 + 4 * 13, 676).
+Reply with only the integer.`) starts writing the multiplication instead of
+an integer. This matches the eval: `none` scored 3/9 lookups in the short
+control too, and `xhigh`, which reasons first, answered every lookup at
+every size measured, up to ~250K. So the remedy is reasoning (`xhigh`
+measured) or letting the answer show its work; nothing in the engine
+changes it. An F16 K/V run of
+the 128K probe was stopped as redundant: the failure does not depend on
+length, so it cannot come from K/V quantization or position handling at long
+context.
