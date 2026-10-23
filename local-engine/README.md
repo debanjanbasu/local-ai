@@ -66,8 +66,11 @@ is the generation's visible content, never its raw reasoning.
   from that turn's snapshot; a summary of a shorter prefix, or rendered under
   another system turn, would prefill the whole history again, because exact
   prefixes are kept only at snapshot boundaries. Tools are rendered with
-  `ToolChoice::None`, so no call can be made; a conversation that reasons
-  gets a summary that reasons too, with 4,096 more output tokens for it.
+  `ToolChoice::None`, so no call can be made. The summary never reasons: for
+  a conversation that reasons it keeps the effort's instruction in the system
+  turn (`ChatRequest::reasoning_instruction`) and closes the reasoning block
+  in the prompt, so it still shares the conversation's prefix and answers at
+  once, in up to 2,048 tokens.
 - `summary_message(summary)` is how a compacted summary is rendered back: one
   `user` message under a fixed `[Context compacted]` header, in place of the
   turns it replaced.
@@ -260,6 +263,7 @@ let request = ChatRequest {
     sampling: Sampling::default(),
     thinking: true,
     effort: local_engine::ReasoningEffort::default(),
+    reasoning_instruction: false,
     preserve_thinking: true,
     session: None,
     tools: vec![ToolDefinition {

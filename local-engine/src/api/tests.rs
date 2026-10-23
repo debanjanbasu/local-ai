@@ -48,6 +48,7 @@ fn long_prompt(marker: u128, max_tokens: usize) -> super::ChatRequest {
         sampling: Sampling::default(),
         thinking: false,
         effort: crate::ReasoningEffort::default(),
+        reasoning_instruction: false,
         preserve_thinking: true,
         session: None,
         tools: Vec::new(),
@@ -632,6 +633,7 @@ fn tool_history(thinking: bool) -> super::ChatRequest {
         sampling: Sampling::default(),
         thinking,
         effort: crate::ReasoningEffort::default(),
+        reasoning_instruction: false,
         preserve_thinking: true,
         session: None,
         tools: vec![crate::ToolDefinition {

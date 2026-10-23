@@ -1320,9 +1320,15 @@ recurrent layers' state cannot be rewound), so a summary of a shorter prefix,
 or one rendered under another system turn (thinking off for a conversation
 that reasons, whose effort instruction leads the system turn), would prefill
 the whole history again: before this change a 32K-token compaction cost about
-five minutes of prefill. A compaction of a conversation that reasons reasons
-too (at its effort, with 4,096 more output tokens for it); the summary is the
-answer either way, up to 2,048 tokens. The prompt after a compaction (summary
+five minutes of prefill. The summary never reasons: for a conversation that
+reasons, the request keeps the effort's instruction in the system turn and
+closes the reasoning block in the prompt (`<think>\n\n</think>\n\n`, the
+template's thinking-off opener), so it shares the conversation's prefix and
+answers at once, in up to 2,048 tokens. Summaries used to reason at the
+conversation's effort with 4,096 more output tokens, and at `xhigh` that
+reasoning could take the whole 6,144-token budget: the summary came back
+empty, the compaction was discarded, and the client asked again at its next
+turn (see [Compaction threshold](#compaction-threshold)). The prompt after a compaction (summary
 and kept quarter) is new and is prefilled cold. A
 reasoning summary prefills the reasoning plus about 70 tokens and decodes up
 to its budget. Both run for the Response, so both are in its `usage`: the
@@ -1330,8 +1336,7 @@ pinned `ResponseUsage` has no field of its own for them, so their prompt
 tokens are added to `input_tokens` (their reused prefix to `cached_tokens`),
 their generated tokens to `output_tokens`, and `total_tokens` stays
 `input_tokens + output_tokens`; `reasoning_tokens` is the answer's own (a
-compaction's reasoning counts only in `output_tokens`; a `compaction_trigger`
-turn's usage is the summary generation's, reasoning tokens included). A compaction discarded for not shortening the prompt still
+`compaction_trigger` turn's usage is the summary generation's). A compaction discarded for not shortening the prompt still
 counts. Risk: a summary is
 lossy and is believed by every later turn; an exact string the model left out
 is gone from the prompt, and a mistaken summary is not detectable from it.

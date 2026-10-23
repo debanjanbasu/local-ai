@@ -417,6 +417,7 @@ pub(super) fn prepare_generation_with(
             sampling: Sampling(params),
             thinking: reasoning.is_some(),
             effort: reasoning.unwrap_or_default(),
+            reasoning_instruction: false,
             preserve_thinking: true,
             session: request.prompt_cache_key,
             tools,

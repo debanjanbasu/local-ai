@@ -990,6 +990,7 @@ pub(super) fn prepare_responses_conversing(
             sampling: Sampling(params),
             thinking,
             effort: reasoning.unwrap_or_default(),
+            reasoning_instruction: false,
             preserve_thinking,
             session: request.prompt_cache_key,
             tools,

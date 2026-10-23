@@ -24,6 +24,7 @@ fn main() -> local_engine::Result<()> {
         sampling: Sampling::default(),
         thinking: true,
         effort: ReasoningEffort::default(),
+        reasoning_instruction: false,
         preserve_thinking: true,
         session: None,
         tools: Vec::new(),

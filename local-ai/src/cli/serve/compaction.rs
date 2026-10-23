@@ -340,6 +340,7 @@ async fn compact(
             sampling: local_engine::Sampling::default(),
             thinking: false,
             effort: local_engine::ReasoningEffort::default(),
+            reasoning_instruction: false,
             preserve_thinking: true,
             session: prepared.session.clone(),
             tools: Vec::new(),
