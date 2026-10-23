@@ -35,7 +35,9 @@ python3 tools/agent_bench.py --compare \
 
 Options: `--clients codex,opencode` (also `codex-apply-patch`, Codex with its
 freeform `apply_patch` grammar tool, `codex-remote-compact`, Codex compacting
-through the server whenever a turn reaches 7,000 tokens, and
+through the server whenever a turn reaches 10,000 tokens (`AGENT_COMPACT_LIMIT`;
+`client_compat`'s 7,000 left a whole task compacting after every file read),
+and
 `opencode-responses`), `--tasks`
 (a comma-separated subset), `--effort none|low|medium|xhigh` (default
 `none`), `--seeds 1,2,3` (each seed runs the whole matrix), `--timeout`
@@ -173,3 +175,8 @@ What the baseline shows:
 - **TTFT**: a client's first task prefills its roughly 6,000-token prompt
   cold (45 to 48 s); every later first turn restores it from the cache
   (0.8 to 3.5 s), and the median turn starts streaming in 1.1 to 3.4 s.
+
+Runs at reasoning efforts `medium` and `xhigh`, and with server-side
+compaction at `xhigh`, are in
+[docs/BONSAI.md](BONSAI.md#tool-call-reliability-2026-10-20-branch-opt-tool-calls-base-b09e22f)
+and [Compaction threshold](BONSAI.md#compaction-threshold).

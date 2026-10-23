@@ -3849,14 +3849,49 @@ Findings:
   card's instruct `presence_penalty: 1.5` would penalize every token of a
   coding prompt.
 
-Remaining: replay the other error points (`cat -A`, `python`, `apply_patch`,
-opencode `grep`, `oldString`) under the same settings and at effort `medium`
-(`tools/tool_calls/round2.sh`; stopped part-way); measure whether reasoning
-(`medium`/`xhigh`, the documented Codex default) removes the verification
-loops and GNU-isms; rerun whole sessions with several seeds on the agent
-benchmark for the key-order change; decide whether a client-side note
-(Codex `developer_instructions`) is worth documenting — the one tested did not
-help.
+Reasoning effort (2026-10-23, `tools/agent_bench.py` on `a4cf247`, seed 1,
+one run per effort, each alone under the GPU lock; `none` is the two
+[baseline](AGENT_BENCH.md#baseline) runs). Codex columns; "tail" is the turns
+after the last edit, summed over tasks:
+
+| Effort | Codex success | Turns, mean | wrong_tool | Loops | Tail | `sed -i` without `''` | `cat -A` | Wall s | opencode |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| none (two runs) | 6/7, 7/7 | 18.9, 14.9 | 4, 3 | 2, 1 | 72, 40 | 3, 5 | 2, 1 | 1,197, 862 | 7/7, 7/7 |
+| medium | 6/7 | 10.3 | 2 | 0 | 22 | 4 | 2 | 1,641 | 7/7 |
+| xhigh | 5/7 | 8.6 | 0 | 0 | 16 | 3 | 2 | 1,481 | 7/7 |
+| xhigh, here-document fix | 7/7 | 9.6 | 2 | 0 | 13 | 5 | 0 | 769 | - |
+
+- Reasoning removes the verification loops: no loop at `medium` or `xhigh`,
+  and the turns after the last edit fall from 40–72 to 13–22. It does not
+  cost wall time once the harness lets here-documents work: `xhigh` took
+  769 s for 7/7, fewer turns making up for the reasoning, against 862–1,197 s
+  at `none` (1,481 s before the fix, see below).
+- It does not remove the GNU-isms: `sed -i` without `''` appears as often
+  at every effort (3–5 per run), `cat -A` 0–2 times. Each costs a failed
+  command and a retry, and no task failed on one. Nothing server-side can
+  fix them (the server does not know the client's OS, and round 1's macOS
+  note in the instructions did not reduce them at `none`); on macOS the
+  remedy is client-side, for example GNU `sed` and `coreutils` first on the
+  `PATH` Codex inherits.
+- The three Codex failures at `medium` and `xhigh` were one chain, not
+  reasoning quality: the harness's Codex sandbox excluded `TMPDIR` and
+  `/tmp` from its writable roots, so `cat > file << 'EOF'` failed with "can't
+  create temp file for here document" (default Codex allows both), the model
+  then reasoned about quoting until the server's default 8,192-token output
+  budget ran out (Codex sends no `max_output_tokens`), and Codex ended the
+  turn on the incomplete response. The same here-document error appeared at
+  `none` too (in 2 and 4 log lines), where the model, not reasoning, simply
+  tried another way. `client_compat` now keeps the run's own scratch
+  `TMPDIR` writable and points zsh's `TMPPREFIX` into it. `medium`'s
+  `rename-function` was rerun alone (with that fix) because Homebrew replaced
+  the running Python mid-run (`No module named 'glob'` in the harness).
+- opencode solved every task at every effort; its one bare `python` (per
+  `none` run) did not recur at `medium` or `xhigh`.
+
+So the documented Codex setting, `model_reasoning_effort = "xhigh"` (or
+`medium`), is the configuration fix for the loops, at no cost in wall time
+on these tasks; one run per effort, so read single-task differences as
+noise.
 
 #### Long-context coding quality
 

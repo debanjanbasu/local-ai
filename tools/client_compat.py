@@ -515,7 +515,11 @@ def codex_config(proxy_port: int, effort: str, compat: bool, catalog: Path | Non
         "",
         "[sandbox_workspace_write]",
         "network_access = false",
-        "exclude_tmpdir_env_var = true",
+        # TMPDIR is the run's own scratch directory (see prepare_client), so
+        # keeping it writable keeps the jail; without it zsh could not create
+        # the temporary file a here-document needs, and `cat > f << EOF`
+        # failed with "operation not permitted" where default Codex allows it.
+        "exclude_tmpdir_env_var = false",
         "exclude_slash_tmp = true",
     ]
     if compat:
@@ -716,9 +720,10 @@ def file_hash(path: Path) -> str:
 
 
 def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bool = True,
-                   variant: str = "") -> tuple[Path, Path, dict]:
+                   variant: str = "", compact_limit: int | None = 7000) -> tuple[Path, Path, dict]:
     """Scratch repository, HOME and environment for one run. `variant` picks a
-    client configuration: `responses` (opencode), `apply-patch` or `compact` (Codex)."""
+    client configuration: `responses` (opencode), `apply-patch` or `compact` (Codex);
+    `compact_limit` is the Codex auto-compaction limit of the compact variants."""
     base = ctx.out / "scenarios" / name
     if base.exists():
         shutil.rmtree(base)
@@ -742,12 +747,15 @@ def prepare_client(ctx: Context, client: str, name: str, effort: str, compat: bo
         # the fix task ends near 7,700 tokens, so 9,000 is never reached.
         # The same limit drives remote compaction; `remote-manual` compacts
         # only when asked to (app-server `thread/compact/start`).
-        compact_limit = 7000 if variant in ("compact", "remote-compact") else None
+        if variant not in ("compact", "remote-compact"):
+            compact_limit = None
         # Remote compaction v2 everywhere but the scenario testing local compaction.
         remote = variant != "compact"
         (codex_home / "config.toml").write_text(
             codex_config(ctx.proxy_port, effort, compat, catalog, compact_limit, remote))
-        env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp)
+        # zsh puts here-document files under TMPPREFIX (default /tmp/zsh), not TMPDIR.
+        env = client_env(home, CODEX_HOME=str(codex_home), TMPDIR=scratch_tmp,
+                         TMPPREFIX=f"{scratch_tmp}/zsh")
     elif client == "opencode":
         config = home / ".config" / "opencode"
         config.mkdir(parents=True)

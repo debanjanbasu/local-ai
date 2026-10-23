@@ -575,6 +575,9 @@ CHECK_SCRIPT = Task(
 
 TASKS = [PAGINATION, SLUGIFY, RENAME, LOCATE, LINECOUNT, LARGE_FILE, CHECK_SCRIPT]
 
+# Codex's auto-compaction limit for `codex-remote-compact` (see run_one).
+AGENT_COMPACT_LIMIT = 10_000
+
 # Client name -> (client_compat client, prepare_client variant).
 CLIENTS = {
     "codex": ("codex", ""),
@@ -885,7 +888,12 @@ def run_one(ctx: cc.Context, out: Path, task: Task, client_name: str, effort: st
     # every task: the client's system prompt (which quotes them) is then the
     # same for every task, as for a user who works in one project, so only a
     # client's first task prefills it cold.
-    repo, base, env = cc.prepare_client(ctx, client, client_name, effort, variant=variant)
+    # client_compat's 7,000-token compaction limit leaves its one small task
+    # room, but Codex's own instructions and tools take about 5,400 tokens and
+    # a summary about 700, so a whole task compacted again after every file
+    # read and never finished. Tasks here peak at 6.5K to 18K tokens.
+    repo, base, env = cc.prepare_client(ctx, client, client_name, effort, variant=variant,
+                                        compact_limit=AGENT_COMPACT_LIMIT)
     cc.write_files(repo, task.files)
     cc.git_init(repo)
     ctx.recorder.inject = {"seed": seed} if seed is not None else {}
