@@ -178,6 +178,7 @@ let request = ChatRequest {
     sampling: Sampling::default(),
     thinking: true,
     effort: ReasoningEffort::default(),
+    reasoning_instruction: false,
     preserve_thinking: true,
     session: None,
     tools: vec![],

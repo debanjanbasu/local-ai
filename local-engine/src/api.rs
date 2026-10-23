@@ -82,6 +82,7 @@ pub struct Sampling(pub GenerateParams);
 
 /// A templated chat generation request.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ChatRequest {
     /// Conversation in chronological order.
     pub messages: Vec<ChatMessage>,
@@ -91,8 +92,16 @@ pub struct ChatRequest {
     pub sampling: Sampling,
     /// Whether the model reasons before answering.
     pub thinking: bool,
-    /// How hard it reasons when `thinking`; ignored otherwise.
+    /// How hard it reasons when `thinking`; ignored otherwise, unless
+    /// `reasoning_instruction`.
     pub effort: ReasoningEffort,
+    /// With `thinking` off, still render `effort`'s reasoning instruction in
+    /// the system turn and close the reasoning block in the prompt, so the
+    /// request answers at once while its prompt shares the system turn and
+    /// history of the same conversation's thinking requests (a compaction
+    /// summary reuses the conversation's cached prefix). Ignored with
+    /// `thinking`.
+    pub reasoning_instruction: bool,
     /// Whether assistant turns up to the last user query keep their
     /// reasoning when rendered (the template's `preserve_thinking`, on by
     /// default). `false` drops it, as `OpenAI`'s `reasoning.context:
@@ -420,6 +429,7 @@ impl Engine {
             sampling: Sampling::default(),
             thinking: true,
             effort: ReasoningEffort::default(),
+            reasoning_instruction: false,
             preserve_thinking: true,
             session: None,
             tools: Vec::new(),
@@ -746,7 +756,7 @@ impl EngineHandle {
     /// ```no_run
     /// # use local_engine::{ChatMessage, ChatRequest, Engine, Event, Sampling};
     /// let handle = Engine::open()?.into_handle();
-    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, effort: local_engine::ReasoningEffort::default(), preserve_thinking: true, session: None, tools: Vec::new(), tool_choice: local_engine::ToolChoice::Auto, parallel_tool_calls: true, response_format: local_engine::ResponseFormat::Text, stop: Vec::new() };
+    /// let request = ChatRequest { messages: vec![ChatMessage { role: "user".into(), content: "Hello".into(), ..ChatMessage::default() }], max_tokens: 32, sampling: Sampling::default(), thinking: true, effort: local_engine::ReasoningEffort::default(), reasoning_instruction: false, preserve_thinking: true, session: None, tools: Vec::new(), tool_choice: local_engine::ToolChoice::Auto, parallel_tool_calls: true, response_format: local_engine::ResponseFormat::Text, stop: Vec::new() };
     /// for event in handle.chat(request)? {
     ///     if let Event::Content(text) = event { print!("{text}"); }
     /// }
@@ -1111,6 +1121,7 @@ impl EventStream {
     ///     sampling: local_engine::Sampling::default(),
     ///     thinking: false,
     ///     effort: local_engine::ReasoningEffort::default(),
+    ///     reasoning_instruction: false,
     ///     preserve_thinking: true,
     ///     session: None,
     ///     tools: Vec::new(),
@@ -1227,14 +1238,20 @@ impl Drop for EventStream {
 
 /// Render a request and validate its tools; the one path shared by the
 /// synchronous [`Engine`] and the worker.
-fn prepare_chat(request: &ChatRequest) -> crate::Result<(String, Option<Arc<ToolSet>>)> {
+pub fn prepare_chat(request: &ChatRequest) -> crate::Result<(String, Option<Arc<ToolSet>>)> {
     let tools = ToolSet::new(&request.tools)?;
-    let prompt = render_messages(
+    let instructed = request.thinking || request.reasoning_instruction;
+    let mut prompt = render_messages(
         &request.messages,
-        request.thinking.then_some(request.effort),
+        instructed.then_some(request.effort),
         request.preserve_thinking,
         &tools,
     )?;
+    if instructed && !request.thinking {
+        // The thinking opener `<think>\n` becomes the template's empty
+        // reasoning block, `<think>\n\n</think>\n\n`, as with thinking off.
+        prompt.push_str("\n</think>\n\n");
+    }
     Ok((prompt, (!tools.is_empty()).then(|| Arc::new(tools))))
 }
 

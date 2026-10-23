@@ -24,10 +24,6 @@ use crate::{ToolDefinition, runtime::DEFAULT_MAX_OUTPUT_TOKENS};
 /// The output budget of one compaction summary.
 pub const COMPACTION_MAX_TOKENS: usize = 2_048;
 
-/// The extra output budget of a compaction summary of a reasoning
-/// conversation, for the reasoning before it.
-pub const COMPACTION_REASONING_TOKENS: usize = 4_096;
-
 /// Sampling temperature for summaries: low, because a summary should restate,
 /// not invent.
 const SUMMARY_TEMPERATURE: f32 = 0.3;
@@ -122,6 +118,7 @@ fn summary_request(
         }),
         thinking: false,
         effort: ReasoningEffort::default(),
+        reasoning_instruction: false,
         preserve_thinking: true,
         session,
         // The conversation's tools are rendered, so the prompt shares its
@@ -148,10 +145,12 @@ fn summary_request(
 /// keeps exact prefixes only at snapshot boundaries (the previous request's
 /// tail among them), and a summary of a shorter prefix, or under another
 /// system turn, would prefill the whole history again. The whole history is
-/// summarized, including the newest items a caller keeps verbatim. When the
-/// conversation reasons, the summary does too, with
-/// [`COMPACTION_REASONING_TOKENS`] more output; the summary is the visible
-/// content of the generation either way.
+/// summarized, including the newest items a caller keeps verbatim. The
+/// summary never reasons: a conversation that reasons keeps its effort's
+/// instruction in the system turn (see [`ChatRequest::reasoning_instruction`])
+/// and the summary answers at once. A reasoning summary could spend its whole
+/// budget reasoning and come back empty, and an empty summary discards the
+/// compaction, so the client asked again at every later turn.
 #[must_use]
 pub fn compaction_request(conversation: &ChatRequest) -> ChatRequest {
     let mut messages = conversation.messages.clone();
@@ -160,20 +159,15 @@ pub fn compaction_request(conversation: &ChatRequest) -> ChatRequest {
         content: COMPACTION_PROMPT.into(),
         ..ChatMessage::default()
     });
-    let reasoning = if conversation.thinking {
-        COMPACTION_REASONING_TOKENS
-    } else {
-        0
-    };
     ChatRequest {
-        thinking: conversation.thinking,
         effort: conversation.effort,
+        reasoning_instruction: conversation.thinking,
         preserve_thinking: conversation.preserve_thinking,
         ..summary_request(
             messages,
             conversation.tools.clone(),
             conversation.session.clone(),
-            COMPACTION_MAX_TOKENS + reasoning,
+            COMPACTION_MAX_TOKENS,
         )
     }
 }
@@ -220,7 +214,6 @@ pub fn reasoning_summary_request(reasoning: &str, detail: SummaryDetail) -> Chat
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::Engine;
 
     #[test]
     fn compaction_requests_extend_the_conversations_prompt() {
@@ -244,35 +237,32 @@ mod tests {
             strict: false,
         };
         for thinking in [false, true] {
+            // `xhigh` has a system-turn instruction, which the summary must keep.
             let conversation = ChatRequest {
                 messages: messages.clone(),
                 thinking,
-                effort: ReasoningEffort::Medium,
+                effort: ReasoningEffort::XHigh,
                 ..summary_request(Vec::new(), vec![tool.clone()], Some("s".into()), 64)
             };
             let request = compaction_request(&conversation);
-            assert_eq!(request.thinking, thinking);
-            assert_eq!(request.effort, ReasoningEffort::Medium);
+            assert!(!request.thinking, "a summary never reasons");
+            assert_eq!(request.reasoning_instruction, thinking);
+            assert_eq!(request.effort, ReasoningEffort::XHigh);
             assert_eq!(request.tool_choice, ToolChoice::None, "no call may be made");
-            assert_eq!(
-                request.max_tokens,
-                COMPACTION_MAX_TOKENS
-                    + if thinking {
-                        COMPACTION_REASONING_TOKENS
-                    } else {
-                        0
-                    }
-            );
+            assert_eq!(request.max_tokens, COMPACTION_MAX_TOKENS);
             assert_eq!(request.session.as_deref(), Some("s"));
-            let render = |request: &ChatRequest| {
-                Engine::render_chat_with_tools(&request.messages, request.thinking, &request.tools)
-                    .expect("renders")
-            };
+            let render =
+                |request: &ChatRequest| crate::api::prepare_chat(request).expect("renders").0;
             let (own, summary) = (render(&conversation), render(&request));
-            // Everything but the generation opener is a prefix of the summary.
+            // Everything but the generation opener is a prefix of the summary,
+            // which answers at once.
             let opener = own.rfind("<|im_start|>assistant").expect("opener");
             assert!(
                 summary.starts_with(own.get(..opener).expect("opener boundary")),
+                "{summary}"
+            );
+            assert!(
+                summary.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
                 "{summary}"
             );
             let ask = summary.find("Add quoting").unwrap_or(usize::MAX);

@@ -249,6 +249,7 @@ fn plain(messages: Vec<ChatMessage>) -> local_engine::ChatRequest {
         sampling: local_engine::Sampling::default(),
         thinking: false,
         effort: local_engine::ReasoningEffort::default(),
+        reasoning_instruction: false,
         preserve_thinking: true,
         session: None,
         tools: Vec::new(),
