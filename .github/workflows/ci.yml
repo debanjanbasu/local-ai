@@ -1,6 +1,6 @@
 # CI for local-ai.
 #
-# This workflow runs exactly the five commands in README.md's "Verification"
+# This workflow runs exactly the six commands in README.md's "Verification"
 # block, in the same order, so CI cannot drift from the documented procedure.
 # If you change one of them, change the README in the same commit.
 #
@@ -131,20 +131,29 @@ jobs:
             ${{ runner.os }}-arm64-cargo-
 
       # Gates 1-3, verbatim from README.md "Verification".
-      - name: Gate 1/5 -- cargo fmt
+      - name: Gate 1/6 -- cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: Gate 2/5 -- cargo clippy
+      - name: Gate 2/6 -- cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Gate 3/5 -- cargo test
+      - name: Gate 3/6 -- cargo test
         run: cargo test --workspace --locked --release
 
-      # Gates 4-5, verbatim from README.md "Verification". `tools/` is the
+      # Gates 4-6, verbatim from README.md "Verification". `tools/` is the
       # documented scope and it is also complete: every tracked .py file in the
       # repo lives under tools/.
-      - name: Gate 4/5 -- ruff
+      - name: Gate 4/6 -- ruff
         run: uvx ruff check tools/
 
-      - name: Gate 5/5 -- python unittest
+      - name: Gate 5/6 -- python unittest
         run: python3 -m unittest discover -s tools -p 'test_*.py'
+
+      # Installed outside the checkout so neither rust-toolchain.toml's nightly
+      # nor .cargo/config.toml's build-std applies to the tool's own build.
+      - name: Install cargo-audit
+        working-directory: ${{ runner.temp }}
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Gate 6/6 -- cargo audit
+        run: cargo audit

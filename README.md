@@ -523,7 +523,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked --release
 uvx ruff check tools/
 python3 -m unittest discover -s tools -p 'test_*.py'
+cargo audit
 ```
+
+`cargo audit` (from `cargo install cargo-audit`) fails on any RustSec
+vulnerability in `Cargo.lock`; unmaintained and unsound warnings are
+reported without failing.
 
 Real-model checks are in [docs/BONSAI.md](docs/BONSAI.md#verification).
 
