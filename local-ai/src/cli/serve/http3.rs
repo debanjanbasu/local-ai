@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,15 +16,21 @@ pub(super) async fn serve_h3(
     cert_path: PathBuf,
     key_path: PathBuf,
 ) -> crate::Result<()> {
+    use rustls::pki_types::pem::{self, PemObject};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let cert_data = std::fs::read(cert_path)?;
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut Cursor::new(cert_data)).collect::<Result<_, _>>()?;
-    let key_data = std::fs::read(key_path)?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut Cursor::new(key_data))?
-        .ok_or_else(|| {
-            crate::Error::InvalidArgument("TLS key file contains no private key".into())
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_data)
+        .collect::<Result<_, _>>()
+        .map_err(|error| {
+            crate::Error::InvalidArgument(format!("invalid TLS certificate file: {error}"))
         })?;
+    let key_data = std::fs::read(key_path)?;
+    let key = PrivateKeyDer::from_pem_slice(&key_data).map_err(|error| match error {
+        pem::Error::NoItemsFound => {
+            crate::Error::InvalidArgument("TLS key file contains no private key".into())
+        }
+        error => crate::Error::InvalidArgument(format!("invalid TLS key file: {error}")),
+    })?;
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
