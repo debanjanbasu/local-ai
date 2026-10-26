@@ -54,7 +54,10 @@ impl BonsaiOps {
     /// On a tensor build, F16 caches use `bo_attn_split_tensor` and quantized
     /// ones `bo_attn_split_tensor_<layout>` (the six GQA heads as one Q tile per
     /// split); the SIMD build uses `bo_attn_split` with `SPLIT_HEADS` heads per
-    /// SIMD group. All feed the same partial records to `bo_attn_reduce`.
+    /// SIMD group, as do short prefixes on every build, with
+    /// [`Self::short_split_tokens`] tokens per split below
+    /// `SPLIT_TENSOR_MIN_PREFIX` and `SPLIT` from it on. All feed the same
+    /// partial records to `bo_attn_reduce`.
     pub fn attention_row_kv(
         &self,
         layout: KvLayout,
@@ -122,7 +125,12 @@ impl BonsaiOps {
             );
             splits
         } else {
-            let splits = prefix.div_ceil(SPLIT);
+            let split_tokens = if prefix < SPLIT_TENSOR_MIN_PREFIX {
+                self.short_split_tokens
+            } else {
+                SPLIT
+            };
+            let splits = prefix.div_ceil(split_tokens);
             need(
                 &workspace.partials,
                 splits as usize * Q_HEADS as usize * 258 * 4,
@@ -131,7 +139,7 @@ impl BonsaiOps {
                 b,
                 10,
                 &caches,
-                &[prefix, splits, codes[0], codes[1]],
+                &[prefix, splits, codes[0], codes[1], split_tokens],
                 &[],
                 (24 / SPLIT_HEADS * splits) as usize,
                 32,

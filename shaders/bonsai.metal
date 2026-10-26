@@ -318,10 +318,15 @@ kernel void bonsai_ptq1_matmul_bytewise_32(
     device const BonsaiPtq1Block *weights [[buffer(0)]], device const float *input [[buffer(1)]],
     device float *output [[buffer(2)]], constant uint &rows [[buffer(3)]],
     constant uint &columns [[buffer(4)]], constant uint &tokens [[buffer(5)]],
+    threadgroup float *decoded [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float activations[32 * 64], decoded[64 * 33];
+    // `decoded` (64 x 33 floats, BYTEWISE_DECODED_BYTES in bonsai.rs) is dynamic
+    // threadgroup memory: Metal's shader validation counts static threadgroup
+    // memory twice against the 32 KiB limit, and both tiles static (16.25 KiB)
+    // aborted under MTL_SHADER_VALIDATION=1.
+    threadgroup float activations[32 * 64];
     // Activation storage is dead after the final multiply; reuse it for results.
     bonsai_ptq1_matmul_bytewise_impl<32, 64>(weights, input, output, rows, columns, tokens,
         group, tid, simd_group, activations, decoded, activations);

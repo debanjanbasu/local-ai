@@ -68,10 +68,15 @@ kernel void egv_attention_64(
     device const float *v [[buffer(2)]], device float *out [[buffer(3)]],
     constant uint &first [[buffer(4)]], constant uint &count [[buffer(5)]],
     constant uint &heads [[buffer(6)]],
+    threadgroup float *ks_memory [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 ) {
-    threadgroup float ks[EGV_BK][EGV_LD];
+    // ks is dynamic threadgroup memory (ATTENTION_KS_BYTES in
+    // embedding_vision.rs): Metal's shader validation counts static
+    // threadgroup memory twice against the 32 KiB limit, and every tile static
+    // (22.6 KiB) aborted under MTL_SHADER_VALIDATION=1.
+    threadgroup float (*ks)[EGV_LD] = (threadgroup float (*)[EGV_LD]) ks_memory;
     threadgroup float vs[EGV_BK][EGV_LD];
     threadgroup float ps[4][8][EGV_PLD];
     threadgroup float dg[4][8][8];

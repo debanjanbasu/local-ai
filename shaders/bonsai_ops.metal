@@ -540,7 +540,8 @@ kernel void bo_kv_prep(
     bonsai_kv_store(v_cache, v_format, absolute_position, head, tid / 32, tid % 32, v);
 }
 
-// Decode attention over one 128-token split. One SIMD group serves
+// Decode attention over one `split_tokens` split (see `BonsaiOps`'s
+// `short_split_tokens`; 128 from 1,024 tokens on). One SIMD group serves
 // BONSAI_SPLIT_HEADS of the six query heads that share a KV head, so each
 // cached K/V element is fetched from device memory once for all of them
 // (the one-head-per-group form re-read every byte six times and held the
@@ -553,7 +554,7 @@ constant uint BONSAI_SPLIT_GROUPS_PER_KV_HEAD = 6 / BONSAI_SPLIT_HEADS;
 template <uint KF, uint VF>
 static inline void bonsai_attn_split_impl(
     device const float *query, device const uchar *key, device const uchar *value,
-    device float *partials, uint prefix, uint splits, uint group, uint lane
+    device float *partials, uint prefix, uint splits, uint split_tokens, uint group, uint lane
 ) {
     const uint split = group % splits, slot = group / splits;
     const uint kv_head = slot / BONSAI_SPLIT_GROUPS_PER_KV_HEAD;
@@ -568,8 +569,8 @@ static inline void bonsai_attn_split_impl(
         maximum[h] = -INFINITY;
         denominator[h] = 0.0f;
     }
-    const uint end = min(split * 128 + 128, prefix);
-    for (uint token = split * 128; token < end; ++token) {
+    const uint start = split * split_tokens, end = min(start + split_tokens, prefix);
+    for (uint token = start; token < end; ++token) {
         float k[8], score[BONSAI_SPLIT_HEADS];
         for (uint i = 0; i < 8; ++i) k[i] = bonsai_kv_load<KF>(key, token, kv_head, i, lane);
         for (uint h = 0; h < BONSAI_SPLIT_HEADS; ++h) {
@@ -601,10 +602,11 @@ kernel void bo_attn_split(
     device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],
     constant uint &prefix [[buffer(4)]], constant uint &splits [[buffer(5)]],
     constant uint &k_format [[buffer(6)]], constant uint &v_format [[buffer(7)]],
+    constant uint &split_tokens [[buffer(8)]],
     uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
     BONSAI_KV_DISPATCH(bonsai_attn_split_impl, k_format, v_format,
-        query, key, value, partials, prefix, splits, group, lane);
+        query, key, value, partials, prefix, splits, split_tokens, group, lane);
 }
 
 // Share split metadata and read numerator values ahead, retaining the original
@@ -968,6 +970,13 @@ static inline void bonsai_kv_tile(
     }
 }
 
+// The quantized tensor kernels take their 16 KiB half tile as dynamic
+// threadgroup memory (`[[threadgroup(0)]]`, length `Q8_TILE_BYTES` in
+// bonsai_ops.rs): Metal's shader validation (MTL_SHADER_VALIDATION=1) counts
+// static threadgroup memory twice against the 32 KiB limit, so a kernel
+// declaring more than 16 KiB statically aborts there. Dynamic memory is
+// counted once; outputs are bitwise those of the static tile.
+//
 // bo_attn_split_tensor for quantized caches. The tensor operands must be half, so each
 // NK-token tile is dequantized into threadgroup memory first: K, then V into
 // the same storage once the scores exist, its loads overlapping the softmax
@@ -1084,9 +1093,9 @@ kernel void NAME(                                                               
     device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],   \
     constant uint &prefix [[buffer(4)]], constant uint &splits [[buffer(5)]],        \
     constant uint &split_tokens [[buffer(6)]],                                       \
+    threadgroup half *tile [[threadgroup(0)]],                                       \
     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]] \
 ) {                                                                                  \
-    threadgroup half tile[32 * 256];                                                 \
     threadgroup float scores[8 * 32], correction[8], maximum[8], denominator[8];     \
     bonsai_attn_split_tensor_quantized_impl<KF, VF, 32>(query, key, value, partials, \
         prefix, splits, split_tokens, group, tid, tile, scores, correction, maximum, \
@@ -1197,9 +1206,9 @@ kernel void NAME(                                                               
     device const uchar *value [[buffer(2)]], device const float *gate [[buffer(3)]], \
     device float *output [[buffer(4)]], constant uint &position [[buffer(5)]],       \
     constant uint &tokens [[buffer(6)]], constant uint &gated [[buffer(7)]],         \
+    threadgroup half *tile [[threadgroup(0)]],                                       \
     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]] \
 ) {                                                                                  \
-    threadgroup half tile[32 * 256];                                                 \
     threadgroup float scores[8 * 32], correction[8], maximum[8], denominator[8];     \
     bonsai_attn_tensor_quantized_impl<KF, VF>(query, key, value, gate, output,       \
         position, tokens, gated, group, tid, tile, scores, correction, maximum,     \
@@ -1469,10 +1478,10 @@ kernel void bo_attn_split_tensor_rows_q8_##TOKENS(                              
     device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],    \
     constant uint &first_prefix [[buffer(4)]], constant uint &splits [[buffer(5)]],   \
     constant uint &split_tokens [[buffer(6)]],                                      \
+    threadgroup half *tile [[threadgroup(0)]],                                      \
     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]] \
 ) {                                                                                \
     constexpr uint nt = (6 * TOKENS + 7) / 8;                                       \
-    threadgroup half tile[32 * 256];                                                \
     threadgroup float scores[nt * 8 * 32], correction[nt * 8], maximum[nt * 8],       \
         denominator[nt * 8];                                                       \
     if (TOKENS == 4) {                                                               \
@@ -1618,11 +1627,10 @@ kernel void bo_attn_tensor_rows_q8(
     device float *query [[buffer(0)]], device const uchar *key [[buffer(1)]],
     device const uchar *value [[buffer(2)]], device float *output [[buffer(3)]],
     constant uint &position [[buffer(4)]], constant uint &tokens [[buffer(5)]],
-    constant uint &stride [[buffer(6)]],
+    constant uint &stride [[buffer(6)]], threadgroup half *tile [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
 ) {
     constexpr uint tokens_per_group = 4, m = (6 * tokens_per_group + 7) / 8 * 8;
-    threadgroup half tile[32 * 256];
     threadgroup float scores[m * 32], correction[m], maximum[m], denominator[m];
     threadgroup uint rescaled[1];
     bonsai_attn_tensor_rows_q8_impl<tokens_per_group>(query, key, value, output, position,

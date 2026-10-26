@@ -28,6 +28,11 @@ pub const VISION_WIDTH: u32 = 1152;
 pub const VISION_HEADS: u32 = 16;
 /// Head dimension.
 pub const VISION_HEAD_DIM: u32 = 72;
+/// Dynamic threadgroup memory of `bv_attention`, its `ks` tile of
+/// `BV_KS_ROWS` (35) rows of `BV_LD` (76) floats: Metal's shader validation
+/// counts static threadgroup memory twice against the 32 KiB limit, so the
+/// kernel aborted under `MTL_SHADER_VALIDATION=1` with the tile static.
+const ATTENTION_KS_BYTES: usize = 35 * 76 * 4;
 
 /// What [`VisionKernels::gemm`] does with each result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,7 +307,7 @@ impl VisionKernels {
     /// `[count][16][72]` rows of `out` at `out_offset`, for the queries
     /// `queries` (a start that is a multiple of 64), so a large image can
     /// split its attention over several command buffers.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unsafe_code)]
     pub fn attention(
         &self,
         batch: &mut CommandBatch,
@@ -341,6 +346,8 @@ impl VisionKernels {
         set(encoder, &count, 2);
         set(encoder, &scale, 3);
         set(encoder, &queries.start, 4);
+        // SAFETY: index 0 is the kernel's only threadgroup argument.
+        unsafe { encoder.setThreadgroupMemoryLength_atIndex(ATTENTION_KS_BYTES, 0) };
         grid(
             encoder,
             ((queries.len()).div_ceil(64), VISION_HEADS as usize),

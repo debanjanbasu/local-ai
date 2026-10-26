@@ -38,7 +38,15 @@ pub const GDN_DIM: u32 = 128;
 /// tok/s at 128 rows, 128.7 at 256, 130.3 at 512 and 129.4 at 640 (before
 /// that rounding).
 pub const MAX_PREFILL_TOKENS: u32 = 512;
+/// Tokens per `bo_attn_split` split from `SPLIT_TENSOR_MIN_PREFIX` on (SIMD
+/// builds only: tensor builds take the tensor split kernels there).
 const SPLIT: u32 = 128;
+/// Default tokens per `bo_attn_split` split below `SPLIT_TENSOR_MIN_PREFIX`;
+/// see [`BonsaiOps::with_short_split_tokens`].
+const DEFAULT_SHORT_SPLIT_TOKENS: u32 = 32;
+/// Smallest short split [`BonsaiOps::with_short_split_tokens`] accepts, which
+/// [`AttentionWorkspace`] reserves partial records for.
+const SHORT_SPLIT_MIN: u32 = 32;
 /// Tokens per threadgroup of `bo_attn_split_tensor` (a multiple of its
 /// 64-key tile). Short prefixes use the small split so the four KV heads
 /// still yield enough threadgroups to fill the GPU; from
@@ -167,9 +175,14 @@ impl AttentionWorkspace {
         } else {
             0
         };
-        let splits = max_context
-            .div_ceil(SPLIT)
-            .max(SPLIT_TENSOR_ROWS * tensor_short.max(tensor_long)) as usize;
+        // Short SIMD splits below the tensor threshold may be as small as
+        // `SHORT_SPLIT_MIN`.
+        let simd = max_context.div_ceil(SPLIT).max(
+            max_context
+                .min(SPLIT_TENSOR_MIN_PREFIX - 1)
+                .div_ceil(SHORT_SPLIT_MIN),
+        );
+        let splits = simd.max(SPLIT_TENSOR_ROWS * tensor_short.max(tensor_long)) as usize;
         let partial_bytes = splits
             .checked_mul(Q_HEADS as usize)
             .and_then(|n| n.checked_mul(258 * 4))
@@ -302,14 +315,24 @@ impl KvLayout {
 /// `bo_attn_split_tensor_*` and `bo_attn_tensor_*` instantiations.
 const QUANTIZED_TENSOR_LAYOUTS: [KvLayout; 1] = [KvLayout::Q8];
 
+/// Dynamic threadgroup memory of the quantized tensor attention kernels: their
+/// 32-token half K/V tile (`tile [[threadgroup(0)]]` in the shader). Metal's
+/// shader validation counts static threadgroup memory twice against the
+/// 32 KiB limit, so these kernels (16 KiB of tile plus their softmax state)
+/// aborted under `MTL_SHADER_VALIDATION=1` while the tile was static.
+const Q8_TILE_BYTES: usize = 32 * 256 * 2;
+
 pub struct BonsaiOps {
-    p: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Pipelines with the dynamic threadgroup bytes each takes at index 0.
+    p: Vec<(Retained<ProtocolObject<dyn MTLComputePipelineState>>, usize)>,
     attention_kernel: AttentionKernel,
     /// Quantized layout -> index in `p` of its tensor decode-split pipeline;
     /// its causal prefill pipeline follows at the next index.
     quantized_tensor: Vec<(KvLayout, usize)>,
     /// Gather followed by the two-, three- and four-row Q8 split pipelines.
     tensor_rows: Option<usize>,
+    /// Tokens per `bo_attn_split` split below `SPLIT_TENSOR_MIN_PREFIX`.
+    short_split_tokens: u32,
 }
 impl BonsaiOps {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
@@ -328,6 +351,7 @@ impl BonsaiOps {
 
     /// Select an exact implementation for numerical/performance comparisons.
     /// Unlike automatic selection, an unavailable explicit kernel is an error.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_attention_kernel(
         context: &MetalContext,
         shaders: &ShaderLibrary,
@@ -406,10 +430,11 @@ impl BonsaiOps {
             &[]
         };
         let mut p = Vec::with_capacity(names.len() + quantized_names.len() + row_names.len());
-        for name in names
+        for (index, name) in names
             .into_iter()
             .chain(quantized_names.iter().map(String::as_str))
             .chain(row_names.iter().copied())
+            .enumerate()
         {
             let f = shaders.get_function(name)?;
             let pipeline = context
@@ -428,7 +453,9 @@ impl BonsaiOps {
                     "Bonsai pipeline cannot support the required SIMD/threadgroup size",
                 ));
             }
-            p.push(pipeline);
+            // Every quantized and row kernel but the gather takes the tile.
+            let tiled = index >= names.len() && name != "bo_attn_gather_rows";
+            p.push((pipeline, if tiled { Q8_TILE_BYTES } else { 0 }));
         }
         let quantized_tensor = quantized
             .iter()
@@ -441,12 +468,31 @@ impl BonsaiOps {
             attention_kernel,
             quantized_tensor,
             tensor_rows,
+            short_split_tokens: DEFAULT_SHORT_SPLIT_TOKENS,
         })
     }
 
     #[must_use]
     pub const fn attention_kernel(&self) -> AttentionKernel {
         self.attention_kernel
+    }
+
+    /// Tokens per split of decode attention's SIMD kernel below a 1,024-token
+    /// prefix, where every build uses it.
+    #[must_use]
+    pub const fn short_split_tokens(&self) -> u32 {
+        self.short_split_tokens
+    }
+
+    /// Override [`Self::short_split_tokens`] (for measurements and controls).
+    /// Only the summation order changes. Accepts 32 to 128 tokens, the range
+    /// [`AttentionWorkspace`] reserves partial records for.
+    pub fn with_short_split_tokens(mut self, tokens: u32) -> crate::Result<Self> {
+        if !(SHORT_SPLIT_MIN..=SPLIT).contains(&tokens) {
+            return Err(arg("short attention split must be 32..=128 tokens"));
+        }
+        self.short_split_tokens = tokens;
+        Ok(self)
     }
 
     /// Index of `layout`'s quantized tensor decode-split pipeline, if it has one.
@@ -469,8 +515,12 @@ impl BonsaiOps {
         threads: usize,
     ) {
         let e = b.encoder();
-        e.setComputePipelineState(&self.p[pi]);
+        let (pipeline, threadgroup_bytes) = &self.p[pi];
+        e.setComputePipelineState(pipeline);
         unsafe {
+            if *threadgroup_bytes > 0 {
+                e.setThreadgroupMemoryLength_atIndex(*threadgroup_bytes, 0);
+            }
             for (i, (v, o)) in bufs.iter().enumerate() {
                 e.setBuffer_offset_atIndex(Some(v.raw()), *o, i);
             }

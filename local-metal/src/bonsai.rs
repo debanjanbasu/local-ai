@@ -179,6 +179,12 @@ pub enum HadamardDirection {
     Inverse,
 }
 
+/// Dynamic threadgroup memory of `bonsai_ptq1_matmul_bytewise_32`, its 64 x 33
+/// float decoded-weight tile: Metal's shader validation counts static
+/// threadgroup memory twice against the 32 KiB limit, so the kernel aborted
+/// under `MTL_SHADER_VALIDATION=1` with both of its tiles static.
+const BYTEWISE_DECODED_BYTES: usize = 64 * 33 * 4;
+
 /// Execution primitive for multi-token Bonsai projections; both keep F32 inputs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PrefillKernel {
@@ -889,6 +895,9 @@ impl BonsaiKernels {
             set_u32(encoder, &matrix.rows, 3);
             set_u32(encoder, &matrix.columns, 4);
             set_u32(encoder, &tokens, 5);
+            if self.prefill_kernel == PrefillKernel::SimdF32 {
+                encoder.setThreadgroupMemoryLength_atIndex(BYTEWISE_DECODED_BYTES, 0);
+            }
         }
         let tile_rows = 32;
         encoder.dispatchThreadgroups_threadsPerThreadgroup(

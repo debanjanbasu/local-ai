@@ -108,7 +108,8 @@ fn signed_decay_and_tiny_l2_use_pinned_formulas() {
 fn validation_happens_before_dispatch_and_workspace_is_linear() {
     let Some((ctx, ops)) = setup() else { return };
     let workspace = AttentionWorkspace::new(&ctx, 129).expect("workspace");
-    assert_eq!(workspace.byte_len(), 2 * 24 * 258 * 4 + 4 * 6144 * 4);
+    // Five 32-token splits, the smallest short split, of 258-float records.
+    assert_eq!(workspace.byte_len(), 5 * 24 * 258 * 4 + 4 * 6144 * 4);
     let tiny = MetalBuffer::from_slice(ctx.device(), &[0.0_f32; 4]).expect("tiny");
     let mut batch = CommandBatch::new(&ctx).expect("batch");
     assert!(ops.sigmoid_mul(&mut batch, &tiny, &tiny, &tiny, 5).is_err());
@@ -781,11 +782,25 @@ fn kv_preparation_matches_full_preparation_rows_bitwise_and_touches_nothing_else
     );
 }
 
+/// Both ends of the short SIMD split range, on a workspace sized for the
+/// longest prefix and on one sized tightly below the 1,024-token threshold.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn split_gqa_matches_f64_across_boundaries_and_shorter_workspace_reuse() {
-    let Some((ctx, ops)) = setup() else { return };
+    let Some((ctx, default)) = setup() else {
+        return;
+    };
+    assert_eq!(default.short_split_tokens(), 32);
+    let shaders = ShaderLibrary::new(ctx.device()).expect("shaders");
+    let ops = |tokens| {
+        BonsaiOps::new(&ctx, &shaders)
+            .expect("ops")
+            .with_short_split_tokens(tokens)
+    };
+    assert!(ops(31).is_err() && ops(129).is_err());
     let capacity = 4105;
     let workspace = AttentionWorkspace::new(&ctx, capacity).expect("workspace");
+    let short_workspace = AttentionWorkspace::new(&ctx, 1023).expect("short workspace");
     let query_data = (0..6144).map(|i| signal(i, 19) * 1.7).collect::<Vec<_>>();
     let gate_data = (0..6144).map(|i| signal(i, 23) * 3.0).collect::<Vec<_>>();
     let keys = (0..capacity as usize * 1024)
@@ -801,60 +816,73 @@ fn split_gqa_matches_f64_across_boundaries_and_shorter_workspace_reuse() {
     let output = guarded(&ctx, 6144);
     // 1,100 and 4,000 take 64-token tensor splits on tensor builds: more
     // partial records than a 4,105-token workspace has 128-token splits.
-    for prefix in [1, 2, 127, 128, 129, 257, 1100, 4000, 4097, 7] {
-        let mut expected = vec![0.0; 6144];
-        for head in 0..24 {
-            let mut scores = (0..prefix as usize)
-                .map(|t| {
-                    (0..256)
-                        .map(|i| {
-                            f64::from(query_data[head * 256 + i])
-                                * f64::from(keys[(t * 4 + head / 6) * 256 + i].to_f32())
-                        })
+    let cases = [
+        (
+            &workspace,
+            &[1, 2, 31, 33, 127, 128, 129, 257, 1023, 1100, 4000, 4097, 7][..],
+        ),
+        (&short_workspace, &[32, 65, 1023][..]),
+    ];
+    for (short_split, &(workspace, prefixes)) in [32, 128]
+        .into_iter()
+        .flat_map(|short_split| cases.iter().map(move |case| (short_split, case)))
+    {
+        let ops = ops(short_split).expect("short split");
+        for &prefix in prefixes {
+            let mut expected = vec![0.0; 6144];
+            for head in 0..24 {
+                let mut scores = (0..prefix as usize)
+                    .map(|t| {
+                        (0..256)
+                            .map(|i| {
+                                f64::from(query_data[head * 256 + i])
+                                    * f64::from(keys[(t * 4 + head / 6) * 256 + i].to_f32())
+                            })
+                            .sum::<f64>()
+                            / 16.0
+                    })
+                    .collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                for score in &mut scores {
+                    *score = (*score - maximum).exp();
+                }
+                let denominator = scores.iter().sum::<f64>();
+                for i in 0..256 {
+                    expected[head * 256 + i] = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(t, p)| p * f64::from(values[(t * 4 + head / 6) * 256 + i].to_f32()))
                         .sum::<f64>()
-                        / 16.0
-                })
-                .collect::<Vec<_>>();
-            let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            for score in &mut scores {
-                *score = (*score - maximum).exp();
+                        / denominator;
+                }
             }
-            let denominator = scores.iter().sum::<f64>();
-            for i in 0..256 {
-                expected[head * 256 + i] = scores
+            for gated in [false, true] {
+                let mut batch = CommandBatch::new(&ctx).expect("batch");
+                ops.attention(
+                    &mut batch,
+                    &query,
+                    &key,
+                    &value,
+                    gated.then_some(&gate),
+                    &output,
+                    prefix,
+                    workspace,
+                )
+                .expect("attention");
+                batch.commit_and_wait().expect("attention completion");
+                let reference = expected
                     .iter()
-                    .enumerate()
-                    .map(|(t, p)| p * f64::from(values[(t * 4 + head / 6) * 256 + i].to_f32()))
-                    .sum::<f64>()
-                    / denominator;
+                    .zip(&gate_data)
+                    .map(|(&v, &g)| {
+                        if gated {
+                            v / (1.0 + (-f64::from(g)).exp())
+                        } else {
+                            v
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                check(&output, &reference, 2e-5);
             }
-        }
-        for gated in [false, true] {
-            let mut batch = CommandBatch::new(&ctx).expect("batch");
-            ops.attention(
-                &mut batch,
-                &query,
-                &key,
-                &value,
-                gated.then_some(&gate),
-                &output,
-                prefix,
-                &workspace,
-            )
-            .expect("attention");
-            batch.commit_and_wait().expect("attention completion");
-            let reference = expected
-                .iter()
-                .zip(&gate_data)
-                .map(|(&v, &g)| {
-                    if gated {
-                        v / (1.0 + (-f64::from(g)).exp())
-                    } else {
-                        v
-                    }
-                })
-                .collect::<Vec<_>>();
-            check(&output, &reference, 2e-5);
         }
     }
 }
