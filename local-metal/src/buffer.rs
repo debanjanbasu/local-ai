@@ -209,7 +209,9 @@ impl MetalBuffer {
     #[allow(unsafe_code)]
     pub fn copy_from_bytes(&self, src: &[u8], offset: usize) {
         assert!(
-            offset + src.len() <= self.length(),
+            offset
+                .checked_add(src.len())
+                .is_some_and(|end| end <= self.length()),
             "copy_from_bytes: out of bounds (offset={offset}, src_len={}, buf_len={})",
             src.len(),
             self.length(),
@@ -336,6 +338,15 @@ mod tests {
         // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
         let out: &[f32] = unsafe { buf.as_slice() };
         assert_eq!(&out[..3], &data[..]);
+    }
+
+    /// An offset near `usize::MAX` must not wrap past the bounds check.
+    #[test]
+    #[should_panic(expected = "copy_from_bytes: out of bounds")]
+    fn buffer_copy_from_bytes_rejects_wrapping_offset() {
+        let device = get_default_device().expect("Metal device");
+        let buf = MetalBuffer::empty(&device, 256).expect("create buffer");
+        buf.copy_from_bytes(&[1, 2], usize::MAX);
     }
 
     #[test]
