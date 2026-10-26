@@ -59,8 +59,11 @@ cancelled. The budgets, measurements and limits are in
 Responses are stored by default, as on OpenAI, in
 `~/Library/Application Support/local-ai/responses` (owner-only, unencrypted
 files; settled responses older than 30 days are removed at startup and hourly
-after). Each record repeats the whole conversation before it, inline images
-included, so a long conversation's records grow with the square of its turns.
+after). Each record carries the whole conversation before it, but every
+string of 16 KiB or more (an image or file sent inline, a long text) is kept
+once, in an owner-only content-addressed blob that every record repeating it
+shares and that goes with the last record naming it, so an image sent in the
+first turn is stored once however long the conversation runs.
 `--response-store DIR` keeps them in DIR instead, until deleted, and
 `--no-response-store` keeps none. The store serves
 `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
