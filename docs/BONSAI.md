@@ -1786,7 +1786,10 @@ snapshot the first wrote at the end of that prefix instead of prefilling it
 again. While that write is still in flight the later one skips its prefill
 each step another request decodes, so their tokens keep coming, and waits for
 the write only when none does; admission never waits for it (see
-[Concurrency measurements](#concurrency-measurements)). A prompt of at most 128 tokens to prefill (a typical
+[Concurrency measurements](#concurrency-measurements)). A prompt whose disk
+snapshot is still being read back (see [Prompt cache](#prompt-cache)) is
+held out the same way: the step's prefill goes to another prompt, or is sat
+out while others decode. A prompt of at most 128 tokens to prefill (a typical
 chat turn) goes whole, in a pass of its own after the step's decode round. A
 longer one, beside two or more decoding requests, prefills inside their
 batched pass: its chunk's rows are stacked after theirs, run every layer with
@@ -2460,6 +2463,17 @@ request whose best disk match is still in flight is not held up at
 admission; its first prefill step asks again and skips steps while other
 requests decode, or waits for that one write when none does (see
 [Prompts prefill inside the decode steps](#prompts-prefill-inside-the-decode-steps)).
+Reading a snapshot back is off the engine thread too. A request whose
+longest match is a disk snapshot starts a load, which reads the file and
+checks its SHA-256 on a thread of its own, and restores at most a GPU
+checkpoint meanwhile, as a stand-in it does not prefill from. It stays out of
+prefill until the load ends: the step's prefill goes to another prompt, or is
+sat out while others decode, and the engine waits for the load only when
+nothing else can run. Its first prefill step then copies the snapshot into
+its buffers, the one part left on the engine thread; a load that failed is a
+failed restore like any other, so its entry leaves the index and the tiers
+are asked again. A load dropped unfinished (its request cancelled) stops
+within a megabyte of reading.
 At most one job is in flight and one queued: a newer job replaces the queued
 one, except that a request tail never displaces a shared boundary. Dropping
 the engine finishes pending writes; the server, whose engine is never
@@ -2481,6 +2495,26 @@ of them together (131K tokens prefill in about half an hour), and the
 staged long-context runs rely on it (see Verification). A failed write is a cache miss reported
 on stderr, not a request error. Trim keeps an in-memory index of the
 directory instead of re-reading every snapshot header after each store.
+
+Reading and checking a snapshot used to run inside the restoring request's
+admission, where every decoding stream waited for it. Synthetic snapshots
+without the head (34 KiB a token), file in the page cache, M4 Pro, best of
+two:
+
+| Tokens | Snapshot | Read and SHA-256 (now off the engine thread) | Copy into the model's buffers |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 366 MB | 211 ms | 34 ms |
+| 32,768 | 1,222 MB | 656 ms | 58 ms |
+| 102,400 | 3,646 MB | 1,924 ms | 336 ms (623 ms growing the caches) |
+
+With a plain greedy stream decoding beside it, a request restoring a
+6,978-token, 324 MB disk snapshot (read and checked in 258–275 ms;
+`a_stream_keeps_decoding_while_another_request_loads_a_disk_snapshot`, one
+run per build, other builds loading the CPU) was admitted in 301 ms before
+and 8.7 ms after. The stream's longest gap until that request's first token
+fell from 419 ms (one token in that window) to 167 ms (six tokens emitted
+while the snapshot loaded, the longest gap being the copy and the request's
+own last-token prefill).
 
 Measured on an M4 Pro (1.7 GB/s write probe, host tier off), six interleaved
 cold runs per arm of `local-ai bonsai --raw --json --greedy --max-tokens 16`,
@@ -3666,23 +3700,46 @@ their own entry, not with current rates.
   prompt on an M2, so a budget below that abandons healthy non-streaming
   requests. The floor is 10 rather than a rounder number because it sits an
   order of magnitude above the worst gap actually observed.
-- Pipelining greedy plain decode (October 2026): encoding and committing
-  token N+1 before waiting on token N, with the argmax left on the device
-  and `draft_embed_inverse` gathering the next embedding row from it. Not
-  built: the most it can recover is the GPU's idle time between tokens,
-  0.32 ms of a 31.17 ms token in the per-token profile above (1.0%), and it
-  is not free. Plain decode updates recurrent state in place, so the token
-  run past an end of sequence cannot be discarded without a 151 MB state
-  copy per token or a verify-style rollback; left in place, the sequence
-  holds one token more than the request, and the request's closing prompt
-  checkpoint, which needs the state at exactly its tokens, is lost (the GPU
-  tier is cleared). The extra token also costs a whole decode step at the end
-  of every request (0.3% of a 300-token answer), and the scheduler, which
-  admits requests and swaps sequences between steps, would have to drain the
-  token in flight first. A gain under 1% sits inside the 4% spread of
-  `tools/benchmark.py` runs, against a lost prompt checkpoint per request,
-  so it was rejected without a prototype. It would apply only to
-  `--no-speculation` and to models without the MTP head.
+- Pipelining greedy plain decode (October 2026, prototype `408924e`,
+  reverted in the next commit): a lone greedy plain decode committed the pass
+  of token N+1 before waiting for token N. That pass gathered its embedding
+  on the GPU from token N's argmax (`draft_embed_inverse` over a second
+  `GreedyRows` selector, so the host read one while the pass in flight wrote
+  the other) and wrote the recurrent state and convolution history out of
+  place into a spare set (157 MB), which then swapped with the layers' own.
+  The state before the pass in flight survived until the next pass was
+  committed, so a pass that guessed wrong (an end of sequence, a client
+  stop, an admission, a lookup round) rolled back by swapping again and
+  stepping the position back, and the request's closing prompt checkpoint
+  was exactly the one-pass-at-a-time one; every other use of the model first
+  waited for and rolled back the pass in flight. Greedy text was
+  byte-identical to the unpipelined build on six prompts at 300 tokens, and
+  a real-model test matched tokens, the closing checkpoint and the next turn
+  after end-of-sequence, token-limit and client-stop endings. GPU timestamps
+  over 256 tokens (M4 Pro, five interleaved pairs in one process): idle
+  between tokens 0.25–0.78 ms per token unpipelined (0.25–0.31 with the CPU
+  quiet), 0.013–0.031 ms pipelined; wall time per token moved by 0.03–1.1 ms
+  (best 33.17 to 32.84 ms) while GPU busy time moved 1.7 ms between rounds.
+  `tools/benchmark.py --no-speculation`, 300 tokens, the two builds
+  interleaved, best of four (load average 4–8 of 14 from other agents' jobs):
+
+  | Prompt | One pass at a time | Pipelined |
+  | --- | ---: | ---: |
+  | Planets, one per line (209 tokens, end of sequence) | 30.61 tok/s | 30.71 tok/s |
+  | Essay on lighthouses | 29.99 | 30.13 |
+  | Hash map collisions | 30.36 | 30.81 |
+  | 1234 × 5678 step by step | 30.92 | 31.45 |
+  | Rust linked-list reversal | 32.08 | 32.32 |
+  | Causes of the French Revolution (293 tokens, end of sequence) | 32.02 | 32.32 |
+
+  Every prompt gained, 0.3–1.7% (geomean 0.95%, about the idle time it
+  removed), but each gain sits inside that run's own spread (1–8% between a
+  build's best and worst sample). It applies only where no MTP head drafts
+  and no lookup matches, which the default configuration never is, and it
+  is not free: the spare state, a wasted pass (and about 33 ms longer
+  request) at every end of sequence, a wasted pass at every stop, admission
+  or lookup round that follows a pipelined one, and a settle before every
+  other use of the model. Rejected.
 
 ## Verification
 

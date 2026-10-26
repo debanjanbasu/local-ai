@@ -40,6 +40,36 @@ fn disk_snapshot_round_trip_and_corruption_rejection() {
     assert!(load(&path, "model").is_err());
 }
 
+#[test]
+fn a_background_load_verifies_exactly_as_a_load_does() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = snapshot_fixture();
+    let path =
+        store(dir.path(), "model", &[12, 34, 56], None, &snapshot, false).expect("store snapshot");
+    let started = Load::spawn(path.clone(), "model".into()).expect("spawn load");
+    assert_eq!(started.path(), path);
+    let loaded = started.wait().expect("loaded snapshot");
+    assert_eq!(loaded.position, snapshot.position);
+    assert_eq!(*loaded.recurrent, *snapshot.recurrent);
+    assert_eq!(*loaded.mtp_kv, *snapshot.mtp_kv);
+    assert!(
+        Load::spawn(path.clone(), "other".into())
+            .expect("spawn load")
+            .wait()
+            .is_err()
+    );
+    let mut bytes = fs::read(&path).expect("read snapshot");
+    let last = bytes.last_mut().expect("non-empty snapshot");
+    *last ^= 1;
+    fs::write(&path, bytes).expect("corrupt snapshot");
+    assert!(
+        Load::spawn(path, "model".into())
+            .expect("spawn load")
+            .wait()
+            .is_err()
+    );
+}
+
 fn names_with_extension(dir: &Path, extension: &str) -> Vec<String> {
     let mut names = fs::read_dir(dir)
         .expect("read cache dir")

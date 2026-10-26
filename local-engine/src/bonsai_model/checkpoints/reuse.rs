@@ -1,5 +1,12 @@
+use std::path::PathBuf;
+
 use crate::bonsai_model::{BonsaiEngine, PromptCacheSource};
+use crate::bonsai_native::PromptSnapshot;
 use crate::prompt_cache;
+
+/// A finished [`prompt_cache::Load`]: the snapshot file and what reading it
+/// gave.
+pub(in crate::bonsai_model) type Loaded = (PathBuf, crate::Result<PromptSnapshot>);
 
 /// Shortest reusable boundary a prefill checkpoints: a shorter prefix costs
 /// less to prefill again (about a second) than its snapshot does to copy.
@@ -69,13 +76,23 @@ impl BonsaiEngine {
     /// an old boundary of the conversation while disk holds snapshots turns
     /// newer. A restore that fails falls back to the next candidate, and with
     /// none the sequence starts empty.
+    ///
+    /// A disk snapshot is read and verified on a helper thread
+    /// ([`prompt_cache::Load`]), never here: when one is the best candidate
+    /// and `loaded` is not its finished load, the load is started and
+    /// returned, and only a GPU checkpoint (a copy on the GPU) is restored
+    /// meanwhile, as a stand-in the request does not prefill from. Once the
+    /// load ends the caller asks again with it as `loaded`; a load that failed
+    /// is a failed restore like any other, so the tiers are asked again.
     pub(super) fn restore_reusable_prefix(
         &mut self,
         prompt: &[u32],
         bounds: &ReuseBounds,
         session_id: Option<&str>,
-    ) -> crate::Result<(usize, PromptCacheSource)> {
+        mut loaded: Option<Loaded>,
+    ) -> crate::Result<(usize, PromptCacheSource, Option<prompt_cache::Load>)> {
         let mut rows_kept = true;
+        let mut load = None;
         'retry: loop {
             for (source, index, _) in self.candidates(prompt, bounds, session_id) {
                 let restored = match source {
@@ -83,11 +100,32 @@ impl BonsaiEngine {
                     // K/V rows a checkpoint relies on.
                     PromptCacheSource::Gpu if !rows_kept => continue,
                     PromptCacheSource::Gpu => self.restore_gpu_checkpoint(index)?,
+                    // A longer disk snapshot is loading: copying a shorter
+                    // host snapshot now would be thrown away when it lands.
+                    _ if load.is_some() => continue,
                     PromptCacheSource::Host => self.restore_host_snapshot(index)?,
-                    _ => self.restore_disk_snapshot(index),
+                    _ => {
+                        let path = self.disk_snapshots[index].path.clone();
+                        let finished = loaded.take_if(|(finished, _)| *finished == path);
+                        if finished.is_none()
+                            && let Ok(started) = prompt_cache::Load::spawn(
+                                path.clone(),
+                                self.prompt_cache_model_key.clone(),
+                            )
+                        {
+                            load = Some(started);
+                            continue;
+                        }
+                        // With no thread to read it on, it is read here.
+                        let snapshot = finished.map_or_else(
+                            || prompt_cache::load(&path, &self.prompt_cache_model_key),
+                            |(_, snapshot)| snapshot,
+                        );
+                        self.restore_disk_snapshot(index, snapshot)
+                    }
                 };
                 if let Some(position) = restored {
-                    return Ok((position, source));
+                    return Ok((position, source, load));
                 }
                 rows_kept &= source == PromptCacheSource::Gpu;
                 // The failed entry is evicted, so ask again.
@@ -96,7 +134,7 @@ impl BonsaiEngine {
             break;
         }
         self.model.reset();
-        Ok((0, PromptCacheSource::None))
+        Ok((0, PromptCacheSource::None, load))
     }
 
     /// Each tier's best entry for `prompt` as (tier, index, position),
@@ -200,13 +238,14 @@ impl BonsaiEngine {
         Ok(Some(position))
     }
 
-    /// Restore disk snapshot `index`. One that fails to load or restore is a
-    /// cache miss, never a failed request: it is dropped from the index.
-    fn restore_disk_snapshot(&mut self, index: usize) -> Option<usize> {
-        let snapshot = prompt_cache::load(
-            &self.disk_snapshots[index].path,
-            &self.prompt_cache_model_key,
-        );
+    /// Restore disk snapshot `index` from its finished load. One that failed
+    /// to load or restore is a cache miss, never a failed request: it is
+    /// dropped from the index.
+    fn restore_disk_snapshot(
+        &mut self,
+        index: usize,
+        snapshot: crate::Result<PromptSnapshot>,
+    ) -> Option<usize> {
         if let Ok(snapshot) = snapshot
             && self.model.restore_prompt_snapshot(&snapshot).is_ok()
         {
