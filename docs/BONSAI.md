@@ -930,7 +930,9 @@ Images may sit anywhere among the text parts of user and tool messages and
 keep their place; system, developer and assistant messages cannot hold them,
 as in the checkpoint's chat template. `file_id` names an upload of the
 [Files API](#native-services) (at most 64 MiB per image or video). JPEG
-(decoded with libjpeg-turbo), PNG, WebP, GIF (first frame) and BMP are read.
+(decoded with libjpeg-turbo), PNG, WebP, GIF (first frame) and BMP are read,
+at most 16,384 pixels a side and 67,108,864 (64 MP) in all, checked from the
+header before any pixel is decoded.
 `http(s)` URLs are fetched by the server ([remote media
 URLs](#remote-media-urls)). Conversations store `input_image` parts too
 (within the 4 MiB item limit, so larger images go by `file_id` or URL).
