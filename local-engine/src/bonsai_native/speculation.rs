@@ -173,6 +173,7 @@ impl BonsaiModel {
     /// the exact top two over its logits all run on the GPU. The host reads
     /// only the top two, which equals [`Self::draft_on_host`]'s selection
     /// whenever the sampler applies no penalties.
+    #[allow(unsafe_code)]
     pub(super) fn draft_on_device(
         &self,
         speculation: &mut Speculation,
@@ -189,7 +190,8 @@ impl BonsaiModel {
                 "draft depth exceeds the drafter's slots".into(),
             ));
         }
-        drafter.tokens.as_mut_slice::<u32>()[0] = seed;
+        // SAFETY: no draft batch is in flight: each one is waited for below.
+        unsafe { drafter.tokens.as_mut_slice::<u32>()[0] = seed };
         let drafter = &speculation.drafter;
         let mtp = &speculation.mtp;
         let embeddings = drafter.embeddings.ptq1_matrix()?;
@@ -221,7 +223,9 @@ impl BonsaiModel {
                 step as u32,
             )?;
             self.finish(batch)?;
-            let top = drafter.results.as_slice::<DraftTopTwo>()[step];
+            // SAFETY: `finish` above waited for this step, and the borrow ends
+            // with this copy.
+            let top = unsafe { drafter.results.as_slice::<DraftTopTwo>()[step] };
             let (next, margin) =
                 sampler.greedy_from_top_two(top.best_id, top.best_logit, top.second_logit);
             drafts.push(Draft {
@@ -293,7 +297,7 @@ impl BonsaiModel {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(unsafe_code, clippy::expect_used)]
 mod tests {
     use super::super::{KvOptions, NgramSettings};
     use super::*;
@@ -384,7 +388,8 @@ mod tests {
                     .embedding_rows(1)
                     .expect("rows")
                     .fill(f32::NAN);
-                speculation.mtp.logits.as_mut_slice::<f32>().fill(f32::NAN);
+                // SAFETY: no GPU work is in flight between drafts.
+                unsafe { speculation.mtp.logits.as_mut_slice::<f32>().fill(f32::NAN) };
                 let device = model
                     .draft_on_device(
                         &mut speculation,

@@ -188,7 +188,7 @@ impl Sampler {
         context: &MetalContext,
         topk: &GpuTopK,
         argmax: Option<u32>,
-        distribution: Option<(f32, &[TopKCandidate])>,
+        distribution: Option<(f32, Vec<TopKCandidate>)>,
     ) -> crate::Result<SamplingResult> {
         let Some(mut logprobs) = self.logprobs.take() else {
             return self.select_plain(buffer, byte_offset, context, topk, argmax);
@@ -220,7 +220,7 @@ impl Sampler {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(unsafe_code, clippy::too_many_arguments)]
     fn select_recorded(
         &mut self,
         logprobs: &mut Logprobs,
@@ -229,12 +229,12 @@ impl Sampler {
         context: &MetalContext,
         topk: &GpuTopK,
         argmax: Option<u32>,
-        distribution: Option<(f32, &[TopKCandidate])>,
+        distribution: Option<(f32, Vec<TopKCandidate>)>,
     ) -> crate::Result<SamplingResult> {
         let start = byte_offset / size_of::<f32>();
-        let Some(row) = buffer
-            .as_slice::<f32>()
-            .get(start..start + self.observed.len())
+        // SAFETY: the caller finished inference before exposing the buffer, and
+        // `row` is last read before selection below writes the buffer.
+        let Some(row) = unsafe { buffer.as_slice::<f32>() }.get(start..start + self.observed.len())
         else {
             return Err(crate::Error::Sampling(
                 "logit row offset exceeds the buffer".into(),
@@ -259,7 +259,8 @@ impl Sampler {
         let result = self.select_plain(buffer, byte_offset, context, topk, argmax)?;
         let token = result.token_id as usize;
         let logit = if untouched {
-            buffer.as_slice::<f32>()[start + token]
+            // SAFETY: selection has finished with the buffer; this is a copy.
+            unsafe { buffer.as_slice::<f32>()[start + token] }
         } else {
             logprobs.raw[token]
         };
@@ -281,6 +282,7 @@ impl Sampler {
 
     /// Select on the GPU, but keep penalty arithmetic, filtering and RNG on the CPU.
     /// The caller must finish inference before exposing the shared logit buffer here.
+    #[allow(unsafe_code)]
     pub fn sample_buffer(
         &mut self,
         buffer: &mut MetalBuffer,
@@ -302,8 +304,13 @@ impl Sampler {
         let Ok(mask) = self.grammar_mask() else {
             return Ok(self.failed());
         };
+        // SAFETY (every view of `buffer` below): the caller finished inference
+        // before exposing it, each view ends before `topk.encode`, and that
+        // batch is waited for before the next view.
         if let Some(mask) = &mask {
-            forbid(mask, &mut buffer.as_mut_slice::<f32>()[float_offset..end]);
+            forbid(mask, unsafe {
+                &mut buffer.as_mut_slice::<f32>()[float_offset..end]
+            });
         }
         let keep = if self.greedy() {
             1
@@ -314,11 +321,11 @@ impl Sampler {
         };
         let token = if vocab <= topk.maximum_supported_k() || keep > topk.maximum_supported_k() {
             self.select(
-                &mut buffer.as_mut_slice::<f32>()[float_offset..end],
+                unsafe { &mut buffer.as_mut_slice::<f32>()[float_offset..end] },
                 mask.as_ref(),
             )?
         } else {
-            self.apply_penalties(&mut buffer.as_mut_slice::<f32>()[float_offset..end]);
+            self.apply_penalties(unsafe { &mut buffer.as_mut_slice::<f32>()[float_offset..end] });
             let mut batch = CommandBatch::new(context)?;
             topk.encode(&mut batch, buffer, byte_offset, vocab, keep)?;
             batch.commit_and_wait()?;
@@ -341,7 +348,9 @@ impl Sampler {
             if self.greedy() {
                 self.candidates[0] as u32
             } else {
-                self.sample_selected(&mut buffer.as_mut_slice::<f32>()[float_offset..end])?
+                self.sample_selected(unsafe {
+                    &mut buffer.as_mut_slice::<f32>()[float_offset..end]
+                })?
             }
         };
         Ok(self.finish(token, mask.as_ref()))
@@ -350,6 +359,7 @@ impl Sampler {
     /// Greedy selection that also reports the winner's logit lead over the
     /// runner-up after penalties: a draft model's own confidence in its
     /// proposal. Only meaningful for a greedy sampler ([`Self::greedy_draft`]).
+    #[allow(unsafe_code)]
     pub fn sample_buffer_with_margin(
         &self,
         buffer: &mut MetalBuffer,
@@ -373,7 +383,9 @@ impl Sampler {
                 "draft margins need an unconstrained greedy sampler".into(),
             ));
         }
-        let logits = &mut buffer.as_mut_slice::<f32>()[float_offset..end];
+        // SAFETY: the caller finished inference before exposing the buffer, and
+        // `logits` is last used before `topk.encode` below.
+        let logits = unsafe { &mut buffer.as_mut_slice::<f32>()[float_offset..end] };
         self.apply_penalties(logits);
         if vocab < 2 {
             return Ok((self.result(0), f32::INFINITY));

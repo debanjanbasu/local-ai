@@ -1,4 +1,5 @@
 #![allow(
+    unsafe_code,
     clippy::expect_used,
     clippy::cast_precision_loss,
     clippy::many_single_char_names,
@@ -72,7 +73,8 @@ fn attention_matches_reference_within_each_segment() {
             .expect("attention");
     }
     batch.commit_and_wait().expect("commit");
-    let got = out.as_slice::<f32>();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let got = unsafe { out.as_slice::<f32>() };
     for (first, count) in segments {
         for t in first..first + count {
             for h in 0..heads {
@@ -153,7 +155,8 @@ fn positions_add_and_pooling_match_reference() {
         }
     }
     // Fast-math may reassociate the three-term sum: allow a rounding step.
-    for (a, e) in hb.as_slice::<f32>().iter().zip(&expected) {
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    for (a, e) in unsafe { hb.as_slice::<f32>() }.iter().zip(&expected) {
         assert!((a - e).abs() <= 1e-6 * (1.0 + e.abs()), "{a} vs {e}");
     }
     for c in 0..width {
@@ -161,6 +164,7 @@ fn positions_add_and_pooling_match_reference() {
             .map(|t| expected[t * width + c] * (1.0 / 9.0))
             .sum::<f32>()
             * 2.0;
-        assert!((pooled.as_slice::<f32>()[c] - mean).abs() < 1e-5);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        assert!((unsafe { pooled.as_slice::<f32>() }[c] - mean).abs() < 1e-5);
     }
 }

@@ -108,6 +108,7 @@ impl MtpCapture {
 
     /// Run `tokens` through the target from an empty cache and write one shard
     /// of `tokens.len()` records to `out`.
+    #[allow(unsafe_code)]
     pub fn capture_document(
         &mut self,
         tokens: &[u32],
@@ -140,8 +141,12 @@ impl MtpCapture {
             self.model
                 .forward_block(block, BlockOutput::Verify(&self.verifier))?;
             self.model.commit_verified(&mut self.verifier, take, take)?;
-            let logits = &self.verifier.verify_logits.as_slice::<f32>()[..take * VOCAB];
-            let normalized = &self.model.scratch.normalized.as_slice::<f32>()[..take * WIDTH];
+            // SAFETY: the block and commit above waited for their GPU work, and
+            // nothing is encoded while these views live.
+            let logits = unsafe { &self.verifier.verify_logits.as_slice::<f32>()[..take * VOCAB] };
+            // SAFETY: as above.
+            let normalized =
+                unsafe { &self.model.scratch.normalized.as_slice::<f32>()[..take * WIDTH] };
             let tops = top_k_rows(logits, top_k)?;
             let mut bytes = Vec::with_capacity(take * record_bytes);
             for (row, &token) in block.iter().enumerate() {
@@ -207,6 +212,7 @@ impl MtpCapture {
     /// `tokens[..position]`, exactly as a speculative round does: step 0 fuses
     /// `tokens[position]` with the committed hidden, every deeper step fuses the
     /// previous step's argmax with the head's own normalized output.
+    #[allow(unsafe_code)]
     pub fn draft_chain(
         &mut self,
         tokens: &[u32],
@@ -254,7 +260,9 @@ impl MtpCapture {
                     true,
                 )?;
                 self.model.finish(batch)?;
-                let logits = &mtp.logits.as_slice::<f32>()[..VOCAB];
+                // SAFETY: `finish` above waited for the head, and nothing is
+                // encoded while this view lives.
+                let logits = unsafe { &mtp.logits.as_slice::<f32>()[..VOCAB] };
                 let (top_ids, top_logits) = top_k_row(logits, top_k);
                 steps.push(DraftStep {
                     position: position + step,
@@ -284,6 +292,7 @@ impl BonsaiModel {
     /// returns `Ok(None)` and submits nothing further. Either way the
     /// resident buffers are left holding a partial capture, not any earlier
     /// sequence: the caller owns invalidating whatever described them.
+    #[allow(unsafe_code)]
     pub(crate) fn capture_hidden(
         &mut self,
         tokens: &[u32],
@@ -314,7 +323,9 @@ impl BonsaiModel {
             }
             let block = &tokens[start..start + take];
             self.forward_block(block, BlockOutput::Hidden)?;
-            let normalized = &self.scratch.normalized.as_slice::<f32>()[..take * WIDTH];
+            // SAFETY: the block above waited for its GPU work, and nothing is
+            // encoded while this view lives.
+            let normalized = unsafe { &self.scratch.normalized.as_slice::<f32>()[..take * WIDTH] };
             next = select_rows(normalized, start, positions, next, &mut features);
             start += take;
         }

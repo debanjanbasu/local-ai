@@ -219,6 +219,7 @@ impl BonsaiModel {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code)]
     fn run_head_drafts(
         &self,
         speculation: &super::super::Speculation,
@@ -431,7 +432,9 @@ impl BonsaiModel {
         let mut active = (0..count).collect::<Vec<_>>();
         let mut rows_of = (0..count).collect::<Vec<_>>();
         for step in 0..heads.depth {
-            let results = heads.results.as_slice::<DraftTopTwo>();
+            // SAFETY: each depth's batch completes before its selections are
+            // read here, and the next depth is encoded only after this read.
+            let results = unsafe { heads.results.as_slice::<DraftTopTwo>() };
             let mut going = Vec::with_capacity(active.len());
             for &index in &active {
                 let top = results[index * heads.depth + step];

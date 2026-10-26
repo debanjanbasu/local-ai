@@ -321,7 +321,7 @@ impl VisionEncoder {
     ///
     /// Metal failures.
     #[doc(hidden)]
-    #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code, clippy::too_many_lines)]
     pub fn encode_raw(
         &self,
         image: &PreparedImage,
@@ -377,7 +377,11 @@ impl VisionEncoder {
             Epilogue::Accumulate,
         )?;
         submit(batch)?;
-        probe("block0_in", &hidden.as_slice::<f32>()[..patches * HIDDEN]);
+        // SAFETY: `submit` waited for the batch, and nothing is encoded while
+        // the probe reads.
+        probe("block0_in", unsafe {
+            &hidden.as_slice::<f32>()[..patches * HIDDEN]
+        });
         let chunk = (ATTENTION_PAIRS / patches).max(64) / 64 * 64;
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
         for (index, block) in gpu.blocks.iter().enumerate() {
@@ -442,7 +446,8 @@ impl VisionEncoder {
             submit(batch)?;
             probe(
                 &format!("block{index}_out"),
-                &hidden.as_slice::<f32>()[..patches * HIDDEN],
+                // SAFETY: as for `block0_in`.
+                unsafe { &hidden.as_slice::<f32>()[..patches * HIDDEN] },
             );
         }
         let mut batch = CommandBatch::new(&gpu.context)?;
@@ -475,7 +480,8 @@ impl VisionEncoder {
         )?;
         submit(batch)?;
         drop(gpu);
-        let rows = qkv.as_slice::<f32>()[..tokens * WIDTH].to_vec();
+        // SAFETY: `submit` waited for the batch; the borrow ends with this copy.
+        let rows = unsafe { qkv.as_slice::<f32>()[..tokens * WIDTH].to_vec() };
         if rows.iter().any(|value| !value.is_finite()) {
             return Err(crate::Error::Generation(
                 "non-finite vision tower output".into(),

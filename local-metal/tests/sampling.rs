@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![allow(unsafe_code, clippy::expect_used)]
 
 use local_metal::batch::CommandBatch;
 use local_metal::buffer::MetalBuffer;
@@ -67,10 +67,10 @@ fn gpu_matches_total_cmp_for_tiny_odd_and_full_vocab() {
         topk.encode(&mut batch, &logits, 3 * size_of::<f32>(), count, k)
             .expect("encode");
         batch.commit_and_wait().expect("wait");
-        assert_exact(topk.candidates(k), &reference(&input, k));
+        assert_exact(&topk.candidates(k), &reference(&input, k));
         assert_eq!(
-            logits
-                .as_slice::<f32>()
+            // SAFETY: the batch has completed and nothing else touches the buffer.
+            unsafe { logits.as_slice::<f32>() }
                 .iter()
                 .map(|x| x.to_bits())
                 .collect::<Vec<_>>(),
@@ -109,8 +109,29 @@ fn preserves_special_bits_and_lowest_id_ties_across_reuse() {
         topk.encode(&mut batch, &logits, 0, input.len(), k)
             .expect("encode");
         batch.commit_and_wait().expect("wait");
-        assert_exact(topk.candidates(k), &reference(&input, k));
+        assert_exact(&topk.candidates(k), &reference(&input, k));
     }
+}
+
+/// Results are copies: encoding into the same workspace later must not
+/// change candidates already read from it.
+#[test]
+fn candidates_survive_a_later_encode() {
+    let Some(context) = gpu_or_skip() else { return };
+    let shaders = ShaderLibrary::new(context.device()).expect("shaders");
+    let topk = GpuTopK::new(&context, &shaders, 300).expect("top-k");
+    let run = |input: &[f32]| {
+        let logits = MetalBuffer::from_slice(context.device(), input).expect("logits");
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        topk.encode(&mut batch, &logits, 0, input.len(), 8)
+            .expect("encode");
+        batch.commit_and_wait().expect("wait");
+    };
+    let first_input = values(300);
+    run(&first_input);
+    let first = topk.candidates(8);
+    run(&first_input.iter().map(|value| -value).collect::<Vec<_>>());
+    assert_exact(&first, &reference(&first_input, 8));
 }
 
 #[test]
@@ -174,7 +195,7 @@ fn logprob_rows_match_a_float64_reference() {
                     "vocab {vocab} row {row}: lse {actual} vs {expected}"
                 );
                 assert_exact(
-                    workspace.top(row, k.min(vocab)),
+                    &workspace.top(row, k.min(vocab)),
                     &reference(values, k.min(vocab)),
                 );
             }

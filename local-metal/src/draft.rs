@@ -300,9 +300,14 @@ impl GreedyRows {
     }
 
     /// The selections of the last completed [`Self::encode`], row by row.
+    /// They are copied, so a later encode cannot write under a live reference.
     #[must_use]
-    pub fn results(&self, rows: usize) -> &[GreedyRowResult] {
-        &self.results.as_slice::<GreedyRowResult>()[..rows.min(self.max_rows)]
+    #[allow(unsafe_code)]
+    pub fn results(&self, rows: usize) -> Vec<GreedyRowResult> {
+        // SAFETY: the borrow ends with this copy. The buffer is private to this
+        // selector and not `Sync`, so no CPU writer runs meanwhile, and the
+        // caller reads after the GPU work from `encode` has completed.
+        unsafe { self.results.as_slice::<GreedyRowResult>()[..rows.min(self.max_rows)].to_vec() }
     }
 
     #[must_use]

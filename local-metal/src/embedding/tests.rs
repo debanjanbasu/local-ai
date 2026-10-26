@@ -1,4 +1,5 @@
 #![allow(
+    unsafe_code,
     clippy::expect_used,
     clippy::cast_precision_loss,
     clippy::many_single_char_names,
@@ -83,7 +84,12 @@ fn bf16_gemm_matches_reference_on_ragged_tiles() {
                 .sum();
         }
     }
-    close(&y.as_slice::<f32>()[..tokens * rows], &expected, 1e-4);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { y.as_slice::<f32>() }[..tokens * rows],
+        &expected,
+        1e-4,
+    );
 }
 
 #[test]
@@ -157,7 +163,12 @@ fn rms_rope_and_gelu_match_reference() {
             expected[r * dim + i + half] = n[i + half] * c + n[i] * s;
         }
     }
-    close(&normed.as_slice::<f32>()[..rows * dim], &expected, 2e-4);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { normed.as_slice::<f32>() }[..rows * dim],
+        &expected,
+        2e-4,
+    );
     let gelu: Vec<f32> = expected
         .iter()
         .zip(&input)
@@ -166,7 +177,12 @@ fn rms_rope_and_gelu_match_reference() {
             0.5 * g * (1.0 + inner.tanh()) * o
         })
         .collect();
-    close(&gated.as_slice::<f32>()[..rows * dim], &gelu, 2e-4);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { gated.as_slice::<f32>() }[..rows * dim],
+        &gelu,
+        2e-4,
+    );
 }
 
 #[test]
@@ -228,5 +244,10 @@ fn packed_attention_respects_sequence_bounds_and_window() {
             }
         }
     }
-    close(&out.as_slice::<f32>()[..q.len()], &expected, 1e-4);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { out.as_slice::<f32>() }[..q.len()],
+        &expected,
+        1e-4,
+    );
 }

@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::too_many_lines)]
+#![allow(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
 
 use half::f16;
 use local_metal::batch::CommandBatch;
@@ -137,7 +137,8 @@ fn guarded(context: &MetalContext, elements: usize) -> MetalBuffer {
 
 fn assert_guards(buffer: &MetalBuffer, elements: usize) {
     assert!(
-        buffer.as_slice::<u32>()[elements..]
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { buffer.as_slice::<u32>() }[elements..]
             .iter()
             .all(|&v| v == SENTINEL)
     );
@@ -281,7 +282,11 @@ fn cpu_and_gpu_decoders_cover_every_byte_code_at_every_element() {
     batch.commit_and_wait().expect("GPU completion");
     for (element, output) in outputs.iter().enumerate() {
         assert_guards(output, 256);
-        for (row, &actual) in output.as_slice::<f32>()[..256].iter().enumerate() {
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        for (row, &actual) in unsafe { output.as_slice::<f32>() }[..256]
+            .iter()
+            .enumerate()
+        {
             assert_close(actual, expected[row * 128 + element], 0.0);
         }
     }
@@ -310,7 +315,8 @@ fn cpu_and_gpu_decoders_cover_every_byte_code_at_every_element() {
         batch.commit_and_wait().expect("GPU completion");
         for (&start, output) in starts.iter().zip(&outputs) {
             assert_guards(output, tokens * 256);
-            let values = output.as_slice::<f32>();
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            let values = unsafe { output.as_slice::<f32>() };
             for token in 0..tokens {
                 for row in 0..256 {
                     assert_close(
@@ -322,7 +328,8 @@ fn cpu_and_gpu_decoders_cover_every_byte_code_at_every_element() {
             }
         }
     }
-    assert_eq!(weights.as_slice::<u8>(), data);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(unsafe { weights.as_slice::<u8>() }, data);
 }
 
 #[test]
@@ -369,14 +376,15 @@ fn signed_fwht_matches_dense_walsh_reference_and_true_inverse() {
         (&roundtrip, &reference_values),
     ] {
         assert_guards(buffer, values.len());
-        for (&actual, &expected) in buffer.as_slice::<f32>().iter().zip(reference) {
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        for (&actual, &expected) in unsafe { buffer.as_slice::<f32>() }.iter().zip(reference) {
             assert_close(actual, expected, 2e-5);
         }
     }
     assert_guards(&wrong_inverse, values.len());
     assert!(
-        wrong_inverse
-            .as_slice::<f32>()
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { wrong_inverse.as_slice::<f32>() }
             .iter()
             .zip(&values)
             .filter(|(a, b)| (*a - *b).abs() > 0.1)
@@ -399,7 +407,11 @@ fn signed_fwht_matches_dense_walsh_reference_and_true_inverse() {
             .expect("in-place transform");
     }
     batch.commit_and_wait().expect("in-place completion");
-    for (&actual, &expected) in input.as_slice::<f32>().iter().zip(&reference_values) {
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    for (&actual, &expected) in unsafe { input.as_slice::<f32>() }
+        .iter()
+        .zip(&reference_values)
+    {
         assert_close(actual, expected, 2e-5);
     }
 }
@@ -477,7 +489,8 @@ fn rotated_matvec_matches_unrotated_weights_and_real_projection_widths() {
             }
             assert_guards(&output, rows);
             assert_close(
-                output.as_slice::<f32>()[row],
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                unsafe { output.as_slice::<f32>() }[row],
                 expected,
                 f64::mul_add(expected.abs(), 1e-5, 3e-5),
             );
@@ -518,12 +531,14 @@ fn matvec_handles_partial_row_groups_and_partial_four_block_iterations() {
                 .sum::<f64>();
             assert_guards(&output, rows);
             assert_close(
-                output.as_slice::<f32>()[row],
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                unsafe { output.as_slice::<f32>() }[row],
                 expected,
                 f64::mul_add(expected.abs(), 1e-5, 3e-5),
             );
         }
-        assert_eq!(weights.as_slice::<u8>(), data);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        assert_eq!(unsafe { weights.as_slice::<u8>() }, data);
     }
 }
 
@@ -609,7 +624,8 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
                 let tolerance = f64::mul_add(expected.abs(), 2e-5, 3e-4)
                     .max(8.0 * f64::from(f32::EPSILON) * magnitude);
                 for ((name, _), output) in kernels.iter().zip(&outputs) {
-                    let actual = f64::from(output.as_slice::<f32>()[token * rows + row]);
+                    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                    let actual = f64::from(unsafe { output.as_slice::<f32>() }[token * rows + row]);
                     assert!(
                         actual.is_finite() && (actual - expected).abs() <= tolerance,
                         "{name}: shape ({tokens}, {rows}, {columns}), token {token}, row {row}: {actual} != {expected}, tolerance {tolerance}",
@@ -620,7 +636,8 @@ fn packed_matmul_preserves_f32_inputs_and_all_tile_tails() {
         for output in &outputs {
             assert_guards(output, tokens * rows);
         }
-        assert_eq!(weights.as_slice::<u8>(), data);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        assert_eq!(unsafe { weights.as_slice::<u8>() }, data);
     }
 }
 
@@ -659,7 +676,8 @@ fn matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range() {
         for token in 0..3 {
             let expected = f64::from(values[token * 128 + 7]) * 2048.0;
             assert_close(
-                output.as_slice::<f32>()[token * 2],
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                unsafe { output.as_slice::<f32>() }[token * 2],
                 expected,
                 2e-6 * expected,
             );
@@ -670,7 +688,12 @@ fn matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range() {
                     .map(f64::from)
                     .sum::<f64>();
             assert!(sum > 65_504.0);
-            assert_close(output.as_slice::<f32>()[token * 2 + 1], sum, 2e-6 * sum);
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            assert_close(
+                unsafe { output.as_slice::<f32>() }[token * 2 + 1],
+                sum,
+                2e-6 * sum,
+            );
         }
         assert_guards(&output, 3 * 2);
     }
@@ -699,21 +722,24 @@ fn matmul_keeps_f32_operand_bits_and_accumulates_beyond_f16_range() {
                 .map(f64::from)
                 .sum::<f64>();
         assert_close(
-            small_output.as_slice::<f32>()[token * 2 + 1],
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { small_output.as_slice::<f32>() }[token * 2 + 1],
             sum,
             2e-6 * sum,
         );
         let expected = f64::from(values[token * 128 + 7]) * 2048.0;
         assert_close(
-            small_output.as_slice::<f32>()[token * 2],
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { small_output.as_slice::<f32>() }[token * 2],
             expected,
             2e-6 * expected,
         );
     }
     eprintln!(
         "offset-heavy lone-trit row: small batch {} vs decode matvec {} vs exact {}",
-        small_output.as_slice::<f32>()[0],
-        matvec_output.as_slice::<f32>()[0],
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { small_output.as_slice::<f32>() }[0],
+        unsafe { matvec_output.as_slice::<f32>() }[0],
         f64::from(values[7]) * 2048.0
     );
     assert_guards(&small_output, 3 * 2);
@@ -910,8 +936,9 @@ fn small_batch_matches_tokenwise_matvec_reference_and_tile_for_all_chunks() {
         batch.commit_and_wait().expect("completion");
         for (token, input_row) in values.chunks_exact(columns).enumerate() {
             for (row, weights) in decoded.chunks_exact(columns).enumerate() {
-                let actual = small_output.as_slice::<f32>()[token * rows + row];
-                let tokenwise = matvec_outputs[token].as_slice::<f32>()[row];
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                let actual = unsafe { small_output.as_slice::<f32>() }[token * rows + row];
+                let tokenwise = unsafe { matvec_outputs[token].as_slice::<f32>() }[row];
                 let expected = weights
                     .iter()
                     .zip(input_row)
@@ -938,7 +965,8 @@ fn small_batch_matches_tokenwise_matvec_reference_and_tile_for_all_chunks() {
                     (f64::from(actual) - expected).abs() <= tolerance,
                     "shape ({tokens}, {rows}, {columns}), token {token}, row {row}: {actual} != reference {expected}, tolerance {tolerance}"
                 );
-                let tiled = tile_output.as_slice::<f32>()[token * rows + row];
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                let tiled = unsafe { tile_output.as_slice::<f32>() }[token * rows + row];
                 for (name, value) in [("matvec", tokenwise), ("tile", tiled)] {
                     assert!(
                         value.is_finite() && (f64::from(value) - expected).abs() <= tolerance,
@@ -949,7 +977,8 @@ fn small_batch_matches_tokenwise_matvec_reference_and_tile_for_all_chunks() {
         }
         assert_guards(&small_output, tokens * rows);
         assert_guards(&tile_output, tokens * rows);
-        assert_eq!(weights.as_slice::<u8>(), data);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        assert_eq!(unsafe { weights.as_slice::<u8>() }, data);
     }
     eprintln!(
         "small batch vs tokenwise matvec: worst gap {worst_matvec_gap} abs, {worst_matvec_ulps} ulp of product magnitude"

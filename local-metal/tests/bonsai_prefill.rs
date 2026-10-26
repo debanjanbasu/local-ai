@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::too_many_lines)]
+#![allow(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
 
 use local_metal::{
     batch::CommandBatch,
@@ -40,7 +40,12 @@ fn signal(index: usize, salt: usize) -> f32 {
 }
 
 fn check(buffer: &MetalBuffer, expected: &[f64], tolerance: f64) {
-    for (i, (&actual, &wanted)) in buffer.as_slice::<f32>().iter().zip(expected).enumerate() {
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    for (i, (&actual, &wanted)) in unsafe { buffer.as_slice::<f32>() }
+        .iter()
+        .zip(expected)
+        .enumerate()
+    {
         assert!(
             actual.is_finite()
                 && (f64::from(actual) - wanted).abs() <= tolerance * (1.0 + wanted.abs()),
@@ -48,7 +53,8 @@ fn check(buffer: &MetalBuffer, expected: &[f64], tolerance: f64) {
         );
     }
     assert!(
-        buffer.as_slice::<f32>()[expected.len()..]
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { buffer.as_slice::<f32>() }[expected.len()..]
             .iter()
             .all(|v| v.is_nan())
     );
@@ -261,10 +267,16 @@ fn batched_conv_l2_gdn_and_postprocess_match_causal_f64_recurrence() {
     // retain future rows, while output guards expose any writes past the block.
     for (start, count, reset) in [(0, 5, true), (0, 2, true), (2, 3, false), (0, 2, true)] {
         if reset {
-            history
-                .as_mut_slice::<f32>()
-                .copy_from_slice(&initial_history);
-            state.as_mut_slice::<f32>().copy_from_slice(&initial_state);
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe {
+                history
+                    .as_mut_slice::<f32>()
+                    .copy_from_slice(&initial_history);
+            }
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe {
+                state.as_mut_slice::<f32>().copy_from_slice(&initial_state);
+            }
         }
         let input = floats(&ctx, &input_data[start * 10240..]);
         let decay = floats(&ctx, &decay_data[start * 48..]);
@@ -447,8 +459,9 @@ fn attention_prefill_rows_use_row_offsets_causal_prefixes_and_one_workspace() {
     check(&gate, &expected_gate, 0.0);
     for i in 0..capacity as usize * 1024 {
         if i < position as usize * 1024 || i >= (position as usize + tokens) * 1024 {
-            assert_eq!(kc.as_slice::<half::f16>()[i], old_keys[i]);
-            assert_eq!(vc.as_slice::<half::f16>()[i], old_values[i]);
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            assert_eq!(unsafe { kc.as_slice::<half::f16>() }[i], old_keys[i]);
+            assert_eq!(unsafe { vc.as_slice::<half::f16>() }[i], old_values[i]);
         } else {
             let local = i - position as usize * 1024;
             let token = local / 1024;
@@ -460,12 +473,15 @@ fn attention_prefill_rows_use_row_offsets_causal_prefixes_and_one_workspace() {
                 position + token as u32,
             );
             assert!(
-                (f64::from(kc.as_slice::<half::f16>()[i].to_f32()) - expected_k[coordinate % 256])
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                (f64::from(unsafe { kc.as_slice::<half::f16>() }[i].to_f32())
+                    - expected_k[coordinate % 256])
                     .abs()
                     < 0.002
             );
             assert_eq!(
-                vc.as_slice::<half::f16>()[i],
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                unsafe { vc.as_slice::<half::f16>() }[i],
                 half::f16::from_f32(v_data[local])
             );
         }
@@ -500,20 +516,25 @@ fn attention_prefill_rows_use_row_offsets_causal_prefixes_and_one_workspace() {
                     / denominator;
                 let g = expected_gate[row * 6144 + head * 256 + d];
                 let wanted = attention / (1.0 + (-g).exp());
-                let actual = output.as_slice::<f32>()[row * 6144 + head * 256 + d];
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                let actual = unsafe { output.as_slice::<f32>() }[row * 6144 + head * 256 + d];
                 assert!((f64::from(actual) - wanted).abs() < 3e-5 * (1.0 + wanted.abs()));
-                let actual = ungated_output.as_slice::<f32>()[row * 6144 + head * 256 + d];
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                let actual =
+                    unsafe { ungated_output.as_slice::<f32>() }[row * 6144 + head * 256 + d];
                 assert!((f64::from(actual) - attention).abs() < 3e-5 * (1.0 + attention.abs()));
             }
         }
     }
     assert!(
-        output.as_slice::<f32>()[tokens * 6144..]
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { output.as_slice::<f32>() }[tokens * 6144..]
             .iter()
             .all(|v| v.is_nan())
     );
     assert!(
-        ungated_output.as_slice::<f32>()[tokens * 6144..]
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { ungated_output.as_slice::<f32>() }[tokens * 6144..]
             .iter()
             .all(|v| v.is_nan())
     );
@@ -716,8 +737,9 @@ fn f16_prefill_matches_f64_when_kv_prep_and_block_attention_share_one_encoder() 
         check(&ungated_output, &expected_attention, 3e-5);
         // The rows this prefill wrote, and the prefix/suffix it must not touch.
         let written = position as usize * 1024;
-        let stored_keys = &kc.as_slice::<half::f16>()[written..][..tokens * 1024];
-        let stored_values = &vc.as_slice::<half::f16>()[written..][..tokens * 1024];
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let stored_keys = &unsafe { kc.as_slice::<half::f16>() }[written..][..tokens * 1024];
+        let stored_values = &unsafe { vc.as_slice::<half::f16>() }[written..][..tokens * 1024];
         for (local, &key) in stored_keys.iter().enumerate() {
             let (token, head, d) = (local / 1024, local % 1024 / 256, local % 256);
             let wanted = normalized_rope(
@@ -743,13 +765,15 @@ fn f16_prefill_matches_f64_when_kv_prep_and_block_attention_share_one_encoder() 
                 continue;
             }
             assert_eq!(
-                &kc.as_slice::<half::f16>()[token * 1024..][..1024],
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                &unsafe { kc.as_slice::<half::f16>() }[token * 1024..][..1024],
                 &initial_keys[token * 1024..][..1024],
                 "{}: key row {token} outside the block was rewritten",
                 kernel.name()
             );
             assert_eq!(
-                &vc.as_slice::<half::f16>()[token * 1024..][..1024],
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                &unsafe { vc.as_slice::<half::f16>() }[token * 1024..][..1024],
                 &initial_values[token * 1024..][..1024],
                 "{}: value row {token} outside the block was rewritten",
                 kernel.name()
@@ -828,13 +852,16 @@ fn attention_block_handles_all_query_tile_tails_and_ignores_future_cache() {
                         .map(|token| f64::from(values_data[token * 1024 + coordinate].to_f32()))
                         .sum::<f64>()
                         / prefix as f64;
-                    let actual = f64::from(output.as_slice::<f32>()[(row * 24 + head) * 256 + d]);
+                    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                    let actual =
+                        f64::from(unsafe { output.as_slice::<f32>() }[(row * 24 + head) * 256 + d]);
                     assert!((actual - expected).abs() < 3e-5 * (1.0 + expected.abs()));
                 }
             }
         }
         assert!(
-            output.as_slice::<f32>()[tokens as usize * 6144..]
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { output.as_slice::<f32>() }[tokens as usize * 6144..]
                 .iter()
                 .all(|v| v.is_nan())
         );

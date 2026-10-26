@@ -15,8 +15,13 @@ pub struct BonsaiMetalTensor {
 impl BonsaiMetalTensor {
     /// Read only the original tensor bytes, excluding mapping-page padding.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn bytes(&self) -> &[u8] {
-        &self.buffer.as_slice::<u8>()[self.offset..self.offset + self.tensor.bytes as usize]
+        // SAFETY: checkpoint weights are read-only: no kernel writes them, and
+        // the mutable `MetalBuffer` API is not exposed (see `buffer`).
+        unsafe {
+            &self.buffer.as_slice::<u8>()[self.offset..self.offset + self.tensor.bytes as usize]
+        }
     }
     // Runtime-only binding. Do not expose the mmap's mutable MetalBuffer API.
     pub(crate) const fn buffer(&self) -> &MetalBuffer {

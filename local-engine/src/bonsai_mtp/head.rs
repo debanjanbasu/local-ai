@@ -200,13 +200,16 @@ impl BonsaiMtp {
     }
 
     /// Host-visible embedding rows the caller fills with inverse-rotation inputs.
+    #[allow(unsafe_code)]
     pub fn embedding_rows(&mut self, rows: usize) -> crate::Result<&mut [f32]> {
         if rows == 0 || rows > self.scratch.rows {
             return Err(crate::Error::InvalidArgument(
                 "MTP embedding rows exceed scratch".into(),
             ));
         }
-        Ok(&mut self.scratch.embedding.as_mut_slice::<f32>()[..rows * WIDTH])
+        // SAFETY: the scratch is private to this head, every head pass waits for
+        // its GPU work, and `&mut self` keeps the head from encoding meanwhile.
+        Ok(unsafe { &mut self.scratch.embedding.as_mut_slice::<f32>()[..rows * WIDTH] })
     }
 }
 

@@ -115,6 +115,7 @@ impl HeadLag {
 
     /// Reserve room for `count` more rows, returning the first one's byte
     /// offset.
+    #[allow(unsafe_code)]
     fn reserve_rows(
         &mut self,
         context: &local_metal::context::MetalContext,
@@ -142,8 +143,10 @@ impl HeadLag {
                 return None;
             };
             if let Some(old) = &self.hidden {
-                // Host-visible and idle: every batch that wrote it has finished.
-                grown.copy_from_bytes(&old.as_slice::<u8>()[..self.tokens.len() * row_bytes], 0);
+                // SAFETY: host-visible and idle: every batch that wrote it has
+                // finished, and `grown` is a different, fresh buffer.
+                let old = unsafe { &old.as_slice::<u8>()[..self.tokens.len() * row_bytes] };
+                grown.copy_from_bytes(old, 0);
             }
             self.hidden = Some(grown);
         }
@@ -435,6 +438,7 @@ impl BonsaiModel {
     /// Every row must belong to a different sequence, and at most one of
     /// them, the prompt's included, may be the resident sequence.
     #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code)]
     pub(crate) fn decode_batch_prefilling(
         &mut self,
         rows: &mut [BatchRow<'_>],
@@ -547,7 +551,9 @@ impl BonsaiModel {
                 },
             )
         });
-        let embedding = self.scratch.embedding.as_mut_slice::<f32>();
+        // SAFETY: every block waits for its GPU work before returning, and
+        // nothing is encoded until the embeddings are written.
+        let embedding = unsafe { self.scratch.embedding.as_mut_slice::<f32>() };
         decode_embeddings(&self.package, &tokens[..decoded], embedding, None)?;
         decode_embeddings(
             &self.package,
@@ -678,9 +684,13 @@ impl BonsaiModel {
                 .iter()
                 .any(|result| result.nonfinite != 0)
         } else {
-            output.logits.as_slice::<f32>()[..decoded * VOCAB]
-                .iter()
-                .any(|value| !value.is_finite())
+            // SAFETY: the batch above has completed and nothing writes the
+            // logits while they are scanned.
+            unsafe {
+                output.logits.as_slice::<f32>()[..decoded * VOCAB]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            }
         };
         if nonfinite {
             return Err(crate::Error::Generation("non-finite Bonsai logits".into()));
@@ -1435,5 +1445,5 @@ fn mismatch() -> crate::Error {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(unsafe_code, clippy::expect_used)]
 mod tests;
