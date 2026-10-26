@@ -405,20 +405,28 @@ impl VectorIndex {
         hits.truncate(plan.limit);
         let mut data = Vec::with_capacity(hits.len());
         for ((attach_id, ordinal), score) in hits {
-            let row: Option<(String, String, String, Vec<u8>)> = snapshot
+            let row: Option<(i64, String, String, String, i64, i64)> = snapshot
                 .query_row(
-                    "SELECT f.file_id, f.filename, f.attributes,
-                            substr(f.text, c.start + 1, c.end - c.start)
+                    "SELECT f.seq, f.file_id, f.filename, f.attributes, c.start, c.end
                      FROM vector_store_chunks c JOIN vector_store_files f
                        ON f.attach_id = c.attach_id
                      WHERE c.attach_id = ?1 AND c.ordinal = ?2 AND f.status = 'completed'",
                     params![attach_id, signed(ordinal)?],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
             // Every admitted document has its chunk row in this snapshot; a
             // missing one would be skipped, never shown.
-            let Some((file_id, filename, attributes, text)) = row else {
+            let Some((seq, file_id, filename, attributes, start, end)) = row else {
                 continue;
             };
             data.push(SearchResult {
@@ -428,7 +436,7 @@ impl VectorIndex {
                 attributes: serde_json::from_str(&attributes)?,
                 content: vec![ContentPart {
                     kind: "text".to_owned(),
-                    text: String::from_utf8(text).map_err(|_| corrupt("chunk text"))?,
+                    text: chunk_text(&snapshot, seq, start, end)?,
                 }],
             });
         }
@@ -1190,6 +1198,22 @@ fn embed_chunks(
         encoded.extend(vectors.iter().map(|vector| encode(vector)));
     }
     Ok(encoded)
+}
+
+/// The bytes `start..end` of the stored text of the file at row `seq`, read
+/// incrementally (`sqlite3_blob_read`) so a hit costs its chunk, not the
+/// whole text (up to 16 MiB).
+fn chunk_text(connection: &rusqlite::Connection, seq: i64, start: i64, end: i64) -> Result<String> {
+    let start = usize::try_from(start).map_err(|_| corrupt("chunk boundary"))?;
+    let length = usize::try_from(end)
+        .ok()
+        .and_then(|end| end.checked_sub(start))
+        .ok_or_else(|| corrupt("chunk boundary"))?;
+    let blob =
+        connection.blob_open(rusqlite::MAIN_DB, c"vector_store_files", c"text", seq, true)?;
+    let mut bytes = vec![0; length];
+    blob.read_at_exact(&mut bytes, start)?;
+    String::from_utf8(bytes).map_err(|_| corrupt("chunk text"))
 }
 
 /// The chunk byte ranges of an attachment, by ordinal.

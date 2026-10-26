@@ -18,7 +18,7 @@ There is one fixed implementation per job, not a set of optional backends:
 
 | Job | Implementation |
 | --- | --- |
-| Durable state | One bundled SQLite database through [`rusqlite` 0.40.2](https://docs.rs/rusqlite/0.40.2/rusqlite/) (`bundled` feature, no other features) |
+| Durable state | One bundled SQLite database through [`rusqlite` 0.40.2](https://docs.rs/rusqlite/0.40.2/rusqlite/) (`bundled` and `blob` features, no others) |
 | File bytes | Owner-only blob files beside the database, tracked by SQLite rows |
 | Ranked repository search | A fresh in-RAM [Tantivy 0.26.2](https://docs.rs/tantivy/0.26.2/tantivy/) index built for each call (default features off; `mmap` and `stemmer` on) |
 | Vector store search | One persistent Tantivy index beside the database, derived from it (BM25, no embeddings) |

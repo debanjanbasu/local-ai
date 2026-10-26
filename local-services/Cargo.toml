@@ -13,8 +13,9 @@ workspace = true
 
 [dependencies]
 # Bundled SQLite: one audited engine version (WAL, multi-process locking)
-# regardless of the host library; no statement cache or other extras.
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+# regardless of the host library; incremental BLOB reads (`blob`, no extra
+# crate) for a search hit's chunk; no statement cache or other extras.
+rusqlite = { version = "0.40.2", default-features = false, features = ["blob", "bundled"] }
 cap-std = "4.0.3"
 ignore = "0.4.33"
 grep-regex = "0.1.14"
