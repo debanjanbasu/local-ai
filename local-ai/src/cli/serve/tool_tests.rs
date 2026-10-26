@@ -19,6 +19,8 @@ use local_services::files::{CreateFile, FilePurpose};
 use local_services::tools::{Limits, Permissions, Toolbox};
 use local_services::vector_stores::CreateVectorStore;
 
+use super::super::admin::Meter;
+use super::super::admin::tests::{completions, open, project_meter, recent};
 use super::super::hosted::{Hosted, Kind};
 use super::super::response::{Protocol, Reply};
 use super::super::responses::{ResponsesState, prepare_responses};
@@ -351,7 +353,7 @@ async fn the_loop_runs_hosted_calls_and_continues_generation() {
             ],
         ],
     );
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     let outputs = outputs(&events);
     assert_eq!(outputs.len(), 3);
     assert!(
@@ -416,7 +418,7 @@ async fn the_loop_renders_hosted_items_in_the_response() {
             ],
         ],
     );
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     let prepared = prepare(TOOLS, &json!({}));
     let echo = Arc::new(prepared.echo);
     let reply = Reply::new(Protocol::Responses(Arc::clone(&echo)), Arc::from("bonsai"));
@@ -459,7 +461,7 @@ async fn iteration_bound_forces_a_final_answer() {
             ],
         ],
     );
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     assert!(matches!(events.last(), Some(Event::Finished(_))));
     let submitted = submitted.lock().expect("lock").clone();
     assert_eq!(submitted.len(), 1);
@@ -480,7 +482,7 @@ async fn a_turn_with_a_client_call_ends_after_its_hosted_calls() {
             Event::Finished(stats(StopReason::Eos, 1)),
         ]],
     );
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     assert_eq!(outputs(&events).len(), 1);
     assert!(matches!(events.last(), Some(Event::Finished(_))));
     assert!(submitted.lock().expect("lock").is_empty());
@@ -502,7 +504,7 @@ async fn a_token_limited_turn_runs_nothing() {
             Event::Finished(stats(StopReason::TokenLimit, 1)),
         ]],
     );
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     assert_eq!(outputs(&events).len(), 0);
     assert!(!root.path().join("never.txt").exists());
     assert!(submitted.lock().expect("lock").is_empty());
@@ -510,6 +512,7 @@ async fn a_token_limited_turn_runs_nothing() {
 
 #[tokio::test]
 async fn cancelling_the_response_stops_a_running_tool() {
+    let (_dir, admin) = open();
     let root = tempfile::tempdir().expect("root");
     let (tool_loop, first, submitted) = fake_loop(
         TOOLS,
@@ -521,7 +524,7 @@ async fn cancelling_the_response_stops_a_running_tool() {
         ]],
     );
     let started = Instant::now();
-    let stream = start(tool_loop, first);
+    let stream = start(tool_loop, first, project_meter(&admin));
     let cancel = stream.cancel_handle();
     let received = tokio::task::spawn_blocking(move || {
         let mut stream = stream;
@@ -540,6 +543,58 @@ async fn cancelling_the_response_stops_a_running_tool() {
         started.elapsed()
     );
     assert!(submitted.lock().expect("lock").is_empty());
+    // The round that finished before the tool ran is recorded, once, by the
+    // time the stream has ended.
+    let usage = recent(&admin, "completions");
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["num_model_requests"], 1);
+    assert_eq!(usage[0]["output_tokens"], 1);
+}
+
+#[tokio::test]
+async fn the_loop_records_all_its_rounds_once_before_its_end() {
+    let (_dir, admin) = open();
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("notes.txt"), "the answer is 42\n").expect("write");
+    let (tool_loop, first, submitted) = fake_loop(
+        TOOLS,
+        toolbox(root.path(), false, false),
+        bounds(4),
+        vec![
+            vec![
+                Event::ToolCall(call("r1", "local_fs_read", json!({"path":"notes.txt"}))),
+                Event::Finished(stats(StopReason::Eos, 7)),
+            ],
+            vec![
+                Event::Content("It is 42.".into()),
+                Event::Finished(stats(StopReason::Eos, 4)),
+            ],
+        ],
+    );
+    let stream = start(tool_loop, first, project_meter(&admin));
+    let reader = Arc::clone(&admin);
+    let events = tokio::task::spawn_blocking(move || {
+        let mut events = Vec::new();
+        for event in stream {
+            // The sum is recorded, once, before the consumer can see the
+            // end (the loop may run ahead of this reader).
+            if matches!(event, Event::Finished(_)) {
+                assert_eq!(completions(&reader), 1);
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("consumer");
+    assert_eq!(submitted.lock().expect("lock").len(), 1);
+    assert_eq!(outputs(&events).len(), 1);
+    assert!(matches!(events.last(), Some(Event::Finished(_))));
+    let usage = recent(&admin, "completions");
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["num_model_requests"], 1);
+    assert_eq!(usage[0]["input_tokens"], 20);
+    assert_eq!(usage[0]["output_tokens"], 11);
 }
 
 #[tokio::test]
@@ -561,7 +616,7 @@ async fn hosted_shell_calls_render_as_shell_items() {
             ],
         ],
     );
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     let prepared = prepare(TOOLS, &json!({}));
     let echo = Arc::new(prepared.echo);
     let reply = Reply::new(Protocol::Responses(Arc::clone(&echo)), Arc::from("bonsai"));
@@ -893,7 +948,7 @@ async fn file_search_runs_without_permissions_and_answers_with_citations() {
         ],
     );
     tool_loop.vector_stores = Some(Arc::clone(&service));
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     let results = outputs(&events);
     assert_eq!(results.len(), 2);
     // Numbered across the Response: the second search's first result is 2.
@@ -1070,7 +1125,7 @@ async fn a_failed_search_is_reported_to_the_model_and_as_a_failed_item() {
     )
     .expect("store");
     store.delete_vector_store(&store_id).expect("deleted");
-    let events = drain(start(tool_loop, first)).await;
+    let events = drain(start(tool_loop, first, Meter::default())).await;
     let results = outputs(&events);
     assert!(
         results[0].content.starts_with("error: "),

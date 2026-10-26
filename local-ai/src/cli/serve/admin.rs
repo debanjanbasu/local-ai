@@ -63,7 +63,7 @@ use super::store::query_pairs;
 
 #[cfg(test)]
 #[path = "admin_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 /// Route prefix of the Administration API.
 pub(super) const PREFIX: &str = "/v1/organization";
@@ -1022,9 +1022,9 @@ pub(super) fn record(state: &AppState, record: UsageRecord) {
 }
 
 /// Where a generation records its usage (a request's own, through
-/// [`Metered`]; batch lines, compaction and reasoning summaries
-/// directly): the usage store and a record template, or nowhere while
-/// there is no store.
+/// [`Metered`] or the hosted tool loop; batch lines, compaction and
+/// reasoning summaries directly): the usage store and a record template, or
+/// nowhere while there is no store.
 #[derive(Clone, Default)]
 pub(super) struct Meter(Option<(Arc<Admin>, UsageRecord)>);
 
@@ -1140,6 +1140,12 @@ pub(super) struct Metered {
 }
 
 impl Metered {
+    /// `events` recording nothing: its producer records its own usage (the
+    /// hosted tool loop), or there is nothing to record it into.
+    pub(super) fn unmetered(events: EventStream) -> Self {
+        Meter::default().stream(events)
+    }
+
     /// [`EventStream::next_signal`], recording the usage when it returns
     /// `Finished`. Blocks on the store then: call it from a blocking context.
     pub(super) fn next_signal(

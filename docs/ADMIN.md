@@ -145,7 +145,10 @@ Implemented:
     record is committed before the client can see the response end (the
     final stream event, the last body byte, a background Response's terminal
     status). A client that went away is still recorded: the generation is
-    cancelled and read to its final count without holding a thread;
+    cancelled and read to its final count without holding a thread. A
+    Response whose hosted tools ran several generations is one record of
+    their sum, written whatever ended it (the client leaving during a tool
+    call, an error in a later round);
   - `completions` with `batch: true`: every batch line, attributed to the
     project key that created the batch (it is stored with it, since a batch
     outlives the request that created it);

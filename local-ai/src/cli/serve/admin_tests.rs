@@ -22,7 +22,7 @@ use super::{Caller, Gate, Meter, dispatch};
 
 const SCHEMAS: &str = include_str!("fixtures/admin_schemas.json");
 
-fn open() -> (tempfile::TempDir, Arc<Admin>) {
+pub(in crate::cli::serve) fn open() -> (tempfile::TempDir, Arc<Admin>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("store")).unwrap();
     (dir, Arc::new(Admin::new(store)))
@@ -811,7 +811,7 @@ fn project() -> Caller {
 }
 
 /// A `completions` meter of the test project's into `admin`.
-fn project_meter(admin: &Arc<Admin>) -> Meter {
+pub(in crate::cli::serve) fn project_meter(admin: &Arc<Admin>) -> Meter {
     Meter::into_store(
         Some(admin),
         project().usage(UsageKind::Completions, "bonsai"),
@@ -819,7 +819,7 @@ fn project_meter(admin: &Arc<Admin>) -> Meter {
 }
 
 /// How many `completions` requests `admin` recorded in the last minute.
-fn completions(admin: &Admin) -> u64 {
+pub(in crate::cli::serve) fn completions(admin: &Admin) -> u64 {
     recent(admin, "completions")
         .iter()
         .map(|result| result["num_model_requests"].as_u64().unwrap())
@@ -829,7 +829,7 @@ fn completions(admin: &Admin) -> u64 {
 /// Wait until `admin` holds `requests` `completions` requests. A dropped
 /// stream records from a task of its own that tells no one, so this polls,
 /// briefly and within a deadline.
-async fn recorded(admin: &Admin, requests: u64) {
+pub(in crate::cli::serve) async fn recorded(admin: &Admin, requests: u64) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while completions(admin) < requests {
         assert!(
@@ -1101,7 +1101,7 @@ async fn a_background_job_is_recorded_once_before_it_settles() {
 }
 
 /// Every result of `family` recorded in the last minute, one bucket.
-fn recent(admin: &Admin, family: &str) -> Vec<Value> {
+pub(in crate::cli::serve) fn recent(admin: &Admin, family: &str) -> Vec<Value> {
     let now = super::super::response::unix_now();
     let page = expect(
         admin,
