@@ -83,7 +83,12 @@ immediate transaction. A database written by a newer build is refused. The
 directory must be `0700` and the database and its `-wal`, `-shm` and
 `-journal` sidecars `0600`. A symlink, the wrong file type, or any group or
 other permission bit is refused with `PermissionDenied`, never repaired. Every
-operation opens its own connection with:
+operation re-checks those paths and then takes a connection from a small pool
+(at most 8 idle, shared by the `Store`'s clones; one with a transaction left
+open is discarded, not reused), opening one when none is idle. Reuse makes a
+read about 6.5 µs instead of 0.9 ms (2,000 `get_conversation` calls, M4 Pro).
+Statements are prepared per call: `rusqlite`'s statement cache is a feature
+this crate leaves off. Each connection is opened with:
 
 - [`SQLITE_OPEN_NOFOLLOW`](https://sqlite.org/c3ref/open.html) and a 5 s
   [busy timeout](https://sqlite.org/c3ref/busy_timeout.html);

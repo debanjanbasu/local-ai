@@ -929,7 +929,7 @@ impl Store {
 
     /// The store `id`.
     pub fn get_vector_store(&self, id: &str) -> Result<VectorStore> {
-        load_store(&self.connection()?, id)
+        load_store(&*self.connection()?, id)
     }
 
     /// Stores, newest first by default.

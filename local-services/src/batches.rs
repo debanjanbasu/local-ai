@@ -506,7 +506,7 @@ impl Store {
 
     /// The batch `id`.
     pub fn get_batch(&self, id: &str) -> Result<Batch> {
-        load(&self.connection()?, id)
+        load(&*self.connection()?, id)
     }
 
     /// Batches, newest first.
@@ -592,7 +592,7 @@ impl Store {
     /// another holder (in this process or another) has it.
     pub fn lease_batch(&self, id: &str) -> Result<Option<BatchLease>> {
         validate_id(id)?;
-        load(&self.connection()?, id)?;
+        load(&*self.connection()?, id)?;
         let dir = self.root().join(LOCK_DIR);
         private_dir(&dir)?;
         let file = private_file(&dir.join(format!("{id}.lock")))?;
@@ -900,7 +900,7 @@ impl Store {
 
 /// Streams the result records of one state as JSONL, a page at a time.
 struct Records {
-    connection: Connection,
+    connection: crate::Pooled,
     batch: String,
     state: &'static str,
     after: i64,

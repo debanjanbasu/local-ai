@@ -23,8 +23,9 @@ pub use conversations::{
 
 use std::fs;
 use std::io::ErrorKind;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
@@ -62,14 +63,60 @@ const DATABASE: &str = "services.sqlite3";
 const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 /// How long a writer waits for another writer before failing with `SQLITE_BUSY`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Idle connections a store keeps for reuse.
+const MAX_IDLE_CONNECTIONS: usize = 8;
 
 /// A handle to the durable store; cheap to clone and share across threads.
 ///
-/// Each operation opens its own connection, so a `Store` holds no lock and no
-/// open file between calls.
+/// Each operation takes a connection from a small pool shared by the clones
+/// (opening one when none is idle) and returns it afterwards, so a `Store`
+/// holds at most [`MAX_IDLE_CONNECTIONS`] idle connections and no lock
+/// between calls.
 #[derive(Clone, Debug)]
 pub struct Store {
     root: Arc<PathBuf>,
+    idle: Arc<Mutex<Vec<Connection>>>,
+}
+
+/// A connection taken from a [`Store`]'s pool, returned to it when dropped
+/// unless a transaction is still open on it.
+#[derive(Debug)]
+pub(crate) struct Pooled {
+    connection: Option<Connection>,
+    idle: Arc<Mutex<Vec<Connection>>>,
+}
+
+impl Deref for Pooled {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        // Only `Drop` takes the connection out.
+        #[allow(clippy::unwrap_used)]
+        self.connection.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for Pooled {
+    fn deref_mut(&mut self) -> &mut Connection {
+        // Only `Drop` takes the connection out.
+        #[allow(clippy::unwrap_used)]
+        self.connection.as_mut().unwrap()
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if !connection.is_autocommit() {
+            return;
+        }
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle.len() < MAX_IDLE_CONNECTIONS {
+            idle.push(connection);
+        }
+    }
 }
 
 impl Store {
@@ -85,6 +132,7 @@ impl Store {
         create_private_file(&root, &root.join(DATABASE))?;
         let store = Self {
             root: Arc::new(root.canonicalize()?),
+            idle: Arc::new(Mutex::new(Vec::new())),
         };
         let mut connection = store.connection()?;
         conversations::initialize(&mut connection)?;
@@ -101,40 +149,58 @@ impl Store {
         &self.root
     }
 
-    /// A new hardened connection to the store's database.
+    /// A hardened connection to the store's database, reused from the pool
+    /// when one is idle.
     ///
     /// WAL journal, `synchronous = FULL` with `fullfsync`, foreign keys on,
     /// untrusted schema, and a bounded busy timeout. The paths are re-checked
-    /// on every open and the database is opened without following symlinks.
-    pub(crate) fn connection(&self) -> Result<Connection> {
+    /// on every call, reused connection or not, and the database is opened
+    /// without following symlinks.
+    pub(crate) fn connection(&self) -> Result<Pooled> {
         check_private_dir(&self.root)?;
         let database = self.root.join(DATABASE);
         check_private_file(&database, false)?;
         for suffix in SIDECARS {
             check_private_file(&self.root.join(format!("{DATABASE}{suffix}")), true)?;
         }
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let connection = Connection::open_with_flags(&database, flags)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        let mode: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(Error::Io(std::io::Error::other(format!(
-                "{} cannot use WAL journaling (journal mode is {mode})",
-                database.display()
-            ))));
-        }
-        connection.execute_batch(
-            "PRAGMA synchronous = FULL;
-             PRAGMA fullfsync = ON;
-             PRAGMA checkpoint_fullfsync = ON;
-             PRAGMA foreign_keys = ON;
-             PRAGMA trusted_schema = OFF;",
-        )?;
-        Ok(connection)
+        let reused = self
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let connection = match reused {
+            Some(connection) => connection,
+            None => open_connection(&database)?,
+        };
+        Ok(Pooled {
+            connection: Some(connection),
+            idle: Arc::clone(&self.idle),
+        })
     }
+}
+
+/// Open and configure a new connection to `database`.
+fn open_connection(database: &Path) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let connection = Connection::open_with_flags(database, flags)?;
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+    let mode: String = connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "{} cannot use WAL journaling (journal mode is {mode})",
+            database.display()
+        ))));
+    }
+    connection.execute_batch(
+        "PRAGMA synchronous = FULL;
+         PRAGMA fullfsync = ON;
+         PRAGMA checkpoint_fullfsync = ON;
+         PRAGMA foreign_keys = ON;
+         PRAGMA trusted_schema = OFF;",
+    )?;
+    Ok(connection)
 }
 
 /// Bring `component`'s tables up to date, atomically.

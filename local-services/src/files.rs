@@ -880,7 +880,7 @@ impl Store {
         Ok(report)
     }
 
-    fn files_connection(&self) -> Result<Connection> {
+    fn files_connection(&self) -> Result<crate::Pooled> {
         self.connection()
     }
 

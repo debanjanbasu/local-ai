@@ -582,7 +582,7 @@ impl VectorIndex {
         } else {
             INDEX_BATCH_BYTES
         };
-        let pending = next_pending(&self.store.connection()?, INDEX_BATCH_FILES)?;
+        let pending = next_pending(&*self.store.connection()?, INDEX_BATCH_FILES)?;
         let mut parsed = Vec::new();
         let mut failed = Vec::new();
         let mut bytes = 0;
@@ -867,7 +867,7 @@ impl VectorIndex {
     fn collect(&self, writer: &mut IndexWriter) -> Result<u64> {
         let mut collected = 0;
         loop {
-            let batch = garbage(&self.store.connection()?, GARBAGE_BATCH)?;
+            let batch = garbage(&*self.store.connection()?, GARBAGE_BATCH)?;
             if batch.is_empty() {
                 return Ok(collected);
             }

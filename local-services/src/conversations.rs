@@ -225,7 +225,7 @@ impl Store {
 
     /// The live conversation `id`.
     pub fn get_conversation(&self, id: &str) -> Result<Conversation> {
-        live(&self.connection()?, id)
+        live(&*self.connection()?, id)
     }
 
     /// Replace conversation `id`'s metadata.
