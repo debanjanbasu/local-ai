@@ -100,6 +100,25 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+/// A PNG of `width` x `height` RGB pixels with no pixel data: its header
+/// reads, its pixels do not decode.
+pub fn png_header(width: u32, height: u32) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = b"IHDR".to_vec();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    png.extend_from_slice(&13_u32.to_be_bytes());
+    png.extend_from_slice(&ihdr);
+    png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+    for chunk in [&b"IDAT"[..], b"IEND"] {
+        png.extend_from_slice(&0_u32.to_be_bytes());
+        png.extend_from_slice(chunk);
+        png.extend_from_slice(&crc32(chunk).to_be_bytes());
+    }
+    png
+}
+
 /// 10,000 x 10,000 is within the side limit but over the pixel limit: the
 /// header is refused before 300 MB of pixels are allocated, for JPEG
 /// (libjpeg-turbo) and the `image` crate's formats alike.
@@ -115,21 +134,9 @@ fn images_over_the_pixel_limit_are_refused_from_their_header() {
     jpeg[163..167].copy_from_slice(&[0x27, 0x10, 0x27, 0x10]);
     let error = decode_image(&jpeg).expect_err("refused").to_string();
     assert!(error.contains("pixels"), "{error}");
-
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut ihdr = b"IHDR".to_vec();
-    ihdr.extend_from_slice(&10_000_u32.to_be_bytes());
-    ihdr.extend_from_slice(&10_000_u32.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-    png.extend_from_slice(&13_u32.to_be_bytes());
-    png.extend_from_slice(&ihdr);
-    png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
-    for chunk in [&b"IDAT"[..], b"IEND"] {
-        png.extend_from_slice(&0_u32.to_be_bytes());
-        png.extend_from_slice(chunk);
-        png.extend_from_slice(&crc32(chunk).to_be_bytes());
-    }
-    let error = decode_image(&png).expect_err("refused").to_string();
+    let error = decode_image(&png_header(10_000, 10_000))
+        .expect_err("refused")
+        .to_string();
     assert!(error.contains("exceeds 67108864 pixels"), "{error}");
 }
 

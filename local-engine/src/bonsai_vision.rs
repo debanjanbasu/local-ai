@@ -40,7 +40,7 @@ use sha2::{Digest as _, Sha256};
 use crate::bonsai::VOCAB;
 use crate::bonsai::WIDTH;
 
-pub use self::preprocess::{ImageDetail, PreparedImage, prepare_decoded, prepare_image};
+pub use self::preprocess::{ImageDetail, ImageFile, PreparedImage, prepare_decoded, prepare_image};
 pub use self::tower::{VISION_PROJECTOR_FILE, VisionEncoder};
 pub use self::video::{PreparedVideo, VIDEO_PAD, VIDEO_PLACEHOLDER, prepare_video};
 
@@ -53,6 +53,22 @@ pub const VISION_END: u32 = 248_054;
 pub const IMAGE_PAD: u32 = 248_056;
 /// What the chat template renders for each image part.
 pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+/// Most image and video parts one request may hold.
+pub const MAX_REQUEST_PARTS: usize = 64;
+/// Most encoded bytes of one request's images and videos together.
+pub const MAX_REQUEST_MEDIA_BYTES: usize = 256 << 20;
+/// Most decoded pixels of one request's images together (512 MP; each image
+/// is decoded and resized on its own, so this bounds CPU time, not memory).
+pub const MAX_REQUEST_IMAGE_PIXELS: usize = 512 << 20;
+/// Most track frames of one request's videos together (two videos at the
+/// per-video limit), checked as each video is read.
+pub const MAX_REQUEST_VIDEO_FRAMES: usize = 2 * video::MAX_TRACK_FRAMES;
+
+/// The error of work stopped because its request was cancelled.
+pub(crate) fn cancelled() -> crate::Error {
+    crate::Error::Generation("the request was cancelled".into())
+}
 
 /// First virtual image-token id: everything at or above it is an image token.
 pub const IMAGE_TOKEN_BASE: u32 = VOCAB as u32;
@@ -233,20 +249,36 @@ pub(crate) fn check_tokens(
     Ok(())
 }
 
+/// What a prompt needs of an image or frame group: its merged grid and the
+/// digest its token ids derive from ([`PreparedImage::layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grid {
+    pub rows: usize,
+    pub cols: usize,
+    pub digest: [u8; 32],
+}
+
+impl Grid {
+    #[must_use]
+    pub const fn tokens(&self) -> usize {
+        self.rows * self.cols
+    }
+}
+
 /// One image or video of a prompt, encoded, for [`expand_prompt`].
 #[derive(Clone, Debug)]
-pub enum Visual<'a> {
+pub enum Visual {
     /// An image and its decoder rows (`[tokens][WIDTH]`, embedding basis).
-    Image(&'a PreparedImage, Arc<[f32]>),
+    Image(Grid, Arc<[f32]>),
     /// A video: its frame groups in order.
-    Video(Vec<FrameGroup<'a>>),
+    Video(Vec<FrameGroup>),
 }
 
 /// A video frame group of a [`Visual::Video`]: the token ids of its
 /// timestamp text, the group and its rows.
-pub type FrameGroup<'a> = (Vec<u32>, &'a PreparedImage, Arc<[f32]>);
+pub type FrameGroup = (Vec<u32>, Grid, Arc<[f32]>);
 
-impl Visual<'_> {
+impl Visual {
     /// The template token this part's expansion replaces.
     const fn pad(&self) -> u32 {
         match self {
@@ -267,7 +299,7 @@ impl Visual<'_> {
     }
 }
 
-fn check_pads(ids: &[u32], visuals: &[Visual<'_>]) -> crate::Result<()> {
+fn check_pads(ids: &[u32], visuals: &[Visual]) -> crate::Result<()> {
     let mut expected = visuals.iter().map(Visual::pad);
     let matched = ids
         .iter()
@@ -298,13 +330,13 @@ fn check_pads(ids: &[u32], visuals: &[Visual<'_>]) -> crate::Result<()> {
 pub fn expand_prompt(
     ids: &[u32],
     projector: &[u8; 32],
-    visuals: &[Visual<'_>],
+    visuals: &[Visual],
 ) -> crate::Result<(Vec<u32>, PromptImages)> {
     check_pads(ids, visuals)?;
     let extra = visuals.iter().map(Visual::len).sum::<usize>();
     let mut expanded = Vec::with_capacity(ids.len() + extra);
     let mut spans = Vec::new();
-    let mut grid = |expanded: &mut Vec<u32>, image: &PreparedImage, embedding: &Arc<[f32]>| {
+    let mut grid = |expanded: &mut Vec<u32>, image: &Grid, embedding: &Arc<[f32]>| {
         let start = expanded.len();
         expanded.extend(
             (0..image.tokens() as u32).map(|k| image_token_id(projector, &image.digest, k)),
@@ -344,7 +376,7 @@ pub fn expand_prompt(
 /// # Errors
 ///
 /// As [`expand_prompt`].
-pub fn expanded_len(ids: &[u32], visuals: &[Visual<'_>]) -> crate::Result<usize> {
+pub fn expanded_len(ids: &[u32], visuals: &[Visual]) -> crate::Result<usize> {
     check_pads(ids, visuals)?;
     Ok(ids.len() + visuals.iter().map(|visual| visual.len() - 1).sum::<usize>())
 }

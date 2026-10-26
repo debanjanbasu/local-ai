@@ -21,9 +21,10 @@ use local_metal::shaders::ShaderLibrary;
 use sha2::{Digest as _, Sha256};
 
 use super::preprocess::{PATCH_VALUES, PreparedImage, merge_order};
-use super::{EmbeddingCache, rotate_rows};
+use super::{EmbeddingCache, cancelled, rotate_rows};
 use crate::activity::EngineActivity;
 use crate::bonsai::{BonsaiMetalTensor, BonsaiPackage, BonsaiTensorType, WIDTH};
+use crate::bonsai_model::CancelToken;
 
 /// The projector file, installed beside the Bonsai GGUF.
 pub const VISION_PROJECTOR_FILE: &str = "Ternary-Bonsai-2-27B-mmproj-BF16.gguf";
@@ -290,23 +291,32 @@ impl VisionEncoder {
         &self.digest
     }
 
+    /// The cached decoder input rows of the image or frame group whose
+    /// digest is `digest`, if it was encoded recently.
+    #[must_use]
+    pub fn cached(&self, digest: &[u8; 32]) -> Option<Arc<[f32]>> {
+        self.cache.get(digest)
+    }
+
     /// The decoder input rows (`[tokens][5120]`, in the checkpoint's
     /// embedding basis) of `image`, from the cache when it was encoded
     /// recently. With `activity`, every submission after the first waits for
-    /// a running decode step first.
+    /// a running decode step first; `cancel` is checked before each
+    /// submission.
     ///
     /// # Errors
     ///
-    /// Metal failures.
+    /// Metal failures; [`crate::Error::Generation`] when cancelled.
     pub fn encode(
         &self,
         image: &PreparedImage,
         activity: Option<&EngineActivity>,
+        cancel: Option<&CancelToken>,
     ) -> crate::Result<Arc<[f32]>> {
         if let Some(rows) = self.cache.get(&image.digest) {
             return Ok(rows);
         }
-        let mut rows = self.encode_raw(image, activity, &mut |_, _| {})?;
+        let mut rows = self.encode_raw(image, activity, cancel, &mut |_, _| {})?;
         rotate_rows(&mut rows, &self.signs);
         let rows: Arc<[f32]> = rows.into();
         self.cache.insert(image.digest, Arc::clone(&rows));
@@ -315,17 +325,19 @@ impl VisionEncoder {
 
     /// The tower's output for `image` (`[tokens][5120]`, as the reference
     /// returns it), reporting `block0_in` (the embedded patches) and
-    /// `block{i}_out` to `probe`.
+    /// `block{i}_out` to `probe`. `activity` and `cancel` as for
+    /// [`Self::encode`].
     ///
     /// # Errors
     ///
-    /// Metal failures.
+    /// Metal failures; [`crate::Error::Generation`] when cancelled.
     #[doc(hidden)]
     #[allow(clippy::too_many_lines)]
     pub fn encode_raw(
         &self,
         image: &PreparedImage,
         activity: Option<&EngineActivity>,
+        cancel: Option<&CancelToken>,
         probe: &mut dyn FnMut(&str, &[f32]),
     ) -> crate::Result<Vec<f32>> {
         let gpu = self.gpu.lock().unwrap_or_else(PoisonError::into_inner);
@@ -347,9 +359,14 @@ impl VisionEncoder {
         let ffn = floats(FFN)?;
         let kernels = &gpu.kernels;
         let mut first = true;
+        // A cancelled request submits nothing more (and gives the tower's
+        // lock back); a submitted buffer always runs to completion.
         let mut submit = |batch: CommandBatch| -> crate::Result<()> {
             if !first && let Some(activity) = activity {
                 activity.yield_to_decode(DECODE_YIELD_LIMIT);
+            }
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Err(cancelled());
             }
             first = false;
             batch.commit_and_wait()?;

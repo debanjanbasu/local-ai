@@ -158,6 +158,30 @@ fn decode_jpeg(bytes: &[u8]) -> crate::Result<Option<RgbImage>> {
     }
 }
 
+/// The `(width, height)` [`decode_image`] would decode `bytes` to, from the
+/// header alone (libjpeg-turbo's for JPEG, as decoding reads it).
+///
+/// # Errors
+///
+/// As [`decode_image`], for what the header shows.
+pub fn image_dimensions(bytes: &[u8]) -> crate::Result<(usize, usize)> {
+    let invalid = |error: String| Error::InvalidArgument(format!("image: {error}"));
+    let (width, height) = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        std::panic::catch_unwind(|| mozjpeg::Decompress::new_mem(bytes).map(|d| d.size()))
+            .map_err(|_| invalid("JPEG: undecodable data".into()))?
+            .map_err(|error| invalid(format!("JPEG: {error}")))?
+    } else {
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|error| invalid(error.to_string()))?
+            .into_dimensions()
+            .map_err(|error| invalid(error.to_string()))?;
+        (width as usize, height as usize)
+    };
+    check_size(width, height).map_err(invalid)?;
+    Ok((width, height))
+}
+
 /// Decode an encoded image (JPEG, PNG, GIF, BMP or WebP; the first frame of
 /// an animation) to 8-bit RGB.
 ///

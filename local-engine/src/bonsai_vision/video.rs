@@ -339,11 +339,6 @@ fn check_frame(width: usize, height: usize) -> crate::Result<()> {
     Ok(())
 }
 
-/// The error of a cancelled decode.
-fn cancelled() -> Error {
-    Error::Generation("the request was cancelled".into())
-}
-
 /// What the first pass learns about a video track.
 #[derive(Clone, Copy, Debug)]
 pub struct Probe {
@@ -422,7 +417,8 @@ pub mod decode {
 
     use std::io::Write as _;
 
-    use super::{MAX_SECONDS, MAX_TRACK_FRAMES, Probe, cancelled, check_frame, container_suffix};
+    use super::super::cancelled;
+    use super::{MAX_SECONDS, MAX_TRACK_FRAMES, Probe, check_frame, container_suffix};
     use crate::Error;
     use crate::bonsai_model::CancelToken;
     use crate::embedding::vision::preprocess::RgbImage;

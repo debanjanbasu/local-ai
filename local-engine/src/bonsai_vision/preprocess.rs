@@ -14,10 +14,15 @@
 //!    order of the blocks. The processor stacks two identical temporal
 //!    slices; the tower folds them into its patch weights instead.
 
+use std::sync::{Mutex, PoisonError};
+
 use sha2::{Digest as _, Sha256};
 
+use super::Grid;
 use crate::Error;
-use crate::embedding::vision::preprocess::{RgbImage, decode_image, resize_bicubic};
+use crate::embedding::vision::preprocess::{
+    RgbImage, decode_image, image_dimensions, resize_bicubic,
+};
 
 /// Patch side in pixels.
 pub const PATCH: usize = 16;
@@ -95,6 +100,16 @@ impl PreparedImage {
     #[must_use]
     pub const fn tokens(&self) -> usize {
         self.rows * self.cols
+    }
+
+    /// The grid and digest a prompt lays this image out by.
+    #[must_use]
+    pub const fn layout(&self) -> Grid {
+        Grid {
+            rows: self.rows,
+            cols: self.cols,
+            digest: self.digest,
+        }
     }
 
     /// Patch rows (`rows * cols * 4`).
@@ -226,4 +241,112 @@ pub fn prepare_decoded(image: &RgbImage, max_pixels: usize) -> crate::Result<Pre
         cols,
         digest,
     })
+}
+
+/// An image file's SHA-256 and detail.
+type FileKey = ([u8; 32], ImageDetail);
+
+/// Grids (and decoded pixel counts) of recently prepared image files.
+static GRIDS: Mutex<Vec<(FileKey, Grid, usize)>> = Mutex::new(Vec::new());
+/// Grids remembered (about 80 bytes each).
+const GRID_CACHE_ENTRIES: usize = 4096;
+
+/// An image file of a request, sized from its header.
+///
+/// Its tokens are known before any pixel is decoded, and a file prepared
+/// before (an image kept in a conversation's history) also has its grid, so
+/// its encoded rows can be found without decoding it again.
+#[derive(Clone, Debug)]
+pub struct ImageFile {
+    key: FileKey,
+    /// The file's decoded pixels.
+    pub source_pixels: usize,
+    /// Merged grid at the part's detail.
+    pub rows: usize,
+    pub cols: usize,
+    known: Option<Grid>,
+}
+
+impl ImageFile {
+    /// Size `bytes` at `detail` from the file's header (or from an earlier
+    /// preparation of the same file and detail).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for an unreadable header, an image over the
+    /// decoding limits or an unsupported shape.
+    pub fn plan(bytes: &[u8], detail: ImageDetail) -> crate::Result<Self> {
+        let key = (Sha256::digest(bytes).into(), detail);
+        let known = {
+            let grids = GRIDS.lock().unwrap_or_else(PoisonError::into_inner);
+            grids
+                .iter()
+                .find(|(entry, ..)| *entry == key)
+                .map(|&(_, grid, pixels)| (grid, pixels))
+        };
+        if let Some((grid, source_pixels)) = known {
+            return Ok(Self {
+                key,
+                source_pixels,
+                rows: grid.rows,
+                cols: grid.cols,
+                known: Some(grid),
+            });
+        }
+        let (width, height) = image_dimensions(bytes)?;
+        let (h, w) = smart_resize(height, width, detail.max_pixels())?;
+        Ok(Self {
+            key,
+            source_pixels: width * height,
+            rows: h / FACTOR,
+            cols: w / FACTOR,
+            known: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn tokens(&self) -> usize {
+        self.rows * self.cols
+    }
+
+    /// The grid of an earlier preparation of this file at this detail.
+    #[must_use]
+    pub const fn known(&self) -> Option<Grid> {
+        self.known
+    }
+
+    /// The grid for counting: its digest is unknown (zero) until the file
+    /// has been prepared.
+    #[must_use]
+    pub fn grid(&self) -> Grid {
+        self.known.unwrap_or(Grid {
+            rows: self.rows,
+            cols: self.cols,
+            digest: [0; 32],
+        })
+    }
+
+    /// Decode and resize `bytes`, the file this was planned from, and
+    /// remember its grid.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_image`], and [`Error::InvalidArgument`] when the pixels
+    /// do not have the header's size.
+    pub fn prepare(&self, bytes: &[u8]) -> crate::Result<PreparedImage> {
+        let image = prepare_image(bytes, self.key.1)?;
+        if (image.rows, image.cols) != (self.rows, self.cols) {
+            return Err(Error::InvalidArgument(
+                "the image decoded to another size than its header declares".into(),
+            ));
+        }
+        let mut grids = GRIDS.lock().unwrap_or_else(PoisonError::into_inner);
+        grids.retain(|(entry, ..)| *entry != self.key);
+        grids.push((self.key, image.layout(), self.source_pixels));
+        if grids.len() > GRID_CACHE_ENTRIES {
+            grids.remove(0);
+        }
+        drop(grids);
+        Ok(image)
+    }
 }

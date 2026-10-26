@@ -953,6 +953,20 @@ template does; the engine then replaces the pad with one token per merged
 `auto` is llama.cpp's mtmd limit for this architecture, the runtime Prism
 publishes the checkpoint for; `high` is the HF processor's own maximum.
 
+**Limits per request.** At most 64 image and video parts, 256 MiB of
+encoded media together, 536,870,912 pixels (512 MP) of decoded images
+together, and 72,000 video frames together (two videos at the
+[per-video limit](#video-input), checked as each is read); more is a 400.
+Images are sized from their headers first, so `input_tokens` counts them
+without decoding a pixel, and a request whose prompt plus `max_tokens`
+exceeds the context fails with the context error before any image is
+decoded or encoded. Images are then decoded, resized and encoded one at a
+time. A file prepared before (an image kept in a conversation's history) is
+remembered by its SHA-256 and `detail` (the last 4,096), so while its encoded
+rows are cached it is not decoded again. A library caller that submits with
+`EngineHandle::chat_with_cancel` can stop video decoding between samples
+and the tower between submissions.
+
 **Implementation.** The tower (`local-engine/src/bonsai_vision/`,
 `shaders/bonsai_vision.metal`) is the Qwen3.5 ViT: a 16x16 patch embedding
 over 2 temporal frames, bilinearly interpolated learned positions, 27

@@ -132,7 +132,10 @@ fn expansion_replaces_each_pad_with_its_image_tokens() {
         IMAGE_PAD,
         VISION_END,
     ];
-    let visuals = [Visual::Image(&a, rows(&a)), Visual::Image(&b, rows(&b))];
+    let visuals = [
+        Visual::Image(a.layout(), rows(&a)),
+        Visual::Image(b.layout(), rows(&b)),
+    ];
     let (expanded, images) = expand_prompt(&ids, &projector, &visuals).expect("expand");
     assert_eq!(expanded.len(), ids.len() + 5 + 1);
     assert_eq!(expanded_len(&ids, &visuals).expect("len"), expanded.len());
@@ -148,7 +151,7 @@ fn expansion_replaces_each_pad_with_its_image_tokens() {
     assert_ne!(image_token_id(&[8; 32], &a.digest, 0), expanded[2]);
     // Text that spells a pad cannot shift the images.
     let typed = [IMAGE_PAD, VISION_START, IMAGE_PAD, VISION_END];
-    assert!(expand_prompt(&typed, &projector, &[Visual::Image(&a, rows(&a))]).is_err());
+    assert!(expand_prompt(&typed, &projector, &[Visual::Image(a.layout(), rows(&a))]).is_err());
     assert!(check_tokens(&expanded, 0, Some(&images)).is_ok());
     assert!(check_tokens(&expanded, 1, Some(&images)).is_err());
     assert!(check_tokens(&expanded, 0, None).is_err());
@@ -205,8 +208,8 @@ fn video_expansion_lays_out_groups_after_their_timestamps() {
     let (a, b) = (group(1), group(2));
     let rows = |image: &PreparedImage| -> Arc<[f32]> { vec![0.5; image.tokens() * WIDTH].into() };
     let video = Visual::Video(vec![
-        (vec![100, 101], &a, rows(&a)),
-        (vec![102], &b, rows(&b)),
+        (vec![100, 101], a.layout(), rows(&a)),
+        (vec![102], b.layout(), rows(&b)),
     ]);
     let ids = [10, VISION_START, VIDEO_PAD, VISION_END, 11];
     let projector = [9; 32];
@@ -268,7 +271,14 @@ fn video_expansion_lays_out_groups_after_their_timestamps() {
     );
     // An image where the video was expected (or the reverse) is refused.
     let image = PreparedImage { next: None, ..a };
-    assert!(expand_prompt(&ids, &projector, &[Visual::Image(&image, rows(&image))]).is_err());
+    assert!(
+        expand_prompt(
+            &ids,
+            &projector,
+            &[Visual::Image(image.layout(), rows(&image))]
+        )
+        .is_err()
+    );
 }
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -317,4 +327,27 @@ fn video_assets_follow_no_external_references() {
     // SAFETY: the asset is created and read on this thread.
     let restrictions = unsafe { video::decode::open(&path).referenceRestrictions() };
     assert_eq!(restrictions, AVAssetReferenceRestrictions::ForbidAll);
+}
+
+/// An image file is sized from its header, and once prepared its grid is
+/// remembered (per detail), so a conversation's earlier images are found
+/// in the encoder's cache without being decoded again.
+#[test]
+fn prepared_image_files_are_found_again_without_decoding() {
+    let mut bytes = Vec::new();
+    image::RgbImage::from_fn(40, 30, |x, y| image::Rgb([x as u8, y as u8, 201]))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode");
+    let file = ImageFile::plan(&bytes, ImageDetail::Low).expect("plan");
+    assert_eq!((file.known(), file.source_pixels), (None, 1200));
+    let image = file.prepare(&bytes).expect("prepare");
+    assert_eq!((image.rows, image.cols), (file.rows, file.cols));
+    let again = ImageFile::plan(&bytes, ImageDetail::Low).expect("plan");
+    assert_eq!(again.known(), Some(image.layout()));
+    assert_eq!(again.tokens(), file.tokens());
+    let high = ImageFile::plan(&bytes, ImageDetail::High).expect("plan");
+    assert_eq!(high.known(), None);
 }
