@@ -201,13 +201,27 @@ impl BonsaiEngine {
         // Two or more decode as one batch: two streams taking speculative
         // rounds in turn measured 32.7 tok/s aggregate against 36.8 batched
         // on the M4 Pro, so batching starts at two.
+        let mut failed = Vec::new();
         let outcome = match running {
             0 => Ok(false),
-            1 => self.step_alone().map(|()| false),
-            _ => self.step_batched(progress),
+            1 => self.step_alone(&mut failed).map(|()| false),
+            _ => self.step_batched(progress, &mut failed),
         };
+        for (id, error) in failed {
+            // Only these sequences' state is in doubt.
+            if let Some(index) = self
+                .active
+                .iter()
+                .position(|generation| generation.id == id)
+            {
+                let generation = self.active.remove(index);
+                self.discard(generation);
+            }
+            finished.push((id, Err(error)));
+        }
         if let Err(error) = &outcome {
-            // A failed pass leaves every participant's state undefined.
+            // A failure no sequence owns (an interrupted swap) leaves every
+            // generation's state undefined.
             let message = error.to_string();
             for generation in std::mem::take(&mut self.active) {
                 if let Some(state) = generation.state {
@@ -312,8 +326,10 @@ impl BonsaiEngine {
         self.step(&mut |_, _, _| false, &mut |_, _| {})
     }
 
-    /// The single-sequence round of the one running generation.
-    fn step_alone(&mut self) -> crate::Result<()> {
+    /// The single-sequence round of the one running generation. Its round
+    /// touches only its own state, so a failure there is its alone and goes
+    /// to `failed`.
+    fn step_alone(&mut self, failed: &mut Vec<(u64, crate::Error)>) -> crate::Result<()> {
         let Some(index) = self.active.iter().position(ActiveGeneration::decoding) else {
             return Ok(());
         };
@@ -324,8 +340,12 @@ impl BonsaiEngine {
         self.make_resident(index)?;
         let mut generation = self.active.swap_remove(index);
         let result = self.solo_round(&mut generation);
+        let id = generation.id;
         self.active.push(generation);
-        result
+        if let Err(error) = result {
+            failed.push((id, error));
+        }
+        Ok(())
     }
 
     /// One batched pass over every running generation: its seed and, where
@@ -334,17 +354,24 @@ impl BonsaiEngine {
     /// long prompt is prefilling, its next chunk (see [`Self::fold_candidate`]).
     /// Returns whether it prefilled a chunk, which is then the step's
     /// prefill.
+    ///
+    /// A failure that belongs to some sequences goes to `failed` with their
+    /// ids, and only they stop: each sequence's caches grow before any GPU
+    /// work, so running out fails that sequence alone; a sequence whose drafts
+    /// or selection fail is dropped from the pass or commits only its seed
+    /// row; a failed pass or commit fails the sequences whose state it wrote.
     #[allow(clippy::too_many_lines)]
     fn step_batched(
         &mut self,
         progress: &mut dyn FnMut(u64, PrefillProgress),
+        failed: &mut Vec<(u64, crate::Error)>,
     ) -> crate::Result<bool> {
         let greedy = self
             .active
             .iter()
             .any(|generation| generation.decoding() && generation.sampler.selects_argmax());
         let speculating = self.model.speculation().is_some();
-        let participants = self
+        let mut participants = self
             .active
             .iter()
             .enumerate()
@@ -354,15 +381,36 @@ impl BonsaiEngine {
         if participants.is_empty() {
             return Ok(false);
         }
-        let fold = self.fold_candidate(participants.len());
+        let mut fold = self.fold_candidate(participants.len());
+        if let Some((index, count)) = fold
+            && let Err(error) = self.reserve_for(index, count)
+        {
+            failed.push((self.active[index].id, error));
+            fold = None;
+        }
         let fold_rows = fold.map_or(0, |(_, rows)| rows);
         // What each sequence could draft, and which drafts the step verifies.
         let mut lookups = vec![None; participants.len()];
         let mut candidates = vec![None; participants.len()];
+        let mut dropped = vec![false; participants.len()];
         for (slot, &index) in participants.iter().enumerate() {
             let generation = &mut self.active[index];
             let lookup = Self::lookup_draft(self.ngram, self.info.context, generation);
-            if !lookup.is_empty() {
+            if lookup.is_empty() {
+                let remaining = generation.params.max_tokens - generation.stats.sampled_tokens;
+                let position = generation.prompt.len() + generation.stats.sampled_tokens - 1;
+                if let Some(head) = self.model.speculation()
+                    && generation.lag.usable()
+                {
+                    let depth = draft_depth(head.depth, remaining, self.info.context, position);
+                    candidates[slot] = (depth > 0).then_some(policy::Candidate {
+                        depth,
+                        acceptance: generation.mtp_acceptance,
+                        draft_ms: policy::COMMIT_MS,
+                        head: true,
+                    });
+                }
+            } else {
                 candidates[slot] = Some(policy::Candidate {
                     depth: lookup.len(),
                     acceptance: generation.ngram_acceptance,
@@ -370,20 +418,14 @@ impl BonsaiEngine {
                     head: false,
                 });
                 lookups[slot] = Some(lookup);
-                continue;
             }
-            let remaining = generation.params.max_tokens - generation.stats.sampled_tokens;
-            let position = generation.prompt.len() + generation.stats.sampled_tokens - 1;
-            if let Some(head) = self.model.speculation()
-                && generation.lag.usable()
-            {
-                let depth = draft_depth(head.depth, remaining, self.info.context, position);
-                candidates[slot] = (depth > 0).then_some(policy::Candidate {
-                    depth,
-                    acceptance: generation.mtp_acceptance,
-                    draft_ms: policy::COMMIT_MS,
-                    head: true,
-                });
+            // Its seed and every draft it may verify.
+            let rows = 1 + candidates[slot].map_or(0, |candidate| candidate.depth);
+            if let Err(error) = self.reserve_for(index, rows) {
+                failed.push((self.active[index].id, error));
+                dropped[slot] = true;
+                candidates[slot] = None;
+                lookups[slot] = None;
             }
         }
         let chosen = self.choose_drafts(participants.len() + fold_rows, &candidates);
@@ -406,10 +448,29 @@ impl BonsaiEngine {
             heads.push((slot, depth));
         }
         if !heads.is_empty() {
-            self.draft_from_heads(&participants, &heads, &mut drafts)?;
+            self.draft_from_heads(&participants, &heads, &mut drafts, &mut dropped, failed)?;
             for &(slot, _) in &heads {
                 from_head[slot] = !drafts[slot].is_empty();
             }
+        }
+        // Sequences that failed so far leave the pass.
+        let mut slot = 0;
+        participants.retain(|_| {
+            slot += 1;
+            !dropped[slot - 1]
+        });
+        let mut slot = 0;
+        drafts.retain(|_| {
+            slot += 1;
+            !dropped[slot - 1]
+        });
+        let mut slot = 0;
+        from_head.retain(|_| {
+            slot += 1;
+            !dropped[slot - 1]
+        });
+        if participants.is_empty() {
+            return Ok(false);
         }
         self.model.set_device_greedy(greedy);
         // The most alternatives any participant reports; each takes its own.
@@ -420,6 +481,14 @@ impl BonsaiEngine {
                 .max(),
         );
         let resident = self.resident;
+        // Everyone whose state the pass writes, collected before the rows
+        // borrow `self.active`.
+        #[allow(clippy::needless_collect)]
+        let written = participants
+            .iter()
+            .chain(fold.iter().map(|(index, _)| index))
+            .map(|&index| self.active[index].id)
+            .collect::<Vec<_>>();
         let mut rows = Vec::with_capacity(participants.len());
         let mut samplers = Vec::with_capacity(participants.len());
         let mut drafts = drafts.into_iter();
@@ -467,32 +536,61 @@ impl BonsaiEngine {
             samplers.push(&mut generation.sampler);
         }
         self.model.take_gpu_time();
-        self.model.decode_batch_prefilling(&mut rows, prefill)?;
+        if let Err(error) = self.model.decode_batch_prefilling(&mut rows, prefill) {
+            let message = error.to_string();
+            failed.extend(
+                written
+                    .into_iter()
+                    .map(|id| (id, crate::Error::Generation(message.clone()))),
+            );
+            return Ok(false);
+        }
         let started = std::time::Instant::now();
         let mut committed = vec![1; rows.len()];
         let mut outcomes = Vec::with_capacity(rows.len());
         for (slot, (row, sampler)) in rows.iter().zip(samplers.iter_mut()).enumerate() {
             let verification = if row.drafts.is_empty() {
-                let start = self.model.batch_row_start(slot)?;
-                crate::sampler::Verification {
-                    samples: vec![self.model.sample_batch_row(start, sampler)?],
-                    accepted: 0,
-                }
+                self.model.batch_row_start(slot).and_then(|start| {
+                    Ok(crate::sampler::Verification {
+                        samples: vec![self.model.sample_batch_row(start, sampler)?],
+                        accepted: 0,
+                    })
+                })
             } else {
-                self.model.verify_batch_row(slot, &row.drafts, sampler)?
+                self.model.verify_batch_row(slot, &row.drafts, sampler)
             };
-            committed[slot] = verification.accepted + 1;
+            // A failed selection keeps only the seed row, so the commit stays
+            // valid for everyone; the sequence then stops.
+            committed[slot] = verification
+                .as_ref()
+                .map_or(1, |verification| verification.accepted + 1);
             outcomes.push((row.drafts.len(), verification));
         }
-        self.model.commit_batch(&mut rows, &committed)?;
+        let commit = self.model.commit_batch(&mut rows, &committed);
+        let verifying = rows
+            .iter()
+            .map(|row| !row.drafts.is_empty())
+            .collect::<Vec<_>>();
         drop(rows);
         drop(samplers);
         let sampling = started.elapsed() / participants.len() as u32;
         let gpu = self.model.take_gpu_time() / participants.len() as u32;
-        for ((&index, (proposed, verification)), head) in
-            participants.iter().zip(outcomes).zip(from_head)
+        let commit_failure = commit.err().map(|error| error.to_string());
+        for (slot, ((&index, (proposed, verification)), head)) in
+            participants.iter().zip(outcomes).zip(from_head).enumerate()
         {
             let generation = &mut self.active[index];
+            if let Some(message) = commit_failure.as_ref().filter(|_| verifying[slot]) {
+                failed.push((generation.id, crate::Error::Generation(message.clone())));
+                continue;
+            }
+            let verification = match verification {
+                Ok(verification) => verification,
+                Err(error) => {
+                    failed.push((generation.id, error));
+                    continue;
+                }
+            };
             let accepted = verification.accepted;
             generation.stats.sampling += sampling;
             generation.stats.gpu += gpu;
@@ -537,6 +635,27 @@ impl BonsaiEngine {
             );
         }
         Ok(true)
+    }
+
+    /// Grow the caches of the active generation at `index`, resident or
+    /// parked, for `rows` more rows before any GPU work of the step reads
+    /// them, so running out fails it alone.
+    fn reserve_for(&mut self, index: usize, rows: usize) -> crate::Result<()> {
+        let generation = &mut self.active[index];
+        #[cfg(test)]
+        if self.fail_reservation == Some(generation.id) {
+            return Err(crate::Error::Generation(
+                "injected K/V reservation failure".into(),
+            ));
+        }
+        let state = if self.resident == Some(generation.id) {
+            None
+        } else {
+            Some(generation.state.as_mut().ok_or_else(|| {
+                crate::Error::InvalidArgument("parked generation has no state".into())
+            })?)
+        };
+        self.model.reserve_sequence(state, rows)
     }
 
     /// `generation`'s n-gram lookup drafts for its next round, solo or
@@ -607,12 +726,15 @@ impl BonsaiEngine {
     /// Head drafts of `depth` for each `(slot, depth)` of `heads`, slots
     /// indexing `participants`: every sequence's chain drafted together, in
     /// one head pass per depth. A sampler with penalties drafts on the host,
-    /// alone, as its solo round would.
+    /// alone, as its solo round would. Sequences whose drafting fails are
+    /// marked `dropped` and go to `failed`.
     fn draft_from_heads(
         &mut self,
         participants: &[usize],
         heads: &[(usize, usize)],
         drafts: &mut [Vec<u32>],
+        dropped: &mut [bool],
+        failed: &mut Vec<(u64, crate::Error)>,
     ) -> crate::Result<()> {
         let (alone, together): (Vec<_>, Vec<_>) = heads.iter().partition(|&&(slot, _)| {
             self.active[participants[slot]]
@@ -630,15 +752,22 @@ impl BonsaiEngine {
             let seed = generation.seed.unwrap_or_default();
             self.model.set_cancel(generation.cancel.clone());
             let started = std::time::Instant::now();
-            let mut tokens = self.model.draft_resident(
+            match self.model.draft_resident(
                 &mut generation.lag,
                 seed,
                 &generation.sampler,
                 remaining.min(depth + 1),
-            )?;
-            tokens.truncate(depth);
+            ) {
+                Ok(mut tokens) => {
+                    tokens.truncate(depth);
+                    drafts[slot] = tokens;
+                }
+                Err(error) => {
+                    failed.push((generation.id, error));
+                    dropped[slot] = true;
+                }
+            }
             generation.stats.mtp.drafting += started.elapsed();
-            drafts[slot] = tokens;
         }
         if together.is_empty() {
             return Ok(());
@@ -672,8 +801,23 @@ impl BonsaiEngine {
                 sampler: &generation.sampler,
             });
         }
-        let chains = self.model.draft_heads(&mut entries)?;
+        let chains = self.model.draft_heads(&mut entries);
         drop(entries);
+        let chains = match chains {
+            Ok(chains) => chains,
+            Err(error) => {
+                // Every drafting head is in an unknown state.
+                let message = error.to_string();
+                for &(slot, _) in &together {
+                    failed.push((
+                        self.active[participants[slot]].id,
+                        crate::Error::Generation(message.clone()),
+                    ));
+                    dropped[slot] = true;
+                }
+                return Ok(());
+            }
+        };
         let share = started.elapsed() / slots.len() as u32;
         for (index, chain) in slots.into_iter().zip(chains) {
             self.active[index].stats.mtp.drafting += share;

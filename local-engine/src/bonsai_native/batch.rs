@@ -416,6 +416,24 @@ impl BonsaiModel {
         Ok(())
     }
 
+    /// Grow a batched sequence's caches (`state`, `None` for the resident
+    /// sequence) for `rows` more rows, as [`Self::decode_batch_prefilling`]
+    /// would, so a caller can do it before any GPU work and fail only that
+    /// sequence when it cannot.
+    pub(crate) fn reserve_sequence(
+        &mut self,
+        state: Option<&mut SequenceState>,
+        rows: usize,
+    ) -> crate::Result<()> {
+        match state {
+            Some(state) => {
+                let end = state.position + rows;
+                self.reserve_parked(state, end)
+            }
+            None => self.reserve_kv(self.position + rows, None),
+        }
+    }
+
     /// [`Self::decode_batch_prefilling`] without a prompt chunk.
     #[cfg(test)]
     pub(crate) fn decode_batch(&mut self, rows: &mut [BatchRow<'_>]) -> crate::Result<()> {

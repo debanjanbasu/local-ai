@@ -194,6 +194,10 @@ pub struct BonsaiEngine {
     /// model says, so tests exercise batched speculation.
     #[cfg(test)]
     force_batched_drafts: bool,
+    /// Fail the K/V reservation of this generation's next batched step, so
+    /// tests exercise a failure that belongs to one sequence.
+    #[cfg(test)]
+    fail_reservation: Option<u64>,
 }
 
 impl BonsaiEngine {

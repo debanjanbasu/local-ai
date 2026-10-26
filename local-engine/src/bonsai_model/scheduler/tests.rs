@@ -208,6 +208,40 @@ fn cancelling_one_sequence_leaves_the_batch_exact() {
     assert_same("after batch", &again.token_ids, &reference[0]);
 }
 
+/// A failure that belongs to one batched sequence (its K/V reservation)
+/// fails that sequence alone; the others finish exactly as they would have.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn a_failure_of_one_sequence_leaves_the_batch_exact() {
+    let max_tokens = 32;
+    let mut engine = open(&MtpMode::Off(None));
+    let reference = alone(&mut engine, max_tokens);
+    let ids = (0..PROMPTS.len())
+        .map(|index| admit(&mut engine, index, max_tokens, CancelToken::new()))
+        .collect::<Vec<_>>();
+    let mut outcomes = HashMap::new();
+    let mut steps = 0;
+    while engine.active_generations() > 0 {
+        for (id, result) in engine.step(&mut |_, _, _| true, &mut |_, _| {}) {
+            outcomes.insert(id, result);
+        }
+        steps += 1;
+        if steps == 5 {
+            engine.fail_reservation = Some(ids[1]);
+        }
+    }
+    assert!(outcomes[&ids[1]].is_err(), "the failing sequence failed");
+    for index in [0, 2] {
+        let output = outcomes[&ids[index]].as_ref().expect("generation");
+        assert!(output.stats.batched_tokens > 0, "prompt {index} batched");
+        assert_same(
+            &format!("prompt {index}"),
+            &output.token_ids,
+            &reference[index],
+        );
+    }
+}
+
 /// A huge `max_tokens` beside a running generation neither overflows the
 /// reservation sum (a panic in debug, a wrapped yes in release) nor fits.
 #[test]

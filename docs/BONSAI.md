@@ -1654,7 +1654,12 @@ recurrent layers and the K/V append and attention of the 16 full-attention
 layers. Each request owns its recurrent state, convolution history, K/V caches,
 position and MTP-head caches; one set is resident in the model and the others
 are parked, and a swap exchanges buffer handles, never bytes. Requests join
-between steps and leave when they finish or are cancelled.
+between steps and leave when they finish or are cancelled. A failure that
+belongs to one request ends that request alone: every sequence's caches grow
+for its rows before the step's GPU work, so running out of memory fails that
+sequence; a sequence whose drafting or selection fails leaves the pass or
+commits only its seed row; a failed batched pass ends only the requests whose
+state it wrote, and a request still waiting to prefill keeps its place.
 
 A request alone runs exactly the single-sequence rounds it always ran, with
 speculation; its text and speed are unchanged. Taking speculative rounds in

@@ -120,6 +120,8 @@ impl BonsaiEngine {
             next_generation: 0,
             #[cfg(test)]
             force_batched_drafts: false,
+            #[cfg(test)]
+            fail_reservation: None,
         })
     }
 }
