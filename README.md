@@ -140,7 +140,9 @@ Admin keys (`sk-admin-...`) authorize only the OpenAI Administration API
 (`/v1/organization/*`: admin keys, projects, service accounts and their
 project keys, audit logs, usage aggregated from records the server writes,
 and costs, always empty because nothing is billed); project keys
-(`sk-proj-...`) authorize everything else and attribute usage. Keys are
+(`sk-proj-...`) authorize everything else, attribute usage, and see only the
+responses, conversations, files, uploads, vector stores and batches their
+own project created ([docs/ADMIN.md](docs/ADMIN.md#limits)). Keys are
 stored only as salted HMAC-SHA-256 tags in the services store. Users,
 invites, rate limits, certificates, roles and spend controls are refused or
 minimal; see [docs/ADMIN.md](docs/ADMIN.md).
