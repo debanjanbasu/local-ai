@@ -242,6 +242,18 @@ struct Generation {
     cancel: CancelHandle,
 }
 
+/// Cancels a submission still running on the blocking pool when the request
+/// handler waiting for it is dropped; emptied once the submission returns.
+struct Submitting(Option<CancelHandle>);
+
+impl Drop for Submitting {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel.cancel();
+        }
+    }
+}
+
 impl Drop for Generation {
     fn drop(&mut self) {
         self.cancel.cancel();
@@ -573,13 +585,21 @@ async fn dispatch(
         Ok(compaction::finished(stats).await)
     } else {
         let engine = state.engine.clone();
-        tokio::task::spawn_blocking(move || engine.chat(request))
+        // Submission also decodes and encodes the request's images, which can
+        // take seconds; a client that leaves meanwhile drops this handler, and
+        // the guard stops that work at its next video sample or GPU submission.
+        let cancel = CancelHandle::new();
+        let mut submitting = Submitting(Some(cancel.clone()));
+        let events = tokio::task::spawn_blocking(move || engine.chat_with_cancel(request, &cancel))
             .await
             .unwrap_or_else(|error| {
                 Err(crate::Error::Generation(format!(
                     "request submission failed: {error}"
                 )))
-            })
+            });
+        // From here the stream's own guards own cancellation.
+        submitting.0 = None;
+        events
     };
     let events = match events {
         Ok(events) => admin::meter(
