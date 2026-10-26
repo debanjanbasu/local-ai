@@ -19,6 +19,20 @@ pub(super) const fn decay_projection(weights: &BonsaiMetalTensor) -> Bf16Matrix<
     }
 }
 
+/// Where a recurrent layer's pass leaves its final state and history.
+#[derive(Clone, Copy)]
+pub(super) enum RecurrentTarget<'a> {
+    /// Over the layer's own state.
+    InPlace,
+    /// Into a verify block's rollback buffers, with every row's inputs.
+    Verify(&'a RollbackLayer),
+    /// Into these buffers, leaving the layer's own untouched.
+    Into {
+        state: &'a MetalBuffer,
+        history: &'a MetalBuffer,
+    },
+}
+
 /// Where [`BonsaiModel::recurrent_inputs`] leaves what the recurrence and a
 /// later replay read.
 #[derive(Clone, Copy)]
@@ -181,27 +195,32 @@ impl BonsaiModel {
         batch: &mut CommandBatch,
         layer: &RecurrentLayer,
         tokens: u32,
-        rollback: Option<&RollbackLayer>,
+        target: RecurrentTarget<'_>,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
-        let (inputs, decay, beta, final_state, final_history) = rollback.map_or(
-            (
+        let (inputs, decay, beta, final_state, final_history) = match target {
+            RecurrentTarget::InPlace => (
                 &scratch.query_gate,
                 &scratch.decay,
                 &scratch.beta,
                 &layer.state,
                 &layer.history,
             ),
-            |rollback| {
-                (
-                    &rollback.inputs,
-                    &rollback.decay,
-                    &rollback.beta,
-                    &rollback.state,
-                    &rollback.history,
-                )
-            },
-        );
+            RecurrentTarget::Verify(rollback) => (
+                &rollback.inputs,
+                &rollback.decay,
+                &rollback.beta,
+                &rollback.state,
+                &rollback.history,
+            ),
+            RecurrentTarget::Into { state, history } => (
+                &scratch.query_gate,
+                &scratch.decay,
+                &scratch.beta,
+                state,
+                history,
+            ),
+        };
         self.recurrent_inputs(
             batch,
             layer,

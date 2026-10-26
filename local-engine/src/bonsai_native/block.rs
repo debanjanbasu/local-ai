@@ -1,3 +1,4 @@
+use super::layers::RecurrentTarget;
 use super::{
     AttentionLayer, BlockOutput, BonsaiModel, BufferCopyRequest, CommandBatch, Described,
     HadamardDirection, Rope, Selection, Speculation, VOCAB, WIDTH, decode_embeddings,
@@ -155,9 +156,11 @@ impl BonsaiModel {
             }
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
-                    let rollback = verify.map(|verifier| &verifier.rollback[recurrent_index]);
+                    let target = verify.map_or(RecurrentTarget::InPlace, |verifier| {
+                        RecurrentTarget::Verify(&verifier.rollback[recurrent_index])
+                    });
                     recurrent_index += 1;
-                    self.recurrent(&mut batch, recurrent, count, rollback)?;
+                    self.recurrent(&mut batch, recurrent, count, target)?;
                 }
                 AttentionLayer::Full(full) => {
                     self.full_attention(&mut batch, full, count, rope)?;

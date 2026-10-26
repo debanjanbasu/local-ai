@@ -41,6 +41,7 @@ mod block;
 pub mod capture;
 mod checkpoint;
 mod layers;
+mod pipeline;
 mod speculation;
 
 pub use self::batch::{
@@ -772,6 +773,8 @@ pub struct BonsaiModel {
     batch: Option<batch::BatchScratch>,
     /// Images of the resident sequence's prompt (see [`SequenceState`]).
     images: Option<Arc<PromptImages>>,
+    /// Pipelined plain decode's buffers and pass in flight, made on first use.
+    pipeline: Option<pipeline::Pipeline>,
 }
 
 impl BonsaiModel {
@@ -950,6 +953,7 @@ impl BonsaiModel {
             state_id: 0,
             batch: None,
             images: None,
+            pipeline: None,
             context,
             package,
         })

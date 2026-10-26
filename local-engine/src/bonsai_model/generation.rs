@@ -564,10 +564,24 @@ impl BonsaiEngine {
             .set_device_top_k(generation.sampler.device_top_k());
         self.model.set_logprobs(generation.sampler.logprobs());
         let head = self.model.speculation().is_some() && generation.lag.usable();
+        let drafts = Self::lookup_draft(self.ngram, self.info.context, generation);
+        // A lone greedy plain decode leaves its next pass in flight (see
+        // `BonsaiModel::decode_pipelined`); anything else waits for it first.
+        let pipelined = !head
+            && drafts.is_empty()
+            && self.active.is_empty()
+            && self.model.pipelines_decode()
+            && generation.sampler.selects_argmax()
+            && generation.sampler.logprobs().is_none()
+            && !generation.sampler.is_constrained();
+        #[cfg(test)]
+        let pipelined = pipelined && !self.unpipelined_decode;
+        if !pipelined {
+            self.model.settle_decode()?;
+        }
         if head && !generation.lag.is_empty() {
             self.model.catch_up_head(&mut generation.lag)?;
         }
-        let drafts = Self::lookup_draft(self.ngram, self.info.context, generation);
         let stats = &mut generation.stats;
         let remaining = generation.params.max_tokens - stats.sampled_tokens;
         let pending = &mut generation.pending;
@@ -592,6 +606,12 @@ impl BonsaiEngine {
             stats.sampling += batch.sampling;
             accumulate_mtp(&mut stats.mtp, &batch.stats);
             pending.extend(batch.samples);
+        } else if pipelined {
+            let last = remaining <= 1;
+            pending.push_back(
+                self.model
+                    .decode_pipelined(seed, &mut generation.sampler, last)?,
+            );
         } else {
             self.model.decode(seed)?;
         }
