@@ -917,3 +917,44 @@ fn a_request_that_can_never_fit_fails_without_waiting_for_the_engine() {
     }
     first.cancel_handle().cancel();
 }
+
+/// A finished request whose reader stopped reading does not keep the idle
+/// worker from taking the next job: its last events wait for room while
+/// later requests run.
+#[test]
+#[ignore = "requires the pinned model and the GPU"]
+fn an_unread_finished_request_does_not_hold_up_the_next_one() {
+    let handle = Engine::open().expect("open engine").into_handle();
+    let request = |max_tokens| {
+        let mut request = long_prompt(0, max_tokens);
+        request.messages = vec![message(
+            "user",
+            "Write every number from 1 to 3000, one per line.",
+        )];
+        request.sampling.0.temperature = 0.0;
+        request
+    };
+    // More events than its channel holds, never read: once it finishes beside
+    // the second request, its last events are left undelivered.
+    let unread = handle
+        .chat(request(4 * crate::runtime::EVENT_BUFFER))
+        .expect("queue");
+    let second = handle
+        .chat(request(8 * crate::runtime::EVENT_BUFFER))
+        .expect("queue");
+    let mut finished = false;
+    for event in second {
+        match event {
+            Event::Finished(_) => finished = true,
+            Event::Error(error) => panic!("the second request failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(finished, "the second request finished");
+    let mut third = handle.chat(request(4)).expect("queue");
+    match third.next_timeout(Duration::from_secs(60)) {
+        Ok(Some(Event::Content(_))) => {}
+        other => panic!("the next request did not start: {other:?}"),
+    }
+    drop(unread);
+}

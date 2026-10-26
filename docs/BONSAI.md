@@ -855,7 +855,10 @@ worker blocks inside its emit callback upstream of every cancellation
 checkpoint, and the generation holds its queue slot indefinitely. (Beside other
 requests the worker no longer waits on a slow reader at all: events queue per
 request and reach the channel without blocking, so only the stalled request
-is held.) When the budget is exceeded the server logs, cancels
+is held. A finished request's undelivered last events never hold up the
+next job either: the idle worker waits for the next job and for room in
+those channels together, so a stalled reader's leftovers wait for its stall
+timer while later requests run.) When the budget is exceeded the server logs, cancels
 that generation, releases the queue slot, and drops the request, leaving the
 engine free for the next client. The default is 30 seconds; a value outside
 10 to 3600 inclusive, or one that is not a whole number of seconds, is refused
@@ -864,7 +867,8 @@ at startup.
 Both HTTP body pumps share an event-driven backpressure wait. A full channel
 parks the pump thread until capacity becomes available, the receiver closes,
 or the single stall deadline expires. It does not retry every few milliseconds.
-The engine's worker likewise blocks on its request channel when idle; its
+The engine's worker likewise blocks on its request channel when idle (and on
+room in finished requests' channels while they hold events); its
 nonblocking admission checks between GPU steps are active scheduling, not
 idle polling.
 
