@@ -315,8 +315,16 @@ impl KvLayout {
 /// `bo_attn_split_tensor_*` and `bo_attn_tensor_*` instantiations.
 const QUANTIZED_TENSOR_LAYOUTS: [KvLayout; 1] = [KvLayout::Q8];
 
+/// Dynamic threadgroup memory of the quantized tensor attention kernels: their
+/// 32-token half K/V tile (`tile [[threadgroup(0)]]` in the shader). Metal's
+/// shader validation counts static threadgroup memory twice against the
+/// 32 KiB limit, so these kernels (16 KiB of tile plus their softmax state)
+/// aborted under `MTL_SHADER_VALIDATION=1` while the tile was static.
+const Q8_TILE_BYTES: usize = 32 * 256 * 2;
+
 pub struct BonsaiOps {
-    p: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Pipelines with the dynamic threadgroup bytes each takes at index 0.
+    p: Vec<(Retained<ProtocolObject<dyn MTLComputePipelineState>>, usize)>,
     attention_kernel: AttentionKernel,
     /// Quantized layout -> index in `p` of its tensor decode-split pipeline;
     /// its causal prefill pipeline follows at the next index.
@@ -343,6 +351,7 @@ impl BonsaiOps {
 
     /// Select an exact implementation for numerical/performance comparisons.
     /// Unlike automatic selection, an unavailable explicit kernel is an error.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_attention_kernel(
         context: &MetalContext,
         shaders: &ShaderLibrary,
@@ -421,10 +430,11 @@ impl BonsaiOps {
             &[]
         };
         let mut p = Vec::with_capacity(names.len() + quantized_names.len() + row_names.len());
-        for name in names
+        for (index, name) in names
             .into_iter()
             .chain(quantized_names.iter().map(String::as_str))
             .chain(row_names.iter().copied())
+            .enumerate()
         {
             let f = shaders.get_function(name)?;
             let pipeline = context
@@ -443,7 +453,9 @@ impl BonsaiOps {
                     "Bonsai pipeline cannot support the required SIMD/threadgroup size",
                 ));
             }
-            p.push(pipeline);
+            // Every quantized and row kernel but the gather takes the tile.
+            let tiled = index >= names.len() && name != "bo_attn_gather_rows";
+            p.push((pipeline, if tiled { Q8_TILE_BYTES } else { 0 }));
         }
         let quantized_tensor = quantized
             .iter()
@@ -503,8 +515,12 @@ impl BonsaiOps {
         threads: usize,
     ) {
         let e = b.encoder();
-        e.setComputePipelineState(&self.p[pi]);
+        let (pipeline, threadgroup_bytes) = &self.p[pi];
+        e.setComputePipelineState(pipeline);
         unsafe {
+            if *threadgroup_bytes > 0 {
+                e.setThreadgroupMemoryLength_atIndex(*threadgroup_bytes, 0);
+            }
             for (i, (v, o)) in bufs.iter().enumerate() {
                 e.setBuffer_offset_atIndex(Some(v.raw()), *o, i);
             }

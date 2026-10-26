@@ -3698,6 +3698,35 @@ them serially:
 cargo test --workspace --release -- --ignored --test-threads 1
 ```
 
+Metal's API validation (`MTL_DEBUG_LAYER=1`) passes every `local-metal`
+test, ignored ones included, and a real-model generation (a 2,755-token
+prompt, then 48 greedy tokens with MTP and suffix-lookup speculation) without
+an error. Its shader validation (`MTL_SHADER_VALIDATION=1`) counts a kernel's
+static threadgroup memory twice against the 32 KiB limit, so a kernel
+declaring more than 16 KiB statically aborts at its first dispatch (`total
+used threadgroupMemoryLength(33280) must be <= 32768` for 16,640 bytes);
+dynamic threadgroup memory set with `setThreadgroupMemoryLength` counts once.
+Nine kernels declared more: the Q8 tensor attention kernels (decode split,
+prefill, two- to four-row splits and packed prefill rows, 17.1-19.3 KiB),
+the SIMD prefill tile `bonsai_ptq1_matmul_bytewise_32` (16.25 KiB) and the
+two vision attention kernels (19.9 and 22.6 KiB). Each now takes its largest
+tile as dynamic threadgroup memory and is otherwise unchanged: outputs are
+bitwise those of the static build in all twelve benchmarked cases (Q8 decode
+at 1K-16K, two- to four-row blocks, 128- and 512-row prefill blocks, the
+prefill tile, both vision kernels), greedy generation after the 2,755-token
+prompt is token-identical, and GPU time is the same or lower in every case
+(M4 Pro, median of nine trials, two interleaved rounds: Q8 decode at 16K
+224-232 to 215-223 µs, the four-row split at 2K 89-90 to 84 µs, the 128-row
+prefill block at 512 529 to 501-503 µs; the prefill tile and both vision
+kernels within 1%).
+Keep new kernels at or under 16 KiB of static threadgroup memory. With the
+fix, every `local-metal` test passes under shader validation except
+`fused_residual_and_gdn_output_chains_match_separate_dispatches_bitwise`:
+the instrumented recompile changes the fused GDN-output kernel's
+floating-point code generation, leaving it within 9e-8 (largest value 0.63)
+of the separate dispatches instead of bitwise; it also fails on the build
+before the fix, and uninstrumented builds stay bitwise.
+
 The engine targets text inference on Apple Silicon. Model quality relative to
 the unquantized checkpoint and broad application benchmarks are outside these
 runtime measurements.

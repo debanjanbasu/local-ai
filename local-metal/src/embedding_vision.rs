@@ -25,6 +25,11 @@ type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
 /// Head dimension of [`VisionKernels::attention`].
 pub const VISION_HEAD_DIM: u32 = 64;
+/// Dynamic threadgroup memory of `egv_attention_64`, its `ks` tile of
+/// `EGV_BK` (32) rows of `EGV_LD` (68) floats: Metal's shader validation
+/// counts static threadgroup memory twice against the 32 KiB limit, so the
+/// kernel aborted under `MTL_SHADER_VALIDATION=1` with the tile static.
+const ATTENTION_KS_BYTES: usize = 32 * 68 * 4;
 /// Patches averaged into one pooled token (3 x 3).
 pub const POOL_MEMBERS: usize = 9;
 
@@ -209,7 +214,7 @@ impl VisionKernels {
 
     /// Bidirectional attention among tokens `[first, first + count)` only;
     /// `q`, `k`, `v` and `out` are `[tokens, heads, 64]` F32 rows.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, unsafe_code)]
     pub fn attention(
         &self,
         batch: &mut CommandBatch,
@@ -241,6 +246,8 @@ impl VisionKernels {
         set(encoder, &first, 4);
         set(encoder, &count, 5);
         set(encoder, &heads, 6);
+        // SAFETY: index 0 is the kernel's only threadgroup argument.
+        unsafe { encoder.setThreadgroupMemoryLength_atIndex(ATTENTION_KS_BYTES, 0) };
         grid(
             encoder,
             ((count as usize).div_ceil(32), heads as usize),

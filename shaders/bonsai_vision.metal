@@ -255,10 +255,16 @@ kernel void bv_attention(
     device const float *qkv [[buffer(0)]], device float *out [[buffer(1)]],
     constant uint &count [[buffer(2)]], constant float &scale [[buffer(3)]],
     constant uint &first_query [[buffer(4)]],
+    threadgroup float *ks_memory [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 ) {
-    threadgroup float ks[BV_KS_ROWS][BV_LD];  // Q staging, then K^T [72][BV_KLD], then O
+    // ks is dynamic threadgroup memory (ATTENTION_KS_BYTES in bonsai_vision.rs):
+    // Metal's shader validation counts static threadgroup memory twice against
+    // the 32 KiB limit, and both tiles static (19.9 KiB) aborted under
+    // MTL_SHADER_VALIDATION=1.
+    // Q staging, then K^T [72][BV_KLD], then O.
+    threadgroup float (*ks)[BV_LD] = (threadgroup float (*)[BV_LD]) ks_memory;
     threadgroup float vs[BV_BK][BV_LD];
     threadgroup float (*kt_tile)[BV_KLD] = (threadgroup float (*)[BV_KLD]) &ks[0][0];
 
