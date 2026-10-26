@@ -259,6 +259,67 @@ fn a_live_subscriber_follows_and_one_that_leaves_does_not_cancel() {
 }
 
 #[test]
+fn parked_subscribers_hold_no_blocking_thread() {
+    const SUBSCRIBERS: usize = 8;
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let background = Arc::new(Background::default());
+    let depth = QueueDepth::default();
+    let (id, pump, stopped) = admit(&background, &store, &depth, |_| finished_steps());
+    // One blocking thread, as if every other were taken: a subscriber parked
+    // on its queued job must not need it, or nothing else (authentication,
+    // /health) can run.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    let slots = Arc::new(tokio::sync::Semaphore::new(SUBSCRIBERS));
+    let receivers = runtime.block_on(async {
+        let mut receivers = Vec::new();
+        for _ in 0..SUBSCRIBERS {
+            let mut receiver = super::resume::start(
+                open(&background, &store, &id, None),
+                STALL,
+                Arc::clone(&slots).try_acquire_owned().expect("slot"),
+            );
+            // Each has read what the queued job published and is parked.
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .expect("a subscriber runs beside the parked ones")
+                    .expect("frame")
+                    .expect("bytes");
+            }
+            receivers.push(receiver);
+        }
+        let answered =
+            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| 7)).await;
+        assert_eq!(
+            answered.expect("the blocking pool is free").expect("task"),
+            7
+        );
+        receivers
+    });
+    // A client leaving gives its place back.
+    drop(receivers);
+    runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            slots.acquire_many(SUBSCRIBERS as u32),
+        )
+        .await
+        .expect("every place released")
+        .expect("permits")
+        .forget();
+    });
+    pump.run();
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert_eq!(status(&store, &id), "completed");
+    assert_eq!(depth.load(), 0);
+}
+
+#[test]
 fn a_stalled_subscriber_is_dropped_without_blocking_generation() {
     let scratch = Scratch::new();
     let store = scratch.open();

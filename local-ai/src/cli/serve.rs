@@ -121,6 +121,8 @@ struct AppState {
     cipher: Option<Arc<ReasoningCipher>>,
     /// Background Responses running on this server.
     background: Arc<Background>,
+    /// Places for background-response streams ([`resume::MAX_SUBSCRIBERS`]).
+    subscribers: Arc<tokio::sync::Semaphore>,
     /// Where background `store: false` Responses are kept briefly; `None`
     /// when no private temporary store could be created.
     temporary: Option<Arc<Temporary>>,
@@ -241,7 +243,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 }
 
 /// Serve an admitted request.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 async fn dispatch(
     state: AppState,
     parts: axum::http::request::Parts,
@@ -478,6 +480,15 @@ async fn dispatch(
         )
         .await;
     }
+    // A streamed background request takes its stream's place before any
+    // engine work, so a full house refuses it rather than starting a job
+    // whose stream it then refuses. (The place is held until the stream
+    // starts, which is what the lint cannot see.)
+    let slot =
+        match (background && stream).then(|| Arc::clone(&state.subscribers).try_acquire_owned()) {
+            Some(Err(_)) => return subscribers_full(&state, &parts.headers).await,
+            slot => slot.and_then(Result::ok),
+        };
     let responses = matches!(&reply.protocol, Protocol::Responses(_));
     // Submission compiles a structured response format synchronously before
     // queueing (about half a second the first time, building the tokenizer's
@@ -534,8 +545,8 @@ async fn dispatch(
             .await;
         }
     };
-    let admitted = state.depth.admit();
     if background {
+        let admitted = state.depth.admit();
         // Not waiting for the first event: a pre-generation failure becomes a
         // `failed` status on the stored response, not this request's status.
         let started = background::start(
@@ -546,19 +557,22 @@ async fn dispatch(
             stream,
         )
         .await;
-        return match started {
-            Ok(queued) if stream => {
+        return match (started, slot) {
+            (Ok(queued), Some(slot)) => {
                 // The client follows the journal from its first event; going
                 // away only ends this stream, never the job.
                 let id = queued["id"].as_str().unwrap_or_default().to_owned();
-                stream_events(&state, id, None, &parts.headers).await
+                stream_events(&state, id, None, slot, &parts.headers).await
             }
-            Ok(queued) => json_response(StatusCode::OK, queued, &state, &parts.headers).await,
-            Err((status, message)) => {
+            (Ok(queued), None) => {
+                json_response(StatusCode::OK, queued, &state, &parts.headers).await
+            }
+            (Err((status, message)), _) => {
                 error_response(status, &message, &state, &parts.headers).await
             }
         };
     }
+    let admitted = state.depth.admit();
     if stream {
         match start_stream(events, reply, admitted, state.stall).await {
             Ok(events) => event_stream(events, &state),
@@ -670,12 +684,13 @@ fn event_stream(
     response
 }
 
-/// Stream background response `id`'s events after `after`, or answer with
-/// the status that refuses it before any stream starts.
+/// Stream background response `id`'s events after `after` in `slot`, or
+/// answer with the status that refuses it before any stream starts.
 async fn stream_events(
     state: &AppState,
     id: String,
     after: Option<u64>,
+    slot: tokio::sync::OwnedSemaphorePermit,
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let not_found = format!("response with id {id:?} not found");
@@ -708,10 +723,27 @@ async fn stream_events(
         ))
     });
     match subscribed {
-        Ok(Some(subscription)) => event_stream(resume::start(subscription, state.stall), state),
+        Ok(Some(subscription)) => {
+            event_stream(resume::start(subscription, state.stall, slot), state)
+        }
         Ok(None) => error_response(StatusCode::NOT_FOUND, &not_found, state, headers).await,
         Err((status, message)) => error_response(status, &message, state, headers).await,
     }
+}
+
+/// The `503` refusing a background-response stream past
+/// [`resume::MAX_SUBSCRIBERS`].
+async fn subscribers_full(state: &AppState, headers: &axum::http::HeaderMap) -> Response {
+    let message = format!(
+        "{} background response streams are already open; retry after 1s with your own backoff",
+        resume::MAX_SUBSCRIBERS
+    );
+    let mut response =
+        error_response(StatusCode::SERVICE_UNAVAILABLE, &message, state, headers).await;
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+    response
 }
 
 #[derive(Clone, Copy)]
@@ -812,7 +844,10 @@ async fn stored_response(
     }
     let outcome = match stored_request(method, items, query) {
         Ok(Retrieval::Stream(after)) => {
-            return stream_events(state, id.to_owned(), after, headers).await;
+            let Ok(slot) = state.subscribers.clone().try_acquire_owned() else {
+                return subscribers_full(state, headers).await;
+            };
+            return stream_events(state, id.to_owned(), after, slot, headers).await;
         }
         Ok(retrieval) => {
             let page = retrieval.into_page();
@@ -1236,6 +1271,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         responses,
         cipher,
         background: Arc::default(),
+        subscribers: Arc::new(tokio::sync::Semaphore::new(resume::MAX_SUBSCRIBERS)),
         temporary: temporary.clone(),
         decisions: decisions.clone(),
         services: Some(services),
