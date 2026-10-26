@@ -2058,7 +2058,10 @@ prompt, M4 Pro; the shared index costs 0.2 ms for the prompt (1.2 ms the
 first time it indexes the remembered requests) and, from the structures'
 sizes, about 28 bytes per anchor against about 160. 72,000 lookups over
 random token streams with repeats (anchors of 1, 3 and 12) drafted exactly
-what the rebuilt map drafted.
+what the rebuilt map drafted, and on a real edit (rename a field in 35 quoted
+lines of this repository's Rust, 265 greedy tokens) both builds ran 18 lookup
+rounds proposing 218 drafts and accepting 147 (67.4%), with identical text,
+at 57.06 and 57.31 tok/s best of two (lookup 0.28 and 0.23 µs per token).
 When the optional head is installed, it drafts up to three tokens. A gate
 avoids head work where measured acceptance does not repay its cost.
 
@@ -3477,6 +3480,23 @@ their own entry, not with current rates.
   prompt on an M2, so a budget below that abandons healthy non-streaming
   requests. The floor is 10 rather than a rounder number because it sits an
   order of magnitude above the worst gap actually observed.
+- Pipelining greedy plain decode (October 2026): encoding and committing
+  token N+1 before waiting on token N, with the argmax left on the device
+  and `draft_embed_inverse` gathering the next embedding row from it. Not
+  built: the most it can recover is the GPU's idle time between tokens,
+  0.32 ms of a 31.17 ms token in the per-token profile above (1.0%), and it
+  is not free. Plain decode updates recurrent state in place, so the token
+  run past an end of sequence cannot be discarded without a 151 MB state
+  copy per token or a verify-style rollback; left in place, the sequence
+  holds one token more than the request, and the request's closing prompt
+  checkpoint, which needs the state at exactly its tokens, is lost (the GPU
+  tier is cleared). The extra token also costs a whole decode step at the end
+  of every request (0.3% of a 300-token answer), and the scheduler, which
+  admits requests and swaps sequences between steps, would have to drain the
+  token in flight first. A gain under 1% sits inside the 4% spread of
+  `tools/benchmark.py` runs, against a lost prompt checkpoint per request,
+  so it was rejected without a prototype. It would apply only to
+  `--no-speculation` and to models without the MTP head.
 
 ## Verification
 
