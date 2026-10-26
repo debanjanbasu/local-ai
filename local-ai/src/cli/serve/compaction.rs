@@ -29,7 +29,7 @@ use super::responses::{
     Generate, History, PreparedResponses, Summarizer, compaction_resource, prepare_compact,
     prepare_responses_conversing,
 };
-use super::{AppState, MAX_REQUEST_BYTES, services};
+use super::{AppState, MAX_REQUEST_BYTES};
 
 /// The route this module answers.
 pub(super) const ROUTE: &str = "/v1/responses/compact";
@@ -139,23 +139,28 @@ async fn shrinks(
 
 /// Prepare a `POST /v1/responses` body for generation: parse and resolve it,
 /// compact it first when `context_management` says it is due, and attach the
-/// summarizer `reasoning.summary` needs.
+/// summarizer `reasoning.summary` needs. The caller acts for `project`
+/// (see [`prepare_responses_conversing`]).
 pub(super) async fn prepare_responses(
     state: &AppState,
     body: Vec<u8>,
-    meter: &Meter,
+    (meter, project): (&Meter, Option<&str>),
 ) -> crate::Result<(bool, local_engine::ChatRequest, Protocol)> {
     let (thinking, store) = (state.thinking, state.responses.clone());
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
     let temporary = state.temporary.clone();
-    let services = state.services.clone();
+    let services = state
+        .services
+        .as_ref()
+        .map(|services| services.store().scoped(project));
+    let project = project.map(str::to_owned);
     let mut prepared = tokio::task::spawn_blocking(move || {
         prepare_responses_conversing(
             &body,
             thinking,
             store.as_ref(),
             temporary.as_ref(),
-            services.as_deref().map(services::Services::store),
+            (services.as_ref(), project.as_deref()),
             cipher.as_ref(),
             &model,
         )
@@ -296,12 +301,12 @@ pub(super) async fn finished(stats: Stats) -> EventStream {
     events
 }
 
-/// `POST /v1/responses/compact`.
+/// `POST /v1/responses/compact`, for a caller acting for `project`.
 pub(super) async fn handle(
     state: &AppState,
     headers: &HeaderMap,
     body: Body,
-    meter: &Meter,
+    (meter, project): (&Meter, Option<&str>),
 ) -> Response {
     let body = match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
         Ok(value) => value.to_bytes().to_vec(),
@@ -315,7 +320,7 @@ pub(super) async fn handle(
             return error_response(status, &message, state, headers).await;
         }
     };
-    match compact(state, body, meter).await {
+    match compact(state, body, meter, project).await {
         Ok(resource) => json_response(StatusCode::OK, resource, state, headers).await,
         Err(error) => {
             error_response(error_status(&error), &error.to_string(), state, headers).await
@@ -327,11 +332,19 @@ async fn compact(
     state: &AppState,
     body: Vec<u8>,
     meter: &Meter,
+    project: Option<&str>,
 ) -> crate::Result<serde_json::Value> {
     let (store, cipher) = (state.responses.clone(), state.cipher.clone());
     let (engine, model) = (state.engine.clone(), Arc::clone(&state.model));
+    let project = project.map(str::to_owned);
     let (prepared, pass, template, tokens) = tokio::task::spawn_blocking(move || {
-        let prepared = prepare_compact(&body, store.as_ref(), cipher.as_ref(), &model)?;
+        let prepared = prepare_compact(
+            &body,
+            store.as_ref(),
+            project.as_deref(),
+            cipher.as_ref(),
+            &model,
+        )?;
         // The window as a tool-free conversation without reasoning: this
         // endpoint takes neither.
         let template = ChatRequest {

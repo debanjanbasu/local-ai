@@ -300,10 +300,12 @@ pub(in crate::cli::serve) struct PreparedCompact {
 }
 
 /// Parse a `POST /v1/responses/compact` body, resolving
-/// `previous_response_id` against `store`. Blocks on the store.
+/// `previous_response_id` against `store` among the Responses `project` may
+/// see. Blocks on the store.
 pub(in crate::cli::serve) fn prepare_compact(
     body: &[u8],
     store: Option<&Arc<ResponseStore>>,
+    project: Option<&str>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedCompact> {
@@ -325,7 +327,7 @@ pub(in crate::cli::serve) fn prepare_compact(
     }
     service_tier(request.service_tier.as_deref())?;
     let mut items = match (&request.previous_response_id, store) {
-        (Some(id), Some(store)) => previous_history(store, id)?,
+        (Some(id), Some(store)) => previous_history(store, id, project)?,
         (Some(_), None) => {
             return Err(unsupported(
                 "previous_response_id",

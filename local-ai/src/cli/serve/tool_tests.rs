@@ -859,12 +859,12 @@ async fn file_search_runs_without_permissions_and_answers_with_citations() {
     let error = check(&none, prepared.echo.kinds(), None).expect_err("no vector stores");
     assert!(error.contains("file_search is unavailable"), "{error}");
     let error = service
-        .check_searchable(vec![store_id.clone(), "vs_missing".into()])
+        .check_searchable(vec![store_id.clone(), "vs_missing".into()], None)
         .await
         .expect_err("unknown store");
     assert!(error.contains("vs_missing"), "{error}");
     service
-        .check_searchable(vec![store_id.clone()])
+        .check_searchable(vec![store_id.clone()], None)
         .await
         .expect("searchable");
 

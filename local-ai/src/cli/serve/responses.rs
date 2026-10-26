@@ -98,7 +98,7 @@ mod state;
 pub(super) use self::history::{History, compaction_resource, prepare_compact};
 pub(super) use self::parse::{
     Echo, Generate, PreparedResponses, Summarizer, prepare_input_tokens_conversing,
-    prepare_responses_conversing, prepare_resumed,
+    prepare_responses_conversing, prepare_resumed, visible,
 };
 #[cfg(test)]
 pub(super) use self::parse::{

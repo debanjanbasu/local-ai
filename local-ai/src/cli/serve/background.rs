@@ -816,7 +816,12 @@ impl Background {
             // yet, so cancelling it is only its status.
             stored.response["status"] = json!("cancelled");
             store
-                .save(&stored.response, &stored.input_items)
+                .save_with(
+                    &stored.response,
+                    &stored.input_items,
+                    None,
+                    stored.project.as_deref(),
+                )
                 .map_err(|error| store_failure(&error))?;
             if let Err(error) = store.seal_journal(id, &stored.response) {
                 // Readers derive the same end from the record.

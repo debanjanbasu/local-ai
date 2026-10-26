@@ -123,8 +123,14 @@ pub(super) fn matches(path: &str) -> bool {
     })
 }
 
-/// Answer a native services request. Authentication has already passed.
-pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Response {
+/// Answer a native services request from a caller acting for `project`
+/// (see [`Store::scoped`]). Authentication has already passed.
+pub(super) async fn handle(
+    state: &AppState,
+    parts: &Parts,
+    body: Body,
+    project: Option<&str>,
+) -> Response {
     let Some(services) = state.services.as_ref() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -134,7 +140,7 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
         )
         .await;
     };
-    match services.dispatch(parts, body).await {
+    match services.dispatch(parts, body, project).await {
         Reply::Json(status, value) => json_response(status, value, state, &parts.headers).await,
         Reply::Error(status, message) => {
             let mut response = error_response(status, &message, state, &parts.headers).await;
@@ -207,9 +213,19 @@ impl Services {
         })
     }
 
-    /// Answer one request, independent of the server's other state.
-    pub(super) async fn dispatch(&self, parts: &Parts, body: Body) -> Reply {
-        self.route(parts, body)
+    /// Answer one request for a caller acting for `project`, independent of
+    /// the server's other state: it sees, and creates, only that project's
+    /// objects (see [`Store::scoped`]).
+    pub(super) async fn dispatch(&self, parts: &Parts, body: Body, project: Option<&str>) -> Reply {
+        let scoped = Self {
+            store: self.store.scoped(project),
+            spool: self.spool.clone(),
+            blocking: Arc::clone(&self.blocking),
+            transfers: Arc::clone(&self.transfers),
+            downloads: Arc::clone(&self.downloads),
+        };
+        scoped
+            .route(parts, body)
             .await
             .unwrap_or_else(|(status, message)| Reply::Error(status, message))
     }

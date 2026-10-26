@@ -100,6 +100,18 @@ impl Caller {
         record
     }
 
+    /// The project whose stored objects this caller creates and sees (see
+    /// [`local_services::Store::scoped`]): a project API key's. `None` (no
+    /// project: creates unowned objects, sees every object) with
+    /// authentication off and for the `--api-key` key, which is the
+    /// operator's.
+    pub(super) fn project(&self) -> Option<&str> {
+        match self {
+            Self::Project { project_id, .. } => Some(project_id),
+            Self::Anonymous | Self::Static | Self::Admin { .. } => None,
+        }
+    }
+
     /// The project and key that work stored for this caller, and run later
     /// (resumed background Responses), is attributed to: `None` unless
     /// this is a project API key.

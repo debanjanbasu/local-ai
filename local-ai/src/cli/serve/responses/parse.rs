@@ -310,6 +310,8 @@ pub(super) struct Persist {
     pub(super) request: Option<Value>,
     /// Who created `request` (see [`StoredResponse::creator`]), kept with it.
     pub(super) creator: Option<Value>,
+    /// The project that owns the Response (see [`StoredResponse::project`]).
+    pub(super) project: Option<String>,
 }
 
 /// A `context_management` compaction entry.
@@ -609,7 +611,7 @@ pub(in crate::cli::serve) fn prepare_input_tokens(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<ChatRequest> {
-    prepare_input_tokens_conversing(body, thinking, store, None, cipher, model)
+    prepare_input_tokens_conversing(body, thinking, store, (None, None), cipher, model)
 }
 
 /// Count requests use the generation input contract, but never persist a
@@ -617,12 +619,13 @@ pub(in crate::cli::serve) fn prepare_input_tokens(
 /// silently accepting a misspelled count request.
 ///
 /// A `conversation` is read, as one snapshot, exactly as generation would
-/// read it, and never written. Blocks on the stores.
+/// read it, and never written. Stored objects are those `project` may see
+/// (see [`prepare_responses_conversing`]). Blocks on the stores.
 pub(in crate::cli::serve) fn prepare_input_tokens_conversing(
     body: &[u8],
     thinking: bool,
     store: Option<&Arc<ResponseStore>>,
-    conversations: Option<&ConversationStore>,
+    (conversations, project): (Option<&ConversationStore>, Option<&str>),
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<ChatRequest> {
@@ -658,8 +661,15 @@ pub(in crate::cli::serve) fn prepare_input_tokens_conversing(
     object.insert("store".into(), json!(false));
     let body = serde_json::to_vec(&value)
         .map_err(|error| invalid(format!("invalid token count request: {error}")))?;
-    let prepared =
-        prepare_responses_conversing(&body, thinking, store, None, conversations, cipher, model)?;
+    let prepared = prepare_responses_conversing(
+        &body,
+        thinking,
+        store,
+        None,
+        (conversations, project),
+        cipher,
+        model,
+    )?;
     Ok(prepared.request)
 }
 
@@ -685,7 +695,15 @@ pub(in crate::cli::serve) fn prepare_responses_retaining(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedResponses> {
-    prepare_responses_conversing(body, thinking, store, temporary, None, cipher, model)
+    prepare_responses_conversing(
+        body,
+        thinking,
+        store,
+        temporary,
+        (None, None),
+        cipher,
+        model,
+    )
 }
 
 /// Parse a `POST /v1/responses` body, resolving `previous_response_id`
@@ -696,20 +714,25 @@ pub(in crate::cli::serve) fn prepare_responses_retaining(
 /// whose items precede this request's input; its version and the request's
 /// new items are kept for the append when the Response ends. Blocks on the
 /// stores, so it runs on the blocking pool.
+///
+/// The caller acts for `project` (see [`super::super::admin::Caller::project`]):
+/// `previous_response_id` must name a Response it may see, the Response is
+/// stored as its own, and `conversations` (which also resolves `file_id`
+/// parts) is scoped to it.
 #[allow(clippy::too_many_lines)]
 pub(in crate::cli::serve) fn prepare_responses_conversing(
     body: &[u8],
     thinking: bool,
     store: Option<&Arc<ResponseStore>>,
     temporary: Option<&Arc<Temporary>>,
-    conversations: Option<&ConversationStore>,
+    (conversations, project): (Option<&ConversationStore>, Option<&str>),
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedResponses> {
     let request: ResponsesRequest = serde_json::from_slice(body)
         .map_err(|error| invalid(format!("invalid JSON request: {error}")))?;
     super::super::models::check_generation(request.model.as_deref())?;
-    reject_temporary_previous(request.previous_response_id.as_deref(), temporary)?;
+    reject_temporary_previous(request.previous_response_id.as_deref(), temporary, project)?;
     request.reject_unsupported(
         store.is_some(),
         temporary.is_some(),
@@ -768,7 +791,7 @@ pub(in crate::cli::serve) fn prepare_responses_conversing(
     // conversation (never combined with `previous_response_id`) is likewise
     // one consistent snapshot, oldest item first, at a known version.
     let mut items = match (&request.previous_response_id, store) {
-        (Some(id), Some(store)) => previous_history(store, id)?,
+        (Some(id), Some(store)) => previous_history(store, id, project)?,
         _ => Vec::new(),
     };
     let snapshot = if let (Some(id), Some(conversations)) = (conversation_id, conversations) {
@@ -816,7 +839,7 @@ pub(in crate::cli::serve) fn prepare_responses_conversing(
     let conversation = snapshot
         .map(|(conversations, id, version)| conversing(conversations, id, version, new_input))
         .transpose()?;
-    let mut persist = persist(&request, store, temporary, items);
+    let mut persist = persist(&request, (store, temporary), items, project);
     if let Some(persist) = persist.as_mut().filter(|persist| {
         request.background == Some(true) && persist.temporary.is_none() && conversation.is_none()
     }) {
@@ -943,8 +966,10 @@ pub(in crate::cli::serve) fn prepare_resumed(
         }
     }
     let bytes = serde_json::to_vec(&body).map_err(|error| invalid(error.to_string()))?;
+    // Stored again as the project's that owns it.
+    let owner = (None, stored.project.as_deref());
     let mut prepared =
-        prepare_responses_conversing(&bytes, thinking, Some(store), None, None, cipher, model)?;
+        prepare_responses_conversing(&bytes, thinking, Some(store), None, owner, cipher, model)?;
     let id = response
         .get("id")
         .and_then(Value::as_str)
@@ -1012,17 +1037,18 @@ pub(in crate::cli::serve) fn prepare_resumed(
 }
 
 /// Where the Response to `request` is to be kept, with its resolved input
-/// `items`, if anywhere.
+/// `items`, if anywhere, as `project`'s.
 ///
 /// Storing follows `OpenAI`'s default of `true` once a store exists; without
 /// one, `reject_unsupported` has already refused an explicit `true`. A
 /// temporary background response goes only to the temporary store.
 fn persist(
     request: &ResponsesRequest,
-    store: Option<&Arc<ResponseStore>>,
-    temporary: Option<&Arc<Temporary>>,
+    (store, temporary): (Option<&Arc<ResponseStore>>, Option<&Arc<Temporary>>),
     items: Vec<Value>,
+    project: Option<&str>,
 ) -> Option<Persist> {
+    let project = project.map(str::to_owned);
     match temporary.filter(|_| request.temporary_background(store.is_some())) {
         Some(temporary) => Some(Persist {
             store: Arc::clone(temporary.store()),
@@ -1030,6 +1056,7 @@ fn persist(
             temporary: Some(Arc::clone(temporary)),
             request: None,
             creator: None,
+            project,
         }),
         None => store
             .filter(|_| request.store.unwrap_or(true))
@@ -1039,35 +1066,68 @@ fn persist(
                 temporary: None,
                 request: None,
                 creator: None,
+                project,
             }),
     }
 }
 
 /// Refuse to continue a temporary response. It is never looked up in the
 /// response store, so it is not reported as merely missing there.
+///
+/// One `project` may not see is not mentioned: it is then looked up in the
+/// response store, which does not have it either.
 fn reject_temporary_previous(
     previous: Option<&str>,
     temporary: Option<&Arc<Temporary>>,
+    project: Option<&str>,
 ) -> crate::Result<()> {
     match (previous, temporary) {
-        (Some(id), Some(temporary)) if temporary.knows(id) => Err(unsupported(
-            "previous_response_id",
-            &format!(
-                "response {id} was created with background=true and store=false, so it is kept \
-                 only briefly for retrieval and cannot be continued; send its items in input"
-            ),
-        )),
+        (Some(id), Some(temporary))
+            if temporary.knows(id) && visible(temporary.store(), id, project).unwrap_or(false) =>
+        {
+            Err(unsupported(
+                "previous_response_id",
+                &format!(
+                    "response {id} was created with background=true and store=false, so it is \
+                     kept only briefly for retrieval and cannot be continued; send its items in \
+                     input"
+                ),
+            ))
+        }
         _ => Ok(()),
     }
 }
 
-/// The history stored response `id` continues with.
-pub(super) fn previous_history(store: &ResponseStore, id: &str) -> crate::Result<Vec<Value>> {
+/// Whether a caller acting for `project` may see response `id` in `store`:
+/// any stored one without a project, otherwise only one that `project`
+/// owns (see [`StoredResponse::project`]). Reads the record only for a
+/// project. Blocks on the store.
+pub(in crate::cli::serve) fn visible(
+    store: &ResponseStore,
+    id: &str,
+    project: Option<&str>,
+) -> std::io::Result<bool> {
+    let Some(project) = project else {
+        return Ok(true);
+    };
+    Ok(store
+        .load(id)?
+        .is_some_and(|stored| stored.project.as_deref() == Some(project)))
+}
+
+/// The history stored response `id` continues with, when `project` may see
+/// it (see [`visible`]).
+pub(super) fn previous_history(
+    store: &ResponseStore,
+    id: &str,
+    project: Option<&str>,
+) -> crate::Result<Vec<Value>> {
     let stored = store
         .load(id)
         .map_err(|error| {
             crate::Error::Generation(format!("could not read stored response {id}: {error}"))
         })?
+        .filter(|stored| project.is_none_or(|project| stored.project.as_deref() == Some(project)))
         .ok_or_else(|| invalid(format!("previous response with id {id:?} not found")))?;
     // A background response has no output to continue until it ends.
     match stored.response.get("status").and_then(Value::as_str) {

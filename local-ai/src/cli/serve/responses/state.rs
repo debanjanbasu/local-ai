@@ -1077,7 +1077,12 @@ impl ResponsesState {
                 return self.not_kept(&message, stats);
             }
             if let Some(persist) = &self.echo.persist
-                && let Err(failure) = persist.store.save(&response, &persist.input_items)
+                && let Err(failure) = persist.store.save_with(
+                    &response,
+                    &persist.input_items,
+                    None,
+                    persist.project.as_deref(),
+                )
             {
                 eprintln!("response {} could not be stored: {failure}", self.id);
                 let mut message = format!("the response could not be stored: {failure}");
@@ -1137,14 +1142,22 @@ impl ResponsesState {
             .filter(|_| matches!(status, Some("queued" | "in_progress")))
             .map(|request| (request, persist.creator.as_ref()));
         let Some(conversing) = self.echo.conversation.as_ref().filter(|_| ended) else {
-            return persist
-                .store
-                .save_with(response, &persist.input_items, request);
+            return persist.store.save_with(
+                response,
+                &persist.input_items,
+                request,
+                persist.project.as_deref(),
+            );
         };
         conversing.append(response).map_err(std::io::Error::other)?;
         persist
             .store
-            .save(response, &persist.input_items)
+            .save_with(
+                response,
+                &persist.input_items,
+                None,
+                persist.project.as_deref(),
+            )
             .map_err(|error| {
                 std::io::Error::new(
                     error.kind(),
