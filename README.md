@@ -125,10 +125,10 @@ expired bytes are purged at startup. The same crate offers native repository sea
 
 Authentication is off by default: on `127.0.0.1` any local process may use
 the server (and `serve` warns when bound elsewhere without it). Web pages a
-local browser opens may not: requests addressed to a non-loopback host name
-(DNS rebinding) and cross-site browser requests are refused with `403`;
-pages on loopback hosts and local apps are admitted, and `--allow-origin`
-admits more. CLIs and SDKs send none of the headers involved and are never
+local browser opens may not: requests addressed to a host name that is not
+local (DNS rebinding; `--allow-host` admits more names) and cross-site
+browser requests are refused with `403`; pages on loopback hosts and local
+apps are admitted, and `--allow-origin` admits more. CLIs and SDKs send none of the headers involved and are never
 affected; see [docs/ADMIN.md](docs/ADMIN.md#browsers). `local-ai admin
 create-key` creates the first admin API key, prints it once, and turns
 authentication on: every request then needs `Authorization: Bearer <key>`.

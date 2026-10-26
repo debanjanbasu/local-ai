@@ -201,6 +201,9 @@ local-ai serve [options]
   --allow-origin ORIGIN  admit browser requests from ORIGIN while
                      authentication is off; repeatable, * for every origin,
                      null for file: pages (see docs/ADMIN.md#browsers)
+  --allow-host NAME  answer requests addressed to NAME besides IP addresses,
+                     localhost and *.local or *.internal names; repeatable
+                     (DNS rebinding protection, see docs/ADMIN.md#browsers)
   --no-thinking      disable reasoning
   --stall-timeout N  drop a generation or download whose client stopped
                      reading, or a request body that stopped arriving;

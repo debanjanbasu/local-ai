@@ -89,6 +89,11 @@ pub(super) fn usage() {
          https://chat.example.com) while authentication is off; repeatable; * for every origin, \
          null for file: pages (default: loopback pages and local apps only; see docs/BONSAI.md)"
     );
+    eprintln!(
+        "  --allow-host NAME  Answer requests addressed to host NAME besides IP addresses, \
+         localhost and *.local/*.internal names (DNS rebinding protection; applies on loopback, \
+         and elsewhere while authentication is off); repeatable"
+    );
     eprintln!("  --no-thinking      Disable thinking");
     eprintln!(
         "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \
@@ -154,6 +159,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         decisions_artifact: None,
         tools: ToolArgs::default(),
         allowed_origins: Vec::new(),
+        allowed_hosts: Vec::new(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -189,6 +195,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 | "--port"
                 | "--api-key"
                 | "--allow-origin"
+                | "--allow-host"
                 | "--stall-timeout"
                 | "--response-store"
                 | "--reasoning-key"
@@ -209,6 +216,7 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
             "--port" => parsed.port = value.parse().map_err(|_| "invalid --port")?,
             "--api-key" => parsed.api_key = Some(value.clone()),
             "--allow-origin" => parsed.allowed_origins.push(allowed_origin(value)?),
+            "--allow-host" => parsed.allowed_hosts.push(allowed_host(value)?),
             "--stall-timeout" => parsed.stall = stall_timeout(value)?,
             "--reasoning-key" => {
                 if value.is_empty() {
@@ -253,6 +261,27 @@ fn allowed_origin(value: &str) -> Result<String, String> {
         Err(format!(
             "--allow-origin must be *, null or an origin such as https://chat.example.com, not \
              {value:?}"
+        ))
+    }
+}
+
+/// An `--allow-host` value: a host name as a client addresses this server,
+/// without scheme or port, compared exactly (lowercase, no trailing dot).
+fn allowed_host(value: &str) -> Result<String, String> {
+    let host = value
+        .strip_suffix('.')
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    let valid = !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'));
+    if valid {
+        Ok(host)
+    } else {
+        Err(format!(
+            "--allow-host must be a host name such as ai.example.com, without scheme or port, \
+             not {value:?}"
         ))
     }
 }

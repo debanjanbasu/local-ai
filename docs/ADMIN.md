@@ -55,13 +55,20 @@ enough to start a generation or delete a file), and by DNS rebinding, where
 its own origin (Ollama's CVE-2024-28224). Every request, on every HTTP
 version, is checked before authentication:
 
-- **Host.** While bound to a loopback address, a request is refused (`403`)
-  unless its `Host` (HTTP/2 and HTTP/3 `:authority`) is `localhost`, a
-  `*.localhost` name, a `*.internal` name (Docker's `host.docker.internal`;
-  the TLD is reserved for private use, so public DNS cannot rebind it) or an
-  IP address. A rebinding page always sends its own name. Bound to another
-  address the server can be reached under names it cannot know, and the host
-  is not checked.
+- **Host.** A request is refused (`403`) unless its `Host` (HTTP/2 and
+  HTTP/3 `:authority`) is `localhost`, a `*.localhost` name, a `*.internal`
+  name (Docker's `host.docker.internal`; the TLD is reserved for private use,
+  so public DNS cannot rebind it), a `*.local` name (resolved by multicast
+  DNS on the local network, never by public DNS), an IP address, or a name
+  given with `serve --allow-host NAME` (repeatable, exact, any port). A
+  rebinding page always sends its own name. While bound to a loopback address
+  this always applies. Bound to another address (`--host 0.0.0.0`) it applies
+  while authentication is off, where a rebinding page could otherwise read
+  files, stored responses and conversations from a browser on the network:
+  clients addressing the server by IP address or `name.local` are
+  unaffected, and one using a DNS name needs `--allow-host name`. Once
+  authentication is on it does not apply there, since a rebinding page has
+  no key.
 - **Origin.** While authentication is off, a request whose `Origin` is
   another site, or that has no `Origin` but `Sec-Fetch-Site: cross-site`, is
   refused (`403`). Admitted without configuration: `http(s)` pages on

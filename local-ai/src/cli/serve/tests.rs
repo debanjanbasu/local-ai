@@ -56,6 +56,24 @@ fn allowed_origins_are_normalized_origins() {
     }
 }
 #[test]
+fn allowed_hosts_are_normalized_names() {
+    let parsed = parse(&args(&[
+        "--allow-host",
+        "AI.Example.com.",
+        "--allow-host",
+        "studio",
+    ]))
+    .expect("options");
+    assert_eq!(parsed.allowed_hosts, ["ai.example.com", "studio"]);
+    for invalid in ["", "https://ai.example.com", "ai.example.com:8080", "a/b"] {
+        assert!(
+            parse(&args(&["--allow-host", invalid])).is_err(),
+            "{invalid}"
+        );
+    }
+    assert!(parse(&args(&["--allow-host"])).is_err());
+}
+#[test]
 fn thinking_is_not_a_flag_because_it_already_is_the_default() {
     // Reasoning is on unless the flag turns it off, so a positive spelling
     // could only ever be a no-op. The parser used to accept it anyway, which

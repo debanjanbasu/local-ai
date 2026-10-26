@@ -95,6 +95,9 @@ struct Args {
     /// `--allow-origin` values: browser origins admitted while
     /// authentication is off (see [`browser`]).
     allowed_origins: Vec<String>,
+    /// `--allow-host` names: `Host` values admitted besides IP addresses and
+    /// local names (see [`browser`]).
+    allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -258,7 +261,10 @@ impl Drop for Admitted {
 async fn route(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = connection::paced(body, state.stall);
-    if let Some(message) = state.browsers.host_refusal(&parts) {
+    if let Some(refused) = state.browsers.host_refusal(&parts)
+        && !(refused.unless_authenticated && admin::enabled(&state).await)
+    {
+        let message = refused.message;
         return error_response(StatusCode::FORBIDDEN, &message, &state, &parts.headers).await;
     }
     let origin = state.browsers.origin(&parts.headers);
@@ -1333,7 +1339,11 @@ async fn run_async(args: Args) -> crate::Result<()> {
             ))),
             args.api_key.as_deref(),
         )?),
-        browsers: Arc::new(browser::Browsers::new(args.host, args.allowed_origins)),
+        browsers: Arc::new(browser::Browsers::new(
+            args.host,
+            args.allowed_origins,
+            args.allowed_hosts,
+        )),
         alt_svc: resources
             .tls
             .as_ref()
