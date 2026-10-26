@@ -52,7 +52,9 @@ released; the budgets, measurements and limits are in
 
 Responses are stored by default, as on OpenAI, in
 `~/Library/Application Support/local-ai/responses` (owner-only, unencrypted
-files; settled responses older than 30 days are removed at startup).
+files; settled responses older than 30 days are removed at startup and hourly
+after). Each record repeats the whole conversation before it, inline images
+included, so a long conversation's records grow with the square of its turns.
 `--response-store DIR` keeps them in DIR instead, until deleted, and
 `--no-response-store` keeps none. The store serves
 `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
