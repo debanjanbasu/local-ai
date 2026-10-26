@@ -131,9 +131,13 @@ the metadata), `delete_conversation`, `add_items`, `list_items`, `get_item`,
   takes an idempotency `request_id` and an `expected_version`. A retry with
   the same request returns the stored items with `replayed: true`. A stale
   version, or the same key with different items, is a `Conflict`, and nothing
-  is stored.
-- Deletion is logical. The conversation and its items become unreachable,
-  but its item rows stay in the database. No purge exists for them.
+  is stored. The record of an applied request keeps only a fingerprint of
+  the items and their IDs, so a replay returns the items that still exist.
+- `delete_item` deletes the item's row; no copy of its content is kept.
+  Deleting a conversation is logical. The conversation and its items become
+  unreachable, but its item rows stay in the database. No purge exists for
+  them. Neither deletion overwrites freed database pages (SQLite's
+  `secure_delete` is off).
 
 ## Files and Uploads
 

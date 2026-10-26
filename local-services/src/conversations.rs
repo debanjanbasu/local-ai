@@ -147,7 +147,8 @@ pub struct Append {
 pub struct Appended {
     /// The conversation after the append (its current state on a replay).
     pub conversation: Conversation,
-    /// The items this request appended, as they were stored.
+    /// The items this request appended, as they were stored (on a replay,
+    /// those not deleted since).
     pub items: Vec<Item>,
     /// Whether this request ID had already been applied, so nothing changed.
     pub replayed: bool,
@@ -163,7 +164,11 @@ pub struct History {
 /// Version 1: conversations, their items (the `AUTOINCREMENT` sequence is the
 /// order and the cursor, never reused after a deletion), and the record of
 /// applied append requests.
-const MIGRATIONS: &[&str] = &["
+///
+/// Version 2: an applied append request keeps only its items' IDs, so an
+/// item deleted later leaves no copy of its content behind.
+const MIGRATIONS: &[&str] = &[
+    "
 CREATE TABLE conversations (
     id TEXT PRIMARY KEY NOT NULL,
     created_at INTEGER NOT NULL,
@@ -187,7 +192,13 @@ CREATE TABLE conversation_appends (
     items TEXT NOT NULL,
     PRIMARY KEY (conversation_id, request_id)
 ) STRICT, WITHOUT ROWID;
-"];
+",
+    "
+UPDATE conversation_appends SET items =
+    (SELECT json_group_array(json_extract(value, '$.id')) FROM json_each(items));
+ALTER TABLE conversation_appends RENAME COLUMN items TO item_ids;
+",
+];
 
 /// Create or upgrade the conversation tables.
 pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
@@ -378,8 +389,9 @@ impl Store {
     /// Append generated history exactly once.
     ///
     /// Applied at most once per `request_id`: a retry with the same request ID
-    /// and the same items returns the originally stored items with
-    /// `replayed: true`, whatever the conversation's version is now; the same
+    /// and the same items returns the items it stored that still exist (one
+    /// deleted since is left out) with `replayed: true`, whatever the
+    /// conversation's version is now; the same
     /// request ID with different items is a [`Error::Conflict`]. A new request
     /// is applied only if the conversation is still at `expected_version`,
     /// so generation that raced another writer cannot append stale history:
@@ -403,7 +415,7 @@ impl Store {
         let conversation = live(&transaction, id)?;
         let applied: Option<(String, String)> = transaction
             .query_row(
-                "SELECT fingerprint, items FROM conversation_appends
+                "SELECT fingerprint, item_ids FROM conversation_appends
                  WHERE conversation_id = ?1 AND request_id = ?2",
                 params![id, request_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -415,9 +427,17 @@ impl Store {
                     "request {request_id} was already applied to conversation {id} with different items"
                 )));
             }
+            // Only the IDs were recorded: a deleted item is gone for good.
+            let items = select_items(
+                &transaction,
+                "SELECT id, body FROM conversation_items
+                 WHERE conversation_id = ?1 AND id IN (SELECT value FROM json_each(?2))
+                 ORDER BY seq ASC",
+                params![id, recorded],
+            )?;
             return Ok(Appended {
                 conversation,
-                items: serde_json::from_str(&recorded)?,
+                items,
                 replayed: true,
             });
         }
@@ -429,9 +449,14 @@ impl Store {
         }
         insert_items(&transaction, id, &items, now()?)?;
         transaction.execute(
-            "INSERT INTO conversation_appends (conversation_id, request_id, fingerprint, items)
+            "INSERT INTO conversation_appends (conversation_id, request_id, fingerprint, item_ids)
              VALUES (?1, ?2, ?3, ?4)",
-            params![id, request_id, fingerprint, serde_json::to_string(&items)?],
+            params![
+                id,
+                request_id,
+                fingerprint,
+                serde_json::to_string(&items.iter().map(|item| &item.id).collect::<Vec<_>>())?
+            ],
         )?;
         let conversation = live(&transaction, id)?;
         transaction.commit()?;

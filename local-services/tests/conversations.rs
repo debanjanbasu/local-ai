@@ -448,6 +448,70 @@ fn deletion_hides_the_conversation_but_keeps_its_items() {
     assert_eq!(stored, 1);
 }
 
+/// How many append records hold `needle` in any column.
+fn append_records_holding(database: &rusqlite::Connection, needle: &str) -> usize {
+    let mut statement = database
+        .prepare("SELECT * FROM conversation_appends")
+        .expect("prepared");
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            Ok((0..columns).any(|column| {
+                matches!(row.get_ref(column), Ok(rusqlite::types::ValueRef::Text(text))
+                    if String::from_utf8_lossy(text).contains(needle))
+            }))
+        })
+        .expect("queried")
+        .filter(|holds| *holds.as_ref().expect("row"))
+        .count()
+}
+
+#[test]
+fn a_deleted_item_leaves_no_copy_in_the_append_record() {
+    let (scratch, store) = store();
+    let conversation = store
+        .create_conversation(&Metadata::new(), Vec::new())
+        .expect("created");
+    let turn = vec![user("keep this"), user("forget-this-canary")];
+    let append = |store: &Store| {
+        store.append_items(
+            &conversation.id,
+            Append {
+                request_id: "resp_a".to_owned(),
+                expected_version: 0,
+                items: turn.clone(),
+            },
+        )
+    };
+    let first = append(&store).expect("appended");
+    let database = rusqlite::Connection::open(scratch.path().join("services/services.sqlite3"))
+        .expect("database opens");
+    store
+        .delete_item(&conversation.id, &first.items[1].id)
+        .expect("deleted");
+    assert_eq!(append_records_holding(&database, "canary"), 0);
+    // A replay still answers, without the deleted item.
+    let replay = append(&store).expect("replayed");
+    assert!(replay.replayed);
+    assert_eq!(replay.items, first.items[..1]);
+
+    // A record written by version 1, with the items' content, keeps only
+    // their IDs once the store is reopened.
+    let stored = serde_json::to_string(&first.items).expect("json");
+    database
+        .execute_batch(&format!(
+            "ALTER TABLE conversation_appends RENAME COLUMN item_ids TO items;
+             UPDATE conversation_appends SET items = '{}';
+             UPDATE schema_versions SET version = 1 WHERE component = 'conversations';",
+            stored.replace('\'', "''")
+        ))
+        .expect("downgraded");
+    assert_eq!(append_records_holding(&database, "canary"), 1);
+    let store = Store::open(scratch.path().join("services")).expect("store reopens");
+    assert_eq!(append_records_holding(&database, "canary"), 0);
+    assert_eq!(append(&store).expect("replayed").items, first.items[..1]);
+}
+
 #[test]
 fn appends_are_idempotent_and_refuse_stale_versions() {
     let (_scratch, store) = store();
