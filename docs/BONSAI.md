@@ -1857,7 +1857,15 @@ top twos after each depth and applies each chain's EOS and margin gate, and
 rows whose chain stopped leave the next pass. The first pass also feeds each
 head the rows it missed in batched steps, as K/V-only rows beside the
 drafting rows (a lag too long for one pass is fed first, in K/V-only passes),
-so no sequence is swapped in to draft. A pass costs about 2.1 ms plus 0.5 ms
+so no sequence is swapped in to draft. A sequence that does not draft for a
+long time (eight seeds fill a pass, so eight streams seldom draft) has its
+lag fed the same way before it would pass 512 rows. A lag used to grow until
+4,096 rows and then give the head up for the rest of the request, so a long
+reasoning request lost MTP for good after batching beside others, even once
+it ran alone again (about 38 against 31 tok/s), and its 80 MB of owed hidden
+rows stayed allocated; now the lag buffer stays at 10 MB, and after 552
+batched rows a head caught up this way drafts exactly what a head that
+ingested every row in prefill blocks drafts. A pass costs about 2.1 ms plus 0.5 ms
 per drafting sequence (2.5 ms for one, 4.4 for three, 6.1 for eight, against
 3.0, 8.9 and 23.5 ms for the same chains drafted one sequence at a time,
 `batched_head_draft_timings`), so a full depth-3 round for four sequences
@@ -1982,7 +1990,7 @@ against 2.30 GB for `f088159`.
 Each extra stream costs its own state: 81 MB of F16 recurrent state and
 convolution history, 34 KiB of Q8 K/V per token (initially 1,024 tokens,
 36 MB) plus 4 KiB of head K/V per token, and 20 KiB per batched token of
-hidden rows owed to its MTP head. A verifying step keeps each recurrent
+hidden rows owed to its MTP head (at most 512 rows, 10 MB). A verifying step keeps each recurrent
 layer's raw QKV rows, decay and beta for its rows (about 2 MB per stacked row,
 allocated on first use at the next power of two of the rows, up to 126 MB at
 64 rows) plus one spare state, and batched logits grow to the stacked rows

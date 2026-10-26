@@ -15,9 +15,11 @@
 
 use local_metal::draft::{DraftRows, DraftTopTwo};
 
-use super::{BonsaiModel, HeadLag, MAX_BATCH_SEQUENCES, SequenceState};
+use super::{
+    BatchRow, BonsaiModel, HEAD_LAG_CATCH_UP, HeadLag, MAX_BATCH_SEQUENCES, SequenceState,
+};
 use crate::bonsai::{BonsaiMetalTensor, VOCAB, WIDTH};
-use crate::bonsai_mtp::{DRAFT_CHAIN_MIN_MARGIN, HeadSpan, HeadState};
+use crate::bonsai_mtp::{BonsaiMtp, DRAFT_CHAIN_MIN_MARGIN, HeadSpan, HeadState};
 use crate::bonsai_native::{BufferCopyRequest, CommandBatch, MetalBuffer, decode_embeddings};
 use crate::sampler::Sampler;
 
@@ -267,67 +269,9 @@ impl BonsaiModel {
         let count = sequences.len();
         let stride = heads.stride();
         let row_bytes = WIDTH * size_of::<f32>();
-        let stage_tokens = |tokens: &[u32]| -> crate::Result<()> {
-            let mut values = vec![0.0; tokens.len() * WIDTH];
-            decode_embeddings(&self.package, tokens, &mut values, None)?;
-            mtp.stage_embeddings(&values)
-        };
         // Lags too long to ride beside the drafting rows go first, in
         // K/V-only passes.
-        loop {
-            let owed = sequences
-                .iter()
-                .map(|sequence| sequence.lag_tokens.len() - sequence.fed)
-                .sum::<usize>();
-            if count + owed <= limit {
-                break;
-            }
-            let mut spans = Vec::new();
-            let mut tokens = Vec::new();
-            let mut copies = Vec::new();
-            let mut taken = vec![0; count];
-            for (index, sequence) in sequences.iter().enumerate() {
-                let left = sequence.lag_tokens.len() - sequence.fed;
-                let rows = left.min(limit - tokens.len());
-                if rows == 0 {
-                    continue;
-                }
-                sequence.stage(
-                    mtp.hidden_in(),
-                    tokens.len(),
-                    sequence.fed,
-                    rows,
-                    &mut copies,
-                )?;
-                spans.push(HeadSpan {
-                    state: sequence.state,
-                    capacity: sequence.capacity,
-                    row: tokens.len(),
-                    rows,
-                    position: sequence.first() + sequence.fed,
-                });
-                tokens.extend_from_slice(&sequence.lag_tokens[sequence.fed..sequence.fed + rows]);
-                taken[index] = rows;
-            }
-            let total = tokens.len();
-            stage_tokens(&tokens)?;
-            let mut batch = CommandBatch::new(&self.context)?;
-            batch.blit_buffer_copies(copies)?;
-            mtp.transform_embeddings(&mut batch, &shared, total)?;
-            mtp.encode_stacked(
-                &mut batch,
-                &shared,
-                mtp.hidden_in(),
-                &[],
-                &spans,
-                total,
-                &heads.logits,
-            )?;
-            self.finish(batch)?;
-            for (sequence, rows) in sequences.iter_mut().zip(taken) {
-                sequence.fed += rows;
-            }
-        }
+        self.feed_lags(mtp, heads, &mut sequences, Some(count))?;
         // The first depth: each sequence's seed row, then whatever lag rows
         // are left to feed.
         let mut tokens = Vec::with_capacity(limit);
@@ -377,7 +321,7 @@ impl BonsaiModel {
             tokens.extend_from_slice(&sequence.lag_tokens[sequence.fed..]);
         }
         let total = tokens.len();
-        stage_tokens(&tokens)?;
+        self.stage_tokens(mtp, &tokens)?;
         let mut batch = CommandBatch::new(&self.context)?;
         batch.blit_buffer_copies(copies)?;
         mtp.transform_embeddings(&mut batch, &shared, total)?;
@@ -524,5 +468,205 @@ impl BonsaiModel {
             }
         }
         Ok(drafts)
+    }
+    /// Host-decoded embeddings of `tokens`, staged for a head pass.
+    fn stage_tokens(&self, mtp: &BonsaiMtp, tokens: &[u32]) -> crate::Result<()> {
+        let mut values = vec![0.0; tokens.len() * WIDTH];
+        decode_embeddings(&self.package, tokens, &mut values, None)?;
+        mtp.stage_embeddings(&values)
+    }
+
+    /// Feed `sequences`' heads their lag rows in K/V-only passes: all of
+    /// them, or with `beside` drafting rows to come, until what is left
+    /// fits beside those rows in one pass.
+    fn feed_lags(
+        &self,
+        mtp: &BonsaiMtp,
+        heads: &HeadDrafts,
+        sequences: &mut [Drafting<'_>],
+        beside: Option<usize>,
+    ) -> crate::Result<()> {
+        let shared = self.mtp_shared();
+        let limit = mtp.scratch_rows();
+        let count = sequences.len();
+        loop {
+            let owed = sequences
+                .iter()
+                .map(|sequence| sequence.lag_tokens.len() - sequence.fed)
+                .sum::<usize>();
+            if owed == 0 || beside.is_some_and(|rows| rows + owed <= limit) {
+                return Ok(());
+            }
+            let mut spans = Vec::new();
+            let mut tokens = Vec::new();
+            let mut copies = Vec::new();
+            let mut taken = vec![0; count];
+            for (index, sequence) in sequences.iter().enumerate() {
+                let left = sequence.lag_tokens.len() - sequence.fed;
+                let rows = left.min(limit - tokens.len());
+                if rows == 0 {
+                    continue;
+                }
+                sequence.stage(
+                    mtp.hidden_in(),
+                    tokens.len(),
+                    sequence.fed,
+                    rows,
+                    &mut copies,
+                )?;
+                spans.push(HeadSpan {
+                    state: sequence.state,
+                    capacity: sequence.capacity,
+                    row: tokens.len(),
+                    rows,
+                    position: sequence.first() + sequence.fed,
+                });
+                tokens.extend_from_slice(&sequence.lag_tokens[sequence.fed..sequence.fed + rows]);
+                taken[index] = rows;
+            }
+            let total = tokens.len();
+            self.stage_tokens(mtp, &tokens)?;
+            let mut batch = CommandBatch::new(&self.context)?;
+            batch.blit_buffer_copies(copies)?;
+            mtp.transform_embeddings(&mut batch, &shared, total)?;
+            mtp.encode_stacked(
+                &mut batch,
+                &shared,
+                mtp.hidden_in(),
+                &[],
+                &spans,
+                total,
+                &heads.logits,
+            )?;
+            self.finish(batch)?;
+            for (sequence, rows) in sequences.iter_mut().zip(taken) {
+                sequence.fed += rows;
+            }
+        }
+    }
+
+    /// Feed every lag of `rows` that has grown past [`HEAD_LAG_CATCH_UP`]
+    /// (counting the rows this pass adds) to its head now, in K/V-only
+    /// passes, so a long run of batched steps neither gives the head up nor
+    /// keeps a large buffer of hidden rows.
+    pub(super) fn catch_up_lags(&mut self, rows: &mut [BatchRow<'_>]) -> crate::Result<()> {
+        let owed = |row: &BatchRow<'_>| {
+            row.lag.as_deref().is_some_and(|lag| {
+                lag.usable() && !lag.is_empty() && lag.tokens.len() + row.rows() > HEAD_LAG_CATCH_UP
+            })
+        };
+        if !rows.iter().any(owed) {
+            return Ok(());
+        }
+        let Some(mut speculation) = self.speculation.take() else {
+            return Ok(());
+        };
+        let result = self
+            .prepare_catch_up(&mut speculation, rows)
+            .and_then(|()| self.run_catch_up(&speculation, rows, owed));
+        self.speculation = Some(speculation);
+        if result.is_ok() {
+            for row in rows.iter_mut().filter(|row| owed(row)) {
+                if let Some(lag) = row.lag.as_deref_mut() {
+                    lag.tokens.clear();
+                }
+            }
+        }
+        result
+    }
+
+    /// The draft round's buffers and an attention workspace covering every
+    /// sequence of `rows`.
+    fn prepare_catch_up(
+        &mut self,
+        speculation: &mut super::super::Speculation,
+        rows: &[BatchRow<'_>],
+    ) -> crate::Result<()> {
+        let longest = rows
+            .iter()
+            .map(|row| {
+                row.state
+                    .as_deref()
+                    .map_or(self.position, |state| state.position)
+            })
+            .max()
+            .unwrap_or(0);
+        speculation.mtp.ensure_attention(&self.context, longest)?;
+        if self
+            .batch
+            .as_ref()
+            .is_none_or(|output| output.heads.is_none())
+        {
+            self.reserve_batch(MAX_BATCH_SEQUENCES, None)?;
+            let heads = HeadDrafts::new(self, speculation.mtp.depth)?;
+            if let Some(output) = self.batch.as_mut() {
+                output.heads = Some(heads);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_catch_up(
+        &self,
+        speculation: &super::super::Speculation,
+        rows: &[BatchRow<'_>],
+        owed: impl Fn(&BatchRow<'_>) -> bool,
+    ) -> crate::Result<()> {
+        let heads = self
+            .batch
+            .as_ref()
+            .and_then(|output| output.heads.as_ref())
+            .ok_or_else(|| crate::Error::InvalidArgument("batch scratch missing".into()))?;
+        let mtp = &speculation.mtp;
+        let mut sequences = Vec::new();
+        for row in rows.iter().filter(|row| owed(row)) {
+            let Some(lag) = row.lag.as_deref() else {
+                continue;
+            };
+            let (state, position, capacity) = match row.state.as_deref() {
+                Some(parked) => (
+                    parked.head.as_ref().ok_or_else(super::mismatch)?.state(),
+                    parked.position,
+                    parked.kv_allocated,
+                ),
+                None => (mtp.state(), self.position, self.kv_allocated),
+            };
+            if lag.tokens.len() > position {
+                return Err(crate::Error::InvalidArgument(
+                    "head lag is ahead of the sequence".into(),
+                ));
+            }
+            sequences.push(Drafting {
+                seed: row.token,
+                state,
+                position,
+                capacity,
+                lag_tokens: &lag.tokens,
+                lag_hidden: lag.hidden.as_ref(),
+                fed: 0,
+                depth: 0,
+            });
+        }
+        self.feed_lags(mtp, heads, &mut sequences, None)?;
+        // Each head now holds every row it was owed: its next row reads the
+        // newest one's hidden.
+        let row_bytes = WIDTH * size_of::<f32>();
+        let commits = sequences
+            .iter()
+            .map(|sequence| {
+                Ok(BufferCopyRequest {
+                    source: sequence.lag_hidden.ok_or_else(|| {
+                        crate::Error::InvalidArgument("head lag has no rows".into())
+                    })?,
+                    source_offset: (sequence.lag_tokens.len() - 1) * row_bytes,
+                    destination: sequence.state.prev_hidden,
+                    destination_offset: 0,
+                    size: row_bytes,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let mut batch = CommandBatch::new(&self.context)?;
+        batch.blit_buffer_copies(commits)?;
+        self.finish(batch)
     }
 }

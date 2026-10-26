@@ -666,6 +666,82 @@ fn batched_head_drafts_match_each_alone() {
     );
 }
 
+/// A sequence decoding batched for longer than [`HEAD_LAG_CATCH_UP`] rows
+/// keeps its head: the pass feeds the lag to the head before it would pass
+/// the bound (a lag that only grew gave the head up for good past
+/// `MAX_HEAD_LAG`, with up to 80 MB of hidden rows), and the head then drafts
+/// what a head that ingested every row in prefill blocks drafts.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
+fn long_batched_runs_catch_their_heads_up() {
+    const PROMPT: usize = 8;
+    let mut model = load_with_head(4096, 64);
+    let sampler = greedy_sampler();
+    let texts = natural_texts(&model);
+    let token = |index: usize, at: usize| texts[index][at % texts[index].len()];
+    let steps = HEAD_LAG_CATCH_UP + 40;
+    let mut sequences = (0..2)
+        .map(|index| {
+            let mut state = model.new_sequence().expect("sequence");
+            model.swap_sequence(&mut state).expect("swap in");
+            let prompt = (0..PROMPT).map(|at| token(index, at)).collect::<Vec<_>>();
+            model
+                .prefill_segment(&prompt, true, &mut |_| {})
+                .expect("prefill");
+            model.swap_sequence(&mut state).expect("swap out");
+            (state, HeadLag::default())
+        })
+        .collect::<Vec<_>>();
+    for step in 0..steps {
+        let mut rows = sequences
+            .iter_mut()
+            .enumerate()
+            .map(|(index, (state, lag))| BatchRow {
+                token: token(index, PROMPT + step),
+                drafts: Vec::new(),
+                state: Some(state),
+                lag: Some(lag),
+            })
+            .collect::<Vec<_>>();
+        model.decode_batch(&mut rows).expect("batched step");
+        drop(rows);
+        for (_, lag) in &sequences {
+            assert!(lag.usable(), "head given up at step {step}");
+            assert!(
+                lag.tokens.len() <= HEAD_LAG_CATCH_UP,
+                "lag of {} rows at step {step}",
+                lag.tokens.len()
+            );
+        }
+    }
+    for (index, (state, lag)) in sequences.iter_mut().enumerate() {
+        let seed = token(index, PROMPT + steps);
+        model.swap_sequence(state).expect("swap in");
+        let caught_up = model
+            .draft_resident(lag, seed, &sampler, 4)
+            .expect("drafts after catch-up");
+        model.swap_sequence(state).expect("swap out");
+        let mut reference = model.new_sequence().expect("sequence");
+        model.swap_sequence(&mut reference).expect("swap in");
+        let committed = (0..PROMPT + steps)
+            .map(|at| token(index, at))
+            .collect::<Vec<_>>();
+        model
+            .prefill_segment(&committed, true, &mut |_| {})
+            .expect("reference prefill");
+        let expected = model
+            .draft_resident(&mut HeadLag::default(), seed, &sampler, 4)
+            .expect("reference drafts");
+        model.swap_sequence(&mut reference).expect("swap out");
+        println!(
+            "{}",
+            serde_json::json!({"sequence": index, "caught_up": caught_up, "reference": expected})
+        );
+        assert!(!caught_up.is_empty(), "sequence {index} drafted nothing");
+        assert_eq!(caught_up[0], expected[0], "first draft, sequence {index}");
+    }
+}
+
 /// Time of one batched MTP draft round at 1..=8 sequences, each owing its
 /// head one row (a sequence that drafted last step) or eight, against each
 /// sequence drafting alone in turn (the cost model of batched head drafts).

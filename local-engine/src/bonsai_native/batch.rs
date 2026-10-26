@@ -41,8 +41,17 @@ pub use heads::HeadDraft;
 pub const MAX_BATCH_SEQUENCES: usize = 8;
 
 /// Most decoded rows a sequence may owe its MTP head before it gives the head
-/// up for the rest of its generation (20 KiB of hidden per row).
+/// up for the rest of its generation (20 KiB of hidden per row). A batched
+/// pass catches a lag up first once it would pass [`HEAD_LAG_CATCH_UP`], so
+/// this is reached only when a catch-up cannot run.
 const MAX_HEAD_LAG: usize = 4096;
+
+/// Rows a sequence may owe its MTP head before a batched pass feeds them to
+/// it, in K/V-only head passes: a long generation among several streams that
+/// never draft (eight seeds fill a pass) keeps its head, and its lag buffer
+/// stays at 10 MB. One catch-up of 512 rows costs a few head passes every
+/// 512 steps.
+const HEAD_LAG_CATCH_UP: usize = 512;
 
 static NEXT_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -531,6 +540,9 @@ impl BonsaiModel {
         }
         if self.scratch.attention.max_context() < longest as u32 {
             self.scratch.attention = AttentionWorkspace::new(&self.context, longest as u32)?;
+        }
+        if self.speculation.is_some() {
+            self.catch_up_lags(rows)?;
         }
         let lag_offsets = rows
             .iter_mut()
