@@ -254,7 +254,12 @@ artifact record as JSON.
 `serve` provides HTTP/1.1 and HTTP/2 on TCP. If
 `~/Library/Application Support/local-ai/tls/cert.pem` and `key.pem` exist, it
 also starts HTTP/3 on UDP at the same address and advertises it with `Alt-Svc`.
-TLS and HTTP/3 are automatic runtime behavior, not a build option.
+TLS and HTTP/3 are automatic runtime behavior, not a build option. An HTTP/3
+request's header block is limited to 64 KiB; a response body that fails
+partway (speech whose synthesis fails mid-stream) resets its stream with
+`H3_INTERNAL_ERROR` instead of finishing it, so a client never takes a
+truncated body for a complete one; and a client whose QUIC connection closes
+cancels its request even while nothing is being written to it.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
