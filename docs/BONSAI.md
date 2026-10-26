@@ -3235,6 +3235,14 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
 
+- Fat LTO with one codegen unit for the release profile (October 2026, M4
+  Pro): the binary shrinks from 38.6 MB to 27.7 MB, but rendering and
+  tokenizing a ~130K-token prompt (`local-ai bonsai --tokenize`) takes
+  0.35–0.44 s either way (identical tokens), while every build, incremental
+  ones included, re-runs whole-program optimization at link time. Decode
+  is GPU-bound, so nothing on the host path measured faster. `panic =
+  "abort"` is not an option regardless: JPEG decoding catches mozjpeg's
+  unwinding errors.
 - Pooled Bonsai hidden states as retrieval embeddings (October 2026):
   BEIR SciFact, all 300 test queries against a 1,000-document subset (the
   283 relevant abstracts plus 717 random others, title and abstract,
