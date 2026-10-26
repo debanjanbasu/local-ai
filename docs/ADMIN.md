@@ -161,6 +161,14 @@ limits, data retention, model and hosted-tool permissions, external storage.
 
 ## Limits
 
+- Projects separate usage, not data. Every project key, and the `--api-key`
+  key, reaches the same stored responses, files, uploads, conversations,
+  vector stores and batches: a key of one project can list, read, cancel and
+  delete another project's, given its ID (or by listing, where the API lists).
+  Only the usage records and the creator kept for later work are per project.
+  Do not give a project key to anyone who must not see the other projects'
+  data; run a separate server for them, as another user (whose home holds
+  its own data directory).
 - Work that runs after its request ended is attributed to the project key
   that created it, which is stored with it: batch lines in the services
   database, and a pending durable background Response in its record beside
