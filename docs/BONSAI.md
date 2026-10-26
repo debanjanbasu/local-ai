@@ -1714,8 +1714,10 @@ asks the prompt cache again for a longer prefix than admission restored and
 restores that one when it gains at least one token in 64 of it: requests
 admitted together that share a long uncached prefix (sub-agents fanned out
 at once) prefill one after another, and each later one starts from the
-snapshot the first wrote at the end of that prefix, waiting for it if the
-write is still in flight, instead of prefilling it again (see
+snapshot the first wrote at the end of that prefix instead of prefilling it
+again. While that write is still in flight the later one skips its prefill
+each step another request decodes, so their tokens keep coming, and waits for
+the write only when none does; admission never waits for it (see
 [Concurrency measurements](#concurrency-measurements)). A prompt of at most 128 tokens to prefill (a typical
 chat turn) goes whole, in a pass of its own after the step's decode round. A
 longer one, beside two or more decoding requests, prefills inside their
@@ -1740,8 +1742,12 @@ behind a long prompt is admitted, and can start its own shorter prefill,
 within a block; each block is its own GPU round trip either way, so this
 costs the prompt nothing (measured with 128-token blocks, before blocks grew
 to 512: 6.6K tokens alone, 51.9 s at one block a step against 52.1 s at
-four). A cancellation between two chunks ends the request with
-no tokens and clears the prompt cache, as a cancelled single-pass prefill did.
+four). A cancellation between two chunks ends the request with no tokens.
+Its sequence's K/V rows still hold the prompt up to where it stopped, so
+the GPU checkpoints of prefixes of that stay and only those past it go: a
+retry restores the checkpoint the cancelled request restored. A cancelled
+request used to clear the whole GPU tier, while the same client disconnect
+seen by the stream instead of the token (a stop) kept it.
 
 The chunk size trades the running requests' inter-token gap against the
 prompt's own time to first token. A prefill block costs about 9.2 ms a row at
@@ -2327,11 +2333,37 @@ cached instead of 7,474, 10,456 and 13,562, 78, 50 and 53 s instead of 26 to
 it in three requests: without the change the third restores 385 tokens from
 the GPU tier where the penultimate checkpoint is at 396.
 
+A request that persisted a boundary leaves its penultimate snapshot to its
+GPU checkpoint, which its session's next turn restores, and reads it back
+(about 38 KiB a prompt token) only for a tier that keeps it. It used to read
+it back at every request's end and, with no host tier (fast storage) and the
+boundary already written, drop it. On a 13,223-token chat prompt (`local-ai
+bonsai --json --greedy --no-thinking --max-tokens 1`, cold, host tier off,
+MTP head; two interleaved runs per arm with other jobs loading the CPU) the
+time from the first token to the end of the request fell from 80 and 85 ms
+to 38 and 39 ms and the peak footprint from 2,620 and 2,629 MB to 2,059 and
+2,064 MB, the 0.56 GB copy (3.8 GB at 100K tokens). The GPU tier describes
+one buffer set, though, so that checkpoint was the only copy of the tail and
+was lost whenever another session's request took the tier: a request of
+another session running at the same time claims it at its milestones and end, and
+one that runs next prefills over its rows. The tail now goes to disk before
+its GPU copy does: at the request's end when the copy is already gone or
+another request is running, else when a request that does not extend it
+takes the set. `concurrent_sessions_each_restore_their_previous_tail`
+reproduces it with two sessions admitted together: on the old code the
+session whose turn ended first restored 245 tokens (its system turn) where
+its tail is at 286. Keeping per-set checkpoint lists would have avoided the
+readback but needs the scheduler's pooled and parked sets to keep their
+rows for it, and up to four 81 MB checkpoints per set.
+
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
 and trim run behind the request. A snapshot is indexed for reuse only after
-its rename is reported, so a file still being written is never loaded; a
-request whose best disk match is still in flight waits for that one write.
+its rename is reported, so a file still being written is never loaded. A
+request whose best disk match is still in flight is not held up at
+admission; its first prefill step asks again and skips steps while other
+requests decode, or waits for that one write when none does (see
+[Prompts prefill inside the decode steps](#prompts-prefill-inside-the-decode-steps)).
 At most one job is in flight and one queued: a newer job replaces the queued
 one, except that a request tail never displaces a shared boundary. Dropping
 the engine finishes pending writes; the server, whose engine is never
@@ -2344,7 +2376,13 @@ closed 5 s later are dropped), and a long generation cannot delay shutdown
 until a supervisor's SIGKILL interrupts these writes. A temporary is live only while its writer holds an
 exclusive lock on it (taken in `open`), so the sweep after every store and
 at startup removes any other at once, whatever its age. A snapshot the trim
-after it would delete again is not written. A failed write is a cache miss reported
+after it would delete again is not written, nor read back from the GPU: the
+engine sizes it from its token count and asks its own index the writer's
+question first. A snapshot larger than the whole budget is still written,
+and kept while it is the only one, evicting every other: what it evicts fits
+in the budget and it does not, so it costs more prefill to rebuild than all
+of them together (131K tokens prefill in about half an hour), and the
+staged long-context runs rely on it (see Verification). A failed write is a cache miss reported
 on stderr, not a request error. Trim keeps an in-memory index of the
 directory instead of re-reading every snapshot header after each store.
 
@@ -2548,7 +2586,9 @@ cache snapshot was read back to host memory right after prefill and held
 through the whole decode until the request ended; the request now pins an
 81 MB recurrent checkpoint instead and reads the snapshot at the end, from that
 checkpoint and the live K/V prefix, which decode never rewrites. The peak is
-that end-of-request readback (673 MB) on its way to the disk writer.
+that end-of-request readback (673 MB) on its way to the disk writer; a
+request that already wrote a boundary skips it when no host tier keeps the
+snapshot (see Prompt cache).
 
 ## Performance
 

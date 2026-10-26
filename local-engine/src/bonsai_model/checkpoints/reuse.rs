@@ -90,8 +90,7 @@ impl BonsaiEngine {
                     return Ok((position, source));
                 }
                 rows_kept &= source == PromptCacheSource::Gpu;
-                // The failed entry is evicted, so ask again: a disk write in
-                // flight that it made not worth waiting for may now be.
+                // The failed entry is evicted, so ask again.
                 continue 'retry;
             }
             break;
@@ -101,10 +100,10 @@ impl BonsaiEngine {
     }
 
     /// Each tier's best entry for `prompt` as (tier, index, position),
-    /// longest first and in tier order on a tie. Waits for a disk write in
-    /// flight that would beat all of them, then counts it.
+    /// longest first and in tier order on a tie. A disk write still in flight
+    /// is not counted and not waited for (see [`Self::pending_disk_prefix`]).
     fn candidates(
-        &mut self,
+        &self,
         prompt: &[u32],
         bounds: &ReuseBounds,
         session_id: Option<&str>,
@@ -139,12 +138,6 @@ impl BonsaiEngine {
                 )
             })
             .map(|(index, snapshot)| (index, snapshot.state.position()));
-        let held = gpu
-            .into_iter()
-            .chain(host)
-            .map(|(_, position)| position)
-            .max();
-        self.await_pending_disk_write(prompt, bounds, held.unwrap_or(0));
         let disk = self
             .disk_snapshots
             .iter()
@@ -225,30 +218,54 @@ impl BonsaiEngine {
         None
     }
 
-    /// Wait for a disk write still in flight when it would beat every
-    /// committed snapshot for this prompt and the `held` tokens a faster tier
-    /// holds, then index it.
+    /// The length of a disk write still in flight that would restore more of
+    /// `prompt` than `held` tokens and every committed snapshot, without
+    /// waiting for it.
     ///
-    /// Writes run in the background, so a request that arrives right behind
-    /// the one that queued a snapshot could otherwise find it absent and
-    /// prefill from further back. Waiting costs at most the rest of that one
-    /// write; it is never paid when a committed snapshot or a faster tier
-    /// already holds as long a prefix, nor when no write is pending.
-    fn await_pending_disk_write(&mut self, prompt: &[u32], bounds: &ReuseBounds, held: usize) {
+    /// Writes run in the background, so a request admitted right behind the
+    /// one that queued a snapshot can find it absent and would prefill from
+    /// further back. Its first prefill step asks again and, when this finds
+    /// such a write, sits steps out while other requests decode or, with none
+    /// decoding, waits for it ([`Self::await_disk_prefix`]); admission never
+    /// waits, so the decoding requests never stall for the rest of the write.
+    pub(in crate::bonsai_model) fn pending_disk_prefix(
+        &mut self,
+        prompt: &[u32],
+        held: usize,
+    ) -> Option<usize> {
+        self.collect_disk_writes();
+        let usable = Self::disk_usable(prompt);
+        let committed = self.committed_disk_prefix(prompt).max(held);
+        self.disk_writer
+            .as_ref()?
+            .longest_pending(|tokens| tokens.len() > committed && usable(tokens))
+    }
+
+    /// Wait for the disk write [`Self::pending_disk_prefix`] finds, then
+    /// index it. Costs at most the rest of that one write.
+    pub(in crate::bonsai_model) fn await_disk_prefix(&mut self, prompt: &[u32], held: usize) {
         let Some(writer) = &self.disk_writer else {
             return;
         };
-        let usable =
-            |tokens: &[u32]| tokens.len() <= bounds.snapshot_reusable && prompt.starts_with(tokens);
-        let committed = self
-            .disk_snapshots
+        let usable = Self::disk_usable(prompt);
+        let committed = self.committed_disk_prefix(prompt).max(held);
+        writer.wait_for(|tokens| tokens.len() > committed && usable(tokens));
+        self.collect_disk_writes();
+    }
+
+    /// Whether a disk snapshot of `tokens` restores a prefix of `prompt`.
+    fn disk_usable(prompt: &[u32]) -> impl Fn(&[u32]) -> bool + '_ {
+        move |tokens| tokens.len() < prompt.len() && prompt.starts_with(tokens)
+    }
+
+    /// The longest committed disk snapshot that restores a prefix of `prompt`.
+    fn committed_disk_prefix(&self, prompt: &[u32]) -> usize {
+        let usable = Self::disk_usable(prompt);
+        self.disk_snapshots
             .iter()
             .filter(|snapshot| usable(&snapshot.tokens))
             .map(|snapshot| snapshot.tokens.len())
             .max()
             .unwrap_or(0)
-            .max(held);
-        writer.wait_for(|tokens| tokens.len() > committed && usable(tokens));
-        self.collect_disk_writes();
     }
 }

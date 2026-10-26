@@ -56,6 +56,9 @@ pub(super) struct ActiveGeneration {
     pub(super) lag: HeadLag,
     /// The prompt's remaining prefill, until its first sample is taken.
     pub(super) prefill: Option<PromptPrefill>,
+    /// Skip this step's prefill: a disk write that restores more of the
+    /// prompt is still in flight (see [`BonsaiEngine::refresh_prefix`]).
+    defer_prefill: bool,
     /// Prefill chunks reported to the caller.
     pub(super) prefill_chunks: usize,
     /// Running estimates of the chance a lookup or head draft is accepted,
@@ -135,9 +138,11 @@ impl BonsaiEngine {
     /// committed command buffer, so a trip submits no further work and leaves
     /// the K/V cache and position cursor on the last committed boundary.
     ///
-    /// A trip is the success value [`StopReason::Cancelled`], never an error,
-    /// and it clears the reusable prompt-cache tiers below, so a cancelled
-    /// request cannot poison the next one.
+    /// A trip is the success value [`StopReason::Cancelled`], never an error.
+    /// The GPU prompt-cache tier keeps the checkpoints of prefixes of the
+    /// prompt up to where the request stopped, whose K/V rows are intact, and
+    /// drops every other, so a cancelled request cannot poison the next one
+    /// and a retry still restores what it shares.
     pub fn generate_session_cancellable(
         &mut self,
         prompt: &[u32],
@@ -290,6 +295,7 @@ impl BonsaiEngine {
             state: None,
             lag: HeadLag::default(),
             prefill: None,
+            defer_prefill: false,
             prefill_chunks: 0,
             ngram_acceptance: INITIAL_NGRAM_ACCEPTANCE,
             mtp_acceptance: INITIAL_MTP_ACCEPTANCE,
@@ -313,7 +319,9 @@ impl BonsaiEngine {
     /// admission: requests admitted together that share a long uncached
     /// prefix (sub-agents fanned out at once) prefill one at a time, and each
     /// later one then starts from the snapshot the first left at that prefix
-    /// instead of prefilling it again.
+    /// instead of prefilling it again. While that snapshot's disk write is
+    /// still in flight, the generation skips its prefill each step another
+    /// request decodes, and waits for the write only when none does.
     pub(super) fn refresh_prefix(
         &mut self,
         generation: &mut ActiveGeneration,
@@ -325,10 +333,25 @@ impl BonsaiEngine {
         if plan.done() != reused {
             return Ok(());
         }
-        let best = self.reusable_prefix(&generation.prompt);
         // A restore costs in proportion to the prefix it copies, prefill in
         // proportion to the tokens it saves (about 8 ms against 0.1 ms each).
-        if best <= reused || (best - reused) * 64 < best {
+        let worth = |best: usize| best > reused && (best - reused) * 64 >= best;
+        let mut best = self.reusable_prefix(&generation.prompt);
+        let held = best.max(reused);
+        if self
+            .pending_disk_prefix(&generation.prompt, held)
+            .is_some_and(worth)
+        {
+            if self.active.iter().any(ActiveGeneration::decoding) {
+                // Waiting here would stall every decoding request for the
+                // rest of the write: sit this step out and ask again next one.
+                generation.defer_prefill = true;
+                return Ok(());
+            }
+            self.await_disk_prefix(&generation.prompt, held);
+            best = self.reusable_prefix(&generation.prompt);
+        }
+        if !worth(best) {
             return Ok(());
         }
         self.model.take_gpu_time();
@@ -350,6 +373,9 @@ impl BonsaiEngine {
         budget: usize,
         progress: &mut dyn FnMut(u64, PrefillProgress),
     ) -> crate::Result<()> {
+        if std::mem::take(&mut generation.defer_prefill) {
+            return Ok(());
+        }
         let Some(mut plan) = generation.prefill.take() else {
             return Ok(());
         };
@@ -381,7 +407,7 @@ impl BonsaiEngine {
         if self.model.take_cancel_observed() {
             // Prefill stopped between chunks, so `scratch.logits` holds no row
             // of this prompt: there is nothing to sample. The shared tail
-            // clears the prompt cache for a cancelled stop.
+            // drops the checkpoints past where it stopped.
             generation.stop_reason = StopReason::Cancelled;
             generation.done = true;
             return Ok(());
@@ -552,8 +578,8 @@ impl BonsaiEngine {
     }
 
     /// Close the resident `generation`: catch its state up to everything it
-    /// emitted and record it in the prompt cache, or clear the cache after a
-    /// cancellation.
+    /// emitted and record it in the prompt cache, or after a cancellation
+    /// drop what its prefill or decode overwrote.
     pub(super) fn finish_generation(
         &mut self,
         mut generation: ActiveGeneration,
@@ -579,7 +605,7 @@ impl BonsaiEngine {
             });
         }
         if generation.stop_reason == StopReason::Cancelled {
-            self.clear_gpu_cache();
+            self.keep_reached_prompt(prompt);
         } else {
             if self.model.speculation().is_some()
                 && generation.lag.usable()
@@ -599,27 +625,36 @@ impl BonsaiEngine {
                 self.cached_tokens.extend_from_slice(prompt);
                 self.cached_tokens.extend_from_slice(&token_ids);
                 let represented_tokens = self.cached_tokens.clone();
+                let tail = &prompt[..prompt.len() - 1];
+                // A request that persisted a boundary leaves its tail to the
+                // GPU checkpoint, which its session's next turn restores,
+                // unless that copy is already gone or about to be: another
+                // buffer set claimed the tier meanwhile, or another request
+                // is running, whose next milestone or end will.
+                let gpu_tail = self.holds_checkpoint(tail);
+                let persist =
+                    !generation.persisted_reusable_boundary || !gpu_tail || !self.active.is_empty();
+                let keep = self.host_would_keep(tail.len())
+                    || (persist && self.disk_would_keep(tail, false));
                 // The prompt boundary's snapshot, read back now that decode
-                // no longer needs the bandwidth.
+                // no longer needs the bandwidth, and only when a tier keeps it:
+                // at long prompts the copy is gigabytes on the engine thread.
                 let prompt_snapshot = match generation.prompt_snapshot.take() {
-                    Some(checkpoint) => self.model.prompt_snapshot_at(&checkpoint)?,
-                    None => None,
+                    Some(checkpoint) if keep => self.model.prompt_snapshot_at(&checkpoint)?,
+                    _ => None,
                 };
                 self.save_prompt_checkpoint(&represented_tokens, false)?;
                 if let Some(snapshot) = prompt_snapshot {
-                    self.save_session_snapshot(
-                        &prompt[..prompt.len() - 1],
-                        session_id,
-                        Some(snapshot),
-                        !generation.persisted_reusable_boundary,
-                        false,
-                    )?;
+                    self.save_session_snapshot(tail, session_id, Some(snapshot), persist, false)?;
+                }
+                if !persist && !self.host_would_keep(tail.len()) {
+                    self.owe_to_disk(tail, session_id);
                 }
                 // Chat templates re-render assistant turns, so the output end is
                 // rarely a later prefix: keep it in (volatile) host memory only.
                 self.save_session_snapshot(&represented_tokens, session_id, None, false, false)?;
             } else {
-                self.clear_gpu_cache();
+                self.keep_reached_prompt(prompt);
             }
         }
         stats.elapsed = generation.started.elapsed();

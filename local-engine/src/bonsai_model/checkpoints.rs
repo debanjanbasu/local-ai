@@ -1,6 +1,6 @@
 use super::{
-    BonsaiEngine, HostPromptSnapshot, PromptCacheSource, PromptCheckpoint, PromptSnapshot,
-    prompt_cache,
+    BonsaiEngine, HostPromptSnapshot, PROMPT_CHECKPOINT_BYTES, PromptCacheSource, PromptCheckpoint,
+    PromptSnapshot, prompt_cache,
 };
 const MAX_HOST_PROMPT_SNAPSHOTS: usize = 16;
 pub(super) struct SessionSnapshot {
@@ -14,6 +14,11 @@ pub(super) struct CachedCheckpoint {
     tokens: Vec<u32>,
     pub(super) state: PromptCheckpoint,
     reusable_boundary: bool,
+    /// A request tail no other tier holds: it is read back and written to
+    /// disk only when something is about to overwrite its K/V rows (see
+    /// [`BonsaiEngine::persist_owed_checkpoints`]).
+    owed_to_disk: bool,
+    session_id: Option<String>,
 }
 
 mod boundary;
@@ -38,6 +43,8 @@ impl BonsaiEngine {
             tokens: tokens.to_vec(),
             state: self.model.prompt_checkpoint()?,
             reusable_boundary,
+            owed_to_disk: false,
+            session_id: None,
         });
         if self.prompt_checkpoints.len() > self.max_prompt_checkpoints {
             // The disk tier's policy: a boundary a few tokens past a kept one
@@ -66,6 +73,7 @@ impl BonsaiEngine {
         session_id: Option<&str>,
     ) -> crate::Result<(PromptPrefill, PromptCacheSource)> {
         self.collect_disk_writes();
+        self.persist_owed_checkpoints(prompt)?;
         let bounds: ReuseBounds = self.reuse_bounds(prompt);
         let (reused, source) = self.restore_reusable_prefix(prompt, &bounds, session_id)?;
         Ok((self.plan_prefill(prompt, &bounds, reused), source))
@@ -165,20 +173,124 @@ impl BonsaiEngine {
         }
     }
 
-    /// Whether a committed disk boundary that `tokens` only barely extends
-    /// (see [`prompt_cache::barely_extends`]) already fills half the budget.
+    /// The bytes a snapshot of the first `tokens` prompt tokens holds, known
+    /// before it is read back: the recurrent state and head hidden row, and
+    /// each token's target and head K/V rows and id (about 38 KiB a token
+    /// with the head).
+    fn snapshot_bytes(&self, tokens: usize) -> u64 {
+        let head = if self.model.speculation().is_some() {
+            2 * local_metal::bonsai_ops::KvFormat::F16.token_bytes()
+        } else {
+            0
+        };
+        let per_token = self.model.kv_layout().token_bytes() * crate::bonsai::LAYERS
+            / crate::bonsai::FULL_INTERVAL
+            + head
+            + size_of::<u32>();
+        (PROMPT_CHECKPOINT_BYTES + tokens * per_token) as u64
+    }
+
+    /// Whether the host tier would keep a snapshot of `tokens` prompt tokens.
+    pub(super) fn host_would_keep(&self, tokens: usize) -> bool {
+        self.prompt_cache_bytes > 0 && self.snapshot_bytes(tokens) <= self.prompt_cache_bytes as u64
+    }
+
+    /// Whether the disk writer would keep a snapshot of `tokens` beside the
+    /// committed ones (see [`prompt_cache::would_admit`]): it refuses a
+    /// boundary that only barely extends a kept one when the two cannot both
+    /// fit, and a request tail behind boundaries that fill the budget.
+    pub(super) fn disk_would_keep(&self, tokens: &[u32], reusable_boundary: bool) -> bool {
+        self.prompt_cache_disk_bytes > 0
+            && self.prompt_cache_dir.is_some()
+            && prompt_cache::would_admit(
+                &self.disk_snapshots,
+                tokens,
+                self.snapshot_bytes(tokens.len()),
+                reusable_boundary,
+                self.prompt_cache_disk_bytes,
+            )
+    }
+
+    /// Whether the GPU tier holds a checkpoint of exactly `tokens`.
+    pub(super) fn holds_checkpoint(&self, tokens: &[u32]) -> bool {
+        self.prompt_checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.tokens == tokens)
+    }
+
+    /// Owe the request tail checkpointed at `tokens` to the disk tier: no
+    /// other tier holds it, and its GPU checkpoint is the snapshot the
+    /// session's next turn restores.
+    pub(super) fn owe_to_disk(&mut self, tokens: &[u32], session_id: Option<&str>) {
+        if let Some(checkpoint) = self
+            .prompt_checkpoints
+            .iter_mut()
+            .find(|checkpoint| !checkpoint.reusable_boundary && checkpoint.tokens == tokens)
+        {
+            checkpoint.owed_to_disk = true;
+            checkpoint.session_id = session_id.map(str::to_owned);
+        }
+    }
+
+    /// Before `prompt` runs on the resident set, write to disk each owed
+    /// checkpoint it is about to overwrite: one `prompt` does not extend,
+    /// whose K/V rows its prefill or decode rewrites. One `prompt` extends is
+    /// superseded by this request's own tail and owes nothing more.
     ///
-    /// A snapshot of `tokens` is at least as large as its ancestor's, so the
-    /// two cannot both fit, and the writer would refuse it to keep the
-    /// ancestor every request sharing `tokens` also shares.
-    pub(super) fn disk_ancestor_suffices(&self, tokens: &[u32]) -> bool {
-        self.disk_snapshots.iter().any(|entry| {
-            entry.reusable_boundary
-                && prompt_cache::barely_extends(tokens, &entry.tokens)
-                && std::fs::metadata(&entry.path).is_ok_and(|metadata| {
-                    metadata.len().saturating_mul(2) > self.prompt_cache_disk_bytes
-                })
-        })
+    /// Reading a request tail back costs about 38 KiB a token on the engine
+    /// thread, which an agent session's next turn, restoring the checkpoint
+    /// from the GPU, never needs. So a tail that also persisted a boundary is
+    /// read back only here, when a request of another session takes the set,
+    /// rather than at its end: dropped there, as it used to be, it was gone
+    /// for good once another session prefilled over it, and the session's next
+    /// turn fell back to a boundary turns older.
+    fn persist_owed_checkpoints(&mut self, prompt: &[u32]) -> crate::Result<()> {
+        if self.cache_state != self.model.state_id() {
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < self.prompt_checkpoints.len() {
+            let checkpoint = &mut self.prompt_checkpoints[index];
+            if !checkpoint.owed_to_disk || prompt.starts_with(&checkpoint.tokens) {
+                checkpoint.owed_to_disk = false;
+                index += 1;
+                continue;
+            }
+            let checkpoint = self.prompt_checkpoints.remove(index);
+            if !self.disk_would_keep(&checkpoint.tokens, false) {
+                continue;
+            }
+            // Purged by the OS, or no longer behind the set's position: a
+            // cache miss like any other.
+            if let Ok(Some(snapshot)) = self.model.prompt_snapshot_at(&checkpoint.state) {
+                self.save_session_snapshot(
+                    &checkpoint.tokens,
+                    checkpoint.session_id.as_deref(),
+                    Some(snapshot),
+                    true,
+                    false,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep what the resident set still holds after a request on it ended
+    /// without its position matching the tokens it emitted (cancelled, or
+    /// with rows committed past its last emitted token): its K/V rows hold
+    /// the prompt up to the position it reached, so the checkpoints of
+    /// prefixes of that, and only they, still restore.
+    /// The tier is left alone when it describes another set, which the
+    /// request never touched.
+    pub(super) fn keep_reached_prompt(&mut self, prompt: &[u32]) {
+        if self.cache_state != self.model.state_id() {
+            return;
+        }
+        let reached = &prompt[..self.model.position().min(prompt.len())];
+        self.cached_tokens.clear();
+        self.cached_tokens.extend_from_slice(reached);
+        self.prompt_checkpoints
+            .retain(|checkpoint| reached.starts_with(&checkpoint.tokens));
     }
 
     /// Index the disk snapshots the writer has committed since the last call,
