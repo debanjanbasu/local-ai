@@ -9,13 +9,13 @@ use zstd::stream::write::Encoder;
 
 use local_engine::{Event, EventStream, Signal, Stats, ToolCall};
 
-use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, checked,
     event_wait, logprob_json, usage_json,
 };
 use super::responses::ResponsesState;
+use super::{Admitted, Foreground, Generation};
 
 /// Body bytes written per frame when the generation is outrunning the clock.
 ///
@@ -572,9 +572,14 @@ pub(super) async fn start_chunked(
     mut events: EventStream,
     reply: Reply,
     admitted: Admitted,
+    foreground: &std::sync::Arc<Foreground>,
     stall: Duration,
     zstd: bool,
 ) -> Result<(mpsc::Receiver<Result<Bytes, std::io::Error>>, bool), String> {
+    // Held here, not by the blocking task: a client that leaves while the
+    // request is queued drops this future and the guard with it, which
+    // cancels the job the task is waiting on (see [`Generation`]).
+    let generation = foreground.track(events.cancel_handle());
     // Unbounded for the same reason the streaming path's first event is: it is
     // prefill, not a stall, and `response::event_wait` is the same rule.
     let (first, events) = tokio::task::spawn_blocking(move || {
@@ -596,7 +601,9 @@ pub(super) async fn start_chunked(
     let (sender, receiver) = mpsc::channel(1);
     // Detached, because this function returns the receiver and the pump owns the
     // only `EventStream`; the receiver is what ends the pump.
-    tokio::task::spawn_blocking(move || pump(first, events, body, sender, admitted, stall));
+    tokio::task::spawn_blocking(move || {
+        pump(first, events, body, sender, (admitted, generation), stall);
+    });
     Ok((receiver, compressed))
 }
 
@@ -613,8 +620,9 @@ pub(super) async fn start_chunked(
 /// which is what the stall budget in `send_frame` is for, and the pump logs it as
 /// the streaming path does rather than dropping a generation silently.
 ///
-/// `_admission` is a drop guard held for the pump's lifetime, so the queue slot is
-/// released exactly when this function returns, on every path out of it.
+/// `_guards` are drop guards held for the pump's lifetime, so the queue slot is
+/// released, and the generation's cancellation and shutdown tracking end,
+/// exactly when this function returns, on every path out of it.
 // `model`, `sender` and `stall` are owned because the detached task has to keep
 // all three alive for the whole pump; none is consumed by the body.
 #[allow(clippy::needless_pass_by_value)]
@@ -623,7 +631,7 @@ fn pump(
     mut events: EventStream,
     mut body: Body,
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
-    _admission: Admitted,
+    _guards: (Admitted, Generation),
     stall: Duration,
 ) {
     let mut queued = Some(first);

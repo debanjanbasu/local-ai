@@ -843,8 +843,13 @@ the level.
 The engine decodes up to eight requests together (see
 [Concurrent requests](#concurrent-requests)) and queues eight more behind them;
 submission to a full queue fails immediately. Dropping an `EventStream`, using
-its cancellation handle, or disconnecting a streaming client cooperatively
-cancels queued or running generation. A reset and a graceful close are both
+its cancellation handle, or disconnecting a client cooperatively cancels
+queued or running generation, also while it is still queued or prefilling and
+nothing has been sent. A streaming (SSE) response sends its headers at the
+first prefill boundary rather than the first token, and an SSE comment
+(`: keep-alive`) at every later boundary, as the non-streaming body sends
+whitespace, so a client that leaves during a long prefill fails a write and
+cancels it. A reset and a graceful close are both
 detected and release the engine promptly — a graceful close was caught after
 only 3,544 bytes — so `--stall-timeout` covers the one case neither of them
 reports: a client that stops reading while holding the socket open.

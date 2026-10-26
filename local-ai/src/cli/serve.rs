@@ -14,7 +14,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
-use local_engine::{ChatRequest, Engine, EngineHandle};
+use local_engine::{CancelHandle, ChatRequest, Engine, EngineHandle};
 
 use crate::resources::Resources;
 
@@ -123,6 +123,8 @@ struct AppState {
     background: Arc<Background>,
     /// Places for background-response streams ([`resume::MAX_SUBSCRIBERS`]).
     subscribers: Arc<tokio::sync::Semaphore>,
+    /// Foreground generations, cancelled at the shutdown drain deadline.
+    foreground: Arc<Foreground>,
     /// Where background `store: false` Responses are kept briefly; `None`
     /// when no private temporary store could be created.
     temporary: Option<Arc<Temporary>>,
@@ -184,6 +186,55 @@ impl QueueDepth {
 }
 
 struct Admitted(Arc<Depth>);
+
+/// The foreground generations running on this server (Chat Completions and
+/// Responses requests a client is waiting on), so shutdown can cancel those
+/// still running at its drain deadline.
+#[derive(Default)]
+struct Foreground {
+    next: std::sync::atomic::AtomicU64,
+    live: std::sync::Mutex<std::collections::HashMap<u64, CancelHandle>>,
+}
+
+impl Foreground {
+    /// Track the generation `cancel` controls until the returned guard drops.
+    fn track(self: &Arc<Self>, cancel: CancelHandle) -> Generation {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(id, cancel.clone());
+        Generation {
+            foreground: Arc::clone(self),
+            id,
+            cancel,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, CancelHandle>> {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One tracked foreground generation, cancelled when this guard drops.
+///
+/// The guard is what ties a generation to the request waiting for it. The
+/// request's handler holds it while the first signal is awaited on the
+/// blocking pool, so a client that leaves while its request is queued or
+/// prefilling drops the handler, and with it the guard, which cancels the job
+/// that thread is still waiting on. The body pump then holds it until the
+/// body ends. Cancelling a generation that already ended does nothing.
+struct Generation {
+    foreground: Arc<Foreground>,
+    id: u64,
+    cancel: CancelHandle,
+}
+
+impl Drop for Generation {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.foreground.lock().remove(&self.id);
+    }
+}
 
 impl Drop for Admitted {
     fn drop(&mut self) {
@@ -574,7 +625,7 @@ async fn dispatch(
     }
     let admitted = state.depth.admit();
     if stream {
-        match start_stream(events, reply, admitted, state.stall).await {
+        match start_stream(events, reply, admitted, &state.foreground, state.stall).await {
             Ok(events) => event_stream(events, &state),
             Err(error) => {
                 error_response(error_status_message(&error), &error, &state, &parts.headers).await
@@ -587,7 +638,15 @@ async fn dispatch(
         // request here and reported back from the body, because the response may
         // only claim an encoding it is really using.
         let zstd = wants_zstd(&parts.headers);
-        match start_chunked(events, reply, admitted, state.stall, zstd).await {
+        let started = start_chunked(
+            events,
+            reply,
+            admitted,
+            &state.foreground,
+            state.stall,
+            zstd,
+        );
+        match started.await {
             Ok((frames, compressed)) => {
                 let mut response = Response::new(Body::from_stream(ReceiverStream::new(frames)));
                 response.headers_mut().insert(
@@ -1272,6 +1331,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         cipher,
         background: Arc::default(),
         subscribers: Arc::new(tokio::sync::Semaphore::new(resume::MAX_SUBSCRIBERS)),
+        foreground: Arc::default(),
         temporary: temporary.clone(),
         decisions: decisions.clone(),
         services: Some(services),
