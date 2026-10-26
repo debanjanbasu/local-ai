@@ -2670,6 +2670,15 @@ Sleep and competing builds remain timing-validity guards. `--allow-busy`
 bypasses the load/build guards and downgrades sleep failures to warnings with
 an `UNTRUSTED` result. There is no background power-polling loop.
 
+Release builds use fat LTO, one codegen unit and a stripped symbol table
+(`[profile.release]` in `Cargo.toml`). Against the previous thin-local,
+16-unit, unstripped profile the `local-ai` binary shrinks from 38.5 MB to
+23.5 MB, and decode is unchanged: 37.38 and 37.30 against 37.41 and 37.26
+tok/s best (`tools/benchmark.py --rounds 2 --max-tokens 300`, binaries
+interleaved), as expected for an engine that spends 97-98% of decode on the
+GPU. The cost is build time: about 3 minutes for a full `--release` build or
+test run, and every relink repeats whole-program optimization.
+
 | Workload | Result | Source |
 | --- | ---: | --- |
 | Plain short-prompt decode, six-prompt geomean | 30.4–32.3 tok/s | best-of-two A/B runs below, across recent kernel changes |
@@ -3311,14 +3320,6 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
 
-- Fat LTO with one codegen unit for the release profile (October 2026, M4
-  Pro): the binary shrinks from 38.6 MB to 27.7 MB, but rendering and
-  tokenizing a ~130K-token prompt (`local-ai bonsai --tokenize`) takes
-  0.35–0.44 s either way (identical tokens), while every build, incremental
-  ones included, re-runs whole-program optimization at link time. Decode
-  is GPU-bound, so nothing on the host path measured faster. `panic =
-  "abort"` is not an option regardless: JPEG decoding catches mozjpeg's
-  unwinding errors.
 - Pooled Bonsai hidden states as retrieval embeddings (October 2026):
   BEIR SciFact, all 300 test queries against a 1,000-document subset (the
   283 relevant abstracts plus 717 random others, title and abstract,

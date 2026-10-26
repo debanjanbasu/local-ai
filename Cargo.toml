@@ -41,3 +41,13 @@ half = { version = "2.7", features = ["use-intrinsics", "zerocopy", "bytemuck"] 
 bytemuck = { version = "1.25", features = ["aarch64_simd", "derive", "latest_stable_rust"] }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 sha2 = "0.11"
+
+# Every `--release` build, tests included: whole-program optimization across
+# every crate and std (build-std), one codegen unit, and no symbol table, for
+# the smallest binary (backtraces therefore show addresses, not names).
+# `panic = "abort"` is deliberately absent: JPEG decoding catches mozjpeg's
+# unwinding errors (local-engine/Cargo.toml).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
