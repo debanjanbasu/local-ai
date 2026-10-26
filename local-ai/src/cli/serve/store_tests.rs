@@ -1083,3 +1083,349 @@ fn a_sweep_removes_crash_leftovers_and_spent_lease_sidecars() {
     assert!(store.lease("resp_done").expect("lease").is_none());
     drop(again);
 }
+
+/// A string of `len` bytes, different for each `seed`, standing in for an
+/// image sent inline.
+fn data_url(len: usize, seed: u8) -> String {
+    let mut url = format!("data:image/png;base64,{seed:03}");
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut state = u32::from(seed).wrapping_mul(2_654_435_761) | 1;
+    while url.len() < len {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        url.push(char::from(alphabet[(state >> 26) as usize]));
+    }
+    url
+}
+
+/// The blob files in `dir`.
+fn blob_files(dir: &Path) -> Vec<PathBuf> {
+    let mut blobs = std::fs::read_dir(dir)
+        .expect("listed")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.to_string_lossy().ends_with(".blob"))
+        .collect::<Vec<_>>();
+    blobs.sort();
+    blobs
+}
+
+/// The links record `id` has to blobs.
+fn link_files(dir: &Path, id: &str) -> Vec<PathBuf> {
+    let prefix = format!(".{id}.");
+    let mut links = std::fs::read_dir(dir)
+        .expect("listed")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| {
+            let name = path.file_name().expect("name").to_string_lossy();
+            name.starts_with(&prefix) && name.ends_with(".ref")
+        })
+        .collect::<Vec<_>>();
+    links.sort();
+    links
+}
+
+/// A user message carrying `images` inline.
+fn image_message(id: &str, images: &[&str]) -> Value {
+    let mut content = vec![json!({"type":"input_text","text":"what is this?"})];
+    content.extend(
+        images
+            .iter()
+            .map(|url| json!({"type":"input_image","image_url":url,"detail":"auto"})),
+    );
+    json!({"id":id,"type":"message","role":"user","content":content})
+}
+
+#[test]
+fn large_values_round_trip_through_blobs_byte_for_byte() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let image = data_url(64 * 1024, 1);
+    let long_answer = "Ünïcödé answer ✓ ".repeat(2048);
+    let just_below = "b".repeat(16 * 1024 - 1);
+    let mut response = record("resp_large", true, "queued");
+    response["output"][0]["content"] =
+        json!([{"type":"output_text","text":long_answer,"annotations":[]}]);
+    // Keys a JSON pointer must escape, and the same value twice.
+    response["metadata"] = json!({"a/b~c": image, "short": just_below});
+    let input_items = vec![image_message("msg_0", &[&image, &image])];
+    let request = json!({"input":input_items, "background":true});
+    let creator = json!({"project_id":"proj_1","api_key_id":"key_1"});
+    store
+        .save_with(&response, &input_items, Some((&request, Some(&creator))))
+        .expect("saved");
+
+    let stored = scratch
+        .open()
+        .load("resp_large")
+        .expect("readable")
+        .expect("stored");
+    assert_eq!(stored.response, response);
+    assert_eq!(stored.input_items, input_items);
+    assert_eq!(stored.request, Some(request));
+    assert_eq!(stored.creator, Some(creator));
+    // What the endpoints serialize is what was saved, byte for byte.
+    assert_eq!(stored.response.to_string(), response.to_string());
+    assert_eq!(
+        Value::Array(stored.input_items).to_string(),
+        Value::Array(input_items).to_string()
+    );
+
+    // The image (five places) and the answer are stored once each; the
+    // string just below the threshold stays inline.
+    let blobs = blob_files(&scratch.0);
+    assert_eq!(blobs.len(), 2, "{blobs:?}");
+    assert_eq!(link_files(&scratch.0, "resp_large").len(), 2);
+    let raw = std::fs::read_to_string(scratch.0.join("resp_large.json")).expect("record");
+    assert!(!raw.contains(&image) && !raw.contains(&long_answer));
+    assert!(raw.contains(&just_below));
+    let on_disk: Value = serde_json::from_str(&raw).expect("JSON");
+    assert_eq!(
+        on_disk["version"], 2,
+        "a binary that reads only version 1 refuses it"
+    );
+    assert_eq!(on_disk["blobs"].as_object().expect("references").len(), 6);
+    #[cfg(unix)]
+    for blob in &blobs {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = std::fs::metadata(blob).expect("blob");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "{}",
+            blob.display()
+        );
+        assert_eq!(metadata.nlink(), 2, "the blob and the record's link");
+    }
+
+    // A record without large values is still written as version 1.
+    store
+        .save(&record("resp_small", false, "completed"), &input())
+        .expect("saved");
+    let raw = std::fs::read_to_string(scratch.0.join("resp_small.json")).expect("record");
+    let on_disk: Value = serde_json::from_str(&raw).expect("JSON");
+    assert_eq!(on_disk["version"], 1);
+    assert!(on_disk.get("blobs").is_none());
+}
+
+#[test]
+fn every_turn_of_a_conversation_shares_one_blob_per_image() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let image = data_url(256 * 1024, 2);
+    let mut history = vec![image_message("msg_u0", &[&image])];
+    for turn in 0..20 {
+        let id = format!("resp_turn{turn:02}");
+        let mut response = record(&id, false, "completed");
+        response["output"][0]["id"] = json!(format!("msg_a{turn}"));
+        store.save(&response, &history).expect("saved");
+        history.extend(
+            response["output"]
+                .as_array()
+                .expect("output")
+                .iter()
+                .cloned(),
+        );
+        history.push(json!({"id":format!("msg_u{}", turn + 1),"type":"message",
+            "role":"user","content":"and then?"}));
+    }
+    assert_eq!(blob_files(&scratch.0).len(), 1);
+    assert_eq!(link_files(&scratch.0, "resp_turn07").len(), 1);
+    let records = (0..20)
+        .map(|turn| scratch.0.join(format!("resp_turn{turn:02}.json")))
+        .collect::<Vec<_>>();
+    for path in &records {
+        let len = std::fs::metadata(path).expect("record").len();
+        assert!(len < 16 * 1024, "{} is {len} bytes", path.display());
+    }
+    let reopened = scratch.open();
+    let last = reopened
+        .load("resp_turn19")
+        .expect("readable")
+        .expect("stored");
+    assert_eq!(last.input_items[0], image_message("msg_u0", &[&image]));
+    assert_eq!(last.input_items.len(), 39);
+    // Each record still loads on its own, whatever became of the others.
+    for turn in 1..20 {
+        assert!(
+            reopened
+                .delete(&format!("resp_turn{turn:02}"))
+                .expect("deleted")
+        );
+    }
+    let first = reopened
+        .load("resp_turn00")
+        .expect("readable")
+        .expect("stored");
+    assert_eq!(first.input_items, vec![image_message("msg_u0", &[&image])]);
+    assert_eq!(blob_files(&scratch.0).len(), 1, "still referenced");
+}
+
+#[test]
+fn deleting_and_pruning_collect_only_unreferenced_blobs() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let (shared, own, other) = (
+        data_url(20 * 1024, 3),
+        data_url(20 * 1024, 4),
+        data_url(20 * 1024, 5),
+    );
+    let save = |id: &str, images: &[&str], age: u64| {
+        let mut response = record(id, false, "completed");
+        response["created_at"] = json!(super::response::unix_now() - age);
+        store
+            .save(&response, &[image_message("msg_0", images)])
+            .expect("saved");
+    };
+    let day = 86_400;
+    save("resp_first", &[&shared], 0);
+    save("resp_second", &[&shared, &own], 0);
+    save("resp_old", &[&other], 31 * day);
+    age_file(&scratch.0.join("resp_old.json"), 31 * day);
+    save("resp_plain", &[], 0);
+    assert_eq!(blob_files(&scratch.0).len(), 3);
+
+    assert!(store.delete("resp_first").expect("deleted"));
+    assert_eq!(blob_files(&scratch.0).len(), 3, "all still referenced");
+    assert!(store.delete("resp_second").expect("deleted"));
+    assert_eq!(
+        blob_files(&scratch.0).len(),
+        1,
+        "only the old record's left"
+    );
+    assert!(!store.delete("resp_second").expect("no error"));
+
+    let removed = store
+        .prune(std::time::Duration::from_secs(30 * day))
+        .expect("pruned");
+    assert_eq!(removed, 1);
+    assert!(
+        blob_files(&scratch.0).is_empty(),
+        "collected with its record"
+    );
+    assert!(store.load("resp_plain").expect("readable").is_some());
+
+    // A blob a record names is never collected; the record holds it through
+    // its own link, without which it cannot be loaded.
+    save("resp_kept", &[&own], 0);
+    drop(scratch.open());
+    let blobs = blob_files(&scratch.0);
+    assert_eq!(blobs.len(), 1, "referenced: kept by a sweep");
+    std::fs::remove_file(&blobs[0]).expect("removed");
+    let stored = store.load("resp_kept").expect("readable").expect("stored");
+    assert_eq!(stored.input_items, [image_message("msg_0", &[&own])]);
+    for link in link_files(&scratch.0, "resp_kept") {
+        std::fs::remove_file(link).expect("removed");
+    }
+    let error = store.load("resp_kept").expect_err("blob missing");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("missing blob"), "{error}");
+}
+
+#[test]
+fn a_blob_left_by_a_crash_before_its_record_is_collected() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    store
+        .save(
+            &record("resp_kept", false, "completed"),
+            &[image_message("msg_0", &[&data_url(20 * 1024, 6)])],
+        )
+        .expect("saved");
+    let kept = blob_files(&scratch.0);
+    // A crash after a blob was written and before its record was renamed
+    // into place: the blob is durable, the record never appeared. And one
+    // in the middle of writing a blob, and a blob being written now.
+    store
+        .save(
+            &record("resp_crashed", false, "completed"),
+            &[image_message("msg_0", &[&data_url(20 * 1024, 7)])],
+        )
+        .expect("saved");
+    std::fs::remove_file(scratch.0.join("resp_crashed.json")).expect("unsaved");
+    let crashed_links = link_files(&scratch.0, "resp_crashed");
+    assert_eq!(crashed_links.len(), 1);
+    let orphan = blob_files(&scratch.0)
+        .into_iter()
+        .find(|blob| !kept.contains(blob))
+        .expect("orphan");
+    let name = orphan.file_name().expect("name").to_string_lossy();
+    let digest = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".blob"))
+        .expect("digest");
+    let partial = scratch.0.join(format!(".{digest}.0123abcd.tmp"));
+    let in_flight = scratch.0.join(format!(".{digest}.4567ef01.tmp"));
+    for path in [&partial, &in_flight] {
+        std::fs::write(path, "data:").expect("planted");
+    }
+    age_file(&partial, 2 * 3600);
+    drop(scratch.open());
+    assert!(!orphan.exists(), "unreferenced: collected at once");
+    assert!(!crashed_links[0].exists(), "a link without its record goes");
+    assert!(!partial.exists(), "stale temporary removed");
+    assert!(in_flight.exists(), "a save may still be writing it");
+    assert_eq!(blob_files(&scratch.0), kept);
+    assert!(store.load("resp_kept").expect("readable").is_some());
+}
+
+#[test]
+fn records_written_before_blobs_load_unchanged() {
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(&scratch.0).expect("dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only");
+    }
+    // As the previous release wrote it: one file, the image inline.
+    let response = record("resp_legacy", false, "completed");
+    let input_items = vec![image_message("msg_0", &[&data_url(64 * 1024, 8)])];
+    let path = scratch.0.join("resp_legacy.json");
+    let bytes = json!({
+        "object":"local_ai.stored_response",
+        "version":1,
+        "response":response,
+        "input_items":input_items,
+    })
+    .to_string();
+    std::fs::write(&path, &bytes).expect("written");
+    let store = scratch.open();
+    let stored = store
+        .load("resp_legacy")
+        .expect("readable")
+        .expect("stored");
+    assert_eq!(stored.response, response);
+    assert_eq!(stored.input_items, input_items);
+    assert_eq!(std::fs::read_to_string(&path).expect("kept"), bytes);
+    assert_eq!(blob_files(&scratch.0), Vec::<PathBuf>::new());
+    assert!(store.delete("resp_legacy").expect("deleted"));
+    assert!(store.load("resp_legacy").expect("readable").is_none());
+}
+
+#[test]
+fn collection_never_takes_a_blob_a_save_is_about_to_name() {
+    let scratch = Scratch::new();
+    let image = data_url(20 * 1024, 9);
+    // Two stores over one directory, as two servers: each saves records
+    // naming the same blob and deletes them again, which collects it
+    // whenever no record names it.
+    std::thread::scope(|scope| {
+        for writer in ["a", "b"] {
+            let store = scratch.open();
+            let image = &image;
+            scope.spawn(move || {
+                for round in 0..40 {
+                    let id = format!("resp_{writer}{round}");
+                    let input = [image_message("msg_0", &[image])];
+                    store
+                        .save(&record(&id, false, "completed"), &input)
+                        .expect("saved");
+                    let stored = store.load(&id).expect("loads").expect("stored");
+                    assert_eq!(stored.input_items, input);
+                    assert!(store.delete(&id).expect("deleted"));
+                }
+            });
+        }
+    });
+    assert_eq!(blob_files(&scratch.0), Vec::<PathBuf>::new());
+}

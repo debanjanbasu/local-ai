@@ -548,12 +548,40 @@ reported as failed rather than as stored (background responses differ; see
 below). Each record is one JSON file holding the final response and its
 resolved input (the earlier response's input and output, then
 this request's items), so a follow-up never walks a chain and deleting an
-earlier response does not break a later one. The cost is disk space: every
-record repeats the conversation before it, inline `input_image` data URLs
-included, so a conversation of `n` turns stores about `n²/2` turns (a 5 MB
-image sent in the first of 20 turns is stored 20 times, 100 MB). Records
+earlier response does not break a later one. Large values are stored once
+rather than once per turn: every string of 16 KiB or more (an inline
+`input_image` or `input_file` data URL, a long text or answer) goes to an
+owner-only content-addressed blob, `.{sha256}.blob`, and the record keeps
+the digest in its place, lists the places (`blobs`, JSON pointer to digest)
+and names each blob with a hard link of its own, `.{id}.{sha256}.ref`,
+through which it is loaded, so a record is its file and its links and loads
+without any other record. Below 16 KiB a blob's extra file, flush and open
+cost more than repeating the string (at most 320 KiB over 20 turns). A
+record with blobs is version 2, which binaries from before blobs refuse as
+"not a version 1 record" (a 500) rather than misread; a record without large
+strings is still version 1, and version 1 records load unchanged. Blobs and
+links are flushed, and the directory synced, before the record naming them
+is renamed into place, all under a shared lock on `.blobs.lock`; collection
+takes that lock exclusively, lists the directory and unlinks links whose
+record is gone and blobs no link names, on `DELETE` and in every sweep
+(store open and each pruning pass). So no blob is collected between being
+written for a record and the record appearing, a crash in between leaves an
+orphan the next sweep removes, and finding references opens no record. A
+20-turn conversation with a 5 MB image in its first turn takes 5.6 MB
+instead of 105 MB, and a record of it loads in 0.44 to 0.77 ms instead of
+0.89 to 1.6 ms. A save no longer rewrites the image but hashes it (SHA-256,
+1.8 ms per 5 MB) and syncs the directory once more for its link, which
+comes out about even: 14.5 to 17.2 ms a turn against 15.3 to 19.7 ms (six
+runs each, on a machine busy with other builds; fsync dominates). A
+`DELETE` costs a listing and a directory sync more (7.7 to 9.8 ms against
+5.2 to 6.5 ms). Opening a store of 2,000 records whose 100 conversations
+each carry an image takes 7.0 to 9.7 ms instead of 1.3 to 2.9 ms, two
+listings of a directory with a link per record and no record opened
+(reading each record's references instead took 0.3 to 1.4 s here, where
+opening a file costs about 0.1 ms); a store without blobs opens as before,
+in 1.2 to 1.6 ms. Records
 contain prompts, tool results and the model's raw reasoning in plain text. The
-directory is created `0700` and records `0600`; that is owner-only local data,
+directory is created `0700` and records and blobs `0600`; that is owner-only local data,
 not encryption at rest. Only `resp_` IDs of ASCII letters and digits ever reach the filesystem.
 
 `previous_response_id` carries over conversation items only: the earlier

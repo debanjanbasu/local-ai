@@ -7,9 +7,36 @@
 //! prior response's input and output followed by this request's own items.
 //! Replaying `previous_response_id` therefore reads exactly one file and never
 //! walks a chain, and deleting an earlier response does not break a later one
-//! that already carries its history. The price is disk space: every turn of a
-//! conversation repeats all of the turns before it, inline images (data URLs)
-//! included, so a conversation of `n` turns stores about `n²/2` turns' worth.
+//! that already carries its history.
+//!
+//! Carrying the history would store a conversation's large values (inline
+//! images and files as data URLs, long texts) once per turn, so every string
+//! of at least [`BLOB_MIN_LEN`] bytes is kept once instead, in an owner-only
+//! content-addressed blob, `.{sha256}.blob`, holding its UTF-8 bytes. The
+//! record keeps the digest in the string's place and lists every such place
+//! in a `blobs` member, `{JSON pointer: digest}`, and is version
+//! [`BLOB_RECORD_VERSION`]: a binary that reads only version 1 refuses it as
+//! not a version 1 record rather than misreading it. A record without large
+//! strings is still written as version 1, and version 1 records load
+//! unchanged.
+//!
+//! A record names each of its blobs with a hard link, `.{id}.{sha256}.ref`,
+//! and is loaded through those: a record is its file and its links, and
+//! loading it reads no other record's files, nor even the blob's own name.
+//! The links are also the store's reference list, in file names: a blob is
+//! referenced while a link to it has its record, so collecting unreferenced
+//! blobs needs one listing of the directory and opens no record. Deleting a
+//! record unlinks its links and any blob no other record links, and every
+//! sweep collects the links of records that are gone (one a writer without
+//! blobs deleted) and the blobs they leave unlinked.
+//!
+//! Collection holds an exclusive lock on `.blobs.lock` from its listing to
+//! its last unlink, and a save that names blobs holds it shared from writing
+//! (or finding) its blobs and links until its record is renamed into place,
+//! so collection never sees a link whose record is about to appear. Blobs
+//! and links are durable before the record naming them is renamed, so a
+//! crash between the two leaves only a link without its record and perhaps
+//! a blob, which the next sweep collects.
 //!
 //! The records hold user prompts, tool results and the model's raw reasoning
 //! in plain text. That is protected local data, not encrypted data: the
@@ -59,6 +86,7 @@
 //! records that have one too. Every other record is never opened.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
@@ -74,6 +102,30 @@ use super::response::new_id;
 
 /// Version of the on-disk record layout, checked on read.
 const RECORD_VERSION: u64 = 1;
+
+/// Version of a record that keeps some of its strings in blobs. Binaries
+/// that predate blobs accept only [`RECORD_VERSION`], so they refuse it.
+const BLOB_RECORD_VERSION: u64 = 2;
+
+/// Shortest string a record keeps in a blob rather than inline.
+///
+/// A blob costs files of its own: on first write a create, a flush to disk
+/// and a directory sync, for every record naming it a link and a directory
+/// sync, and on every load an open and a read. Inline, a string
+/// costs its length once per later turn of its conversation, and 16 KiB in
+/// each record of a 20-turn conversation is at most 320 KiB, so below this a
+/// blob saves little and costs a file. Images and files sent inline as data
+/// URLs, and long texts, are far longer.
+const BLOB_MIN_LEN: usize = 16 * 1024;
+
+/// Suffix of a blob, `.{sha256}.blob`.
+const BLOB_SUFFIX: &str = ".blob";
+
+/// Suffix of a record's hard link to a blob it names, `.{id}.{sha256}.ref`.
+const LINK_SUFFIX: &str = ".ref";
+
+/// The lock that saves naming blobs share and collection takes alone.
+const BLOB_LOCK: &str = ".blobs.lock";
 
 /// Suffix of a record being written. A leading dot keeps it apart from IDs.
 const TEMPORARY_SUFFIX: &str = ".tmp";
@@ -225,6 +277,10 @@ struct Listing {
     sidecars: BTreeSet<String>,
     /// Temporary files of saves, with when each was last written.
     temporaries: Vec<(PathBuf, Option<SystemTime>)>,
+    /// The digest of every blob.
+    blobs: BTreeSet<String>,
+    /// Every record's links to blobs, as (ID, digest).
+    links: Vec<(String, String)>,
 }
 
 /// A stored Response and the resolved input it was generated from.
@@ -350,7 +406,9 @@ impl ResponseStore {
     /// one's sidecar is unlinked under its lease. With a `cutoff` (Unix
     /// seconds), every settled record created and last written before it is
     /// deleted with its sidecars; its file's modification time decides which
-    /// records are read at all. Returns how many records were deleted.
+    /// records are read at all. Returns how many records were deleted. If
+    /// there are blobs, those no record names are then collected, from a
+    /// listing alone.
     ///
     /// Records that cannot be read are skipped: they are not this pass's to
     /// judge, and `load` reports them to whoever asks for them. Failing to
@@ -418,7 +476,7 @@ impl ResponseStore {
                     header.created_at().is_some_and(|created| created < cutoff)
                 })
             {
-                if self.delete(id)? {
+                if self.remove(id)? {
                     removed += 1;
                 }
                 continue;
@@ -426,6 +484,13 @@ impl ResponseStore {
             if leased && let Err(error) = self.remove_lock(id) {
                 eprintln!("response {id}: lease sidecar not removed: {error}");
             }
+        }
+        // Collection lists the directory again under its lock, so a blob
+        // written since this listing is seen with the record naming it.
+        if !(listing.blobs.is_empty() && listing.links.is_empty())
+            && let Err(error) = self.collect_blobs()
+        {
+            eprintln!("response store: unreferenced blobs not removed: {error}");
         }
         Ok(removed)
     }
@@ -461,6 +526,19 @@ impl ResponseStore {
                 listing.sidecars.insert(id);
             } else if temporary_name(name) {
                 listing.temporaries.push((entry.path(), modified()));
+            } else if let Some(digest) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(BLOB_SUFFIX))
+                .filter(|digest| valid_digest(digest))
+            {
+                listing.blobs.insert(digest.to_owned());
+            } else if let Some((id, digest)) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(LINK_SUFFIX))
+                .and_then(|name| name.rsplit_once('.'))
+                .filter(|(id, digest)| valid_id(id) && valid_digest(digest))
+            {
+                listing.links.push((id.to_owned(), digest.to_owned()));
             }
         }
         Ok(listing)
@@ -484,12 +562,15 @@ impl ResponseStore {
             )
         })?;
         let named = header.field(|response| response.id.as_ref()) == Some(&json!(id));
-        if header.version == Some(RECORD_VERSION) && named {
+        if matches!(header.version, Some(RECORD_VERSION | BLOB_RECORD_VERSION)) && named {
             Ok(Some(header))
         } else {
             Err(std::io::Error::new(
                 ErrorKind::InvalidData,
-                format!("stored response {id} is not a version {RECORD_VERSION} record"),
+                format!(
+                    "stored response {id} is not a version {RECORD_VERSION} or \
+                     {BLOB_RECORD_VERSION} record"
+                ),
             ))
         }
     }
@@ -861,6 +942,20 @@ impl ResponseStore {
             let lock = self.lock_path(id).ok_or_else(|| invalid_id(id))?;
             open_private(&lock, Access::Lock)?;
         }
+        let mut references = serde_json::Map::new();
+        let mut blobs = HashMap::new();
+        externalize(&mut record, &mut String::new(), &mut references, &mut blobs);
+        // Held until the record is in place, so collection cannot take the
+        // links this record is about to name.
+        let blob_lock = if references.is_empty() {
+            None
+        } else {
+            record["version"] = json!(BLOB_RECORD_VERSION);
+            record["blobs"] = Value::Object(references);
+            let lock = self.blob_lock(false)?;
+            self.write_blobs(id, &blobs)?;
+            Some(lock)
+        };
         let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         let temporary = self
             .dir
@@ -871,7 +966,130 @@ impl ResponseStore {
             return Err(error);
         }
         sync_dir(&self.dir);
+        drop(blob_lock);
         Ok(())
+    }
+
+    fn blob_path(&self, digest: &str) -> PathBuf {
+        self.dir.join(format!(".{digest}{BLOB_SUFFIX}"))
+    }
+
+    /// Where record `id` links blob `digest`; `id` must be valid.
+    fn link_path(&self, id: &str, digest: &str) -> PathBuf {
+        self.dir.join(format!(".{id}.{digest}{LINK_SUFFIX}"))
+    }
+
+    /// The blob lock, held shared by a save that names blobs and
+    /// exclusively by collection, until the returned file is dropped.
+    fn blob_lock(&self, exclusive: bool) -> std::io::Result<fs::File> {
+        let file = open_private(&self.dir.join(BLOB_LOCK), Access::Lock)?;
+        if exclusive {
+            file.lock()?;
+        } else {
+            file.lock_shared()?;
+        }
+        Ok(file)
+    }
+
+    /// Give record `id` a link to every blob in `blobs` (by digest),
+    /// durably, writing the blobs that are not stored yet. The caller holds
+    /// the blob lock shared.
+    ///
+    /// A blob is written like a record, to a temporary file renamed over
+    /// its name, so a blob by that name is always whole; one that is the
+    /// wrong length, or not an owner-only regular file, is replaced. A link
+    /// is another name for the blob's file, so the record holds its content
+    /// whatever becomes of the blob's own name.
+    fn write_blobs(&self, id: &str, blobs: &HashMap<String, String>) -> std::io::Result<()> {
+        let whole = |path: &Path, content: &str| {
+            open_private(path, Access::Read)
+                .and_then(|file| file.metadata())
+                .is_ok_and(|metadata| metadata.len() == content.len() as u64)
+        };
+        let mut written = false;
+        for (digest, content) in blobs {
+            let link = self.link_path(id, digest);
+            if whole(&link, content) {
+                continue;
+            }
+            let blob = self.blob_path(digest);
+            if !whole(&blob, content) {
+                let temporary = self
+                    .dir
+                    .join(format!(".{digest}.{}{TEMPORARY_SUFFIX}", new_id("")));
+                let saved = write_new(&temporary, content.as_bytes())
+                    .and_then(|()| fs::rename(&temporary, &blob));
+                if let Err(error) = saved {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+            }
+            remove_if_present(&link)?;
+            match fs::hard_link(&blob, &link) {
+                // Linked by another save of this record meanwhile.
+                Err(error) if error.kind() != ErrorKind::AlreadyExists => return Err(error),
+                _ => {}
+            }
+            written = true;
+        }
+        // The record naming these is renamed only after they are durable.
+        if written {
+            sync_dir(&self.dir);
+        }
+        Ok(())
+    }
+
+    /// The content of blob `digest`, through record `id`'s link to it.
+    /// `NotFound` when there is no such link.
+    fn read_blob(&self, id: &str, digest: &str) -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut open_private(&self.link_path(id, digest), Access::Read)?,
+            &mut bytes,
+        )?;
+        String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("blob {digest} is not UTF-8"),
+            )
+        })
+    }
+
+    /// Unlink every link whose record is gone, then every blob no remaining
+    /// link names, and return how many blobs went.
+    ///
+    /// Works from one listing of the directory, taken holding the blob lock
+    /// exclusively, so no save is between linking a blob and renaming the
+    /// record that names it: a link without its record is a deleted
+    /// record's, or a crashed save's. A link is kept while its record is,
+    /// even if a later save of the record no longer names the blob.
+    fn collect_blobs(&self) -> std::io::Result<usize> {
+        let _lock = self.blob_lock(true)?;
+        let listing = self.list(false)?;
+        let mut linked = BTreeSet::new();
+        let mut unlinked = false;
+        for (id, digest) in &listing.links {
+            if listing.records.contains_key(id) {
+                linked.insert(digest);
+            } else {
+                remove_if_present(&self.link_path(id, digest))?;
+                unlinked = true;
+            }
+        }
+        let mut removed = 0;
+        for digest in listing
+            .blobs
+            .iter()
+            .filter(|digest| !linked.contains(digest))
+        {
+            if remove_if_present(&self.blob_path(digest))? {
+                removed += 1;
+            }
+        }
+        if unlinked || removed > 0 {
+            sync_dir(&self.dir);
+        }
+        Ok(removed)
     }
 
     /// The stored response `id`; `None` when it is not stored, was deleted, or
@@ -892,6 +1110,21 @@ impl ResponseStore {
             )
         })?;
         let version = record.get("version").and_then(Value::as_u64);
+        if version == Some(BLOB_RECORD_VERSION) {
+            match self.resolve(id, &mut record) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    // Deleted, and its blobs collected, since it was read.
+                    if !path.exists() {
+                        return Ok(None);
+                    }
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        error.to_string(),
+                    ));
+                }
+                resolved => resolved?,
+            }
+        }
         let response = record.get_mut("response").map(Value::take);
         let input_items = record.get_mut("input_items").map(Value::take);
         let request = record.get_mut("request").map(Value::take);
@@ -904,9 +1137,11 @@ impl ResponseStore {
             .and_then(Value::as_str)
             .map(str::to_owned);
         match (version, response, input_items) {
-            (Some(RECORD_VERSION), Some(response), Some(Value::Array(input_items)))
-                if response.get("id").and_then(Value::as_str) == Some(id) =>
-            {
+            (
+                Some(RECORD_VERSION | BLOB_RECORD_VERSION),
+                Some(response),
+                Some(Value::Array(input_items)),
+            ) if response.get("id").and_then(Value::as_str) == Some(id) => {
                 Ok(Some(StoredResponse {
                     response,
                     input_items,
@@ -917,9 +1152,65 @@ impl ResponseStore {
             }
             _ => Err(std::io::Error::new(
                 ErrorKind::InvalidData,
-                format!("stored response {id} is not a version {RECORD_VERSION} record"),
+                format!(
+                    "stored response {id} is not a version {RECORD_VERSION} or \
+                     {BLOB_RECORD_VERSION} record"
+                ),
             )),
         }
+    }
+
+    /// Put back into `record` every string it keeps in a blob, removing its
+    /// reference list. `NotFound` when a link to a blob is missing.
+    fn resolve(&self, id: &str, record: &mut Value) -> std::io::Result<()> {
+        let corrupt = |why: String| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("stored response {id} is corrupt: {why}"),
+            )
+        };
+        let Some(Value::Object(references)) = record
+            .as_object_mut()
+            .and_then(|record| record.remove("blobs"))
+        else {
+            return Err(corrupt("it lists no blobs".into()));
+        };
+        let mut places = HashMap::<String, Vec<String>>::new();
+        for (pointer, digest) in references {
+            let Some(digest) = digest.as_str().filter(|digest| valid_digest(digest)) else {
+                return Err(corrupt(format!("{pointer} names no blob")));
+            };
+            places.entry(digest.to_owned()).or_default().push(pointer);
+        }
+        for (digest, pointers) in places {
+            let content = self.read_blob(id, &digest).map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    std::io::Error::new(
+                        ErrorKind::NotFound,
+                        format!("stored response {id} names a missing blob {digest}"),
+                    )
+                } else {
+                    corrupt(error.to_string())
+                }
+            })?;
+            let mut content = Some(content);
+            for (index, pointer) in pointers.iter().enumerate() {
+                let Some(slot) = record
+                    .pointer_mut(pointer)
+                    .filter(|slot| slot.as_str() == Some(digest.as_str()))
+                else {
+                    return Err(corrupt(format!("{pointer} does not hold blob {digest}")));
+                };
+                // The last place takes the content, the others a copy.
+                let value = if index + 1 == pointers.len() {
+                    content.take()
+                } else {
+                    content.clone()
+                };
+                *slot = Value::String(value.unwrap_or_default());
+            }
+        }
+        Ok(())
     }
 
     /// Delete the stored response `id`, its event journal, its hosted-tool
@@ -929,7 +1220,24 @@ impl ResponseStore {
     /// The record goes first: once it is gone the response is not found,
     /// whatever became of the rest, and a sidecar left by a failed unlink or
     /// a held lease is removed by the next sweep.
+    ///
+    /// Then, in a store that has had blobs, its links go, and every blob no
+    /// other record names; those a failure leaves are collected by the next
+    /// sweep.
     pub(super) fn delete(&self, id: &str) -> std::io::Result<bool> {
+        let found = self.remove(id)?;
+        if found
+            && fs::symlink_metadata(self.dir.join(BLOB_LOCK)).is_ok()
+            && let Err(error) = self.collect_blobs()
+        {
+            eprintln!("response {id}: unreferenced blobs not removed: {error}");
+        }
+        Ok(found)
+    }
+
+    /// [`Self::delete`], leaving the record's links and blobs to the
+    /// caller.
+    fn remove(&self, id: &str) -> std::io::Result<bool> {
         let (Some(path), Some(journal)) = (self.path(id), self.journal_path(id)) else {
             return Ok(false);
         };
@@ -977,16 +1285,73 @@ fn still_named(_file: &fs::File, _path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Whether `name` is a save's temporary file, `.{id}.{nonce}.tmp`.
+/// Whether `name` is a save's temporary file, `.{id}.{nonce}.tmp` for a
+/// record and `.{sha256}.{nonce}.tmp` for a blob.
 fn temporary_name(name: &str) -> bool {
     name.strip_prefix('.')
         .and_then(|name| name.strip_suffix(TEMPORARY_SUFFIX))
         .and_then(|name| name.rsplit_once('.'))
         .is_some_and(|(id, nonce)| {
-            valid_id(id)
+            (valid_id(id) || valid_digest(id))
                 && !nonce.is_empty()
                 && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
         })
+}
+
+/// Whether `digest` can name a blob: a SHA-256 in lowercase hex, so it
+/// never leaves the store as a path.
+fn valid_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The SHA-256 of `bytes`, in lowercase hex.
+fn hex_digest(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+/// Move every string of at least [`BLOB_MIN_LEN`] bytes under `value`, at
+/// JSON pointer `pointer`, into `blobs` by digest, leaving the digest in its
+/// place and the place in `references`.
+fn externalize(
+    value: &mut Value,
+    pointer: &mut String,
+    references: &mut serde_json::Map<String, Value>,
+    blobs: &mut HashMap<String, String>,
+) {
+    let len = pointer.len();
+    match value {
+        Value::String(text) if text.len() >= BLOB_MIN_LEN => {
+            let digest = hex_digest(text.as_bytes());
+            references.insert(pointer.clone(), json!(digest));
+            let text = std::mem::replace(text, digest.clone());
+            blobs.entry(digest).or_insert(text);
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                let _ = write!(pointer, "/{index}");
+                externalize(item, pointer, references, blobs);
+                pointer.truncate(len);
+            }
+        }
+        Value::Object(members) => {
+            for (key, member) in members.iter_mut() {
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                externalize(member, pointer, references, blobs);
+                pointer.truncate(len);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn invalid_id(id: &str) -> std::io::Error {
