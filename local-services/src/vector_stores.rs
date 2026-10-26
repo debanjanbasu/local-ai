@@ -938,9 +938,12 @@ impl Store {
         if query.filter.is_some() {
             return Err(invalid("filter applies only to vector store files"));
         }
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
+        // One snapshot: a store deleted between reading the window and
+        // loading it must not turn the listing into a not-found.
+        let snapshot = connection.transaction()?;
         let seq = |id: &str| {
-            connection
+            snapshot
                 .query_row("SELECT seq FROM vector_stores WHERE id = ?1", [id], |row| {
                     row.get::<_, i64>(0)
                 })
@@ -949,14 +952,14 @@ impl Store {
         };
         let window = Window::new(query, seq)?;
         let ids = window.ids(
-            &connection,
+            &snapshot,
             "SELECT id FROM vector_stores WHERE seq > ?1 AND seq < ?2",
             &[],
         )?;
         let (ids, has_more) = window.finish(ids);
         let data = ids
             .iter()
-            .map(|id| load_store(&connection, id))
+            .map(|id| load_store(&snapshot, id))
             .collect::<Result<Vec<_>>>()?;
         Ok(page(data, has_more, |store| store.id.clone()))
     }
@@ -1058,9 +1061,10 @@ impl Store {
         store_id: &str,
         query: &ListQuery,
     ) -> Result<Page<VectorStoreFile>> {
-        let connection = self.connection()?;
-        load_store(&connection, store_id)?;
-        list_files(&connection, store_id, None, query)
+        let mut connection = self.connection()?;
+        let snapshot = connection.transaction()?;
+        load_store(&snapshot, store_id)?;
+        list_files(&snapshot, store_id, None, query)
     }
 
     /// Replace a file's attributes.
@@ -1232,10 +1236,11 @@ impl Store {
         batch_id: &str,
         query: &ListQuery,
     ) -> Result<Page<VectorStoreFile>> {
-        let connection = self.connection()?;
-        load_store(&connection, store_id)?;
-        load_batch(&connection, store_id, batch_id)?;
-        list_files(&connection, store_id, Some(batch_id), query)
+        let mut connection = self.connection()?;
+        let snapshot = connection.transaction()?;
+        load_store(&snapshot, store_id)?;
+        load_batch(&snapshot, store_id, batch_id)?;
+        list_files(&snapshot, store_id, Some(batch_id), query)
     }
 
     /// Read and chunk a pending file, or say why it fails.
@@ -1741,6 +1746,8 @@ fn page<T>(data: Vec<T>, has_more: bool, id: impl Fn(&T) -> String) -> Page<T> {
     }
 }
 
+/// A page of a store's files; run it in one read transaction, so a file
+/// removed meanwhile cannot fail the listing.
 fn list_files(
     connection: &Connection,
     store_id: &str,
