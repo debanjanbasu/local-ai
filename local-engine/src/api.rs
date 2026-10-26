@@ -483,13 +483,14 @@ impl Engine {
         progress: &mut dyn FnMut(PrefillProgress),
         callback: impl FnMut(Event) -> ControlFlow<()>,
     ) -> crate::Result<Stats> {
-        let grammar = chat_grammar(self.inner.tokenizer(), request)?;
-        let prompt = chat_prompt(
-            self.inner.tokenizer(),
-            self.vision.as_deref(),
-            None,
-            request,
-        )?;
+        let (tools, grammar) = chat_grammar(self.inner.tokenizer(), request)?;
+        let encoding = Encoding {
+            vision: self.vision.as_deref(),
+            activity: None,
+            cancel: Some(cancel),
+            context: self.inner.info().context,
+        };
+        let prompt = chat_prompt(self.inner.tokenizer(), &encoding, request, tools)?;
         self.generate(
             &prompt.ids,
             prompt.images,
@@ -638,9 +639,9 @@ impl Engine {
 struct ChatJob {
     request: ChatRequest,
     grammar: Option<Grammar>,
-    /// The tokenized prompt of a request with images, encoded on the
-    /// submitting thread; the worker tokenizes every other request itself.
-    prompt: Option<ChatPrompt>,
+    /// The prompt, rendered, tokenized and (with images) encoded on the
+    /// submitting thread, so the worker only admits it.
+    prompt: ChatPrompt,
     events: async_mpsc::Sender<Delivered>,
     cancel: CancelToken,
 }
@@ -676,6 +677,9 @@ pub struct EngineHandle {
     prompt_cache: crate::prompt_cache::Closer,
     /// The vision tower, run on the submitting thread.
     vision: Option<Arc<VisionEncoder>>,
+    /// The worker engine's context, which a prompt with images must fit
+    /// before its images are encoded.
+    context: usize,
 }
 
 impl EngineHandle {
@@ -695,6 +699,7 @@ impl EngineHandle {
         let tokenizer = engine.inner.tokenizer().clone();
         let prompt_cache = engine.inner.prompt_cache_closer();
         let vision = engine.vision.clone();
+        let context = engine.inner.info().context;
         let (sender, receiver) = async_mpsc::channel::<Job>(SERVE_QUEUE);
         let activity = Arc::new(crate::activity::EngineActivity::default());
         let published = Arc::clone(&activity);
@@ -705,6 +710,7 @@ impl EngineHandle {
             activity,
             prompt_cache,
             vision,
+            context,
         }
     }
 
@@ -763,23 +769,36 @@ impl EngineHandle {
     /// # Ok::<(), local_engine::Error>(())
     /// ```
     ///
-    /// A request with images is rendered, tokenized and run through the
-    /// vision tower here as well (each image's embedding is cached for
-    /// reuse), yielding to running decode steps between GPU submissions;
-    /// an undecodable image or a missing projector fails this call.
+    /// The request is rendered and tokenized here too, never on the worker
+    /// thread that steps other generations; a request with images is also
+    /// run through the vision tower here (each image's embedding is cached
+    /// for reuse), yielding to running decode steps between GPU
+    /// submissions, once its whole prompt is known to fit the context. An
+    /// invalid request, an undecodable image, a prompt over the context or
+    /// a missing projector fails this call.
     pub fn chat(&self, request: ChatRequest) -> crate::Result<EventStream> {
-        let grammar = chat_grammar(&self.tokenizer, &request)?;
-        let prompt = has_images(&request)
-            .then(|| {
-                chat_prompt(
-                    &self.tokenizer,
-                    self.vision.as_deref(),
-                    Some(&self.activity),
-                    &request,
-                )
-            })
-            .transpose()?;
-        self.submit(|events, cancel| {
+        self.chat_with_cancel(request, &CancelHandle::new())
+    }
+
+    /// [`Self::chat`] with a cancellation control the caller holds before
+    /// the call returns: cancelling it stops a request's video decoding
+    /// between samples and its vision tower between submissions (the call
+    /// then fails), and afterwards cancels the queued or running generation
+    /// like the returned stream's own handle.
+    pub fn chat_with_cancel(
+        &self,
+        request: ChatRequest,
+        cancel: &CancelHandle,
+    ) -> crate::Result<EventStream> {
+        let (tools, grammar) = chat_grammar(&self.tokenizer, &request)?;
+        let encoding = Encoding {
+            vision: self.vision.as_deref(),
+            activity: Some(&self.activity),
+            cancel: Some(&cancel.cancel),
+            context: self.context,
+        };
+        let prompt = chat_prompt(&self.tokenizer, &encoding, &request, tools)?;
+        self.submit_with(cancel.cancel.clone(), |events, cancel| {
             Job::Chat(Box::new(ChatJob {
                 request,
                 grammar,
@@ -848,12 +867,13 @@ impl EngineHandle {
         })
     }
 
-    fn submit(
+    /// Queue the job `job` builds, cancelled through `cancel`.
+    fn submit_with(
         &self,
+        cancel: CancelToken,
         job: impl FnOnce(async_mpsc::Sender<Delivered>, CancelToken) -> Job,
     ) -> crate::Result<EventStream> {
         let (sender, receiver) = async_mpsc::channel::<Delivered>(EVENT_BUFFER);
-        let cancel = CancelToken::new();
         self.send(job(sender, cancel.clone()))?;
         Ok(EventStream {
             receiver,
@@ -920,12 +940,19 @@ impl Drop for PendingDecision {
 }
 
 /// Explicit cancellation control for a queued or running request.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct CancelHandle {
     cancel: CancelToken,
 }
 
 impl CancelHandle {
+    /// A control for a request not yet made, for
+    /// [`EngineHandle::chat_with_cancel`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Request cooperative cancellation.
     pub fn cancel(&self) {
         self.cancel.cancel();
@@ -1236,23 +1263,29 @@ impl Drop for EventStream {
     }
 }
 
-/// Render a request and validate its tools; the one path shared by the
-/// synchronous [`Engine`] and the worker.
+/// Render a request and validate its tools.
 pub fn prepare_chat(request: &ChatRequest) -> crate::Result<(String, Option<Arc<ToolSet>>)> {
     let tools = ToolSet::new(&request.tools)?;
+    let prompt = render_prompt(request, &tools)?;
+    Ok((prompt, (!tools.is_empty()).then(|| Arc::new(tools))))
+}
+
+/// Render a request with its validated `tools`; the one path shared by
+/// generation and counting.
+fn render_prompt(request: &ChatRequest, tools: &ToolSet) -> crate::Result<String> {
     let instructed = request.thinking || request.reasoning_instruction;
     let mut prompt = render_messages(
         &request.messages,
         instructed.then_some(request.effort),
         request.preserve_thinking,
-        &tools,
+        tools,
     )?;
     if instructed && !request.thinking {
         // The thinking opener `<think>\n` becomes the template's empty
         // reasoning block, `<think>\n\n</think>\n\n`, as with thinking off.
         prompt.push_str("\n</think>\n\n");
     }
-    Ok((prompt, (!tools.is_empty()).then(|| Arc::new(tools))))
+    Ok(prompt)
 }
 
 /// Tokenize a rendered prompt; every generation and count goes through
@@ -1285,48 +1318,97 @@ fn vision_required(vision: Option<&VisionEncoder>) -> crate::Result<&VisionEncod
     })
 }
 
-/// One image or video of a request, decoded and resized.
-enum Prepared {
-    Image(crate::bonsai_vision::PreparedImage),
+/// One image or video of a request, before any image pixel is decoded.
+enum Planned<'a> {
+    /// The file and its size from its header.
+    Image(&'a [u8], crate::bonsai_vision::ImageFile),
     Video(Arc<crate::bonsai_vision::PreparedVideo>),
 }
 
-/// Decode and resize every image and video of `request`, in prompt order.
-fn prepare_images(request: &ChatRequest) -> crate::Result<Vec<Prepared>> {
-    request
+/// Size every image of `request` from its header and prepare every video,
+/// in prompt order, within the per-request limits (see
+/// [`crate::bonsai_vision::MAX_REQUEST_PARTS`] and the limits beside it).
+fn plan_media<'a>(
+    request: &'a ChatRequest,
+    cancel: Option<&CancelToken>,
+) -> crate::Result<Vec<Planned<'a>>> {
+    use crate::bonsai_vision::{
+        ImageFile, MAX_REQUEST_IMAGE_PIXELS, MAX_REQUEST_MEDIA_BYTES, MAX_REQUEST_PARTS,
+        MAX_REQUEST_VIDEO_FRAMES, prepare_video,
+    };
+    let parts = request
         .messages
         .iter()
         .flat_map(|message| &message.images)
+        .collect::<Vec<_>>();
+    if parts.len() > MAX_REQUEST_PARTS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "a request may hold at most {MAX_REQUEST_PARTS} images and videos, not {}",
+            parts.len()
+        )));
+    }
+    let bytes = parts.iter().map(|part| part.data.len()).sum::<usize>();
+    if bytes > MAX_REQUEST_MEDIA_BYTES {
+        return Err(crate::Error::InvalidArgument(format!(
+            "a request's images and videos may hold at most {MAX_REQUEST_MEDIA_BYTES} bytes \
+             together, not {bytes}"
+        )));
+    }
+    let (mut pixels, mut frames) = (0, 0);
+    parts
+        .into_iter()
         .map(|part| {
             if part.video {
-                crate::bonsai_vision::prepare_video(&part.data).map(Prepared::Video)
-            } else {
-                crate::bonsai_vision::prepare_image(&part.data, part.detail).map(Prepared::Image)
+                let video = prepare_video(&part.data, cancel)?;
+                frames += video.total_frames;
+                if frames > MAX_REQUEST_VIDEO_FRAMES {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "a request's videos may hold at most {MAX_REQUEST_VIDEO_FRAMES} frames \
+                         together"
+                    )));
+                }
+                return Ok(Planned::Video(video));
             }
+            let file = ImageFile::plan(&part.data, part.detail)?;
+            pixels += file.source_pixels;
+            if pixels > MAX_REQUEST_IMAGE_PIXELS {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "a request's images may hold at most {MAX_REQUEST_IMAGE_PIXELS} pixels \
+                     together"
+                )));
+            }
+            Ok(Planned::Image(&part.data, file))
         })
         .collect()
 }
 
-/// `prepared` laid out for the prompt, each grid's rows from `rows`.
-fn visuals<'a>(
+/// `planned` laid out for the prompt: each image's grid and rows from
+/// `image`, each video frame group's rows from `group`, one part at a time.
+fn visuals(
     tokenizer: &BonsaiTokenizer,
-    prepared: &'a [Prepared],
-    mut rows: impl FnMut(&crate::bonsai_vision::PreparedImage) -> crate::Result<Arc<[f32]>>,
-) -> crate::Result<Vec<crate::bonsai_vision::Visual<'a>>> {
+    planned: &[Planned<'_>],
+    mut image: impl FnMut(
+        &[u8],
+        &crate::bonsai_vision::ImageFile,
+    ) -> crate::Result<(crate::bonsai_vision::Grid, Arc<[f32]>)>,
+    mut group: impl FnMut(&crate::bonsai_vision::PreparedImage) -> crate::Result<Arc<[f32]>>,
+) -> crate::Result<Vec<crate::bonsai_vision::Visual>> {
     use crate::bonsai_vision::{Visual, video::timestamp_text};
-    prepared
+    planned
         .iter()
         .map(|part| match part {
-            Prepared::Image(image) => Ok(Visual::Image(image, rows(image)?)),
-            Prepared::Video(video) => video
+            Planned::Image(bytes, file) => {
+                image(bytes, file).map(|(grid, rows)| Visual::Image(grid, rows))
+            }
+            Planned::Video(video) => video
                 .groups
                 .iter()
                 .zip(&video.timestamps)
-                .map(|(group, &seconds)| {
+                .map(|(frames, &seconds)| {
                     Ok((
                         tokenizer.encode(&timestamp_text(seconds))?,
-                        group,
-                        rows(group)?,
+                        frames.layout(),
+                        group(frames)?,
                     ))
                 })
                 .collect::<crate::Result<Vec<_>>>()
@@ -1335,16 +1417,42 @@ fn visuals<'a>(
         .collect()
 }
 
-/// Validate, render and tokenize a chat request, encoding its images (with
-/// `activity`, yielding to its decode steps between GPU submissions).
+/// The prompt length `ids` expands to with `planned`, nothing encoded.
+fn planned_len(
+    tokenizer: &BonsaiTokenizer,
+    ids: &[u32],
+    planned: &[Planned<'_>],
+) -> crate::Result<usize> {
+    let empty: Arc<[f32]> = Arc::new([]);
+    let layout = visuals(
+        tokenizer,
+        planned,
+        |_, file| Ok((file.grid(), Arc::clone(&empty))),
+        |_| Ok(Arc::clone(&empty)),
+    )?;
+    crate::bonsai_vision::expanded_len(ids, &layout)
+}
+
+/// Where a request's images are encoded: the tower, the decode activity to
+/// yield to, the request's cancellation and the context its prompt must fit.
+struct Encoding<'a> {
+    vision: Option<&'a VisionEncoder>,
+    activity: Option<&'a crate::activity::EngineActivity>,
+    cancel: Option<&'a CancelToken>,
+    context: usize,
+}
+
+/// Render and tokenize a chat request with its validated `tools`, encoding
+/// its images (yielding to decode steps between GPU submissions) once the
+/// whole prompt is known to fit the context.
 fn chat_prompt(
     tokenizer: &BonsaiTokenizer,
-    vision: Option<&VisionEncoder>,
-    activity: Option<&crate::activity::EngineActivity>,
+    encoding: &Encoding<'_>,
     request: &ChatRequest,
+    tools: ToolSet,
 ) -> crate::Result<ChatPrompt> {
-    let (prompt, tools) = prepare_chat(request)?;
-    let ids = encode_prompt(tokenizer, &prompt)?;
+    let ids = encode_prompt(tokenizer, &render_prompt(request, &tools)?)?;
+    let tools = (!tools.is_empty()).then(|| Arc::new(tools));
     if !has_images(request) {
         return Ok(ChatPrompt {
             ids,
@@ -1352,9 +1460,37 @@ fn chat_prompt(
             tools,
         });
     }
-    let vision = vision_required(vision)?;
-    let prepared = prepare_images(request)?;
-    let encoded = visuals(tokenizer, &prepared, |image| vision.encode(image, activity))?;
+    let vision = vision_required(encoding.vision)?;
+    let planned = plan_media(request, encoding.cancel)?;
+    // The tower runs only for a prompt that can be generated.
+    let length = planned_len(tokenizer, &ids, &planned)?;
+    if length
+        .checked_add(request.max_tokens)
+        .is_none_or(|total| total > encoding.context)
+    {
+        return Err(crate::Error::ContextOverflow(format!(
+            "{length} prompt + {} output tokens exceed {}; no tokens were truncated",
+            request.max_tokens, encoding.context
+        )));
+    }
+    let encode = |image: &crate::bonsai_vision::PreparedImage| {
+        vision.encode(image, encoding.activity, encoding.cancel)
+    };
+    let encoded = visuals(
+        tokenizer,
+        &planned,
+        |bytes, file| {
+            // An image prepared and encoded before is not decoded again.
+            if let Some(grid) = file.known()
+                && let Some(rows) = vision.cached(&grid.digest)
+            {
+                return Ok((grid, rows));
+            }
+            let image = file.prepare(bytes)?;
+            Ok((image.layout(), encode(&image)?))
+        },
+        encode,
+    )?;
     let (ids, images) = crate::bonsai_vision::expand_prompt(&ids, vision.digest(), &encoded)?;
     Ok(ChatPrompt {
         ids,
@@ -1363,20 +1499,22 @@ fn chat_prompt(
     })
 }
 
-/// Compile a chat request's constraint: from `</think>` on with thinking,
-/// else from the first token.
+/// Validate a chat request's tools and compile its constraint: from
+/// `</think>` on with thinking, else from the first token.
 ///
 /// A request whose tool settings need it (see
 /// [`crate::tools::grammar::needs_grammar`]) gets the native tool grammar,
 /// which also carries its response format; otherwise only a response format
-/// is compiled, as before tools could be constrained.
+/// is compiled, as before tools could be constrained. The validated tools
+/// are returned for rendering.
 fn chat_grammar(
     tokenizer: &BonsaiTokenizer,
     request: &ChatRequest,
-) -> crate::Result<Option<Grammar>> {
+) -> crate::Result<(ToolSet, Option<Grammar>)> {
     crate::tools::check_choice(&request.tools, &request.tool_choice)?;
     if request.tools.is_empty() {
-        return tokenizer.compile_format(&request.response_format, request.thinking);
+        let grammar = tokenizer.compile_format(&request.response_format, request.thinking)?;
+        return Ok((ToolSet::default(), grammar));
     }
     let tools = ToolSet::new(&request.tools)?;
     if !crate::tools::grammar::needs_grammar(
@@ -1385,17 +1523,16 @@ fn chat_grammar(
         request.parallel_tool_calls,
         request.response_format.is_text(),
     ) {
-        return Ok(None);
+        return Ok((tools, None));
     }
-    tokenizer
-        .compile_tools(
-            &tools,
-            &request.tool_choice,
-            request.parallel_tool_calls,
-            &request.response_format,
-            request.thinking,
-        )
-        .map(Some)
+    let grammar = tokenizer.compile_tools(
+        &tools,
+        &request.tool_choice,
+        request.parallel_tool_calls,
+        &request.response_format,
+        request.thinking,
+    )?;
+    Ok((tools, Some(grammar)))
 }
 
 fn count_chat(
@@ -1409,10 +1546,8 @@ fn count_chat(
         return Ok(ids.len());
     }
     vision_required(vision)?;
-    let prepared = prepare_images(request)?;
-    let empty: Arc<[f32]> = Arc::new([]);
-    let layout = visuals(tokenizer, &prepared, |_| Ok(Arc::clone(&empty)))?;
-    crate::bonsai_vision::expanded_len(&ids, &layout)
+    // Images are sized from their headers: none is decoded to count it.
+    planned_len(tokenizer, &ids, &plan_media(request, None)?)
 }
 
 fn render_messages(

@@ -40,6 +40,9 @@ pub const VIDEO_FPS: f64 = 1.0;
 pub const VIDEO_MAX_FRAMES: usize = 32;
 /// Largest accepted decoded image side, in pixels.
 pub const MAX_IMAGE_SIDE: u32 = 16_384;
+/// Most pixels of an accepted decoded image (64 MP, 192 MiB as RGB): the
+/// side limit alone would admit 268 MP.
+pub const MAX_IMAGE_PIXELS: usize = 64 << 20;
 
 /// The processor's `rescale_factor` (0.00392156862745098) as torch applies
 /// it to a `uint8` tensor: an F32 multiply.
@@ -106,6 +109,22 @@ impl ImagePatches {
     }
 }
 
+/// Refuse an image over [`MAX_IMAGE_SIDE`] a side or [`MAX_IMAGE_PIXELS`]
+/// in all, before its pixels are allocated.
+fn check_size(width: usize, height: usize) -> Result<(), String> {
+    if width.max(height) > MAX_IMAGE_SIDE as usize {
+        return Err(format!(
+            "{width}x{height} exceeds {MAX_IMAGE_SIDE} pixels per side"
+        ));
+    }
+    if width.saturating_mul(height) > MAX_IMAGE_PIXELS {
+        return Err(format!(
+            "{width}x{height} exceeds {MAX_IMAGE_PIXELS} pixels"
+        ));
+    }
+    Ok(())
+}
+
 /// Decode a baseline, progressive or arithmetic-coded JPEG with
 /// libjpeg-turbo (islow IDCT, fancy upsampling: the library defaults Pillow
 /// and torchvision use). `Ok(None)` for CMYK/YCCK, left to [`image`].
@@ -114,11 +133,7 @@ fn decode_jpeg(bytes: &[u8]) -> crate::Result<Option<RgbImage>> {
         std::panic::catch_unwind(|| -> std::io::Result<Option<(usize, usize, Vec<u8>)>> {
             let decompress = mozjpeg::Decompress::new_mem(bytes)?;
             let (width, height) = decompress.size();
-            if width.max(height) > MAX_IMAGE_SIDE as usize {
-                return Err(std::io::Error::other(format!(
-                    "{width}x{height} exceeds {MAX_IMAGE_SIDE} pixels per side"
-                )));
-            }
+            check_size(width, height).map_err(std::io::Error::other)?;
             if matches!(
                 decompress.color_space(),
                 mozjpeg::ColorSpace::JCS_CMYK | mozjpeg::ColorSpace::JCS_YCCK
@@ -143,13 +158,37 @@ fn decode_jpeg(bytes: &[u8]) -> crate::Result<Option<RgbImage>> {
     }
 }
 
+/// The `(width, height)` [`decode_image`] would decode `bytes` to, from the
+/// header alone (libjpeg-turbo's for JPEG, as decoding reads it).
+///
+/// # Errors
+///
+/// As [`decode_image`], for what the header shows.
+pub fn image_dimensions(bytes: &[u8]) -> crate::Result<(usize, usize)> {
+    let invalid = |error: String| Error::InvalidArgument(format!("image: {error}"));
+    let (width, height) = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        std::panic::catch_unwind(|| mozjpeg::Decompress::new_mem(bytes).map(|d| d.size()))
+            .map_err(|_| invalid("JPEG: undecodable data".into()))?
+            .map_err(|error| invalid(format!("JPEG: {error}")))?
+    } else {
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|error| invalid(error.to_string()))?
+            .into_dimensions()
+            .map_err(|error| invalid(error.to_string()))?;
+        (width as usize, height as usize)
+    };
+    check_size(width, height).map_err(invalid)?;
+    Ok((width, height))
+}
+
 /// Decode an encoded image (JPEG, PNG, GIF, BMP or WebP; the first frame of
 /// an animation) to 8-bit RGB.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] for undecodable data or a side over
-/// [`MAX_IMAGE_SIDE`].
+/// [`Error::InvalidArgument`] for undecodable data, a side over
+/// [`MAX_IMAGE_SIDE`] or more than [`MAX_IMAGE_PIXELS`].
 pub fn decode_image(bytes: &[u8]) -> crate::Result<RgbImage> {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF])
         && let Some(image) = decode_jpeg(bytes)?
@@ -164,10 +203,15 @@ pub fn decode_image(bytes: &[u8]) -> crate::Result<RgbImage> {
     limits.max_image_height = Some(MAX_IMAGE_SIDE);
     limits.max_alloc = Some(2 << 30);
     reader.limits(limits);
-    let decoded = reader
-        .decode()
+    let decoder = reader
+        .into_decoder()
         .map_err(|error| Error::InvalidArgument(format!("image: {error}")))?;
-    let rgb = decoded.into_rgb8();
+    let (width, height) = image::ImageDecoder::dimensions(&decoder);
+    check_size(width as usize, height as usize)
+        .map_err(|error| Error::InvalidArgument(format!("image: {error}")))?;
+    let rgb = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| Error::InvalidArgument(format!("image: {error}")))?
+        .into_rgb8();
     let (width, height) = (rgb.width() as usize, rgb.height() as usize);
     RgbImage::new(width, height, rgb.into_raw())
 }
@@ -305,7 +349,8 @@ fn convolve(sum: i64, precision: u32) -> u8 {
 /// `F.interpolate(..., mode="bicubic", antialias=True)` on `uint8`).
 #[must_use]
 pub fn resize_bicubic(image: &RgbImage, height: usize, width: usize) -> RgbImage {
-    let mut current = image.clone();
+    // The source is only read: the first pass borrows it.
+    let mut current = std::borrow::Cow::Borrowed(image);
     if width != current.width {
         let w = axis_weights(current.width, width);
         let mut out = vec![0_u8; current.height * width * 3];
@@ -323,11 +368,11 @@ pub fn resize_bicubic(image: &RgbImage, height: usize, width: usize) -> RgbImage
                 }
             }
         }
-        current = RgbImage {
+        current = std::borrow::Cow::Owned(RgbImage {
             width,
             height: current.height,
             pixels: out,
-        };
+        });
     }
     if height != current.height {
         let w = axis_weights(current.height, height);
@@ -346,13 +391,13 @@ pub fn resize_bicubic(image: &RgbImage, height: usize, width: usize) -> RgbImage
                 out[y * row + i] = convolve(sum, w.precision);
             }
         }
-        current = RgbImage {
+        current = std::borrow::Cow::Owned(RgbImage {
             width: current.width,
             height,
             pixels: out,
-        };
+        });
     }
-    current
+    current.into_owned()
 }
 
 /// Resize (if needed), rescale and patchify one image for a budget of

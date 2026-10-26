@@ -157,7 +157,7 @@ fn tower(out: &Path) -> Result<()> {
         }
         let mut probes = Vec::new();
         let started = Instant::now();
-        let embedding = encoder.encode_raw(&prepared, None, &mut |name, values| {
+        let embedding = encoder.encode_raw(&prepared, None, None, &mut |name, values| {
             let path = out.join("hf").join(format!("{tag}.{name}.f32"));
             if path.is_file() {
                 probes.push((name.to_owned(), values.to_vec(), path));
@@ -299,7 +299,7 @@ fn llama(out: &Path) -> Result<()> {
         let mut llama_rows = Vec::new();
         let mut same_grids = true;
         for (index, (image, reference)) in prepared.iter().zip(&layout).enumerate() {
-            let rows = encoder.encode_raw(image, None, &mut |_, _| {})?;
+            let rows = encoder.encode_raw(image, None, None, &mut |_, _| {})?;
             let grid_matches = (image.cols, image.rows) == (reference.nx, reference.ny)
                 && image.tokens() == reference.tokens;
             same_grids &= grid_matches;
@@ -349,7 +349,7 @@ fn llama(out: &Path) -> Result<()> {
                 .zip(embeddings)
                 .map(|(image, mut rows)| {
                     rotate_rows(&mut rows, &signs);
-                    Visual::Image(image, Arc::<[f32]>::from(rows))
+                    Visual::Image(image.layout(), Arc::<[f32]>::from(rows))
                 })
                 .collect::<Vec<_>>();
             let (expanded, images) = expand_prompt(&ids, encoder.digest(), &pairs)?;
@@ -412,7 +412,7 @@ fn bench(file: &Path, detail: ImageDetail) -> Result<()> {
     let prepare = started.elapsed().as_secs_f64();
     for run in 0..3 {
         let started = Instant::now();
-        let rows = encoder.encode_raw(&image, None, &mut |_, _| {})?;
+        let rows = encoder.encode_raw(&image, None, None, &mut |_, _| {})?;
         println!(
             "run {run}: {}x{} merged ({} tokens, {} patches): preprocess {prepare:.3}s, tower {:.3}s, \
              output norm {:.3}",
@@ -486,7 +486,7 @@ fn video(out: &Path, clips: &[String]) -> Result<()> {
         );
         std::fs::write(dir.join("frames.u8"), raw)?;
         let started = Instant::now();
-        let video = prepare_video(&bytes)?;
+        let video = prepare_video(&bytes, None)?;
         let prepared = started.elapsed().as_secs_f64();
         let first = video.groups.first().ok_or("no groups")?;
         let mut pixels = Vec::new();
@@ -494,7 +494,7 @@ fn video(out: &Path, clips: &[String]) -> Result<()> {
         let started = Instant::now();
         for group in &video.groups {
             pixels.extend(group.patch_rows());
-            embedding.extend(encoder.encode_raw(group, None, &mut |_, _| {})?);
+            embedding.extend(encoder.encode_raw(group, None, None, &mut |_, _| {})?);
         }
         let tower = started.elapsed().as_secs_f64();
         write_f32(&dir.join("pixels.f32"), &pixels)?;
@@ -510,7 +510,7 @@ fn video(out: &Path, clips: &[String]) -> Result<()> {
             .map(|(group, &seconds)| {
                 Ok((
                     tokenizer.encode(&timestamp_text(seconds))?,
-                    group,
+                    group.layout(),
                     vec![0.0; group.tokens() * WIDTH].into(),
                 ))
             })

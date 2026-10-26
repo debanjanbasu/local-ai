@@ -293,7 +293,8 @@ refused and nothing else changes.
   - decode to 8-bit RGB: JPEG with libjpeg-turbo's decoder (the `mozjpeg`
     crate, the decoder Pillow and torchvision use), PNG, GIF, BMP and WebP
     with the `image` crate; alpha dropped, grey replicated, **no EXIF
-    rotation** (the reference applies none either);
+    rotation** (the reference applies none either); at most 16,384 pixels a
+    side and 64 MP (67,108,864 pixels) in all, refused from the header;
   - aspect-preserving resize to the largest size with both sides multiples
     of 48 (patch 16 × pooling 3) holding at most 9 × budget patches (budget
     280 soft tokens per image, 140 per video frame; 70/560/1120 accepted),

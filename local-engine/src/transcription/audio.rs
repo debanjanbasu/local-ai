@@ -20,6 +20,10 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
 pub const SAMPLE_RATE: u32 = 16_000;
+/// Sample rates a file may declare, in Hz: telephone audio to studio rates.
+/// The resampler's kernel grows with the input rate (about 1.6 MB at
+/// 384 kHz), so a file may not name an arbitrary one.
+pub const SAMPLE_RATES: std::ops::RangeInclusive<u32> = 4_000..=384_000;
 
 /// Why a file could not become model input.
 #[derive(Debug, thiserror::Error)]
@@ -235,8 +239,12 @@ pub fn decode(
         let channels = spec.channels().count().max(1);
         if rate == 0 {
             rate = spec.rate();
-            if rate == 0 {
-                return Err(AudioError::Malformed("sample rate 0".into()));
+            if !SAMPLE_RATES.contains(&rate) {
+                return Err(AudioError::Unsupported(format!(
+                    "a sample rate of {rate} Hz (accepted: {} to {} Hz)",
+                    SAMPLE_RATES.start(),
+                    SAMPLE_RATES.end()
+                )));
             }
             if rate != SAMPLE_RATE {
                 resampler = Some(Resampler::new(rate));
@@ -354,5 +362,22 @@ mod tests {
             decode(wav(&[], 16_000, 1), Some("wav"), 60),
             Err(AudioError::Empty)
         ));
+    }
+
+    /// A rate outside the accepted range is refused before the resampler
+    /// sizes its kernel for it (200 MHz would take 845 MB).
+    #[test]
+    fn sample_rates_outside_the_range_are_refused() {
+        let samples = vec![0_i16; 64];
+        for rate in [200_000_000, 384_001, 3_999, 1] {
+            let error = decode(wav(&samples, rate, 1), Some("wav"), 60).expect_err("refused");
+            assert!(
+                matches!(&error, AudioError::Unsupported(message) if message.contains("sample rate")),
+                "{rate}: {error}"
+            );
+        }
+        for rate in [4_000, 384_000] {
+            decode(wav(&samples, rate, 1), Some("wav"), 60).expect("accepted");
+        }
     }
 }

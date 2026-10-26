@@ -84,6 +84,62 @@ fn unsupported_budgets_and_bad_buffers_are_refused() {
     assert!(decode_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', 0xFF, 0xC0]).is_err());
 }
 
+/// CRC-32 (IEEE) of a PNG chunk's type and data.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A PNG of `width` x `height` RGB pixels with no pixel data: its header
+/// reads, its pixels do not decode.
+pub fn png_header(width: u32, height: u32) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = b"IHDR".to_vec();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    png.extend_from_slice(&13_u32.to_be_bytes());
+    png.extend_from_slice(&ihdr);
+    png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+    for chunk in [&b"IDAT"[..], b"IEND"] {
+        png.extend_from_slice(&0_u32.to_be_bytes());
+        png.extend_from_slice(chunk);
+        png.extend_from_slice(&crc32(chunk).to_be_bytes());
+    }
+    png
+}
+
+/// 10,000 x 10,000 is within the side limit but over the pixel limit: the
+/// header is refused before 300 MB of pixels are allocated, for JPEG
+/// (libjpeg-turbo) and the `image` crate's formats alike.
+#[test]
+fn images_over_the_pixel_limit_are_refused_from_their_header() {
+    let mut jpeg = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/vision/syn_wide_1600x90.jpg"
+    ))
+    .unwrap();
+    // The SOF0 segment's height and width.
+    assert_eq!(&jpeg[158..160], &[0xFF, 0xC0]);
+    jpeg[163..167].copy_from_slice(&[0x27, 0x10, 0x27, 0x10]);
+    let error = decode_image(&jpeg).expect_err("refused").to_string();
+    assert!(error.contains("pixels"), "{error}");
+    let error = decode_image(&png_header(10_000, 10_000))
+        .expect_err("refused")
+        .to_string();
+    assert!(error.contains("exceeds 67108864 pixels"), "{error}");
+}
+
 #[derive(serde::Deserialize)]
 struct Reference {
     images: Vec<ReferenceImage>,

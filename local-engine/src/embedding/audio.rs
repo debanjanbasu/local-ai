@@ -161,6 +161,7 @@ fn decode_interleaved(bytes: Vec<u8>) -> crate::Result<(Vec<f32>, usize, u32)> {
         let spec = buffer.spec();
         let (c, r) = (spec.channels().count(), spec.rate());
         if channels == 0 {
+            check_rate(r)?;
             (channels, rate) = (c, r);
         } else if (channels, rate) != (c, r) {
             return Err(bad_audio(
@@ -181,6 +182,22 @@ fn decode_interleaved(bytes: Vec<u8>) -> crate::Result<(Vec<f32>, usize, u32)> {
     Ok((samples, channels, rate))
 }
 
+/// Sample rates accepted, in Hz: telephone audio to studio rates. Decoding
+/// buffers up to [`MAX_DECODE_SECONDS`] at the declared rate and the
+/// resampler is sized by it, so a file may not name an arbitrary one.
+pub const SAMPLE_RATES: std::ops::RangeInclusive<u32> = 4_000..=384_000;
+
+fn check_rate(rate: u32) -> crate::Result<()> {
+    if SAMPLE_RATES.contains(&rate) {
+        return Ok(());
+    }
+    Err(bad_audio(format!(
+        "a sample rate of {rate} Hz is outside {} to {} Hz",
+        SAMPLE_RATES.start(),
+        SAMPLE_RATES.end()
+    )))
+}
+
 /// Decoding stops past this duration (clips longer than 30 s are refused
 /// anyway; this only bounds memory on hostile input).
 const MAX_DECODE_SECONDS: usize = 600;
@@ -190,11 +207,13 @@ const MAX_DECODE_SECONDS: usize = 600;
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] for zero channels or rate, or a resampler error.
+/// [`Error::InvalidArgument`] for zero channels, a rate outside
+/// [`SAMPLE_RATES`], or a resampler error.
 pub fn to_mono_16k(interleaved: &[f32], channels: usize, rate: u32) -> crate::Result<Vec<f32>> {
-    if channels == 0 || rate == 0 {
-        return Err(bad_audio("zero channels or sample rate"));
+    if channels == 0 {
+        return Err(bad_audio("zero channels"));
     }
+    check_rate(rate)?;
     let mono: Vec<f32> = interleaved
         .chunks_exact(channels)
         .map(|frame| frame.iter().sum::<f32>() / channels as f32)

@@ -31,8 +31,8 @@
 //! priority: it submits bounded command buffers and, while Bonsai generations
 //! are running, waits for the engine worker to finish a decode step between
 //! them ([`EngineActivity::yield_to_decode`]). At most [`MAX_PENDING`]
-//! requests are admitted (running or waiting); more are answered `503` with
-//! `Retry-After`. A client that goes away cancels its request at the next
+//! requests are admitted (validating, running or waiting); more are answered
+//! `503` with `Retry-After` before their input is phonemized. A client that goes away cancels its request at the next
 //! submission boundary.
 
 use std::path::Path;
@@ -346,6 +346,11 @@ pub(super) async fn handle(
             return error_response(StatusCode::BAD_REQUEST, &message, state, headers).await;
         }
     };
+    // Admitted first: phonemizing the input to validate it is CPU work
+    // (bounded per request, but not in number without the slot).
+    let Ok(permit) = Arc::clone(&service.slots).try_acquire_owned() else {
+        return busy(state, headers).await;
+    };
     // Validate on the blocking pool without the model lock (a running
     // synthesis holds it), so bad requests fail fast with 400.
     let catalog = service.catalog.clone();
@@ -372,9 +377,6 @@ pub(super) async fn handle(
         Err(message) => {
             return error_response(StatusCode::BAD_REQUEST, &message, state, headers).await;
         }
-    };
-    let Ok(permit) = Arc::clone(&service.slots).try_acquire_owned() else {
-        return busy(state, headers).await;
     };
     let seed = service.requests.fetch_add(1, Ordering::Relaxed);
     let cancelled = Arc::new(AtomicBool::new(false));

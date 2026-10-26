@@ -54,7 +54,9 @@ let score: f32 = audio[0].iter().zip(&query[0]).map(|(a, b)| a * b).sum();
 
 - **`decode_audio(bytes)`** decodes with Symphonia, probing the container from the bytes.
   It averages the channels to mono and resamples any other rate to 16 kHz with Rubato's
-  synchronous FFT resampler. Decoding stops with an error past 600 s. Supported formats:
+  synchronous FFT resampler. Decoding stops with an error past 600 s, and sample rates
+  outside 4–384 kHz are refused with `InvalidArgument` (decoding buffers and the
+  resampler are sized by the declared rate). Supported formats:
 
   | Container | Codecs | Test result (`tests/fixtures/audio-formats/`) |
   | --- | --- | --- |
@@ -72,7 +74,7 @@ let score: f32 = audio[0].iter().zip(&query[0]).map(|(a, b)| a * b).sum();
   the same codec set. Correlation is the best normalized cross-correlation within
   ±2,048 samples.
 - **`to_mono_16k(interleaved, channels, rate)`** does the same downmix and resampling for
-  PCM you already have.
+  PCM you already have, with the same 4–384 kHz rate range.
 - **`EmbeddingModel::embed_audio(clips, pace)`** returns one normalized vector per clip,
   in order. It is `embed_multimodal` with one `MediaPart::Audio` part per input, the
   same sequence assembly the image and video path uses; `MediaPart::Audio` can also be

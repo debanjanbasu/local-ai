@@ -649,6 +649,16 @@ fn tool_history(thinking: bool) -> super::ChatRequest {
     }
 }
 
+/// Encoding without a vision tower, cancellation or context limit.
+const fn no_vision() -> super::Encoding<'static> {
+    super::Encoding {
+        vision: None,
+        activity: None,
+        cancel: None,
+        context: usize::MAX,
+    }
+}
+
 #[test]
 fn a_chat_count_is_the_length_of_the_prompt_generation_would_prefill() {
     let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
@@ -656,8 +666,9 @@ fn a_chat_count_is_the_length_of_the_prompt_generation_would_prefill() {
         let request = tool_history(thinking);
         let rendered = Engine::render_chat_with_tools(&request.messages, thinking, &request.tools)
             .expect("render");
+        let tool_set = crate::tools::ToolSet::new(&request.tools).expect("tools");
         let super::ChatPrompt { ids, tools, .. } =
-            super::chat_prompt(&tokenizer, None, None, &request).expect("prepare");
+            super::chat_prompt(&tokenizer, &no_vision(), &request, tool_set).expect("prepare");
         assert!(tools.is_some());
         assert_eq!(ids, tokenizer.encode(&rendered).expect("encode"));
         assert_eq!(
@@ -741,11 +752,140 @@ fn images_render_as_the_templates_vision_markers_where_they_sit() {
     let mut request = tool_history(false);
     request.messages = vec![user];
     let counted = super::count_chat(&tokenizer, None, &request).expect_err("no projector");
-    let Err(generated) = super::chat_prompt(&tokenizer, None, None, &request) else {
+    let Err(generated) = super::chat_prompt(
+        &tokenizer,
+        &no_vision(),
+        &request,
+        crate::tools::ToolSet::default(),
+    ) else {
         panic!("generation needs the projector");
     };
     assert_eq!(counted.to_string(), generated.to_string());
     assert!(counted.to_string().contains("mmproj"), "{counted}");
+}
+
+/// A request holding `parts`, each at the start of one user message.
+fn media_request(parts: Vec<super::ChatImage>) -> super::ChatRequest {
+    let mut request = tool_history(false);
+    request.tools.clear();
+    request.messages = vec![super::ChatMessage {
+        role: "user".into(),
+        content: "Look.".into(),
+        images: parts,
+        ..super::ChatMessage::default()
+    }];
+    request
+}
+
+fn image_part(data: &std::sync::Arc<[u8]>) -> super::ChatImage {
+    super::ChatImage {
+        offset: 0,
+        data: std::sync::Arc::clone(data),
+        detail: super::ImageDetail::Auto,
+        video: false,
+    }
+}
+
+/// A request's media are bounded before any pixel is decoded: at most 64
+/// parts, 256 MiB and 512 MP of images, sized from their headers (these
+/// PNGs hold no pixel data at all).
+#[test]
+fn media_beyond_the_request_limits_are_refused_before_decoding() {
+    use crate::bonsai_vision::{MAX_REQUEST_MEDIA_BYTES, MAX_REQUEST_PARTS};
+    use crate::embedding::vision::tests::png_header;
+    let plan = |parts| super::plan_media(&media_request(parts), None).map(|planned| planned.len());
+    let small: std::sync::Arc<[u8]> = png_header(64, 64).into();
+    assert_eq!(
+        plan(vec![image_part(&small); MAX_REQUEST_PARTS]).expect("within"),
+        64
+    );
+    let error = plan(vec![image_part(&small); MAX_REQUEST_PARTS + 1]).expect_err("parts");
+    assert!(error.to_string().contains("at most 64 images"), "{error}");
+    // 64 MP each: eight are 512 MP, nine are over.
+    let large: std::sync::Arc<[u8]> = png_header(8192, 8192).into();
+    assert_eq!(plan(vec![image_part(&large); 8]).expect("within"), 8);
+    let error = plan(vec![image_part(&large); 9]).expect_err("pixels");
+    assert!(error.to_string().contains("pixels together"), "{error}");
+    // Bytes are counted before anything is read.
+    let bulky: std::sync::Arc<[u8]> = vec![0; MAX_REQUEST_MEDIA_BYTES / 4 + 1].into();
+    let error = plan(vec![image_part(&bulky); 4]).expect_err("bytes");
+    assert!(error.to_string().contains("bytes together"), "{error}");
+}
+
+/// Every chat is rendered and tokenized by the submitting thread, so the
+/// worker that steps other generations only admits it, and an invalid one
+/// fails the call instead of being queued.
+#[test]
+fn a_handle_queues_chats_already_tokenized() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
+    let handle = super::EngineHandle {
+        sender,
+        tokenizer: tokenizer.clone(),
+        activity: std::sync::Arc::default(),
+        prompt_cache: crate::prompt_cache::Closer::new(),
+        vision: None,
+        context: 32_768,
+    };
+    let mut invalid = tool_history(true);
+    invalid.messages.clear();
+    assert!(handle.chat(invalid).is_err());
+    assert!(receiver.try_recv().is_err(), "nothing queued");
+    let request = tool_history(true);
+    let _events = handle.chat(request.clone()).expect("queued");
+    let Ok(super::Job::Chat(job)) = receiver.try_recv() else {
+        panic!("a queued chat");
+    };
+    let (prompt, _) = super::prepare_chat(&request).expect("render");
+    assert_eq!(job.prompt.ids, tokenizer.encode(&prompt).expect("encode"));
+    assert!(job.prompt.tools.is_some());
+}
+
+/// With the pinned model and projector, an image prompt over the context
+/// fails at submission before its image is even decoded, and a cancelled
+/// one fails before the tower submits anything.
+#[test]
+#[ignore = "requires the pinned model, the vision projector and the GPU"]
+fn image_prompts_fit_the_context_and_observe_cancellation_before_encoding() {
+    use crate::bonsai_vision::ImageFile;
+    let handle = Engine::open().expect("open engine").into_handle();
+    let vision = std::sync::Arc::clone(handle.vision.as_ref().expect("projector installed"));
+    let bytes: std::sync::Arc<[u8]> = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/vision/syn_wide_1600x90.jpg"
+    ))
+    .expect("fixture")
+    .into();
+    let known = || {
+        ImageFile::plan(&bytes, super::ImageDetail::Auto)
+            .expect("plan")
+            .known()
+    };
+    let mut request = media_request(vec![image_part(&bytes)]);
+    request.thinking = false;
+    request.max_tokens = handle.context;
+    let Err(error) = handle.chat(request.clone()) else {
+        panic!("over the context");
+    };
+    assert!(matches!(error, crate::Error::ContextOverflow(_)), "{error}");
+    assert_eq!(known(), None, "not decoded");
+
+    request.max_tokens = 4;
+    let cancel = super::CancelHandle::new();
+    cancel.cancel();
+    let Err(error) = handle.chat_with_cancel(request.clone(), &cancel) else {
+        panic!("cancelled");
+    };
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    let grid = known().expect("decoded");
+    assert!(vision.cached(&grid.digest).is_none(), "not encoded");
+
+    let finished = handle
+        .chat(request)
+        .expect("queued")
+        .any(|event| matches!(event, Event::Finished(_)));
+    assert!(finished);
+    assert!(vision.cached(&grid.digest).is_some(), "encoded");
 }
 
 #[test]
@@ -798,6 +938,7 @@ fn default_tool_settings_need_no_compiler_and_native_ones_compile_up_front() {
     assert!(
         super::chat_grammar(&plain, &request)
             .expect("text")
+            .1
             .is_none()
     );
     let constrained = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_with_specials_for_tests(
@@ -809,6 +950,7 @@ fn default_tool_settings_need_no_compiler_and_native_ones_compile_up_front() {
     assert!(
         super::chat_grammar(&constrained, &request)
             .expect("tools with a format")
+            .1
             .is_some()
     );
     request.response_format = crate::ResponseFormat::Text;
@@ -831,6 +973,7 @@ fn default_tool_settings_need_no_compiler_and_native_ones_compile_up_front() {
         assert!(
             super::chat_grammar(&constrained, &native)
                 .expect("native")
+                .1
                 .is_some()
         );
         // The prompt never depends on the tool policy.

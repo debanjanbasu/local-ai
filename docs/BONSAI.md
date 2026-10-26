@@ -973,7 +973,9 @@ Images may sit anywhere among the text parts of user and tool messages and
 keep their place; system, developer and assistant messages cannot hold them,
 as in the checkpoint's chat template. `file_id` names an upload of the
 [Files API](#native-services) (at most 64 MiB per image or video). JPEG
-(decoded with libjpeg-turbo), PNG, WebP, GIF (first frame) and BMP are read.
+(decoded with libjpeg-turbo), PNG, WebP, GIF (first frame) and BMP are read,
+at most 16,384 pixels a side and 67,108,864 (64 MP) in all, checked from the
+header before any pixel is decoded.
 `http(s)` URLs are fetched by the server ([remote media
 URLs](#remote-media-urls)). Conversations store `input_image` parts too
 (within the 4 MiB item limit, so larger images go by `file_id` or URL).
@@ -993,6 +995,20 @@ template does; the engine then replaces the pad with one token per merged
 
 `auto` is llama.cpp's mtmd limit for this architecture, the runtime Prism
 publishes the checkpoint for; `high` is the HF processor's own maximum.
+
+**Limits per request.** At most 64 image and video parts, 256 MiB of
+encoded media together, 536,870,912 pixels (512 MP) of decoded images
+together, and 72,000 video frames together (two videos at the
+[per-video limit](#video-input), checked as each is read); more is a 400.
+Images are sized from their headers first, so `input_tokens` counts them
+without decoding a pixel, and a request whose prompt plus `max_tokens`
+exceeds the context fails with the context error before any image is
+decoded or encoded. Images are then decoded, resized and encoded one at a
+time. A file prepared before (an image kept in a conversation's history) is
+remembered by its SHA-256 and `detail` (the last 4,096), so while its encoded
+rows are cached it is not decoded again. A library caller that submits with
+`EngineHandle::chat_with_cancel` can stop video decoding between samples
+and the tower between submissions.
 
 **Implementation.** The tower (`local-engine/src/bonsai_vision/`,
 `shaders/bonsai_vision.metal`) is the Qwen3.5 ViT: a 16x16 patch embedding
@@ -1060,7 +1076,8 @@ is fetched by the server, through the hosted fetch tool's transport
   `http`; `https` verified by the macOS trust store.
 - At most 64 MiB (the generation request body limit), refused (not
   truncated) by `Content-Length` or while reading; one 60-second deadline
-  for the whole exchange.
+  for the whole exchange, and 120 seconds for all of one request's fetches
+  together.
 - The response's `Content-Type` must be `image/*` for images and `video/*`
   (or `application/mp4`) for videos; none, `application/octet-stream` and
   `binary/octet-stream` pass and the decoder decides. Anything else (an HTML
@@ -1068,6 +1085,10 @@ is fetched by the server, through the hosted fetch tool's transport
   any of the body is read.
 - Fetched bytes are kept by URL for ten minutes (256 MiB in all), so a
   conversation replaying the URL in its history every turn fetches it once.
+- One request's parts, whatever their source (data URL, `file_id` or URL),
+  hold at most 64 parts and 256 MiB together, checked as they are read (a
+  `file_id` before its bytes are); a `file_id` or URL named several times is
+  read once.
 
 Every failure is a 400 naming the URL and the reason.
 
@@ -1084,7 +1105,13 @@ MP4, MOV and M4V files are read, with any codec macOS decodes (H.264 and
 HEVC on every Apple Silicon Mac, ProRes, AV1 where the hardware has it);
 Matroska and WebM are refused with a 400, since AVFoundation does not open
 them. A `file` part whose bytes are an ISO media file is taken as a video,
-otherwise as an image.
+otherwise as an image. A video may last at most 600 s and hold at most 36,000
+frames (600 s at 60 fps): the counting pass refuses it with a 400 as soon as
+it passes either, since both passes read every frame up to the last. Frames
+are held to the image limits (16,384 pixels a side, 64 MP), checked on the
+track header and again on every decoded frame. The file is opened with
+`AVURLAssetReferenceRestrictionsKey` set to forbid all references, so a movie
+naming other files or URLs as its media data is not followed outside itself.
 
 The layout is the checkpoint's own processor (`Qwen3VLVideoProcessor`,
 which Qwen3.5 uses, with the base model's `video_preprocessor_config.json`):

@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
-use super::{
-    ChatJob, Delivered, Engine, Event, EventSplitter, Job, Stats, encode_prompt, prepare_chat,
-};
+use super::{ChatJob, Delivered, Engine, Event, EventSplitter, Job, Stats};
 use crate::GenerateParams;
 use crate::bonsai_model::CancelToken;
 use crate::judgment::{Decision, JudgmentHead, PreparedDecision};
@@ -239,7 +237,7 @@ impl Worker {
                 let Some(job) = self.receiver.blocking_recv() else {
                     return;
                 };
-                self.waiting = self.prepare(job);
+                self.waiting = Self::prepare(job);
             }
             self.admit_waiting();
             if !self.running.is_empty() {
@@ -278,7 +276,7 @@ impl Worker {
             let pending = match self.waiting.take() {
                 Some(pending) => pending,
                 None => match self.receiver.try_recv() {
-                    Ok(job) => match self.prepare(job) {
+                    Ok(job) => match Self::prepare(job) {
                         Some(pending) => pending,
                         None => continue,
                     },
@@ -349,9 +347,9 @@ impl Worker {
         }
     }
 
-    /// Render and tokenize a job, answering it at once if that fails.
-    /// Decisions were prepared when they were queued.
-    fn prepare(&self, job: Job) -> Option<Pending> {
+    /// Unpack a job for admission. Chat prompts and decisions were prepared
+    /// when they were queued.
+    fn prepare(job: Job) -> Option<Pending> {
         let (prompt, max_tokens, sampling, session, thinking, stop, grammar, events, cancel) =
             match job {
                 Job::Decision(job) => return Some(Pending::Decision(job)),
@@ -363,16 +361,9 @@ impl Worker {
                         events,
                         cancel,
                     } = *job;
-                    let tokenizer = self.engine.inner.tokenizer();
-                    // A request with images arrives tokenized and encoded.
-                    let prompt = prompt.map_or_else(
-                        || {
-                            prepare_chat(&request).and_then(|(prompt, tools)| {
-                                Ok((encode_prompt(tokenizer, &prompt)?, None, tools))
-                            })
-                        },
-                        |prompt| Ok((prompt.ids, prompt.images, prompt.tools)),
-                    );
+                    // Every request arrives rendered and tokenized (and its
+                    // images encoded) by the submitting thread.
+                    let prompt: crate::Result<_> = Ok((prompt.ids, prompt.images, prompt.tools));
                     (
                         prompt,
                         request.max_tokens,
@@ -462,6 +453,7 @@ mod tests {
             activity: Arc::default(),
             prompt_cache: crate::prompt_cache::Closer::new(),
             vision: None,
+            context: 32_768,
         };
         (handle, receiver)
     }

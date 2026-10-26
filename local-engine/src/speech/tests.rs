@@ -133,3 +133,32 @@ fn native_durations_match_the_reference_fixture() {
         fixture.synthesis.len()
     );
 }
+
+/// The fallback segments only up to the longest lexicon piece (identical
+/// results) and refuses words over [`g2p::MAX_FALLBACK_LETTERS`] letters,
+/// which took seconds of CPU before any request was admitted.
+#[test]
+fn the_fallback_is_bounded_by_its_pieces_and_word_length() {
+    let lexicon = Lexicon::new(r#"{"cat": "kˈæt", "dog": "dˈɑɡ"}"#.as_bytes(), b"{}", false)
+        .expect("lexicon");
+    assert_eq!(lexicon.fallback("catdog").as_deref(), Some("kˈætdˌɑɡ"));
+    assert_eq!(lexicon.fallback("catsdog").as_deref(), Some("kˈætsdˌɑɡ"));
+    let longest = "catdog".repeat(g2p::MAX_FALLBACK_LETTERS / 6) + "cat";
+    assert!(longest.len() <= g2p::MAX_FALLBACK_LETTERS);
+    assert!(lexicon.fallback(&longest).is_some());
+    assert_eq!(lexicon.fallback(&format!("{longest}catdog")), None);
+}
+
+/// A hyphenated token of 2,000 subtokens looked up every span of itself
+/// (cubic: 100 s of CPU on an M4 Pro before any request was admitted);
+/// spans are now tried up to the longest lexicon key's length (40 ms).
+#[test]
+fn long_hyphenated_tokens_are_phonemized_in_linear_time() {
+    let lexicon = Lexicon::new(r#"{"a": "ɐ"}"#.as_bytes(), b"{}", false).expect("lexicon");
+    let g2p = G2p::new(Arc::new(lexicon));
+    let started = std::time::Instant::now();
+    let phonemes = g2p.phonemize(&"a-".repeat(2000), true);
+    assert!(phonemes.starts_with("ˌA"), "{phonemes}");
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+}
