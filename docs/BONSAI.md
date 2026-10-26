@@ -3104,6 +3104,18 @@ decoded at 105.60 tok/s median with `top_logprobs: 0` and 105.51 with 20
 Against an f64 reference the kernel's log-sum-exp is within 1e-5 relative
 and its top 20 are bit-exact, ties going to the lower id like argmax.
 
+### Sampled decoding
+
+A sampler that is not greedy (the server's defaults are temperature 1.0,
+top-p 0.95 and top-k 20) selects from the GPU's top k of each row. The top-k
+kernels have the log-probability kernels' shape: each group of 4,096 logits
+selects its best k in one dispatch and each row merges its groups' candidates
+in a second, where the former kernels sorted 970 chunks of 256 and merged
+them in ten more dispatches. GPU time per 248,320-logit row, M4 Pro, 50
+selections per command buffer: 170, 177 and 183 µs at k = 1, 20 and 64
+before, 11, 43 and 127 µs after. The candidates are bit-exact against a
+`total_cmp` reference, ties to the lower id, special bit patterns included.
+
 ## Tried and rejected
 
 Entries are measured on the build current when they were tried. Decode rates

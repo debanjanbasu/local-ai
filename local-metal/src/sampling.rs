@@ -15,7 +15,10 @@ use crate::context::MetalContext;
 use crate::shaders::ShaderLibrary;
 
 pub const MAX_TOP_K: usize = 64;
-const CHUNK_SIZE: usize = 256;
+/// Logits each first-stage threadgroup of the top-k kernels reduces.
+const TOPK_GROUP: usize = 4096;
+/// Candidates the second stage can hold: 256 threads, 16 each.
+const TOPK_FINAL_CANDIDATES: usize = 256 * 16;
 
 /// One selected logit. The logit's exact bit pattern is preserved.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -31,15 +34,98 @@ impl PartialEq for TopKCandidate {
     }
 }
 
+/// The two top-k pipelines: each group of 4,096 logits of a row selects its
+/// best k, then each row merges its groups' candidates.
+struct TopKPipelines {
+    partial: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    finish: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+}
+
+impl TopKPipelines {
+    fn new(ctx: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
+        let make_pipeline = |name: &str| {
+            let function = shaders.get_function(name)?;
+            ctx.device()
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|error| Error::PipelineCreation(error.to_string()))
+        };
+        Ok(Self {
+            partial: make_pipeline("topk_rows_partial")?,
+            finish: make_pipeline("topk_rows_final")?,
+        })
+    }
+
+    /// Encode the best `k` of each of `rows` rows of `vocab` logits, `stride`
+    /// floats apart from `offset` bytes into `logits`, into `MAX_TOP_K`
+    /// slots per row of `output`. Bounds are the caller's.
+    #[allow(unsafe_code, clippy::too_many_arguments)]
+    fn encode(
+        &self,
+        batch: &mut CommandBatch,
+        logits: (&MetalBuffer, usize),
+        vocab: usize,
+        stride: usize,
+        rows: usize,
+        k: usize,
+        partials: &MetalBuffer,
+        output: &MetalBuffer,
+    ) {
+        let groups = vocab.div_ceil(TOPK_GROUP);
+        let (vocab, k, stride) = (vocab as u32, k as u32, stride as u32);
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.partial);
+        unsafe {
+            bind(encoder, logits.0, logits.1, 0);
+            bind(encoder, partials, 0, 1);
+            set_u32(encoder, &vocab, 2);
+            set_u32(encoder, &k, 3);
+            set_u32(encoder, &stride, 4);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: groups,
+                height: rows,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        batch.record_dispatch();
+        let groups = groups as u32;
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.finish);
+        unsafe {
+            bind(encoder, partials, 0, 0);
+            bind(encoder, output, 0, 1);
+            set_u32(encoder, &groups, 2);
+            set_u32(encoder, &k, 3);
+        }
+        dispatch(encoder, rows, 256);
+        batch.record_dispatch();
+    }
+}
+
+/// The partial candidates of `rows` rows of up to `vocab` logits.
+const fn partials_bytes(vocab: usize, rows: usize) -> usize {
+    rows * vocab.div_ceil(TOPK_GROUP) * MAX_TOP_K * size_of::<TopKCandidate>()
+}
+
+/// Whether the second stage can merge every group of a `vocab`-wide row.
+const fn mergeable(vocab: usize) -> bool {
+    vocab.div_ceil(TOPK_GROUP) * MAX_TOP_K <= TOPK_FINAL_CANDIDATES
+}
+
 /// Reusable workspace for top-k selection.
 ///
 /// `encode` only records GPU work. The caller must complete/wait for the containing
 /// command batch before reading `candidates`, and must not overlap another encode
 /// using this workspace with unfinished work from an earlier encode.
 pub struct GpuTopK {
-    chunk_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    merge_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    intermediate: [MetalBuffer; 2],
+    pipelines: TopKPipelines,
+    partials: MetalBuffer,
     output: MetalBuffer,
     max_vocab: usize,
 }
@@ -50,33 +136,20 @@ impl GpuTopK {
         shaders: &ShaderLibrary,
         max_vocab: usize,
     ) -> crate::Result<Self> {
-        if max_vocab == 0 || max_vocab > u32::MAX as usize {
+        if max_vocab == 0 || !mergeable(max_vocab) {
             return Err(Error::InvalidArgument(
-                "top-k max_vocab must be in 1..=u32::MAX".into(),
+                "top-k max_vocab must be in 1..=262144".into(),
             ));
         }
-        let make_pipeline = |name: &str| {
-            let function = shaders.get_function(name)?;
-            ctx.device()
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|error| Error::PipelineCreation(error.to_string()))
-        };
-        let chunks = max_vocab.div_ceil(CHUNK_SIZE);
-        let intermediate_bytes = chunks * MAX_TOP_K * size_of::<TopKCandidate>();
         Ok(Self {
-            chunk_pipeline: make_pipeline("sampling_chunk_topk")?,
-            merge_pipeline: make_pipeline("sampling_merge_topk")?,
-            intermediate: [
-                MetalBuffer::empty(ctx.device(), intermediate_bytes)?,
-                MetalBuffer::empty(ctx.device(), intermediate_bytes)?,
-            ],
+            pipelines: TopKPipelines::new(ctx, shaders)?,
+            partials: MetalBuffer::empty(ctx.device(), partials_bytes(max_vocab, 1))?,
             output: MetalBuffer::empty(ctx.device(), MAX_TOP_K * size_of::<TopKCandidate>())?,
             max_vocab,
         })
     }
 
-    /// Encode hierarchical selection without allocating or synchronizing.
-    #[allow(unsafe_code)]
+    /// Encode selection in two dispatches without allocating or synchronizing.
     pub fn encode(
         &self,
         batch: &mut CommandBatch,
@@ -107,51 +180,16 @@ impl GpuTopK {
                 "top-k logits offset is unaligned or exceeds the buffer".into(),
             ));
         }
-        let vocab = vocab as u32;
-        let k = k as u32;
-        let chunks = (vocab as usize).div_ceil(CHUNK_SIZE) as u32;
-        let encoder = batch.encoder();
-        encoder.setComputePipelineState(&self.chunk_pipeline);
-        unsafe {
-            bind(encoder, logits, logits_offset, 0);
-            bind(
-                encoder,
-                if chunks == 1 {
-                    &self.output
-                } else {
-                    &self.intermediate[0]
-                },
-                0,
-                1,
-            );
-            set_u32(encoder, &vocab, 2);
-            set_u32(encoder, &k, 3);
-        }
-        dispatch(encoder, chunks as usize, CHUNK_SIZE);
-        batch.record_dispatch();
-
-        let mut lists = chunks;
-        let mut source = 0;
-        while lists > 1 {
-            let merged = lists.div_ceil(2);
-            let destination = if merged == 1 {
-                &self.output
-            } else {
-                &self.intermediate[1 - source]
-            };
-            let encoder = batch.encoder();
-            encoder.setComputePipelineState(&self.merge_pipeline);
-            unsafe {
-                bind(encoder, &self.intermediate[source], 0, 0);
-                bind(encoder, destination, 0, 1);
-                set_u32(encoder, &lists, 2);
-                set_u32(encoder, &k, 3);
-            }
-            dispatch(encoder, merged as usize, (2 * k as usize).div_ceil(32) * 32);
-            batch.record_dispatch();
-            lists = merged;
-            source = 1 - source;
-        }
+        self.pipelines.encode(
+            batch,
+            (logits, logits_offset),
+            vocab,
+            vocab,
+            1,
+            k,
+            &self.partials,
+            &self.output,
+        );
         Ok(())
     }
 
@@ -168,16 +206,101 @@ impl GpuTopK {
 
     #[must_use]
     pub fn allocated_bytes(&self) -> usize {
-        self.intermediate
-            .iter()
-            .map(MetalBuffer::length)
-            .sum::<usize>()
-            + self.output.length()
+        self.partials.length() + self.output.length()
     }
 
     #[must_use]
     pub const fn maximum_supported_k(&self) -> usize {
         MAX_TOP_K
+    }
+}
+
+/// The best `k` (at most [`MAX_TOP_K`]) logits of each of up to `max_rows`
+/// consecutive logit rows, selected as [`GpuTopK`] selects one row, so a
+/// block can select every row it produces inside its own command buffer.
+///
+/// Same encoding contract as [`GpuTopK`].
+pub struct TopKRows {
+    pipelines: TopKPipelines,
+    partials: MetalBuffer,
+    output: MetalBuffer,
+    vocab: usize,
+    max_rows: usize,
+}
+
+impl TopKRows {
+    pub fn new(
+        ctx: &MetalContext,
+        shaders: &ShaderLibrary,
+        vocab: usize,
+        max_rows: usize,
+    ) -> crate::Result<Self> {
+        if vocab == 0 || !mergeable(vocab) || max_rows == 0 {
+            return Err(Error::InvalidArgument(
+                "top-k rows need a vocabulary of 1..=262144 tokens and one row".into(),
+            ));
+        }
+        Ok(Self {
+            pipelines: TopKPipelines::new(ctx, shaders)?,
+            partials: MetalBuffer::empty(ctx.device(), partials_bytes(vocab, max_rows))?,
+            output: MetalBuffer::empty(
+                ctx.device(),
+                max_rows * MAX_TOP_K * size_of::<TopKCandidate>(),
+            )?,
+            vocab,
+            max_rows,
+        })
+    }
+
+    /// Encode the best `k` logits of each of the first `rows` rows of `logits`.
+    pub fn encode(
+        &self,
+        batch: &mut CommandBatch,
+        logits: &MetalBuffer,
+        rows: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        if rows == 0
+            || rows > self.max_rows
+            || !(1..=MAX_TOP_K.min(self.vocab)).contains(&k)
+            || logits.length() < rows * self.vocab * size_of::<f32>()
+        {
+            return Err(Error::InvalidArgument(
+                "top-k rows exceed the workspace or the logits".into(),
+            ));
+        }
+        self.pipelines.encode(
+            batch,
+            (logits, 0),
+            self.vocab,
+            self.vocab,
+            rows,
+            k,
+            &self.partials,
+            &self.output,
+        );
+        Ok(())
+    }
+
+    /// Row `row`'s best `k` logits, best first, copied out of the last
+    /// completed [`Self::encode`] (which must have selected at least `k`).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `row` is outside the workspace or `k` exceeds [`MAX_TOP_K`].
+    #[must_use]
+    pub fn row(&self, row: usize, k: usize) -> Vec<TopKCandidate> {
+        assert!(
+            row < self.max_rows && k <= MAX_TOP_K,
+            "top-k row or count exceeds the workspace"
+        );
+        let start = row * MAX_TOP_K;
+        self.output.as_slice::<TopKCandidate>()[start..start + k].to_vec()
+    }
+
+    #[must_use]
+    pub const fn max_rows(&self) -> usize {
+        self.max_rows
     }
 }
 
