@@ -38,6 +38,7 @@ use super::background::{Background, Failure, Published, pending};
 use super::journal::{JournalReader, Line, terminal_events};
 use super::responses::sse_frame;
 use super::store::{ItemPage, ResponseStore, query_pairs};
+use super::store_failure;
 
 /// What a stored-response request asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -143,12 +144,7 @@ pub(super) fn subscribe(
     id: &str,
     after: Option<u64>,
 ) -> Result<Option<Subscription>, Failure> {
-    let failed = |error: std::io::Error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("response store failed: {error}"),
-        )
-    };
+    let failed = |error: std::io::Error| store_failure(&error);
     // Watched before the record is read, so a job that settles in between is
     // still followed to its end rather than missed.
     let live = background.watch(id);

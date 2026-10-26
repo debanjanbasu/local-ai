@@ -851,3 +851,28 @@ fn a_temporary_streamed_response_replays_until_it_expires() {
     assert_eq!(code, StatusCode::NOT_FOUND);
     assert_eq!(store.open_journal(&id).expect("readable").map(|_| ()), None);
 }
+
+#[test]
+fn a_store_failure_reaches_the_client_without_its_details() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let background = Arc::new(Background::default());
+    let depth = QueueDepth::default();
+    let (id, pump, _) = admit(&background, &store, &depth, |_| finished_steps());
+    pump.run();
+    // An unreadable record, whose error names the scratch directory.
+    let record = scratch.0.join(format!("{id}.json"));
+    std::fs::remove_file(&record).expect("record");
+    std::fs::create_dir(&record).expect("a directory where the record was");
+    let failure = super::stored_answer(&store, &axum::http::Method::GET, &id, None)
+        .expect_err("the store failed");
+    let streamed = subscribe(&background, &store, &id, None)
+        .err()
+        .expect("the store failed");
+    let directory = scratch.0.to_string_lossy();
+    for (status, message) in [failure, streamed] {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!message.contains(directory.as_ref()), "{message}");
+        assert!(!message.contains("os error"), "{message}");
+    }
+}

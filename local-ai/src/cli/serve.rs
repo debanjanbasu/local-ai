@@ -1171,6 +1171,16 @@ fn deleted(id: &str) -> serde_json::Value {
     json!({"id":id,"object":"response.deleted","deleted":true})
 }
 
+/// The `500` for a response store that failed: the error, which can name
+/// files on this machine, goes to the server log, not to the client.
+fn store_failure(error: &std::io::Error) -> Failure {
+    eprintln!("response store failed: {error}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the response store failed; the server log has the details".to_owned(),
+    )
+}
+
 /// Read, list or delete stored response `id`; `Ok(None)` is a 404.
 fn stored_answer(
     store: &ResponseStore,
@@ -1178,12 +1188,7 @@ fn stored_answer(
     id: &str,
     page: Option<&ItemPage>,
 ) -> Result<Option<serde_json::Value>, (StatusCode, String)> {
-    let failed = |error: std::io::Error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("response store failed: {error}"),
-        )
-    };
+    let failed = |error: std::io::Error| store_failure(&error);
     if *method == Method::DELETE {
         return Ok(background::delete_unowned(store, id)?.then(|| deleted(id)));
     }
