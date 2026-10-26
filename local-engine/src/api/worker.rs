@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
-use super::{
-    ChatJob, Delivered, Engine, Event, EventSplitter, Job, Stats, encode_prompt, prepare_chat,
-};
+use super::{ChatJob, Delivered, Engine, Event, EventSplitter, Job, encode_prompt, prepare_chat};
 use crate::GenerateParams;
 use crate::bonsai_model::CancelToken;
 use crate::judgment::{Decision, JudgmentHead, PreparedDecision};
@@ -142,27 +140,17 @@ impl Delivery {
             &mut self.splitter,
             EventSplitter::new(false, None, Vec::new()),
         );
-        let (finished, stop_reason) =
-            splitter.close(output.stop_reason, &mut |event| self.push(event));
-        if let Some(failure) = splitter.take_failure() {
+        let closed = Engine::close_generation(&mut splitter, output, &mut |event| self.push(event));
+        self.splitter = splitter;
+        if let Err(error) = closed {
             // A parse failure is terminal: report it, never `Finished`.
+            let failure = match error {
+                crate::Error::Generation(failure) => failure,
+                other => other.to_string(),
+            };
             self.outbox
                 .push_back(Delivered::Event(Event::Error(failure)));
-            return;
         }
-        let reasoning_tokens =
-            crate::bonsai_tokenizer::answer_start(&output.token_ids, splitter.thinking)
-                .unwrap_or(output.token_ids.len());
-        if finished.is_break() || self.push(Event::TokenIds(output.token_ids)).is_break() {
-            return;
-        }
-        let stats = Stats {
-            stop_reason,
-            cache_source: output.cache_source,
-            reasoning_tokens,
-            generation: output.stats,
-        };
-        let _ = self.push(Event::Finished(Box::new(stats)));
     }
 
     /// Hand queued events to the channel; `wait` blocks for room. Returns
