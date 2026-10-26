@@ -90,8 +90,8 @@ pub struct VisionEncoder {
 // SAFETY: Metal devices, queues, pipelines and buffers may move between
 // threads; every GPU object sits behind the mutex, so none is used by two
 // threads at once.
-#[allow(unsafe_code)]
-#[allow(clippy::non_send_fields_in_send_ty)]
+#[expect(unsafe_code)]
+#[expect(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Gpu {}
 
 const fn linear(
@@ -143,7 +143,7 @@ impl VisionEncoder {
     ///
     /// Fails when the file is not the pinned projector, a tensor is missing
     /// or misshapen, or Metal cannot be set up.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn open(path: &Path, signs: &[f32]) -> crate::Result<Self> {
         let bytes = std::fs::metadata(path)?.len();
         if bytes != VISION_PROJECTOR_BYTES {
@@ -332,7 +332,7 @@ impl VisionEncoder {
     ///
     /// Metal failures; [`crate::Error::Generation`] when cancelled.
     #[doc(hidden)]
-    #[allow(unsafe_code, clippy::too_many_lines)]
+    #[expect(unsafe_code, clippy::too_many_lines)]
     pub fn encode_raw(
         &self,
         image: &PreparedImage,
@@ -510,7 +510,7 @@ impl VisionEncoder {
 
 /// torch's float32 `linspace(0, 47, steps)`, rounded as torch rounds it
 /// (separate multiply and subtract, not a fused multiply-add).
-#[allow(clippy::suboptimal_flops)]
+#[expect(clippy::suboptimal_flops)]
 fn linspace(steps: usize) -> Vec<f32> {
     let end = (GRID - 1) as f32;
     if steps == 1 {
@@ -532,7 +532,7 @@ fn linspace(steps: usize) -> Vec<f32> {
 /// The learned positions bilinearly interpolated to a `grid_h x grid_w`
 /// patch grid (`fast_pos_embed_interpolate`), in merge order, with torch's
 /// unfused products and sums.
-#[allow(clippy::suboptimal_flops)]
+#[expect(clippy::suboptimal_flops)]
 pub(super) fn position_rows(table: &[f32], grid_h: usize, grid_w: usize) -> Vec<f32> {
     let (hs, ws) = (linspace(grid_h), linspace(grid_w));
     let corners = |value: f32| {

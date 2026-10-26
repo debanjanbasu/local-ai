@@ -36,7 +36,7 @@ struct Header {
 }
 
 #[derive(Deserialize, PartialEq, Eq, Debug)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 struct Config {
     n_mels: usize,
     n_audio_ctx: usize,
@@ -101,7 +101,7 @@ impl Artifact {
         let file = File::open(path)?;
         // SAFETY: the file is opened read-only and treated as immutable; the
         // installation is never rewritten in place (new installs are new files).
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code)]
         let map = unsafe { Mmap::map(&file)? };
         if map.len() < 16 || &map[..8] != MAGIC {
             return Err(invalid("bad magic"));

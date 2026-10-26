@@ -246,7 +246,7 @@ fn the_validator_rejects_what_the_contract_forbids() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn the_api_answers_with_conforming_objects() {
     let scratch = Scratch::new();
     let store = scratch.store();

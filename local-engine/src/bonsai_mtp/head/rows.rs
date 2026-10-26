@@ -126,7 +126,7 @@ impl BonsaiMtp {
     /// `0..drafting.len()`), whose draft logits land in row `i` of `logits`
     /// and whose predicted hidden in row `i` of [`Self::predicted`];
     /// `catching` spans the remaining rows, which only write their K/V.
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    #[expect(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn encode_stacked(
         &self,
         batch: &mut CommandBatch,

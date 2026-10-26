@@ -544,7 +544,7 @@ pub struct UpdateVectorStore {
 
 /// Reads a present field, `null` included, as `Some`: absent, `null` and a
 /// value are three different updates.
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,

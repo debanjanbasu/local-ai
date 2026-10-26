@@ -184,7 +184,7 @@ impl Sampler {
     /// raw distribution: from `distribution` (its log-sum-exp and best logits,
     /// at least [`Self::logprobs`] of them) when the GPU computed it, else on
     /// the host. The row is read before selection overwrites it.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn select_row(
         &mut self,
         buffer: &mut MetalBuffer,
@@ -226,7 +226,7 @@ impl Sampler {
         }
     }
 
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    #[expect(unsafe_code, clippy::too_many_arguments)]
     fn select_recorded(
         &mut self,
         logprobs: &mut Logprobs,
@@ -289,7 +289,6 @@ impl Sampler {
 
     /// Select on the GPU, but keep penalty arithmetic, filtering and RNG on the CPU.
     /// The caller must finish inference before exposing the shared logit buffer here.
-    #[allow(unsafe_code)]
     pub fn sample_buffer(
         &mut self,
         buffer: &mut MetalBuffer,
@@ -303,7 +302,7 @@ impl Sampler {
     /// [`Self::sample_buffer`], taking its candidates from `precomputed`, the
     /// row's best logits selected on the device, when nothing (no mask, no
     /// penalty) could change them and they hold at least `top_k`.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn sample_from(
         &mut self,
         buffer: &mut MetalBuffer,
@@ -392,7 +391,7 @@ impl Sampler {
     /// Greedy selection that also reports the winner's logit lead over the
     /// runner-up after penalties: a draft model's own confidence in its
     /// proposal. Only meaningful for a greedy sampler ([`Self::greedy_draft`]).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn sample_buffer_with_margin(
         &self,
         buffer: &mut MetalBuffer,

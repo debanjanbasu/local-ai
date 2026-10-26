@@ -170,7 +170,7 @@ impl BonsaiPackage {
         Self::open_architecture(path, "clip")
     }
 
-    #[allow(unsafe_code, clippy::too_many_lines)]
+    #[expect(unsafe_code, clippy::too_many_lines)]
     fn open_architecture(path: impl AsRef<Path>, expected: &str) -> crate::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
@@ -455,7 +455,7 @@ impl BonsaiPackage {
 
     /// Bind one tensor for the native backend without copying when the
     /// page-aligned window fits the device's buffer limit and the file.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn metal_tensor(
         &self,
         device: &ProtocolObject<dyn MTLDevice>,

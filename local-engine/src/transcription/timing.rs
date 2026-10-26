@@ -7,7 +7,6 @@
 //!
 //! Arithmetic follows the reference's order (no fused multiply-add, exact
 //! comparisons, F32 DTW costs) so that alignments match it.
-#![allow(clippy::suboptimal_flops, clippy::float_cmp)]
 
 use super::decode::Forward;
 use super::tokens::WhisperTokenizer;
@@ -66,7 +65,7 @@ fn median_filter(x: &mut [f64], rows: usize, cols: usize, width: usize) {
 
 /// `whisper.timing.dtw_cpu` + `backtrace` on an `n` x `m` cost matrix:
 /// (text indices, time indices).
-#[allow(clippy::many_single_char_names)]
+#[expect(clippy::many_single_char_names)]
 fn dtw(x: &[f64], n: usize, m: usize) -> (Vec<usize>, Vec<usize>) {
     let w = m + 1;
     let mut cost = vec![f32::INFINITY; (n + 1) * w];
@@ -177,7 +176,7 @@ fn split_to_word_tokens(
 }
 
 /// `find_alignment` for the window the forward holds.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn find_alignment(
     forward: &mut dyn Forward,
     tokenizer: &WhisperTokenizer,
@@ -326,7 +325,7 @@ fn merge_punctuations(alignment: &mut [WordTiming]) {
 
 /// `add_word_timestamps` over one window's segments (which must not be
 /// empty of text tokens for words to appear).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(clippy::too_many_arguments)]
 pub fn add_word_timestamps(
     segments: &mut [Segment],
     forward: &mut dyn Forward,

@@ -147,7 +147,7 @@ struct RequestBody {
     model: String,
     input: Value,
     questions: Vec<Question>,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     safety_identifier: Option<String>,
 }
 
@@ -160,16 +160,16 @@ enum Question {
     },
     Choice {
         name: Option<String>,
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         instructions: String,
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         choices: Vec<Value>,
     },
     Score {
         name: Option<String>,
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         instructions: String,
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         levels: Vec<Value>,
     },
 }

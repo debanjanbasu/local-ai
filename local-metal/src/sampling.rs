@@ -58,7 +58,7 @@ impl TopKPipelines {
     /// Encode the best `k` of each of `rows` rows of `vocab` logits, `stride`
     /// floats apart from `offset` bytes into `logits`, into `MAX_TOP_K`
     /// slots per row of `output`. Bounds are the caller's.
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    #[expect(unsafe_code, clippy::too_many_arguments)]
     fn encode(
         &self,
         batch: &mut CommandBatch,
@@ -202,7 +202,7 @@ impl GpuTopK {
     ///
     /// Panics when `k` exceeds [`MAX_TOP_K`].
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn candidates(&self, k: usize) -> Vec<TopKCandidate> {
         assert!(k <= MAX_TOP_K, "candidate count exceeds maximum top-k");
         // SAFETY: the borrow ends with this copy. The output buffer is private
@@ -296,7 +296,7 @@ impl TopKRows {
     ///
     /// Panics when `row` is outside the workspace or `k` exceeds [`MAX_TOP_K`].
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn row(&self, row: usize, k: usize) -> Vec<TopKCandidate> {
         assert!(
             row < self.max_rows && k <= MAX_TOP_K,
@@ -381,7 +381,7 @@ impl LogprobRows {
 
     /// Encode the statistics of the first `rows` rows of `logits`, with the
     /// best `k` (at most [`MAX_TOP_LOGPROBS`]) logits of each.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn encode(
         &self,
         batch: &mut CommandBatch,
@@ -445,7 +445,7 @@ impl LogprobRows {
     ///
     /// Panics when `row` is outside the workspace.
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn log_sum_exp(&self, row: usize) -> f32 {
         // SAFETY: the borrow ends with this copy. The buffer is private to this
         // workspace and not `Sync`, so no CPU writer runs meanwhile, and the
@@ -461,7 +461,7 @@ impl LogprobRows {
     ///
     /// Panics when `row` is outside the workspace or `k` exceeds [`MAX_TOP_LOGPROBS`].
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn top(&self, row: usize, k: usize) -> Vec<TopKCandidate> {
         assert!(
             k <= MAX_TOP_LOGPROBS,
@@ -495,7 +495,7 @@ fn dispatch(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, groups: usiz
     );
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn bind(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     buffer: &MetalBuffer,
@@ -505,7 +505,7 @@ unsafe fn bind(
     unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), offset, index) };
 }
 
-#[allow(unsafe_code, clippy::trivially_copy_pass_by_ref)]
+#[expect(unsafe_code)]
 unsafe fn set_u32(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &u32,

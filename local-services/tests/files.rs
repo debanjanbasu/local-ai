@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![expect(clippy::unwrap_used, clippy::expect_used)]
 //! Files and multipart Uploads persistence, using small disposable data.
 
 use std::fs;
@@ -563,7 +563,7 @@ fn concurrent_completions_produce_exactly_one_file() {
     };
     let results: Vec<bool> = std::thread::scope(|scope| {
         // Collecting first is required so all threads run concurrently.
-        #[allow(clippy::needless_collect)]
+        #[expect(clippy::needless_collect)]
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let store = store.clone();

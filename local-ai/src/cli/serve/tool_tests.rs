@@ -892,7 +892,7 @@ fn searchable(
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn file_search_runs_without_permissions_and_answers_with_citations() {
     let (_dir, service, store_id, files) = searchable(&[
         ("notes.md", "The launch code is 7421. Keep it secret."),

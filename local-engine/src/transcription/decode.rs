@@ -9,7 +9,7 @@
 //! Arithmetic on times and probabilities is written as the reference writes
 //! it (no fused multiply-add, exact float comparisons), so segment times
 //! match it bit for bit.
-#![allow(clippy::suboptimal_flops, clippy::float_cmp)]
+#![expect(clippy::suboptimal_flops, clippy::float_cmp)]
 
 use std::io::Write as _;
 
@@ -203,7 +203,7 @@ pub fn apply_filters(
 
 /// One `DecodingTask.run` over the last encoded window: greedy at
 /// temperature 0, sampling otherwise; timestamps on.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn decode_window(
     forward: &mut dyn Forward,
     tokenizer: &WhisperTokenizer,
@@ -375,7 +375,7 @@ pub struct WindowOptions {
     pub condition_on_previous_text: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn new_segment(
     tokenizer: &WhisperTokenizer,
     id: usize,
@@ -424,7 +424,7 @@ fn get_end(segments: &[Segment]) -> Option<f64> {
 /// segments as soon as they are final. `first_window_encoded`: the forward
 /// already holds the encoding of the full first window (`mel.window(0,
 /// 3000)`, as language detection leaves it).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn transcribe(
     forward: &mut dyn Forward,
     tokenizer: &WhisperTokenizer,

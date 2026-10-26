@@ -1280,7 +1280,7 @@ fn still_named(file: &fs::File, path: &Path) -> std::io::Result<bool> {
 }
 
 #[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn still_named(_file: &fs::File, _path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }

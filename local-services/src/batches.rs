@@ -1210,7 +1210,7 @@ fn raw(row: &Row<'_>) -> rusqlite::Result<Raw> {
 impl Raw {
     // The bindings are the public `batch` field names (`expires_at` and
     // `expired_at` both appear in the spec).
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     fn into_batch(self) -> Result<Batch> {
         let time = |value: Option<i64>| value.map(unsigned).transpose();
         let [

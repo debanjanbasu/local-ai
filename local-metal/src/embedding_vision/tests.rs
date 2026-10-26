@@ -1,10 +1,4 @@
-#![allow(
-    unsafe_code,
-    clippy::expect_used,
-    clippy::cast_precision_loss,
-    clippy::many_single_char_names,
-    clippy::suboptimal_flops
-)]
+#![expect(unsafe_code, clippy::cast_precision_loss)]
 
 use super::*;
 

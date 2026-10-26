@@ -537,7 +537,7 @@ fn cipher(scratch: &Scratch) -> Arc<ReasoningCipher> {
 }
 
 /// One token per rendered message: enough to plan a compaction.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn by_messages(messages: Vec<ChatMessage>) -> crate::Result<usize> {
     local_engine::Engine::render_chat_with_tools(&messages, false, &[])?;
     Ok(messages.len())

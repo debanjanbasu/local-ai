@@ -1,4 +1,4 @@
-#![allow(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
+#![expect(unsafe_code, clippy::expect_used)]
 
 use std::ptr::NonNull;
 
@@ -62,7 +62,7 @@ fn encode(batch: &mut CommandBatch, kernel: &Kernel, buffers: [&MetalBuffer; 5],
 }
 
 /// Buffers: QKV, decay, beta, initial state, output, final state.
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn encode_into(batch: &mut CommandBatch, kernel: &Kernel, buffers: [&MetalBuffer; 6], tokens: u32) {
     let encoder = batch.encoder();
     encoder.setComputePipelineState(&kernel.pipeline);

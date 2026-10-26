@@ -252,8 +252,8 @@ pub struct EmbeddingModel {
 // between threads. The model owns every object exclusively and is `!Sync`
 // (its Metal objects are), so no encoder or workspace is used concurrently;
 // sharing goes through a mutex.
-#[allow(unsafe_code)]
-#[allow(clippy::non_send_fields_in_send_ty)]
+#[expect(unsafe_code)]
+#[expect(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for EmbeddingModel {}
 
 impl EmbeddingModel {
@@ -490,7 +490,7 @@ impl EmbeddingModel {
     /// Run the encoder over packed input embeddings `x0` (`[Σ lens, 512]`,
     /// sequences of `lens` tokens back to back); one normalized embedding per
     /// sequence. The workspace grows to fit a longer pass.
-    #[allow(unsafe_code, clippy::too_many_lines)]
+    #[expect(unsafe_code, clippy::too_many_lines)]
     fn encode_embedded(
         &mut self,
         x0: &[f32],

@@ -80,7 +80,7 @@ struct VideoRef {
 }
 
 #[derive(Deserialize)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 struct Captions {
     files: Vec<String>,
     captions: Vec<String>,
@@ -150,7 +150,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn preprocess_gate(path: &str) -> Result<()> {
     let (index, base) = read_index(path)?;
     let (mut resize_ok, mut decode_ok, mut pipeline_ok) = (0, 0, 0);

@@ -204,7 +204,7 @@ impl BonsaiEngine {
     }
 
     /// [`Self::generate_session_progress`] under a compiled response format.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn generate_constrained(
         &mut self,
         prompt: &[u32],
@@ -240,7 +240,7 @@ impl BonsaiEngine {
     /// Validate a request whose sequence is resident in the model, restore
     /// its reusable prompt prefix and plan the rest of its prefill, which
     /// [`Self::prefill_round`] runs.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn begin_generation(
         &mut self,
         id: u64,

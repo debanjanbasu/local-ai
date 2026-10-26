@@ -143,7 +143,7 @@ impl BonsaiKernels {
     /// take one dispatch that reads the matrix once: the vector kernels for up
     /// to [`INT8_VECTOR_TOKENS`] rows, the wide simdgroup-matrix kernel above.
     /// Larger blocks take even chunks of at most [`INT8_CHUNK_TOKENS`] rows.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn int8_matmul(
         &self,
         batch: &mut CommandBatch,
@@ -200,7 +200,7 @@ impl BonsaiKernels {
     /// Single-row projections of one input by one to three int8 matrices with
     /// the same column count, in one dispatch. Outputs must be distinct from
     /// the input and every weight buffer.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn int8_matvec_concat(
         &self,
         batch: &mut CommandBatch,
@@ -259,7 +259,7 @@ impl BonsaiKernels {
 
     /// Single-row `silu(gate · input) · (up · input)` for two same-shape int8
     /// matrices in one dispatch; neither projection is stored.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn int8_matvec_swiglu(
         &self,
         batch: &mut CommandBatch,

@@ -557,7 +557,7 @@ struct CreateProject {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 struct ModifyProject {
     name: Option<String>,
     #[serde(default, deserialize_with = "present")]
@@ -566,7 +566,7 @@ struct ModifyProject {
 }
 
 /// Distinguishes an explicit `null` (`Some(None)`) from an absent field.
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 fn present<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Option<String>>, D::Error> {
@@ -575,7 +575,7 @@ fn present<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 struct CreateServiceAccount {
     name: String,
     create_service_account_only: Option<bool>,
@@ -600,7 +600,7 @@ struct CreateServiceAccountKey {
 const RESIDENCY: &str = "data residency does not apply: every byte stays on this machine";
 
 /// Route and answer one Administration API request. Blocks on the store.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) fn dispatch(
     admin: &Admin,
     method: &Method,
@@ -1254,7 +1254,7 @@ pub(super) fn transcription_usage(caller: &Caller, model: &str, seconds: f64) ->
 /// Seconds of audio as a usage column, a started second counting as one.
 pub(super) fn audio_seconds(seconds: f64) -> i64 {
     if seconds.is_finite() && seconds > 0.0 {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         let whole = seconds.ceil().min(i64::MAX as f64) as i64;
         whole
     } else {

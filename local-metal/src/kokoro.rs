@@ -130,7 +130,7 @@ fn arg(message: &str) -> Error {
     Error::InvalidArgument(message.to_owned())
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn set<T: Copy>(encoder: &Encoder, value: &T, index: usize) {
     // SAFETY: `value` is a live plain value; Metal copies the bytes.
     unsafe {
@@ -142,7 +142,7 @@ fn set<T: Copy>(encoder: &Encoder, value: &T, index: usize) {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn bind(encoder: &Encoder, view: View<'_>, index: usize) {
     // SAFETY: the buffer is retained by the caller until GPU completion.
     unsafe { encoder.setBuffer_offset_atIndex(Some(view.buffer.raw()), view.offset, index) };
@@ -255,7 +255,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short or an empty sequence.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn lstm(
         &self,
         batch: &mut CommandBatch,
@@ -292,7 +292,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn channel_norm(
         &self,
         batch: &mut CommandBatch,
@@ -341,7 +341,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short, or `Snake` without `alpha`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn instance_norm(
         &self,
         batch: &mut CommandBatch,
@@ -397,7 +397,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn copy(
         &self,
         batch: &mut CommandBatch,
@@ -436,7 +436,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn gather(
         &self,
         batch: &mut CommandBatch,
@@ -473,7 +473,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn depthwise_up(
         &self,
         batch: &mut CommandBatch,
@@ -535,7 +535,7 @@ impl KokoroKernels {
     /// # Errors
     ///
     /// Views too short.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn attention(
         &self,
         batch: &mut CommandBatch,

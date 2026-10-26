@@ -690,7 +690,7 @@ fn speculative_rows_across_the_reasoning_end_equal_sequential_selections() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // One row per refused setting.
+#[expect(clippy::too_many_lines)] // One row per refused setting.
 fn unenforceable_settings_fail_early_with_the_reason() {
     let tokenizer = special_tags();
     let strict = |parameters: Value| tool("f", parameters, true);

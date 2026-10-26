@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used)]
 
 //! Observable behaviour of the read-only workspace tools on throwaway trees.
 

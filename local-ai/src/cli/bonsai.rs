@@ -65,7 +65,7 @@ fn parse_export(requested: &str) -> Result<ExportKind, String> {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct Args {
     max_tokens: usize,
@@ -108,7 +108,7 @@ fn usage() {
     );
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut result = Args {
         max_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -258,7 +258,7 @@ fn mtp_summary(engine: &BonsaiEngine) -> Option<(serde_json::Value, serde_json::
         .then(|| (policy["head"].clone(), policy["depth"].clone()))
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn run(args: &Args) -> crate::Result<()> {
     let resources = Resources::discover_with_depth(None, !args.no_speculation, args.mtp_depth)?;
     if let OutputMode::Export(kind) = &args.output {

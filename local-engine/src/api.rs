@@ -82,7 +82,7 @@ pub struct Sampling(pub GenerateParams);
 
 /// A templated chat generation request.
 #[derive(Clone, Debug)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct ChatRequest {
     /// Conversation in chronological order.
     pub messages: Vec<ChatMessage>,
@@ -296,8 +296,8 @@ pub struct Engine {
 // SAFETY: Metal command queues and resource objects may be transferred between
 // threads. `Engine` has exclusive ownership of every object and is deliberately
 // `!Sync`, so no command encoder or mutable model state is used concurrently.
-#[allow(unsafe_code)]
-#[allow(clippy::non_send_fields_in_send_ty)]
+#[expect(unsafe_code)]
+#[expect(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Engine {}
 
 impl Engine {
@@ -507,7 +507,7 @@ impl Engine {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn generate(
         &mut self,
         ids: &[u32],

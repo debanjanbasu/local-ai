@@ -87,9 +87,9 @@ struct ArtifactFile {
     window_tokens: usize,
     dimensions: usize,
     categories: std::collections::BTreeMap<String, CategoryFile>,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     provenance: serde_json::Value,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     evaluation: serde_json::Value,
 }
 

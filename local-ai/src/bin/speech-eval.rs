@@ -28,11 +28,10 @@
 //! - `bench`: real-time factor of fixed sentences (best of three).
 
 // An offline measurement tool: plain float arithmetic and short math names.
-#![allow(
+#![expect(
     clippy::suboptimal_flops,
     clippy::many_single_char_names,
-    clippy::type_complexity,
-    clippy::too_many_lines
+    clippy::type_complexity
 )]
 
 use std::collections::BTreeMap;
@@ -338,7 +337,7 @@ fn synth(dir: &Path, out: &Path) -> Result<()> {
 
 /// CPU half of `parity`: compare `synth`'s outputs with the reference and
 /// write 16-bit WAVs of both for the ASR job.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn compare(dir: &Path, out: &Path) -> Result<()> {
     let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(
         dir.join("fixtures/manifest.json"),

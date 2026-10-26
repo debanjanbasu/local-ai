@@ -587,7 +587,7 @@ impl VectorIndex {
     // The writer lock spans the whole write protocol: the outbox entries,
     // the index commit and the confirming transaction must not interleave
     // with another indexing run or a collection.
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    #[expect(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub(crate) fn index_batch(&self, stop: &dyn Fn() -> bool) -> Result<usize> {
         let embedder = self.embedder();
         let budget = if embedder.is_some() {
@@ -853,7 +853,7 @@ impl VectorIndex {
     /// comparison is exact: after collection, documents outside the outbox
     /// belong to completed files only.
     // The writer lock keeps the index fixed while it is compared.
-    #[allow(clippy::significant_drop_tightening)]
+    #[expect(clippy::significant_drop_tightening)]
     pub fn check(&self) -> Result<IndexCheck> {
         let mut writer = self.lock();
         let collected = self.collect(&mut writer)?;

@@ -76,7 +76,7 @@ fn mel_to_hertz(mel: f64) -> f64 {
 
 /// `numpy.linspace(first, last, count)`: `i * step + first`, rounded
 /// separately as numpy does (no fused multiply-add).
-#[allow(clippy::suboptimal_flops)]
+#[expect(clippy::suboptimal_flops)]
 fn linspace(first: f64, last: f64, count: usize) -> Vec<f64> {
     let increment = (last - first) / (count - 1) as f64;
     (0..count)
@@ -110,7 +110,7 @@ fn mel_filters() -> Vec<f64> {
 /// Periodic Hann window of 320 samples as F32: `np.hanning(321)[:-1]`,
 /// i.e. `0.5 + 0.5 cos(pi n / 320)` for `n = -320, -318, ...`, in numpy's
 /// operation order.
-#[allow(clippy::suboptimal_flops)]
+#[expect(clippy::suboptimal_flops)]
 fn window() -> Vec<f32> {
     (0..FRAME)
         .map(|k| {

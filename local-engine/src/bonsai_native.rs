@@ -126,7 +126,7 @@ impl HostPromptSnapshot {
         self.position
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn from_snapshot(model: &BonsaiModel, snapshot: &PromptSnapshot) -> crate::Result<Self> {
         let section_lengths = [
             snapshot.recurrent.len(),
@@ -160,7 +160,7 @@ impl HostPromptSnapshot {
         self.buffer.make_nonvolatile()
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn snapshot(&self) -> crate::Result<PromptSnapshot> {
         // SAFETY: the snapshot buffer is written once, at creation, and never
         // by the GPU.
@@ -775,7 +775,7 @@ pub struct BonsaiModel {
 }
 
 impl BonsaiModel {
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(crate) fn load(
         package: BonsaiPackage,
         capacity: usize,
@@ -1099,7 +1099,7 @@ impl BonsaiModel {
     }
 
     /// Copy an exact boundary to CPU memory. Cache tails are deliberately omitted.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn prompt_snapshot(&self) -> crate::Result<PromptSnapshot> {
         let recurrent = self
             .layers
@@ -1126,7 +1126,7 @@ impl BonsaiModel {
     /// from the live caches, which only ever append past it within a request.
     /// So a request's prompt snapshot need not sit in host memory for its
     /// whole decode. `None` when the OS purged the checkpoint.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn prompt_snapshot_at(
         &self,
         checkpoint: &PromptCheckpoint,
@@ -1158,7 +1158,7 @@ impl BonsaiModel {
             .map(Some)
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn snapshot_with<'a>(
         &'a self,
         position: usize,
@@ -1429,7 +1429,7 @@ impl BonsaiModel {
     }
 
     /// The logits the last block left for its final row.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn last_logits(&self) -> Vec<f32> {
         // SAFETY: every block waits for its GPU work before returning, and the
         // borrow ends with this copy.
@@ -1794,5 +1794,5 @@ fn invalid<T>(message: impl Into<String>) -> crate::Result<T> {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 mod tests;

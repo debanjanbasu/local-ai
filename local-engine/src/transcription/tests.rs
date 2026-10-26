@@ -1,5 +1,3 @@
-#![allow(clippy::cast_precision_loss)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 

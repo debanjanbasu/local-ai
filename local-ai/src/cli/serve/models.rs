@@ -132,7 +132,7 @@ const fn route_of(model: Served) -> &'static str {
 /// Which optional models this server runs beside Bonsai (independent
 /// installs, so independent flags).
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub(super) struct Installed {
     pub(super) embeddings: bool,
     pub(super) moderation: bool,

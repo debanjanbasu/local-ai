@@ -1,4 +1,4 @@
-#![allow(unsafe_code, clippy::expect_used)]
+#![expect(unsafe_code, clippy::expect_used)]
 
 use local_metal::{
     batch::CommandBatch,
@@ -389,7 +389,7 @@ fn bf16_matmul_rows_match_f64_and_are_bitwise_the_matvec() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn recurrent_sequence_preserves_all_heads_state_history_and_grouped_output() {
     let Some((ctx, ops)) = setup() else { return };
     let weight_data = (0..10240 * 4)
@@ -614,7 +614,7 @@ fn attention_preparation_splits_every_head_and_rotates_only_first64() {
 /// `RoPE` angles differ per row), asymmetric rows, guarded neighbours, and
 /// rejected alias/overflow/short-input calls.
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn kv_preparation_matches_full_preparation_rows_bitwise_and_touches_nothing_else() {
     let Some((ctx, ops)) = setup() else { return };
     let tokens = 3u32;
@@ -785,7 +785,6 @@ fn kv_preparation_matches_full_preparation_rows_bitwise_and_touches_nothing_else
 /// Both ends of the short SIMD split range, on a workspace sized for the
 /// longest prefix and on one sized tightly below the 1,024-token threshold.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn split_gqa_matches_f64_across_boundaries_and_shorter_workspace_reuse() {
     let Some((ctx, default)) = setup() else {
         return;
@@ -961,7 +960,7 @@ fn dequantize_row(format: KvFormat, row: &[u8]) -> Vec<f32> {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_else() {
     let Some((ctx, ops)) = setup() else { return };
     let tokens = 3u32;
@@ -1170,7 +1169,7 @@ fn q8_kv_scale_saturates_instead_of_overflowing() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() {
     let Some((ctx, ops)) = setup() else { return };
     let capacity = 65_537u32;

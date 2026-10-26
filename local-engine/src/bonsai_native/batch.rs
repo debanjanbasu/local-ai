@@ -124,7 +124,7 @@ impl HeadLag {
 
     /// Reserve room for `count` more rows, returning the first one's byte
     /// offset.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn reserve_rows(
         &mut self,
         context: &local_metal::context::MetalContext,
@@ -465,8 +465,8 @@ impl BonsaiModel {
     ///
     /// Every row must belong to a different sequence, and at most one of
     /// them, the prompt's included, may be the resident sequence.
-    #[allow(clippy::too_many_lines)]
-    #[allow(unsafe_code)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(unsafe_code)]
     pub(crate) fn decode_batch_prefilling(
         &mut self,
         rows: &mut [BatchRow<'_>],
@@ -852,7 +852,7 @@ impl BonsaiModel {
     /// those rows from the start of the round, in one submission for every
     /// sequence; positions and head lags advance by the kept rows. Entries of
     /// sequences without drafts are ignored.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(crate) fn commit_batch(
         &mut self,
         rows: &mut [BatchRow<'_>],
@@ -1239,7 +1239,7 @@ impl BonsaiModel {
     /// them and leave them as they were (the block's final ones go to the
     /// spares); with `keep` the layer's raw QKV rows, decay and beta are kept
     /// there for [`Self::commit_batch`] to replay.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn recurrent_rows(
         &self,
         batch: &mut CommandBatch,
@@ -1479,5 +1479,5 @@ fn mismatch() -> crate::Error {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 mod tests;

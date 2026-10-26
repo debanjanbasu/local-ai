@@ -7,16 +7,16 @@ pub mod speech;
 
 pub mod bonsai;
 #[doc(hidden)]
-#[allow(clippy::must_use_candidate)]
+#[expect(clippy::must_use_candidate)]
 pub mod bonsai_model;
 mod bonsai_mtp;
 #[doc(hidden)]
 pub mod bonsai_native;
 #[doc(hidden)]
-#[allow(clippy::must_use_candidate, clippy::too_long_first_doc_paragraph)]
+#[expect(clippy::must_use_candidate, clippy::too_long_first_doc_paragraph)]
 pub mod bonsai_ngram;
 #[doc(hidden)]
-#[allow(clippy::too_long_first_doc_paragraph)]
+#[expect(clippy::too_long_first_doc_paragraph)]
 pub mod bonsai_tokenizer;
 pub mod bonsai_vision;
 pub mod compaction;
@@ -25,7 +25,7 @@ pub mod judgment;
 pub mod moderation;
 mod prompt_cache;
 #[doc(hidden)]
-#[allow(clippy::must_use_candidate)]
+#[expect(clippy::must_use_candidate)]
 pub mod resources;
 mod sampler;
 mod structured;

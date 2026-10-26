@@ -108,7 +108,7 @@ impl MtpCapture {
 
     /// Run `tokens` through the target from an empty cache and write one shard
     /// of `tokens.len()` records to `out`.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn capture_document(
         &mut self,
         tokens: &[u32],
@@ -212,7 +212,7 @@ impl MtpCapture {
     /// `tokens[..position]`, exactly as a speculative round does: step 0 fuses
     /// `tokens[position]` with the committed hidden, every deeper step fuses the
     /// previous step's argmax with the head's own normalized output.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn draft_chain(
         &mut self,
         tokens: &[u32],
@@ -292,7 +292,7 @@ impl BonsaiModel {
     /// returns `Ok(None)` and submits nothing further. Either way the
     /// resident buffers are left holding a partial capture, not any earlier
     /// sequence: the caller owns invalidating whatever described them.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn capture_hidden(
         &mut self,
         tokens: &[u32],
@@ -670,7 +670,7 @@ fn write_rotated_table(
         let per_thread = per.div_ceil(threads) * row_bytes;
         // Every worker is spawned before any is joined; joining lazily would
         // run them one at a time.
-        #[allow(clippy::needless_collect)]
+        #[expect(clippy::needless_collect)]
         let parts = std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
                 .chunks(per_thread.max(row_bytes))

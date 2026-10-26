@@ -144,7 +144,7 @@ fn fit(mut ids: Vec<u32>) -> Vec<u32> {
     ids
 }
 
-#[allow(clippy::needless_pass_by_value)] // used as `map_err(failure)`
+#[expect(clippy::needless_pass_by_value)] // used as `map_err(failure)`
 fn failure(error: local_engine::Error) -> local_services::Error {
     local_services::Error::Io(std::io::Error::other(format!("embedding failed: {error}")))
 }

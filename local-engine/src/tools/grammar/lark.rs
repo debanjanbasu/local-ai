@@ -101,7 +101,7 @@ enum Token {
     Newline,
 }
 
-#[allow(clippy::too_many_lines)] // One scanner over the Lark token syntax.
+// One scanner over the Lark token syntax.
 fn tokenize(source: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut characters = source.chars().peekable();

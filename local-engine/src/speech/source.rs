@@ -10,7 +10,7 @@
 
 // Multiplies and adds stay separate (no fused multiply-add) to follow the
 // reference's F32 rounding.
-#![allow(clippy::suboptimal_flops)]
+#![expect(clippy::suboptimal_flops)]
 
 const SAMPLE_RATE: f32 = 24_000.0;
 /// Samples per F0 frame (generator upsampling 10 x 6 times the iSTFT hop 5).

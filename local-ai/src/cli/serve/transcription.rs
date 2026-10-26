@@ -130,7 +130,7 @@ enum Format {
 }
 
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 struct Form {
     file: Vec<u8>,
     extension: Option<String>,
@@ -202,7 +202,7 @@ async fn read_form_within(
         })
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn read_form(parts: &Parts, body: Body, task: Task) -> Result<RawForm, Failure> {
     let content_type = parts
         .headers
@@ -306,7 +306,7 @@ async fn read_form(parts: &Parts, body: Body, task: Task) -> Result<RawForm, Fai
     Ok(raw)
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn validate(raw: RawForm, task: Task) -> Result<Form, Failure> {
     let (file, filename) = raw.file.ok_or_else(|| bad("field \"file\" is required"))?;
     let model = raw
@@ -638,7 +638,7 @@ fn sse(value: &Value) -> Bytes {
     Bytes::from(format!("data: {value}\n\n"))
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) async fn handle(
     state: &AppState,
     parts: &Parts,

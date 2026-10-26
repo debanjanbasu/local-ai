@@ -632,7 +632,7 @@ fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
 /// stream's longest gap while the snapshot restores.
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device; prints timings"]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn a_stream_keeps_decoding_while_another_request_loads_a_disk_snapshot() {
     let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let mut engine = BonsaiEngine::open_with_options(

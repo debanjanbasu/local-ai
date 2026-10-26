@@ -323,7 +323,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 }
 
 /// Serve an admitted request.
-#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+#[expect(clippy::too_many_lines, clippy::significant_drop_tightening)]
 async fn dispatch(
     state: AppState,
     parts: axum::http::request::Parts,
@@ -1287,7 +1287,7 @@ impl AppState {
 }
 
 // Keep service startup and shutdown ownership together.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn run_async(args: Args) -> crate::Result<()> {
     let services = services::Services::open_default()?;
     let vector_stores = match vector_stores::VectorStores::start(services.store()) {

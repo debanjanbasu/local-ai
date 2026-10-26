@@ -572,7 +572,7 @@ async fn vector_call(
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn vector_stores_are_private_over_http_and_to_file_search() {
     let scratch = Scratch::new();
     let store = Store::open(&scratch.root).unwrap();

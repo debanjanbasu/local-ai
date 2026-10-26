@@ -153,8 +153,8 @@ pub(super) struct WhisperGpu {
 // between threads. The model owns every object exclusively and is `!Sync`
 // (its Metal objects are), so no encoder or workspace is used concurrently;
 // sharing goes through a mutex.
-#[allow(unsafe_code)]
-#[allow(clippy::non_send_fields_in_send_ty)]
+#[expect(unsafe_code)]
+#[expect(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for WhisperGpu {}
 
 fn linear(
@@ -305,7 +305,7 @@ impl WhisperGpu {
 
     /// `output = epilogue(W · input)` for `tokens` rows, split by estimated
     /// cost when Bonsai is decoding.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn linear(
         &self,
         sub: &mut Submit<'_, '_, '_>,
@@ -387,14 +387,14 @@ impl WhisperGpu {
     }
 
     /// The final encoder states of the last window, `[1500][1280]`.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(super) fn encoder_output(&self) -> Vec<f32> {
         // SAFETY: every encoder pass waits for its GPU work before returning;
         // the borrow ends with this copy.
         unsafe { self.ws.output.as_slice::<f32>()[..CTX_AUDIO * STATE].to_vec() }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn encode_window(&mut self, window: &[f32], pace: &mut Pace<'_>) -> crate::Result<()> {
         if window.len() != WINDOW_FRAMES * N_MELS {
             return Err(Error::InvalidArgument(
@@ -595,7 +595,7 @@ impl WhisperGpu {
 
     /// Run `tokens` at positions `start..` and return the logits at `rows`
     /// (indices into `tokens`).
-    #[allow(unsafe_code, clippy::too_many_lines)]
+    #[expect(unsafe_code, clippy::too_many_lines)]
     fn decode_tokens(
         &mut self,
         payload: &[u8],
@@ -809,7 +809,7 @@ impl Forward for Bound<'_> {
             .decode_tokens(self.payload, tokens, 0, rows, &[], pace)
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn alignment(
         &mut self,
         tokens: &[u32],

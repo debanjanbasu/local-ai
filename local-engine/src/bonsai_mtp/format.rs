@@ -179,7 +179,7 @@ pub(super) fn read_head_with(path: &Path, bind: &SpecBinder<'_>) -> Result<HeadM
     let open = |error: std::io::Error| reject(format!("{}: {error}", path.display()));
     let file = File::open(path).map_err(open)?;
     // SAFETY: immutable mapping retained by every no-copy Metal buffer.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     let map = unsafe { MmapOptions::new().map(&file) }.map_err(open)?;
     let header = map.get(..HEADER_BYTES).ok_or_else(|| {
         reject(format!(
@@ -229,7 +229,7 @@ pub(super) fn read_head_with(path: &Path, bind: &SpecBinder<'_>) -> Result<HeadM
 /// Check a header page against `spec` and return what it claims. No section
 /// byte is read here, so a file whose framing is wrong is rejected before
 /// anything is hashed.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn parse_header(header: &[u8], path: &Path, bind: &SpecBinder<'_>) -> Result<HeadHeader, String> {
     let mut cursor = HeaderReader {
         bytes: header,

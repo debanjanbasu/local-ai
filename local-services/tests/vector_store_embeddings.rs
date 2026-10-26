@@ -1,9 +1,4 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::assert_is_empty
-)]
+#![expect(clippy::unwrap_used, clippy::assert_is_empty)]
 //! Vector store embeddings: vectors written with the index, kept consistent
 //! with the database across crashes, restarts and deletions, backfilled
 //! for stores indexed without them, and the hybrid ranking options; driven

@@ -82,7 +82,7 @@ fn same(a: &MetalBuffer, b: &MetalBuffer) -> bool {
     std::ptr::eq(a.raw(), b.raw())
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn set<T: Copy>(
     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     value: &T,
@@ -98,7 +98,7 @@ fn set<T: Copy>(
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn bind(
     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     buffer: &MetalBuffer,
@@ -160,7 +160,7 @@ impl EmbeddingKernels {
     /// `RMSNorm` of `rows` contiguous rows of `dimension`, optionally scaled by
     /// `weight[i % weight_period]` (one shared weight vector), after
     /// multiplying the input by `scale`. `output` may be `input` (in place).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn rms(
         &self,
         batch: &mut CommandBatch,
@@ -204,7 +204,7 @@ impl EmbeddingKernels {
     }
 
     /// `hidden = (hidden + rms(branch) * weight) * scalar` over `rows` rows.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn rms_add(
         &self,
         batch: &mut CommandBatch,
@@ -242,7 +242,7 @@ impl EmbeddingKernels {
 
     /// Rotary embedding in place on `[tokens, heads, dimension]`;
     /// `positions` holds one `u32` per token.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn rope(
         &self,
         batch: &mut CommandBatch,
@@ -283,7 +283,7 @@ impl EmbeddingKernels {
 
     /// `output[t, c] = gelu_tanh(gate[t, c]) * other[t * other_stride +
     /// other_offset + c]` for `rows` rows of `columns`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn gelu_mul(
         &self,
         batch: &mut CommandBatch,
@@ -325,7 +325,7 @@ impl EmbeddingKernels {
     }
 
     /// Bidirectional packed attention; see [`AttentionShape`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn attention(
         &self,
         batch: &mut CommandBatch,

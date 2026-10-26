@@ -129,7 +129,7 @@ fn count(ps: &str, set: &str) -> bool {
 }
 
 // `misaki`'s stress levels are the exact values -2, -1, -0.5, 0, 0.5, 1 and 2.
-#[allow(clippy::float_cmp)]
+#[expect(clippy::float_cmp)]
 fn apply_stress(ps: &str, stress: Option<f32>) -> String {
     let Some(stress) = stress else {
         return ps.to_owned();
@@ -312,7 +312,6 @@ impl Lexicon {
         (Some(out), Some(3))
     }
 
-    #[allow(clippy::too_many_lines)]
     fn get_special_case(&self, word: &str, tag: &str, stress: Option<f32>, ctx: Context) -> Lookup {
         let symbols = |w: &str| match w {
             "%" => Some("percent"),
@@ -706,7 +705,7 @@ impl Lexicon {
         cents.chars().count() < 3
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn get_number(
         &self,
         word: &str,

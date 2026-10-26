@@ -203,7 +203,7 @@ pub fn plan<E>(
 }
 
 #[cfg(test)]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 mod tests {
     use serde_json::json;
 

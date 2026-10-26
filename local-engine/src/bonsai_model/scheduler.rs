@@ -379,7 +379,7 @@ impl BonsaiEngine {
     /// work, so running out fails that sequence alone; a sequence whose drafts
     /// or selection fail is dropped from the pass or commits only its seed
     /// row; a failed pass or commit fails the sequences whose state it wrote.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn step_batched(
         &mut self,
         progress: &mut dyn FnMut(u64, PrefillProgress),
@@ -509,7 +509,7 @@ impl BonsaiEngine {
         let resident = self.resident;
         // Everyone whose state the pass writes, collected before the rows
         // borrow `self.active`.
-        #[allow(clippy::needless_collect)]
+        #[expect(clippy::needless_collect)]
         let written = participants
             .iter()
             .chain(fold.iter().map(|(index, _)| index))

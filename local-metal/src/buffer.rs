@@ -52,7 +52,7 @@ impl MetalBuffer {
     /// # Errors
     ///
     /// Returns [`Error::BufferAllocation`] if Metal cannot allocate the buffer.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn from_slice<T: bytemuck::NoUninit>(
         device: &ProtocolObject<dyn MTLDevice>,
         data: &[T],
@@ -96,7 +96,7 @@ impl MetalBuffer {
     /// for its lifetime. The pointer and length must satisfy Metal's
     /// page-alignment requirements. Native buffer retention also retains
     /// `owner`, including after all Rust wrappers have been dropped.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub unsafe fn from_bytes_no_copy(
         device: &ProtocolObject<dyn MTLDevice>,
         pointer: NonNull<u8>,
@@ -150,7 +150,7 @@ impl MetalBuffer {
     /// Panics if the buffer length is not a multiple of `size_of::<T>()` or if
     /// the pointer is not suitably aligned.
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub unsafe fn as_slice<T: bytemuck::Pod>(&self) -> &[T] {
         let ptr = self.inner.contents().as_ptr().cast::<u8>();
         let len = self.inner.length();
@@ -176,7 +176,7 @@ impl MetalBuffer {
     ///
     /// Panics if the buffer length is not a multiple of `size_of::<T>()` or if
     /// the pointer is not suitably aligned.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub unsafe fn as_mut_slice<T: bytemuck::Pod>(&mut self) -> &mut [T] {
         let ptr = self.inner.contents().as_ptr().cast::<u8>();
         let len = self.inner.length();
@@ -196,7 +196,7 @@ impl MetalBuffer {
     /// [`Self::as_slice`] or [`Self::as_mut_slice`] on any clone, nor a
     /// committed GPU command that uses this buffer and has not completed.
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub unsafe fn contents_mut_ptr(&self) -> *mut u8 {
         self.inner.contents().as_ptr().cast::<u8>()
     }
@@ -206,7 +206,7 @@ impl MetalBuffer {
     /// # Panics
     ///
     /// Panics if `offset + src.len()` exceeds the buffer length.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn copy_from_bytes(&self, src: &[u8], offset: usize) {
         assert!(
             offset
@@ -228,7 +228,7 @@ impl MetalBuffer {
     }
 
     /// Fill the shared buffer with zero bytes.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn clear(&self) {
         // SAFETY: `contents_mut_ptr` is valid for the retained buffer length;
         // live slices must not exist while this runs, by the `as_slice` contract.
@@ -270,7 +270,7 @@ pub fn get_default_device() -> crate::Result<Retained<ProtocolObject<dyn MTLDevi
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn no_copy_owner_follows_native_retains() {
         #[repr(align(16384))]
         struct Page([u8; 16384]);

@@ -147,7 +147,7 @@ fn logsumexp(row: &[f32]) -> f32 {
     max + sum.ln() as f32
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn parity(dir: &Path, cases: &Path) -> Result<()> {
     let cases: Vec<Case> = serde_json::from_str(&std::fs::read_to_string(cases)?)?;
     let mut model = open()?;

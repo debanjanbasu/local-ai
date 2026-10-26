@@ -1,7 +1,5 @@
-#![allow(
+#![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
     clippy::too_many_lines,
     clippy::assert_is_empty,
     clippy::format_collect

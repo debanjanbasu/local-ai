@@ -841,7 +841,7 @@ fn batched_head_draft_timings() {
 /// without the chunk.
 #[test]
 #[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
     let mut model = load_with_head(4096, 64);
     let sampler = greedy_sampler();

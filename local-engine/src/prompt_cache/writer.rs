@@ -177,7 +177,7 @@ impl Closer {
     /// Wait up to `timeout` until nothing is pending, first refusing new jobs
     /// when `close`; whether nothing is.
     // The guard moves into the wait, which the lint does not follow.
-    #[allow(clippy::significant_drop_tightening)]
+    #[expect(clippy::significant_drop_tightening)]
     fn wait(&self, close: bool, timeout: Duration) -> bool {
         let mut state = self.shared.lock();
         state.closed |= close;

@@ -381,7 +381,7 @@ fn lark_string(text: &str) -> String {
 }
 
 /// Translate one strict tool's parameter schema, or say exactly why not.
-#[allow(clippy::too_many_lines)] // One linear check per root keyword.
+#[expect(clippy::too_many_lines)] // One linear check per root keyword.
 pub(super) fn classify(parameters: &Value) -> Result<StrictTool, String> {
     let root = match parameters {
         Value::Null => {
@@ -724,7 +724,7 @@ fn regex_literal(text: &str) -> String {
 /// otherwise the match may start and end anywhere. Anchors anywhere else,
 /// lookarounds, backreferences, inline flags and other syntax without an
 /// exact translation are rejected.
-#[allow(clippy::too_many_lines)] // One scanner over the pattern syntax.
+#[expect(clippy::too_many_lines)] // One scanner over the pattern syntax.
 fn search_pattern(pattern: &str) -> Result<String, String> {
     if pattern.len() > MAX_PATTERN {
         return Err(format!("pattern longer than {MAX_PATTERN} bytes"));

@@ -110,7 +110,7 @@ fn f32s(count: u64) -> Option<usize> {
     usize::try_from(count.checked_mul(4)?).ok()
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn set<T: Copy>(encoder: &Encoder, value: &T, index: usize) {
     // SAFETY: `value` is a live plain value; Metal copies the bytes.
     unsafe {
@@ -122,7 +122,7 @@ fn set<T: Copy>(encoder: &Encoder, value: &T, index: usize) {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn bind(encoder: &Encoder, region: Region<'_>, index: usize) {
     // SAFETY: the buffer is retained by the caller until GPU completion.
     unsafe { encoder.setBuffer_offset_atIndex(Some(region.buffer.raw()), region.offset, index) };
@@ -190,7 +190,7 @@ impl WhisperKernels {
 
     /// `LayerNorm` (biased variance) of `rows` rows of `dimension`, with F32
     /// weight and bias. `output` may be `input`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn layernorm(
         &self,
         batch: &mut CommandBatch,
@@ -225,7 +225,7 @@ impl WhisperKernels {
 
     /// Columns of a kernel-3, padding-1 `Conv1d` over `[t_in, channels]`:
     /// `[t_out, channels * 3]`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn im2col3(
         &self,
         batch: &mut CommandBatch,
@@ -395,7 +395,7 @@ impl WhisperKernels {
     /// Bidirectional encoder attention, head dim 64, over `tokens` rows of
     /// `[tokens, heads * 64]` q/k/v, for queries `queries.0 .. queries.0 +
     /// queries.1` (so one layer can be split across submissions).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn encoder_attention(
         &self,
         batch: &mut CommandBatch,
@@ -449,7 +449,7 @@ impl WhisperKernels {
 
     /// Decoder attention for `queries` rows of `q` (`[queries, heads * 64]`)
     /// over `k`/`v` (`[keys, heads * 64]`), see [`DecoderKeys`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn decoder_attention(
         &self,
         batch: &mut CommandBatch,

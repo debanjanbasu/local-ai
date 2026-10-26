@@ -689,7 +689,7 @@ fn ptq1_packer_reproduces_checkpoint_blocks() {
 /// head uses and at the row counts drafts, verify blocks and prefill chunks use.
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn ternary_projection_matches_cpu_reference() {
     use local_metal::batch::CommandBatch;
     use local_metal::bonsai::{BonsaiKernels, HadamardDirection, Ptq1Matrix};

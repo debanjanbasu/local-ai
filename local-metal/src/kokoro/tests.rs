@@ -1,14 +1,12 @@
-#![allow(
+#![expect(
     unsafe_code,
-    clippy::expect_used,
     clippy::cast_precision_loss,
     clippy::cast_possible_wrap,
     clippy::many_single_char_names,
     clippy::suboptimal_flops,
     clippy::cast_lossless,
     clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::too_many_lines
+    clippy::cast_possible_truncation
 )]
 
 use super::*;
@@ -53,7 +51,7 @@ fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
 }
 
 /// CPU `Conv1d`: x `[cin, t_in]`, w `[cout, cin, k]` (the `PyTorch` layout).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn conv_reference(
     x: &[f32],
     w: &[f32],

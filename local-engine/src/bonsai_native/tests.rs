@@ -193,7 +193,7 @@ fn verify_block_restores_every_accepted_prefix_like_tokenwise_decoding() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn verify_block_restores_like_tokenwise_decoding(layout: KvLayout) {
     // Block-vs-tokenwise F32 kernels differ slightly; a wrong restore
     // differs by whole units (see the negative control below, which must
@@ -407,7 +407,7 @@ fn draft_logits(model: &mut BonsaiModel, seed: u32) -> Vec<f32> {
 /// would prove nothing about the cache.
 #[test]
 #[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn kv_only_ingestion_matches_full_head_cache_and_next_draft() {
     let path = String::from(DEFAULT_BONSAI_GGUF);
     let head = pinned_head();
@@ -598,7 +598,7 @@ fn kv_only_ingestion_matches_full_head_cache_and_next_draft() {
 /// outside that bound, or a loose bound would prove nothing.
 #[test]
 #[ignore = "requires the Bonsai GGUF, the MTP head and a Metal device"]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn chunked_prefill_ingests_output_normalized_rows_for_every_chunk() {
     struct HeadState {
         keys: Vec<f32>,
@@ -798,7 +798,7 @@ fn chunked_prefill_ingests_output_normalized_rows_for_every_chunk() {
 /// docs/BONSAI.md).
 #[test]
 #[ignore = "requires the pinned model"]
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn quantized_kv_tracks_f16_next_token_distribution() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let text = [
@@ -993,7 +993,7 @@ fn mixed_int8_head_drafts_like_the_ternary_head_it_requantizes() {
 /// could accumulate; KL is reported per quarter of the generation.
 #[test]
 #[ignore = "requires the pinned model"]
-#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+#[expect(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn reduced_state_tracks_f32_state_next_token_distribution() {
     use local_metal::bonsai_ops::GdnStateFormat;
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
@@ -1123,7 +1123,7 @@ fn reduced_state_tracks_f32_state_next_token_distribution() {
 /// mean next-token KL at most 1e-5 and at least 63/64 top-1.
 #[test]
 #[ignore = "requires the pinned model"]
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn large_batch_prefill_tracks_small_batch_next_token_distribution() {
     use local_metal::bonsai::DEFAULT_LARGE_BATCH_MIN;
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
@@ -1266,7 +1266,7 @@ fn prefill_block_size_leaves_identical_logits() {
 /// mean next-token KL at most 1e-5 and at least 63/64 top-1 per prompt.
 #[test]
 #[ignore = "requires the pinned model"]
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn short_attention_splits_track_128_token_splits_next_token_distribution() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
     let text = [

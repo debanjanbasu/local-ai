@@ -1,10 +1,4 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::too_many_lines,
-    clippy::assert_is_empty
-)]
+#![expect(clippy::unwrap_used, clippy::too_many_lines, clippy::assert_is_empty)]
 //! Per-project isolation: a store scoped to a project sees only the objects
 //! that project created, as if no other existed; an unscoped store sees
 //! everything; objects from before projects were recorded are unowned.

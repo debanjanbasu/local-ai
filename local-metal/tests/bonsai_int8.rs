@@ -1,4 +1,4 @@
-#![allow(unsafe_code, clippy::expect_used)]
+#![expect(unsafe_code, clippy::expect_used)]
 
 use local_metal::batch::CommandBatch;
 use local_metal::bonsai::{BonsaiKernels, Int8Matrix, PTQ1_BLOCK_BYTES, Ptq1Matrix};
@@ -110,7 +110,6 @@ fn assert_close(label: &str, actual: &MetalBuffer, expected: &[f64]) -> f64 {
 /// commit blocks (2..=5), chunked blocks (12) and K/V-only prefill ingestion
 /// (40, 128) use; the fused concat and `SwiGLU` kernels match their parts.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn int8_projections_match_f64_reference() {
     let Some((context, kernels)) = setup() else {
         return;
@@ -209,7 +208,7 @@ fn int8_projections_match_f64_reference() {
 /// cycled so the system cache cannot serve repeated reads.
 #[test]
 #[ignore = "benchmark: run alone on an idle GPU"]
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+#[expect(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn int8_and_ptq1_projection_throughput() {
     let Some((context, kernels)) = setup() else {
         return;
@@ -338,7 +337,7 @@ fn p1m(set: &[MetalBuffer], copy: usize, rows: usize) -> Ptq1Matrix<'_> {
 /// a cross-format fused kernel could at most recover.
 #[test]
 #[ignore = "benchmark: run alone on an idle GPU"]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn mixed_group_dispatch_costs() {
     use local_metal::bonsai_ops::BonsaiOps;
 

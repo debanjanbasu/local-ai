@@ -418,7 +418,7 @@ fn a_call_cut_off_by_the_budget_is_dropped_and_the_stop_reason_stands() {
 /// it, and never stream part of one; reasoning and tool-call markup are not
 /// matched, and a refusal that was not a match is the consumer cancelling.
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn stop_sequences_end_the_visible_answer_without_streaming_part_of_one() {
     use crate::bonsai_model::StopReason;
     struct Case {

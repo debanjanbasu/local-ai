@@ -44,7 +44,7 @@ fn conforms(name: &str, value: &Value) {
     assert!(errors.is_empty(), "{name}: {errors:#?}\n{value:#}");
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn call(admin: &Admin, method: Method, uri: &str, body: &Value) -> (StatusCode, Value) {
     let (path, query) = uri
         .split_once('?')
@@ -244,7 +244,7 @@ fn the_fixed_api_key_authorizes_the_api_but_not_administration() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn key_project_and_service_account_lifecycle_conforms_to_the_spec() {
     let (_dir, admin) = open();
     let created = expect(
@@ -683,7 +683,7 @@ fn requests_are_strict() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn usage_families_aggregate_recorded_requests_and_costs_are_empty() {
     let (_dir, admin) = open();
     let day = 1_730_419_200;

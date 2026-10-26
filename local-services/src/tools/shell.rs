@@ -315,7 +315,7 @@ impl ChildLimits {
         for fd in 3..=self.last_fd {
             // SAFETY: `fcntl` is async-signal-safe; a descriptor that is not
             // open fails with `EBADF`, which is ignored.
-            #[allow(unsafe_code)]
+            #[expect(unsafe_code)]
             unsafe {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
@@ -344,7 +344,7 @@ fn highest_fd() -> i32 {
 const PROC_RUID_ONLY: u32 = 5;
 
 /// Processes the current user (by real user ID) runs now.
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn user_processes() -> Option<u64> {
     let uid = rustix::process::getuid().as_raw();
     // SAFETY: with a null buffer `proc_listpids` only returns the bytes a
@@ -635,7 +635,7 @@ fn sandboxed(
         .kill_on_drop(true);
     // SAFETY: the closure only calls `setrlimit` and `fcntl`, which are
     // async-signal-safe, and touches nothing but the copied `limits`.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     unsafe {
         builder.pre_exec(move || limits.apply());
     }

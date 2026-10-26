@@ -5,7 +5,6 @@ use super::{
 
 /// The exact tensor set, shapes, dtypes and hyperparameters of the pinned
 /// Bonsai 2 27B PTQ1 checkpoint; anything else is refused rather than guessed.
-#[allow(clippy::too_many_lines)]
 pub fn validate_profile(package: &BonsaiPackage) -> crate::Result<()> {
     use BonsaiTensorType::{Bf16, F32, Ptq1};
 

@@ -34,7 +34,7 @@ use crate::workspace::{
 
 /// Run a filesystem request. Blocking.
 // One flat dispatch over the request kinds, each a few lines of formatting.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) fn run(inner: &Inner, request: Request) -> Result<Output, ToolError> {
     let workspace = inner
         .workspace

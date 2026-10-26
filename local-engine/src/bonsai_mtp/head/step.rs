@@ -179,7 +179,7 @@ impl BonsaiMtp {
     /// `embeddings` row is decoded and inverse-rotated on the GPU, bit-identical
     /// to staging it through [`Self::embedding_rows`] and [`Self::encode`],
     /// and the full layer projects draft logits into [`Self::logits`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn encode_draft(
         &self,
         batch: &mut CommandBatch,
@@ -211,7 +211,7 @@ impl BonsaiMtp {
     /// that point of the layer: `rotated` (WIDTH, free until the final
     /// projection), `query` (ATTENTION, after attention) and `ffn_gate` (FFN,
     /// after `SwiGLU`).
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn encode_layer(
         &self,
         batch: &mut CommandBatch,

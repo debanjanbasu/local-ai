@@ -46,8 +46,8 @@ impl BonsaiModel {
     /// One target block over `tokens`, optionally followed in the same command
     /// batch by MTP head ingestion of those committed rows (`ingest`), which
     /// needs `output` to leave every row output-normalized.
-    #[allow(clippy::too_many_lines)]
-    #[allow(unsafe_code)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(unsafe_code)]
     pub(super) fn encode_block(
         &mut self,
         tokens: &[u32],

@@ -96,7 +96,7 @@ impl DraftKernels {
     /// it into `output`: bit-identical to `decode_ptq1_row` followed by an
     /// inverse [`crate::bonsai::BonsaiKernels::transform`]. A token beyond the
     /// table produces a zero row.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn embed_inverse(
         &self,
         batch: &mut CommandBatch,
@@ -137,7 +137,7 @@ impl DraftKernels {
     /// Exact top two of `logits[..vocab]`: the winner goes to
     /// `tokens[token_index]` for the next chained step and the pair to
     /// `results[result_index]`.
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    #[expect(unsafe_code, clippy::too_many_arguments)]
     pub fn top_two(
         &self,
         batch: &mut CommandBatch,
@@ -250,7 +250,7 @@ impl GreedyRows {
     }
 
     /// Select each of the first `rows` rows of `logits` into [`Self::results`].
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn encode(
         &self,
         batch: &mut CommandBatch,
@@ -302,7 +302,7 @@ impl GreedyRows {
     /// The selections of the last completed [`Self::encode`], row by row.
     /// They are copied, so a later encode cannot write under a live reference.
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn results(&self, rows: usize) -> Vec<GreedyRowResult> {
         // SAFETY: the borrow ends with this copy. The buffer is private to this
         // selector and not `Sync`, so no CPU writer runs meanwhile, and the
@@ -336,7 +336,7 @@ fn dispatch(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, groups: usiz
     );
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn bind(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     buffer: &MetalBuffer,
@@ -346,7 +346,7 @@ unsafe fn bind(
     unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), offset, index) };
 }
 
-#[allow(unsafe_code, clippy::trivially_copy_pass_by_ref)]
+#[expect(unsafe_code)]
 unsafe fn set_u32(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &u32,

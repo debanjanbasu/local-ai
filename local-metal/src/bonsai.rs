@@ -451,7 +451,7 @@ impl BonsaiKernels {
     }
 
     /// Transform contiguous F32 rows. In-place transforms are supported.
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    #[expect(unsafe_code)]
     pub fn transform(
         &self,
         batch: &mut CommandBatch,
@@ -497,7 +497,7 @@ impl BonsaiKernels {
     /// [`Self::transform`] with [`HadamardDirection::Forward`]. The output may
     /// alias `gate` or `up` (in place), as each threadgroup reads its block
     /// before writing it.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn swiglu_transform(
         &self,
         batch: &mut CommandBatch,
@@ -539,7 +539,7 @@ impl BonsaiKernels {
     ///
     /// This operation does not apply or infer a rotation. Separating it permits
     /// reuse of a matching transform across gate/up or attention projections.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn matvec(
         &self,
         batch: &mut CommandBatch,
@@ -576,7 +576,7 @@ impl BonsaiKernels {
 
     /// Single-token `silu(gate * input) * (up * input)` in one dispatch;
     /// neither projection is stored. Both matrices must have the same shape.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn matvec_swiglu(
         &self,
         batch: &mut CommandBatch,
@@ -674,7 +674,7 @@ impl BonsaiKernels {
         self.concat(batch, projections, input, Some((bf16, bf16_input)))
     }
 
-    #[allow(unsafe_code, clippy::type_complexity)]
+    #[expect(unsafe_code)]
     fn concat(
         &self,
         batch: &mut CommandBatch,
@@ -759,7 +759,7 @@ impl BonsaiKernels {
     /// rotation) into `normalized`, and write their forward rotation to
     /// `output`, in one dispatch. Values are bitwise those of an `RMSNorm`
     /// followed by [`Self::transform`] with [`HadamardDirection::Forward`].
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    #[expect(unsafe_code, clippy::too_many_arguments)]
     pub fn normalize_transform(
         &self,
         batch: &mut CommandBatch,
@@ -821,7 +821,7 @@ impl BonsaiKernels {
     /// `SMALL_BATCH_WIDE_TOKENS` rows; larger blocks use the constructor-
     /// selected prefill primitive. Nothing expands the model; activations,
     /// accumulation and output stay F32.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn matmul(
         &self,
         batch: &mut CommandBatch,
@@ -917,7 +917,7 @@ impl BonsaiKernels {
     }
 
     /// One large-batch dispatch; the caller has validated extents and aliasing.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn large_batch(
         &self,
         batch: &mut CommandBatch,
@@ -958,7 +958,7 @@ impl BonsaiKernels {
     /// use wide dispatches of at most `SMALL_BATCH_WIDE_TOKENS` rows, plus one
     /// scalar dispatch for a remainder of one to four rows (a remainder of one
     /// borrows a row from the last wide chunk, so no dispatch has one row).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn small_batch(
         &self,
         batch: &mut CommandBatch,
@@ -1028,7 +1028,7 @@ fn dispatch(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, groups: usiz
     );
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn bind(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     buffer: &MetalBuffer,
@@ -1038,7 +1038,7 @@ unsafe fn bind(
     unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), offset, index) };
 }
 
-#[allow(unsafe_code, clippy::trivially_copy_pass_by_ref)]
+#[expect(unsafe_code)]
 unsafe fn set_u32(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &u32,
@@ -1053,7 +1053,7 @@ unsafe fn set_u32(
     }
 }
 
-#[allow(unsafe_code, clippy::trivially_copy_pass_by_ref)]
+#[expect(unsafe_code)]
 unsafe fn set_f32(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &f32,

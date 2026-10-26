@@ -141,7 +141,7 @@ fn sigmoid(x: f64) -> f64 {
 
 impl Calibrator {
     // The same operations, in the same order, as the Python evaluation.
-    #[allow(clippy::suboptimal_flops)]
+    #[expect(clippy::suboptimal_flops)]
     fn p_yes(self, raw_yes: f64, raw_no: f64) -> f64 {
         match self {
             Self::Temperature(t) => {
@@ -236,7 +236,7 @@ impl Gate {
     }
 
     // The same operations, in the same order, as the Python evaluation.
-    #[allow(clippy::suboptimal_flops)]
+    #[expect(clippy::suboptimal_flops)]
     fn distance(&self, decide: &[f32]) -> f64 {
         let y: Vec<f64> = decide
             .iter()
@@ -521,7 +521,7 @@ fn families(artifact: &Json) -> crate::Result<([Calibrator; 2], [Option<f64>; 2]
 }
 
 /// `(metadata, [(name, shape, values)])` of an F32-only safetensors file.
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn read_f32_safetensors(
     bytes: &[u8],
 ) -> crate::Result<(
@@ -852,12 +852,5 @@ impl Parser<'_> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::float_cmp,
-    clippy::suboptimal_flops,
-    clippy::doc_markdown
-)]
+#[expect(clippy::float_cmp, clippy::suboptimal_flops, clippy::doc_markdown)]
 mod tests;

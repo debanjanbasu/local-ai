@@ -223,7 +223,7 @@ impl VectorStores {
 
     /// Answer one request from a caller acting for `project`, which sees
     /// (and creates) only its project's stores and attaches only its files.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(super) async fn dispatch(
         &self,
         parts: &Parts,

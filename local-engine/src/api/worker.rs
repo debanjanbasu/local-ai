@@ -107,7 +107,7 @@ const fn decision_gate(abandoned: bool, active: usize) -> Gate {
 
 /// A job taken off the queue and not yet admitted. There is at most one, so
 /// its size does not matter.
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 enum Pending {
     Generation(Prepared),
     Decision(Box<DecisionJob>),

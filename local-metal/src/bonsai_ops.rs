@@ -1,6 +1,6 @@
 //! Checked graph operations for the fixed Qwen3.5 Bonsai profile.
 
-#![allow(clippy::too_many_arguments)]
+#![expect(clippy::too_many_arguments)]
 
 use core::ffi::c_void;
 use std::ptr::NonNull;
@@ -351,7 +351,7 @@ impl BonsaiOps {
 
     /// Select an exact implementation for numerical/performance comparisons.
     /// Unlike automatic selection, an unavailable explicit kernel is an error.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn new_with_attention_kernel(
         context: &MetalContext,
         shaders: &ShaderLibrary,
@@ -503,7 +503,7 @@ impl BonsaiOps {
             .map(|&(_, index)| index)
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn go(
         &self,
         b: &mut CommandBatch,
@@ -615,7 +615,7 @@ fn trio(a: &MetalBuffer, b: &MetalBuffer, o: &MetalBuffer, n: u32) -> crate::Res
     need(o, n as usize * 4)?;
     no_alias(o, &[a, b])
 }
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn scalar<T>(e: &ProtocolObject<dyn MTLComputeCommandEncoder>, v: &T, i: usize) {
     unsafe {
         e.setBytes_length_atIndex(

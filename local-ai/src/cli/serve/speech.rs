@@ -310,7 +310,7 @@ async fn busy(state: &AppState, headers: &HeaderMap) -> Response {
     response
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) async fn handle(
     state: &AppState,
     headers: &HeaderMap,

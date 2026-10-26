@@ -102,7 +102,7 @@ pub(super) async fn start_stream(
 /// exactly when this function returns, on every path out of it.
 // `sender` is owned because the detached task has to keep it alive for the
 // whole pump; it is not consumed by the body.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn pump(
     first: Signal,
     mut events: Metered,

@@ -60,7 +60,7 @@ pub struct BufferCopyRequest<'a> {
     pub size: usize,
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn encode_buffer_copy(
     encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>,
     copy: &BufferCopyRequest<'_>,
@@ -286,7 +286,7 @@ impl CommandBatch {
     /// slot. The completion handler releases this separate lease even while a
     /// caller retains the completed command buffer. An uncommitted command
     /// buffer releases the capture on destruction instead.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn retain_until_completed<T: Send + Sync + 'static>(&mut self, lease: Arc<T>) {
         let leases = self.leases.get_or_insert_with(|| {
             let leases = Arc::new(Mutex::new(Vec::<Arc<dyn Send + Sync>>::new()));
@@ -466,5 +466,5 @@ impl Drop for CommandBatch {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 mod tests;

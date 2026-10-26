@@ -1,11 +1,6 @@
 //! Public-interface tests for the durable store and the Conversations API.
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::too_many_lines
-)]
+#![expect(clippy::expect_used)]
 
 use std::sync::Barrier;
 

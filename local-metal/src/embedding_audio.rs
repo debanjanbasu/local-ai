@@ -94,7 +94,7 @@ fn same(a: &MetalBuffer, b: &MetalBuffer) -> bool {
     std::ptr::eq(a.raw(), b.raw())
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn set<T: Copy>(encoder: &Encoder, value: &T, index: usize) {
     // SAFETY: `value` is a live plain value; Metal copies the bytes.
     unsafe {
@@ -106,7 +106,7 @@ fn set<T: Copy>(encoder: &Encoder, value: &T, index: usize) {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn bind(encoder: &Encoder, region: Region<'_>, index: usize) {
     // SAFETY: the buffer is retained by the caller until GPU completion.
     unsafe { encoder.setBuffer_offset_atIndex(Some(region.0.raw()), region.1, index) };
@@ -160,7 +160,7 @@ impl AudioKernels {
     /// `[in_shape[0]][in_shape[1]][in_shape[2]]` with F32 weights
     /// `[out_c][in_c][3][3]`, writing the first `out_rows` time steps of the
     /// `[out_t][out_f][out_c]` result (`out_f = ceil(in_f / 2)`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn conv2d_s2(
         &self,
         batch: &mut CommandBatch,
@@ -204,7 +204,7 @@ impl AudioKernels {
     /// In-place `LayerNorm` (weight, no bias) over `dimension` channels and
     /// `ReLU` for `rows` rows; rows whose time step (`row / rows_per_t`) is
     /// at or past `valid_t` are zeroed instead.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn layer_norm_relu(
         &self,
         batch: &mut CommandBatch,
@@ -235,7 +235,7 @@ impl AudioKernels {
     }
 
     /// `hidden += rms(branch) * weight * scale` over `rows` rows.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn rms_add(
         &self,
         batch: &mut CommandBatch,
@@ -303,7 +303,7 @@ impl AudioKernels {
     /// depthwise convolution (F32 weights `[channels][kernel_size]`, left
     /// padding `kernel_size - 1`, sequence starts in `first`), writing
     /// `[tokens, channels]`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn glu_dwconv(
         &self,
         batch: &mut CommandBatch,

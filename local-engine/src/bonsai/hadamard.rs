@@ -68,7 +68,6 @@ fn forward_weight_name(name: &str) -> bool {
         )
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn parse_hadamard(
     map: &[u8],
     metadata: &HashMap<String, MetadataValue>,

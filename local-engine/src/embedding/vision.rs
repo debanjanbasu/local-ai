@@ -254,7 +254,7 @@ impl VisionTower {
         Ok(out)
     }
 
-    #[allow(unsafe_code, clippy::too_many_lines)]
+    #[expect(unsafe_code, clippy::too_many_lines)]
     fn pass(
         &self,
         context: &MetalContext,

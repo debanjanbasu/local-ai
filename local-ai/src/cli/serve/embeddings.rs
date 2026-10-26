@@ -162,7 +162,7 @@ struct RequestBody {
     encoding_format: Option<String>,
     dimensions: Option<u64>,
     /// Accepted and ignored.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     user: Option<String>,
 }
 

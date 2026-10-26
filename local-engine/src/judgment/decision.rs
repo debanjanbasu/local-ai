@@ -458,7 +458,6 @@ impl DecisionCapture {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
 mod tests {
     use super::{
         DECISION_RENDERER, DecisionCapture, DecisionKind, DecisionRequest, DecisionValue,

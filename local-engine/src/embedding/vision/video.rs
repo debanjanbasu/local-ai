@@ -158,7 +158,7 @@ pub(crate) fn yuv2rgb_coefficients(color_space: Option<&str>) -> [i64; 4] {
 /// swscale's fixed-point YUV 4:2:0 → RGB24 conversion (the x86 `yuv2rgb`
 /// path: coefficients rounded to 16 bits, `(a · b) >> 16` products,
 /// saturating 16-bit adds, nearest chroma), default contrast and saturation.
-#[allow(clippy::many_single_char_names)]
+#[expect(clippy::many_single_char_names)]
 pub(crate) fn yuv420_to_rgb(
     planes: &[u8],
     width: usize,
@@ -306,7 +306,6 @@ pub fn decode_video_file(path: &Path) -> crate::Result<Vec<ImagePatches>> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
 
     use super::*;
 

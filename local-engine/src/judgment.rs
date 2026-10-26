@@ -341,7 +341,6 @@ impl JudgmentHead {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
 mod tests {
     use super::{JUDGMENT_HEAD_FORMAT, JudgmentHead};
     use serde_json::{Value, json};

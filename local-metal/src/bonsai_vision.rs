@@ -87,7 +87,7 @@ fn same(a: &MetalBuffer, b: &MetalBuffer) -> bool {
     std::ptr::eq(a.raw(), b.raw())
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn set<T: Copy>(
     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     value: &T,
@@ -103,7 +103,7 @@ fn set<T: Copy>(
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn bind(
     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     buffer: &MetalBuffer,
@@ -226,7 +226,7 @@ impl VisionKernels {
 
     /// `LayerNorm` of `tokens` rows of `width`, weight and bias `[width]` F32
     /// at the given byte offsets.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn layernorm(
         &self,
         batch: &mut CommandBatch,
@@ -307,7 +307,7 @@ impl VisionKernels {
     /// `[count][16][72]` rows of `out` at `out_offset`, for the queries
     /// `queries` (a start that is a multiple of 64), so a large image can
     /// split its attention over several command buffers.
-    #[allow(clippy::too_many_arguments, unsafe_code)]
+    #[expect(clippy::too_many_arguments, unsafe_code)]
     pub fn attention(
         &self,
         batch: &mut CommandBatch,

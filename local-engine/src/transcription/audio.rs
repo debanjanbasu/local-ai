@@ -174,7 +174,7 @@ fn quantize(value: f32) -> f32 {
 /// Decode a whole audio file to 16 kHz mono samples. `extension` (from the
 /// upload's file name) helps the container probe; at most `max_seconds` of
 /// audio are accepted.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub fn decode(
     bytes: Vec<u8>,
     extension: Option<&str>,

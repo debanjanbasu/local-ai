@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![expect(clippy::unwrap_used, clippy::panic)]
 //! Batches persistence and the worker protocol, driven without a model.
 
 use std::fs;

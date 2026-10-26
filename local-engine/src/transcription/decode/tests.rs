@@ -1,8 +1,4 @@
-#![allow(
-    clippy::expect_used,
-    clippy::float_cmp,
-    clippy::cast_possible_truncation
-)]
+#![expect(clippy::cast_possible_truncation)]
 
 use std::collections::BTreeMap;
 

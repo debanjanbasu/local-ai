@@ -76,7 +76,7 @@ impl DraftRows {
 
     /// Decode row `tokens[slots[y]]` of the packed `table` into row `y` of
     /// `output`, inverse-rotated, for every `y` of `slots`.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn embed_inverse(
         &self,
         batch: &mut CommandBatch,
@@ -132,7 +132,7 @@ impl DraftRows {
     /// Exact top two of each of the first `token_slots.len()` rows of
     /// `logits`: row `y`'s winner goes to `tokens[token_slots[y]]` and its
     /// pair to `results[result_slots[y]]`.
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    #[expect(unsafe_code, clippy::too_many_arguments)]
     pub fn top_two(
         &self,
         batch: &mut CommandBatch,
@@ -213,7 +213,7 @@ impl DraftRows {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn set_slots(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     slots: &[u32],

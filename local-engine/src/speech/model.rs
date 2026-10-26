@@ -82,8 +82,8 @@ pub(super) struct Network {
 // SAFETY: Metal devices, queues, pipelines and buffers may be transferred
 // between threads. The network owns every object exclusively and is `!Sync`,
 // so nothing is encoded concurrently; sharing goes through a mutex.
-#[allow(unsafe_code)]
-#[allow(clippy::non_send_fields_in_send_ty)]
+#[expect(unsafe_code)]
+#[expect(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Network {}
 
 /// The pacing wrapper: one live command batch and the work encoded into it.
@@ -151,7 +151,7 @@ fn buffer(context: &MetalContext, floats: usize) -> crate::Result<MetalBuffer> {
     Ok(MetalBuffer::empty(context.device(), floats.max(1) * 4)?)
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn read(act: Act<'_>) -> Vec<f32> {
     // SAFETY: callers read taps after the pacer has synced, and the borrow
     // ends with the copy below.
@@ -290,7 +290,7 @@ impl Network {
     /// Convolution `y = conv(x)` over `columns` outputs (split by columns
     /// into bounded submissions). `weight` is `[cout, taps, cin]` (taps 1
     /// for a linear map, stored `[cout, cin]` when `linear`).
-    #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+    #[expect(clippy::too_many_arguments, clippy::many_single_char_names)]
     fn conv(
         &self,
         pacer: &mut Pacer<'_>,
@@ -339,7 +339,7 @@ impl Network {
         self.dispatch_conv(pacer, w, b, x.view, y.view, p)
     }
 
-    #[allow(clippy::many_single_char_names)]
+    #[expect(clippy::many_single_char_names)]
     fn dispatch_conv(
         &self,
         pacer: &mut Pacer<'_>,
@@ -368,7 +368,6 @@ impl Network {
     }
 
     /// `y = W x + b` for a `[cout, cin]` weight over every column of `x`.
-    #[allow(clippy::too_many_arguments)]
     fn linear(
         &self,
         pacer: &mut Pacer<'_>,
@@ -430,7 +429,7 @@ impl Network {
     }
 
     /// `AdainResBlk1d` (`istftnet.py`): x `[cin, T]` to out `[cout, T or 2T]`.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn adain_res_block(
         &self,
         pacer: &mut Pacer<'_>,
@@ -566,7 +565,7 @@ impl Network {
     }
 
     /// `AdaINResBlock1` in place on `x` (`[C, L]`), using `t1`, `t2` scratch.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn adain_res_block1(
         &self,
         pacer: &mut Pacer<'_>,
@@ -637,7 +636,7 @@ impl Network {
 
     /// Synthesize one chunk: `ids` framed by the boundary id 0, `style` the
     /// voice pack row for the chunk's phoneme count (256 values).
-    #[allow(unsafe_code, clippy::too_many_lines, clippy::many_single_char_names)]
+    #[expect(unsafe_code, clippy::too_many_lines, clippy::many_single_char_names)]
     pub(super) fn synthesize(
         &self,
         ids: &[u32],

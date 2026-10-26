@@ -15,7 +15,7 @@ pub struct BonsaiMetalTensor {
 impl BonsaiMetalTensor {
     /// Read only the original tensor bytes, excluding mapping-page padding.
     #[must_use]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn bytes(&self) -> &[u8] {
         // SAFETY: checkpoint weights are read-only: no kernel writes them, and
         // the mutable `MetalBuffer` API is not exposed (see `buffer`).

@@ -236,7 +236,7 @@ pub(super) struct HeadSections {
 /// Read `source` (the safetensors contract above) into artifact-order
 /// sections. Each matrix is ternary or int8 according to which pair of tensors
 /// the file holds for it; holding tensors of both pairs is refused.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) fn head_sections(source: &Path) -> crate::Result<HeadSections> {
     #[derive(Deserialize)]
     struct Entry {
@@ -246,7 +246,7 @@ pub(super) fn head_sections(source: &Path) -> crate::Result<HeadSections> {
     }
     let file = File::open(source)?;
     // SAFETY: read-only mapping of an input file this process never writes.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     let map = unsafe { MmapOptions::new().map(&file)? };
     let header_len = map
         .first_chunk::<8>()

@@ -200,7 +200,7 @@ impl BonsaiMtp {
     }
 
     /// Host-visible embedding rows the caller fills with inverse-rotation inputs.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub fn embedding_rows(&mut self, rows: usize) -> crate::Result<&mut [f32]> {
         if rows == 0 || rows > self.scratch.rows {
             return Err(crate::Error::InvalidArgument(

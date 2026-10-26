@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::cast_precision_loss)]
+#![expect(clippy::expect_used, clippy::cast_precision_loss)]
 
 use local_metal::batch::CommandBatch;
 use local_metal::bonsai::{BonsaiKernels, PTQ1_BLOCK_BYTES, Ptq1Matrix};
@@ -42,7 +42,7 @@ fn packed(rows: usize, columns: usize, salt: usize) -> Vec<u8> {
 /// `cargo test --release -p local-metal --test bonsai_throughput -- --ignored --nocapture`
 #[test]
 #[ignore = "benchmark: run alone on an idle GPU"]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn ptq1_projection_throughput() {
     let Some(context) = gpu_or_skip() else {
         return;

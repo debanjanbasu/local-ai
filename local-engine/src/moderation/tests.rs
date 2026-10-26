@@ -1,5 +1,3 @@
-#![allow(clippy::float_cmp)]
-
 use serde_json::{Value, json};
 
 use super::*;

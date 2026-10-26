@@ -69,7 +69,7 @@ fn read_f32(path: &Path) -> Result<Vec<f32>> {
 }
 
 /// Cosine and largest absolute difference.
-#[allow(clippy::suboptimal_flops)]
+#[expect(clippy::suboptimal_flops)]
 fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
     let (mut dot, mut na, mut nb, mut max) = (0.0, 0.0, 0.0, 0.0_f64);
     for (&x, &y) in a.iter().zip(b) {
@@ -246,7 +246,7 @@ fn parse_layout(text: &str) -> (Vec<Vec<u32>>, Vec<LlamaImage>) {
     (texts, images)
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn llama(out: &Path) -> Result<()> {
     let log: Value = serde_json::from_slice(&std::fs::read(out.join("log.json"))?)?;
     let mut engine = BonsaiEngine::open_with_options(
@@ -441,7 +441,7 @@ fn write_f32(path: &Path, values: &[f32]) -> Result<()> {
 
 /// Dump each clip's native video preprocessing, tower output and prompt
 /// layout under `out/<stem>/` for the transformers comparison.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn video(out: &Path, clips: &[String]) -> Result<()> {
     let package = BonsaiPackage::open(MODEL)?;
     let tokenizer = BonsaiTokenizer::from_package(&package)?;

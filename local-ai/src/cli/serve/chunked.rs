@@ -626,7 +626,7 @@ pub(super) async fn start_chunked(
 /// exactly when this function returns, on every path out of it.
 // `model`, `sender` and `stall` are owned because the detached task has to keep
 // all three alive for the whole pump; none is consumed by the body.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn pump(
     first: Signal,
     mut events: Metered,

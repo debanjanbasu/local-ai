@@ -108,7 +108,7 @@ impl Deref for Pooled {
 
     fn deref(&self) -> &Connection {
         // Only `Drop` takes the connection out.
-        #[allow(clippy::unwrap_used)]
+        #[expect(clippy::unwrap_used)]
         self.connection.as_ref().unwrap()
     }
 }
@@ -116,7 +116,7 @@ impl Deref for Pooled {
 impl DerefMut for Pooled {
     fn deref_mut(&mut self) -> &mut Connection {
         // Only `Drop` takes the connection out.
-        #[allow(clippy::unwrap_used)]
+        #[expect(clippy::unwrap_used)]
         self.connection.as_mut().unwrap()
     }
 }

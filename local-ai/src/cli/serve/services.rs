@@ -230,7 +230,7 @@ impl Services {
             .unwrap_or_else(|(status, message)| Reply::Error(status, message))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn route(&self, parts: &Parts, body: Body) -> Result<Reply, Failure> {
         let segments: Vec<&str> = parts
             .uri

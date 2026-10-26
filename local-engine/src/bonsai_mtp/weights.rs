@@ -183,7 +183,7 @@ impl Weights {
             let owner: Arc<dyn Send + Sync> = head.map.clone();
             // SAFETY: sections begin on VM pages, their padded ranges are
             // validated within the immutable mapping, and `owner` retains it.
-            #[allow(unsafe_code)]
+            #[expect(unsafe_code)]
             unsafe {
                 Ok(MetalBuffer::from_bytes_no_copy(
                     device,

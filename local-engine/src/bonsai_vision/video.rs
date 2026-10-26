@@ -393,7 +393,7 @@ fn container_suffix(bytes: &[u8]) -> crate::Result<&'static str> {
 /// indices (ascending), and lends each selected frame, at its source size,
 /// in order. A video whose decoder yields fewer frames than probed
 /// repeats its last decoded frame for the rest.
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub mod decode {
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::AnyObject;
@@ -611,7 +611,7 @@ pub mod decode {
         autoreleasepool(|_| {
             // SAFETY: `AVFoundation` objects created and used on this thread
             // only; `AVMediaTypeVideo` is an immutable framework constant.
-            #[allow(deprecated)]
+            #[expect(deprecated)]
             let (asset, track) = unsafe {
                 let asset = open(&path);
                 let kind =

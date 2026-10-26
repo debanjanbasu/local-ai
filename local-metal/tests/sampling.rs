@@ -1,4 +1,4 @@
-#![allow(unsafe_code, clippy::expect_used)]
+#![expect(unsafe_code, clippy::expect_used)]
 
 use local_metal::batch::CommandBatch;
 use local_metal::buffer::MetalBuffer;

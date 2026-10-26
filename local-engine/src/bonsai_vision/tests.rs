@@ -317,7 +317,7 @@ fn video_decoding_observes_cancellation() {
 
 /// The asset resolves no media reference outside its own file.
 #[test]
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn video_assets_follow_no_external_references() {
     use objc2_av_foundation::AVAssetReferenceRestrictions;
     let path = format!(

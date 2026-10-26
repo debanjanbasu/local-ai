@@ -139,7 +139,6 @@ impl MelFilters {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::suboptimal_flops)]
     use super::*;
 
     fn triangle_filters(n_mels: usize) -> Vec<f32> {

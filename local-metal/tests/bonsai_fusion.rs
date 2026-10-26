@@ -1,4 +1,4 @@
-#![allow(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
+#![expect(unsafe_code, clippy::expect_used)]
 
 //! Every fused decode kernel must reproduce, bit for bit, the separate
 //! dispatches it replaces: greedy output is only unchanged if logits are.

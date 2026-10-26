@@ -70,7 +70,7 @@ fn base64_decode(text: &str) -> Vec<u8> {
 /// reference ids within the parity gate (mean cosine ≥ 0.9995, min ≥ 0.999).
 #[test]
 #[ignore = "requires the installed embedding model"]
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn native_embeddings_match_the_reference_fixture() {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -173,7 +173,7 @@ fn placeholders_split_text_in_order() {
 /// (mean cosine ≥ 0.9995, min ≥ 0.999).
 #[test]
 #[ignore = "requires the installed embedding model with the vision and audio artifacts"]
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn native_mixed_modality_embeddings_match_the_reference_fixture() {
     #[derive(serde::Deserialize)]
     struct Fixture {

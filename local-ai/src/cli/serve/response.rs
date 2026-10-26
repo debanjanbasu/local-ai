@@ -96,7 +96,6 @@ pub(super) const fn event_wait(first_seen: bool, stall: Duration) -> EventWait {
 /// `serde_json::to_vec` and zstd are both synchronous CPU work, and at the 2
 /// MiB body cap that is a substantial fraction of a second, so both run on the
 /// blocking pool rather than on a runtime worker.
-#[allow(clippy::needless_pass_by_value)]
 pub(super) async fn json_response(
     status: StatusCode,
     value: Value,

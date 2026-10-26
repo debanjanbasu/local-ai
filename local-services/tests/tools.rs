@@ -7,7 +7,7 @@
 //! deadline). Refusals are checked on inert strings that are validated and
 //! never executed.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![expect(clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -762,7 +762,7 @@ async fn shell_inherits_no_descriptors_beyond_its_standard_streams() {
     let file = std::fs::File::open("/etc/hosts").expect("open");
     // A descriptor without close-on-exec, as a C library might leave one.
     // SAFETY: `dup` of an open descriptor; the result is owned below.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     let leaked = unsafe { OwnedFd::from_raw_fd(libc::dup(file.as_raw_fd())) };
     let tools = toolbox(root.path(), false, true);
     let runs = runs(

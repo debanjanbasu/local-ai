@@ -1,4 +1,4 @@
-#![allow(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
+#![expect(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
 
 use local_metal::{
     batch::CommandBatch,

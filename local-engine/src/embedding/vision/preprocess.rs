@@ -267,7 +267,7 @@ struct AxisWeights {
 }
 
 // Unfused arithmetic on purpose: the same operations as torch's C++.
-#[allow(clippy::suboptimal_flops)]
+#[expect(clippy::suboptimal_flops)]
 fn cubic(x: f64) -> f64 {
     const A: f64 = -0.5;
     let x = x.abs();
@@ -280,7 +280,7 @@ fn cubic(x: f64) -> f64 {
     }
 }
 
-#[allow(clippy::cast_possible_wrap, clippy::suboptimal_flops)]
+#[expect(clippy::cast_possible_wrap, clippy::suboptimal_flops)]
 fn axis_weights(input: usize, output: usize) -> AxisWeights {
     let scale = input as f64 / output as f64;
     let support = if scale >= 1.0 { 2.0 * scale } else { 2.0 };

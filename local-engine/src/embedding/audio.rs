@@ -531,7 +531,7 @@ impl AudioTower {
 
     /// Soft tokens (`[tokens, 512]` row-major, one block per clip) of clips
     /// whose features fit one pass.
-    #[allow(unsafe_code, clippy::too_many_lines)]
+    #[expect(unsafe_code, clippy::too_many_lines)]
     fn pass(
         &self,
         model: &EmbeddingModel,

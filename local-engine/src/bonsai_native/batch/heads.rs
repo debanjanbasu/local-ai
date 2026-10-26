@@ -220,8 +220,8 @@ impl BonsaiModel {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
-    #[allow(unsafe_code)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(unsafe_code)]
     fn run_head_drafts(
         &self,
         speculation: &super::super::Speculation,

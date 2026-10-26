@@ -168,7 +168,7 @@ impl BonsaiModel {
     /// the exact top two over its logits all run on the GPU. The host reads
     /// only the top two, which equals [`Self::draft_on_host`]'s selection
     /// whenever the sampler applies no penalties.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(super) fn draft_on_device(
         &self,
         speculation: &mut Speculation,
@@ -292,7 +292,7 @@ impl BonsaiModel {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 mod tests {
     use super::super::{KvOptions, NgramSettings};
     use super::*;

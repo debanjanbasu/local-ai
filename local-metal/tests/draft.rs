@@ -1,4 +1,4 @@
-#![allow(unsafe_code, clippy::expect_used)]
+#![expect(unsafe_code, clippy::expect_used)]
 
 use half::f16;
 use local_metal::batch::CommandBatch;

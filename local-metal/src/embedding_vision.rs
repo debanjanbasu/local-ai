@@ -58,7 +58,7 @@ fn same(a: &MetalBuffer, b: &MetalBuffer) -> bool {
     std::ptr::eq(a.raw(), b.raw())
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn set<T: Copy>(
     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     value: &T,
@@ -74,7 +74,7 @@ fn set<T: Copy>(
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn bind(
     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     buffer: &MetalBuffer,
@@ -133,7 +133,7 @@ impl VisionKernels {
     /// `tokens` rows of `width`; `table` is BF16 `[2 * table_rows, width]` at
     /// `table_offset` and `positions` holds `(x, y)` `u32` pairs, each below
     /// `table_rows` (the caller checks).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn add_positions(
         &self,
         batch: &mut CommandBatch,
@@ -177,7 +177,7 @@ impl VisionKernels {
     /// `output[o, c] = scale * mean_j input[members[9 o + j], c]` for
     /// `outputs` rows of `width`; every member index must be a row of
     /// `input` (the caller checks).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn pool(
         &self,
         batch: &mut CommandBatch,
@@ -214,7 +214,7 @@ impl VisionKernels {
 
     /// Bidirectional attention among tokens `[first, first + count)` only;
     /// `q`, `k`, `v` and `out` are `[tokens, heads, 64]` F32 rows.
-    #[allow(clippy::too_many_arguments, unsafe_code)]
+    #[expect(clippy::too_many_arguments, unsafe_code)]
     pub fn attention(
         &self,
         batch: &mut CommandBatch,

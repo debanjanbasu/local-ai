@@ -277,7 +277,7 @@ impl BonsaiOps {
     /// On a tensor build, F16 caches use `bo_attn_tensor` and quantized ones
     /// `bo_attn_tensor_<layout>`; the SIMD build takes the SIMD block kernel,
     /// which dequantizes in registers.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn attention_block_kv(
         &self,
         layout: KvLayout,

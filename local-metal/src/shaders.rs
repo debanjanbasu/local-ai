@@ -16,7 +16,6 @@ impl ShaderLibrary {
     /// # Errors
     ///
     /// Returns [`Error::LibraryCreation`] if the metallib data cannot be loaded.
-    #[allow(unsafe_code)]
     pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> crate::Result<Self> {
         let metallib_bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
         let data = dispatch2::DispatchData::from_bytes(metallib_bytes);

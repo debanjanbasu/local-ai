@@ -371,7 +371,7 @@ impl ResponsesRequest {
     /// says whether a response store was configured, `temporary` whether the
     /// private temporary store is available, `conversations` whether the
     /// durable conversation store is.
-    #[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
+    #[expect(clippy::fn_params_excessive_bools)]
     fn reject_unsupported(
         &self,
         stored: bool,
@@ -719,7 +719,7 @@ pub(in crate::cli::serve) fn prepare_responses_retaining(
 /// `previous_response_id` must name a Response it may see, the Response is
 /// stored as its own, and `conversations` (which also resolves `file_id`
 /// parts) is scoped to it.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(in crate::cli::serve) fn prepare_responses_conversing(
     body: &[u8],
     thinking: bool,
