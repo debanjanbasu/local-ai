@@ -277,13 +277,11 @@ impl BonsaiEngine {
         running: usize,
         progress: &mut dyn FnMut(u64, PrefillProgress),
     ) -> Option<(u64, crate::Error)> {
-        let (index, remaining) = self
-            .active
-            .iter()
-            .enumerate()
-            .filter(|(_, generation)| !generation.done)
-            .filter_map(|(index, generation)| Some((index, generation.prefill_remaining()?)))
-            .min_by_key(|&(_, remaining)| remaining)?;
+        let (index, remaining) = self.next_prefill()?;
+        if running > 0 && self.active[index].awaiting_disk() {
+            // Its load is still running: it would only sit the step out.
+            return None;
+        }
         let short = self.active[index].prefill_total() <= PREFILL_WHOLE_DECODING;
         let budget = if running == 0 {
             // One prefill block, each its own GPU round trip either way: a
@@ -315,6 +313,27 @@ impl BonsaiEngine {
             self.discard(generation);
         }
         Some((id, error))
+    }
+
+    /// The prompt this step prefills and its tokens left: the one with the
+    /// fewest, preferring prompts whose disk snapshot is not still loading.
+    /// One that is gets the step only when no other prompt prefills, and then
+    /// sits it out while others decode, or waits for its load when none do
+    /// (see [`Self::refresh_prefix`]).
+    fn next_prefill(&self) -> Option<(usize, usize)> {
+        self.active
+            .iter()
+            .enumerate()
+            .filter(|(_, generation)| !generation.done)
+            .filter_map(|(index, generation)| {
+                Some((
+                    index,
+                    generation.prefill_remaining()?,
+                    generation.awaiting_disk(),
+                ))
+            })
+            .min_by_key(|&(_, remaining, loading)| (loading, remaining))
+            .map(|(index, remaining, _)| (index, remaining))
     }
 
     /// Cancel and return every active generation, as a worker shutting down
@@ -701,13 +720,7 @@ impl BonsaiEngine {
     /// milestone. The chunk fills the pass to a multiple of eight rows, from
     /// [`PREFILL_FOLD_MIN`] to seven more.
     fn fold_candidate(&self, seeds: usize) -> Option<(usize, usize)> {
-        let (index, _) = self
-            .active
-            .iter()
-            .enumerate()
-            .filter(|(_, generation)| !generation.done)
-            .filter_map(|(index, generation)| Some((index, generation.prefill_remaining()?)))
-            .min_by_key(|&(_, remaining)| remaining)?;
+        let (index, _) = self.next_prefill()?;
         let generation = &self.active[index];
         if generation.prefill_total() <= PREFILL_WHOLE_DECODING || generation.cancel.is_cancelled()
         {

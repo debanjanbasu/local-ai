@@ -623,6 +623,167 @@ fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
     assert_eq!(resumed.token_ids, cold.token_ids);
 }
 
+/// Reading and verifying a disk snapshot (about 34 KiB a token here) used to
+/// run on the engine thread inside the restoring request's admission, so a
+/// stream decoding beside it emitted nothing until the whole file was read
+/// and hashed. The read now runs on a helper thread: the stream keeps
+/// emitting while the request waits out of prefill, the restore that follows
+/// is only a copy, and both produce exactly their tokens alone. Prints the
+/// stream's longest gap while the snapshot restores.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device; prints timings"]
+#[allow(clippy::too_many_lines)]
+fn a_stream_keeps_decoding_while_another_request_loads_a_disk_snapshot() {
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
+    let mut engine = BonsaiEngine::open_with_options(
+        Path::new(&path),
+        Some(16_384),
+        DEFAULT_PREFILL_CHUNK,
+        None,
+        &MtpMode::Off(None),
+        NgramSettings {
+            enabled: false,
+            ..NgramSettings::default()
+        },
+        KvOptions::default(),
+    )
+    .expect("load model");
+    let cache = tempfile::tempdir().expect("cache directory");
+    engine.set_prompt_cache_checkpoints(4).expect("checkpoints");
+    engine.set_session_cache(0, Some(cache.path().to_owned()));
+    engine.prompt_cache_disk_bytes = u64::MAX;
+    let stream_prompt = engine
+        .encode_prompt(
+            "Write a long story about a lighthouse keeper.",
+            false,
+            false,
+        )
+        .expect("stream prompt");
+    let stream_params = GenerateParams {
+        temperature: 0.0,
+        max_tokens: 160,
+        ..GenerateParams::default()
+    };
+    let params = GenerateParams {
+        temperature: 0.0,
+        max_tokens: 4,
+        ..GenerateParams::default()
+    };
+    let text = (0..360)
+        .map(|index| format!("Line {index}: the keeper of lighthouse {index} logged calm seas."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let long = engine
+        .encode_prompt(&text, true, false)
+        .expect("long prompt");
+    assert!(long.len() > 6_000, "{} tokens", long.len());
+    // Cold references, the second leaving the long prompt's tail on disk.
+    let stream_alone = engine
+        .generate(&stream_prompt, &stream_params, |_| true)
+        .expect("stream alone")
+        .token_ids;
+    let long_alone = engine
+        .generate(&long, &params, |_| true)
+        .expect("long alone cold");
+    assert_eq!(long_alone.stats.reused_prompt_tokens, 0);
+    engine.flush_prompt_cache();
+    let snapshot = engine
+        .disk_snapshots
+        .iter()
+        .find(|entry| entry.tokens.as_slice() == &long[..long.len() - 1])
+        .expect("the long prompt's tail on disk")
+        .path
+        .clone();
+    let snapshot_bytes = std::fs::metadata(&snapshot).expect("snapshot").len();
+    engine.clear_gpu_cache();
+
+    let stream = engine
+        .admit(&stream_prompt, &stream_params, None, CancelToken::new())
+        .expect("admit stream");
+    let mut stream_emitted = Vec::new();
+    let mut outcomes = std::collections::HashMap::new();
+    let step = |engine: &mut BonsaiEngine,
+                emitted: &mut Vec<Instant>,
+                outcomes: &mut std::collections::HashMap<u64, BonsaiGeneration>| {
+        let mut others = 0;
+        for (id, result) in engine.step(
+            &mut |id, _, _| {
+                if id == stream {
+                    emitted.push(Instant::now());
+                } else {
+                    others += 1;
+                }
+                true
+            },
+            &mut |_, _| {},
+        ) {
+            outcomes.insert(id, result.expect("generation"));
+        }
+        others
+    };
+    while stream_emitted.len() < 8 {
+        step(&mut engine, &mut stream_emitted, &mut outcomes);
+    }
+    let admitted = Instant::now();
+    let restoring = engine
+        .admit(&long, &params, None, CancelToken::new())
+        .expect("admit restoring request");
+    let admission = admitted.elapsed();
+    let mut steps_while_loading = 0;
+    let mut first_token = None;
+    while engine.active_generations() > 0 {
+        let loading = engine
+            .active
+            .iter()
+            .any(|generation| generation.id == restoring && generation.awaiting_disk());
+        let before = stream_emitted.len();
+        let others = step(&mut engine, &mut stream_emitted, &mut outcomes);
+        if loading && stream_emitted.len() > before {
+            steps_while_loading += 1;
+        }
+        if others > 0 || outcomes.contains_key(&restoring) {
+            first_token.get_or_insert_with(Instant::now);
+        }
+    }
+    let first_token = first_token.expect("restoring request's first token");
+    let window = stream_emitted
+        .iter()
+        .copied()
+        .filter(|&at| at > admitted && at <= first_token)
+        .collect::<Vec<_>>();
+    let longest_gap = std::iter::once(admitted)
+        .chain(window.iter().copied())
+        .zip(window.iter().copied())
+        .map(|(earlier, later)| later - earlier)
+        .max()
+        .unwrap_or_else(|| first_token - admitted);
+    let started = Instant::now();
+    prompt_cache::load(&snapshot, &engine.prompt_cache_model_key).expect("load snapshot");
+    let load = started.elapsed();
+    eprintln!(
+        "{} MB snapshot ({} tokens): load and verify {:.0} ms; admission {:.1} ms; \
+         stream emitted {} tokens in {} steps while it loaded, longest gap until the \
+         restoring request's first token {:.0} ms ({:.0} ms after admission)",
+        snapshot_bytes / 1_000_000,
+        long.len() - 1,
+        load.as_secs_f64() * 1e3,
+        admission.as_secs_f64() * 1e3,
+        window.len(),
+        steps_while_loading,
+        longest_gap.as_secs_f64() * 1e3,
+        (first_token - admitted).as_secs_f64() * 1e3,
+    );
+    let restored = &outcomes[&restoring];
+    assert_eq!(restored.cache_source, PromptCacheSource::Disk);
+    assert_eq!(restored.stats.reused_prompt_tokens, long.len() - 1);
+    assert!(
+        steps_while_loading > 0,
+        "the stream emitted nothing while the snapshot loaded"
+    );
+    assert_eq!(restored.token_ids, long_alone.token_ids);
+    assert_eq!(outcomes[&stream].token_ids, stream_alone);
+}
+
 /// Deep cancellation: a tripped [`CancelToken`] stops a request between GPU
 /// dispatches and is a successful [`StopReason::Cancelled`], never an error.
 /// It drops only the checkpoints past where it stopped: the one it restored

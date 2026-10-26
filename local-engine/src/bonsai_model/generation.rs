@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 
+use super::checkpoints::Loaded;
 use super::{
     BonsaiEngine, BonsaiGeneration, BonsaiModel, CancelToken, GenerateParams, GenerationStats,
     HeadLag, Instant, LookupPolicy, MtpStats, PrefillProgress, PromptCacheSource, PromptCheckpoint,
     PromptPrefill, Sampler, SamplingParams, SamplingResult, SequenceState, StopReason,
-    SuffixSession, VOCAB,
+    SuffixSession, VOCAB, prompt_cache,
 };
 use std::sync::Arc;
 
@@ -56,9 +57,12 @@ pub(super) struct ActiveGeneration {
     pub(super) lag: HeadLag,
     /// The prompt's remaining prefill, until its first sample is taken.
     pub(super) prefill: Option<PromptPrefill>,
-    /// Skip this step's prefill: a disk write that restores more of the
-    /// prompt is still in flight (see [`BonsaiEngine::refresh_prefix`]).
+    /// Skip this step's prefill: a disk write or load that restores more of
+    /// the prompt is still in flight (see [`BonsaiEngine::refresh_prefix`]).
     defer_prefill: bool,
+    /// The disk snapshot this generation restores, still being read and
+    /// verified; its prefill waits for it.
+    disk_load: Option<prompt_cache::Load>,
     /// Prefill chunks reported to the caller.
     pub(super) prefill_chunks: usize,
     /// Running estimates of the chance a lookup or head draft is accepted,
@@ -83,6 +87,13 @@ impl ActiveGeneration {
     /// Whether the generation is past its prompt and still running.
     pub(super) const fn decoding(&self) -> bool {
         !self.done && self.prefill.is_none()
+    }
+
+    /// Whether the disk snapshot this generation restores is still loading.
+    pub(super) fn awaiting_disk(&self) -> bool {
+        self.disk_load
+            .as_ref()
+            .is_some_and(|load| !load.is_finished())
     }
 
     /// Prompt tokens still to prefill, if the prompt is not prefilled yet.
@@ -296,6 +307,7 @@ impl BonsaiEngine {
             lag: HeadLag::default(),
             prefill: None,
             defer_prefill: false,
+            disk_load: None,
             prefill_chunks: 0,
             ngram_acceptance: INITIAL_NGRAM_ACCEPTANCE,
             mtp_acceptance: INITIAL_MTP_ACCEPTANCE,
@@ -306,10 +318,11 @@ impl BonsaiEngine {
         }
         self.model.take_gpu_time();
         generation.sampler.observe(prompt);
-        let (plan, cache_source) = self.begin_prompt(prompt, session_id)?;
+        let (plan, cache_source, load) = self.begin_prompt(prompt, session_id, None)?;
         generation.stats.reused_prompt_tokens = plan.reused;
         generation.cache_source = cache_source;
         generation.prefill = Some(plan);
+        generation.disk_load = load;
         generation.stats.gpu += self.model.take_gpu_time();
         Ok(generation)
     }
@@ -322,45 +335,81 @@ impl BonsaiEngine {
     /// instead of prefilling it again. While that snapshot's disk write is
     /// still in flight, the generation skips its prefill each step another
     /// request decodes, and waits for the write only when none does.
+    ///
+    /// A disk snapshot its admission or this found is read and verified on a
+    /// helper thread (see [`BonsaiEngine::restore_reusable_prefix`]); the
+    /// generation skips its prefill the same way until that load ends, and is
+    /// then restored from it, the only part left on the engine thread being
+    /// the copy into the model's buffers.
     pub(super) fn refresh_prefix(
         &mut self,
         generation: &mut ActiveGeneration,
     ) -> crate::Result<()> {
-        let Some(plan) = &generation.prefill else {
-            return Ok(());
-        };
-        let reused = plan.reused;
-        if plan.done() != reused {
-            return Ok(());
-        }
-        // A restore costs in proportion to the prefix it copies, prefill in
-        // proportion to the tokens it saves (about 8 ms against 0.1 ms each).
-        let worth = |best: usize| best > reused && (best - reused) * 64 >= best;
-        let mut best = self.reusable_prefix(&generation.prompt);
-        let held = best.max(reused);
-        if self
-            .pending_disk_prefix(&generation.prompt, held)
-            .is_some_and(worth)
-        {
-            if self.active.iter().any(ActiveGeneration::decoding) {
-                // Waiting here would stall every decoding request for the
-                // rest of the write: sit this step out and ask again next one.
-                generation.defer_prefill = true;
+        loop {
+            let Some(plan) = &generation.prefill else {
+                return Ok(());
+            };
+            let reused = plan.reused;
+            if plan.done() != reused {
                 return Ok(());
             }
-            self.await_disk_prefix(&generation.prompt, held);
-            best = self.reusable_prefix(&generation.prompt);
+            let others_decode = self.active.iter().any(ActiveGeneration::decoding);
+            if let Some(load) = generation.disk_load.take() {
+                if others_decode && !load.is_finished() {
+                    // Waiting here would stall every decoding request for the
+                    // rest of the read: sit this step out.
+                    generation.disk_load = Some(load);
+                    generation.defer_prefill = true;
+                    return Ok(());
+                }
+                let path = load.path().to_owned();
+                let snapshot = load.wait();
+                self.restart_prompt(generation, Some((path, snapshot)))?;
+                continue;
+            }
+            // A restore costs in proportion to the prefix it copies, prefill in
+            // proportion to the tokens it saves (about 8 ms against 0.1 ms each).
+            let worth = |best: usize| best > reused && (best - reused) * 64 >= best;
+            let mut best = self.reusable_prefix(&generation.prompt);
+            let held = best.max(reused);
+            if self
+                .pending_disk_prefix(&generation.prompt, held)
+                .is_some_and(worth)
+            {
+                if others_decode {
+                    // Waiting here would stall every decoding request for the
+                    // rest of the write: sit this step out and ask again next one.
+                    generation.defer_prefill = true;
+                    return Ok(());
+                }
+                self.await_disk_prefix(&generation.prompt, held);
+                best = self.reusable_prefix(&generation.prompt);
+            }
+            if !worth(best) {
+                return Ok(());
+            }
+            self.restart_prompt(generation, None)?;
+            if generation.disk_load.is_none() {
+                return Ok(());
+            }
         }
-        if !worth(best) {
-            return Ok(());
-        }
+    }
+
+    /// Restore `generation`'s longest reusable prefix again, with a disk
+    /// snapshot that finished `loaded`, and plan its prefill from there.
+    fn restart_prompt(
+        &mut self,
+        generation: &mut ActiveGeneration,
+        loaded: Option<Loaded>,
+    ) -> crate::Result<()> {
         self.model.take_gpu_time();
         self.claim_gpu_cache();
-        let (plan, cache_source) =
-            self.begin_prompt(&generation.prompt, generation.session_id.as_deref())?;
+        let (plan, cache_source, load) =
+            self.begin_prompt(&generation.prompt, generation.session_id.as_deref(), loaded)?;
         generation.stats.reused_prompt_tokens = plan.reused;
         generation.cache_source = cache_source;
         generation.prefill = Some(plan);
+        generation.disk_load = load;
         generation.stats.gpu += self.model.take_gpu_time();
         Ok(())
     }

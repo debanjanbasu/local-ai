@@ -11,8 +11,10 @@ use sha2::{Digest, Sha256};
 
 use crate::bonsai_native::{PageBytes, PromptSnapshot};
 
+mod loader;
 mod writer;
 
+pub use self::loader::Load;
 pub use self::writer::{Closed, Closer, StoreJob, Writer};
 
 const MAGIC: &[u8; 8] = b"BPCACHE1";
@@ -103,6 +105,15 @@ fn read_index(path: &Path) -> crate::Result<(Header, Vec<u8>)> {
 }
 
 pub fn load(path: &Path, model_key: &str) -> crate::Result<PromptSnapshot> {
+    load_abortable(path, model_key, &AtomicBool::new(false))
+}
+
+/// `load`, giving up between pieces once `abort` is set.
+fn load_abortable(
+    path: &Path,
+    model_key: &str,
+    abort: &AtomicBool,
+) -> crate::Result<PromptSnapshot> {
     let mut file = File::open(path)?;
     let header = read_header(&mut file)?;
     if header.model_key != model_key {
@@ -137,10 +148,10 @@ pub fn load(path: &Path, model_key: &str) -> crate::Result<PromptSnapshot> {
     let mut stored_tokens = vec![0; token_bytes];
     file.read_exact(&mut stored_tokens)?;
     digest.update(&stored_tokens);
-    let recurrent = read_hashed(&mut file, header.recurrent, &mut digest)?;
-    let mtp_prev_hidden = read_hashed(&mut file, header.mtp_hidden, &mut digest)?;
-    let target_kv = read_hashed(&mut file, header.target_kv, &mut digest)?;
-    let mtp_kv = read_hashed(&mut file, header.mtp_kv, &mut digest)?;
+    let recurrent = read_hashed(&mut file, header.recurrent, &mut digest, abort)?;
+    let mtp_prev_hidden = read_hashed(&mut file, header.mtp_hidden, &mut digest, abort)?;
+    let target_kv = read_hashed(&mut file, header.target_kv, &mut digest, abort)?;
+    let mtp_kv = read_hashed(&mut file, header.mtp_kv, &mut digest, abort)?;
     let mut trailing = [0];
     if file.read(&mut trailing)? != 0 {
         return Err(crate::Error::InvalidFormat(
@@ -615,9 +626,20 @@ impl DiskIndex {
 /// syscall and an extra copy per 16 KiB of a ~152 MiB snapshot.
 const READ_CHUNK: usize = 1024 * 1024;
 
-fn read_hashed(file: &mut File, length: usize, digest: &mut Sha256) -> crate::Result<PageBytes> {
+fn read_hashed(
+    file: &mut File,
+    length: usize,
+    digest: &mut Sha256,
+    abort: &AtomicBool,
+) -> crate::Result<PageBytes> {
     let mut bytes = PageBytes::zeroed(length)?;
     for chunk in bytes.chunks_mut(READ_CHUNK) {
+        if abort.load(Ordering::Acquire) {
+            return Err(crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "prompt cache load abandoned",
+            )));
+        }
         file.read_exact(chunk)?;
         digest.update(&*chunk);
     }

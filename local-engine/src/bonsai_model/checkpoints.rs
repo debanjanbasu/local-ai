@@ -26,7 +26,7 @@ mod reuse;
 
 pub(super) use self::boundary::PromptPrefill;
 use self::reuse::ReuseBounds;
-pub(super) use self::reuse::SHARED_PREFIX_MIN_TOKENS;
+pub(super) use self::reuse::{Loaded, SHARED_PREFIX_MIN_TOKENS};
 
 impl BonsaiEngine {
     pub(super) fn save_prompt_checkpoint(
@@ -66,17 +66,22 @@ impl BonsaiEngine {
     }
 
     /// Restore the longest reusable prefix of `prompt` into the resident
-    /// sequence and plan the prefill of the rest.
+    /// sequence and plan the prefill of the rest, with a disk snapshot that
+    /// finished `loaded` (see [`Self::restore_reusable_prefix`]). Also
+    /// returns the load of a longer disk snapshot, when one was started: the
+    /// plan is then a stand-in, not to be prefilled before the load ends.
     pub(super) fn begin_prompt(
         &mut self,
         prompt: &[u32],
         session_id: Option<&str>,
-    ) -> crate::Result<(PromptPrefill, PromptCacheSource)> {
+        loaded: Option<Loaded>,
+    ) -> crate::Result<(PromptPrefill, PromptCacheSource, Option<prompt_cache::Load>)> {
         self.collect_disk_writes();
         self.persist_owed_checkpoints(prompt)?;
         let bounds: ReuseBounds = self.reuse_bounds(prompt);
-        let (reused, source) = self.restore_reusable_prefix(prompt, &bounds, session_id)?;
-        Ok((self.plan_prefill(prompt, &bounds, reused), source))
+        let (reused, source, load) =
+            self.restore_reusable_prefix(prompt, &bounds, session_id, loaded)?;
+        Ok((self.plan_prefill(prompt, &bounds, reused), source, load))
     }
 
     /// `persist` also writes the snapshot to the disk tier; only boundaries a
