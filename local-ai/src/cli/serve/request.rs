@@ -105,38 +105,27 @@ struct StreamOptions {
 
 impl GenerateRequest {
     fn params(&self) -> GenerateParams {
-        let defaults = GenerateParams::default();
-        GenerateParams {
-            max_tokens: self
-                .max_completion_tokens
-                .or(self.max_tokens)
-                .unwrap_or(defaults.max_tokens),
-            temperature: self.temperature.unwrap_or(defaults.temperature),
-            top_p: self.top_p.unwrap_or(defaults.top_p),
-            top_k: self.top_k.unwrap_or(defaults.top_k),
-            min_p: self.min_p.unwrap_or(defaults.min_p),
-            presence_penalty: self.presence_penalty.unwrap_or(defaults.presence_penalty),
-            repetition_penalty: repetition_penalty(self.repetition_penalty, self.frequency_penalty),
-            seed: self
-                .seed
-                .as_ref()
-                .and_then(|seed| {
-                    seed.as_u64()
-                        .or_else(|| seed.as_i64().map(i64::cast_unsigned))
-                })
-                .unwrap_or(defaults.seed),
+        SamplingOptions {
+            max_tokens: self.max_completion_tokens.or(self.max_tokens),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            seed: self.seed.as_ref().and_then(|seed| {
+                seed.as_u64()
+                    .or_else(|| seed.as_i64().map(i64::cast_unsigned))
+            }),
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            repetition_penalty: self.repetition_penalty,
             logprobs: (self.logprobs == Some(Value::Bool(true)))
                 .then(|| self.top_logprobs.unwrap_or(0) as usize),
         }
+        .params()
     }
 
     /// Fail on any named option whose effect this server cannot produce.
     fn reject_unsupported(&self) -> crate::Result<()> {
-        let unsupported = |name: &str, why: &str| {
-            Err(crate::Error::InvalidArgument(format!(
-                "{name} is not supported: {why}"
-            )))
-        };
         if self
             .seed
             .as_ref()
@@ -147,7 +136,7 @@ impl GenerateRequest {
             ));
         }
         if self.n.is_some_and(|n| n != 1) {
-            return unsupported("n", "this server generates exactly one choice");
+            return Err(unsupported("n", "this server generates exactly one choice"));
         }
         let logprobs = match self.logprobs.as_ref() {
             None | Some(Value::Null) => false,
@@ -158,58 +147,110 @@ impl GenerateRequest {
                 ));
             }
         };
-        if self
-            .top_logprobs
-            .is_some_and(|n| n > local_engine::MAX_TOP_LOGPROBS as u64)
-        {
-            return Err(crate::Error::InvalidArgument(format!(
-                "top_logprobs must be between 0 and {}",
-                local_engine::MAX_TOP_LOGPROBS
-            )));
-        }
+        top_logprobs(self.top_logprobs)?;
         if !logprobs && self.top_logprobs.is_some_and(|n| n > 0) {
             return Err(crate::Error::InvalidArgument(
                 "top_logprobs requires logprobs to be true".into(),
             ));
         }
         if self.logit_bias.as_ref().is_some_and(|bias| !is_empty(bias)) {
-            return unsupported("logit_bias", "the sampler has no per-token bias");
+            return Err(unsupported(
+                "logit_bias",
+                "the sampler has no per-token bias",
+            ));
         }
         if self.store == Some(true) {
-            return unsupported("store", "this server stores no completions");
+            return Err(unsupported("store", "this server stores no completions"));
         }
         if self.audio.as_ref().is_some_and(|audio| !audio.is_null()) {
-            return unsupported("audio", "Bonsai 2 is text-only");
+            return Err(unsupported("audio", "Bonsai 2 is text-only"));
         }
         if self
             .modalities
             .as_ref()
             .is_some_and(|modalities| modalities.iter().any(|modality| modality != "text"))
         {
-            return unsupported("modalities", "Bonsai 2 only produces text");
+            return Err(unsupported("modalities", "Bonsai 2 only produces text"));
         }
         if self
             .prediction
             .as_ref()
             .is_some_and(|value| !value.is_null())
         {
-            return unsupported("prediction", "predicted outputs are not implemented");
+            return Err(unsupported(
+                "prediction",
+                "predicted outputs are not implemented",
+            ));
         }
         if self
             .web_search_options
             .as_ref()
             .is_some_and(|value| !value.is_null())
         {
-            return unsupported("web_search_options", "there is no built-in web search");
+            return Err(unsupported(
+                "web_search_options",
+                "there is no built-in web search",
+            ));
         }
         service_tier(self.service_tier.as_deref())
     }
 }
 
+/// The sampling members Chat Completions and Responses both take, as the
+/// request set them. Each protocol reads its own token limit (`max_tokens`
+/// or `max_completion_tokens`, `max_output_tokens`), `seed` and `logprobs`
+/// members into these; what is unset takes the server's default.
+pub(super) struct SamplingOptions {
+    pub(super) max_tokens: Option<usize>,
+    pub(super) temperature: Option<f32>,
+    pub(super) top_p: Option<f32>,
+    pub(super) top_k: Option<usize>,
+    pub(super) min_p: Option<f32>,
+    pub(super) seed: Option<u64>,
+    pub(super) presence_penalty: Option<f32>,
+    pub(super) frequency_penalty: Option<f32>,
+    pub(super) repetition_penalty: Option<f32>,
+    pub(super) logprobs: Option<usize>,
+}
+
+impl SamplingOptions {
+    /// These members over [`GenerateParams::default`].
+    pub(super) fn params(self) -> GenerateParams {
+        let defaults = GenerateParams::default();
+        GenerateParams {
+            max_tokens: self.max_tokens.unwrap_or(defaults.max_tokens),
+            temperature: self.temperature.unwrap_or(defaults.temperature),
+            top_p: self.top_p.unwrap_or(defaults.top_p),
+            top_k: self.top_k.unwrap_or(defaults.top_k),
+            min_p: self.min_p.unwrap_or(defaults.min_p),
+            seed: self.seed.unwrap_or(defaults.seed),
+            presence_penalty: self.presence_penalty.unwrap_or(defaults.presence_penalty),
+            repetition_penalty: repetition_penalty(self.repetition_penalty, self.frequency_penalty),
+            logprobs: self.logprobs,
+        }
+    }
+}
+
+/// A request option this server cannot honour, refused with the reason.
+pub(super) fn unsupported(name: &str, why: &str) -> crate::Error {
+    crate::Error::InvalidArgument(format!("{name} is not supported: {why}"))
+}
+
+/// Refuse a `top_logprobs` (Chat and Responses) above what the engine reports.
+pub(super) fn top_logprobs(top: Option<u64>) -> crate::Result<()> {
+    if top.is_some_and(|n| n > local_engine::MAX_TOP_LOGPROBS as u64) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "top_logprobs must be between 0 and {}",
+            local_engine::MAX_TOP_LOGPROBS
+        )));
+    }
+    Ok(())
+}
+
 /// The sampler's multiplicative repetition penalty: vLLM's
 /// `repetition_penalty` as given, else `OpenAI`'s additive
 /// `frequency_penalty` as `1 + max(value, 0)`, else none.
-pub(super) fn repetition_penalty(repetition: Option<f32>, frequency: Option<f32>) -> f32 {
+fn repetition_penalty(repetition: Option<f32>, frequency: Option<f32>) -> f32 {
     repetition
         .or_else(|| frequency.map(|value| 1.0 + value.max(0.0)))
         .unwrap_or_else(|| GenerateParams::default().repetition_penalty)

@@ -12,10 +12,10 @@ use local_services::Store as ConversationStore;
 use local_services::compaction::{COMPACTION, Compacted, latest, plan};
 
 use super::super::reasoning_crypto::ReasoningCipher;
-use super::super::request::{add_verbosity, service_tier, tool_call};
+use super::super::request::{add_verbosity, service_tier, tool_call, unsupported};
 use super::super::response::{new_id, unix_now};
 use super::super::store::ResponseStore;
-use super::parse::{PreparedResponses, invalid, present, previous_history, unsupported};
+use super::parse::{PreparedResponses, invalid, present, previous_history};
 
 /// The `type` of the input item that asks for a compaction turn: Codex's
 /// remote compaction (provider capability `remote_compaction = "v2"`)

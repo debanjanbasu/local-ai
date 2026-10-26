@@ -15,8 +15,9 @@ use local_services::{Append, Error as ServiceError, Store as ConversationStore};
 use super::super::background::Temporary;
 use super::super::reasoning_crypto::ReasoningCipher;
 use super::super::request::{
-    add_verbosity, effective_reasoning, function_definition, repetition_penalty,
-    responses_text_format, responses_tool_choice, service_tier, tool_policy, verbosity_level,
+    SamplingOptions, add_verbosity, effective_reasoning, function_definition,
+    responses_text_format, responses_tool_choice, service_tier, tool_policy, top_logprobs,
+    unsupported, verbosity_level,
 };
 use super::super::response::Reply;
 use super::super::store::{ResponseStore, StoredResponse};
@@ -337,10 +338,6 @@ pub(super) fn invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::InvalidArgument(message.into())
 }
 
-pub(super) fn unsupported(name: &str, why: &str) -> crate::Error {
-    invalid(format!("{name} is not supported: {why}"))
-}
-
 pub(super) fn present(value: Option<&Value>) -> bool {
     value.is_some_and(|value| !value.is_null())
 }
@@ -455,15 +452,7 @@ impl ResponsesRequest {
                  file_search_call.results and message.output_text.logprobs are implemented",
             ));
         }
-        if self
-            .top_logprobs
-            .is_some_and(|n| n > local_engine::MAX_TOP_LOGPROBS as u64)
-        {
-            return Err(invalid(format!(
-                "top_logprobs must be between 0 and {}",
-                local_engine::MAX_TOP_LOGPROBS
-            )));
-        }
+        top_logprobs(self.top_logprobs)?;
         if self
             .stream_options
             .as_ref()
@@ -478,18 +467,19 @@ impl ResponsesRequest {
     }
 
     fn params(&self) -> GenerateParams {
-        let defaults = GenerateParams::default();
-        GenerateParams {
-            max_tokens: self.max_output_tokens.unwrap_or(defaults.max_tokens),
-            temperature: self.temperature.unwrap_or(defaults.temperature),
-            top_p: self.top_p.unwrap_or(defaults.top_p),
-            top_k: self.top_k.unwrap_or(defaults.top_k),
-            min_p: self.min_p.unwrap_or(defaults.min_p),
-            seed: self.seed.unwrap_or(defaults.seed),
-            presence_penalty: self.presence_penalty.unwrap_or(defaults.presence_penalty),
-            repetition_penalty: repetition_penalty(self.repetition_penalty, self.frequency_penalty),
+        SamplingOptions {
+            max_tokens: self.max_output_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+            seed: self.seed,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            repetition_penalty: self.repetition_penalty,
             logprobs: self.logprobs(),
         }
+        .params()
     }
 
     /// The alternatives each answer token reports, when `include` asks for
