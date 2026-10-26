@@ -1033,13 +1033,18 @@ is fetched by the server, through the hosted fetch tool's transport
   macOS trust store.
 - At most 64 MiB (the generation request body limit), refused (not
   truncated) by `Content-Length` or while reading; one 60-second deadline
-  for the whole exchange.
+  for the whole exchange, and 120 seconds for all of one request's fetches
+  together.
 - The response's `Content-Type` must be `image/*` for images and `video/*`
   (or `application/mp4`) for videos; none, `application/octet-stream` and
   `binary/octet-stream` pass and the decoder decides. Anything else (an HTML
   error page, say) is a 400 naming the type.
 - Fetched bytes are kept by URL for ten minutes (256 MiB in all), so a
   conversation replaying the URL in its history every turn fetches it once.
+- One request's parts, whatever their source (data URL, `file_id` or URL),
+  hold at most 64 parts and 256 MiB together, checked as they are read (a
+  `file_id` before its bytes are); a `file_id` or URL named several times is
+  read once.
 
 Every failure is a 400 naming the URL and the reason.
 

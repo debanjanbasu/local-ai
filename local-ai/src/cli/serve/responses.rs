@@ -1923,9 +1923,11 @@ fn input_messages(
         Value::String(text) => messages.push(plain("user", text.clone(), None)),
         Value::Array(items) => {
             let mut turn = Turn::default();
-            for item in items {
-                input_item(item, &mut turn, &mut messages, files)?;
-            }
+            super::images::request_scope(|| {
+                items
+                    .iter()
+                    .try_for_each(|item| input_item(item, &mut turn, &mut messages, files))
+            })?;
             flush(&mut turn, &mut messages);
         }
         _ => return Err(invalid("input must be a string or an array of items")),

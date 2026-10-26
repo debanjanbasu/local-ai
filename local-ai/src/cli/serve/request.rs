@@ -383,10 +383,12 @@ pub(super) fn prepare_generation_with(
         .messages
         .as_deref()
         .ok_or_else(|| crate::Error::InvalidArgument("messages are required".into()))?;
-    let mut messages = messages
-        .iter()
-        .map(|message| chat_message(message, files))
-        .collect::<crate::Result<Vec<_>>>()?;
+    let mut messages = super::images::request_scope(|| {
+        messages
+            .iter()
+            .map(|message| chat_message(message, files))
+            .collect::<crate::Result<Vec<_>>>()
+    })?;
     add_verbosity(
         &mut messages,
         verbosity_level(request.verbosity.as_deref(), "verbosity")?,
