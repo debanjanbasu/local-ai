@@ -65,12 +65,6 @@ const PREFILL_WHOLE_DECODING: usize = 128;
 /// steady stream of overlapping requests.
 const POOLED_SEQUENCES: usize = 1;
 
-/// Fewest running generations that decode as one batch while an MTP head is
-/// loaded; a lone generation takes whole speculative rounds. Two streams taking
-/// speculative rounds in turn measured 32.7 tok/s aggregate against 36.8
-/// batched on the M4 Pro, so batching starts at two.
-const BATCH_THRESHOLD: usize = 2;
-
 /// Move an acceptance estimate a quarter of the way toward a new observation.
 fn blend(estimate: f64, observed: f64) -> f64 {
     0.75f64.mul_add(estimate, 0.25 * observed)
@@ -203,12 +197,12 @@ impl BonsaiEngine {
             .iter()
             .filter(|generation| generation.decoding())
             .count();
+        // Two or more decode as one batch: two streams taking speculative
+        // rounds in turn measured 32.7 tok/s aggregate against 36.8 batched
+        // on the M4 Pro, so batching starts at two.
         let outcome = match running {
             0 => Ok(false),
             1 => self.step_alone().map(|()| false),
-            _ if self.model.speculation().is_some() && running < BATCH_THRESHOLD => {
-                self.step_in_turn().map(|()| false)
-            }
             _ => self.step_batched(progress),
         };
         if let Err(error) = &outcome {
@@ -317,38 +311,24 @@ impl BonsaiEngine {
         self.step(&mut |_, _, _| false, &mut |_, _| {})
     }
 
+    /// The single-sequence round of the one running generation.
     fn step_alone(&mut self) -> crate::Result<()> {
-        self.step_in_turn()
-    }
-
-    /// One solo round for each running generation in turn: below the batch
-    /// threshold, a speculative round each beats one batched plain token each.
-    fn step_in_turn(&mut self) -> crate::Result<()> {
-        let ids = self
+        let Some(index) = self
             .active
             .iter()
-            .filter(|generation| generation.decoding())
-            .map(|generation| generation.id)
-            .collect::<Vec<_>>();
-        for id in ids {
-            let Some(index) = self
-                .active
-                .iter()
-                .position(|generation| generation.id == id)
-            else {
-                continue;
-            };
-            if self.active[index].cancel.is_cancelled() {
-                self.active[index].mark_cancelled();
-                continue;
-            }
-            self.make_resident(index)?;
-            let mut generation = self.active.swap_remove(index);
-            let result = self.solo_round(&mut generation);
-            self.active.push(generation);
-            result?;
+            .position(ActiveGeneration::decoding)
+        else {
+            return Ok(());
+        };
+        if self.active[index].cancel.is_cancelled() {
+            self.active[index].mark_cancelled();
+            return Ok(());
         }
-        Ok(())
+        self.make_resident(index)?;
+        let mut generation = self.active.swap_remove(index);
+        let result = self.solo_round(&mut generation);
+        self.active.push(generation);
+        result
     }
 
     /// One batched pass over every running generation: its seed and, where
