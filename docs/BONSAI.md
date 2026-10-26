@@ -2335,6 +2335,9 @@ with an F16 scale per 32, 8.5 bits per value and 34 KiB per token across the
 sixteen layers, against F16's 64 KiB. There is no other target format and no
 fallback: Q8's 34 KiB per token is what the context policy budgets. Scores and
 accumulation remain F32. The MTP head's one-layer cache always remains F16.
+A block's scale saturates at F16's largest value, 65,504, so values beyond
+127 times that (8.3e6) clip instead of an infinite scale reading the whole
+block back as NaN (0 × inf).
 
 Quantized rows are stored in a rotated basis: each head's 256-value key and
 value row is multiplied by the orthonormal Walsh-Hadamard matrix H/16 before

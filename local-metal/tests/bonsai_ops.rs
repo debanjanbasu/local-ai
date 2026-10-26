@@ -1090,6 +1090,57 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
     }
 }
 
+/// A Q8 block whose peak exceeds 127 times F16's largest value must store a
+/// saturated finite scale, not infinity, which readers would turn into NaN
+/// (0 * inf) for every zero code of the block.
+#[test]
+fn q8_kv_scale_saturates_instead_of_overflowing() {
+    let Some((ctx, ops)) = setup() else { return };
+    let layout = KvLayout::parse("q8").expect("layout");
+    // Values are stored unnormalized; their rotated peaks reach about 1e9.
+    let value = floats(
+        &ctx,
+        &(0..1024).map(|i| signal(i, 31) * 1.0e9).collect::<Vec<_>>(),
+    );
+    let key = floats(&ctx, &(0..1024).map(|i| signal(i, 11)).collect::<Vec<_>>());
+    let kw = floats(&ctx, &[1.0f32; 256]);
+    let k_cache = MetalBuffer::empty(ctx.device(), layout.key.token_bytes()).expect("keys");
+    let v_cache = MetalBuffer::empty(ctx.device(), layout.value.token_bytes()).expect("values");
+    let mut batch = CommandBatch::new(&ctx).expect("batch");
+    ops.prepare_kv_rows_kv(
+        layout,
+        &mut batch,
+        &key,
+        &value,
+        &kw,
+        &k_cache,
+        &v_cache,
+        0,
+        1,
+        1e-6,
+        10_000_000.0,
+        1,
+        Rope::TEXT,
+    )
+    .expect("kv preparation");
+    batch.commit_and_wait().expect("preparation completion");
+    // SAFETY: the batch has completed and nothing else touches the buffer.
+    let row = unsafe { v_cache.as_slice::<u8>() };
+    let scales = (0..32)
+        .map(|block| half::f16::from_le_bytes([row[1024 + block * 2], row[1025 + block * 2]]))
+        .collect::<Vec<_>>();
+    assert!(
+        scales.iter().all(|scale| scale.is_finite()),
+        "Q8 scales overflowed: {scales:?}"
+    );
+    assert!(scales.contains(&half::f16::MAX), "no block saturated");
+    assert!(
+        dequantize_row(KvFormat::Q8, row)
+            .iter()
+            .all(|value| value.is_finite())
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() {
