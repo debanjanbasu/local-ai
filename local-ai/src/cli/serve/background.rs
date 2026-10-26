@@ -64,12 +64,12 @@ use tokio::sync::watch;
 
 use local_engine::{ChatRequest, Event, EventStream, Signal};
 
-use super::Admitted;
 use super::journal::{JournalWriter, terminal_events};
 use super::reasoning_crypto::ReasoningCipher;
 use super::response::{Protocol, Reply};
 use super::responses::{ResponsesState, Summarizer, prepare_resumed};
 use super::store::{NO_REQUEST, ResponseLease, ResponseStore};
+use super::{Admitted, store_failure};
 
 /// What a stopped server reports for a job it did not finish.
 const SHUTDOWN_MESSAGE: &str =
@@ -80,13 +80,6 @@ const STOPPED_MESSAGE: &str = "generation stopped before it produced a result";
 
 /// An HTTP status and message for a refused or failed request.
 pub(super) type Failure = (StatusCode, String);
-
-fn store_failed(error: &std::io::Error) -> Failure {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("response store failed: {error}"),
-    )
-}
 
 /// The background jobs this server is running.
 pub(super) struct Background {
@@ -434,7 +427,7 @@ impl Job {
             return Ok(false);
         }
         // Removed under the lock, so no write of this job can follow it.
-        let found = store.delete(id).map_err(|error| store_failed(&error))?;
+        let found = store.delete(id).map_err(|error| store_failure(&error))?;
         let pending = inner.pending();
         inner.phase = Phase::Deleted;
         inner.journal = None;
@@ -574,7 +567,7 @@ impl Background {
             .clone();
         let lease = store
             .lease(&id)
-            .map_err(|error| store_failed(&error))?
+            .map_err(|error| store_failure(&error))?
             .ok_or_else(|| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -698,12 +691,12 @@ impl Background {
         if self.job(id).is_some() {
             return Ok(Resumed::Settled);
         }
-        let Some(lease) = store.lease(id).map_err(|error| store_failed(&error))? else {
+        let Some(lease) = store.lease(id).map_err(|error| store_failure(&error))? else {
             return Ok(Resumed::Owned);
         };
         // Read under the lease: a writer may have finished or the response
         // been cancelled or deleted since the caller looked.
-        let Some(stored) = store.load(id).map_err(|error| store_failed(&error))? else {
+        let Some(stored) = store.load(id).map_err(|error| store_failure(&error))? else {
             return Ok(Resumed::Settled);
         };
         if stored.response.get("background").and_then(Value::as_bool) != Some(true)
@@ -716,7 +709,7 @@ impl Background {
             store
                 .settle_interrupted(&lease, id, reason)
                 .map(|()| Resumed::Settled)
-                .map_err(|error| store_failed(&error))
+                .map_err(|error| store_failure(&error))
         };
         let Some(request) = stored.request.as_ref() else {
             return settle(NO_REQUEST);
@@ -799,7 +792,7 @@ impl Background {
         if let Some(job) = self.job(id) {
             return job.cancel();
         }
-        let Some(stored) = store.load(id).map_err(|error| store_failed(&error))? else {
+        let Some(stored) = store.load(id).map_err(|error| store_failure(&error))? else {
             return Ok(None);
         };
         if stored.response.get("background").and_then(Value::as_bool) != Some(true) {
@@ -815,7 +808,7 @@ impl Background {
         }
         let _lease = lease_or_conflict(store, id)?;
         // Re-read under the lease: its writer may have finished meanwhile.
-        let Some(mut stored) = store.load(id).map_err(|error| store_failed(&error))? else {
+        let Some(mut stored) = store.load(id).map_err(|error| store_failure(&error))? else {
             return Ok(None);
         };
         if pending(&stored.response) {
@@ -824,7 +817,7 @@ impl Background {
             stored.response["status"] = json!("cancelled");
             store
                 .save(&stored.response, &stored.input_items)
-                .map_err(|error| store_failed(&error))?;
+                .map_err(|error| store_failure(&error))?;
             if let Err(error) = store.seal_journal(id, &stored.response) {
                 // Readers derive the same end from the record.
                 eprintln!("response {id}: event journal not sealed: {error}");
@@ -870,7 +863,7 @@ pub(super) fn delete_unowned(store: &ResponseStore, id: &str) -> Result<bool, Fa
         Ok(Some(stored)) if pending(&stored.response) => Some(lease_or_conflict(store, id)?),
         _ => None,
     };
-    store.delete(id).map_err(|error| store_failed(&error))
+    store.delete(id).map_err(|error| store_failure(&error))
 }
 
 pub(super) fn pending(response: &Value) -> bool {
@@ -883,7 +876,7 @@ pub(super) fn pending(response: &Value) -> bool {
 fn lease_or_conflict(store: &ResponseStore, id: &str) -> Result<ResponseLease, Failure> {
     store
         .lease(id)
-        .map_err(|error| store_failed(&error))?
+        .map_err(|error| store_failure(&error))?
         .ok_or_else(|| {
             (
                 StatusCode::CONFLICT,
