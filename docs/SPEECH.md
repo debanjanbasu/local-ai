@@ -99,9 +99,13 @@ Bonsai GGUF and verifies the payload SHA-256 on every load.
   subtoken merging of hyphenated and compound words. spaCy's tagger is
   replaced by a rule tokenizer and context rules for the tags the lexicon
   needs (determiner *a*, demonstrative *that*, heteronyms after modals,
-  determiners, pronouns and auxiliaries, proper nouns, *used to*). Words in
-  neither lexicon are segmented into known words of three or more letters and
-  letter sounds instead of being sent to espeak-ng.
+  determiners, pronouns and auxiliaries, proper nouns, *used to*). Merged
+  subtoken spans are looked up up to 32 subtokens long (the longest
+  multi-part lexicon key, *what-you-see-is-what-you-get*, has 13), so a long
+  hyphenated token costs linear time. Words in neither lexicon are segmented
+  into known words of three or more letters and letter sounds instead of
+  being sent to espeak-ng; segments are tried up to the longest lexicon key,
+  and a word of more than 100 letters is left unpronounced.
 - **Chunking**: like Kokoro's pipeline: newlines split the text, then chunks
   of at most 510 phonemes are cut at the last sentence end, clause or comma
   that fits. Each chunk is synthesized separately and streamed as soon as it
@@ -159,7 +163,8 @@ split by output columns to stay under it; about 3 ms of GPU time), and while
 Bonsai generations run, the synthesizer waits between submissions until the
 engine worker finishes a decode step (`EngineActivity::yield_to_decode`,
 500 ms limit), as embeddings do. At most 4 speech requests are admitted (one
-running); more get `503` with `Retry-After`. A client that disconnects
+running); more get `503` with `Retry-After`, before their input is
+phonemized for validation. A client that disconnects
 cancels its request at the next submission boundary.
 
 ## Verification

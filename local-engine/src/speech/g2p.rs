@@ -205,7 +205,18 @@ pub struct Lexicon {
     silvers: HashMap<String, Entry>,
     /// Lowercase alphabetic lexicon keys of 3+ letters (fallback segmentation).
     pieces: HashMap<String, String>,
+    /// Letters of the longest of `pieces`: no longer segment can match.
+    longest_piece: usize,
 }
+
+/// Most subtokens of a merged span looked up as one word: the lexicons'
+/// longest multi-part key, `what-you-see-is-what-you-get`, has 13.
+const MAX_MERGED_SUBTOKENS: usize = 32;
+/// Longest letter sound the fallback segments with ([`letter_sound`]).
+const LONGEST_LETTER_SOUND: usize = 2;
+/// Most letters of a word the fallback pronounces; a longer word no lexicon
+/// knows is not English and is left unpronounced.
+pub const MAX_FALLBACK_LETTERS: usize = 100;
 
 fn grow(raw: HashMap<String, Entry>) -> HashMap<String, Entry> {
     let mut grown = HashMap::with_capacity(raw.len() * 2);
@@ -268,11 +279,13 @@ impl Lexicon {
                 }
             }
         }
+        let longest_piece = pieces.keys().map(String::len).max().unwrap_or(0);
         Ok(Self {
             british,
             golds,
             silvers,
             pieces,
+            longest_piece,
         })
     }
 
@@ -896,17 +909,20 @@ impl Lexicon {
     /// Pronunciation of a word no lexicon knows: the cheapest segmentation
     /// into known words of 3+ letters and spelled letter sounds, first
     /// primary stress kept and later ones made secondary. A heuristic
-    /// stand-in for `misaki`'s espeak-ng fallback.
+    /// stand-in for `misaki`'s espeak-ng fallback. `None` for a word of
+    /// more than [`MAX_FALLBACK_LETTERS`] letters.
     #[must_use]
     pub fn fallback(&self, word: &str) -> Option<String> {
         let w: Vec<char> = lower(word)
             .chars()
             .filter(char::is_ascii_alphabetic)
             .collect();
-        if w.is_empty() {
+        if w.is_empty() || w.len() > MAX_FALLBACK_LETTERS {
             return None;
         }
         let n = w.len();
+        // Segments longer than every piece and letter sound match nothing.
+        let reach = self.longest_piece.max(LONGEST_LETTER_SOUND);
         // Short all-caps words are initialisms: spell the letter names.
         if word.chars().count() <= 4 && word == upper(word) && is_alpha(word) {
             return self.get_nnp(word).0;
@@ -917,7 +933,7 @@ impl Lexicon {
             let Some((cost, _, _)) = best[start].clone() else {
                 continue;
             };
-            for end in (start + 1)..=n {
+            for end in (start + 1)..=n.min(start + reach) {
                 let piece: String = w[start..end].iter().collect();
                 let option = if end - start >= 3 {
                     self.pieces.get(&piece).map(|ps| (3, ps.clone()))
@@ -1721,7 +1737,12 @@ impl G2p {
                     ctx = token_context(ctx, tk.phonemes.as_deref(), tk);
                 }
                 Word::Group(group) => {
-                    let (mut left, mut right) = (0, group.len());
+                    // Spans are tried longest first, but only up to
+                    // MAX_MERGED_SUBTOKENS: no longer one is a lexicon
+                    // key, and trying every span made a long hyphenated
+                    // token cubic (2,000 subtokens took 100 s).
+                    let first = |right: usize| right.saturating_sub(MAX_MERGED_SUBTOKENS);
+                    let (mut left, mut right) = (first(group.len()), group.len());
                     let mut should_fallback = false;
                     while left < right {
                         let merged = if group[left..right]
@@ -1746,7 +1767,7 @@ impl G2p {
                                 ctx = token_context(ctx, Some(&ps), m);
                             }
                             right = left;
-                            left = 0;
+                            left = first(right);
                         } else if left + 1 < right {
                             left += 1;
                         } else {
@@ -1761,7 +1782,7 @@ impl G2p {
                                     break;
                                 }
                             }
-                            left = 0;
+                            left = first(right);
                         }
                     }
                     if should_fallback {
