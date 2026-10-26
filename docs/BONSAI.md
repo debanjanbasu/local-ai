@@ -1754,7 +1754,10 @@ snapshot the first wrote at the end of that prefix instead of prefilling it
 again. While that write is still in flight the later one skips its prefill
 each step another request decodes, so their tokens keep coming, and waits for
 the write only when none does; admission never waits for it (see
-[Concurrency measurements](#concurrency-measurements)). A prompt of at most 128 tokens to prefill (a typical
+[Concurrency measurements](#concurrency-measurements)). A prompt whose disk
+snapshot is still being read back (see [Prompt cache](#prompt-cache)) is
+held out the same way: the step's prefill goes to another prompt, or is sat
+out while others decode. A prompt of at most 128 tokens to prefill (a typical
 chat turn) goes whole, in a pass of its own after the step's decode round. A
 longer one, beside two or more decoding requests, prefills inside their
 batched pass: its chunk's rows are stacked after theirs, run every layer with
@@ -2428,6 +2431,17 @@ request whose best disk match is still in flight is not held up at
 admission; its first prefill step asks again and skips steps while other
 requests decode, or waits for that one write when none does (see
 [Prompts prefill inside the decode steps](#prompts-prefill-inside-the-decode-steps)).
+Reading a snapshot back is off the engine thread too. A request whose
+longest match is a disk snapshot starts a load, which reads the file and
+checks its SHA-256 on a thread of its own, and restores at most a GPU
+checkpoint meanwhile, as a stand-in it does not prefill from. It stays out of
+prefill until the load ends: the step's prefill goes to another prompt, or is
+sat out while others decode, and the engine waits for the load only when
+nothing else can run. Its first prefill step then copies the snapshot into
+its buffers, the one part left on the engine thread; a load that failed is a
+failed restore like any other, so its entry leaves the index and the tiers
+are asked again. A load dropped unfinished (its request cancelled) stops
+within a megabyte of reading.
 At most one job is in flight and one queued: a newer job replaces the queued
 one, except that a request tail never displaces a shared boundary. Dropping
 the engine finishes pending writes; the server, whose engine is never
@@ -2449,6 +2463,26 @@ of them together (131K tokens prefill in about half an hour), and the
 staged long-context runs rely on it (see Verification). A failed write is a cache miss reported
 on stderr, not a request error. Trim keeps an in-memory index of the
 directory instead of re-reading every snapshot header after each store.
+
+Reading and checking a snapshot used to run inside the restoring request's
+admission, where every decoding stream waited for it. Synthetic snapshots
+without the head (34 KiB a token), file in the page cache, M4 Pro, best of
+two:
+
+| Tokens | Snapshot | Read and SHA-256 (now off the engine thread) | Copy into the model's buffers |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 366 MB | 211 ms | 34 ms |
+| 32,768 | 1,222 MB | 656 ms | 58 ms |
+| 102,400 | 3,646 MB | 1,924 ms | 336 ms (623 ms growing the caches) |
+
+With a plain greedy stream decoding beside it, a request restoring a
+6,978-token, 324 MB disk snapshot (read and checked in 258–275 ms;
+`a_stream_keeps_decoding_while_another_request_loads_a_disk_snapshot`, one
+run per build, other builds loading the CPU) was admitted in 301 ms before
+and 8.7 ms after. The stream's longest gap until that request's first token
+fell from 419 ms (one token in that window) to 167 ms (six tokens emitted
+while the snapshot loaded, the longest gap being the copy and the request's
+own last-token prefill).
 
 Measured on an M4 Pro (1.7 GB/s write probe, host tier off), six interleaved
 cold runs per arm of `local-ai bonsai --raw --json --greedy --max-tokens 16`,
