@@ -14,7 +14,11 @@ use local_services::Store;
 use local_services::admin::usage::{UsageKind, UsageRecord};
 use local_services::admin::{Actor, Admin};
 
-use super::{Caller, Gate, dispatch, metered};
+use super::super::chunked::start_chunked;
+use super::super::response::{Protocol, Reply};
+use super::super::responses::prepare_responses_with;
+use super::super::sse::start_stream;
+use super::{Caller, Gate, Meter, dispatch};
 
 const SCHEMAS: &str = include_str!("fixtures/admin_schemas.json");
 
@@ -799,26 +803,64 @@ fn finished(prompt: usize, reused: usize, generated: usize) -> Event {
     }))
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn metering_forwards_every_event_and_records_the_finished_usage() {
-    let (_dir, admin) = open();
-    let (source, events) = EventStream::relay();
-    let caller = Caller::Project {
+fn project() -> Caller {
+    Caller::Project {
         key_id: "key_p".into(),
         project_id: "proj_p".into(),
-    };
-    let mut stream = metered(
-        Arc::clone(&admin),
-        caller.usage(UsageKind::Completions, "bonsai"),
-        events,
-    );
+    }
+}
+
+/// A `completions` meter of the test project's into `admin`.
+fn project_meter(admin: &Arc<Admin>) -> Meter {
+    Meter::into_store(
+        Some(admin),
+        project().usage(UsageKind::Completions, "bonsai"),
+    )
+}
+
+/// How many `completions` requests `admin` recorded in the last minute.
+fn completions(admin: &Admin) -> u64 {
+    recent(admin, "completions")
+        .iter()
+        .map(|result| result["num_model_requests"].as_u64().unwrap())
+        .sum()
+}
+
+/// Wait until `admin` holds `requests` `completions` requests. A dropped
+/// stream records from a task of its own that tells no one, so this polls,
+/// briefly and within a deadline.
+async fn recorded(admin: &Admin, requests: u64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while completions(admin) < requests {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} of {requests} requests recorded",
+            completions(admin)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Nothing more arrives late.
+    tokio::task::yield_now().await;
+    tokio::task::spawn_blocking(|| ()).await.unwrap();
+    assert_eq!(completions(admin), requests);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_generation_is_recorded_once_by_the_read_that_returns_its_end() {
+    let (_dir, admin) = open();
+    let (source, events) = EventStream::relay();
+    let mut stream = project_meter(&admin).stream(events);
     let producer = tokio::task::spawn_blocking(move || {
         assert!(source.blocking_send(Signal::Event(Event::Content("hi".into()))));
         assert!(source.blocking_send(Signal::Event(finished(11, 4, 2))));
     });
+    let reader = Arc::clone(&admin);
     let received = tokio::task::spawn_blocking(move || {
         let mut seen = Vec::new();
         while let Ok(Some(signal)) = stream.next_signal(None) {
+            // Committed before the consumer holds `Finished`, never after.
+            let finished = matches!(signal, Signal::Event(Event::Finished(_)));
+            assert_eq!(completions(&reader), u64::from(finished));
             seen.push(signal);
         }
         seen
@@ -829,7 +871,7 @@ async fn metering_forwards_every_event_and_records_the_finished_usage() {
     assert_eq!(received.len(), 2);
     assert!(matches!(&received[0], Signal::Event(Event::Content(text)) if text == "hi"));
     assert!(matches!(&received[1], Signal::Event(Event::Finished(_))));
-    // The record is committed before the stream ends.
+    recorded(&admin, 1).await;
     let now = super::super::response::unix_now();
     let page = expect(
         &admin,
@@ -854,6 +896,208 @@ async fn metering_forwards_every_event_and_records_the_finished_usage() {
     assert_eq!(results[0]["input_cached_tokens"], 4);
     assert_eq!(results[0]["output_tokens"], 2);
     assert_eq!(results[0]["num_model_requests"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_generation_is_cancelled_and_still_recorded_once() {
+    let (_dir, admin) = open();
+    let (source, events) = EventStream::relay();
+    let mut stream = project_meter(&admin).stream(events);
+    assert!(source.send(Signal::Event(Event::Content("h".into()))).await);
+    // The client reads one token and goes away.
+    let stream = tokio::task::spawn_blocking(move || {
+        assert!(matches!(
+            stream.next_signal(None),
+            Ok(Some(Signal::Event(Event::Content(_))))
+        ));
+        stream
+    })
+    .await
+    .unwrap();
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(5), source.cancelled())
+        .await
+        .expect("the generation is cancelled");
+    assert_eq!(completions(&admin), 0);
+    // The engine reports what the cancelled generation produced.
+    let Event::Finished(mut stats) = finished(9, 0, 3) else {
+        unreachable!()
+    };
+    stats.stop_reason = StopReason::Cancelled;
+    assert!(source.send(Signal::Event(Event::Content("i".into()))).await);
+    assert!(source.send(Signal::Event(Event::Finished(stats))).await);
+    drop(source);
+    recorded(&admin, 1).await;
+    assert_eq!(recent(&admin, "completions")[0]["output_tokens"], 3);
+}
+
+#[test]
+fn metered_generations_hold_no_blocking_thread_until_they_end() {
+    const GENERATIONS: usize = 8;
+    let (_dir, admin) = open();
+    // One blocking thread, as if every other were taken: a queued
+    // generation, read or abandoned, must not need it.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut sources = Vec::new();
+        let mut held = Vec::new();
+        for index in 0..GENERATIONS {
+            let (source, events) = EventStream::relay();
+            let stream = project_meter(&admin).stream(events);
+            // Half are abandoned while queued, half wait for their reader.
+            if index % 2 == 0 {
+                drop(stream);
+            } else {
+                held.push(stream);
+            }
+            sources.push((index % 2 == 0, source));
+        }
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(|| 7),
+        )
+        .await;
+        assert_eq!(answered.expect("the blocking pool is free").unwrap(), 7);
+        for (abandoned, source) in sources {
+            if abandoned {
+                tokio::time::timeout(std::time::Duration::from_secs(5), source.cancelled())
+                    .await
+                    .expect("an abandoned generation is cancelled");
+            }
+            assert!(source.send(Signal::Event(finished(5, 0, 1))).await);
+        }
+        tokio::task::spawn_blocking(move || {
+            for mut stream in held {
+                while let Ok(Some(_)) = stream.next_signal(None) {}
+            }
+        })
+        .await
+        .unwrap();
+        recorded(&admin, GENERATIONS as u64).await;
+    });
+}
+
+fn chat_reply(include_usage: bool) -> Reply {
+    Reply {
+        protocol: Protocol::Chat {
+            include_usage,
+            logprobs: false,
+        },
+        id: "chatcmpl-1".into(),
+        created: 5,
+        model: "m".into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_is_recorded_before_the_response_can_end() {
+    const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+    for chunked in [false, true] {
+        let (_dir, admin) = open();
+        let (source, events) = EventStream::relay();
+        let events = project_meter(&admin).stream(events);
+        assert!(
+            source
+                .send(Signal::Event(Event::Content("hi".into())))
+                .await
+        );
+        let foreground = Arc::new(super::super::Foreground::default());
+        let admitted = super::super::QueueDepth::default().admit();
+        let mut frames = if chunked {
+            let reply = chat_reply(false);
+            let started = start_chunked(events, reply, admitted, &foreground, STALL, false);
+            started.await.unwrap().0
+        } else {
+            // Usage adds a frame after the finish chunk, so the pump is still
+            // running when the finish chunk is read: a record made when it
+            // returns cannot be there yet.
+            let reply = chat_reply(true);
+            start_stream(events, reply, admitted, &foreground, STALL)
+                .await
+                .unwrap()
+        };
+        assert!(source.send(Signal::Event(finished(11, 4, 2))).await);
+        // The source stays open, so the chunked pump is still waiting for
+        // the end of the stream when its last byte arrives.
+        let mut body = String::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames.recv())
+                .await
+                .expect("a frame in time")
+                .expect("a frame")
+                .unwrap();
+            body.push_str(std::str::from_utf8(&frame).unwrap());
+            let seen = completions(&admin);
+            let ended = if chunked {
+                serde_json::from_str::<Value>(&body).is_ok()
+            } else {
+                body.contains("\"finish_reason\":\"stop\"")
+            };
+            if ended {
+                assert_eq!(seen, 1, "chunked={chunked}: recorded before the end");
+                break;
+            }
+        }
+        drop(source);
+        while let Some(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), frames.recv())
+                .await
+                .expect("the end in time")
+        {
+            body.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+        assert!(chunked || body.ends_with("data: [DONE]\n\n"), "{body}");
+        recorded(&admin, 1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_job_is_recorded_once_before_it_settles() {
+    use super::super::background::{self, Background};
+    use super::super::background_tests::{Scratch, status};
+    let (_dir, admin) = open();
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let background = Arc::new(Background::default());
+    let body = json!({"input":"hi","background":true}).to_string();
+    let prepared = prepare_responses_with(body.as_bytes(), true, Some(&store), None, "m").unwrap();
+    let reply = Reply::new(Protocol::Responses(Arc::new(prepared.echo)), "m".into());
+    let (source, events) = EventStream::relay();
+    let queued = background::start(
+        Arc::clone(&background),
+        project_meter(&admin).stream(events),
+        reply,
+        super::super::QueueDepth::default().admit(),
+        false,
+    )
+    .await
+    .unwrap();
+    let id = queued["id"].as_str().unwrap().to_owned();
+    let mut published = background.watch(&id).expect("running here");
+    assert!(
+        source
+            .send(Signal::Event(Event::Content("hi".into())))
+            .await
+    );
+    assert!(source.send(Signal::Event(finished(11, 4, 2))).await);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        published.wait_for(|published| published.settled),
+    )
+    .await
+    .expect("settled in time")
+    .unwrap();
+    // The terminal state is observable, and the pump still waits for the end
+    // of the stream: the usage is already there.
+    assert_eq!(completions(&admin), 1);
+    assert_eq!(status(&store, &id), "completed");
+    drop(source);
+    background.drained().await;
+    recorded(&admin, 1).await;
 }
 
 /// Every result of `family` recorded in the last minute, one bucket.

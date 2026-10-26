@@ -4,8 +4,9 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use local_engine::{Event, EventStream, Signal};
+use local_engine::{Event, Signal};
 
+use super::admin::Metered;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     Protocol, Reply, arguments_text, chat_finish_reason, chat_tool_call, checked, logprob_json,
@@ -28,7 +29,7 @@ pub(super) const KEEP_ALIVE: &str = ": keep-alive\n\n";
 /// pre-generation validation error becomes a real HTTP status code instead of
 /// a 200 whose first frame is an error.
 pub(super) async fn start_stream(
-    mut events: EventStream,
+    mut events: Metered,
     reply: Reply,
     admitted: Admitted,
     foreground: &std::sync::Arc<Foreground>,
@@ -104,7 +105,7 @@ pub(super) async fn start_stream(
 #[allow(clippy::needless_pass_by_value)]
 fn pump(
     first: Signal,
-    mut events: EventStream,
+    mut events: Metered,
     mut frames: Frames,
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
     _guards: (Admitted, Generation),

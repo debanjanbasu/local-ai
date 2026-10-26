@@ -35,6 +35,8 @@
 //! tool permissions, external storage, and key scopes.
 
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::request::Parts;
@@ -44,8 +46,9 @@ use http_body_util::{BodyExt as _, Limited};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio_stream::StreamExt;
 
-use local_engine::{Event, EventStream, Signal, Stats};
+use local_engine::{CancelHandle, Event, EventStream, Signal, Stats};
 use local_services::Error;
 use local_services::admin::usage::{
     DAY, UsageKind, UsageQuery, UsageRecord, bucket_spans, parse_width,
@@ -1018,10 +1021,10 @@ pub(super) fn record(state: &AppState, record: UsageRecord) {
     }
 }
 
-/// Where a generation that runs outside the request's own event stream
-/// (batch lines, compaction and reasoning summaries) records its
-/// usage: the usage store and a record template, or nowhere while there is
-/// no store.
+/// Where a generation records its usage (a request's own, through
+/// [`Metered`]; batch lines, compaction and reasoning summaries
+/// directly): the usage store and a record template, or nowhere while
+/// there is no store.
 #[derive(Clone, Default)]
 pub(super) struct Meter(Option<(Arc<Admin>, UsageRecord)>);
 
@@ -1093,67 +1096,112 @@ impl Meter {
             tokio::task::spawn_blocking(move || meter.generation(&stats));
         }
     }
-}
 
-/// `events` with its usage recorded, once it finishes, as a `completions`
-/// record of `caller`'s.
-///
-/// The events are forwarded unchanged (prefill progress included) through a
-/// relay on the blocking pool; the consumer's cancellation reaches the
-/// generation. A consumer that goes away still has the tokens it caused
-/// recorded: the generation is cancelled and drained to its final
-/// measurements. The record is written after the final event is forwarded
-/// and before the stream ends.
-pub(super) fn meter(state: &AppState, caller: &Caller, events: EventStream) -> EventStream {
-    match state.auth.admin() {
-        Some(admin) => metered(
-            Arc::clone(admin),
-            caller.usage(UsageKind::Completions, &state.model),
-            events,
-        ),
-        None => events,
+    /// `events`, whose consumer records its generation here (see
+    /// [`Metered`]).
+    pub(super) fn stream(self, events: EventStream) -> Metered {
+        Metered {
+            cancel: events.cancel_handle(),
+            events: Some(events),
+            meter: self,
+            ended: false,
+        }
     }
 }
 
-/// [`meter`] into `admin`, completing `record` from the final measurements.
-fn metered(admin: Arc<Admin>, record: UsageRecord, events: EventStream) -> EventStream {
-    let (relay, stream) = EventStream::relay();
-    let relay = Arc::new(relay);
-    let cancel = events.cancel_handle();
-    let canceller = {
-        let relay = Arc::clone(&relay);
-        tokio::spawn(async move {
-            relay.cancelled().await;
-            cancel.cancel();
-        })
-    };
-    tokio::task::spawn_blocking(move || {
-        let mut events = events;
-        let mut record = record;
-        let mut finished = false;
-        let mut forwarding = true;
-        while let Ok(Some(signal)) = events.next_signal(None) {
-            if let Signal::Event(Event::Finished(stats)) = &signal {
-                let generation = &stats.generation;
-                record.input_tokens += count(generation.prompt_tokens);
-                record.input_cached_tokens += count(generation.reused_prompt_tokens);
-                record.output_tokens += count(generation.generated_tokens);
-                finished = true;
+/// `events` with its usage recorded, once it finishes, as a `completions`
+/// record of `caller`'s (see [`Metered`]).
+pub(super) fn meter(state: &AppState, caller: &Caller, events: EventStream) -> Metered {
+    Meter::completions(state, caller).stream(events)
+}
+
+/// One generation's events with its usage recorded exactly once, from its
+/// `Finished` event, by whoever reads that event.
+///
+/// The consumer reads the generation itself; nothing runs beside it and no
+/// event is copied. The read that takes `Finished` writes the record before
+/// returning the event, on the consumer's own thread (every consumer reads
+/// with [`Self::next_signal`], which parks, so that is a blocking-pool
+/// thread, never a runtime worker or the engine's): the record is committed
+/// before the consumer can turn `Finished` into the end of its response.
+///
+/// A consumer that drops the stream before its end (the client went away, a
+/// stall) still has the tokens it caused recorded: the generation is
+/// cancelled and an async task, holding no thread while it waits, reads it to
+/// its final measurements and records them on the blocking pool.
+pub(super) struct Metered {
+    /// `None` only once dropped.
+    events: Option<EventStream>,
+    cancel: CancelHandle,
+    meter: Meter,
+    /// `Finished`, an error or the end has been read: nothing is left to
+    /// record.
+    ended: bool,
+}
+
+impl Metered {
+    /// [`EventStream::next_signal`], recording the usage when it returns
+    /// `Finished`. Blocks on the store then: call it from a blocking context.
+    pub(super) fn next_signal(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<Signal>, RecvTimeoutError> {
+        let Some(events) = self.events.as_mut() else {
+            return Ok(None);
+        };
+        let signal = events.next_signal(timeout)?;
+        match &signal {
+            Some(Signal::Event(Event::Finished(stats))) => {
+                self.ended = true;
+                self.meter.generation(stats);
             }
-            if forwarding && !relay.blocking_send(signal) {
-                forwarding = false;
-                events.cancel_handle().cancel();
+            Some(Signal::Event(Event::Error(_))) | None => self.ended = true,
+            Some(Signal::Event(_) | Signal::Progress(_)) => {}
+        }
+        Ok(signal)
+    }
+
+    /// [`EventStream::cancel_handle`].
+    pub(super) fn cancel_handle(&self) -> CancelHandle {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for Metered {
+    fn drop(&mut self) {
+        let Some(events) = self.events.take() else {
+            return;
+        };
+        if self.ended || self.meter.0.is_none() {
+            // Dropping the stream cancels whatever is left of it.
+            return;
+        }
+        self.cancel.cancel();
+        let meter = std::mem::take(&mut self.meter);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn(drain(events, meter))),
+            // Outside any runtime (no server runs there), on this thread.
+            Err(_) => {
+                for event in events {
+                    if let Event::Finished(stats) = event {
+                        meter.generation(&stats);
+                    }
+                }
             }
         }
-        // Recorded before the stream ends, so a client that has read the
-        // whole response finds its usage.
-        if finished && let Err(error) = admin.record_usage(&record) {
-            eprintln!("warning: usage not recorded: {error}");
+    }
+}
+
+/// Read abandoned, cancelled `events` to their final measurements and record
+/// them. Waits on the channel as a task, not a thread; the store write alone
+/// goes to the blocking pool, once.
+async fn drain(mut events: EventStream, meter: Meter) {
+    while let Some(event) = StreamExt::next(&mut events).await {
+        if let Event::Finished(stats) = event {
+            let _ = tokio::task::spawn_blocking(move || meter.generation(&stats)).await;
+            return;
         }
-        drop(relay);
-        canceller.abort();
-    });
-    stream
+    }
 }
 
 /// The usage of one request of a family measured in input tokens

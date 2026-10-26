@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use zstd::stream::write::Encoder;
 
-use local_engine::{Event, EventStream, Signal, Stats, ToolCall};
+use local_engine::{Event, Signal, Stats, ToolCall};
 
+use super::admin::Metered;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     EventWait, Protocol, Reply, ZSTD_LEVEL, chat_finish_reason, chat_tool_call, checked,
@@ -569,7 +570,7 @@ fn json_interior(value: &str) -> Vec<u8> {
 /// quantum instead of the whole prefill — which is what lets the body reach the
 /// wire while the prompt is still being consumed.
 pub(super) async fn start_chunked(
-    mut events: EventStream,
+    mut events: Metered,
     reply: Reply,
     admitted: Admitted,
     foreground: &std::sync::Arc<Foreground>,
@@ -628,7 +629,7 @@ pub(super) async fn start_chunked(
 #[allow(clippy::needless_pass_by_value)]
 fn pump(
     first: Signal,
-    mut events: EventStream,
+    mut events: Metered,
     mut body: Body,
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
     _guards: (Admitted, Generation),
@@ -690,7 +691,7 @@ fn deliver(
 ///
 /// `None` ends the pump, for end of stream or for a stall whose message is
 /// already logged and whose cancellation has already been asked for.
-fn await_signal(events: &mut EventStream, first_seen: bool, stall: Duration) -> Option<Signal> {
+fn await_signal(events: &mut Metered, first_seen: bool, stall: Duration) -> Option<Signal> {
     let wait = event_wait(first_seen, stall);
     let outcome = match wait {
         EventWait::Unbounded => events.next_signal(None),
