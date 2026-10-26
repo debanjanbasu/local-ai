@@ -152,7 +152,6 @@ impl BonsaiEngine {
         if self.active.len() >= MAX_BATCH_SEQUENCES {
             return Err(crate::Error::QueueFull);
         }
-        self.model.settle_decode()?;
         self.next_generation += 1;
         let id = self.next_generation;
         self.make_room_for(id)?;
@@ -203,19 +202,11 @@ impl BonsaiEngine {
         // rounds in turn measured 32.7 tok/s aggregate against 36.8 batched
         // on the M4 Pro, so batching starts at two.
         let mut failed = Vec::new();
-        // Only a lone decoding generation's next round continues a pass its
-        // last round left in flight; everything else waits for it.
-        let lone = self.active.len() == 1 && running == 1;
-        let settled = if lone {
-            Ok(())
-        } else {
-            self.model.settle_decode()
-        };
-        let outcome = settled.and_then(|()| match running {
+        let outcome = match running {
             0 => Ok(false),
             1 => self.step_alone(&mut failed).map(|()| false),
             _ => self.step_batched(progress, &mut failed),
-        });
+        };
         for (id, error) in failed {
             // Only these sequences' state is in doubt.
             if let Some(index) = self
@@ -966,10 +957,6 @@ impl BonsaiEngine {
 
     /// Finish a generation: make it resident and run its tail.
     fn close(&mut self, generation: ActiveGeneration) -> crate::Result<BonsaiGeneration> {
-        if let Err(error) = self.model.settle_decode() {
-            self.discard(generation);
-            return Err(error);
-        }
         let id = generation.id;
         self.active.push(generation);
         let index = self.active.len() - 1;
@@ -986,8 +973,6 @@ impl BonsaiEngine {
 
     /// Drop a generation that failed, releasing its buffers.
     fn discard(&mut self, generation: ActiveGeneration) {
-        // Its state is in doubt either way; only the wait matters.
-        let _ = self.model.settle_decode();
         if self.resident == Some(generation.id) {
             self.resident = None;
             self.clear_gpu_cache();

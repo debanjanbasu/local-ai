@@ -315,14 +315,6 @@ impl GreedyRows {
         self.max_rows
     }
 
-    /// The device buffer [`Self::encode`] writes: a [`GreedyRowResult`] per
-    /// row, so row `r`'s token id is `u32` index `4 * r`, which a chained
-    /// step can read on the GPU (see [`DraftKernels::embed_inverse`]).
-    #[must_use]
-    pub const fn results_buffer(&self) -> &MetalBuffer {
-        &self.results
-    }
-
     #[must_use]
     pub fn allocated_bytes(&self) -> usize {
         self.partials.length() + self.flags.length() + self.results.length()

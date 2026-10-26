@@ -111,11 +111,6 @@ impl Sampler {
         self.logprobs.as_mut()?.records.pop_front()
     }
 
-    /// Whether a grammar constrains this sampler's selections.
-    pub(crate) const fn is_constrained(&self) -> bool {
-        self.grammar.is_some()
-    }
-
     /// Constrain every later selection to `grammar` (see [`crate::structured`]).
     pub(crate) fn constrain(&mut self, grammar: Grammar) {
         self.grammar = Some(Box::new(grammar));

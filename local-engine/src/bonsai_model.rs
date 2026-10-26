@@ -198,10 +198,6 @@ pub struct BonsaiEngine {
     /// tests exercise a failure that belongs to one sequence.
     #[cfg(test)]
     fail_reservation: Option<u64>,
-    /// Decode without leaving the next pass in flight, so tests compare the
-    /// two.
-    #[cfg(test)]
-    unpipelined_decode: bool,
 }
 
 impl BonsaiEngine {

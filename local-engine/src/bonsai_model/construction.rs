@@ -122,8 +122,6 @@ impl BonsaiEngine {
             force_batched_drafts: false,
             #[cfg(test)]
             fail_reservation: None,
-            #[cfg(test)]
-            unpipelined_decode: false,
         })
     }
 }
