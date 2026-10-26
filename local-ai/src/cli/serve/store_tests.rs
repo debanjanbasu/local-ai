@@ -979,7 +979,14 @@ fn leases_refuse_bad_ids_and_symlinks_and_keep_their_sidecar() {
         let target = scratch.0.with_extension("lock-target");
         std::fs::write(&target, b"").expect("target");
         std::os::unix::fs::symlink(&target, scratch.0.join(".resp_link.lock")).expect("link");
-        assert!(store.lease("resp_link").is_err(), "symlink not followed");
+        let refused = store.lease("resp_link").expect_err("symlink not followed");
+        // The error can reach a client in a 500, so it names the file only.
+        let message = refused.to_string();
+        assert!(message.contains(".resp_link.lock"), "{message}");
+        assert!(
+            !message.contains(scratch.0.to_str().expect("utf-8")),
+            "{message}"
+        );
         let _ = std::fs::remove_file(target);
     }
     assert!(sidecar.exists());

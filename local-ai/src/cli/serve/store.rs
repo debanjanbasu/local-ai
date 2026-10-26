@@ -663,6 +663,10 @@ pub(super) enum Access {
 /// Unix a symlink as the final component is refused rather than followed, a
 /// FIFO cannot block the open, and the result must be an owner-only regular
 /// file belonging to this user.
+///
+/// An error names the file but not the directory it is in, since it may
+/// reach a client; the full path is logged instead (except for a file that
+/// does not exist, which callers expect).
 #[cfg(unix)]
 pub(super) fn open_private(path: &Path, access: Access) -> std::io::Result<fs::File> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -678,18 +682,23 @@ pub(super) fn open_private(path: &Path, access: Access) -> std::io::Result<fs::F
             Access::Append => OFlags::WRONLY | OFlags::APPEND,
             Access::Read => OFlags::RDONLY,
         };
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let fd = rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR).map_err(|errno| {
-        std::io::Error::new(
-            std::io::Error::from(errno).kind(),
-            format!("cannot open response file {}: {errno}", path.display()),
-        )
+        let kind = std::io::Error::from(errno).kind();
+        if kind != ErrorKind::NotFound {
+            eprintln!("response store: cannot open {}: {errno}", path.display());
+        }
+        std::io::Error::new(kind, format!("cannot open response file {name}: {errno}"))
     })?;
     let file = fs::File::from(fd);
     let metadata = file.metadata()?;
     let refused = |why: &str| {
+        eprintln!("response store: {} {why}", path.display());
         Err(std::io::Error::new(
             ErrorKind::PermissionDenied,
-            format!("response file {} {why}", path.display()),
+            format!("response file {name} {why}"),
         ))
     };
     if !metadata.file_type().is_file() {
