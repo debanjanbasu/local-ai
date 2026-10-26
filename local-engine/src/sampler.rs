@@ -175,12 +175,16 @@ impl Sampler {
 
     /// The target selection from the logit row at `byte_offset` of `buffer`:
     /// `argmax`, the row's argmax a block selected on the device, when the
-    /// selection is the plain argmax, else [`Self::sample_buffer`].
+    /// selection is the plain argmax, else [`Self::sample_buffer`], drawing
+    /// from `device_top`, the row's best logits a block selected on the device,
+    /// when they are the candidates it would select (see
+    /// [`Self::device_top_k`]).
     ///
     /// When the request asked for log-probabilities, also records the row's
     /// raw distribution: from `distribution` (its log-sum-exp and best logits,
     /// at least [`Self::logprobs`] of them) when the GPU computed it, else on
     /// the host. The row is read before selection overwrites it.
+    #[allow(clippy::too_many_arguments)]
     pub fn select_row(
         &mut self,
         buffer: &mut MetalBuffer,
@@ -188,10 +192,12 @@ impl Sampler {
         context: &MetalContext,
         topk: &GpuTopK,
         argmax: Option<u32>,
+        device_top: Option<&[TopKCandidate]>,
         distribution: Option<(f32, &[TopKCandidate])>,
     ) -> crate::Result<SamplingResult> {
+        let device = (argmax, device_top);
         let Some(mut logprobs) = self.logprobs.take() else {
-            return self.select_plain(buffer, byte_offset, context, topk, argmax);
+            return self.select_plain(buffer, byte_offset, context, topk, device);
         };
         let result = self.select_recorded(
             &mut logprobs,
@@ -199,7 +205,7 @@ impl Sampler {
             byte_offset,
             context,
             topk,
-            argmax,
+            device,
             distribution,
         );
         self.logprobs = Some(logprobs);
@@ -212,11 +218,11 @@ impl Sampler {
         byte_offset: usize,
         context: &MetalContext,
         topk: &GpuTopK,
-        argmax: Option<u32>,
+        (argmax, device_top): (Option<u32>, Option<&[TopKCandidate]>),
     ) -> crate::Result<SamplingResult> {
         match argmax {
             Some(token_id) if self.selects_argmax() => Ok(self.greedy_result(token_id)),
-            _ => self.sample_buffer(buffer, byte_offset, context, topk),
+            _ => self.sample_from(buffer, byte_offset, context, topk, device_top),
         }
     }
 
@@ -228,9 +234,10 @@ impl Sampler {
         byte_offset: usize,
         context: &MetalContext,
         topk: &GpuTopK,
-        argmax: Option<u32>,
+        device: (Option<u32>, Option<&[TopKCandidate]>),
         distribution: Option<(f32, &[TopKCandidate])>,
     ) -> crate::Result<SamplingResult> {
+        let argmax = device.0;
         let start = byte_offset / size_of::<f32>();
         let Some(row) = buffer
             .as_slice::<f32>()
@@ -256,7 +263,7 @@ impl Sampler {
             ),
             _ => raw_distribution(if untouched { row } else { &logprobs.raw }, logprobs.top),
         };
-        let result = self.select_plain(buffer, byte_offset, context, topk, argmax)?;
+        let result = self.select_plain(buffer, byte_offset, context, topk, device)?;
         let token = result.token_id as usize;
         let logit = if untouched {
             buffer.as_slice::<f32>()[start + token]
@@ -288,6 +295,20 @@ impl Sampler {
         context: &MetalContext,
         topk: &GpuTopK,
     ) -> crate::Result<SamplingResult> {
+        self.sample_from(buffer, byte_offset, context, topk, None)
+    }
+
+    /// [`Self::sample_buffer`], taking its candidates from `precomputed`, the
+    /// row's best logits selected on the device, when nothing (no mask, no
+    /// penalty) could change them and they hold at least `top_k`.
+    fn sample_from(
+        &mut self,
+        buffer: &mut MetalBuffer,
+        byte_offset: usize,
+        context: &MetalContext,
+        topk: &GpuTopK,
+        precomputed: Option<&[TopKCandidate]>,
+    ) -> crate::Result<SamplingResult> {
         let vocab = self.observed.len();
         let float_offset = byte_offset / size_of::<f32>();
         let Some(end) = float_offset.checked_add(vocab) else {
@@ -312,22 +333,31 @@ impl Sampler {
         } else {
             self.params.top_k.min(vocab)
         };
+        let precomputed = precomputed
+            .filter(|top| mask.is_none() && !self.applies_penalties() && top.len() >= keep);
         let token = if vocab <= topk.maximum_supported_k() || keep > topk.maximum_supported_k() {
             self.select(
                 &mut buffer.as_mut_slice::<f32>()[float_offset..end],
                 mask.as_ref(),
             )?
         } else {
-            self.apply_penalties(&mut buffer.as_mut_slice::<f32>()[float_offset..end]);
-            let mut batch = CommandBatch::new(context)?;
-            topk.encode(&mut batch, buffer, byte_offset, vocab, keep)?;
-            batch.commit_and_wait()?;
             self.candidates.clear();
-            self.candidates.extend(
-                topk.candidates(keep)
-                    .iter()
-                    .map(|item| item.token_id as usize),
-            );
+            if let Some(top) = precomputed {
+                // Exactly what the selection below would return: the same
+                // kernels, `total_cmp` order, ties to the lower id.
+                self.candidates
+                    .extend(top[..keep].iter().map(|item| item.token_id as usize));
+            } else {
+                self.apply_penalties(&mut buffer.as_mut_slice::<f32>()[float_offset..end]);
+                let mut batch = CommandBatch::new(context)?;
+                topk.encode(&mut batch, buffer, byte_offset, vocab, keep)?;
+                batch.commit_and_wait()?;
+                self.candidates.extend(
+                    topk.candidates(keep)
+                        .iter()
+                        .map(|item| item.token_id as usize),
+                );
+            }
             if let Some(mask) = &mask {
                 // Forbidden tokens sit at -inf, behind every allowed one.
                 self.candidates
@@ -426,6 +456,22 @@ impl Sampler {
         self.greedy()
             && !self.applies_penalties()
             && !self.grammar.as_deref().is_some_and(Grammar::masking)
+    }
+
+    /// The top k a block may select on the device for this sampler's next
+    /// target selection: `Some(top_k)` when it samples from the plain top k of
+    /// the logits (not greedy, no penalty, no masking grammar, a top-k the GPU
+    /// selects). A grammar can start masking mid-round, so the selection
+    /// itself asks again.
+    #[must_use]
+    pub fn device_top_k(&self) -> Option<usize> {
+        let vocab = self.observed.len();
+        (!self.greedy()
+            && !self.applies_penalties()
+            && !self.grammar.as_deref().is_some_and(Grammar::masking)
+            && vocab > local_metal::sampling::MAX_TOP_K
+            && (1..=local_metal::sampling::MAX_TOP_K).contains(&self.params.top_k))
+        .then_some(self.params.top_k)
     }
 
     /// What [`Self::sample_buffer`] returns for the argmax `token_id` selected

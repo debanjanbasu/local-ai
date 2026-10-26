@@ -357,6 +357,8 @@ impl BonsaiEngine {
         self.model.set_cancel(generation.cancel.clone());
         self.model
             .set_device_greedy(generation.sampler.selects_argmax());
+        self.model
+            .set_device_top_k(generation.sampler.device_top_k());
         self.model.set_logprobs(generation.sampler.logprobs());
         let id = generation.id;
         let chunks = &mut generation.prefill_chunks;
@@ -483,6 +485,8 @@ impl BonsaiEngine {
         self.model.set_cancel(generation.cancel.clone());
         self.model
             .set_device_greedy(generation.sampler.selects_argmax());
+        self.model
+            .set_device_top_k(generation.sampler.device_top_k());
         self.model.set_logprobs(generation.sampler.logprobs());
         let head = self.model.speculation().is_some() && generation.lag.usable();
         if head && !generation.lag.is_empty() {

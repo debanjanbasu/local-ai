@@ -84,6 +84,7 @@ impl BonsaiModel {
         // describes the logits the caller will read.
         self.selection = Selection::None;
         self.distributions.described = Described::None;
+        self.candidates.described = Described::None;
         let mut ingest = ingest;
         self.reserve_kv(self.position + tokens.len(), ingest.as_deref_mut())?;
         let count = tokens.len() as u32;
@@ -227,18 +228,25 @@ impl BonsaiModel {
         };
         // The argmax rides in the block's command buffer, and its kernel
         // flags non-finite rows, so the host neither submits a selection per
-        // row nor scans the logits.
-        let selected =
-            produced.filter(|&(_, rows, _)| self.device_greedy && rows <= self.greedy.max_rows());
-        if let Some((logits, rows, _)) = selected {
+        // row nor scans the logits; the selection itself is used only for
+        // greedy samplers, and the best k only for samplers drawing from them.
+        let flagged = produced.filter(|&(_, rows, _)| rows <= self.greedy.max_rows());
+        if let Some((logits, rows, _)) = flagged {
             self.greedy.encode(&mut batch, logits, rows)?;
         }
+        let described = |selection| match selection {
+            Selection::Last => Described::Last,
+            Selection::Rows(rows) => Described::Rows(rows),
+            Selection::None => Described::None,
+        };
+        if let (Some(k), Some((logits, rows, selection))) = (self.top_k, produced) {
+            self.candidates.reserve(&self.context, rows)?;
+            self.candidates.encode(&mut batch, logits, rows, k)?;
+            self.candidates.described = described(selection);
+            self.candidates.k = k;
+        }
         if let (Some(top), Some((logits, rows, selection))) = (self.logprobs, produced) {
-            let described = match selection {
-                Selection::Last => Described::Last,
-                Selection::Rows(rows) => Described::Rows(rows),
-                Selection::None => Described::None,
-            };
+            let described = described(selection);
             self.distributions.reserve(&self.context, rows)?;
             self.distributions.encode(&mut batch, logits, rows, top)?;
             self.distributions.described = described;
@@ -249,9 +257,11 @@ impl BonsaiModel {
         }
         self.finish(batch)?;
         self.position += tokens.len();
-        let nonfinite = match (selected, produced) {
+        let nonfinite = match (flagged, produced) {
             (Some((_, rows, selection)), _) => {
-                self.selection = selection;
+                if self.device_greedy {
+                    self.selection = selection;
+                }
                 self.greedy
                     .results(rows)
                     .iter()

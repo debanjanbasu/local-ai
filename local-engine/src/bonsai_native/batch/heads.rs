@@ -185,7 +185,7 @@ impl BonsaiModel {
             if entry.depth == 0 || !entry.lag.usable() {
                 continue;
             }
-            if entry.sampler.greedy_draft().applies_penalties() {
+            if entry.sampler.applies_penalties() {
                 return Err(crate::Error::InvalidArgument(
                     "batched drafting cannot apply penalties".into(),
                 ));
@@ -247,7 +247,7 @@ impl BonsaiModel {
                 None => (mtp.state(), self.position, self.kv_allocated),
             };
             slots.push(slot);
-            samplers.push(entry.sampler.greedy_draft());
+            samplers.push(entry.sampler);
             sequences.push(Drafting {
                 seed: entry.seed,
                 state,

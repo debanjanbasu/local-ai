@@ -83,23 +83,18 @@ impl BonsaiModel {
         // The head drafts through `start + depth - 1` and the verify block
         // commits through `start + depth`; grow both caches once, up front.
         self.reserve_kv(start + depth + 1, Some(speculation))?;
-        let mut draft_sampler = sampler.greedy_draft();
-        let drafts = if draft_sampler.applies_penalties() {
+        // Only a host chain needs the greedy copy (with its 1 MB of seen
+        // tokens); the device chain reads nothing but the EOS ids.
+        let drafts = if sampler.applies_penalties() {
             self.draft_on_host(
                 speculation,
-                &mut draft_sampler,
+                &mut sampler.greedy_draft(),
                 seed,
                 depth,
                 DRAFT_CHAIN_MIN_MARGIN,
             )?
         } else {
-            self.draft_on_device(
-                speculation,
-                &draft_sampler,
-                seed,
-                depth,
-                DRAFT_CHAIN_MIN_MARGIN,
-            )?
+            self.draft_on_device(speculation, sampler, seed, depth, DRAFT_CHAIN_MIN_MARGIN)?
         };
         let drafts = drafts.iter().map(|draft| draft.token).collect::<Vec<_>>();
         let mut stats = MtpStats {

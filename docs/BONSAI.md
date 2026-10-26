@@ -2126,7 +2126,11 @@ With a greedy sampler and no penalty, the verify block (and a plain decode
 step) also selects each row's argmax in its own command buffer, with the same
 `total_cmp` order and ties to the lower id as the GPU top-k, and flags any
 non-finite logit; the host reads one id per row instead of submitting a top-k
-per row and scanning every logit. Other samplers keep the host path.
+per row and scanning every logit. Every other sampler gets the same
+non-finite flag, and one that draws from the plain top k (no penalty, no
+masking grammar) gets each row's top k from the same command buffer too (see
+[Sampled decoding](#sampled-decoding)); penalties and grammars keep the host
+path.
 
 Drafting stays on the GPU. Each draft step is one submission: the token's
 `token_embd` row is decoded and inverse-rotated on the device
@@ -3115,6 +3119,33 @@ them in ten more dispatches. GPU time per 248,320-logit row, M4 Pro, 50
 selections per command buffer: 170, 177 and 183 µs at k = 1, 20 and 64
 before, 11, 43 and 127 µs after. The candidates are bit-exact against a
 `total_cmp` reference, ties to the lower id, special bit patterns included.
+
+Every block and batched pass that produces logits now selects each row's top
+k in its own command buffer while a sampler draws from the plain top k (no
+presence or repetition penalty, no masking grammar; a batch selects the
+largest k any of its requests uses, and each takes its prefix), and every
+such pass flags non-finite rows with the argmax kernel. Before, each sampled
+row submitted a top-k command buffer of its own and waited for it, and every
+non-greedy pass scanned its logits on the host for non-finite values (1 MB a
+row); head drafting also cloned the request's sampler, about 250 KB of
+seen-token flags (2 MB of candidates at `top_k: 0`), only to ask whether it
+applies penalties. Penalties and grammars keep the submitted top k, whose
+candidates they must see. `tools/benchmark.py --sampled` and
+`tools/serve_concurrency.py --sampled` measure the default settings with a
+fixed seed. M4 Pro, 2026-10-26, back to back under the GPU lock but with
+other builds loading the CPU (load average about 9 of 14), one build before
+and after this change, every sampled output byte-identical between them:
+
+| Default sampling, default speculation | Before | After |
+| --- | ---: | ---: |
+| `bonsai`, planets prompt, 203 tokens, best / median of 3 | 34.89 / 33.83 tok/s | 35.10 / 35.07 tok/s |
+| `serve`, 1 stream, 300 tokens | 32.61 tok/s | 33.05 tok/s |
+| `serve`, 8 streams, 300 tokens each, aggregate | 74.36 tok/s | 76.25 tok/s |
+
+Greedy decoding, which already selected on the device, measured 37.08 and
+37.28 tok/s (`bonsai`), and 35.38 / 74.80 and 35.16 / 73.92 tok/s at one and
+eight streams (`serve`, one run each, inside its run-to-run spread), with
+identical text.
 
 ## Tried and rejected
 

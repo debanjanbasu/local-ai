@@ -378,6 +378,7 @@ impl BonsaiModel {
         }
         self.selection = Selection::None;
         self.distributions.described = Described::None;
+        self.candidates.described = Described::None;
         Ok(())
     }
 
@@ -542,8 +543,12 @@ impl BonsaiModel {
             .collect::<Vec<_>>();
         self.selection = Selection::None;
         self.distributions.described = Described::None;
+        self.candidates.described = Described::None;
         if self.logprobs.is_some() {
             self.distributions.reserve(&self.context, decoded)?;
+        }
+        if self.top_k.is_some() {
+            self.candidates.reserve(&self.context, decoded)?;
         }
         let tokens = rows
             .iter()
@@ -627,9 +632,13 @@ impl BonsaiModel {
             &output.logits,
             decoded as u32,
         )?;
+        // The argmax kernel also flags non-finite rows, so the host never
+        // scans the logits; its selection is used only for greedy samplers.
         let selected = self.device_greedy;
-        if selected {
-            output.greedy.encode(&mut batch, &output.logits, decoded)?;
+        output.greedy.encode(&mut batch, &output.logits, decoded)?;
+        if let Some(k) = self.top_k {
+            self.candidates
+                .encode(&mut batch, &output.logits, decoded, k)?;
         }
         if let Some(top) = self.logprobs {
             self.distributions
@@ -688,18 +697,16 @@ impl BonsaiModel {
             self.distributions.described = Described::Batch;
             self.distributions.top = top;
         }
+        if let Some(k) = self.top_k {
+            self.candidates.described = Described::Batch;
+            self.candidates.k = k;
+        }
         output.starts = spans[..count].iter().map(|&(start, _)| start).collect();
-        let nonfinite = if selected {
-            output
-                .greedy
-                .results(decoded)
-                .iter()
-                .any(|result| result.nonfinite != 0)
-        } else {
-            output.logits.as_slice::<f32>()[..decoded * VOCAB]
-                .iter()
-                .any(|value| !value.is_finite())
-        };
+        let nonfinite = output
+            .greedy
+            .results(decoded)
+            .iter()
+            .any(|result| result.nonfinite != 0);
         if nonfinite {
             return Err(crate::Error::Generation("non-finite Bonsai logits".into()));
         }
@@ -786,12 +793,14 @@ impl BonsaiModel {
         let distribution = sampler
             .logprobs()
             .and_then(|top| self.distributions.row(Described::Batch, row, top));
+        let top_k = self.candidates.row(Described::Batch, row);
         sampler.select_row(
             &mut output.logits,
             row * VOCAB * size_of::<f32>(),
             &self.context,
             &self.sampling,
             argmax,
+            top_k.as_deref(),
             distribution,
         )
     }
@@ -973,11 +982,10 @@ impl BonsaiModel {
                 return Ok(Vec::new());
             }
             self.reserve_kv(self.position + depth + 1, Some(&mut speculation))?;
-            let mut draft_sampler = sampler.greedy_draft();
-            let drafts = if draft_sampler.applies_penalties() {
+            let drafts = if sampler.applies_penalties() {
                 self.draft_on_host(
                     &mut speculation,
-                    &mut draft_sampler,
+                    &mut sampler.greedy_draft(),
                     seed,
                     depth,
                     super::DRAFT_CHAIN_MIN_MARGIN,
@@ -985,7 +993,7 @@ impl BonsaiModel {
             } else {
                 self.draft_on_device(
                     &mut speculation,
-                    &draft_sampler,
+                    sampler,
                     seed,
                     depth,
                     super::DRAFT_CHAIN_MIN_MARGIN,

@@ -473,6 +473,13 @@ impl BonsaiEngine {
             return Ok(false);
         }
         self.model.set_device_greedy(greedy);
+        // The most candidates any participant draws from; each takes its own.
+        self.model.set_device_top_k(
+            participants
+                .iter()
+                .filter_map(|&index| self.active[index].sampler.device_top_k())
+                .max(),
+        );
         // The most alternatives any participant reports; each takes its own.
         self.model.set_logprobs(
             participants
@@ -736,12 +743,9 @@ impl BonsaiEngine {
         dropped: &mut [bool],
         failed: &mut Vec<(u64, crate::Error)>,
     ) -> crate::Result<()> {
-        let (alone, together): (Vec<_>, Vec<_>) = heads.iter().partition(|&&(slot, _)| {
-            self.active[participants[slot]]
-                .sampler
-                .greedy_draft()
-                .applies_penalties()
-        });
+        let (alone, together): (Vec<_>, Vec<_>) = heads
+            .iter()
+            .partition(|&&(slot, _)| self.active[participants[slot]].sampler.applies_penalties());
         for (slot, depth) in alone {
             // Host drafting reads the resident sequence's head: bring the
             // sequence in (a handle swap) and draft as its solo round does.

@@ -33,9 +33,15 @@ reported, not refused.
     tools/benchmark.py --rounds 3
     tools/benchmark.py --sweep-depth
     tools/benchmark.py --rounds 3 -- '--no-thinking' '--greedy'
+    tools/benchmark.py --rounds 3 --sampled
     tools/benchmark.py --check-only
     tools/benchmark.py --prefill 2048,8192 --binary A --binary B -- --no-speculation
     tools/benchmark.py --ttft
+
+`--sampled` measures the engine's default sampling (temperature 1.0, top-p
+0.95, top-k 20, the CLI's fixed seed) instead of `--greedy`; the seed keeps
+every configuration's output comparable, so the identical-output check still
+applies.
 
 `--prefill` times cold prefill of raw prompts of repository text and then a
 second process restoring the first one's disk snapshot (a restart), with the
@@ -82,7 +88,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from statistics import median
 
@@ -237,6 +243,9 @@ class Config:
     # None is the default build, read when the command is made so tests can
     # patch `BINARY`; `--binary` names others to compare builds.
     binary: Path | None = None
+    # `--sampled` drops `--greedy`: the engine's default sampling (temperature
+    # 1.0, top-p 0.95, top-k 20) with its fixed seed, still deterministic.
+    greedy: bool = True
 
     def executable(self) -> str:
         return str(self.binary or BINARY)
@@ -245,7 +254,7 @@ class Config:
         return [
             self.executable(),
             "bonsai",
-            "--greedy",
+            *(["--greedy"] if self.greedy else []),
             "--no-thinking",
             "--json",
             "--max-tokens",
@@ -893,6 +902,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=160)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument(
+        "--sampled",
+        action="store_true",
+        help="decode with the default sampling settings (seeded) instead of --greedy",
+    )
+    parser.add_argument(
         "--sweep-depth",
         action="store_true",
         help="compare every --mtp-depth the engine accepts",
@@ -981,6 +995,8 @@ def main(argv: list[str]) -> int:
 
         configs = depth_sweep() if args.sweep_depth else parse_configs(args.configs)
         configs = with_binaries(configs, args.binary)
+        if args.sampled:
+            configs = [replace(config, greedy=False) for config in configs]
         print(
             f"comparing {', '.join(config.name for config in configs)} "
             f"for {args.rounds} rounds",
