@@ -13,8 +13,9 @@
 //!   profile that denies all network access and every file write outside a
 //!   per-call scratch directory (and, with `write`, the root), with CPU-time,
 //!   file-size, open-file and process-count `setrlimit`s applied in the child
-//!   before `exec`, a wall-clock deadline, output byte caps and termination
-//!   of the child's own process group.
+//!   before `exec`, a wall-clock deadline, a scratch-directory quota, output
+//!   byte caps and termination of the child's own process group (and, at the
+//!   deadline, of the child itself).
 //! - **Web fetch** ([`fetch`]): one `GET` to a host on an explicit domain
 //!   allowlist, refusing private, loopback and other non-public addresses,
 //!   never following redirects, with time and size limits.
