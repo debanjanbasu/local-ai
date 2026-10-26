@@ -1,12 +1,15 @@
 //! The Responses store: by default in the user's data directory, pruned of
-//! responses older than 30 days at startup, or `--response-store DIR`.
+//! responses older than 30 days at startup and every hour after, or
+//! `--response-store DIR`.
 //!
 //! One JSON file per stored Response, named by its ID. Each record holds the
 //! final Response object and the *resolved* input it was generated from: the
 //! prior response's input and output followed by this request's own items.
 //! Replaying `previous_response_id` therefore reads exactly one file and never
 //! walks a chain, and deleting an earlier response does not break a later one
-//! that already carries its history.
+//! that already carries its history. The price is disk space: every turn of a
+//! conversation repeats all of the turns before it, inline images (data URLs)
+//! included, so a conversation of `n` turns stores about `n²/2` turns' worth.
 //!
 //! The records hold user prompts, tool results and the model's raw reasoning
 //! in plain text. That is protected local data, not encrypted data: the
@@ -16,21 +19,24 @@
 //! Writes are atomic: a record is written to a temporary file in the same
 //! directory, flushed to disk and renamed over its final name, so a reader
 //! sees either the whole record or none of it, and a crash mid-write leaves
-//! only an ignored temporary file. Opening a second server must not remove
-//! the first server's in-flight writes or unrelated files in the directory.
+//! only a temporary file, which a sweep removes once it is an hour old.
+//! Opening a second server must not remove the first server's in-flight
+//! writes or unrelated files in the directory.
 //!
 //! A background Response is written more than once (queued, then terminal),
 //! so its writer holds a [`ResponseLease`]: an exclusive advisory lock on an
 //! owner-only `.{id}.lock` sidecar, taken before the first save and released
-//! after the terminal one. Sidecars are never unlinked, so every process
-//! always locks the same inode. A background record still `queued` or
-//! `in_progress` whose lease is free has lost its writer to a crash or
-//! restart. While it is pending, a durable background record also keeps the
-//! request it was created from (`request`), and a server resumes it from that
-//! (see [`super::background::Background::resume`]); one without it (one
-//! continuing a conversation) is marked `failed` when
-//! a store opens. A record whose lease is held belongs to a live server
-//! sharing the directory and is left alone.
+//! after the terminal one. A sidecar is unlinked only by whoever holds its
+//! lease, once its record is settled or gone, and [`ResponseStore::lease`]
+//! checks after locking that the name still leads to the inode it locked, so
+//! two processes never both hold one response's lease. A background record
+//! still `queued` or `in_progress` whose lease is free has lost its writer to
+//! a crash or restart. While it is pending, a durable background record also
+//! keeps the request it was created from (`request`), and a server resumes it
+//! from that (see [`super::background::Background::resume`]); one without it
+//! (one continuing a conversation) is marked `failed` when a store opens. A
+//! record whose lease is held belongs to a live server sharing the directory
+//! and is left alone.
 //!
 //! A background Response created with `stream: true` also has an owner-only
 //! `.{id}.events` journal of the events it published (see [`super::journal`]).
@@ -42,11 +48,25 @@
 //! call starts executing: a record without one provably never ran a hosted
 //! call, so a restarted server may regenerate it without running any twice.
 //! It is deleted with the record.
+//!
+//! A pending background record is written by its lease holder, and saving
+//! one creates its sidecar if it has none, so every record that can be
+//! pending has a lease sidecar. A sweep of the directory (when a store
+//! opens, and on every pruning pass) therefore reads only records that have
+//! one (to settle an interrupted one that cannot be resumed, or to unlink the
+//! sidecar of one that has settled) and, when pruning, records not written
+//! for the whole retention period; [`ResponseStore::resumable`] reads only
+//! records that have one too. Every other record is never opened.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::{Value, json};
 
 use super::journal::{JournalReader, JournalWriter, ended_with, terminal_events};
@@ -79,18 +99,132 @@ const INTERRUPTED_MESSAGE: &str =
 /// Why a record without its request cannot be resumed.
 pub(super) const NO_REQUEST: &str = "its record keeps no request to regenerate it from";
 
+/// How long a temporary file, or a lease sidecar with neither a record nor a
+/// journal, must have gone unmodified before a sweep removes it.
+///
+/// A save writes, flushes and renames its temporary file within seconds, and
+/// a writer locks a sidecar it creates at once, so a live server's in-flight
+/// file is always far younger than this, and anything older is a crash's.
+const STALE_AFTER: Duration = Duration::from_hours(1);
+
+/// How often a pruning store prunes again after [`ResponseStore::prune`].
+///
+/// A timer, because no event marks a record becoming old enough to go, and a
+/// deadline per record would mean reading every record to learn its age,
+/// which is the work a sweep avoids. An hour past 30 days is immaterial to
+/// the retention, and a pass reads only the records it deletes.
+const PRUNE_INTERVAL: Duration = Duration::from_hours(1);
+
+/// How often [`ResponseStore::lease`] locks the sidecar again when it finds
+/// the one it locked was unlinked meanwhile. A sidecar is unlinked only once
+/// its response has settled or gone, so a second unlink in the same moment
+/// is already unlikely.
+const LEASE_ATTEMPTS: usize = 4;
+
 #[derive(Debug)]
 pub(super) struct ResponseStore {
     dir: PathBuf,
+    /// Stops the periodic pruning [`Self::prune`] starts when this store is
+    /// dropped. `None` for the handle the pruning thread itself works with.
+    pruner: Option<Arc<Pruner>>,
+}
+
+/// The periodic pruning of one store.
+#[derive(Debug, Default)]
+struct Pruner {
+    state: Mutex<PrunerState>,
+    /// Wakes the pruning thread early, to stop.
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct PrunerState {
+    started: bool,
+    closed: bool,
+}
+
+impl Pruner {
+    fn lock(&self) -> MutexGuard<'_, PrunerState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for ResponseStore {
+    fn drop(&mut self) {
+        if let Some(pruner) = &self.pruner {
+            pruner.lock().closed = true;
+            pruner.wake.notify_all();
+        }
+    }
 }
 
 /// Exclusive ownership of one stored response's writes, across processes.
 ///
 /// Held for as long as this value lives; dropping it closes the sidecar and
-/// releases the lock. The sidecar itself stays, so its inode never changes.
+/// releases the lock. The sidecar stays: only a lease holder unlinks it, and
+/// only once the response has settled or gone.
 #[derive(Debug)]
 pub(super) struct ResponseLease {
     _file: fs::File,
+}
+
+/// What a sweep needs to know of a record, read without building the
+/// Response or its input: unknown members, the bulk of a record, are skipped.
+#[derive(Deserialize)]
+struct Header {
+    version: Option<u64>,
+    response: Option<ResponseHeader>,
+    #[serde(default)]
+    request: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct ResponseHeader {
+    id: Option<Value>,
+    background: Option<Value>,
+    status: Option<Value>,
+    created_at: Option<Value>,
+}
+
+impl Header {
+    fn field(&self, pick: impl Fn(&ResponseHeader) -> Option<&Value>) -> Option<&Value> {
+        self.response.as_ref().and_then(pick)
+    }
+
+    /// Still `queued` or `in_progress`, as [`super::background::pending`].
+    fn pending(&self) -> bool {
+        matches!(
+            self.field(|response| response.status.as_ref())
+                .and_then(Value::as_str),
+            Some("queued" | "in_progress")
+        )
+    }
+
+    /// A background response its writer never finished, as [`interrupted`].
+    fn interrupted(&self) -> bool {
+        self.field(|response| response.background.as_ref())
+            .and_then(Value::as_bool)
+            == Some(true)
+            && self.pending()
+    }
+
+    fn created_at(&self) -> Option<u64> {
+        self.field(|response| response.created_at.as_ref())
+            .and_then(Value::as_u64)
+    }
+}
+
+/// The store's files by ID, from one listing of its directory.
+#[derive(Default)]
+struct Listing {
+    /// Every record, with when it was last written if that was asked for.
+    records: HashMap<String, Option<SystemTime>>,
+    /// Every lease sidecar, with when it was last modified.
+    locks: HashMap<String, Option<SystemTime>>,
+    /// The IDs with a journal or a hosted-tool marker.
+    sidecars: BTreeSet<String>,
+    /// Temporary files of saves, with when each was last written.
+    temporaries: Vec<(PathBuf, Option<SystemTime>)>,
 }
 
 /// A stored Response and the resolved input it was generated from.
@@ -161,8 +295,11 @@ impl ResponseStore {
                 ));
             }
         }
-        let store = Self { dir };
-        store.recover_interrupted()?;
+        let store = Self {
+            dir,
+            pruner: Some(Arc::default()),
+        };
+        store.sweep(true, None)?;
         Ok(store)
     }
 
@@ -170,112 +307,276 @@ impl ResponseStore {
         valid_id(id).then(|| self.dir.join(format!("{id}.json")))
     }
 
+    fn lock_path(&self, id: &str) -> Option<PathBuf> {
+        valid_id(id).then(|| self.dir.join(format!(".{id}{LOCK_SUFFIX}")))
+    }
+
     /// Take the write lease for response `id` without waiting.
     ///
     /// `Ok(None)` when another writer, in this process or another, holds it.
     /// An `id` that could not name a response is refused, as is a sidecar that
     /// is a symlink, not a regular file, or not owner-only.
+    ///
+    /// A sidecar found unlinked after it was opened (its response settled or
+    /// was deleted meanwhile) is opened again by name, so every holder locks
+    /// the sidecar the name leads to.
     pub(super) fn lease(&self, id: &str) -> std::io::Result<Option<ResponseLease>> {
-        if !valid_id(id) {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!("invalid response ID {id:?}"),
-            ));
+        let path = self.lock_path(id).ok_or_else(|| invalid_id(id))?;
+        for _ in 0..LEASE_ATTEMPTS {
+            let file = open_private(&path, Access::Lock)?;
+            let locked = match file.try_lock() {
+                Ok(()) => true,
+                Err(fs::TryLockError::WouldBlock) => false,
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            };
+            if still_named(&file, &path)? {
+                return Ok(locked.then_some(ResponseLease { _file: file }));
+            }
         }
-        let path = self.dir.join(format!(".{id}{LOCK_SUFFIX}"));
-        let file = open_private(&path, Access::Lock)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(ResponseLease { _file: file })),
-            Err(fs::TryLockError::WouldBlock) => Ok(None),
-            Err(fs::TryLockError::Error(error)) => Err(error),
-        }
+        Ok(None)
     }
 
-    /// Settle every background response left `queued` or `in_progress` by a
-    /// writer that no longer holds its lease and that cannot be resumed (its
-    /// record keeps no request), and remove journals whose record is gone and
-    /// whose lease is free. A resumable one is left pending for a server to
-    /// resume.
+    /// One pass over the directory, reading only the records that need it.
+    ///
+    /// Removes temporary files and lease sidecars with no record that are
+    /// [`STALE_AFTER`] old, and journals and markers whose record is gone and
+    /// whose lease is free. Of the records with a lease sidecar (every one
+    /// that can be pending): `at_open`, one whose writer is gone and that
+    /// cannot be resumed (its record keeps no request) is settled; a settled
+    /// one's sidecar is unlinked under its lease. With a `cutoff` (Unix
+    /// seconds), every settled record created and last written before it is
+    /// deleted with its sidecars; its file's modification time decides which
+    /// records are read at all. Returns how many records were deleted.
     ///
     /// Records that cannot be read are skipped: they are not this pass's to
-    /// judge, and `load` reports them to whoever asks for them.
-    fn recover_interrupted(&self) -> std::io::Result<()> {
-        for entry in fs::read_dir(&self.dir)? {
-            let name = entry?.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if let Some(id) = name
-                .strip_prefix('.')
-                .and_then(|name| name.strip_suffix(JOURNAL_SUFFIX))
+    /// judge, and `load` reports them to whoever asks for them. Failing to
+    /// remove a leftover file is reported and skipped too.
+    fn sweep(&self, at_open: bool, cutoff: Option<u64>) -> std::io::Result<usize> {
+        let listing = self.list(cutoff.is_some())?;
+        let now = SystemTime::now();
+        let stale = |modified: Option<SystemTime>| {
+            modified
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= STALE_AFTER)
+        };
+        for (path, modified) in &listing.temporaries {
+            if stale(*modified)
+                && let Err(error) = remove_if_present(path)
             {
-                self.remove_orphan_journal(id)?;
-                continue;
-            }
-            if let Some(id) = name
-                .strip_prefix('.')
-                .and_then(|name| name.strip_suffix(TOOLS_SUFFIX))
-            {
-                self.remove_orphan_marker(id)?;
-                continue;
-            }
-            let Some(id) = name.strip_suffix(".json") else {
-                continue;
-            };
-            if valid_id(id)
-                && matches!(self.load(id), Ok(Some(stored)) if interrupted(&stored) && stored.request.is_none())
-            {
-                self.recover(id)?;
+                eprintln!("response store: temporary file not removed: {error}");
             }
         }
-        Ok(())
-    }
-
-    /// Delete every settled response created more than `retention` ago,
-    /// with its journal and marker, and return how many went. Pending
-    /// background responses are kept whatever their age, and records that
-    /// cannot be read are left for `load` to report.
-    pub(super) fn prune(&self, retention: std::time::Duration) -> std::io::Result<usize> {
-        let cutoff = super::response::unix_now().saturating_sub(retention.as_secs());
+        let orphans = listing
+            .sidecars
+            .iter()
+            .chain(listing.locks.keys())
+            .filter(|id| !listing.records.contains_key(*id))
+            .collect::<BTreeSet<_>>();
+        for id in orphans {
+            // A writer creates its sidecar just before it locks it, and saves
+            // its first record only after that: a young lone sidecar may be
+            // in that window.
+            let lone_lock = !listing.sidecars.contains(id);
+            if lone_lock
+                && !listing
+                    .locks
+                    .get(id)
+                    .is_some_and(|modified| stale(*modified))
+            {
+                continue;
+            }
+            if let Err(error) = self.remove_orphan(id) {
+                eprintln!("response {id}: leftover sidecars not removed: {error}");
+            }
+        }
+        let cutoff_time = cutoff.map(|cutoff| SystemTime::UNIX_EPOCH + Duration::from_secs(cutoff));
         let mut removed = 0;
-        for entry in fs::read_dir(&self.dir)? {
-            let name = entry?.file_name();
-            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+        for (id, modified) in &listing.records {
+            let leased = listing.locks.contains_key(id);
+            // A record is written after its response was created, so one
+            // written since the cutoff was created after it too.
+            let old = cutoff_time
+                .is_some_and(|cutoff| modified.is_some_and(|modified| modified < cutoff));
+            if !leased && !old {
+                continue;
+            }
+            let Ok(Some(header)) = self.header(id) else {
                 continue;
             };
-            if valid_id(id)
-                && let Ok(Some(stored)) = self.load(id)
-                && !super::background::pending(&stored.response)
-                && stored
-                    .response
-                    .get("created_at")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|created| created < cutoff)
-                && self.delete(id)?
+            if header.pending() {
+                if at_open && header.interrupted() && header.request.is_none() {
+                    self.recover(id)?;
+                }
+                continue;
+            }
+            if old
+                && cutoff.is_some_and(|cutoff| {
+                    header.created_at().is_some_and(|created| created < cutoff)
+                })
             {
-                removed += 1;
+                if self.delete(id)? {
+                    removed += 1;
+                }
+                continue;
+            }
+            if leased && let Err(error) = self.remove_lock(id) {
+                eprintln!("response {id}: lease sidecar not removed: {error}");
             }
         }
         Ok(removed)
     }
 
-    /// The IDs of every background response still `queued` or `in_progress`
-    /// whose record keeps the request to resume it from, oldest first. Their
-    /// leases are not checked: whoever resumes one takes it.
-    pub(super) fn resumable(&self) -> std::io::Result<Vec<String>> {
-        let mut found = Vec::new();
+    /// The store's files, by ID; `record_times` also reads when each record
+    /// was last written.
+    fn list(&self, record_times: bool) -> std::io::Result<Listing> {
+        let mut listing = Listing::default();
         for entry in fs::read_dir(&self.dir)? {
-            let name = entry?.file_name();
-            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
                 continue;
             };
-            if valid_id(id)
-                && let Ok(Some(stored)) = self.load(id)
-                && interrupted(&stored)
-                && stored.request.is_some()
+            let modified = || {
+                entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            };
+            let id = |suffix: &str| {
+                name.strip_prefix('.')
+                    .and_then(|name| name.strip_suffix(suffix))
+                    .filter(|id| valid_id(id))
+                    .map(str::to_owned)
+            };
+            if let Some(id) = name.strip_suffix(".json").filter(|id| valid_id(id)) {
+                let modified = if record_times { modified() } else { None };
+                listing.records.insert(id.to_owned(), modified);
+            } else if let Some(id) = id(LOCK_SUFFIX) {
+                listing.locks.insert(id, modified());
+            } else if let Some(id) = id(JOURNAL_SUFFIX).or_else(|| id(TOOLS_SUFFIX)) {
+                listing.sidecars.insert(id);
+            } else if temporary_name(name) {
+                listing.temporaries.push((entry.path(), modified()));
+            }
+        }
+        Ok(listing)
+    }
+
+    /// What a sweep needs of record `id`, without building it; `None` when it
+    /// is not stored.
+    fn header(&self, id: &str) -> std::io::Result<Option<Header>> {
+        let Some(path) = self.path(id) else {
+            return Ok(None);
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let header: Header = serde_json::from_slice(&bytes).map_err(|error| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("stored response {id} is corrupt: {error}"),
+            )
+        })?;
+        let named = header.field(|response| response.id.as_ref()) == Some(&json!(id));
+        if header.version == Some(RECORD_VERSION) && named {
+            Ok(Some(header))
+        } else {
+            Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("stored response {id} is not a version {RECORD_VERSION} record"),
+            ))
+        }
+    }
+
+    /// Delete every settled response created more than `retention` ago,
+    /// with its journal and sidecars, and return how many went; then keep
+    /// doing so every [`PRUNE_INTERVAL`] for as long as this store is open
+    /// (the first call starts that). Pending background responses are kept
+    /// whatever their age, and records that cannot be read are left for
+    /// `load` to report.
+    ///
+    /// A record's file modification time decides which records are read: one
+    /// written within `retention` (a background response settled late, or a
+    /// file copied without its times) waits until that much time has passed
+    /// since it was written.
+    pub(super) fn prune(&self, retention: Duration) -> std::io::Result<usize> {
+        self.keep_pruning(retention);
+        self.prune_once(retention)
+    }
+
+    fn prune_once(&self, retention: Duration) -> std::io::Result<usize> {
+        let cutoff = super::response::unix_now().saturating_sub(retention.as_secs());
+        self.sweep(false, Some(cutoff))
+    }
+
+    /// Start pruning this store every [`PRUNE_INTERVAL`] on a thread of its
+    /// own, until the store is dropped. Once only.
+    fn keep_pruning(&self, retention: Duration) {
+        let Some(pruner) = &self.pruner else {
+            return;
+        };
+        {
+            let mut state = pruner.lock();
+            if state.started {
+                return;
+            }
+            state.started = true;
+        }
+        let (store, pruner) = (
+            Self {
+                dir: self.dir.clone(),
+                pruner: None,
+            },
+            Arc::clone(pruner),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("response-store-pruner".into())
+            .spawn(move || {
+                let mut state = pruner.lock();
+                loop {
+                    state = pruner
+                        .wake
+                        .wait_timeout_while(state, PRUNE_INTERVAL, |state| !state.closed)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                    if state.closed {
+                        return;
+                    }
+                    drop(state);
+                    match store.prune_once(retention) {
+                        Ok(0) => {}
+                        Ok(removed) => eprintln!(
+                            "removed {removed} stored responses older than {} days",
+                            retention.as_secs() / 86_400
+                        ),
+                        Err(error) => {
+                            eprintln!("warning: old stored responses were not pruned: {error}");
+                        }
+                    }
+                    state = pruner.lock();
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("warning: stored responses will be pruned only at startup: {error}");
+        }
+    }
+
+    /// The IDs of every background response still `queued` or `in_progress`
+    /// whose record keeps the request to resume it from, oldest first. Their
+    /// leases are not checked: whoever resumes one takes it. Only records
+    /// with a lease sidecar are read, as only those can be pending.
+    pub(super) fn resumable(&self) -> std::io::Result<Vec<String>> {
+        let listing = self.list(false)?;
+        let mut found = Vec::new();
+        for id in listing.records.keys() {
+            if listing.locks.contains_key(id)
+                && let Ok(Some(header)) = self.header(id)
+                && header.interrupted()
+                && header.request.is_some()
             {
-                let created = stored.response.get("created_at").and_then(Value::as_u64);
-                found.push((created.unwrap_or_default(), id.to_owned()));
+                found.push((header.created_at().unwrap_or_default(), id.clone()));
             }
         }
         found.sort();
@@ -397,10 +698,16 @@ impl ResponseStore {
         writer.sync()
     }
 
-    /// Remove the journal of a response with no record, unless a writer holds
-    /// its lease: that is an admission between the two writes.
-    fn remove_orphan_journal(&self, id: &str) -> std::io::Result<()> {
-        let (Some(record), Some(journal)) = (self.path(id), self.journal_path(id)) else {
+    /// Remove the journal, hosted-tool marker and lease sidecar of a response
+    /// with no record, unless a writer holds its lease: that is an admission
+    /// between its first writes.
+    fn remove_orphan(&self, id: &str) -> std::io::Result<()> {
+        let (Some(record), Some(journal), Some(marker), Some(lock)) = (
+            self.path(id),
+            self.journal_path(id),
+            self.marker_path(id),
+            self.lock_path(id),
+        ) else {
             return Ok(());
         };
         if record.exists() {
@@ -411,26 +718,34 @@ impl ResponseStore {
         };
         if !record.exists() {
             remove_if_present(&journal)?;
+            remove_if_present(&marker)?;
+            if UNLINKS_LOCKS {
+                remove_if_present(&lock)?;
+            }
         }
         Ok(())
     }
 
-    /// Remove the hosted-tool marker of a response with no record, unless a
-    /// writer holds its lease.
-    fn remove_orphan_marker(&self, id: &str) -> std::io::Result<()> {
-        let (Some(record), Some(marker)) = (self.path(id), self.marker_path(id)) else {
+    /// Unlink the lease sidecar of response `id`, under its lease, once its
+    /// record is settled or gone. Nothing when it has none, when a writer
+    /// holds it (the next sweep removes it), or when its record cannot be
+    /// read.
+    fn remove_lock(&self, id: &str) -> std::io::Result<()> {
+        let Some(lock) = self.lock_path(id) else {
             return Ok(());
         };
-        if record.exists() {
+        // Leasing creates the sidecar, so a response without one is left so.
+        if !UNLINKS_LOCKS || fs::symlink_metadata(&lock).is_err() {
             return Ok(());
         }
         let Some(_lease) = self.lease(id)? else {
             return Ok(());
         };
-        if !record.exists() {
-            remove_if_present(&marker)?;
+        match self.header(id) {
+            Ok(Some(header)) if header.pending() => Ok(()),
+            Ok(_) => remove_if_present(&lock).map(drop),
+            Err(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn marker_path(&self, id: &str) -> Option<PathBuf> {
@@ -521,6 +836,14 @@ impl ResponseStore {
                 record["creator"] = creator.clone();
             }
         }
+        // A sweep reads only records with a lease sidecar, so a pending
+        // background record always has one, even one saved without its lease.
+        if response.get("background").and_then(Value::as_bool) == Some(true)
+            && super::background::pending(response)
+        {
+            let lock = self.lock_path(id).ok_or_else(|| invalid_id(id))?;
+            open_private(&lock, Access::Lock)?;
+        }
         let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         let temporary = self
             .dir
@@ -577,12 +900,13 @@ impl ResponseStore {
         }
     }
 
-    /// Delete the stored response `id` and its event journal, reporting
-    /// whether there was one. The lease sidecar stays, so its inode does.
+    /// Delete the stored response `id`, its event journal, its hosted-tool
+    /// marker and, unless a writer holds it, its lease sidecar, reporting
+    /// whether there was one.
     ///
     /// The record goes first: once it is gone the response is not found,
-    /// whatever became of the journal, and a journal left by a failed unlink
-    /// is removed when a store next opens.
+    /// whatever became of the rest, and a sidecar left by a failed unlink or
+    /// a held lease is removed by the next sweep.
     pub(super) fn delete(&self, id: &str) -> std::io::Result<bool> {
         let (Some(path), Some(journal)) = (self.path(id), self.journal_path(id)) else {
             return Ok(false);
@@ -600,9 +924,47 @@ impl ResponseStore {
             // Removed when a store next opens, as the record is gone.
             eprintln!("response {id}: hosted tool marker not removed: {error}");
         }
+        if let Err(error) = self.remove_lock(id) {
+            eprintln!("response {id}: lease sidecar not removed: {error}");
+        }
         sync_dir(&self.dir);
         Ok(found)
     }
+}
+
+/// Whether lease sidecars are ever unlinked. Only where [`still_named`] can
+/// tell that a locked sidecar was unlinked meanwhile; elsewhere they stay.
+const UNLINKS_LOCKS: bool = cfg!(unix);
+
+/// Whether `path` still names the open `file`: `false` once it was unlinked,
+/// or replaced by another file.
+#[cfg(unix)]
+fn still_named(file: &fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let held = file.metadata()?;
+    match fs::symlink_metadata(path) {
+        Ok(named) => Ok(named.dev() == held.dev() && named.ino() == held.ino()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn still_named(_file: &fs::File, _path: &Path) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+/// Whether `name` is a save's temporary file, `.{id}.{nonce}.tmp`.
+fn temporary_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|name| name.strip_suffix(TEMPORARY_SUFFIX))
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(id, nonce)| {
+            valid_id(id)
+                && !nonce.is_empty()
+                && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 fn invalid_id(id: &str) -> std::io::Error {

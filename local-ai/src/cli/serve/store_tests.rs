@@ -131,14 +131,17 @@ fn pruning_removes_settled_responses_past_retention_and_keeps_pending_ones() {
     let store = scratch.open();
     let now = super::response::unix_now();
     let day = 86_400;
-    for (id, background, status, age) in [
-        ("resp_old", false, "completed", 31 * day),
-        ("resp_recent", false, "completed", 29 * day),
-        ("resp_oldpending", true, "queued", 31 * day),
+    // Each written when it was created, except one written again since.
+    for (id, background, status, age, written) in [
+        ("resp_old", false, "completed", 31 * day, 31 * day),
+        ("resp_recent", false, "completed", 29 * day, 29 * day),
+        ("resp_oldpending", true, "queued", 31 * day, 31 * day),
+        ("resp_rewritten", true, "failed", 31 * day, day),
     ] {
         let mut response = record(id, background, status);
         response["created_at"] = json!(now - age);
         store.save(&response, &input()).expect("saved");
+        age_file(&scratch.0.join(format!("{id}.json")), written);
     }
     let removed = store
         .prune(std::time::Duration::from_secs(30 * day))
@@ -147,6 +150,21 @@ fn pruning_removes_settled_responses_past_retention_and_keeps_pending_ones() {
     assert!(store.load("resp_old").expect("readable").is_none());
     assert!(store.load("resp_recent").expect("readable").is_some());
     assert!(store.load("resp_oldpending").expect("readable").is_some());
+    assert!(
+        store.load("resp_rewritten").expect("readable").is_some(),
+        "kept for the retention after its last write"
+    );
+}
+
+/// Set the modification time of `path` to `age` seconds ago.
+fn age_file(path: &Path, age: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("opens")
+        .set_modified(when)
+        .expect("time set");
 }
 
 #[test]
@@ -990,4 +1008,78 @@ fn leases_refuse_bad_ids_and_symlinks_and_keep_their_sidecar() {
         let _ = std::fs::remove_file(target);
     }
     assert!(sidecar.exists());
+}
+
+#[test]
+fn a_sweep_removes_crash_leftovers_and_spent_lease_sidecars() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let hour = 3600;
+    let lock = |id: &str| scratch.0.join(format!(".{id}.lock"));
+    let save_leased = |id: &str, status: &str| {
+        let lease = store.lease(id).expect("lease").expect("free");
+        store
+            .save(&record(id, true, status), &input())
+            .expect("saved");
+        lease
+    };
+
+    // A settled background response keeps its sidecar until a sweep, which
+    // unlinks it without touching the record; a pending one keeps it.
+    drop(save_leased("resp_done", "completed"));
+    let running = save_leased("resp_running", "in_progress");
+    // A sidecar left by a crash between leasing and saving, and a young one
+    // that may belong to an admission in progress.
+    drop(store.lease("resp_gone").expect("lease").expect("free"));
+    age_file(&lock("resp_gone"), 2 * hour);
+    drop(store.lease("resp_admitting").expect("lease").expect("free"));
+    // Temporary files: one a crash left mid-save, one being written now, and
+    // a file that only looks like one.
+    let abandoned = scratch.0.join(".resp_done.0123abcd.tmp");
+    let in_flight = scratch.0.join(".resp_done.4567ef01.tmp");
+    let unrelated = scratch.0.join(".notes.tmp");
+    for path in [&abandoned, &in_flight, &unrelated] {
+        std::fs::write(path, b"{\"trunc").expect("planted");
+    }
+    age_file(&abandoned, 2 * hour);
+    age_file(&unrelated, 2 * hour);
+
+    let reopened = scratch.open();
+    assert!(!lock("resp_done").exists(), "settled: sidecar unlinked");
+    assert_eq!(
+        reopened
+            .load("resp_done")
+            .expect("readable")
+            .expect("kept")
+            .response,
+        record("resp_done", true, "completed")
+    );
+    assert!(lock("resp_running").exists(), "pending: sidecar kept");
+    assert!(
+        reopened.lease("resp_running").expect("lease").is_none(),
+        "still held by its writer"
+    );
+    assert!(!lock("resp_gone").exists(), "stale lone sidecar removed");
+    assert!(lock("resp_admitting").exists(), "young lone sidecar kept");
+    assert!(!abandoned.exists(), "stale temporary file removed");
+    assert!(in_flight.exists(), "in-flight temporary file kept");
+    assert!(unrelated.exists(), "unrelated file kept");
+
+    // Deleting a settled response unlinks its sidecar; one whose writer
+    // still holds it waits for the next sweep.
+    drop(save_leased("resp_deleted", "completed"));
+    assert!(reopened.delete("resp_deleted").expect("deleted"));
+    assert!(!lock("resp_deleted").exists(), "unlinked with its record");
+    assert!(reopened.delete("resp_running").expect("deleted"));
+    assert!(lock("resp_running").exists(), "held: left for a sweep");
+    drop(running);
+    age_file(&lock("resp_running"), 2 * hour);
+    drop(scratch.open());
+    assert!(!lock("resp_running").exists(), "swept once released");
+
+    // A lease taken after its sidecar went creates and locks a new one.
+    let again = reopened.lease("resp_done").expect("lease").expect("free");
+    assert!(lock("resp_done").exists());
+    assert!(store.lease("resp_done").expect("lease").is_none());
+    drop(again);
 }

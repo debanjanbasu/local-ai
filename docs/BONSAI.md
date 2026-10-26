@@ -516,12 +516,16 @@ Optional tools with a text answer may end during reasoning without a call;
 required or named calls mask end-of-sequence until the call is complete.
 
 Responses are **stored by default**, as on OpenAI, in
-`~/Library/Application Support/local-ai/responses`; a server pruning that
-default store at startup removes settled responses created more than 30 days
-earlier (pending background ones are kept). `--response-store DIR` uses DIR
-instead and prunes nothing, and `--no-response-store` stores nothing
-(conversations, files and batches use the always-on
-[native services](#native-services) store either way). With
+`~/Library/Application Support/local-ai/responses`; a server using that
+default store removes, at startup and then every hour, settled responses
+created and last written more than 30 days earlier (pending background ones
+are kept). The hourly pass is a timer because nothing signals a record turning
+30 days old; each pass reads only records whose file is that old, judged by
+the file's modification time, so a record written again later (a background
+response settled late, or a file copied without its times) is kept 30 days
+from that write. `--response-store DIR` uses DIR instead and prunes nothing,
+and `--no-response-store` stores nothing (conversations, files and batches
+use the always-on [native services](#native-services) store either way). With
 `--no-response-store` only background responses are kept, briefly, and the
 endpoint is otherwise stateless: responses report
 `store: false`, `store: true` and `previous_response_id` are refused, and
@@ -535,10 +539,13 @@ reported as failed rather than as stored (background responses differ; see
 below). Each record is one JSON file holding the final response and its
 resolved input (the earlier response's input and output, then
 this request's items), so a follow-up never walks a chain and deleting an
-earlier response does not break a later one. Records contain prompts, tool
-results and the model's raw reasoning in plain text. The directory is created
-`0700` and records `0600`; that is owner-only local data, not encryption at
-rest. Only `resp_` IDs of ASCII letters and digits ever reach the filesystem.
+earlier response does not break a later one. The cost is disk space: every
+record repeats the conversation before it, inline `input_image` data URLs
+included, so a conversation of `n` turns stores about `n²/2` turns (a 5 MB
+image sent in the first of 20 turns is stored 20 times, 100 MB). Records
+contain prompts, tool results and the model's raw reasoning in plain text. The
+directory is created `0700` and records `0600`; that is owner-only local data,
+not encryption at rest. Only `resp_` IDs of ASCII letters and digits ever reach the filesystem.
 
 `previous_response_id` carries over conversation items only: the earlier
 request's `instructions`, tools, reasoning effort and sampling controls are not
@@ -585,6 +592,11 @@ background response this server is running deletes the record and cancels the
 work, and the worker never writes it back. Each job holds an advisory lease on
 an owner-only `.{id}.lock` sidecar in the store; cancel or delete of a
 response still pending under another live server's lease is refused with 409.
+A sidecar is unlinked, under its lease, when its response is deleted or by the
+next sweep (store open or pruning pass) after it settles; since every pending
+record has one, a sweep reads only records with a sidecar, and an ordinary
+stored response is never opened at startup. Temporary files a crash left
+mid-write, and sidecars with no record, are removed once an hour old.
 A pending background record whose lease is free lost its writer to a crash or
 `kill -9`. While pending, a durable record keeps the request it was created
 from, and the server resumes it at startup (before serving), when a client
