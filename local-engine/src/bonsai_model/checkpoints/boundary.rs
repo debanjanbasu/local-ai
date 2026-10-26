@@ -152,9 +152,11 @@ impl BonsaiEngine {
         self.claim_gpu_cache();
         self.save_prompt_checkpoint(tokens, true)?;
         if self.caches_snapshots() {
-            // With no host tier, a boundary the disk tier would refuse is not
-            // worth its readback either (gigabytes at long prompts).
-            if self.prompt_cache_bytes > 0 || !self.disk_ancestor_suffices(tokens) {
+            // A boundary no tier would keep is not worth its readback
+            // (gigabytes at long prompts): one the disk tier would refuse
+            // beside the boundary it barely extends, or larger than the host
+            // tier with the disk tier off.
+            if self.host_would_keep(tokens.len()) || self.disk_would_keep(tokens, true) {
                 // Only the GPU readback is paid here, mid-prefill; the disk
                 // write is queued to the background writer.
                 let snapshot = self.model.prompt_snapshot()?;
@@ -176,8 +178,14 @@ impl BonsaiEngine {
         // Pin the boundary's recurrent state on the GPU and read the snapshot
         // back when the request ends: its K/V rows stay put in the live caches
         // meanwhile. Reading it all back now held the whole prefix in host
-        // memory through decode (777 MB after a 16K-token prompt).
-        if !tokens.is_empty() && self.caches_snapshots() {
+        // memory through decode (777 MB after a 16K-token prompt). Nothing is
+        // pinned for a snapshot no tier would keep, nor when the boundary
+        // just persisted is this very position.
+        let persisted_here = plan.persisted_reusable_boundary && !plan.checkpoint_penultimate;
+        if !tokens.is_empty()
+            && !persisted_here
+            && (self.host_would_keep(tokens.len()) || self.disk_would_keep(tokens, false))
+        {
             plan.snapshot = Some(self.model.pinned_prompt_checkpoint()?);
         }
         Ok(())

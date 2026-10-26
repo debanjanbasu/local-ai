@@ -457,6 +457,36 @@ pub fn next_victim(entries: &[(&[u32], bool)]) -> Option<usize> {
         .or_else(|| (!entries.is_empty()).then_some(0))
 }
 
+/// Whether the writer would keep a snapshot of `tokens` taking about `bytes`
+/// beside the committed `entries` (oldest first) under `budget`: the check
+/// `DiskIndex::admits` makes before a write, made before the snapshot is
+/// read back from the GPU, which at long prompts costs gigabytes of copying
+/// on the engine thread. Writes still in flight are not counted, so this errs
+/// toward a readback the writer may then refuse.
+pub fn would_admit(
+    entries: &[DiskEntry],
+    tokens: &[u32],
+    bytes: u64,
+    reusable_boundary: bool,
+    budget: u64,
+) -> bool {
+    let mut index = DiskIndex {
+        dir: PathBuf::new(),
+        entries: entries
+            .iter()
+            .filter_map(|entry| {
+                Some(Indexed {
+                    path: entry.path.clone(),
+                    tokens: entry.tokens.clone(),
+                    bytes: fs::metadata(&entry.path).ok()?.len(),
+                    reusable_boundary: entry.reusable_boundary,
+                })
+            })
+            .collect(),
+    };
+    index.admits(tokens, bytes, reusable_boundary, budget)
+}
+
 /// The order in which entries (oldest first) are evicted to fit `budget`,
 /// by [`next_victim`], always keeping one.
 fn eviction_order(entries: &[Indexed], budget: u64) -> Vec<usize> {

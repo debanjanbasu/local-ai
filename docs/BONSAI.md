@@ -2285,6 +2285,17 @@ cached instead of 7,474, 10,456 and 13,562, 78, 50 and 53 s instead of 26 to
 it in three requests: without the change the third restores 385 tokens from
 the GPU tier where the penultimate checkpoint is at 396.
 
+A request that persisted a boundary leaves its penultimate snapshot to its
+GPU checkpoint, which its session's next turn restores, and reads it back
+(about 38 KiB a prompt token) only for a tier that keeps it. It used to read
+it back at every request's end and, with no host tier (fast storage) and the
+boundary already written, drop it. On a 13,223-token chat prompt (`local-ai
+bonsai --json --greedy --no-thinking --max-tokens 1`, cold, host tier off,
+MTP head; two interleaved runs per arm with other jobs loading the CPU) the
+time from the first token to the end of the request fell from 80 and 85 ms
+to 38 and 39 ms and the peak footprint from 2,620 and 2,629 MB to 2,059 and
+2,064 MB, the 0.56 GB copy (3.8 GB at 100K tokens).
+
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
 and trim run behind the request. A snapshot is indexed for reuse only after
@@ -2301,7 +2312,13 @@ two minutes to commit, past which the one in flight is aborted and its
 temporary removed. A temporary is live only while its writer holds an
 exclusive lock on it (taken in `open`), so the sweep after every store and
 at startup removes any other at once, whatever its age. A snapshot the trim
-after it would delete again is not written. A failed write is a cache miss reported
+after it would delete again is not written, nor read back from the GPU: the
+engine sizes it from its token count and asks its own index the writer's
+question first. A snapshot larger than the whole budget is still written,
+and kept while it is the only one, evicting every other: what it evicts fits
+in the budget and it does not, so it costs more prefill to rebuild than all
+of them together (131K tokens prefill in about half an hour), and the
+staged long-context runs rely on it (see Verification). A failed write is a cache miss reported
 on stderr, not a request error. Trim keeps an in-memory index of the
 directory instead of re-reading every snapshot header after each store.
 
@@ -2505,7 +2522,9 @@ cache snapshot was read back to host memory right after prefill and held
 through the whole decode until the request ended; the request now pins an
 81 MB recurrent checkpoint instead and reads the snapshot at the end, from that
 checkpoint and the live K/V prefix, which decode never rewrites. The peak is
-that end-of-request readback (673 MB) on its way to the disk writer.
+that end-of-request readback (673 MB) on its way to the disk writer; a
+request that already wrote a boundary skips it when no host tier keeps the
+snapshot (see Prompt cache).
 
 ## Performance
 

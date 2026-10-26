@@ -1,6 +1,6 @@
 use super::{
-    BonsaiEngine, HostPromptSnapshot, PromptCacheSource, PromptCheckpoint, PromptSnapshot,
-    prompt_cache,
+    BonsaiEngine, HostPromptSnapshot, PROMPT_CHECKPOINT_BYTES, PromptCacheSource, PromptCheckpoint,
+    PromptSnapshot, prompt_cache,
 };
 const MAX_HOST_PROMPT_SNAPSHOTS: usize = 16;
 pub(super) struct SessionSnapshot {
@@ -165,20 +165,42 @@ impl BonsaiEngine {
         }
     }
 
-    /// Whether a committed disk boundary that `tokens` only barely extends
-    /// (see [`prompt_cache::barely_extends`]) already fills half the budget.
-    ///
-    /// A snapshot of `tokens` is at least as large as its ancestor's, so the
-    /// two cannot both fit, and the writer would refuse it to keep the
-    /// ancestor every request sharing `tokens` also shares.
-    pub(super) fn disk_ancestor_suffices(&self, tokens: &[u32]) -> bool {
-        self.disk_snapshots.iter().any(|entry| {
-            entry.reusable_boundary
-                && prompt_cache::barely_extends(tokens, &entry.tokens)
-                && std::fs::metadata(&entry.path).is_ok_and(|metadata| {
-                    metadata.len().saturating_mul(2) > self.prompt_cache_disk_bytes
-                })
-        })
+    /// The bytes a snapshot of the first `tokens` prompt tokens holds, known
+    /// before it is read back: the recurrent state and head hidden row, and
+    /// each token's target and head K/V rows and id (about 38 KiB a token
+    /// with the head).
+    fn snapshot_bytes(&self, tokens: usize) -> u64 {
+        let head = if self.model.speculation().is_some() {
+            2 * local_metal::bonsai_ops::KvFormat::F16.token_bytes()
+        } else {
+            0
+        };
+        let per_token = self.model.kv_layout().token_bytes() * crate::bonsai::LAYERS
+            / crate::bonsai::FULL_INTERVAL
+            + head
+            + size_of::<u32>();
+        (PROMPT_CHECKPOINT_BYTES + tokens * per_token) as u64
+    }
+
+    /// Whether the host tier would keep a snapshot of `tokens` prompt tokens.
+    pub(super) fn host_would_keep(&self, tokens: usize) -> bool {
+        self.prompt_cache_bytes > 0 && self.snapshot_bytes(tokens) <= self.prompt_cache_bytes as u64
+    }
+
+    /// Whether the disk writer would keep a snapshot of `tokens` beside the
+    /// committed ones (see [`prompt_cache::would_admit`]): it refuses a
+    /// boundary that only barely extends a kept one when the two cannot both
+    /// fit, and a request tail behind boundaries that fill the budget.
+    pub(super) fn disk_would_keep(&self, tokens: &[u32], reusable_boundary: bool) -> bool {
+        self.prompt_cache_disk_bytes > 0
+            && self.prompt_cache_dir.is_some()
+            && prompt_cache::would_admit(
+                &self.disk_snapshots,
+                tokens,
+                self.snapshot_bytes(tokens.len()),
+                reusable_boundary,
+                self.prompt_cache_disk_bytes,
+            )
     }
 
     /// Keep what the resident set still holds after a request on it ended
