@@ -73,6 +73,31 @@ fn authentication_is_off_until_the_first_admin_key_and_then_required() {
 }
 
 #[test]
+fn a_busy_last_used_write_never_fails_authentication() {
+    let (_dir, admin) = open();
+    let created = admin
+        .create_admin_key("first", None, &Actor::Owner)
+        .unwrap();
+    // Another writer holds the write lock throughout; the first use of the
+    // key wants to record `last_used_at`.
+    let writer = rusqlite::Connection::open(admin.store().root().join(crate::DATABASE)).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        granted(&admin, &created.value),
+        Credential::Admin {
+            key_id: created.object.id.clone()
+        }
+    );
+    assert!(
+        started.elapsed() < crate::BUSY_TIMEOUT,
+        "{:?}",
+        started.elapsed()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
 fn keys_are_stored_only_as_salted_hmacs_and_shown_redacted() {
     let (_dir, admin) = open();
     let first = admin.create_admin_key("a", None, &Actor::Owner).unwrap();

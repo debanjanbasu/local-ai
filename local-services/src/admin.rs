@@ -573,8 +573,7 @@ impl Admin {
 
     /// Check bearer token `token` (without the `Bearer ` prefix).
     pub fn authenticate(&self, token: Option<&str>) -> Result<Verdict> {
-        // A pooled connection: no database connection is opened per request.
-        authenticate(&*self.store.connection()?, token)
+        authenticate(&self.store, token)
     }
 
     /// Create an admin API key, turning authentication on.
@@ -1140,8 +1139,12 @@ type Found = (
     Option<i64>,
 );
 
-fn authenticate(connection: &Connection, token: Option<&str>) -> Result<Verdict> {
-    if !auth_enabled(connection)? {
+/// Check `token`, reading through a pooled connection. The once-a-minute
+/// `last_used_at` update is best-effort: a busy or failing write is skipped,
+/// never turned into a failed check.
+fn authenticate(store: &Store, token: Option<&str>) -> Result<Verdict> {
+    let connection = store.connection()?;
+    if !auth_enabled(&connection)? {
         return Ok(Verdict::Open);
     }
     let Some(token) = token else {
@@ -1192,14 +1195,18 @@ fn authenticate(connection: &Connection, token: Option<&str>) -> Result<Verdict>
     if archived.is_some() {
         return Ok(Verdict::Refused("the API key's project is archived"));
     }
+    drop(connection);
     if last_used.is_none_or(|last| now - last >= LAST_USED_GRANULARITY) {
-        connection.execute(
-            &format!(
-                "UPDATE {} SET last_used_at = ?2 WHERE id = ?1",
-                kind.table()
-            ),
-            params![id, now],
-        )?;
+        store.write_best_effort(|connection| {
+            connection.execute(
+                &format!(
+                    "UPDATE {} SET last_used_at = ?2 WHERE id = ?1",
+                    kind.table()
+                ),
+                params![id, now],
+            )?;
+            Ok(())
+        });
     }
     Ok(Verdict::Granted(match (kind, project, account) {
         (KeyKind::Project, Some(project_id), Some(service_account_id)) => Credential::Project {

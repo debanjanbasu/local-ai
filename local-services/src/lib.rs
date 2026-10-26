@@ -63,6 +63,9 @@ const DATABASE: &str = "services.sqlite3";
 const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 /// How long a writer waits for another writer before failing with `SQLITE_BUSY`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a best-effort write ([`Store::write_best_effort`]) waits for
+/// another writer before it is skipped.
+const BEST_EFFORT_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 /// Idle connections a store keeps for reuse.
 const MAX_IDLE_CONNECTIONS: usize = 8;
 
@@ -176,6 +179,23 @@ impl Store {
             connection: Some(connection),
             idle: Arc::clone(&self.idle),
         })
+    }
+
+    /// Run `write`, a write whose loss is harmless (a last-used time, say),
+    /// waiting at most [`BEST_EFFORT_BUSY_TIMEOUT`] for another writer.
+    /// Every failure is ignored: it must never fail the operation it
+    /// accompanies.
+    pub(crate) fn write_best_effort(&self, write: impl FnOnce(&Connection) -> Result<()>) {
+        let Ok(mut connection) = self.connection() else {
+            return;
+        };
+        if connection.busy_timeout(BEST_EFFORT_BUSY_TIMEOUT).is_ok() {
+            let _ = write(&connection);
+        }
+        if connection.busy_timeout(BUSY_TIMEOUT).is_err() {
+            // Not returned to the pool with the short timeout.
+            drop(connection.connection.take());
+        }
     }
 }
 
