@@ -73,7 +73,7 @@ const MAX_IDLE_CONNECTIONS: usize = 8;
 ///
 /// Each operation takes a connection from a small pool shared by the clones
 /// (opening one when none is idle) and returns it afterwards, so a `Store`
-/// holds at most [`MAX_IDLE_CONNECTIONS`] idle connections and no lock
+/// holds at most eight idle connections and no lock
 /// between calls.
 #[derive(Clone, Debug)]
 pub struct Store {
