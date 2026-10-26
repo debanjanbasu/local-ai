@@ -148,6 +148,24 @@ fn a_busy_activity_write_never_fails_a_search() {
 }
 
 #[test]
+fn an_expired_source_file_is_no_longer_searchable() {
+    let root = TempRoot::new();
+    let (store, index) = root.open();
+    let alpha = file(&store, "a.txt", "expiring secret");
+    let beta = file(&store, "b.txt", "lasting secret");
+    let id = vector_store(&store, &[&alpha, &beta]);
+    index_all(&index);
+    assert_eq!(search(&index, &id, "secret").len(), 2);
+    // Its expiry passes; nothing has purged it yet.
+    raw(&store)
+        .execute("UPDATE files SET expires_at = 1 WHERE id = ?1", [&alpha])
+        .unwrap();
+    let found = search(&index, &id, "secret");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, beta);
+}
+
+#[test]
 fn files_are_indexed_searched_and_read_back() {
     let root = TempRoot::new();
     let (store, index) = root.open();

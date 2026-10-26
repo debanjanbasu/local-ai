@@ -158,8 +158,9 @@ the metadata), `delete_conversation`, `add_items`, `list_items`, `get_item`,
   left out of listings, and expired uploads refuse every change. Bytes are
   removed physically only by `purge_file_storage()`, which also deletes
   expired upload parts, staging blobs abandoned for more than 24 hours, and
-  orphaned disk entries. The server calls it once at startup. There is no
-  background sweeper. Upload rows remain as small metadata records.
+  orphaned disk entries. The server calls it at startup, and the vector
+  store indexer every 15 minutes (a timer, since no event announces that an
+  expiry time has passed). Upload rows remain as small metadata records.
 
 ## Batches
 
@@ -218,7 +219,9 @@ contract, limits and semantics are the module docs; the essentials:
   `invalid_file`) and the file ends `completed`, `failed` or, after its
   batch is cancelled, `cancelled`. Chunk sizes (`auto` = 800/400,
   `static` = 100 to 4,096 with overlap at most half) count whitespace words,
-  not model tokens. Deleting the source File removes it from every store.
+  not model tokens. Deleting the source File removes it from every store;
+  an expired one is left out of searches at once and removed by the next
+  purge.
 - **Expiry.** `expires_after` (`last_active_at`, 1 to 365 days); an expired
   store reads as `expired` and refuses search and attachments with a
   conflict. Searches record activity at most once a minute per store,
@@ -358,8 +361,8 @@ the one Tantivy path instead.
 The following are not part of this crate:
 
 - Encryption at rest.
-- A background sweeper or poller (the vector store indexer runs only when
-  notified).
+- A background poller (the vector store indexer runs when notified, plus
+  the 15-minute purge of expired Files).
 - An embedding model: vector stores take one through the `ChunkEmbedder`
   trait (the server supplies the native encoder) and are lexical without it.
 - Physical purge of deleted conversations.

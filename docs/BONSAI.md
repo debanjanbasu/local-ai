@@ -1552,8 +1552,10 @@ preparation and generation blocking tasks, never on runtime workers.
   optional `md5`. At most 4 multipart transfers and 16 downloads run at once;
   past that the answer is a 503 with `Retry-After: 1`. Expired objects are a
   404, and changes to an expired or cancelled upload are a 410. Expiry is
-  enforced on access. Bytes are purged physically only at startup or through
-  the native `purge_file_storage`. A `purpose` is stored and echoed only; it
+  enforced on access. Bytes are purged physically at startup, every 15
+  minutes by the vector store indexer, or through the native
+  `purge_file_storage`; vector store searches leave an expired File out at
+  once. A `purpose` is stored and echoed only; it
   enables no processing.
 - **Batches.** These run `/v1/responses` and `/v1/chat/completions`, with
   `completion_window: "24h"`, on the loaded model, whatever generation model

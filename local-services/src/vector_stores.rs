@@ -205,6 +205,7 @@ use std::collections::HashSet;
 use std::io::Read as _;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -1451,20 +1452,25 @@ fn writable_store(connection: &Connection, store_id: &str) -> Result<VectorStore
 }
 
 /// The attachment IDs of the completed files of `store_id` that `filter`
-/// admits (attributes are only parsed when there is a filter).
+/// admits (attributes are only parsed when there is a filter), leaving out
+/// those whose source File has expired: expiry hides a File at once, while
+/// its attachment is only removed when the purge deletes the File.
 fn searchable_files(
     connection: &Connection,
     store_id: &str,
     filter: Option<&Filter>,
 ) -> Result<Vec<String>> {
     let mut statement = connection.prepare(
-        "SELECT attach_id, CASE WHEN ?2 THEN attributes END FROM vector_store_files
-         WHERE store_id = ?1 AND status = 'completed'",
+        "SELECT v.attach_id, CASE WHEN ?2 THEN v.attributes END FROM vector_store_files v
+         WHERE v.store_id = ?1 AND v.status = 'completed'
+           AND EXISTS (SELECT 1 FROM files f WHERE f.id = v.file_id
+                       AND (f.expires_at IS NULL OR f.expires_at > ?3))",
     )?;
     let rows = statement
-        .query_map(params![store_id, filter.is_some()], |row| {
-            Ok((row.get(0)?, row.get::<_, Option<String>>(1)?))
-        })?
+        .query_map(
+            params![store_id, filter.is_some(), signed(now()?)?],
+            |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<(String, Option<String>)>>>()?;
     let mut files = Vec::with_capacity(rows.len());
     for (attach_id, attributes) in rows {
@@ -1962,7 +1968,8 @@ fn load_file(connection: &Connection, store_id: &str, file_id: &str) -> Result<V
 }
 
 /// The background indexer: one thread that indexes `in_progress` files when
-/// notified, never polling.
+/// notified, never polling, and every [`PURGE_INTERVAL`] purges expired
+/// Files.
 ///
 /// It runs once when started (resuming files a stopped process left
 /// `in_progress`), then once per [`Self::notify`] (coalesced). Each run
@@ -2052,21 +2059,43 @@ impl Drop for VectorStoreIndexer {
     }
 }
 
+/// How often the indexer purges the storage of expired Files.
+///
+/// [`Store::purge_file_storage`] also removes them from every vector store.
+/// Expiry is time passing, which no event announces, so this one job runs
+/// on a timer; searches already leave expired Files out.
+pub const PURGE_INTERVAL: Duration = Duration::from_mins(15);
+
 fn run_indexer(index: &VectorIndex, shared: &Shared) {
+    let mut next_purge = Instant::now() + PURGE_INTERVAL;
     loop {
-        let target = {
+        let (target, purge) = {
             let mut signals = shared.lock();
-            while signals.finished == signals.requested && !signals.stopping {
+            loop {
+                if signals.stopping {
+                    return;
+                }
+                if signals.finished != signals.requested {
+                    break (signals.requested, false);
+                }
+                let now = Instant::now();
+                if now >= next_purge {
+                    break (signals.requested, true);
+                }
                 signals = shared
                     .changed
-                    .wait(signals)
-                    .unwrap_or_else(PoisonError::into_inner);
+                    .wait_timeout(signals, next_purge - now)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
-            if signals.stopping {
-                return;
-            }
-            signals.requested
         };
+        if purge {
+            next_purge = Instant::now() + PURGE_INTERVAL;
+            // Its deletions queue the attachments for the collection below.
+            if let Err(error) = index.store().purge_file_storage() {
+                eprintln!("warning: purging expired files failed: {error}");
+            }
+        }
         if let Err(error) = index.collect_garbage() {
             // Still queued; the next run or start retries.
             eprintln!(
