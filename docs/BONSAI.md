@@ -3668,23 +3668,46 @@ their own entry, not with current rates.
   prompt on an M2, so a budget below that abandons healthy non-streaming
   requests. The floor is 10 rather than a rounder number because it sits an
   order of magnitude above the worst gap actually observed.
-- Pipelining greedy plain decode (October 2026): encoding and committing
-  token N+1 before waiting on token N, with the argmax left on the device
-  and `draft_embed_inverse` gathering the next embedding row from it. Not
-  built: the most it can recover is the GPU's idle time between tokens,
-  0.32 ms of a 31.17 ms token in the per-token profile above (1.0%), and it
-  is not free. Plain decode updates recurrent state in place, so the token
-  run past an end of sequence cannot be discarded without a 151 MB state
-  copy per token or a verify-style rollback; left in place, the sequence
-  holds one token more than the request, and the request's closing prompt
-  checkpoint, which needs the state at exactly its tokens, is lost (the GPU
-  tier is cleared). The extra token also costs a whole decode step at the end
-  of every request (0.3% of a 300-token answer), and the scheduler, which
-  admits requests and swaps sequences between steps, would have to drain the
-  token in flight first. A gain under 1% sits inside the 4% spread of
-  `tools/benchmark.py` runs, against a lost prompt checkpoint per request,
-  so it was rejected without a prototype. It would apply only to
-  `--no-speculation` and to models without the MTP head.
+- Pipelining greedy plain decode (October 2026, prototype `408924e`,
+  reverted in the next commit): a lone greedy plain decode committed the pass
+  of token N+1 before waiting for token N. That pass gathered its embedding
+  on the GPU from token N's argmax (`draft_embed_inverse` over a second
+  `GreedyRows` selector, so the host read one while the pass in flight wrote
+  the other) and wrote the recurrent state and convolution history out of
+  place into a spare set (157 MB), which then swapped with the layers' own.
+  The state before the pass in flight survived until the next pass was
+  committed, so a pass that guessed wrong (an end of sequence, a client
+  stop, an admission, a lookup round) rolled back by swapping again and
+  stepping the position back, and the request's closing prompt checkpoint
+  was exactly the one-pass-at-a-time one; every other use of the model first
+  waited for and rolled back the pass in flight. Greedy text was
+  byte-identical to the unpipelined build on six prompts at 300 tokens, and
+  a real-model test matched tokens, the closing checkpoint and the next turn
+  after end-of-sequence, token-limit and client-stop endings. GPU timestamps
+  over 256 tokens (M4 Pro, five interleaved pairs in one process): idle
+  between tokens 0.25–0.78 ms per token unpipelined (0.25–0.31 with the CPU
+  quiet), 0.013–0.031 ms pipelined; wall time per token moved by 0.03–1.1 ms
+  (best 33.17 to 32.84 ms) while GPU busy time moved 1.7 ms between rounds.
+  `tools/benchmark.py --no-speculation`, 300 tokens, the two builds
+  interleaved, best of four (load average 4–8 of 14 from other agents' jobs):
+
+  | Prompt | One pass at a time | Pipelined |
+  | --- | ---: | ---: |
+  | Planets, one per line (209 tokens, end of sequence) | 30.61 tok/s | 30.71 tok/s |
+  | Essay on lighthouses | 29.99 | 30.13 |
+  | Hash map collisions | 30.36 | 30.81 |
+  | 1234 × 5678 step by step | 30.92 | 31.45 |
+  | Rust linked-list reversal | 32.08 | 32.32 |
+  | Causes of the French Revolution (293 tokens, end of sequence) | 32.02 | 32.32 |
+
+  Every prompt gained, 0.3–1.7% (geomean 0.95%, about the idle time it
+  removed), but each gain sits inside that run's own spread (1–8% between a
+  build's best and worst sample). It applies only where no MTP head drafts
+  and no lookup matches, which the default configuration never is, and it
+  is not free: the spare state, a wasted pass (and about 33 ms longer
+  request) at every end of sequence, a wasted pass at every stop, admission
+  or lookup round that follows a pipelined one, and a settle before every
+  other use of the model. Rejected.
 
 ## Verification
 
