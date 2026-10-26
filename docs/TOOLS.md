@@ -225,8 +225,9 @@ verified by the macOS trust store. The body is capped at 256 KiB.
 
 Remote image and video URLs in chat requests use the same transport
 (`tools::fetch::download`) with the same address checks but no allowlist,
-public IP literals allowed, up to five redirects each checked anew, and a
-64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
+public IP literals allowed, up to five redirects each checked anew (never
+from `https` to `http`), the media type checked before the body is read, and
+a 64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
 
 **Known gaps** (stated, not papered over):
 

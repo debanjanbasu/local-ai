@@ -11,7 +11,7 @@
 //!   between (no DNS rebinding).
 //! - Redirects are reported, never followed: the model may fetch the target
 //!   itself, through the same checks. ([`download`] follows up to five, each
-//!   target checked anew.)
+//!   target checked anew, never from `https` to `http`.)
 //! - `https` is verified by the platform verifier (the macOS trust store).
 //! - The body is read up to the byte limit and the connection then dropped,
 //!   with a marker saying the text was cut; the caller's deadline bounds the
@@ -301,10 +301,17 @@ pub struct Download {
 /// `GET` `url` from any public host, for media a request names.
 ///
 /// A host by name or public IP literal, with the address checks of
-/// [`fetch`] but no allowlist. Up to five redirects are followed, each target checked anew; a status
-/// other than success, or a body over `max_bytes`, fails. The caller's
-/// deadline bounds the whole exchange.
-pub async fn download(url: &str, max_bytes: usize) -> Result<Download, ToolError> {
+/// [`fetch`] but no allowlist. Up to five redirects are followed, each
+/// target checked anew, never from `https` to `http`. A status other than
+/// success, a `Content-Type` that `accept` refuses (it gets the header's
+/// value, or `None` without one; checked before any of the body is read),
+/// or a body over `max_bytes`, fails. The caller's deadline bounds the whole
+/// exchange.
+pub async fn download(
+    url: &str,
+    max_bytes: usize,
+    accept: impl Fn(Option<&str>) -> bool,
+) -> Result<Download, ToolError> {
     let mut target = parse(url)?;
     for _ in 0..=MAX_REDIRECTS {
         let (response, _connection) = open(&target).await?;
@@ -317,7 +324,7 @@ pub async fn download(url: &str, max_bytes: usize) -> Result<Download, ToolError
                 .ok_or_else(|| {
                     ToolError::Failed(format!("HTTP {} without a Location", status.as_u16()))
                 })?;
-            target = parse(&join(&target, location))?;
+            target = redirect(&target, location)?;
             continue;
         }
         if !status.is_success() {
@@ -339,6 +346,12 @@ pub async fn download(url: &str, max_bytes: usize) -> Result<Download, ToolError
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        if !accept(content_type.as_deref()) {
+            return Err(ToolError::Denied(format!(
+                "the response's content type {} is not accepted",
+                content_type.as_deref().unwrap_or("(none)")
+            )));
+        }
         let mut body = response.into_body();
         let mut kept = Vec::new();
         while let Some(frame) = body.frame().await {
@@ -360,6 +373,18 @@ pub async fn download(url: &str, max_bytes: usize) -> Result<Download, ToolError
     Err(ToolError::Failed(format!(
         "more than {MAX_REDIRECTS} redirects"
     )))
+}
+
+/// The target a redirect from `base` to `location` names, refusing a
+/// downgrade from `https` to `http`.
+fn redirect(base: &Target, location: &str) -> Result<Target, ToolError> {
+    let next = parse(&join(base, location))?;
+    if base.https && !next.https {
+        return Err(ToolError::Denied(
+            "a redirect from https to http is never followed".into(),
+        ));
+    }
+    Ok(next)
 }
 
 /// `location` (absolute, scheme-relative, absolute-path or relative) resolved
@@ -436,5 +461,25 @@ mod tests {
         let v6 = super::parse("http://[2606:4700::1]/p/q").expect("url");
         assert_eq!(v6.host, "2606:4700::1");
         assert_eq!(super::join(&v6, "r"), "http://[2606:4700::1]/p/r");
+    }
+
+    #[test]
+    fn redirects_never_downgrade_https_to_http() {
+        let secure = super::parse("https://cdn.example.com/a.png").expect("url");
+        assert!(matches!(
+            super::redirect(&secure, "http://cdn.example.com/a.png"),
+            Err(super::ToolError::Denied(_))
+        ));
+        assert!(
+            super::redirect(&secure, "/b.png")
+                .expect("same scheme")
+                .https
+        );
+        let plain = super::parse("http://cdn.example.com/a.png").expect("url");
+        assert!(
+            super::redirect(&plain, "https://cdn.example.com/a.png")
+                .expect("upgrade")
+                .https
+        );
     }
 }

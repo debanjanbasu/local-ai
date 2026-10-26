@@ -199,7 +199,9 @@ fn remote(url: &str, kind: Kind) -> crate::Result<Arc<[u8]>> {
         let download = block_on(async {
             tokio::time::timeout(
                 FETCH_TIMEOUT,
-                local_services::tools::fetch::download(url, MAX_MEDIA_BYTES),
+                local_services::tools::fetch::download(url, MAX_MEDIA_BYTES, |content_type| {
+                    check_content_type(url, content_type, kind).is_ok()
+                }),
             )
             .await
         })?
