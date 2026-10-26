@@ -156,7 +156,10 @@
 //!   change. Each batch replaces a file's vectors and sets its space in one
 //!   transaction, only if it is still the same completed attachment. A new
 //!   attachment interrupts the backfill after the current batch, so new
-//!   files are indexed first.
+//!   files are indexed first. A file whose embedding fails is skipped (the
+//!   rest of its batch is still committed) and, for the life of the
+//!   process, retried only once no other file waits, so one file the model
+//!   cannot embed never holds the backfill up.
 //! * Opening the index ([`VectorIndex::check`]) deletes vector rows outside
 //!   the invariant and drops the vectors of any embedded file whose rows do
 //!   not match its chunks one to one (the backfill embeds it again).

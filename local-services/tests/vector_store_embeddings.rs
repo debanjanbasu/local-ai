@@ -70,7 +70,12 @@ impl ChunkEmbedder for Fake {
         texts: &[&str],
         stop: &dyn Fn() -> bool,
     ) -> local_services::Result<Vec<Vec<f32>>> {
-        if self.fail.load(Ordering::SeqCst) || stop() {
+        // A document containing "poison" always fails, as one file a model
+        // cannot embed would.
+        if self.fail.load(Ordering::SeqCst)
+            || stop()
+            || texts.iter().any(|text| text.contains("poison"))
+        {
             return Err(Error::Io(std::io::Error::other("fake embedding failure")));
         }
         self.documents.fetch_add(texts.len(), Ordering::SeqCst);
@@ -622,4 +627,32 @@ fn embedding_failures_leave_files_searchable_and_retry_later() {
     assert_eq!(index.embed_next().unwrap(), 1);
     assert_vectors_match_chunks(&store);
     assert_eq!(search(&index, &id, "automobile", Ranker::Auto)[0].0, alpha);
+}
+
+#[test]
+fn a_file_that_cannot_be_embedded_never_holds_up_the_backfill() {
+    let root = TempRoot::new();
+    let fake = Fake::new("fake/1");
+    let (store, index) = root.open(Some(&fake));
+    // Indexed while embedding failed: both wait for the backfill, the
+    // file that can never be embedded first.
+    let poisoned = file(&store, "a.txt", "poison car manual");
+    let healthy = file(&store, "b.txt", "automobile repair notes");
+    let id = vector_store(&store, &[&poisoned, &healthy]);
+    fake.fail.store(true, Ordering::SeqCst);
+    index_all(&index);
+    fake.fail.store(false, Ordering::SeqCst);
+    assert_eq!(vectors(&store), 0);
+    // The healthy file is embedded and committed despite the other one.
+    assert_eq!(index.embed_next().unwrap(), 1);
+    let spaces = spaces(&store);
+    assert_eq!(spaces[&healthy].as_deref(), Some("fake/1"));
+    assert_eq!(spaces[&poisoned], None);
+    assert_vectors_match_chunks(&store);
+    // Only the failing file is left: it is retried, and fails alone.
+    assert!(index.embed_next().is_err());
+    assert_eq!(
+        search(&index, &id, "automobile", Ranker::Auto)[0].0,
+        healthy
+    );
 }

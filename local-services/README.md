@@ -232,7 +232,9 @@ process gets a conflict) and is the native search API (`search`, and
 `file_search` tool); `VectorStoreIndexer` is the event-driven worker thread
 (woken by `notify`, never polling) that calls `collect_garbage`,
 `index_next` and then `embed_next`, the embedding backfill of completed
-files without vectors in the installed model's space.
+files without vectors in the installed model's space (a file that fails to
+embed is skipped and retried only after the others, so it cannot hold the
+backfill up).
 
 ### Index consistency
 
