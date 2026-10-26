@@ -155,15 +155,22 @@ impl GpuTopK {
         Ok(())
     }
 
-    /// Read the first `k` results after GPU completion.
+    /// Copy the first `k` results after GPU completion.
+    ///
+    /// The results are copied, not borrowed, so a later [`Self::encode`] can
+    /// never write under a live reference.
     ///
     /// # Panics
     ///
     /// Panics when `k` exceeds [`MAX_TOP_K`].
     #[must_use]
-    pub fn candidates(&self, k: usize) -> &[TopKCandidate] {
+    #[allow(unsafe_code)]
+    pub fn candidates(&self, k: usize) -> Vec<TopKCandidate> {
         assert!(k <= MAX_TOP_K, "candidate count exceeds maximum top-k");
-        &self.output.as_slice()[..k]
+        // SAFETY: the borrow ends with this copy. The output buffer is private
+        // to this workspace and not `Sync`, so no CPU writer runs meanwhile, and
+        // the caller reads after the GPU work from `encode` has completed.
+        unsafe { self.output.as_slice::<TopKCandidate>()[..k].to_vec() }
     }
 
     #[must_use]
@@ -311,24 +318,33 @@ impl LogprobRows {
     ///
     /// Panics when `row` is outside the workspace.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn log_sum_exp(&self, row: usize) -> f32 {
-        self.lse.as_slice::<f32>()[row]
+        // SAFETY: the borrow ends with this copy. The buffer is private to this
+        // workspace and not `Sync`, so no CPU writer runs meanwhile, and the
+        // caller reads after the GPU work from `encode` has completed.
+        unsafe { self.lse.as_slice::<f32>()[row] }
     }
 
     /// Row `row`'s best `k` logits, best first, from the last completed
-    /// [`Self::encode`] (which must have selected at least `k`).
+    /// [`Self::encode`] (which must have selected at least `k`). The logits
+    /// are copied, so a later encode cannot write under a live reference.
     ///
     /// # Panics
     ///
     /// Panics when `row` is outside the workspace or `k` exceeds [`MAX_TOP_LOGPROBS`].
     #[must_use]
-    pub fn top(&self, row: usize, k: usize) -> &[TopKCandidate] {
+    #[allow(unsafe_code)]
+    pub fn top(&self, row: usize, k: usize) -> Vec<TopKCandidate> {
         assert!(
             k <= MAX_TOP_LOGPROBS,
             "log-probability count exceeds the maximum"
         );
         let start = row * MAX_TOP_LOGPROBS;
-        &self.top.as_slice::<TopKCandidate>()[start..start + k]
+        // SAFETY: the borrow ends with this copy. The buffer is private to this
+        // workspace and not `Sync`, so no CPU writer runs meanwhile, and the
+        // caller reads after the GPU work from `encode` has completed.
+        unsafe { self.top.as_slice::<TopKCandidate>()[start..start + k].to_vec() }
     }
 
     #[must_use]

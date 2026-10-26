@@ -410,7 +410,8 @@ static inline float bonsai_kv_load(
 
 // All 32 lanes of one SIMD group store one block; `value` is this lane's
 // element. The scale is rounded to F16 before quantizing so the stored
-// integers match the scale readers will multiply by.
+// integers match the scale readers will multiply by. It saturates at F16's
+// largest value: an infinite scale would read back as 0 * inf = NaN.
 static inline void bonsai_kv_store(
     device uchar *cache, uint format, ulong token, uint head, uint block, uint lane, float value
 ) {
@@ -422,7 +423,7 @@ static inline void bonsai_kv_store(
     const float peak = simd_max(abs(value));
     if (format == BONSAI_KV_Q8) {
         device uchar *row = cache + token * BONSAI_KV_Q8_TOKEN_BYTES;
-        const half scale = half(peak / 127.0f);
+        const half scale = half(min(peak / 127.0f, 65504.0f));
         const float inverse = scale > half(0.0f) ? 1.0f / float(scale) : 0.0f;
         reinterpret_cast<device char *>(row)[head * 256 + block * 32 + lane] =
             char(clamp(rint(value * inverse), -127.0f, 127.0f));

@@ -783,7 +783,8 @@ fn ternary_projection_matches_cpu_reference() {
                 })
                 .sum()
         };
-        let gpu = output.as_slice::<f32>();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let gpu = unsafe { output.as_slice::<f32>() };
         for token in 0..tokens {
             let reference = forward_rotation(&input[token * columns..][..columns], signs);
             let expected: Vec<f64> = (0..rows).map(|row| project(0, &reference, row)).collect();
@@ -798,7 +799,8 @@ fn ternary_projection_matches_cpu_reference() {
                 );
             }
             if tokens == 1 {
-                let fused = fused.as_slice::<f32>();
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                let fused = unsafe { fused.as_slice::<f32>() };
                 let values: Vec<f64> = expected
                     .iter()
                     .enumerate()

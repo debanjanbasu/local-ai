@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![allow(unsafe_code, clippy::expect_used)]
 
 use local_metal::{
     batch::CommandBatch,
@@ -55,8 +55,13 @@ fn bf16_expansion_preserves_values_outside_f16_range() {
     .expect("encode");
     batch.commit_and_wait().expect("run");
     let expected = f64::from(f32::from_bits(0x47c3_0000)) - 6.0 - 2.0 + 16384.0;
-    assert!((f64::from(y.as_slice::<f32>()[0]) - expected).abs() < 0.02);
-    assert_eq!(y.as_slice::<f32>()[1], 12345.0, "guard tail changed");
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert!((f64::from(unsafe { y.as_slice::<f32>() }[0]) - expected).abs() < 0.02);
+    assert_eq!(
+        unsafe { y.as_slice::<f32>() }[1],
+        12345.0,
+        "guard tail changed"
+    );
 }
 
 #[test]
@@ -79,16 +84,24 @@ fn signed_decay_and_tiny_l2_use_pinned_formulas() {
     ops.l2_normalize_qk(&mut batch, &q, 1.0e-12).expect("l2");
     batch.commit_and_wait().expect("run");
     let softplus = (-0.25_f64).exp().ln_1p();
-    assert!((f64::from(decay.as_slice::<f32>()[0]) - (-2.0 * softplus).exp()).abs() < 2e-6);
-    assert!((f64::from(beta.as_slice::<f32>()[0]) - 1.0 / (1.0 + 1.0_f64.exp())).abs() < 2e-6);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert!(
+        (f64::from(unsafe { decay.as_slice::<f32>() }[0]) - (-2.0 * softplus).exp()).abs() < 2e-6
+    );
+    assert!(
+        (f64::from(unsafe { beta.as_slice::<f32>() }[0]) - 1.0 / (1.0 + 1.0_f64.exp())).abs()
+            < 2e-6
+    );
     for head in 0..32 {
         let expected = if head % 2 == 0 { 1.0_f32 } else { -0.001 };
         assert!(
-            (q.as_slice::<f32>()[head * 128 + head] - expected).abs() < 1e-6,
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            (unsafe { q.as_slice::<f32>() }[head * 128 + head] - expected).abs() < 1e-6,
             "head {head}: must clamp sqrt, not add epsilon"
         );
     }
-    assert_eq!(&q.as_slice::<f32>()[4096..], &[0.0; 7]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { q.as_slice::<f32>() }[4096..], &[0.0; 7]);
 }
 
 #[test]
@@ -117,7 +130,12 @@ fn guarded(context: &MetalContext, count: usize) -> MetalBuffer {
 }
 
 fn check(buffer: &MetalBuffer, expected: &[f64], tolerance: f64) {
-    for (index, (&actual, &expected)) in buffer.as_slice::<f32>().iter().zip(expected).enumerate() {
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    for (index, (&actual, &expected)) in unsafe { buffer.as_slice::<f32>() }
+        .iter()
+        .zip(expected)
+        .enumerate()
+    {
         assert!(
             actual.is_finite()
                 && (f64::from(actual) - expected).abs() <= tolerance * (1.0 + expected.abs()),
@@ -125,7 +143,8 @@ fn check(buffer: &MetalBuffer, expected: &[f64], tolerance: f64) {
         );
     }
     assert!(
-        buffer.as_slice::<f32>()[expected.len()..]
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { buffer.as_slice::<f32>() }[expected.len()..]
             .iter()
             .all(|v| v.is_nan()),
         "tail overwritten"
@@ -169,17 +188,20 @@ fn rms_all_rows_and_elementwise_tails_match_f64() {
             .recip();
         for (i, &value) in values.iter().enumerate() {
             let expected = f64::from(value) * inverse * f64::from(weights_data[i + 2]);
-            let actual = output.as_slice::<f32>()[row * stride + i];
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            let actual = unsafe { output.as_slice::<f32>() }[row * stride + i];
             assert!(actual.is_finite() && (f64::from(actual) - expected).abs() < 2e-6);
         }
         assert!(
-            output.as_slice::<f32>()[row * stride + dimension..(row + 1) * stride]
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { output.as_slice::<f32>() }[row * stride + dimension..(row + 1) * stride]
                 .iter()
                 .all(|v| v.is_nan())
         );
     }
     assert!(
-        output.as_slice::<f32>()[rows * stride..]
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { output.as_slice::<f32>() }[rows * stride..]
             .iter()
             .all(|v| v.is_nan())
     );
@@ -320,8 +342,11 @@ fn bf16_matmul_rows_match_f64_and_are_bitwise_the_matvec() {
                 ops.bf16_matvec(&mut batch, matrix(index), &row_input, &row_output)
                     .expect("BF16 matvec");
                 batch.commit_and_wait().expect("matvec completion");
-                by_matvec.as_mut_slice::<f32>()[token * rows..(token + 1) * rows]
-                    .copy_from_slice(&row_output.as_slice::<f32>()[..rows]);
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                unsafe {
+                    by_matvec.as_mut_slice::<f32>()[token * rows..(token + 1) * rows]
+                        .copy_from_slice(&row_output.as_slice::<f32>()[..rows]);
+                }
             }
         }
         for (index, packed) in packed.iter().enumerate() {
@@ -341,10 +366,13 @@ fn bf16_matmul_rows_match_f64_and_are_bitwise_the_matvec() {
                 .collect::<Vec<_>>();
             check(&pair[index], &expected, 3e-5);
             let bits = |buffer: &MetalBuffer| {
-                buffer.as_slice::<f32>()[..rows * tokens]
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>()
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                unsafe {
+                    buffer.as_slice::<f32>()[..rows * tokens]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                }
             };
             assert_eq!(
                 bits(&pair[index]),
@@ -561,10 +589,11 @@ fn attention_preparation_splits_every_head_and_rotates_only_first64() {
         let expected_key = (0..4)
             .flat_map(|h| normalized_rope(&k_data[h * 256..][..256], &key_norm_data, position))
             .collect::<Vec<_>>();
-        for (i, (&actual_k, &actual_v)) in kc
-            .as_slice::<half::f16>()
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        for (i, (&actual_k, &actual_v)) in unsafe { kc.as_slice::<half::f16>() }
             .iter()
-            .zip(vc.as_slice::<half::f16>())
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            .zip(unsafe { vc.as_slice::<half::f16>() })
             .enumerate()
         {
             if (position as usize * 1024..(position as usize + 1) * 1024).contains(&i) {
@@ -660,10 +689,11 @@ fn kv_preparation_matches_full_preparation_rows_bitwise_and_touches_nothing_else
             })
         })
         .collect::<Vec<_>>();
-    let only_k = only_k.as_slice::<half::f16>();
-    let only_v = only_v.as_slice::<half::f16>();
-    let full_k = full_k.as_slice::<half::f16>();
-    let full_v = full_v.as_slice::<half::f16>();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let only_k = unsafe { only_k.as_slice::<half::f16>() };
+    let only_v = unsafe { only_v.as_slice::<half::f16>() };
+    let full_k = unsafe { full_k.as_slice::<half::f16>() };
+    let full_v = unsafe { full_v.as_slice::<half::f16>() };
     assert_eq!(only_k.len(), nan_cache.len());
     for i in 0..nan_cache.len() {
         if written.contains(&i) {
@@ -996,13 +1026,15 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
         .expect("kv preparation");
         batch.commit_and_wait().expect("preparation completion");
         assert_eq!(
-            only_k.as_slice::<u8>(),
-            full_k.as_slice::<u8>(),
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { only_k.as_slice::<u8>() },
+            unsafe { full_k.as_slice::<u8>() },
             "{layout:?} keys"
         );
         assert_eq!(
-            only_v.as_slice::<u8>(),
-            full_v.as_slice::<u8>(),
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { only_v.as_slice::<u8>() },
+            unsafe { full_v.as_slice::<u8>() },
             "{layout:?} values"
         );
 
@@ -1010,7 +1042,8 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
             (layout.key, &only_k, &expected_key, "key"),
             (layout.value, &only_v, &expected_value, "value"),
         ] {
-            let bytes = cache.as_slice::<u8>();
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            let bytes = unsafe { cache.as_slice::<u8>() };
             let row_bytes = format.token_bytes();
             let written = position as usize * row_bytes..(position + tokens) as usize * row_bytes;
             assert!(
@@ -1055,6 +1088,57 @@ fn quantized_kv_rows_written_by_gpu_decode_within_half_scale_and_touch_nothing_e
             }
         }
     }
+}
+
+/// A Q8 block whose peak exceeds 127 times F16's largest value must store a
+/// saturated finite scale, not infinity, which readers would turn into NaN
+/// (0 * inf) for every zero code of the block.
+#[test]
+fn q8_kv_scale_saturates_instead_of_overflowing() {
+    let Some((ctx, ops)) = setup() else { return };
+    let layout = KvLayout::parse("q8").expect("layout");
+    // Values are stored unnormalized; their rotated peaks reach about 1e9.
+    let value = floats(
+        &ctx,
+        &(0..1024).map(|i| signal(i, 31) * 1.0e9).collect::<Vec<_>>(),
+    );
+    let key = floats(&ctx, &(0..1024).map(|i| signal(i, 11)).collect::<Vec<_>>());
+    let kw = floats(&ctx, &[1.0f32; 256]);
+    let k_cache = MetalBuffer::empty(ctx.device(), layout.key.token_bytes()).expect("keys");
+    let v_cache = MetalBuffer::empty(ctx.device(), layout.value.token_bytes()).expect("values");
+    let mut batch = CommandBatch::new(&ctx).expect("batch");
+    ops.prepare_kv_rows_kv(
+        layout,
+        &mut batch,
+        &key,
+        &value,
+        &kw,
+        &k_cache,
+        &v_cache,
+        0,
+        1,
+        1e-6,
+        10_000_000.0,
+        1,
+        Rope::TEXT,
+    )
+    .expect("kv preparation");
+    batch.commit_and_wait().expect("preparation completion");
+    // SAFETY: the batch has completed and nothing else touches the buffer.
+    let row = unsafe { v_cache.as_slice::<u8>() };
+    let scales = (0..32)
+        .map(|block| half::f16::from_le_bytes([row[1024 + block * 2], row[1025 + block * 2]]))
+        .collect::<Vec<_>>();
+    assert!(
+        scales.iter().all(|scale| scale.is_finite()),
+        "Q8 scales overflowed: {scales:?}"
+    );
+    assert!(scales.contains(&half::f16::MAX), "no block saturated");
+    assert!(
+        dequantize_row(KvFormat::Q8, row)
+            .iter()
+            .all(|value| value.is_finite())
+    );
 }
 
 #[test]
@@ -1208,7 +1292,8 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
                     gated,
                     layout != KvLayout::F16,
                 );
-                for (index, (&actual, &wanted)) in output.as_slice::<f32>()[..6144]
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                for (index, (&actual, &wanted)) in unsafe { output.as_slice::<f32>() }[..6144]
                     .iter()
                     .zip(&expected)
                     .enumerate()
@@ -1239,7 +1324,8 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
             (1086, 9, false),
             (4093, 11, true),
         ] {
-            output.as_mut_slice::<f32>().fill(f32::NAN);
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { output.as_mut_slice::<f32>().fill(f32::NAN) };
             let mut batch = CommandBatch::new(&ctx).expect("batch");
             ops.attention_block_kv(
                 layout,
@@ -1255,7 +1341,8 @@ fn quantized_attention_matches_f64_over_dequantized_cache_for_rows_and_blocks() 
             )
             .expect("attention block");
             batch.commit_and_wait().expect("block completion");
-            let out = output.as_slice::<f32>();
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            let out = unsafe { output.as_slice::<f32>() };
             for row in 0..rows {
                 let prefix = position as usize + row + 1;
                 let (k_read, v_read) = if half_operands {
@@ -1318,7 +1405,8 @@ fn q8_attention_reduces_every_split_at_the_training_context_limit() {
         MetalBuffer::from_slice(ctx.device(), &ordinary.repeat(capacity as usize)).expect("values");
     for prefix in [capacity - 1, capacity] {
         let offset = (prefix as usize - 1) * layout.value.token_bytes();
-        values.as_mut_slice::<u8>()[offset..offset + last.len()].copy_from_slice(&last);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { values.as_mut_slice::<u8>()[offset..offset + last.len()].copy_from_slice(&last) };
         let mut batch = CommandBatch::new(&ctx).expect("batch");
         ops.attention_row_kv(
             layout, &mut batch, &query, &keys, &values, None, &output, prefix, &workspace, 0,
@@ -1332,14 +1420,18 @@ fn q8_attention_reduces_every_split_at_the_training_context_limit() {
             })
             .collect::<Vec<_>>();
         check(&output, &hadamard_rows(&expected), 2e-5);
-        values.as_mut_slice::<u8>()[offset..offset + ordinary.len()].copy_from_slice(&ordinary);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe {
+            values.as_mut_slice::<u8>()[offset..offset + ordinary.len()].copy_from_slice(&ordinary);
+        }
     }
     // Joint verification at the context limit must keep the final token
     // invisible to the first three query rows.
     let query = floats(&ctx, &vec![0.0; 4 * 6144]);
     let output = guarded(&ctx, 4 * 6144);
     let offset = (capacity as usize - 1) * layout.value.token_bytes();
-    values.as_mut_slice::<u8>()[offset..offset + last.len()].copy_from_slice(&last);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    unsafe { values.as_mut_slice::<u8>()[offset..offset + last.len()].copy_from_slice(&last) };
     let mut batch = CommandBatch::new(&ctx).expect("batch");
     ops.attention_block_kv(
         layout,

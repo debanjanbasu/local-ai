@@ -126,6 +126,7 @@ impl HostPromptSnapshot {
         self.position
     }
 
+    #[allow(unsafe_code)]
     fn from_snapshot(model: &BonsaiModel, snapshot: &PromptSnapshot) -> crate::Result<Self> {
         let section_lengths = [
             snapshot.recurrent.len(),
@@ -134,7 +135,8 @@ impl HostPromptSnapshot {
             snapshot.mtp_kv.len(),
         ];
         let mut buffer = MetalBuffer::empty(model.context.device(), section_lengths.iter().sum())?;
-        let bytes = buffer.as_mut_slice::<u8>();
+        // SAFETY: the buffer was just allocated here; no clone or GPU work exists.
+        let bytes = unsafe { buffer.as_mut_slice::<u8>() };
         let mut offset = 0;
         for section in [
             &snapshot.recurrent,
@@ -158,8 +160,11 @@ impl HostPromptSnapshot {
         self.buffer.make_nonvolatile()
     }
 
+    #[allow(unsafe_code)]
     fn snapshot(&self) -> crate::Result<PromptSnapshot> {
-        let bytes = self.buffer.as_slice::<u8>();
+        // SAFETY: the snapshot buffer is written once, at creation, and never
+        // by the GPU.
+        let bytes = unsafe { self.buffer.as_slice::<u8>() };
         let mut offset = 0;
         let mut take = |length: usize| {
             let result = PageBytes::concat([&bytes[offset..offset + length]]);
@@ -642,7 +647,7 @@ impl Distributions {
 
     /// Row `row` of `logits`: its log-sum-exp and best `top` logits, when
     /// these statistics describe them.
-    fn row(&self, logits: Described, row: usize, top: usize) -> Option<(f32, &[TopKCandidate])> {
+    fn row(&self, logits: Described, row: usize, top: usize) -> Option<(f32, Vec<TopKCandidate>)> {
         let workspace = self.rows.as_ref()?;
         (self.described == logits && self.top >= top && row < workspace.max_rows())
             .then(|| (workspace.log_sum_exp(row), workspace.top(row, top)))
@@ -1031,6 +1036,7 @@ impl BonsaiModel {
     }
 
     /// Copy an exact boundary to CPU memory. Cache tails are deliberately omitted.
+    #[allow(unsafe_code)]
     pub(crate) fn prompt_snapshot(&self) -> crate::Result<PromptSnapshot> {
         let recurrent = self
             .layers
@@ -1039,11 +1045,16 @@ impl BonsaiModel {
                 AttentionLayer::Recurrent(layer) => Some(layer),
                 AttentionLayer::Full(_) => None,
             })
-            .flat_map(|layer| [layer.state.as_slice::<u8>(), layer.history.as_slice::<u8>()]);
+            // SAFETY: every block waits for its GPU work before returning, and
+            // `&self` keeps the model from encoding more while these views live.
+            .flat_map(|layer| unsafe {
+                [layer.state.as_slice::<u8>(), layer.history.as_slice::<u8>()]
+            });
         let hidden = self
             .speculation
             .as_ref()
-            .map(|speculation| speculation.mtp.prev_hidden().as_slice::<u8>());
+            // SAFETY: as above.
+            .map(|speculation| unsafe { speculation.mtp.prev_hidden().as_slice::<u8>() });
         self.snapshot_with(self.position, recurrent, hidden)
     }
 
@@ -1052,6 +1063,7 @@ impl BonsaiModel {
     /// from the live caches, which only ever append past it within a request.
     /// So a request's prompt snapshot need not sit in host memory for its
     /// whole decode. `None` when the OS purged the checkpoint.
+    #[allow(unsafe_code)]
     pub(crate) fn prompt_snapshot_at(
         &self,
         checkpoint: &PromptCheckpoint,
@@ -1069,15 +1081,21 @@ impl BonsaiModel {
         let recurrent = checkpoint
             .recurrent
             .iter()
-            .flat_map(|(state, history)| [state.as_slice::<u8>(), history.as_slice::<u8>()]);
+            // SAFETY: checkpoints are filled by completed blit work and never
+            // written again; `&self` keeps the model from encoding meanwhile.
+            .flat_map(|(state, history)| unsafe {
+                [state.as_slice::<u8>(), history.as_slice::<u8>()]
+            });
         let hidden = checkpoint
             .mtp_prev_hidden
             .as_ref()
-            .map(MetalBuffer::as_slice::<u8>);
+            // SAFETY: as above.
+            .map(|hidden| unsafe { hidden.as_slice::<u8>() });
         self.snapshot_with(checkpoint.position, recurrent, hidden)
             .map(Some)
     }
 
+    #[allow(unsafe_code)]
     fn snapshot_with<'a>(
         &'a self,
         position: usize,
@@ -1088,12 +1106,16 @@ impl BonsaiModel {
             .layers
             .iter()
             .filter_map(|layer| match &layer.attention {
-                AttentionLayer::Full(layer) => Some([
-                    &layer.key_cache.as_slice::<u8>()
-                        [..position * self.kv_layout.key.token_bytes()],
-                    &layer.value_cache.as_slice::<u8>()
-                        [..position * self.kv_layout.value.token_bytes()],
-                ]),
+                // SAFETY: every block waits for its GPU work before returning,
+                // and `&self` keeps the model from encoding while these live.
+                AttentionLayer::Full(layer) => Some(unsafe {
+                    [
+                        &layer.key_cache.as_slice::<u8>()
+                            [..position * self.kv_layout.key.token_bytes()],
+                        &layer.value_cache.as_slice::<u8>()
+                            [..position * self.kv_layout.value.token_bytes()],
+                    ]
+                }),
                 AttentionLayer::Recurrent(_) => None,
             });
         let (mtp_prev_hidden, mtp_kv) = match (&self.speculation, mtp_prev_hidden) {
@@ -1102,10 +1124,13 @@ impl BonsaiModel {
                 let (keys, values) = speculation.mtp.kv_caches();
                 (
                     PageBytes::concat([hidden])?,
-                    PageBytes::concat([
-                        &keys.as_slice::<u8>()[..key_bytes],
-                        &values.as_slice::<u8>()[..key_bytes],
-                    ])?,
+                    // SAFETY: as for the target caches above.
+                    PageBytes::concat(unsafe {
+                        [
+                            &keys.as_slice::<u8>()[..key_bytes],
+                            &values.as_slice::<u8>()[..key_bytes],
+                        ]
+                    })?,
                 )
             }
             _ => (PageBytes::zeroed(0)?, PageBytes::zeroed(0)?),
@@ -1341,8 +1366,11 @@ impl BonsaiModel {
     }
 
     /// The logits the last block left for its final row.
+    #[allow(unsafe_code)]
     pub(crate) fn last_logits(&self) -> Vec<f32> {
-        self.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec()
+        // SAFETY: every block waits for its GPU work before returning, and the
+        // borrow ends with this copy.
+        unsafe { self.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec() }
     }
 
     /// Plain one-token decode step producing logits.
@@ -1402,7 +1430,7 @@ impl BonsaiModel {
                 row * VOCAB * size_of::<f32>(),
                 &self.context,
                 &self.sampling,
-                selected.map(|results| results[row].best_id),
+                selected.as_ref().map(|results| results[row].best_id),
                 distribution,
             )
         })
@@ -1692,5 +1720,5 @@ fn invalid<T>(message: impl Into<String>) -> crate::Result<T> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(unsafe_code, clippy::expect_used)]
 mod tests;

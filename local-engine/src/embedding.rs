@@ -490,7 +490,7 @@ impl EmbeddingModel {
     /// Run the encoder over packed input embeddings `x0` (`[Σ lens, 512]`,
     /// sequences of `lens` tokens back to back); one normalized embedding per
     /// sequence. The workspace grows to fit a longer pass.
-    #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code, clippy::too_many_lines)]
     fn encode_embedded(
         &mut self,
         x0: &[f32],
@@ -742,7 +742,9 @@ impl EmbeddingModel {
             EPSILON,
         )?;
         batch.commit_and_wait()?;
-        let normed = &ws.normed.as_slice::<f32>()[..tokens * HIDDEN];
+        // SAFETY: the batch above has completed, and nothing is encoded while
+        // this view lives.
+        let normed = unsafe { &ws.normed.as_slice::<f32>()[..tokens * HIDDEN] };
         let mut out = Vec::with_capacity(lens.len());
         let mut row = 0;
         for &len in lens {

@@ -72,14 +72,17 @@ fn trajectories(model: &mut BonsaiModel, count: usize, batched: bool) -> Vec<Vec
             let output = model.batch.as_ref().expect("batch scratch");
             for (index, row) in logits.iter_mut().enumerate() {
                 row.push(
-                    output.logits.as_slice::<f32>()[index * VOCAB..(index + 1) * VOCAB].to_vec(),
+                    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                    unsafe { output.logits.as_slice::<f32>() }[index * VOCAB..(index + 1) * VOCAB]
+                        .to_vec(),
                 );
             }
         } else {
             for (index, state) in states.iter_mut().enumerate() {
                 model.swap_sequence(state).expect("swap in");
                 model.decode(forced(index, step)).expect("decode");
-                logits[index].push(model.scratch.logits.as_slice::<f32>().to_vec());
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                logits[index].push(unsafe { model.scratch.logits.as_slice::<f32>() }.to_vec());
                 model.swap_sequence(state).expect("swap out");
             }
         }
@@ -325,7 +328,9 @@ fn batched_verify_tracks_each_sequence_alone() {
                 .expect("verify block");
             for row in 0..inputs.len() {
                 rows.push(
-                    verifier.verify_logits.as_slice::<f32>()[row * VOCAB..(row + 1) * VOCAB]
+                    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                    unsafe { verifier.verify_logits.as_slice::<f32>() }
+                        [row * VOCAB..(row + 1) * VOCAB]
                         .to_vec(),
                 );
             }
@@ -335,10 +340,12 @@ fn batched_verify_tracks_each_sequence_alone() {
             model.position = start + kept[index];
         } else {
             model.decode(inputs[0]).expect("decode");
-            rows.push(model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec());
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            rows.push(unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec());
         }
         model.decode(next[index]).expect("next");
-        let after = model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let after = unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
         model.swap_sequence(state).expect("swap out");
         reference.push((rows, after));
     }
@@ -362,7 +369,8 @@ fn batched_verify_tracks_each_sequence_alone() {
         let output = model.batch.as_ref().expect("batch scratch");
         for (row, expected) in expected.iter().enumerate() {
             let actual =
-                &output.logits.as_slice::<f32>()[(start + row) * VOCAB..(start + row + 1) * VOCAB];
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                &unsafe { output.logits.as_slice::<f32>() }[(start + row) * VOCAB..(start + row + 1) * VOCAB];
             worst = worst.max(kl(expected, actual));
             assert_eq!(
                 argmax(expected),
@@ -389,7 +397,9 @@ fn batched_verify_tracks_each_sequence_alone() {
     model.decode_batch(&mut rows).expect("batched step");
     let output = model.batch.as_ref().expect("batch scratch");
     for (index, (_, expected)) in reference.iter().enumerate() {
-        let actual = &output.logits.as_slice::<f32>()[index * VOCAB..(index + 1) * VOCAB];
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let actual =
+            &unsafe { output.logits.as_slice::<f32>() }[index * VOCAB..(index + 1) * VOCAB];
         worst = worst.max(kl(expected, actual));
         assert_eq!(
             argmax(expected),
@@ -776,7 +786,8 @@ fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
         .draft_resident(&mut HeadLag::default(), next, &sampler, 4)
         .expect("reference drafts");
     model.decode(next).expect("decode");
-    let reference_logits = model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let reference_logits = unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
     model.swap_sequence(&mut reference).expect("swap out");
     // The same chunk inside a batched pass.
     let mut decoding = lagged(&mut model, 2, 0);
@@ -820,7 +831,8 @@ fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
         drop(rows);
         let output = model.batch.as_ref().expect("batch scratch");
         assert_eq!(output.rows, 2, "only the decoding rows have logits");
-        let with_chunk = output.logits.as_slice::<f32>()[..2 * VOCAB].to_vec();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let with_chunk = unsafe { output.logits.as_slice::<f32>() }[..2 * VOCAB].to_vec();
         let mut rows = alone
             .iter_mut()
             .enumerate()
@@ -834,7 +846,8 @@ fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
         model.decode_batch(&mut rows).expect("batched pass alone");
         drop(rows);
         let output = model.batch.as_ref().expect("batch scratch");
-        let without = output.logits.as_slice::<f32>()[..2 * VOCAB].to_vec();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let without = unsafe { output.logits.as_slice::<f32>() }[..2 * VOCAB].to_vec();
         for row in 0..2 {
             let range = row * VOCAB..(row + 1) * VOCAB;
             let divergence = kl(&without[range.clone()], &with_chunk[range.clone()]);
@@ -849,7 +862,8 @@ fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
             .draft_resident(&mut HeadLag::default(), next, &sampler, 4)
             .expect("drafts");
         model.decode(next).expect("decode");
-        let logits = model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let logits = unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
         model.swap_sequence(&mut folded).expect("swap out");
         let divergence = kl(&reference_logits, &logits);
         println!(

@@ -1,4 +1,5 @@
 #![allow(
+    unsafe_code,
     clippy::expect_used,
     clippy::cast_precision_loss,
     clippy::many_single_char_names,
@@ -160,9 +161,15 @@ fn gemm_and_gemv_match_reference_with_every_epilogue() {
                 expected[t * rows + r] = acc as f32;
             }
         }
-        close(&y.as_slice::<f32>()[..tokens * rows], &expected, 2e-5);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
         close(
-            &v.as_slice::<f32>()[..rows],
+            &unsafe { y.as_slice::<f32>() }[..tokens * rows],
+            &expected,
+            2e-5,
+        );
+        close(
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            &unsafe { v.as_slice::<f32>() }[..rows],
             &expected[(tokens - 1) * rows..],
             2e-5,
         );
@@ -230,8 +237,13 @@ fn layernorm_and_im2col_match_reference() {
                 + f64::from(bias[i])) as f32;
         }
     }
-    close(&y.as_slice::<f32>()[..rows * dim], &expected, 1e-5);
-    let cols = &co.as_slice::<f32>()[..t_out * channels * 3];
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { y.as_slice::<f32>() }[..rows * dim],
+        &expected,
+        1e-5,
+    );
+    let cols = &unsafe { co.as_slice::<f32>() }[..t_out * channels * 3];
     for t in 0..t_out {
         for c in 0..channels {
             for k in 0..3 {
@@ -313,7 +325,8 @@ fn encoder_attention_matches_reference_across_split_queries() {
             .expect("attention");
     }
     batch.commit_and_wait().expect("commit");
-    let got = out.as_slice::<f32>();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let got = unsafe { out.as_slice::<f32>() };
     for query in [0, 1, 99, 100, 127, 128, 160] {
         let want = attention_reference(&q, &k, &v, heads, query, tokens);
         close(&got[query * width..(query + 1) * width], &want, 2e-5);
@@ -373,13 +386,15 @@ fn decoder_attention_is_causal_over_the_cache_and_full_over_frames() {
     for i in 0..queries {
         let want = attention_reference(&q, &k, &v, heads, i, base as usize + i + 1);
         close(
-            &causal.as_slice::<f32>()[i * width..(i + 1) * width],
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            &unsafe { causal.as_slice::<f32>() }[i * width..(i + 1) * width],
             &want,
             2e-5,
         );
         let want = attention_reference(&q, &k, &v, heads, i, keys);
         close(
-            &full.as_slice::<f32>()[i * width..(i + 1) * width],
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            &unsafe { full.as_slice::<f32>() }[i * width..(i + 1) * width],
             &want,
             2e-5,
         );

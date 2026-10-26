@@ -254,7 +254,7 @@ impl VisionTower {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code, clippy::too_many_lines)]
     fn pass(
         &self,
         context: &MetalContext,
@@ -502,7 +502,8 @@ impl VisionTower {
             pooled_count,
         )?;
         batch.commit_and_wait()?;
-        Ok(ws.k.as_slice::<f32>()[..pooled * TEXT_HIDDEN].to_vec())
+        // SAFETY: the batch above has completed; the borrow ends with this copy.
+        Ok(unsafe { ws.k.as_slice::<f32>()[..pooled * TEXT_HIDDEN].to_vec() })
     }
 }
 

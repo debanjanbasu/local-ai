@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::too_many_lines)]
+#![allow(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
 
 use std::ptr::NonNull;
 
@@ -123,14 +123,20 @@ fn inputs(tokens: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 }
 
 fn check(buffer: &MetalBuffer, expected: &[f64]) {
-    for (i, (&actual, &wanted)) in buffer.as_slice::<f32>().iter().zip(expected).enumerate() {
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    for (i, (&actual, &wanted)) in unsafe { buffer.as_slice::<f32>() }
+        .iter()
+        .zip(expected)
+        .enumerate()
+    {
         assert!(
             actual.is_finite() && (f64::from(actual) - wanted).abs() < 5e-6 * (1.0 + wanted.abs()),
             "element {i}: {actual} != {wanted}"
         );
     }
     assert!(
-        buffer.as_slice::<f32>()[expected.len()..]
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { buffer.as_slice::<f32>() }[expected.len()..]
             .iter()
             .all(|v| v.is_nan())
     );
@@ -191,7 +197,8 @@ fn tiled_recurrence_matches_f64_for_every_state_row_and_causal_continuation() {
             (0, 2, true),
         ] {
             if reset {
-                state.as_mut_slice::<f32>()[..STATE].copy_from_slice(&initial);
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                unsafe { state.as_mut_slice::<f32>()[..STATE].copy_from_slice(&initial) };
             }
             let x = floats(&context, &qkv[start * QKV..]);
             let a = floats(&context, &decay[start * 48..]);
@@ -293,15 +300,15 @@ fn f16_state_rounds_once_per_block_and_leaves_a_separate_initial_state_intact() 
         batch.commit_and_wait().expect("completion");
         check(&out, &output_reference);
         assert!(
-            start
-                .as_slice::<half::f16>()
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { start.as_slice::<half::f16>() }
                 .iter()
                 .zip(&initial)
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "the initial state was modified"
         );
-        for (i, (actual, &wanted)) in end
-            .as_slice::<half::f16>()
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        for (i, (actual, &wanted)) in unsafe { end.as_slice::<half::f16>() }
             .iter()
             .zip(&state_reference)
             .enumerate()

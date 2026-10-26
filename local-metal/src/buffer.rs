@@ -135,41 +135,69 @@ impl MetalBuffer {
 
     /// Reinterpret the buffer contents as a typed slice.
     ///
+    /// # Safety
+    ///
+    /// Clones of a `MetalBuffer` share one `MTLBuffer`, and the GPU writes it
+    /// asynchronously. While the returned slice is alive, nothing may write
+    /// the buffer's bytes: no committed GPU command that writes this buffer
+    /// may still be running or be committed, and no CPU write may happen
+    /// through this or any clone ([`Self::as_mut_slice`],
+    /// [`Self::copy_from_bytes`], [`Self::clear`], [`Self::contents_mut_ptr`])
+    /// or through [`Self::raw`].
+    ///
     /// # Panics
     ///
     /// Panics if the buffer length is not a multiple of `size_of::<T>()` or if
     /// the pointer is not suitably aligned.
     #[must_use]
     #[allow(unsafe_code)]
-    pub fn as_slice<T: bytemuck::Pod>(&self) -> &[T] {
+    pub unsafe fn as_slice<T: bytemuck::Pod>(&self) -> &[T] {
         let ptr = self.inner.contents().as_ptr().cast::<u8>();
         let len = self.inner.length();
         // SAFETY: Metal shared-mode buffer contents are CPU-accessible and valid
-        // for the lifetime of the buffer.  We hold `&self` so the buffer is alive.
+        // for the lifetime of the buffer, which `&self` keeps alive. The caller
+        // guarantees no writer touches the bytes while the slice is alive.
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
         bytemuck::cast_slice(bytes)
     }
 
     /// Typed mutable view over the buffer contents.
     ///
+    /// # Safety
+    ///
+    /// `&mut self` does not make the bytes unique: clones share one
+    /// `MTLBuffer`. While the returned slice is alive, nothing else may read
+    /// or write the buffer's bytes: no committed GPU command that uses this
+    /// buffer may still be running or be committed, and no other slice,
+    /// pointer or copy may access it through any clone or through
+    /// [`Self::raw`].
+    ///
     /// # Panics
     ///
     /// Panics if the buffer length is not a multiple of `size_of::<T>()` or if
     /// the pointer is not suitably aligned.
     #[allow(unsafe_code)]
-    pub fn as_mut_slice<T: bytemuck::Pod>(&mut self) -> &mut [T] {
+    pub unsafe fn as_mut_slice<T: bytemuck::Pod>(&mut self) -> &mut [T] {
         let ptr = self.inner.contents().as_ptr().cast::<u8>();
         let len = self.inner.length();
         // SAFETY: Metal shared-mode buffer contents are CPU-accessible and valid
-        // for the lifetime of the buffer.  We hold `&mut self` so the buffer is
-        // alive and uniquely borrowed.
+        // for the lifetime of the buffer, which `&mut self` keeps alive. The
+        // caller guarantees no other access to the bytes while it is alive.
         let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
         bytemuck::cast_slice_mut(bytes)
     }
 
     /// Raw mutable pointer to the buffer contents (for weight-pool bulk copies).
+    ///
+    /// # Safety
+    ///
+    /// The pointer is valid for [`Self::length`] bytes while any clone of this
+    /// buffer is alive. Writes through it must not overlap a slice returned by
+    /// [`Self::as_slice`] or [`Self::as_mut_slice`] on any clone, nor a
+    /// committed GPU command that uses this buffer and has not completed.
     #[must_use]
-    pub fn contents_mut_ptr(&self) -> *mut u8 {
+    #[allow(unsafe_code)]
+    pub unsafe fn contents_mut_ptr(&self) -> *mut u8 {
         self.inner.contents().as_ptr().cast::<u8>()
     }
 
@@ -181,12 +209,15 @@ impl MetalBuffer {
     #[allow(unsafe_code)]
     pub fn copy_from_bytes(&self, src: &[u8], offset: usize) {
         assert!(
-            offset + src.len() <= self.length(),
+            offset
+                .checked_add(src.len())
+                .is_some_and(|end| end <= self.length()),
             "copy_from_bytes: out of bounds (offset={offset}, src_len={}, buf_len={})",
             src.len(),
             self.length(),
         );
-        // SAFETY: bounds checked above; shared buffer is CPU-writable.
+        // SAFETY: bounds checked above; shared buffer is CPU-writable. Live
+        // slices must not exist while this runs, by the `as_slice` contract.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.as_ptr(),
@@ -199,7 +230,8 @@ impl MetalBuffer {
     /// Fill the shared buffer with zero bytes.
     #[allow(unsafe_code)]
     pub fn clear(&self) {
-        // SAFETY: `contents_mut_ptr` is valid for the retained buffer length.
+        // SAFETY: `contents_mut_ptr` is valid for the retained buffer length;
+        // live slices must not exist while this runs, by the `as_slice` contract.
         unsafe { std::ptr::write_bytes(self.contents_mut_ptr(), 0, self.length()) };
     }
 
@@ -238,7 +270,7 @@ pub fn get_default_device() -> crate::Result<Retained<ProtocolObject<dyn MTLDevi
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(unsafe_code, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -248,7 +280,8 @@ mod tests {
         let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let buf = MetalBuffer::from_slice(&device, &data).expect("create buffer");
         assert_eq!(buf.length(), data.len() * size_of::<f32>());
-        let out: &[f32] = buf.as_slice();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let out: &[f32] = unsafe { buf.as_slice() };
         assert_eq!(out, &data[..]);
     }
 
@@ -302,8 +335,18 @@ mod tests {
         let data: Vec<f32> = vec![10.0, 20.0, 30.0];
         let bytes = bytemuck::cast_slice::<f32, u8>(&data);
         buf.copy_from_bytes(bytes, 0);
-        let out: &[f32] = buf.as_slice();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let out: &[f32] = unsafe { buf.as_slice() };
         assert_eq!(&out[..3], &data[..]);
+    }
+
+    /// An offset near `usize::MAX` must not wrap past the bounds check.
+    #[test]
+    #[should_panic(expected = "copy_from_bytes: out of bounds")]
+    fn buffer_copy_from_bytes_rejects_wrapping_offset() {
+        let device = get_default_device().expect("Metal device");
+        let buf = MetalBuffer::empty(&device, 256).expect("create buffer");
+        buf.copy_from_bytes(&[1, 2], usize::MAX);
     }
 
     #[test]

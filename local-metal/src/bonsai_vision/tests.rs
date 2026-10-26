@@ -1,4 +1,5 @@
 #![allow(
+    unsafe_code,
     clippy::expect_used,
     clippy::cast_precision_loss,
     clippy::many_single_char_names,
@@ -112,7 +113,8 @@ fn gemm_handles_ragged_tiles_column_tails_and_every_epilogue() {
                 .gemm(&mut batch, linear, &ib, &out, tokens as u32, epilogue)
                 .expect("gemm");
             batch.commit_and_wait().expect("wait");
-            let got = out.as_slice::<f32>();
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            let got = unsafe { out.as_slice::<f32>() };
             for t in 0..tokens {
                 for r in 0..rows {
                     let mut value = f64::from(bias[r]);
@@ -174,7 +176,8 @@ fn layernorm_matches_reference() {
         )
         .expect("layernorm");
     batch.commit_and_wait().expect("wait");
-    let got = out.as_slice::<f32>();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let got = unsafe { out.as_slice::<f32>() };
     for t in 0..tokens {
         let row = &input[t * width..(t + 1) * width];
         let mean = row.iter().map(|&x| f64::from(x)).sum::<f64>() / width as f64;
@@ -212,7 +215,8 @@ fn rope_rotates_q_and_k_halves_only() {
         .rope(&mut batch, &qb, &cb, &sb, tokens as u32)
         .expect("rope");
     batch.commit_and_wait().expect("wait");
-    let got = qb.as_slice::<f32>();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let got = unsafe { qb.as_slice::<f32>() };
     for t in 0..tokens {
         for part in 0..3 {
             for head in 0..16 {
@@ -273,7 +277,8 @@ fn attention_matches_reference_over_ragged_counts() {
                 .expect("attention");
         }
         batch.commit_and_wait().expect("wait");
-        let got = out.as_slice::<f32>();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let got = unsafe { out.as_slice::<f32>() };
         let at = |t: usize, part: usize, h: usize, j: usize| {
             f64::from(qkv[(offset_rows + t) * 3 * width + part * width + h * d + j])
         };

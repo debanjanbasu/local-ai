@@ -47,6 +47,7 @@ impl BonsaiModel {
     /// batch by MTP head ingestion of those committed rows (`ingest`), which
     /// needs `output` to leave every row output-normalized.
     #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code)]
     pub(super) fn encode_block(
         &mut self,
         tokens: &[u32],
@@ -91,7 +92,9 @@ impl BonsaiModel {
         decode_embeddings(
             &self.package,
             tokens,
-            self.scratch.embedding.as_mut_slice::<f32>(),
+            // SAFETY: every block waits for its GPU work before returning, and
+            // this block is encoded only after the embeddings are written.
+            unsafe { self.scratch.embedding.as_mut_slice::<f32>() },
             images,
         )?;
         let rope_rows = self.write_rope(self.position, tokens.len(), 0);
@@ -257,9 +260,13 @@ impl BonsaiModel {
                     .iter()
                     .any(|result| result.nonfinite != 0)
             }
-            (None, Some((logits, rows, _))) => logits.as_slice::<f32>()[..rows * VOCAB]
-                .iter()
-                .any(|value| !value.is_finite()),
+            // SAFETY: `finish` above waited for the block, and nothing writes
+            // the logits while they are scanned.
+            (None, Some((logits, rows, _))) => unsafe {
+                logits.as_slice::<f32>()[..rows * VOCAB]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            },
             (None, None) => false,
         };
         if nonfinite {

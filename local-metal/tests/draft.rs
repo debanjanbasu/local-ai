@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![allow(unsafe_code, clippy::expect_used)]
 
 use half::f16;
 use local_metal::batch::CommandBatch;
@@ -96,8 +96,9 @@ fn embed_inverse_matches_cpu_decode_then_inverse_rotation_bit_for_bit() {
             )
             .expect("embed");
         batch.commit_and_wait().expect("wait");
-        let expected = expected.as_slice::<f32>();
-        let actual = actual.as_slice::<f32>();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let expected = unsafe { expected.as_slice::<f32>() };
+        let actual = unsafe { actual.as_slice::<f32>() };
         for column in 0..columns {
             assert_eq!(
                 actual[column].to_bits(),
@@ -173,7 +174,8 @@ fn top_two_matches_total_cmp_with_ties_and_chains_through_the_token_slot() {
             )
             .expect("top two");
         batch.commit_and_wait().expect("wait");
-        let actual = results.as_slice::<DraftTopTwo>()[index];
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let actual = unsafe { results.as_slice::<DraftTopTwo>() }[index];
         let expected = reference(values);
         assert_eq!(actual.best_id, expected.best_id, "case {index}");
         assert_eq!(actual.second_id, expected.second_id, "case {index}");
@@ -182,7 +184,11 @@ fn top_two_matches_total_cmp_with_ties_and_chains_through_the_token_slot() {
             actual.second_logit.to_bits(),
             expected.second_logit.to_bits()
         );
-        assert_eq!(tokens.as_slice::<u32>()[index + 1], expected.best_id);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        assert_eq!(
+            unsafe { tokens.as_slice::<u32>() }[index + 1],
+            expected.best_id
+        );
     }
 }
 

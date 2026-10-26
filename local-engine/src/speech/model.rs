@@ -151,8 +151,11 @@ fn buffer(context: &MetalContext, floats: usize) -> crate::Result<MetalBuffer> {
     Ok(MetalBuffer::empty(context.device(), floats.max(1) * 4)?)
 }
 
+#[allow(unsafe_code)]
 fn read(act: Act<'_>) -> Vec<f32> {
-    let all: &[f32] = act.view.buffer.as_slice();
+    // SAFETY: callers read taps after the pacer has synced, and the borrow
+    // ends with the copy below.
+    let all: &[f32] = unsafe { act.view.buffer.as_slice() };
     let start = act.view.offset / 4;
     let mut out = Vec::with_capacity(act.channels as usize * act.columns as usize);
     for c in 0..act.channels as usize {
@@ -634,7 +637,7 @@ impl Network {
 
     /// Synthesize one chunk: `ids` framed by the boundary id 0, `style` the
     /// voice pack row for the chunk's phoneme count (256 values).
-    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    #[allow(unsafe_code, clippy::too_many_lines, clippy::many_single_char_names)]
     pub(super) fn synthesize(
         &self,
         ids: &[u32],
@@ -1336,7 +1339,8 @@ impl Network {
         )?;
         pacer.sync()?;
         tap(&mut taps, "decoder.generator.conv_post", post);
-        let samples = audio.as_slice::<f32>()[..samples].to_vec();
+        // SAFETY: `pacer.sync` waited for the batch; the borrow ends with this copy.
+        let samples = unsafe { audio.as_slice::<f32>()[..samples].to_vec() };
         Ok(Synthesis { samples, durations })
     }
 }

@@ -1,4 +1,5 @@
 #![allow(
+    unsafe_code,
     clippy::expect_used,
     clippy::cast_precision_loss,
     clippy::cast_possible_wrap,
@@ -150,7 +151,12 @@ fn conv_matches_reference_for_strides_dilations_and_ragged_tiles() {
             )
             .expect("conv");
         batch.commit_and_wait().expect("gpu");
-        close(&yb.as_slice::<f32>()[..expected.len()], &expected, 1e-4);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        close(
+            &unsafe { yb.as_slice::<f32>() }[..expected.len()],
+            &expected,
+            1e-4,
+        );
     }
 }
 
@@ -232,7 +238,12 @@ fn transposed_conv_phases_match_reference() {
             .expect("conv");
     }
     batch.commit_and_wait().expect("gpu");
-    close(&yb.as_slice::<f32>()[..expected.len()], &expected, 1e-4);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { yb.as_slice::<f32>() }[..expected.len()],
+        &expected,
+        1e-4,
+    );
 }
 
 #[test]
@@ -295,7 +306,12 @@ fn lstm_matches_reference_in_both_directions() {
         )
         .expect("lstm");
     batch.commit_and_wait().expect("gpu");
-    close(&out.as_slice::<f32>()[..expected.len()], &expected, 1e-4);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { out.as_slice::<f32>() }[..expected.len()],
+        &expected,
+        1e-4,
+    );
 }
 
 #[test]
@@ -361,7 +377,8 @@ fn instance_norm_snake_and_istft_match_reference() {
         )
         .expect("istft");
     batch.commit_and_wait().expect("gpu");
-    close(&xb.as_slice::<f32>()[..x.len()], &expected, 1e-4);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(&unsafe { xb.as_slice::<f32>() }[..x.len()], &expected, 1e-4);
     let window: Vec<f64> = (0..20)
         .map(|m| 0.5 - 0.5 * (std::f64::consts::TAU * m as f64 / 20.0).cos())
         .collect();
@@ -394,5 +411,10 @@ fn instance_norm_snake_and_istft_match_reference() {
     let expected_audio: Vec<f32> = (0..samples)
         .map(|n| (acc[n + 10] / env[n + 10]) as f32)
         .collect();
-    close(&audio.as_slice::<f32>()[..samples], &expected_audio, 1e-3);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    close(
+        &unsafe { audio.as_slice::<f32>() }[..samples],
+        &expected_audio,
+        1e-3,
+    );
 }

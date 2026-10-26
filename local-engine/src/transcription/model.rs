@@ -387,8 +387,11 @@ impl WhisperGpu {
     }
 
     /// The final encoder states of the last window, `[1500][1280]`.
+    #[allow(unsafe_code)]
     pub(super) fn encoder_output(&self) -> Vec<f32> {
-        self.ws.output.as_slice::<f32>()[..CTX_AUDIO * STATE].to_vec()
+        // SAFETY: every encoder pass waits for its GPU work before returning;
+        // the borrow ends with this copy.
+        unsafe { self.ws.output.as_slice::<f32>()[..CTX_AUDIO * STATE].to_vec() }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -592,7 +595,7 @@ impl WhisperGpu {
 
     /// Run `tokens` at positions `start..` and return the logits at `rows`
     /// (indices into `tokens`).
-    #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code, clippy::too_many_lines)]
     fn decode_tokens(
         &mut self,
         payload: &[u8],
@@ -776,7 +779,9 @@ impl WhisperGpu {
         }
         sub.finish()?;
         self.length = start + n;
-        let all = self.logits.as_slice::<f32>();
+        // SAFETY: `sub.finish` waited for the decode, and the borrow ends with
+        // the copies below.
+        let all = unsafe { self.logits.as_slice::<f32>() };
         Ok((0..rows.len())
             .map(|j| all[j * VOCAB..(j + 1) * VOCAB].to_vec())
             .collect())
@@ -804,6 +809,7 @@ impl Forward for Bound<'_> {
             .decode_tokens(self.payload, tokens, 0, rows, &[], pace)
     }
 
+    #[allow(unsafe_code)]
     fn alignment(
         &mut self,
         tokens: &[u32],
@@ -828,8 +834,11 @@ impl Forward for Bound<'_> {
             .gpu
             .decode_tokens(self.payload, tokens, 0, &logit_rows, &layers, pace)?;
         let n = tokens.len();
-        let q_all = self.gpu.captured.as_slice::<f32>();
-        let k_all = self.gpu.cross_k.as_slice::<f32>();
+        // SAFETY: `decode_tokens` waited for its GPU work, and nothing is
+        // encoded while these views live.
+        let q_all = unsafe { self.gpu.captured.as_slice::<f32>() };
+        // SAFETY: as above.
+        let k_all = unsafe { self.gpu.cross_k.as_slice::<f32>() };
         let mut weights = vec![0.0_f32; heads.len() * n * frames];
         for (h, &[layer, head]) in heads.iter().enumerate() {
             let slot = layers

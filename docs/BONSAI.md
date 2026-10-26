@@ -2452,6 +2452,9 @@ with an F16 scale per 32, 8.5 bits per value and 34 KiB per token across the
 sixteen layers, against F16's 64 KiB. There is no other target format and no
 fallback: Q8's 34 KiB per token is what the context policy budgets. Scores and
 accumulation remain F32. The MTP head's one-layer cache always remains F16.
+A block's scale saturates at F16's largest value, 65,504, so values beyond
+127 times that (8.3e6) clip instead of an infinite scale reading the whole
+block back as NaN (0 × inf).
 
 Quantized rows are stored in a rotated basis: each head's 256-value key and
 value row is multiplied by the orthonormal Walsh-Hadamard matrix H/16 before
@@ -2638,6 +2641,17 @@ an `UNTRUSTED` result. There is no background power-polling loop.
 | Cold prefill, 2K–8K tokens | 133.7 and 131.4 tok/s (128-row blocks: 128.3 and 125.7) | 512-row blocks, uncontended A/B against `b09e22f` (2026-10-22) |
 | Cold prefill, 32,796 tokens | 110.0 → 115.6 tok/s | same |
 | Cold prefill, 131,146 tokens | 69.7 → 74.8 tok/s | same, one round (56 tok/s on the [original build](https://github.com/debanjanbasu/local-ai/commit/b389329)) |
+
+Shaders compile with `-fmetal-math-mode=relaxed`. Metal's default fast mode
+also assumes no infinities or NaNs, yet online softmax starts each running
+maximum at `-INFINITY` and relies on `exp(-inf) = 0`, and sampling and the
+greedy selectors must see non-finite logits. Relaxed keeps the other
+fast-math freedoms (reassociation, contraction, approximate functions); the
+generated AIR differs only in the dropped no-NaN/no-infinity flags. Against
+the fast-mode build it measured the same: plain decode 32.07 against 32.07
+tok/s, best of four interleaved rounds on the default prompt with a 300-token
+cap (while other builds loaded the CPU), and greedy text identical on six
+prompts at 300 tokens with and without speculation.
 
 Decode spends 97–98% of wall time on the GPU. PTQ1 decode moves 5.65 GB of
 weights per token. The packed projections were ALU-bound, not bandwidth-bound:
@@ -2999,6 +3013,18 @@ KL against the small-batch kernels is 5.5e-6 and 2.1e-6 mean (2.1e-5 and
 run the same kernels as before: six prompts, 300 greedy tokens, plain decode
 30.52 against 30.39 tok/s geomean and speculative 38.02 against 38.12, text
 byte-identical in both modes (the six chat prompts are 27-45 tokens).
+
+If the SDK lacks the tensor kernels or the device rejects their attention
+pipelines, startup prints the reason to stderr (`metal: tensor attention
+kernels unavailable, ...`) and continues on the slower SIMD kernels, which
+the policy's `attention_kernel: simd_f32` also shows.
+
+With the default thresholds no block reaches the prefill tile (that takes
+more than 128 rows and fewer than 56), so `BonsaiKernels::new` compiles its
+three tensor pipelines on first use, under overridden thresholds, instead of
+at every startup: 2.02 → 1.92 ms median over twenty interleaved launches
+with a warm shader cache (a cold-cache launch was not measured). An SDK
+without the tensor tile prints the reason and uses the SIMD tile.
 
 Prefill blocks then grew from 128 to 512 rows (`PREFILL_CHUNK`,
 `MAX_PREFILL_TOKENS`). Rows are independent in every projection and attention

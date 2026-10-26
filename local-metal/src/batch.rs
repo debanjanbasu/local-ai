@@ -466,5 +466,5 @@ impl Drop for CommandBatch {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(unsafe_code, clippy::expect_used)]
 mod tests;

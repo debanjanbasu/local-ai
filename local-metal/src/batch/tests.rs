@@ -72,7 +72,8 @@ fn submit_buffer_copies_moves_data_between_shared_buffers() {
     .expect("submit copies");
     pending.wait().expect("copy wait");
 
-    assert_eq!(&dst.as_slice::<u32>()[..2], &[2, 3]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[..2], &[2, 3]);
 }
 
 #[test]
@@ -106,7 +107,8 @@ fn submit_buffer_copies_iter_moves_data_between_shared_buffers() {
     .expect("submit copies");
     pending.wait().expect("copy wait");
 
-    assert_eq!(&dst.as_slice::<u32>()[..4], &[2, 3, 5, 6]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[..4], &[2, 3, 5, 6]);
 }
 
 #[test]
@@ -136,7 +138,8 @@ fn submit_and_renew_can_track_intermediate_copy_work() {
     );
     batch.commit_and_wait().expect("commit_and_wait");
 
-    assert_eq!(&dst.as_slice::<u32>()[..2], &[20, 30]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[..2], &[20, 30]);
 }
 
 #[test]
@@ -161,7 +164,8 @@ fn blit_buffer_copies_moves_data_inside_existing_batch() {
         .expect("blit copies");
     batch.commit_and_wait().expect("commit_and_wait");
 
-    assert_eq!(&dst.as_slice::<u32>()[..2], &[8, 9]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[..2], &[8, 9]);
 }
 
 #[test]
@@ -188,7 +192,8 @@ fn completed_command_releases_lease_while_pending_clone_is_alive() {
     let completed_handle = pending.clone();
     pending.wait().expect("copy wait");
 
-    assert_eq!(&dst.as_slice::<u32>()[1..3], &[33, 44]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[1..3], &[33, 44]);
     assert!(weak.upgrade().is_none());
     drop(completed_handle);
 }
@@ -235,7 +240,8 @@ fn submit_and_renew_keeps_distinct_per_command_leases() {
     batch.wait_pending().expect("first wait");
     assert!(first_weak.upgrade().is_none());
     assert!(second_weak.upgrade().is_some());
-    assert_eq!(&dst.as_slice::<u32>()[3..5], &[5, 7]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[3..5], &[5, 7]);
 
     batch.submit_and_renew(&ctx).expect("second submit");
     batch.wait_pending().expect("second wait");
@@ -263,7 +269,8 @@ fn dropping_renewed_batch_drains_earlier_copy() {
 
     drop(batch);
 
-    assert_eq!(&dst.as_slice::<u32>()[2..5], &[202, 303, 404]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[2..5], &[202, 303, 404]);
 }
 
 #[test]
@@ -303,5 +310,6 @@ fn invalid_blits_restore_encoder_and_allow_valid_work() {
         }])
         .expect("valid copy after rejected copies");
     batch.commit_and_wait().expect("valid copy wait");
-    assert_eq!(&dst.as_slice::<u32>()[1..4], &[8, 16, 32]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    assert_eq!(&unsafe { dst.as_slice::<u32>() }[1..4], &[8, 16, 32]);
 }

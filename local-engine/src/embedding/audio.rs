@@ -531,7 +531,7 @@ impl AudioTower {
 
     /// Soft tokens (`[tokens, 512]` row-major, one block per clip) of clips
     /// whose features fit one pass.
-    #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code, clippy::too_many_lines)]
     fn pass(
         &self,
         model: &EmbeddingModel,
@@ -825,7 +825,9 @@ impl AudioTower {
         )?;
         batch.commit_and_wait()?;
         pace()?;
-        let soft = &ws.soft.as_slice::<f32>()[..token * HIDDEN];
+        // SAFETY: the batch above has completed, and nothing is encoded while
+        // this view lives.
+        let soft = unsafe { &ws.soft.as_slice::<f32>()[..token * HIDDEN] };
         let mut out = Vec::with_capacity(clips.len());
         let mut row = 0;
         for n in tokens_per_clip {

@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::too_many_lines)]
+#![allow(unsafe_code, clippy::expect_used, clippy::too_many_lines)]
 
 //! Every fused decode kernel must reproduce, bit for bit, the separate
 //! dispatches it replaces: greedy output is only unchanged if logits are.
@@ -67,12 +67,14 @@ fn setup() -> Option<(MetalContext, BonsaiKernels, BonsaiOps)> {
 }
 
 fn copy(context: &MetalContext, buffer: &MetalBuffer) -> MetalBuffer {
-    MetalBuffer::from_slice(context.device(), buffer.as_slice::<u32>()).expect("copy")
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    MetalBuffer::from_slice(context.device(), unsafe { buffer.as_slice::<u32>() }).expect("copy")
 }
 
 fn assert_bits(name: &str, actual: &MetalBuffer, expected: &MetalBuffer, count: usize) {
-    let actual = &actual.as_slice::<u32>()[..count];
-    let expected = &expected.as_slice::<u32>()[..count];
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let actual = &unsafe { actual.as_slice::<u32>() }[..count];
+    let expected = &unsafe { expected.as_slice::<u32>() }[..count];
     let differ = actual.iter().zip(expected).filter(|(a, e)| a != e).count();
     assert_eq!(differ, 0, "{name}: {differ} of {count} values differ");
 }
@@ -401,7 +403,8 @@ fn fused_swiglu_and_rotation_match_separate_dispatches_bitwise() {
         assert_bits("rotated SwiGLU", &rows[2], &rows[1], count);
         assert_bits("in-place rotated SwiGLU", &in_place, &rows[1], count);
         assert!(
-            rows[1].as_slice::<f32>()[..count]
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { rows[1].as_slice::<f32>() }[..count]
                 .iter()
                 .any(|&value| value != 0.0),
             "the reference must be nontrivial"

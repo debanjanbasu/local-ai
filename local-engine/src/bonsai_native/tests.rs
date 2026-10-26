@@ -47,7 +47,8 @@ fn tokenwise_logits(model: &mut BonsaiModel, prefix: &[u32], steps: &[u32]) -> V
         .iter()
         .map(|&token| {
             model.forward(token, true).expect("tokenwise decode");
-            model.scratch.logits.as_slice::<f32>().to_vec()
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe { model.scratch.logits.as_slice::<f32>().to_vec() }
         })
         .collect()
 }
@@ -133,11 +134,13 @@ fn kv_growth_reproduces_full_allocation_bitwise_across_prefill_decode_and_specul
         let mut logits = Vec::new();
         let mut allocations = Vec::new();
         model.prefill(&prompt, &mut |_| {}).expect("prefill");
-        logits.push(model.scratch.logits.as_slice::<f32>().to_vec());
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        logits.push(unsafe { model.scratch.logits.as_slice::<f32>() }.to_vec());
         allocations.push(model.kv_allocated());
         for &step in &steps {
             model.decode(step).expect("decode");
-            logits.push(model.scratch.logits.as_slice::<f32>().to_vec());
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            logits.push(unsafe { model.scratch.logits.as_slice::<f32>() }.to_vec());
             allocations.push(model.kv_allocated());
         }
         let mut sampler = Sampler::new(VOCAB, params.clone());
@@ -175,8 +178,9 @@ fn kv_growth_reproduces_full_allocation_bitwise_across_prefill_decode_and_specul
     full.decode(4).expect("decode");
     growing.decode(4).expect("decode");
     assert_eq!(
-        full.scratch.logits.as_slice::<f32>(),
-        growing.scratch.logits.as_slice::<f32>()
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { full.scratch.logits.as_slice::<f32>() },
+        unsafe { growing.scratch.logits.as_slice::<f32>() }
     );
 }
 
@@ -264,7 +268,8 @@ fn verify_block_restores_like_tokenwise_decoding(layout: KvLayout) {
         .map(|(row, expected)| {
             let start = row * VOCAB;
             compare(
-                &verifier.verify_logits.as_slice::<f32>()[start..start + VOCAB],
+                // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+                &unsafe { verifier.verify_logits.as_slice::<f32>() }[start..start + VOCAB],
                 expected,
             )
         })
@@ -286,7 +291,8 @@ fn verify_block_restores_like_tokenwise_decoding(layout: KvLayout) {
             .expect("commit verified rows");
         model.position = start + committed;
         model.forward(next, true).expect("decode after rollback");
-        let report = compare(model.scratch.logits.as_slice::<f32>(), expected);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        let report = compare(unsafe { model.scratch.logits.as_slice::<f32>() }, expected);
         assert!(
             report["same_argmax"].as_bool() == Some(true)
                 && report["max_abs"].as_f64().expect("max_abs") < f64::from(row_tolerance),
@@ -304,7 +310,11 @@ fn verify_block_restores_like_tokenwise_decoding(layout: KvLayout) {
         .expect("adopt every row");
     model.position = start + 1;
     model.forward(next, true).expect("decode without restore");
-    let control = compare(model.scratch.logits.as_slice::<f32>(), &continuations[0]);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let control = compare(
+        unsafe { model.scratch.logits.as_slice::<f32>() },
+        &continuations[0],
+    );
     assert!(
         control["max_abs"].as_f64().expect("max_abs") > 10.0 * f64::from(row_tolerance),
         "skipping the restore was not observable: {control}"
@@ -327,29 +337,32 @@ fn verify_block_restores_like_tokenwise_decoding(layout: KvLayout) {
 fn poison_head(speculation: &mut Speculation) {
     let (keys, values, predicted) = speculation.mtp.cache_buffers_mut();
     for cache in [keys, values] {
-        cache.as_mut_slice::<half::f16>().fill(half::f16::NAN);
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { cache.as_mut_slice::<half::f16>().fill(half::f16::NAN) };
     }
-    predicted.as_mut_slice::<f32>().fill(f32::NAN);
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    unsafe { predicted.as_mut_slice::<f32>().fill(f32::NAN) };
 }
 
 /// Key cache bits, value cache bits, and whether each predicted element is NaN.
 fn head_bits(speculation: &Speculation) -> (Vec<u16>, Vec<u16>, Vec<bool>) {
     let bits = |cache: &MetalBuffer| {
-        cache
-            .as_slice::<half::f16>()
-            .iter()
-            .copied()
-            .map(half::f16::to_bits)
-            .collect::<Vec<_>>()
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe {
+            cache
+                .as_slice::<half::f16>()
+                .iter()
+                .copied()
+                .map(half::f16::to_bits)
+                .collect::<Vec<_>>()
+        }
     };
     let (keys, values) = speculation.mtp.kv_caches();
     (
         bits(keys),
         bits(values),
-        speculation
-            .mtp
-            .predicted()
-            .as_slice::<f32>()
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe { speculation.mtp.predicted().as_slice::<f32>() }
             .iter()
             .map(|value| value.is_nan())
             .collect(),
@@ -380,7 +393,8 @@ fn draft_logits(model: &mut BonsaiModel, seed: u32) -> Vec<f32> {
         )
         .expect("draft encode");
     batch.commit_and_wait().expect("draft completion");
-    let logits = speculation.mtp.logits.as_slice::<f32>().to_vec();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let logits = unsafe { speculation.mtp.logits.as_slice::<f32>() }.to_vec();
     model.speculation = Some(speculation);
     logits
 }
@@ -426,14 +440,17 @@ fn kv_only_ingestion_matches_full_head_cache_and_next_draft() {
     let kv_only_seconds = started.elapsed().as_secs_f64();
     let (kv_keys, kv_values, kv_predicted_nan) =
         head_bits(model.speculation.as_ref().expect("speculation"));
-    let kv_prev_hidden = model
-        .speculation
-        .as_ref()
-        .expect("speculation")
-        .mtp
-        .prev_hidden()
-        .as_slice::<f32>()
-        .to_vec();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let kv_prev_hidden = unsafe {
+        model
+            .speculation
+            .as_ref()
+            .expect("speculation")
+            .mtp
+            .prev_hidden()
+            .as_slice::<f32>()
+    }
+    .to_vec();
     let kv_draft = draft_logits(&mut model, seed);
 
     // Full head over the same rows: the previous behaviour of `logits=false`.
@@ -474,7 +491,8 @@ fn kv_only_ingestion_matches_full_head_cache_and_next_draft() {
     }
     let full_seconds = started.elapsed().as_secs_f64();
     let (full_keys, full_values, full_predicted_nan) = head_bits(&speculation);
-    let full_prev_hidden = speculation.mtp.prev_hidden().as_slice::<f32>().to_vec();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let full_prev_hidden = unsafe { speculation.mtp.prev_hidden().as_slice::<f32>() }.to_vec();
     model.speculation = Some(speculation);
     let full_draft = draft_logits(&mut model, seed);
 
@@ -613,15 +631,19 @@ fn chunked_prefill_ingests_output_normalized_rows_for_every_chunk() {
         let speculation = model.speculation.as_ref().expect("speculation");
         let (keys, values) = speculation.mtp.kv_caches();
         let floats = |cache: &MetalBuffer| {
-            cache.as_slice::<half::f16>()[written.clone()]
-                .iter()
-                .map(|value| value.to_f32())
-                .collect::<Vec<_>>()
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            unsafe {
+                cache.as_slice::<half::f16>()[written.clone()]
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>()
+            }
         };
         HeadState {
             keys: floats(keys),
             values: floats(values),
-            prev_hidden: speculation.mtp.prev_hidden().as_slice::<f32>().to_vec(),
+            // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+            prev_hidden: unsafe { speculation.mtp.prev_hidden().as_slice::<f32>() }.to_vec(),
             draft: draft_logits(model, seed),
         }
     };
@@ -808,7 +830,9 @@ fn quantized_kv_tracks_f16_next_token_distribution() {
         )
         .expect("load")
     };
-    let logits = |model: &BonsaiModel| model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let logits =
+        |model: &BonsaiModel| unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
     let argmax = |values: &[f32]| {
         values
             .iter()
@@ -1003,7 +1027,9 @@ fn reduced_state_tracks_f32_state_next_token_distribution() {
         },
     )
     .expect("load");
-    let logits = |model: &BonsaiModel| model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let logits =
+        |model: &BonsaiModel| unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
     let log_softmax = |values: &[f32]| {
         let peak = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
         let log_sum = values
@@ -1036,7 +1062,12 @@ fn reduced_state_tracks_f32_state_next_token_distribution() {
             AttentionLayer::Recurrent(recurrent) => Some(recurrent),
             AttentionLayer::Full(_) => None,
         })
-        .flat_map(|recurrent| recurrent.state.as_slice::<f32>().iter().map(|v| v.abs()))
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        .flat_map(|recurrent| {
+            unsafe { recurrent.state.as_slice::<f32>() }
+                .iter()
+                .map(|v| v.abs())
+        })
         .fold(0.0f32, f32::max);
     eprintln!(
         "f32 state: largest magnitude {peak} after {} tokens",
@@ -1131,7 +1162,9 @@ fn large_batch_prefill_tracks_small_batch_next_token_distribution() {
             .expect("kernels")
             .with_large_batch_min(large_batch_min)
     };
-    let logits = |model: &BonsaiModel| model.scratch.logits.as_slice::<f32>()[..VOCAB].to_vec();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let logits =
+        |model: &BonsaiModel| unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
     let log_softmax = |values: &[f32]| {
         let peak = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
         let log_sum = values

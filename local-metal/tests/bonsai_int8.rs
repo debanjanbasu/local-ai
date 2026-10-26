@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![allow(unsafe_code, clippy::expect_used)]
 
 use local_metal::batch::CommandBatch;
 use local_metal::bonsai::{BonsaiKernels, Int8Matrix, PTQ1_BLOCK_BYTES, Ptq1Matrix};
@@ -86,7 +86,8 @@ fn guarded(context: &MetalContext, count: usize) -> MetalBuffer {
 }
 
 fn assert_close(label: &str, actual: &MetalBuffer, expected: &[f64]) -> f64 {
-    let actual = actual.as_slice::<f32>();
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let actual = unsafe { actual.as_slice::<f32>() };
     let peak = expected.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
     let mut worst = 0.0_f64;
     for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {

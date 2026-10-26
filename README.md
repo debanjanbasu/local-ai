@@ -4,8 +4,10 @@ Native Rust and Metal inference for Prism ML's Ternary Bonsai 2 27B PTQ1 GGUF
 on Apple Silicon. The engine reads the memory-mapped checkpoint directly,
 without Python, MLX, llama.cpp, or a cloud service.
 
-Requirements: Apple Silicon, Xcode's Metal toolchain, and the Rust nightly
-pinned by `rust-toolchain.toml`. Measurements use an M4 Pro with 48 GB memory
+Requirements: Apple Silicon, Xcode's Metal toolchain (`xcodebuild
+-downloadComponent MetalToolchain`), and the Rust nightly pinned by
+`rust-toolchain.toml`. The tensor kernels need the macOS 26 SDK's Metal 4; an
+older SDK builds with a warning and the slower SIMD kernels. Measurements use an M4 Pro with 48 GB memory
 unless a section says otherwise; [Other hardware](#other-hardware) gives a
 fanless MacBook Air M2 reference.
 
