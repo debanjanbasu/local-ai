@@ -317,6 +317,53 @@ async fn write_and_edit_inside_the_root() {
 }
 
 #[tokio::test]
+async fn writes_never_follow_a_symlink_swapped_in_at_the_last_component() {
+    let root = tempfile::tempdir().expect("root");
+    let target = root.path().join("target.txt");
+    std::fs::write(&target, "original\n").expect("target");
+    std::fs::write(root.path().join("x"), "plain\n").expect("x");
+    // A racing process keeps swapping `x` between a regular file and a
+    // symlink to `target.txt` (inside the root, so cap-std alone would
+    // follow it), by atomic renames, for a bounded number of writes. The
+    // race is probabilistic; following the link loses it in most runs.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let stop = std::sync::Arc::clone(&stop);
+        let dir = root.path().to_owned();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::os::unix::fs::symlink("target.txt", dir.join(".link"));
+                let _ = std::fs::rename(dir.join(".link"), dir.join("x"));
+                let _ = std::fs::write(dir.join(".file"), "plain\n");
+                let _ = std::fs::rename(dir.join(".file"), dir.join("x"));
+            }
+        })
+    };
+    let tools = toolbox(root.path(), true, false);
+    for round in 0..10_000 {
+        let request = if round % 2 == 0 {
+            Request::Write {
+                path: "x".into(),
+                content: "written\n".into(),
+            }
+        } else {
+            Request::Edit {
+                path: "x".into(),
+                old: "original".into(),
+                new: "edited".into(),
+            }
+        };
+        let _ = tools.run(request, SECOND).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().expect("swapper");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("target"),
+        "original\n"
+    );
+}
+
+#[tokio::test]
 async fn shell_runs_harmless_commands_in_the_root() {
     let root = tempfile::tempdir().expect("root");
     std::fs::write(root.path().join("a.txt"), "hello\n").expect("write");

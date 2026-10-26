@@ -9,15 +9,22 @@
 //! created, and the opened directory must be the inode that was checked.
 //! `cap-std` itself never resolves a path outside the root, so even a
 //! component swapped for a symlink between the check and the open stays
-//! inside it.
+//! inside it. The file itself is opened with `O_NOFOLLOW` and checked
+//! through the open handle (a regular file with one link, the inode that was
+//! checked), which is then truncated, read and written; it is never reopened
+//! by name.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::io::ErrorKind;
+use std::fs::File;
+use std::io::{ErrorKind, Read as _};
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::Path;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, MetadataExt as _};
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use super::{Inner, Output, Request, SearchMode, ToolError, truncate_marked};
 use crate::Error;
@@ -152,10 +159,9 @@ fn write_file(inner: &Inner, path: &str, content: &str) -> Result<Output, ToolEr
     let root = root_dir(inner)?;
     let rel = relative_path(path, false).map_err(service_error)?;
     let (parent, name) = open_parent(&root, &rel, true)?;
-    check_target(&parent, &name, path, true)?;
-    parent
-        .write(&name, content.as_bytes())
-        .map_err(|error| io_error(path, &error))?;
+    let seen = check_target(&parent, &name, path, true)?;
+    let (file, _) = open_target(&parent, &name, path, seen)?;
+    replace_contents(&file, content.as_bytes(), path)?;
     Ok(Output::Text {
         text: format!("wrote {} bytes to {path}", content.len()),
         truncated: false,
@@ -167,15 +173,19 @@ fn edit_file(inner: &Inner, path: &str, old: &str, new: &str) -> Result<Output, 
     if old.is_empty() {
         return Err(ToolError::Invalid("old text must not be empty".into()));
     }
+    let max = inner.limits.max_write_bytes;
     let root = root_dir(inner)?;
     let rel = relative_path(path, false).map_err(service_error)?;
     let (parent, name) = open_parent(&root, &rel, false)?;
-    let size = check_target(&parent, &name, path, false)?;
-    check_size(
-        usize::try_from(size).unwrap_or(usize::MAX),
-        inner.limits.max_write_bytes,
-    )?;
-    let bytes = parent.read(&name).map_err(|error| io_error(path, &error))?;
+    let seen = check_target(&parent, &name, path, false)?;
+    let (mut file, size) = open_target(&parent, &name, path, seen)?;
+    check_size(usize::try_from(size).unwrap_or(usize::MAX), max)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(path, &error))?;
+    check_size(bytes.len(), max)?;
     let current = String::from_utf8(bytes)
         .map_err(|_| ToolError::Invalid(format!("{path} is not UTF-8 text")))?;
     let count = current.matches(old).count();
@@ -185,10 +195,8 @@ fn edit_file(inner: &Inner, path: &str, old: &str, new: &str) -> Result<Output, 
         )));
     }
     let edited = current.replacen(old, new, 1);
-    check_size(edited.len(), inner.limits.max_write_bytes)?;
-    parent
-        .write(&name, edited.as_bytes())
-        .map_err(|error| io_error(path, &error))?;
+    check_size(edited.len(), max)?;
+    replace_contents(&file, edited.as_bytes(), path)?;
     Ok(Output::Text {
         text: format!("edited {path}: replaced 1 occurrence"),
         truncated: false,
@@ -276,28 +284,85 @@ fn open_parent(root: &Dir, rel: &Path, create: bool) -> Result<(Dir, OsString), 
 }
 
 /// Check the final component: never a symlink, and a regular file (or, when
-/// `may_create`, absent). Returns its size (0 when absent).
+/// `may_create`, absent). Returns its device and inode (`None` when absent).
 fn check_target(
     parent: &Dir,
     name: &OsString,
     display: &str,
     may_create: bool,
-) -> Result<u64, ToolError> {
+) -> Result<Option<(u64, u64)>, ToolError> {
     match parent.symlink_metadata(name) {
         Ok(seen) if seen.file_type().is_symlink() => Err(ToolError::Denied(format!(
             "{display} is a symlink, which is never followed"
         ))),
         // Another name for the same file may live outside the root.
-        Ok(seen) if seen.is_file() && seen.nlink() > 1 => Err(ToolError::Denied(format!(
-            "{display} has other hard links, so writing it could change files outside the root"
-        ))),
-        Ok(seen) if seen.is_file() => Ok(seen.len()),
+        Ok(seen) if seen.is_file() && seen.nlink() > 1 => Err(more_links(display)),
+        Ok(seen) if seen.is_file() => Ok(Some((seen.dev(), seen.ino()))),
         Ok(_) => Err(ToolError::Invalid(format!(
             "{display} is not a regular file"
         ))),
-        Err(error) if error.kind() == ErrorKind::NotFound && may_create => Ok(0),
+        Err(error) if error.kind() == ErrorKind::NotFound && may_create => Ok(None),
         Err(error) => Err(io_error(display, &error)),
     }
+}
+
+/// Open the final component `name` of `parent` for reading and writing,
+/// creating it when `seen` (what [`check_target`] found) is `None`, and
+/// return it with its size. Nothing is truncated yet.
+///
+/// `O_NOFOLLOW` refuses a symlink swapped in since the check, and a single
+/// component opened relative to `parent` cannot leave it. The opened handle
+/// must again be a regular file with one link, and the checked inode when
+/// there was one; `O_NONBLOCK` keeps a swapped-in FIFO from blocking the
+/// open.
+fn open_target(
+    parent: &Dir,
+    name: &OsString,
+    display: &str,
+    seen: Option<(u64, u64)>,
+) -> Result<(File, u64), ToolError> {
+    let mut flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    if seen.is_none() {
+        flags |= OFlags::CREATE;
+    }
+    let mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH;
+    let file = match rustix::fs::openat(parent, name.as_os_str(), flags, mode) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::LOOP) => {
+            return Err(ToolError::Denied(format!(
+                "{display} is a symlink, which is never followed"
+            )));
+        }
+        Err(errno) => return Err(io_error(display, &errno.into())),
+    };
+    let opened = file.metadata().map_err(|error| io_error(display, &error))?;
+    if !opened.is_file() {
+        return Err(ToolError::Invalid(format!(
+            "{display} is not a regular file"
+        )));
+    }
+    if opened.nlink() > 1 {
+        return Err(more_links(display));
+    }
+    if seen.is_some_and(|seen| seen != (opened.dev(), opened.ino())) {
+        return Err(ToolError::Failed(format!(
+            "{display} changed while it was being opened"
+        )));
+    }
+    Ok((file, opened.len()))
+}
+
+/// Make `file` hold exactly `content`.
+fn replace_contents(file: &File, content: &[u8], display: &str) -> Result<(), ToolError> {
+    file.set_len(0)
+        .and_then(|()| file.write_all_at(content, 0))
+        .map_err(|error| io_error(display, &error))
+}
+
+fn more_links(display: &str) -> ToolError {
+    ToolError::Denied(format!(
+        "{display} has other hard links, so writing it could change files outside the root"
+    ))
 }
 
 fn io_error(display: &str, error: &std::io::Error) -> ToolError {

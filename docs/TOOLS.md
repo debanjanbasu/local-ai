@@ -181,9 +181,12 @@ capability handle on the root (`cap-std`), which cannot resolve outside it
 even if a component is swapped between check and open. Reads, listings and
 searches are bounded by the workspace limits and marked when truncated.
 Writes and edits need `--tools-allow-write`, create missing directories and
-are capped at 4 MiB; edits replace exactly one occurrence. A file with more
-than one hard link is never written (its other name may be outside the
-root), and the shell sandbox refuses to create a hard link to a file outside
+are capped at 4 MiB; edits replace exactly one occurrence. The file itself is
+opened with `O_NOFOLLOW` and checked through that handle (a regular file, the
+inode that was checked) before it is truncated, read and written through the
+same handle, so a symlink swapped in after the check is refused, not
+followed. A file with more than one hard link is never written (its other
+name may be outside the root), and the shell sandbox refuses to create a hard link to a file outside
 the root.
 
 **Shell** (`tools::shell`): `/bin/sh -c` under `sandbox-exec` with a
