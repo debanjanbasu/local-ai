@@ -641,10 +641,17 @@ fn serve_real_bonsai_validates_before_streaming_and_preserves_history() {
     ] {
         let prepared =
             prepare_generation(body.to_string().as_bytes(), true).expect("parse request");
-        assert!(matches!(
-            handle.chat(prepared.request).expect("queue").next(),
-            Some(Event::Error(_))
-        ));
+        // Refused before any token: a prompt that cannot be rendered fails the
+        // submission itself (it is rendered there), invalid parameters and an
+        // oversized output fail as the stream's first event. HTTP answers both
+        // with the same 400.
+        match handle.chat(prepared.request) {
+            Err(error) => assert!(
+                matches!(error, local_engine::Error::InvalidArgument(_)),
+                "{error:?}"
+            ),
+            Ok(mut events) => assert!(matches!(events.next(), Some(Event::Error(_)))),
+        }
     }
     let body = json!({"messages":[
             {"role":"user","content":"First"},
