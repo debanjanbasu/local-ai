@@ -381,9 +381,10 @@ impl VectorIndex {
                 .last_active_at
                 .is_none_or(|at| now.saturating_sub(at) >= ACTIVITY_GRANULARITY_SECONDS)
             {
-                // A write (and its fsync) at most once per granularity period.
-                let writer = self.store.connection()?;
-                touch(&writer, store_id)?;
+                // A write (and its fsync) at most once per granularity
+                // period, best-effort: a busy database never fails a search.
+                self.store
+                    .write_best_effort(|connection| touch(connection, store_id));
             }
             files.extend(searchable_files(
                 &snapshot,

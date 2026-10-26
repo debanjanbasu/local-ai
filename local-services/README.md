@@ -221,7 +221,8 @@ contract, limits and semantics are the module docs; the essentials:
   not model tokens. Deleting the source File removes it from every store.
 - **Expiry.** `expires_after` (`last_active_at`, 1 to 365 days); an expired
   store reads as `expired` and refuses search and attachments with a
-  conflict. Searches record activity at most once a minute per store.
+  conflict. Searches record activity at most once a minute per store,
+  best-effort (skipped, not failing the search, when the database is busy).
 - **Filters.** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `and`, `or`
   over file attributes (at most 16 per file), bounded in depth and size.
 

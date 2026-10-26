@@ -193,7 +193,8 @@
 //! A store with `expires_after` expires `days` after its `last_active_at`,
 //! which creating it, modifying it, attaching files and searching it update
 //! (searches at most once per [`ACTIVITY_GRANULARITY_SECONDS`], so a
-//! burst of searches costs one database write).
+//! burst of searches costs one database write; that write is best-effort,
+//! skipped rather than failing the search when the database is busy).
 //! An expired store reports `status: expired`; it can still be read,
 //! modified and deleted, but searching it or attaching files is a conflict.
 

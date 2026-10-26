@@ -125,6 +125,29 @@ fn words(count: usize) -> String {
 }
 
 #[test]
+fn a_busy_activity_write_never_fails_a_search() {
+    let root = TempRoot::new();
+    let (store, index) = root.open();
+    let alpha = file(&store, "a.txt", "busy database");
+    let id = vector_store(&store, &[&alpha]);
+    index_all(&index);
+    // Long enough ago that the search records activity, while another
+    // writer holds the write lock.
+    let writer = raw(&store);
+    writer
+        .execute(
+            "UPDATE vector_stores SET last_active_at = last_active_at - 600 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(search(&index, &id, "busy")[0].0, alpha);
+    assert!(started.elapsed().as_secs() < 2, "{:?}", started.elapsed());
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
 fn files_are_indexed_searched_and_read_back() {
     let root = TempRoot::new();
     let (store, index) = root.open();
