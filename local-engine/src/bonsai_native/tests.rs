@@ -1257,3 +1257,109 @@ fn prefill_block_size_leaves_identical_logits() {
         .count();
     assert_eq!(differing, 0, "{differing} of {VOCAB} logits differ");
 }
+
+/// Short-prefix decode attention with 32-token SIMD splits against 128-token
+/// splits, teacher-forced over 64 greedy tokens after three prompts of this
+/// repository's text that keep every prefix under the 1,024-token threshold
+/// where the split size applies, for the F16 and the default Q8 cache. Only
+/// the summation order differs, so the bounds are the prefill acceptance bar:
+/// mean next-token KL at most 1e-5 and at least 63/64 top-1 per prompt.
+#[test]
+#[ignore = "requires the pinned model"]
+#[allow(clippy::cast_precision_loss)]
+fn short_attention_splits_track_128_token_splits_next_token_distribution() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = [
+        "docs/BONSAI.md",
+        "README.md",
+        "local-engine/src/bonsai_native.rs",
+    ]
+    .iter()
+    .map(|file| std::fs::read_to_string(format!("{root}/{file}")).expect("corpus"))
+    .collect::<String>();
+    let steps = 64;
+    let context = MetalContext::new().expect("context");
+    let shaders = ShaderLibrary::new(context.device()).expect("shaders");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let corpus = tokenizer.encode(&text).expect("encode");
+    let prompts = [(0, 128), (4096, 512), (12_288, 896)];
+    assert!(prompts.iter().all(|&(_, length)| length + steps < 1024));
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let logits =
+        |model: &BonsaiModel| unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
+    let log_softmax = |values: &[f32]| {
+        let peak = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        let log_sum = values
+            .iter()
+            .map(|&v| (f64::from(v) - peak).exp())
+            .sum::<f64>()
+            .ln()
+            + peak;
+        values
+            .iter()
+            .map(|&v| f64::from(v) - log_sum)
+            .collect::<Vec<_>>()
+    };
+    let ops = |tokens| {
+        BonsaiOps::new(&context, &shaders)
+            .expect("ops")
+            .with_short_split_tokens(tokens)
+            .expect("short split")
+    };
+    for layout in [KvLayout::F16, KvLayout::Q8] {
+        let mut model = BonsaiModel::load(
+            BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open"),
+            1024,
+            128,
+            None,
+            None,
+            NgramSettings::default(),
+            KvOptions {
+                layout,
+                initial_tokens: 1024,
+            },
+        )
+        .expect("load");
+        for (offset, length) in prompts {
+            let prompt = &corpus[offset..offset + length];
+            model.ops = ops(128);
+            model.reset();
+            model.prefill(prompt, &mut |_| {}).expect("prefill");
+            let mut reference = Vec::new();
+            let mut tokens = Vec::new();
+            for _ in 0..steps {
+                let current = logits(&model);
+                tokens.push(argmax(&current) as u32);
+                reference.push(log_softmax(&current));
+                model
+                    .decode(*tokens.last().expect("token"))
+                    .expect("decode");
+            }
+            model.ops = ops(32);
+            model.reset();
+            model.prefill(prompt, &mut |_| {}).expect("prefill");
+            let (mut kl_sum, mut max_kl, mut agree) = (0.0f64, 0.0f64, 0);
+            for (step, &token) in tokens.iter().enumerate() {
+                let current = logits(&model);
+                let candidate = log_softmax(&current);
+                let value = reference[step]
+                    .iter()
+                    .zip(&candidate)
+                    .map(|(&p, &q)| p.exp() * (p - q))
+                    .sum::<f64>();
+                kl_sum += value;
+                max_kl = max_kl.max(value);
+                agree += usize::from(argmax(&current) as u32 == token);
+                model.decode(token).expect("decode");
+            }
+            let mean = kl_sum / steps as f64;
+            let name = layout.name();
+            eprintln!(
+                "{name}, {length}-token prompt: mean KL {mean:.3e}, max {max_kl:.3e}, top-1 {agree}/{steps}"
+            );
+            assert!(mean <= 1e-5, "{name} {length}: mean KL {mean:.3e}");
+            assert!(agree >= 63, "{name} {length}: top-1 {agree}/{steps}");
+        }
+    }
+}

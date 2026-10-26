@@ -2561,35 +2561,7 @@ runs, two rounds): 30.1 → 30.0 tok/s at 8K, 25.5 → 25.9 at 32K, and 16.2 →
 62 ms).
 
 Below a 1,024-token prefix, decode attention uses the SIMD `bo_attn_split`
-kernel on every build. A **rejected candidate** reduced its 128-token splits
-to 32 below that threshold to expose more parallel work. A one-layer
-microbenchmark on the M4 Pro (median GPU time per call over nine
-trials of 64 calls; 128-token baseline given as the range of two bracketing
-runs; 64-token splits were also measured and were slower than 32 at every
-short prefix except a tie at 33):
-
-| Layout, prefix | 128-token splits | 32-token splits |
-| --- | ---: | ---: |
-| F16, 64 | 19.1–23.9 µs | 11.9 µs |
-| F16, 128 | 34.1–37.4 µs | 12.3 µs |
-| F16, 512 | 34.6–38.1 µs | 14.4 µs |
-| F16, 1,023 | 44.1–47.5 µs | 21.1 µs |
-| Q8, 33 | 13.1–13.7 µs | 12.8 µs |
-| Q8, 128 | 36.6–39.7 µs | 13.2 µs |
-| Q8, 512 | 37.5–40.8 µs | 16.8 µs |
-| Q8, 1,023 | 40.3–42.7 µs | 26.7 µs |
-| F16 / Q8, 1,024 (control) | 19.5–23.4 / 20.2–20.6 µs | 19.7 / 20.6 µs |
-| F16 / Q8, 2,048 (control) | 29.6–32.6 / 34.7–34.9 µs | 29.4 / 35.0 µs |
-
-Short prefixes match the F64 reference, and prefixes at or above 1,024 stay
-bitwise identical to the 128-token build. However, an interleaved six-prompt
-full-model comparison (300-token cap, AC power, no sleep) changed greedy text
-on two of six plain-decode prompts: arithmetic and essay. Plain-decode
-geomean was 31.95 → 32.50 tok/s (1.7%); default speculative decode was
-38.92 → 38.97 tok/s (0.1%, within noise), with identical text in all six
-speculative pairs. These are one-round observations, not stable throughput
-estimates. The candidate failed the byte-identity acceptance bar and was
-removed; the runtime retains 128-token SIMD splits.
+kernel on every build, in 32-token splits (see Performance).
 
 Causal prefill uses a tensor kernel of the same shape. Whole model, plain
 decode without speculation, M4 Pro:
@@ -2757,6 +2729,60 @@ patterns and arithmetic differ. Three- and four-row verify blocks reuse
 weights and spend more time computing, so their lower weight GB/s does not
 by itself identify a memory bottleneck. Optimize verified tokens per second,
 not bytes moved for their own sake; retain the mixed-precision head.
+
+Short-prefix decode attention runs in 32-token splits. Below 1,024 tokens
+every build takes the SIMD `bo_attn_split` kernel (one SIMD group per KV
+head, pair of query heads and split), where 128-token splits gave the GPU only
+twelve SIMD groups per 128 tokens of prefix; from 1,024 tokens on nothing
+changes. `BonsaiOps::with_short_split_tokens` selects 32 to 128 tokens for
+comparisons. One layer on the M4 Pro, median GPU time per call over nine
+trials of 64 calls (64-token splits, measured in an earlier round, were slower
+than 32 at every short prefix but a tie at 33):
+
+| Layout, prefix | 128-token splits | 32-token splits |
+| --- | ---: | ---: |
+| F16, 64 | 28.8 µs | 11.9 µs |
+| F16, 128 | 34.6 µs | 12.2 µs |
+| F16, 512 | 35.3 µs | 15.0 µs |
+| F16, 1,023 | 46.1 µs | 21.7 µs |
+| Q8, 33 | 12.7 µs | 12.7 µs |
+| Q8, 128 | 37.1 µs | 13.1 µs |
+| Q8, 512 | 38.8 µs | 19.4 µs |
+| Q8, 1,023 | 42.1 µs | 27.5 µs |
+| F16 / Q8, 1,024 (control) | 20.9 / 20.3 µs | 20.9 / 21.3 µs |
+| Q8, 2,048 (control) | 34.8 µs | 35.3 µs |
+
+Only the summation order changes. Both sizes match the F64 reference within
+2e-5 (`split_gqa_matches_f64_across_boundaries_and_shorter_workspace_reuse`).
+Teacher-forced on the real model along 64 greedy tokens after three prompts
+of this repository's text, against 128-token splits
+(`short_attention_splits_track_128_token_splits_next_token_distribution`):
+
+| Cache, prompt | Mean next-token KL | Worst step | Top-1 |
+| --- | ---: | ---: | ---: |
+| F16, 128 tokens | 1.5e-8 | 4.8e-7 | 64/64 |
+| F16, 512 tokens | 9.7e-9 | 1.5e-7 | 64/64 |
+| F16, 896 tokens | 7.6e-9 | 3.9e-8 | 64/64 |
+| Q8, 128 tokens | 8.8e-7 | 1.1e-5 | 64/64 |
+| Q8, 512 tokens | 5.6e-7 | 6.8e-6 | 64/64 |
+| Q8, 896 tokens | 5.3e-7 | 6.4e-6 | 64/64 |
+
+128-token splits on both sides give exactly zero, so this is the split change
+alone. Q8 presumably shows more of it because a perturbed key or value row
+that crosses an int8 rounding boundary moves by a whole quantization step; it
+is still a tenth of the bar the test asserts (the prefill acceptance bar,
+mean at most 1e-5 and at least 63/64 top-1) and of rotated Q8 against F16
+(8.9e-6). Whole model, six prompts, 300 greedy tokens, best of two
+interleaved runs of both builds while other agents' builds loaded the CPU:
+plain decode 29.47 to 30.26 tok/s geomean (+2.7%, every prompt +1.8% to
++5.0%), default speculative decode 37.45 to 37.46. Speculative rounds verify
+their two to four tokens with the block kernels, so there only drafting and
+undrafted single-token steps take the split kernel. Greedy text on these six
+prompts is byte-identical across the builds in both modes. An earlier
+evaluation rejected the change because greedy text then differed from the
+previous build on two of six prompts, but byte identity counts near-tie
+flips, not error, so it is judged by the teacher-forced bar like the other
+numerical changes in this document.
 
 Q8 attention now shares each dequantized K/V tile across two to four query
 tokens. Their six GQA heads are packed into eight-query tensor tiles: four

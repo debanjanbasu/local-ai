@@ -38,7 +38,15 @@ pub const GDN_DIM: u32 = 128;
 /// tok/s at 128 rows, 128.7 at 256, 130.3 at 512 and 129.4 at 640 (before
 /// that rounding).
 pub const MAX_PREFILL_TOKENS: u32 = 512;
+/// Tokens per `bo_attn_split` split from `SPLIT_TENSOR_MIN_PREFIX` on (SIMD
+/// builds only: tensor builds take the tensor split kernels there).
 const SPLIT: u32 = 128;
+/// Default tokens per `bo_attn_split` split below `SPLIT_TENSOR_MIN_PREFIX`;
+/// see [`BonsaiOps::with_short_split_tokens`].
+const DEFAULT_SHORT_SPLIT_TOKENS: u32 = 32;
+/// Smallest short split [`BonsaiOps::with_short_split_tokens`] accepts, which
+/// [`AttentionWorkspace`] reserves partial records for.
+const SHORT_SPLIT_MIN: u32 = 32;
 /// Tokens per threadgroup of `bo_attn_split_tensor` (a multiple of its
 /// 64-key tile). Short prefixes use the small split so the four KV heads
 /// still yield enough threadgroups to fill the GPU; from
@@ -167,9 +175,14 @@ impl AttentionWorkspace {
         } else {
             0
         };
-        let splits = max_context
-            .div_ceil(SPLIT)
-            .max(SPLIT_TENSOR_ROWS * tensor_short.max(tensor_long)) as usize;
+        // Short SIMD splits below the tensor threshold may be as small as
+        // `SHORT_SPLIT_MIN`.
+        let simd = max_context.div_ceil(SPLIT).max(
+            max_context
+                .min(SPLIT_TENSOR_MIN_PREFIX - 1)
+                .div_ceil(SHORT_SPLIT_MIN),
+        );
+        let splits = simd.max(SPLIT_TENSOR_ROWS * tensor_short.max(tensor_long)) as usize;
         let partial_bytes = splits
             .checked_mul(Q_HEADS as usize)
             .and_then(|n| n.checked_mul(258 * 4))
@@ -310,6 +323,8 @@ pub struct BonsaiOps {
     quantized_tensor: Vec<(KvLayout, usize)>,
     /// Gather followed by the two-, three- and four-row Q8 split pipelines.
     tensor_rows: Option<usize>,
+    /// Tokens per `bo_attn_split` split below `SPLIT_TENSOR_MIN_PREFIX`.
+    short_split_tokens: u32,
 }
 impl BonsaiOps {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
@@ -441,12 +456,31 @@ impl BonsaiOps {
             attention_kernel,
             quantized_tensor,
             tensor_rows,
+            short_split_tokens: DEFAULT_SHORT_SPLIT_TOKENS,
         })
     }
 
     #[must_use]
     pub const fn attention_kernel(&self) -> AttentionKernel {
         self.attention_kernel
+    }
+
+    /// Tokens per split of decode attention's SIMD kernel below a 1,024-token
+    /// prefix, where every build uses it.
+    #[must_use]
+    pub const fn short_split_tokens(&self) -> u32 {
+        self.short_split_tokens
+    }
+
+    /// Override [`Self::short_split_tokens`] (for measurements and controls).
+    /// Only the summation order changes. Accepts 32 to 128 tokens, the range
+    /// [`AttentionWorkspace`] reserves partial records for.
+    pub fn with_short_split_tokens(mut self, tokens: u32) -> crate::Result<Self> {
+        if !(SHORT_SPLIT_MIN..=SPLIT).contains(&tokens) {
+            return Err(arg("short attention split must be 32..=128 tokens"));
+        }
+        self.short_split_tokens = tokens;
+        Ok(self)
     }
 
     /// Index of `layout`'s quantized tensor decode-split pipeline, if it has one.
