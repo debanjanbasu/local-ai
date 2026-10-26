@@ -9,12 +9,15 @@
 //! `9a9394a895b96003ca842a6041cb28ac49a108f7`. See `THIRD_PARTY_NOTICES.md`.
 
 use core::ffi::c_void;
+use std::cell::OnceCell;
 use std::ptr::NonNull;
 
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLSize};
+use objc2_metal::{
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLFunction, MTLSize,
+};
 
 use crate::Error;
 use crate::batch::CommandBatch;
@@ -209,9 +212,15 @@ pub struct BonsaiKernels {
     matvec_concat_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     rms_forward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     swiglu_forward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    /// Tensor-tile variants with 64- and 32-token tiles for verify-sized blocks.
-    matmul_short: Option<[Retained<ProtocolObject<dyn MTLComputePipelineState>>; 2]>,
+    /// The prefill tile, compiled on first use when [`Self::new`] built these
+    /// kernels: default routing never reaches it (see
+    /// [`DEFAULT_SMALL_BATCH_MAX`]), and its three tensor pipelines cost
+    /// every startup.
+    prefill_tile: OnceCell<PrefillTile>,
+    /// What `prefill_tile` is compiled from: the device, and the selected
+    /// kernel's functions (the tile, then the 64- and 32-token tensor tiles).
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    prefill_functions: Vec<Retained<ProtocolObject<dyn MTLFunction>>>,
     /// Exact-token kernels for 2..=`SMALL_BATCH_KERNEL_TOKENS` activation rows.
     small_batch: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// Simdgroup-matrix kernel for up to `SMALL_BATCH_WIDE_TOKENS` rows.
@@ -279,34 +288,101 @@ pub const DEFAULT_LARGE_BATCH_MIN: u32 = 56;
 /// Token rows per large-batch threadgroup tile.
 const LARGE_BATCH_TILE: usize = 64;
 
+/// The prefill tile's pipelines: the full tile and, for the tensor kernel,
+/// its 64- and 32-token variants for verify-sized blocks.
+struct PrefillTile {
+    matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    short: Option<[Retained<ProtocolObject<dyn MTLComputePipelineState>>; 2]>,
+}
+
+impl PrefillTile {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        functions: &[Retained<ProtocolObject<dyn MTLFunction>>],
+    ) -> crate::Result<Self> {
+        let mut pipelines = functions
+            .iter()
+            .map(|function| pipeline(device, function, 128));
+        let matmul = pipelines
+            .next()
+            .transpose()?
+            .ok_or_else(|| Error::InvalidArgument("Bonsai prefill tile has no pipeline".into()))?;
+        let short = match (pipelines.next(), pipelines.next()) {
+            (Some(short_64), Some(short_32)) => Some([short_64?, short_32?]),
+            _ => None,
+        };
+        Ok(Self { matmul, short })
+    }
+}
+
+fn pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    function: &ProtocolObject<dyn MTLFunction>,
+    threads: usize,
+) -> crate::Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(function)
+        .map_err(|error| Error::PipelineCreation(error.to_string()))?;
+    if pipeline.threadExecutionWidth() != 32 || pipeline.maxTotalThreadsPerThreadgroup() < threads {
+        return Err(Error::InvalidArgument(
+            "Bonsai pipeline cannot support the required SIMD/threadgroup size".into(),
+        ));
+    }
+    Ok(pipeline)
+}
+
 impl BonsaiKernels {
+    /// Kernels with the tensor prefill tile when the SDK compiled it, compiled
+    /// on first use. A device that rejects the tensor tile then fails that
+    /// use; only overridden thresholds route blocks to it.
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
-        // Older SDKs omit this function; unsupported devices can reject its PSO.
-        // In either case retain the portable F32 path, not a precision fallback.
-        Self::new_with_prefill_kernel(context, shaders, PrefillKernel::TensorF32)
-            .or_else(|_| Self::new_with_prefill_kernel(context, shaders, PrefillKernel::SimdF32))
+        // Older SDKs omit the tensor functions. Retain the portable F32 path,
+        // not a precision fallback.
+        let prefill_kernel = match shaders.get_function("bonsai_ptq1_matmul_tensor") {
+            Ok(_) => PrefillKernel::TensorF32,
+            Err(error) => {
+                eprintln!("metal: tensor prefill tile unavailable, using the SIMD tile: {error}");
+                PrefillKernel::SimdF32
+            }
+        };
+        Self::build(context, shaders, prefill_kernel, false)
     }
 
+    /// Select an exact prefill tile for comparisons, compiled now: unlike
+    /// [`Self::new`], an unavailable kernel is an error here.
     pub fn new_with_prefill_kernel(
         context: &MetalContext,
         shaders: &ShaderLibrary,
         prefill_kernel: PrefillKernel,
     ) -> crate::Result<Self> {
+        Self::build(context, shaders, prefill_kernel, true)
+    }
+
+    fn build(
+        context: &MetalContext,
+        shaders: &ShaderLibrary,
+        prefill_kernel: PrefillKernel,
+        compile_prefill_tile: bool,
+    ) -> crate::Result<Self> {
         let pipeline = |name: &str, threads: usize| -> crate::Result<_> {
             let function = shaders.get_function(name)?;
-            let pipeline = context
-                .device()
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|error| Error::PipelineCreation(error.to_string()))?;
-            if pipeline.threadExecutionWidth() != 32
-                || pipeline.maxTotalThreadsPerThreadgroup() < threads
-            {
-                return Err(Error::InvalidArgument(
-                    "Bonsai pipeline cannot support the required SIMD/threadgroup size".into(),
-                ));
-            }
-            Ok(pipeline)
+            pipeline(context.device(), &function, threads)
         };
+        let prefill_functions = match prefill_kernel {
+            PrefillKernel::SimdF32 => &["bonsai_ptq1_matmul_bytewise_32"][..],
+            PrefillKernel::TensorF32 => &[
+                "bonsai_ptq1_matmul_tensor",
+                "bonsai_ptq1_matmul_tensor_64",
+                "bonsai_ptq1_matmul_tensor_32",
+            ][..],
+        }
+        .iter()
+        .map(|name| shaders.get_function(name))
+        .collect::<crate::Result<Vec<_>>>()?;
+        let prefill_tile = OnceCell::new();
+        if compile_prefill_tile {
+            let _ = prefill_tile.set(PrefillTile::new(context.device(), &prefill_functions)?);
+        }
         Ok(Self {
             forward: pipeline("bonsai_fwht_forward", 128)?,
             inverse: pipeline("bonsai_fwht_inverse", 128)?,
@@ -316,20 +392,9 @@ impl BonsaiKernels {
             matvec_concat_bf16: pipeline("bonsai_ptq1_matvec_concat_bf16", 32)?,
             rms_forward: pipeline("bonsai_rms_fwht_forward", 128)?,
             swiglu_forward: pipeline("bonsai_swiglu_fwht_forward", 128)?,
-            matmul: pipeline(
-                match prefill_kernel {
-                    PrefillKernel::SimdF32 => "bonsai_ptq1_matmul_bytewise_32",
-                    PrefillKernel::TensorF32 => "bonsai_ptq1_matmul_tensor",
-                },
-                128,
-            )?,
-            matmul_short: match prefill_kernel {
-                PrefillKernel::SimdF32 => None,
-                PrefillKernel::TensorF32 => Some([
-                    pipeline("bonsai_ptq1_matmul_tensor_64", 128)?,
-                    pipeline("bonsai_ptq1_matmul_tensor_32", 128)?,
-                ]),
-            },
+            prefill_tile,
+            device: context.device_retained().clone(),
+            prefill_functions,
             small_batch: (2..=SMALL_BATCH_KERNEL_TOKENS)
                 .map(|tokens| pipeline(&format!("bonsai_ptq1_small_batch_{tokens}"), 32))
                 .collect::<crate::Result<_>>()?,
@@ -798,11 +863,17 @@ impl BonsaiKernels {
             self.small_batch(batch, matrix, input, output, 0, tokens);
             return Ok(());
         }
-        let (pipeline, tile_tokens) = match (&self.matmul_short, tokens) {
+        let tile = if let Some(tile) = self.prefill_tile.get() {
+            tile
+        } else {
+            let tile = PrefillTile::new(&self.device, &self.prefill_functions)?;
+            self.prefill_tile.get_or_init(|| tile)
+        };
+        let (pipeline, tile_tokens) = match (&tile.short, tokens) {
             (Some([_, short]), 0..=32) => (short, 32),
             (Some([short, _]), 33..=64) => (short, 64),
             _ => (
-                &self.matmul,
+                &tile.matmul,
                 match self.prefill_kernel {
                     PrefillKernel::SimdF32 => 32,
                     PrefillKernel::TensorF32 => 128,

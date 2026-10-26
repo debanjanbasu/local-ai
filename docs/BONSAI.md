@@ -2900,6 +2900,13 @@ pipelines, startup prints the reason to stderr (`metal: tensor attention
 kernels unavailable, ...`) and continues on the slower SIMD kernels, which
 the policy's `attention_kernel: simd_f32` also shows.
 
+With the default thresholds no block reaches the prefill tile (that takes
+more than 128 rows and fewer than 56), so `BonsaiKernels::new` compiles its
+three tensor pipelines on first use, under overridden thresholds, instead of
+at every startup: 2.02 → 1.92 ms median over twenty interleaved launches
+with a warm shader cache (a cold-cache launch was not measured). An SDK
+without the tensor tile prints the reason and uses the SIMD tile.
+
 Prefill blocks then grew from 128 to 512 rows (`PREFILL_CHUNK`,
 `MAX_PREFILL_TOKENS`). Rows are independent in every projection and attention
 kernel (attention walks absolute 32-key tiles and groups rows from the block's
