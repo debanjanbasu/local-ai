@@ -42,7 +42,10 @@ use sha2::{Digest as _, Sha256};
 
 use super::preprocess::{PreparedImage, RESIZE_FACTOR, round_half_even};
 use crate::Error;
-use crate::embedding::vision::preprocess::{RgbImage, resize_bicubic};
+use crate::bonsai_model::CancelToken;
+use crate::embedding::vision::preprocess::{
+    MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE, RgbImage, resize_bicubic,
+};
 
 /// `<|video_pad|>`: the template writes one per video; the prompt expands it
 /// to the frame groups.
@@ -64,6 +67,13 @@ const MAX_PIXELS: usize = 25_165_824;
 /// `max_video_tokens`: most tokens of one frame group.
 const MAX_FRAME_TOKENS: usize = 768;
 const MAX_ASPECT: f64 = 200.0;
+/// Longest video accepted, in seconds of its track. The probe and the
+/// decoding pass both read every frame up to the last sampled one (the
+/// last frame), so this bounds a request's decoding time.
+pub const MAX_SECONDS: f64 = 600.0;
+/// Most frames (and sample buffers) a video track may hold: 600 s at 60
+/// frames per second.
+pub const MAX_TRACK_FRAMES: usize = 36_000;
 /// Prepared videos kept for reuse (a clip at the pixel budget holds 72 MiB).
 const CACHE_BYTES: usize = 256 << 20;
 
@@ -262,13 +272,18 @@ fn cached(key: &[u8; 32]) -> Option<Arc<PreparedVideo>> {
 }
 
 /// Decode, sample and resize an encoded video file, from the cache when the
-/// same file was prepared recently.
+/// same file was prepared recently. `cancel` is checked before each sample
+/// the decoder reads.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidArgument`] for a file `AVFoundation` cannot read, one with
-/// no video track, or an unsupported shape.
-pub fn prepare_video(bytes: &[u8]) -> crate::Result<Arc<PreparedVideo>> {
+/// no video track, one longer than [`MAX_SECONDS`] or [`MAX_TRACK_FRAMES`],
+/// or an unsupported shape; [`Error::Generation`] when cancelled.
+pub fn prepare_video(
+    bytes: &[u8],
+    cancel: Option<&CancelToken>,
+) -> crate::Result<Arc<PreparedVideo>> {
     let key: [u8; 32] = Sha256::digest(bytes).into();
     if let Some(video) = cached(&key) {
         return Ok(video);
@@ -278,6 +293,7 @@ pub fn prepare_video(bytes: &[u8]) -> crate::Result<Arc<PreparedVideo>> {
     let mut sampled = Vec::new();
     let probe = decode::decode(
         bytes,
+        cancel,
         |probe| {
             sampled = sample_indices(probe.total_frames, probe.fps);
             size.set(smart_resize(sampled.len(), probe.height, probe.width)?);
@@ -304,6 +320,28 @@ pub fn prepare_video(bytes: &[u8]) -> crate::Result<Arc<PreparedVideo>> {
     }
     drop(cache);
     Ok(video)
+}
+
+/// Refuse a frame over the image limits ([`MAX_IMAGE_SIDE`] a side,
+/// [`MAX_IMAGE_PIXELS`] in all).
+fn check_frame(width: usize, height: usize) -> crate::Result<()> {
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidArgument(
+            "the video track holds no frames".into(),
+        ));
+    }
+    if width.max(height) > MAX_IMAGE_SIDE as usize || width * height > MAX_IMAGE_PIXELS {
+        return Err(Error::InvalidArgument(format!(
+            "video frames of {width}x{height} exceed {MAX_IMAGE_SIDE} pixels a side or \
+             {MAX_IMAGE_PIXELS} in all"
+        )));
+    }
+    Ok(())
+}
+
+/// The error of a cancelled decode.
+fn cancelled() -> Error {
+    Error::Generation("the request was cancelled".into())
 }
 
 /// What the first pass learns about a video track.
@@ -365,13 +403,15 @@ pub mod decode {
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::AnyObject;
     use objc2_av_foundation::{
-        AVAsset, AVAssetReader, AVAssetReaderStatus, AVAssetReaderTrackOutput, AVAssetTrack,
-        AVMediaTypeVideo, AVURLAsset,
+        AVAsset, AVAssetReader, AVAssetReaderStatus, AVAssetReaderTrackOutput,
+        AVAssetReferenceRestrictions, AVAssetTrack, AVMediaTypeVideo, AVURLAsset,
+        AVURLAssetReferenceRestrictionsKey,
     };
     use objc2_core_media::{CMSampleBuffer, kCMFormatDescriptionExtension_YCbCrMatrix};
     use objc2_core_video::{
         CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
-        CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
+        CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType,
+        CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferGetWidthOfPlane,
         CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
         kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_2020,
         kCVImageBufferYCbCrMatrix_SMPTE_240M_1995, kCVPixelBufferPixelFormatTypeKey,
@@ -382,9 +422,10 @@ pub mod decode {
 
     use std::io::Write as _;
 
-    use super::{Probe, container_suffix};
+    use super::{MAX_SECONDS, MAX_TRACK_FRAMES, Probe, cancelled, check_frame, container_suffix};
     use crate::Error;
-    use crate::embedding::vision::preprocess::{MAX_IMAGE_SIDE, RgbImage};
+    use crate::bonsai_model::CancelToken;
+    use crate::embedding::vision::preprocess::RgbImage;
     use crate::embedding::vision::video::{yuv2rgb_coefficients, yuv420_to_rgb};
 
     fn invalid(message: impl Into<String>) -> Error {
@@ -488,11 +529,26 @@ pub mod decode {
         if !full_range && format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
             return Err(invalid("the video decoder did not produce 4:2:0 frames"));
         }
+        // The decoded size, not the track header's: check it again, and
+        // that both planes hold it.
         let (width, height) = (
             CVPixelBufferGetWidth(buffer),
             CVPixelBufferGetHeight(buffer),
         );
+        check_frame(width, height)?;
         let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        if CVPixelBufferGetPlaneCount(buffer) != 2
+            || CVPixelBufferGetWidthOfPlane(buffer, 0) < width
+            || CVPixelBufferGetHeightOfPlane(buffer, 0) < height
+            || CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) < width
+            || CVPixelBufferGetWidthOfPlane(buffer, 1) < chroma_width
+            || CVPixelBufferGetHeightOfPlane(buffer, 1) < chroma_height
+            || CVPixelBufferGetBytesPerRowOfPlane(buffer, 1) < 2 * chroma_width
+        {
+            return Err(invalid(
+                "a decoded video frame's planes do not hold its size",
+            ));
+        }
         let mut planes = vec![0_u8; width * height + 2 * chroma_width * chroma_height];
         // SAFETY: each plane's base address is valid for its rows times its
         // stride while the buffer is locked read-only, and is only read.
@@ -538,9 +594,13 @@ pub mod decode {
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] for files `AVFoundation` cannot read, no
-    /// video track, oversized frames, or errors from the callbacks.
+    /// video track, oversized frames, a track over [`MAX_SECONDS`] or
+    /// [`MAX_TRACK_FRAMES`], or errors from the callbacks;
+    /// [`Error::Generation`] once `cancel` is cancelled (checked before each
+    /// sample is read).
     pub fn decode(
         bytes: &[u8],
+        cancel: Option<&CancelToken>,
         select: impl FnOnce(&Probe) -> crate::Result<Vec<usize>>,
         mut frame: impl FnMut(&RgbImage) -> crate::Result<()>,
     ) -> crate::Result<Probe> {
@@ -557,8 +617,7 @@ pub mod decode {
             // only; `AVMediaTypeVideo` is an immutable framework constant.
             #[allow(deprecated)]
             let (asset, track) = unsafe {
-                let url = NSURL::fileURLWithPath(&NSString::from_str(&path));
-                let asset = AVURLAsset::URLAssetWithURL_options(&url, None);
+                let asset = open(&path);
                 let kind =
                     AVMediaTypeVideo.ok_or_else(|| invalid("AVFoundation is unavailable"))?;
                 let track = asset
@@ -569,7 +628,7 @@ pub mod decode {
                     })?;
                 (asset, track)
             };
-            let probe = probe(&asset, &track)?;
+            let probe = probe(&asset, &track, cancel)?;
             let wanted = select(&probe)?;
             let Some(&last_wanted) = wanted.last() else {
                 return Ok(probe);
@@ -589,7 +648,16 @@ pub mod decode {
             let mut index = 0;
             let mut wanted = wanted.iter().copied().peekable();
             let mut last = None;
+            // Sample buffers read, frames or not: at most the probe's.
+            let mut buffers = 0;
             while wanted.peek().is_some() && index <= last_wanted {
+                if cancel.is_some_and(CancelToken::is_cancelled) {
+                    return Err(cancelled());
+                }
+                buffers += 1;
+                if buffers > MAX_TRACK_FRAMES {
+                    return Err(too_long());
+                }
                 let next = autoreleasepool(|_| -> crate::Result<Next> {
                     // SAFETY: the reader is started and owned by this thread.
                     let Some(sample) = (unsafe { output.copyNextSampleBuffer() }) else {
@@ -630,13 +698,56 @@ pub mod decode {
         })
     }
 
-    /// Count the track's frames and sum their durations without decoding.
-    fn probe(asset: &AVAsset, track: &AVAssetTrack) -> crate::Result<Probe> {
+    /// The asset of the file at `path`, resolving no reference to media
+    /// outside it (a movie may name other local files or URLs as its media
+    /// data; `AVFoundation` follows local ones by default).
+    ///
+    /// # Safety
+    ///
+    /// Call on the thread that uses the asset.
+    pub(in crate::bonsai_vision) unsafe fn open(path: &str) -> Retained<AVURLAsset> {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        let forbid = NSNumber::new_usize(AVAssetReferenceRestrictions::ForbidAll.0);
+        // SAFETY: an immutable framework constant; the value is the NSNumber
+        // the key documents.
+        let options = NSDictionary::<NSString, AnyObject>::from_slices(
+            &[unsafe { AVURLAssetReferenceRestrictionsKey }],
+            &[AsRef::<AnyObject>::as_ref(&*forbid)],
+        );
+        // SAFETY: as documented for this function.
+        unsafe { AVURLAsset::URLAssetWithURL_options(&url, Some(&options)) }
+    }
+
+    fn too_long() -> Error {
+        invalid(format!(
+            "the video is longer than {MAX_SECONDS} s or {MAX_TRACK_FRAMES} frames"
+        ))
+    }
+
+    /// Count the track's frames and sum their durations without decoding,
+    /// refusing a track over [`MAX_SECONDS`] or [`MAX_TRACK_FRAMES`] as soon
+    /// as it passes either.
+    fn probe(
+        asset: &AVAsset,
+        track: &AVAssetTrack,
+        cancel: Option<&CancelToken>,
+    ) -> crate::Result<Probe> {
         let (reader, output) = reader(asset, track, None)?;
         let mut frames = 0_u64;
         let (mut duration, mut timescale) = (0_i128, 0_i32);
+        let mut buffers = 0_usize;
         let mut matrix = None;
         loop {
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Err(cancelled());
+            }
+            buffers += 1;
+            if buffers > MAX_TRACK_FRAMES
+                || frames > MAX_TRACK_FRAMES as u64
+                || (timescale > 0 && duration as f64 / f64::from(timescale) > MAX_SECONDS)
+            {
+                return Err(too_long());
+            }
             let more = autoreleasepool(|_| {
                 // SAFETY: the reader is started and owned by this thread.
                 let Some(sample) = (unsafe { output.copyNextSampleBuffer() }) else {
@@ -665,14 +776,14 @@ pub mod decode {
         // SAFETY: a valid, retained track.
         let size = unsafe { track.naturalSize() };
         let (width, height) = (size.width.abs() as usize, size.height.abs() as usize);
-        if frames == 0 || duration <= 0 || width == 0 || height == 0 {
+        if frames == 0 || duration <= 0 {
             return Err(invalid("the video track holds no frames"));
         }
-        if width > MAX_IMAGE_SIDE as usize || height > MAX_IMAGE_SIDE as usize {
-            return Err(invalid(format!(
-                "video frames of {width}x{height} exceed {MAX_IMAGE_SIDE} pixels a side"
-            )));
+        if frames > MAX_TRACK_FRAMES as u64 || duration as f64 / f64::from(timescale) > MAX_SECONDS
+        {
+            return Err(too_long());
         }
+        check_frame(width, height)?;
         Ok(Probe {
             total_frames: frames as usize,
             fps: (i128::from(frames) * i128::from(timescale)) as f64 / duration as f64,
@@ -695,6 +806,7 @@ pub fn decode_sampled(bytes: &[u8]) -> crate::Result<(Probe, Vec<usize>, Vec<Rgb
     let mut sampled = Vec::new();
     let probe = decode::decode(
         bytes,
+        None,
         |probe| {
             sampled = sample_indices(probe.total_frames, probe.fps);
             Ok(sampled.clone())

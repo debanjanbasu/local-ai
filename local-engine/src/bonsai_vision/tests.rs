@@ -270,3 +270,51 @@ fn video_expansion_lays_out_groups_after_their_timestamps() {
     let image = PreparedImage { next: None, ..a };
     assert!(expand_prompt(&ids, &projector, &[Visual::Image(&image, rows(&image))]).is_err());
 }
+
+fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/vision/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("fixture")
+}
+
+/// Two frames an hour each (`ffmpeg -f lavfi -i color=c=gray:s=64x48:r=1/3600
+/// -frames:v 2 -c:v libx264`): 1.6 KB that is two hours long, refused by the
+/// probe rather than decoded.
+#[test]
+fn videos_over_the_length_limit_are_refused() {
+    let error = prepare_video(&fixture("long_2_frames_7200s.mp4"), None)
+        .expect_err("refused")
+        .to_string();
+    assert!(error.contains("longer than 600 s"), "{error}");
+}
+
+/// A cancelled request stops before the first sample; an uncancelled one
+/// decodes (`ffmpeg -f lavfi -i testsrc=s=64x48:r=30 -frames:v 30`).
+#[test]
+fn video_decoding_observes_cancellation() {
+    let bytes = fixture("testsrc_64x48_30_frames.mp4");
+    let cancel = crate::bonsai_model::CancelToken::new();
+    cancel.cancel();
+    let error = prepare_video(&bytes, Some(&cancel))
+        .expect_err("cancelled")
+        .to_string();
+    assert!(error.contains("cancelled"), "{error}");
+    let video = prepare_video(&bytes, None).expect("decodes");
+    assert_eq!((video.total_frames, video.indices.len()), (30, 4));
+}
+
+/// The asset resolves no media reference outside its own file.
+#[test]
+#[allow(unsafe_code)]
+fn video_assets_follow_no_external_references() {
+    use objc2_av_foundation::AVAssetReferenceRestrictions;
+    let path = format!(
+        "{}/tests/fixtures/vision/testsrc_64x48_30_frames.mp4",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    // SAFETY: the asset is created and read on this thread.
+    let restrictions = unsafe { video::decode::open(&path).referenceRestrictions() };
+    assert_eq!(restrictions, AVAssetReferenceRestrictions::ForbidAll);
+}

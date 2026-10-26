@@ -1042,7 +1042,13 @@ MP4, MOV and M4V files are read, with any codec macOS decodes (H.264 and
 HEVC on every Apple Silicon Mac, ProRes, AV1 where the hardware has it);
 Matroska and WebM are refused with a 400, since AVFoundation does not open
 them. A `file` part whose bytes are an ISO media file is taken as a video,
-otherwise as an image.
+otherwise as an image. A video may last at most 600 s and hold at most 36,000
+frames (600 s at 60 fps): the counting pass refuses it with a 400 as soon as
+it passes either, since both passes read every frame up to the last. Frames
+are held to the image limits (16,384 pixels a side, 64 MP), checked on the
+track header and again on every decoded frame. The file is opened with
+`AVURLAssetReferenceRestrictionsKey` set to forbid all references, so a movie
+naming other files or URLs as its media data is not followed outside itself.
 
 The layout is the checkpoint's own processor (`Qwen3VLVideoProcessor`,
 which Qwen3.5 uses, with the base model's `video_preprocessor_config.json`):

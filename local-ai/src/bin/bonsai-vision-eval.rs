@@ -486,7 +486,7 @@ fn video(out: &Path, clips: &[String]) -> Result<()> {
         );
         std::fs::write(dir.join("frames.u8"), raw)?;
         let started = Instant::now();
-        let video = prepare_video(&bytes)?;
+        let video = prepare_video(&bytes, None)?;
         let prepared = started.elapsed().as_secs_f64();
         let first = video.groups.first().ok_or("no groups")?;
         let mut pixels = Vec::new();

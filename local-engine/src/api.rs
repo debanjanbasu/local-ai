@@ -1299,7 +1299,7 @@ fn prepare_images(request: &ChatRequest) -> crate::Result<Vec<Prepared>> {
         .flat_map(|message| &message.images)
         .map(|part| {
             if part.video {
-                crate::bonsai_vision::prepare_video(&part.data).map(Prepared::Video)
+                crate::bonsai_vision::prepare_video(&part.data, None).map(Prepared::Video)
             } else {
                 crate::bonsai_vision::prepare_image(&part.data, part.detail).map(Prepared::Image)
             }
