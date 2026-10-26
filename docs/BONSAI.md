@@ -1982,8 +1982,10 @@ lengths. Admission shares the context the memory policy sized for one
 sequence: a request joins only while the running requests'
 prompt-plus-`max_tokens` reservations, plus each extra sequence's fixed state
 expressed in K/V tokens (about 2,340), fit in it; otherwise it waits for a
-running request to finish. At most eight decode together, in at most 64
-stacked rows.
+running request to finish. A request whose own prompt and `max_tokens`
+exceed the context fails as soon as it reaches the head of the queue,
+rather than holding the requests behind it until the engine is idle. At most
+eight decode together, in at most 64 stacked rows.
 
 ## Resource policy
 

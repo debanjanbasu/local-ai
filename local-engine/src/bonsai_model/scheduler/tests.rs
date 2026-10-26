@@ -208,6 +208,19 @@ fn cancelling_one_sequence_leaves_the_batch_exact() {
     assert_same("after batch", &again.token_ids, &reference[0]);
 }
 
+/// A huge `max_tokens` beside a running generation neither overflows the
+/// reservation sum (a panic in debug, a wrapped yes in release) nor fits.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn admission_with_a_huge_max_tokens_never_fits() {
+    let mut engine = open(&MtpMode::Off(None));
+    admit(&mut engine, 0, 8, CancelToken::new());
+    assert!(engine.can_admit(16, 8));
+    assert!(!engine.can_admit(16, usize::MAX));
+    assert!(!engine.can_admit(usize::MAX, usize::MAX));
+    drop(engine.abort_all());
+}
+
 /// A prompt of several hundred tokens: many prefill chunks.
 fn long_prompt(engine: &BonsaiEngine) -> Vec<u32> {
     let items = (0..130)

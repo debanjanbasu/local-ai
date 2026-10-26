@@ -302,6 +302,19 @@ impl Worker {
                 prepared.cancel.cancel();
                 continue;
             }
+            // A request that can never fit fails now rather than holding the
+            // queue until the engine is idle.
+            if let Err(error) = self.engine.inner.validate_with_images(
+                &prepared.ids,
+                &prepared.params,
+                prepared.images.as_deref(),
+            ) {
+                let _ = prepared
+                    .events
+                    .try_send(Delivered::Event(Event::Error(error.to_string())));
+                prepared.cancel.cancel();
+                continue;
+            }
             if !self
                 .engine
                 .inner

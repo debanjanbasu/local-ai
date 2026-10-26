@@ -105,14 +105,15 @@ impl BonsaiEngine {
             return false;
         }
         let state_tokens = self.sequence_state_tokens();
+        // Saturating: `max_tokens` comes from the request and may be huge.
         let reserved = self
             .active
             .iter()
             .map(ActiveGeneration::reserved_tokens)
-            .sum::<usize>()
-            + prompt_tokens
-            + max_tokens
-            + self.active.len() * state_tokens;
+            .fold(0, usize::saturating_add)
+            .saturating_add(prompt_tokens)
+            .saturating_add(max_tokens)
+            .saturating_add(self.active.len().saturating_mul(state_tokens));
         reserved <= self.info.context
     }
 
