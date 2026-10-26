@@ -158,8 +158,11 @@ attention are split by rows), each followed by
 `EngineActivity::yield_to_decode` (condition variable, 500 ms limit), as
 `docs/EMBEDDINGS.md` describes; otherwise about 50 ms, pipelined. At most 4
 speech requests are admitted (one running); more get `503` with
-`Retry-After`. A client that disconnects cancels its request at the next
-submission boundary (streams: at the next window).
+`Retry-After`. An admitted request's form must arrive whole within
+`--stall-timeout` (default 30 s), or it is refused with `408` and its slot
+freed, so slow uploads cannot hold the four slots. A client that disconnects
+cancels its request at the next submission boundary (streams: at the next
+window).
 
 ## Verification
 

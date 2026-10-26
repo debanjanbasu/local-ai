@@ -25,6 +25,7 @@ mod batches;
 mod browser;
 mod chunked;
 mod compaction;
+mod connection;
 mod decisions;
 mod embeddings;
 mod file_search;
@@ -208,6 +209,15 @@ impl Foreground {
         }
     }
 
+    /// Cancel every tracked generation, returning how many there were.
+    fn cancel_all(&self) -> usize {
+        let live = self.lock();
+        for cancel in live.values() {
+            cancel.cancel();
+        }
+        live.len()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, CancelHandle>> {
         self.live
             .lock()
@@ -247,6 +257,7 @@ impl Drop for Admitted {
 /// [`browser`]), authentication, then [`dispatch`].
 async fn route(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
+    let body = connection::paced(body, state.stall);
     if let Some(message) = state.browsers.host_refusal(&parts) {
         return error_response(StatusCode::FORBIDDEN, &message, &state, &parts.headers).await;
     }
@@ -404,7 +415,9 @@ async fn dispatch(
         .collect()
         .await
     {
-        Ok(value) => value.to_bytes().to_vec(),
+        // `Vec::from` takes over the collected buffer instead of copying up
+        // to 64 MiB again.
+        Ok(value) => Vec::from(value.to_bytes()),
         Err(error) => {
             let status = if error.is::<LengthLimitError>() {
                 StatusCode::PAYLOAD_TOO_LARGE
@@ -1367,23 +1380,32 @@ async fn run_async(args: Args) -> crate::Result<()> {
     admin::announce(&state.auth, args.host);
     eprintln!("Bonsai server listening on http://{address}");
     let background = Arc::clone(&state.background);
+    let app_foreground = Arc::clone(&state.foreground);
     let app = Router::new().fallback(any(route)).with_state(state);
     // Background jobs are settled and cancelled as soon as shutdown begins,
     // while axum is still draining foreground connections.
     let closing = Arc::clone(&background);
     let closing_decisions = decisions.clone();
     let closing_batches = Arc::clone(&batches);
-    let served = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
+    // Foreground generations still running at the drain deadline are
+    // cancelled, so a long one cannot hold shutdown until a SIGKILL that
+    // might cut the prompt-cache writes below.
+    let foreground = Arc::clone(&app_foreground);
+    connection::serve(
+        listener,
+        app,
+        connection::Limits::default(),
+        async move {
             shutdown().await;
             closing_batches.close();
             // Waiting decisions end at once, cancelling their engine work,
             // so they never hold up the drain.
             decisions::close(closing_decisions.as_deref());
             let _ = tokio::task::spawn_blocking(move || closing.close()).await;
-        })
-        .await
-        .map_err(crate::Error::Io);
+        },
+        move || foreground.cancel_all(),
+    )
+    .await;
     // Again, for a server that stopped without the signal; settling is idempotent.
     decisions::close(decisions.as_deref());
     batches.close();
@@ -1419,7 +1441,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
             PROMPT_CACHE_CLOSE_DEADLINE.as_secs()
         );
     }
-    served
+    Ok(())
 }
 
 /// How long the default response store keeps a settled response, as
@@ -1443,6 +1465,10 @@ fn open_responses(dir: &std::path::Path) -> crate::Result<Arc<ResponseStore>> {
 /// a slower disk while still bounding the stop; past it the write in flight
 /// is aborted and its temporary removed.
 const PROMPT_CACHE_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// How long the runtime waits for its remaining tasks once the server has
+/// shut down.
+const RUNTIME_EXIT_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The hosted tools `args` grant (none without flags) and the tool loop's
 /// bounds, which tools needing no permission (`file_search`) run within.
@@ -1504,13 +1530,20 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
             .enable_all()
             .build()
         {
-            Ok(runtime) => match runtime.block_on(run_async(args)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
+            Ok(runtime) => {
+                let served = runtime.block_on(run_async(args));
+                // Everything that writes has finished by now; a blocking task
+                // still waiting on a cancelled job must not hold the exit
+                // (dropping the runtime would wait for it indefinitely).
+                runtime.shutdown_timeout(RUNTIME_EXIT_DEADLINE);
+                match served {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::FAILURE
+                    }
                 }
-            },
+            }
             Err(error) => {
                 eprintln!("error: could not start Tokio runtime: {error}");
                 ExitCode::FAILURE

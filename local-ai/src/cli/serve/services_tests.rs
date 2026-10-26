@@ -65,7 +65,7 @@ async fn send(services: &Services, request: Request<Body>) -> Answer {
             bytes: None,
         },
         Reply::Content(download) => {
-            let response = download.into_response();
+            let response = download.into_response(std::time::Duration::from_secs(30));
             let headers = response.headers().clone();
             let bytes = response
                 .into_body()
@@ -167,6 +167,49 @@ async fn download(services: &Services, id: &str) -> Vec<u8> {
     .await;
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.json);
     answer.bytes.expect("download").0
+}
+
+#[tokio::test]
+async fn a_stalled_download_gives_its_slot_back() {
+    let scratch = Scratch::new();
+    let services = scratch.open();
+    // Several chunks, so the channel fills while the client reads nothing.
+    let content = vec![b'x'; 8 * 64 * 1024];
+    let id = upload_file(&services, "big.bin", &content).await["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let request = request(Method::GET, &format!("/v1/files/{id}/content"), "");
+    let (parts, body) = request.into_parts();
+    let Reply::Content(download) = services.dispatch(&parts, body).await else {
+        unreachable!("not a download");
+    };
+    assert_eq!(
+        services.downloads.available_permits(),
+        super::MAX_DOWNLOADS - 1
+    );
+    let stall = std::time::Duration::from_millis(100);
+    let response = download.into_response(stall);
+    // The client never reads: once the stall budget passes, the slot is free
+    // again while the response is still held.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        services.downloads.acquire_many(super::MAX_DOWNLOADS as u32),
+    )
+    .await
+    .expect("the stalled download released its slot")
+    .expect("permits")
+    .forget();
+    // What it did send stops short of the file, so it cannot pass for whole.
+    let sent = response
+        .into_body()
+        .collect()
+        .await
+        .map(|body| body.to_bytes().len());
+    assert!(
+        !matches!(sent, Ok(sent) if sent >= content.len()),
+        "{sent:?}"
+    );
 }
 
 fn message(role: &str, text: &str) -> Value {

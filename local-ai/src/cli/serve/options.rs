@@ -104,8 +104,8 @@ pub(super) fn usage() {
          if absent (default: ~/Library/Application Support/local-ai/reasoning.key)"
     );
     eprintln!(
-        "  --stall-timeout SECONDS  Drop a generation whose client stopped reading \
-         (default: {DEFAULT_STALL_SECONDS})"
+        "  --stall-timeout SECONDS  Drop a generation or download whose client stopped \
+         reading, or a request body that stopped arriving (default: {DEFAULT_STALL_SECONDS})"
     );
     eprintln!(
         "  --decisions-artifact DIR  Serve POST /v1/decisions from this evaluated head, gate and \

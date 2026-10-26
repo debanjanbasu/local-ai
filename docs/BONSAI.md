@@ -202,8 +202,9 @@ local-ai serve [options]
                      authentication is off; repeatable, * for every origin,
                      null for file: pages (see docs/ADMIN.md#browsers)
   --no-thinking      disable reasoning
-  --stall-timeout N  drop a generation whose client stopped reading; seconds,
-                     default 30, accepted 10 to 3600
+  --stall-timeout N  drop a generation or download whose client stopped
+                     reading, or a request body that stopped arriving;
+                     seconds, default 30, accepted 10 to 3600
   --response-store DIR  keep Responses API responses in DIR (owner-only,
                      unencrypted) until deleted; default: the user's data
                      directory, pruned of responses older than 30 days
@@ -867,6 +868,21 @@ that generation, releases the queue slot, and drops the request, leaving the
 engine free for the next client. The default is 30 seconds; a value outside
 10 to 3600 inclusive, or one that is not a whole number of seconds, is refused
 at startup.
+
+What a client sends is bounded too, on HTTP/1.1, HTTP/2 and (for bodies)
+HTTP/3. An HTTP/1 request's headers must arrive within 30 s of the server
+starting to read them, which also closes an idle keep-alive connection, and
+a TCP connection that has not delivered a whole request within 30 s of being
+accepted (one that sends nothing, or half an HTTP/2 preface) is closed. A
+request body must deliver at least 64 KiB, or end, within every
+`--stall-timeout` the handler spends waiting for it; otherwise the read fails
+(`400`, "the request body stalled") and the connection closes. A slow but
+moving upload is never cut off, so a 512 MiB file is fine at a few KiB/s,
+but a trickle cannot hold one of the few upload, transcription or generation
+slots indefinitely. A transcription form, which is held in memory, must
+arrive whole within `--stall-timeout` once it has its slot (`408`
+otherwise), and a file download whose client stops reading for
+`--stall-timeout` is dropped and gives its slot back.
 
 Both HTTP body pumps share an event-driven backpressure wait. A full channel
 parks the pump thread until capacity becomes available, the receiver closes,
@@ -1557,7 +1573,9 @@ preparation and generation blocking tasks, never on runtime workers.
   are never held in memory. A file is at most 512 MiB (200 MiB for `batch`)
   and a part at most 64 MiB; anything larger is a 413. Completion verifies an
   optional `md5`. At most 4 multipart transfers and 16 downloads run at once;
-  past that the answer is a 503 with `Retry-After: 1`. Expired objects are a
+  past that the answer is a 503 with `Retry-After: 1`. An upload that stalls
+  or a download whose client stops reading gives its slot back (see
+  [`--stall-timeout`](#generation-requests)). Expired objects are a
   404, and changes to an expired or cancelled upload are a 410. Expiry is
   enforced on access. Bytes are purged physically only at startup or through
   the native `purge_file_storage`. A `purpose` is stored and echoed only; it
@@ -2296,7 +2314,11 @@ one, except that a request tail never displaces a shared boundary. Dropping
 the engine finishes pending writes; the server, whose engine is never
 dropped, closes the writer on SIGINT or SIGTERM instead: accepted writes get
 two minutes to commit, past which the one in flight is aborted and its
-temporary removed. A temporary is live only while its writer holds an
+temporary removed. Before that, shutdown stops accepting connections and
+gives foreground requests 10 s to finish; generations still running then are
+cancelled, so their responses end at the next engine step (connections not
+closed 5 s later are dropped), and a long generation cannot delay shutdown
+until a supervisor's SIGKILL interrupts these writes. A temporary is live only while its writer holds an
 exclusive lock on it (taken in `open`), so the sweep after every store and
 at startup removes any other at once, whatever its age. A snapshot the trim
 after it would delete again is not written. A failed write is a cache miss reported

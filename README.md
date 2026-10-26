@@ -47,7 +47,11 @@ A client that stops reading its
 socket without closing it is invisible to TCP, so `serve`
 takes `--stall-timeout SECONDS` (default 30, accepted 10 to 3600) to bound how
 long a generation may go undelivered before it is cancelled and the engine
-released; the budgets, measurements and limits are in
+released. The same budget bounds what clients send: a request body must
+deliver 64 KiB (or end) in every budget, HTTP/1 headers must arrive within
+30 s, and a connection that sends no request in 30 s is closed. On SIGINT or
+SIGTERM, foreground requests get 10 s to finish before their generations are
+cancelled. The budgets, measurements and limits are in
 [docs/BONSAI.md](docs/BONSAI.md#server-api).
 
 Responses are stored by default, as on OpenAI, in
