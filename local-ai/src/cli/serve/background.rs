@@ -62,8 +62,9 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use local_engine::{ChatRequest, Event, EventStream, Signal};
+use local_engine::{ChatRequest, Event, Signal};
 
+use super::admin::Metered;
 use super::journal::{JournalWriter, terminal_events};
 use super::reasoning_crypto::ReasoningCipher;
 use super::response::{Protocol, Reply};
@@ -1173,7 +1174,7 @@ impl Drop for Temporary {
 /// worker closes the channel.
 pub(super) async fn start(
     background: Arc<Background>,
-    mut events: EventStream,
+    mut events: Metered,
     reply: Reply,
     admitted: Admitted,
     stream: bool,

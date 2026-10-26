@@ -602,14 +602,15 @@ async fn dispatch(
         events
     };
     let events = match events {
-        Ok(events) => admin::meter(
-            &state,
-            &caller,
-            match tool_loop {
-                Some(tool_loop) => tool_loop::start(tool_loop, events),
-                None => events,
-            },
-        ),
+        Ok(events) => match tool_loop {
+            // The loop records its own rounds' usage.
+            Some(tool_loop) => admin::Metered::unmetered(tool_loop::start(
+                tool_loop,
+                events,
+                admin::Meter::completions(&state, &caller),
+            )),
+            None => admin::meter(&state, &caller, events),
+        },
         Err(error) => {
             if matches!(error, crate::Error::QueueFull) {
                 return queue_full_response(&state, &parts.headers).await;
@@ -1021,11 +1022,15 @@ fn resume_background(
                 Protocol::Chat { .. } => None,
             };
             let events = engine.chat(request)?;
-            let events = match tool_loop {
-                Some(tool_loop) => tool_loop::start(tool_loop, events),
-                None => events,
+            let mut events = match tool_loop {
+                // The loop records its own rounds' usage.
+                Some(tool_loop) => admin::Metered::unmetered(tool_loop::start(
+                    tool_loop,
+                    events,
+                    admin::Meter::completions(state, &caller),
+                )),
+                None => admin::meter(state, &caller, events),
             };
-            let mut events = admin::meter(state, &caller, events);
             let cancel = events.cancel_handle();
             // No deadline: the job has no client to stall, and a closed
             // channel is `None`.

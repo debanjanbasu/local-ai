@@ -715,7 +715,7 @@ async fn the_hosted_tool_marker_is_recorded_once_before_any_call_runs() {
             max_calls: None,
             before_tools: Some(before),
         };
-        start(tool_loop, first)
+        start(tool_loop, first, super::admin::Meter::default())
     };
     let drain =
         |stream: EventStream| tokio::task::spawn_blocking(move || stream.collect::<Vec<_>>());

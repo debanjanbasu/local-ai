@@ -46,6 +46,7 @@ use local_engine::{
 };
 use local_services::tools::{Output, ToolError, Toolbox, denial};
 
+use super::admin::Meter;
 use super::file_search;
 use super::hosted::{self, Hosted, Kinds};
 use super::vector_stores::VectorStores;
@@ -142,8 +143,9 @@ pub(super) struct Loop {
 pub(super) type BeforeTools = Box<dyn FnOnce() -> Result<(), String> + Send>;
 
 /// Run the loop over `first`, the request's first generation, returning the
-/// one stream its consumer reads.
-pub(super) fn start(tool_loop: Loop, first: EventStream) -> EventStream {
+/// one stream its consumer reads. The loop records the usage of its rounds
+/// into `meter` (see [`Driver::run`]).
+pub(super) fn start(tool_loop: Loop, first: EventStream, meter: Meter) -> EventStream {
     let (relay, stream) = EventStream::relay();
     let relay = Arc::new(relay);
     let current = Arc::new(Mutex::new(first.cancel_handle()));
@@ -165,6 +167,7 @@ pub(super) fn start(tool_loop: Loop, first: EventStream) -> EventStream {
         relay,
         current,
         runtime,
+        meter,
         _canceller: canceller,
     };
     tokio::task::spawn_blocking(move || driver.run(first));
@@ -176,6 +179,7 @@ struct Driver {
     relay: Arc<EventRelay>,
     current: Arc<Mutex<CancelHandle>>,
     runtime: tokio::runtime::Handle,
+    meter: Meter,
     _canceller: Canceller,
 }
 
@@ -187,6 +191,17 @@ impl Drop for Canceller {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// How one forwarded generation ended.
+enum Round {
+    /// With `Finished`: the turn it generated and its measurements.
+    Finished(Turn, Box<Stats>),
+    /// With an error, which is the stream's end.
+    Failed(String),
+    /// Without its consumer, or without an end at all: its measurements,
+    /// when it still reported them.
+    Gone(Option<Box<Stats>>),
 }
 
 /// The assistant turn a round generated.
@@ -237,14 +252,39 @@ impl Driver {
         self.relay.blocking_send(Signal::Event(event))
     }
 
-    fn run(mut self, mut inner: EventStream) {
-        let budget = self.tool_loop.request.max_tokens;
+    /// Run the rounds, then record the usage of every round that finished,
+    /// once, whatever ended the loop (a consumer gone, a cancelled tool, an
+    /// error in a later round), and only then send the end, so a consumer
+    /// that has seen it finds the usage recorded. The record is written on
+    /// this blocking-pool thread.
+    fn run(mut self, inner: EventStream) {
         let mut spent = Spent::default();
+        let end = self.rounds(inner, &mut spent);
+        if let Some(usage) = &spent.usage {
+            self.meter.generation(usage);
+        }
+        if let Some(end) = end {
+            self.send(end);
+        }
+    }
+
+    /// The loop proper, adding each finished round to `spent`: the event
+    /// that ends the stream, or `None` when the consumer has gone (or the
+    /// engine stopped).
+    fn rounds(&mut self, mut inner: EventStream, spent: &mut Spent) -> Option<Event> {
+        let budget = self.tool_loop.request.max_tokens;
         // The citation marker number of the next file search result.
         let mut marker = 1;
         loop {
-            let Some((turn, stats)) = self.forward(&mut inner) else {
-                return;
+            let (turn, stats) = match self.forward(&mut inner) {
+                Round::Finished(turn, stats) => (turn, stats),
+                Round::Failed(error) => return Some(Event::Error(error)),
+                Round::Gone(stats) => {
+                    if let Some(stats) = stats {
+                        spent.add(&stats);
+                    }
+                    return None;
+                }
             };
             spent.add(&stats);
             let hosted: Vec<(ToolCall, Hosted)> = turn
@@ -258,29 +298,24 @@ impl Driver {
                 })
                 .collect();
             if hosted.is_empty() || stats.stop_reason != StopReason::Eos {
-                self.finish(spent);
-                return;
+                return Self::finish(spent);
             }
             let client_pending = turn.calls.len() > hosted.len();
             if let Some(before) = self.tool_loop.before_tools.take()
                 && let Err(error) = before()
             {
-                self.send(Event::Error(error));
-                return;
+                return Some(Event::Error(error));
             }
             let mut outputs = Vec::with_capacity(hosted.len());
             for (call, operation) in hosted {
-                let Some(output) = self.run_call(&call, operation, &mut spent, &mut marker) else {
-                    return;
-                };
+                let output = self.run_call(&call, operation, spent, &mut marker)?;
                 if !self.send(Event::ToolOutput(output.clone())) {
-                    return;
+                    return None;
                 }
                 outputs.push(output);
             }
             if client_pending {
-                self.finish(spent);
-                return;
+                return Self::finish(spent);
             }
             spent.rounds += 1;
             let left = budget.saturating_sub(spent.generated());
@@ -288,10 +323,9 @@ impl Driver {
                 if let Some(usage) = &mut spent.usage {
                     usage.stop_reason = StopReason::TokenLimit;
                 }
-                self.finish(spent);
-                return;
+                return Self::finish(spent);
             }
-            let choice = if self.exhausted(&spent) {
+            let choice = if self.exhausted(spent) {
                 ToolChoice::None
             } else {
                 ToolChoice::Auto
@@ -315,7 +349,7 @@ impl Driver {
             request.max_tokens = left;
             request.tool_choice = choice;
             if self.relay.is_cancelled() {
-                return;
+                return None;
             }
             let next = request.clone();
             match (self.tool_loop.submit)(next) {
@@ -329,27 +363,22 @@ impl Driver {
                     }
                     inner = next;
                 }
-                Err(error) => {
-                    self.send(Event::Error(error.to_string()));
-                    return;
-                }
+                Err(error) => return Some(Event::Error(error.to_string())),
             }
         }
     }
 
-    /// Forward one generation, returning its turn and measurements, or
-    /// `None` once the stream has ended (an error was forwarded, the engine
-    /// stopped, or the consumer went away).
-    fn forward(&self, inner: &mut EventStream) -> Option<(Turn, Box<Stats>)> {
+    /// Forward one generation, returning how it ended. An error is returned,
+    /// not forwarded, so it goes out after the usage is recorded.
+    fn forward(&self, inner: &mut EventStream) -> Round {
         let mut turn = Turn::default();
         loop {
-            let signal = inner.next_signal(None).ok().flatten()?;
-            match signal {
-                Signal::Event(Event::Finished(stats)) => return Some((turn, stats)),
-                Signal::Event(Event::Error(error)) => {
-                    self.send(Event::Error(error));
-                    return None;
-                }
+            let Some(signal) = inner.next_signal(None).ok().flatten() else {
+                return Round::Gone(None);
+            };
+            let forwarded = match signal {
+                Signal::Event(Event::Finished(stats)) => return Round::Finished(turn, stats),
+                Signal::Event(Event::Error(error)) => return Round::Failed(error),
                 Signal::Event(event) => {
                     match &event {
                         Event::Reasoning(piece) => turn.reasoning.push_str(piece),
@@ -357,26 +386,31 @@ impl Driver {
                         Event::ToolCall(call) => turn.calls.push(call.clone()),
                         _ => {}
                     }
-                    if !self.send(event) {
-                        inner.cancel_handle().cancel();
-                        return None;
+                    self.send(event)
+                }
+                progress @ Signal::Progress(_) => self.relay.blocking_send(progress),
+            };
+            if !forwarded {
+                // The consumer has gone: the generation is cancelled and read
+                // to its end, since a cancelled one still reports what it
+                // generated.
+                inner.cancel_handle().cancel();
+                while let Ok(Some(signal)) = inner.next_signal(None) {
+                    if let Signal::Event(Event::Finished(stats)) = signal {
+                        return Round::Gone(Some(stats));
                     }
                 }
-                progress @ Signal::Progress(_) => {
-                    if !self.relay.blocking_send(progress) {
-                        inner.cancel_handle().cancel();
-                        return None;
-                    }
-                }
+                return Round::Gone(None);
             }
         }
     }
 
-    /// Report the summed usage as the Response's end.
-    fn finish(&self, spent: Spent) {
-        if let Some(usage) = spent.usage {
-            self.send(Event::Finished(Box::new(usage)));
-        }
+    /// The summed usage as the Response's end.
+    fn finish(spent: &Spent) -> Option<Event> {
+        spent
+            .usage
+            .clone()
+            .map(|usage| Event::Finished(Box::new(usage)))
     }
 
     /// Whether another hosted call may run.

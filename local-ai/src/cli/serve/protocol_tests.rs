@@ -805,6 +805,7 @@ async fn next_frame(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_streamed_chat_starts_during_prefill_and_keeps_the_client_alive() {
     let (relay, events) = local_engine::EventStream::relay();
+    let events = super::admin::Metered::unmetered(events);
     let foreground = Arc::new(super::Foreground::default());
     assert!(relay.send(boundary()).await);
     // The headers go out on the first prefill boundary, not the first token.
@@ -841,6 +842,7 @@ async fn a_streamed_chat_starts_during_prefill_and_keeps_the_client_alive() {
 async fn a_client_leaving_before_the_first_signal_cancels_its_generation() {
     for chunked in [false, true] {
         let (relay, events) = local_engine::EventStream::relay();
+        let events = super::admin::Metered::unmetered(events);
         let request = tokio::spawn(async move {
             let foreground = Arc::new(super::Foreground::default());
             let admitted = super::QueueDepth::default().admit();
