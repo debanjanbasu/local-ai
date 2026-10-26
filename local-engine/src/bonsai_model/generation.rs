@@ -279,7 +279,7 @@ impl BonsaiEngine {
             done: false,
             sampler,
             decoder: StreamDecodeState::default(),
-            suffixes: self.suffix_store.session(&[], self.ngram.min_match),
+            suffixes: SuffixSession::default(),
             lookup_policy: LookupPolicy::new(self.ngram.max_drafts),
             pending: VecDeque::new(),
             logprobs: Vec::new(),

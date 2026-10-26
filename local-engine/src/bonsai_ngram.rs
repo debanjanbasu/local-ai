@@ -1,6 +1,8 @@
 //! Lossless suffix-lookup speculative drafting.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
 
 pub const DEFAULT_NGRAM_ENABLED: bool = true;
 pub const DEFAULT_NGRAM_MAX: usize = 63;
@@ -19,13 +21,6 @@ pub const DEFAULT_NGRAM_MIN_MATCH: usize = 12;
 pub const MAX_NGRAM_MAX: usize = 63;
 pub const MAX_STORED_REQUESTS: usize = 8;
 pub const MAX_STORED_TOKENS: usize = 131_072;
-
-/// One place where the `min_match`-token anchor ends.
-#[derive(Clone, Copy, Debug)]
-struct Location {
-    sequence: usize,
-    end: usize,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NgramSettings {
@@ -52,17 +47,28 @@ pub const fn max_lookup_drafts() -> usize {
 
 /// Bounded request-level corpus retained by one engine (and therefore by one
 /// server worker, chat session, or `bonsai --repeat` process).
+///
+/// Each request's anchors are indexed once, the first time a session needs
+/// them, and shared by every session made after that: admitting a request
+/// indexes only its own prompt.
 #[derive(Default)]
 pub struct SuffixStore {
-    requests: std::collections::VecDeque<Vec<u32>>,
+    /// Oldest first.
+    requests: std::collections::VecDeque<Arc<Anchors>>,
     tokens: usize,
 }
 
 impl SuffixStore {
-    pub fn session(&self, prompt: &[u32], min_match: usize) -> SuffixSession {
-        let mut sequences: Vec<Vec<u32>> = self.requests.iter().cloned().collect();
-        sequences.push(prompt.to_vec());
-        SuffixSession::new(sequences, min_match)
+    pub fn session(&mut self, prompt: &[u32], min_match: usize) -> SuffixSession {
+        for request in &mut self.requests {
+            if request.min_match != min_match {
+                *request = Arc::new(Anchors::new(request.tokens.clone(), min_match));
+            }
+        }
+        SuffixSession {
+            stored: self.requests.iter().rev().cloned().collect(),
+            current: Anchors::new(prompt.to_vec(), min_match),
+        }
     }
 
     pub fn remember(&mut self, mut request: Vec<u32>) {
@@ -70,10 +76,11 @@ impl SuffixStore {
             request.drain(..request.len() - MAX_STORED_TOKENS);
         }
         self.tokens += request.len();
-        self.requests.push_back(request);
+        self.requests
+            .push_back(Arc::new(Anchors::unindexed(request)));
         while self.requests.len() > MAX_STORED_REQUESTS || self.tokens > MAX_STORED_TOKENS {
             if let Some(removed) = self.requests.pop_front() {
-                self.tokens -= removed.len();
+                self.tokens -= removed.tokens.len();
             }
         }
     }
@@ -86,93 +93,198 @@ pub struct LookupDraft {
     pub occurrences: usize,
 }
 
+/// No earlier anchor with the same hash.
+const NO_ANCHOR: u32 = u32::MAX;
+/// Multiplier of the rolling anchor hash (odd, so no token is lost).
+const HASH_BASE: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Hasher for keys that are already mixed hashes.
+#[derive(Default)]
+struct PassThrough(u64);
+
+impl Hasher for PassThrough {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) | u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+/// Spread a rolling hash over every bit (`SplitMix64`'s finalizer).
+const fn mix(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// One token sequence and every place a `min_match`-token anchor ends in it,
+/// by a rolling hash of the anchor: the newest end of each hash, and from each
+/// end the previous one with the same hash. Collisions are told apart by
+/// comparing the tokens on lookup.
+struct Anchors {
+    tokens: Vec<u32>,
+    min_match: usize,
+    newest: HashMap<u64, u32, BuildHasherDefault<PassThrough>>,
+    /// The previous end with the same hash as end `min_match + index`.
+    previous: Vec<u32>,
+    /// Rolling hash of the last `min_match` tokens.
+    hash: u64,
+    /// `HASH_BASE` to the `min_match`, which drops a token from `hash`.
+    drop_factor: u64,
+}
+
+impl Anchors {
+    /// Tokens awaiting an index (see [`SuffixStore::session`]).
+    fn unindexed(tokens: Vec<u32>) -> Self {
+        Self {
+            tokens,
+            min_match: usize::MAX,
+            newest: HashMap::default(),
+            previous: Vec::new(),
+            hash: 0,
+            drop_factor: 0,
+        }
+    }
+
+    fn new(tokens: Vec<u32>, min_match: usize) -> Self {
+        let mut anchors = Self {
+            tokens: Vec::with_capacity(tokens.len()),
+            min_match,
+            newest: HashMap::with_capacity_and_hasher(
+                tokens.len().saturating_sub(min_match) + 1,
+                BuildHasherDefault::default(),
+            ),
+            previous: Vec::with_capacity(tokens.len().saturating_sub(min_match) + 1),
+            hash: 0,
+            drop_factor: (0..min_match).fold(1, |power: u64, _| power.wrapping_mul(HASH_BASE)),
+        };
+        for token in tokens {
+            anchors.push(token);
+        }
+        anchors
+    }
+
+    fn push(&mut self, token: u32) {
+        self.tokens.push(token);
+        if self.min_match == 0 {
+            return;
+        }
+        let end = self.tokens.len();
+        self.hash = self
+            .hash
+            .wrapping_mul(HASH_BASE)
+            .wrapping_add(u64::from(token) + 1);
+        if end > self.min_match {
+            let dropped = u64::from(self.tokens[end - 1 - self.min_match]) + 1;
+            self.hash = self
+                .hash
+                .wrapping_sub(dropped.wrapping_mul(self.drop_factor));
+        }
+        if end >= self.min_match {
+            let previous = self
+                .newest
+                .insert(mix(self.hash), end as u32)
+                .unwrap_or(NO_ANCHOR);
+            self.previous.push(previous);
+        }
+    }
+
+    /// Ends of the anchors equal to `anchor` (whose hash key is `key`),
+    /// newest first.
+    fn ends<'a>(&'a self, key: u64, anchor: &'a [u32]) -> impl Iterator<Item = usize> + 'a {
+        let first = self.newest.get(&key).copied().unwrap_or(NO_ANCHOR);
+        std::iter::successors((first != NO_ANCHOR).then_some(first), |&end| {
+            let previous = self.previous[end as usize - self.min_match];
+            (previous != NO_ANCHOR).then_some(previous)
+        })
+        .map(|end| end as usize)
+        .filter(move |&end| &self.tokens[end - self.min_match..end] == anchor)
+    }
+}
+
 /// Incremental exact matcher. A fixed-size anchor finds candidate occurrences
 /// in O(1) expected time; candidates are extended backwards to obtain the exact
 /// longest suffix. This avoids rescanning a 100K-token prompt each decode step.
 pub struct SuffixSession {
-    sequences: Vec<Vec<u32>>,
-    anchors: HashMap<Vec<u32>, Vec<Location>>,
-    min_match: usize,
+    /// Remembered requests, newest first, shared with the store.
+    stored: Vec<Arc<Anchors>>,
+    /// The prompt and every token appended since.
+    current: Anchors,
+}
+
+impl Default for SuffixSession {
+    /// A session over nothing, which drafts nothing and costs nothing to make.
+    fn default() -> Self {
+        Self {
+            stored: Vec::new(),
+            current: Anchors::new(Vec::new(), 0),
+        }
+    }
 }
 
 impl SuffixSession {
-    fn new(sequences: Vec<Vec<u32>>, min_match: usize) -> Self {
-        let mut result = Self {
-            sequences,
-            anchors: HashMap::new(),
-            min_match,
-        };
-        for sequence in 0..result.sequences.len() {
-            for end in min_match..=result.sequences[sequence].len() {
-                result.index(sequence, end);
-            }
-        }
-        result
-    }
-
-    fn index(&mut self, sequence: usize, end: usize) {
-        if self.min_match == 0 || end < self.min_match {
-            return;
-        }
-        let key = self.sequences[sequence][end - self.min_match..end].to_vec();
-        self.anchors
-            .entry(key)
-            .or_default()
-            .push(Location { sequence, end });
-    }
-
     pub fn append(&mut self, token: u32) {
-        let sequence = self.sequences.len() - 1;
-        self.sequences[sequence].push(token);
-        let end = self.sequences[sequence].len();
-        self.index(sequence, end);
+        self.current.push(token);
     }
 
     pub fn history(&self) -> &[u32] {
-        &self.sequences[self.sequences.len() - 1]
+        &self.current.tokens
     }
 
     pub fn find(&self, max_drafts: usize) -> Option<LookupDraft> {
-        let current_index = self.sequences.len() - 1;
-        let current = &self.sequences[current_index];
-        if self.min_match == 0 || max_drafts == 0 || current.len() < self.min_match {
+        let min_match = self.current.min_match;
+        let current = &self.current.tokens;
+        if min_match == 0 || max_drafts == 0 || current.len() < min_match {
             return None;
         }
-        let key = &current[current.len() - self.min_match..];
-        let locations = self.anchors.get(key)?;
+        let anchor = &current[current.len() - min_match..];
+        let key = mix(self.current.hash);
         let mut best_match = 0;
         let mut candidates = Vec::new();
-        for &location in locations.iter().rev() {
-            let source = &self.sequences[location.sequence];
-            if location.end >= source.len()
-                || (location.sequence == current_index && location.end == current.len())
-            {
+        // Newest first: the current sequence, then remembered requests from
+        // the most recent.
+        let locations = std::iter::once((true, &self.current))
+            .chain(self.stored.iter().map(|stored| (false, &**stored)))
+            .flat_map(|(own, sequence)| {
+                sequence
+                    .ends(key, anchor)
+                    .map(move |end| (own, &sequence.tokens, end))
+            });
+        for (own, source, end) in locations {
+            if end >= source.len() || (own && end == current.len()) {
                 continue;
             }
-            let available = location.end.min(current.len());
-            let mut matched = self.min_match;
+            let available = end.min(current.len());
+            let mut matched = min_match;
             while matched < available
-                && source[location.end - matched - 1] == current[current.len() - matched - 1]
+                && source[end - matched - 1] == current[current.len() - matched - 1]
             {
                 matched += 1;
             }
             // Do not copy tokens from the suffix currently being matched.
-            let mut continuation_end = (location.end + max_drafts).min(source.len());
-            if location.sequence == current_index {
+            let mut continuation_end = (end + max_drafts).min(source.len());
+            if own {
                 continuation_end = continuation_end.min(current.len().saturating_sub(matched));
             }
             // A long self-referential match can pull `continuation_end` below
-            // `location.end`; the continuation must be dropped, never sliced
-            // backwards.
-            if continuation_end <= location.end {
+            // `end`; the continuation must be dropped, never sliced backwards.
+            if continuation_end <= end {
                 continue;
             }
             // Image tokens are prompt-only: a draft never proposes one.
-            if let Some(image) = source[location.end..continuation_end]
+            if let Some(image) = source[end..continuation_end]
                 .iter()
                 .position(|&token| crate::bonsai_vision::is_image_token(token))
             {
-                continuation_end = location.end + image;
+                continuation_end = end + image;
                 if image == 0 {
                     continue;
                 }
@@ -182,33 +294,32 @@ impl SuffixSession {
                 candidates.clear();
             }
             if matched == best_match {
-                candidates.push(source[location.end..continuation_end].to_vec());
+                candidates.push(&source[end..continuation_end]);
             }
         }
-        // Frequency wins, then continuation length, then recency (insertion order).
+        // Frequency wins, then continuation length, then the oldest
+        // occurrence (the last one found).
         let mut counts: HashMap<&[u32], usize> = HashMap::new();
-        for candidate in &candidates {
+        for &candidate in &candidates {
             *counts.entry(candidate).or_default() += 1;
         }
-        let (index, tokens) = candidates
+        let (_, tokens) = candidates
             .iter()
             .enumerate()
-            .max_by_key(|(index, candidate)| {
+            .max_by_key(|&(index, candidate)| {
                 (
-                    counts.get(candidate.as_slice()).copied().unwrap_or(0),
+                    counts.get(candidate).copied().unwrap_or(0),
                     candidate.len(),
-                    *index,
+                    index,
                 )
             })?;
-        let _ = index;
         Some(LookupDraft {
-            occurrences: counts.get(tokens.as_slice()).copied().unwrap_or(1),
-            tokens: tokens.clone(),
+            occurrences: counts.get(tokens).copied().unwrap_or(1),
+            tokens: tokens.to_vec(),
             match_len: best_match,
         })
     }
 }
-
 /// Verify cost is flat within a tensor tile (see
 /// `local_metal::bonsai::DEFAULT_SMALL_BATCH_MAX`): past the small-batch
 /// range, extend a draft to fill its 32- or 64-token tile when the matched

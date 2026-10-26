@@ -2040,6 +2040,17 @@ against "of all entries"), deterministically, the same way on every run.
 
 The suffix store finds a matching generated-token suffix and proposes the
 known continuation. Draft depth adapts to match length and remaining context.
+Each of the last eight requests (at most 131,072 tokens in all) is indexed
+once, every 12-token anchor by a rolling 64-bit hash whose matches are
+confirmed token by token, and shared with every later request, so admitting a
+request indexes only its own prompt. Rebuilding one map of every anchor's
+tokens per admission (twice, counting an empty placeholder) cost 10-19 ms and
+a 2-3 ms drop on the engine thread for 128K remembered tokens and a 30K-token
+prompt, M4 Pro; the shared index costs 0.2 ms for the prompt (1.2 ms the
+first time it indexes the remembered requests) and, from the structures'
+sizes, about 28 bytes per anchor against about 160. 72,000 lookups over
+random token streams with repeats (anchors of 1, 3 and 12) drafted exactly
+what the rebuilt map drafted.
 When the optional head is installed, it drafts up to three tokens. A gate
 avoids head work where measured acceptance does not repay its cost.
 

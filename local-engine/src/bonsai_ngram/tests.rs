@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn exact_longest_suffix_and_frequency() {
-    let store = SuffixStore::default();
+    let mut store = SuffixStore::default();
     let mut session = store.session(&[1, 2, 3, 9, 1, 2, 3], 3);
     assert_eq!(session.find(8).map(|draft| draft.tokens), Some(vec![9]));
     session.append(9);
@@ -16,7 +16,7 @@ fn a_long_self_referential_match_never_slices_backwards() {
     // location end. The continuation must then be dropped, not sliced
     // backwards: taking `source[end..continuation_end]` with the end first is
     // the panic that killed the engine worker.
-    let store = SuffixStore::default();
+    let mut store = SuffixStore::default();
     let session = store.session(&[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 3);
     assert_eq!(
         session.find(8).map(|draft| (draft.tokens, draft.match_len)),
