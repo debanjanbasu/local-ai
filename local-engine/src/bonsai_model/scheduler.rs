@@ -23,8 +23,8 @@
 
 use super::generation::ActiveGeneration;
 use super::{
-    BatchRow, BonsaiEngine, BonsaiGeneration, CancelToken, GenerateParams, PrefillProgress,
-    draft_depth,
+    BatchRow, BonsaiEngine, BonsaiGeneration, CancelToken, GenerateParams, NgramSettings,
+    PrefillProgress, draft_depth, fill_verify_tile,
 };
 use crate::bonsai_native::{HeadDraft, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState};
 use crate::sampler::TokenLogprob;
@@ -313,11 +313,7 @@ impl BonsaiEngine {
 
     /// The single-sequence round of the one running generation.
     fn step_alone(&mut self) -> crate::Result<()> {
-        let Some(index) = self
-            .active
-            .iter()
-            .position(ActiveGeneration::decoding)
-        else {
+        let Some(index) = self.active.iter().position(ActiveGeneration::decoding) else {
             return Ok(());
         };
         if self.active[index].cancel.is_cancelled() {
@@ -364,32 +360,19 @@ impl BonsaiEngine {
         let mut candidates = vec![None; participants.len()];
         for (slot, &index) in participants.iter().enumerate() {
             let generation = &mut self.active[index];
+            let lookup = Self::lookup_draft(self.ngram, self.info.context, generation);
+            if !lookup.is_empty() {
+                candidates[slot] = Some(policy::Candidate {
+                    depth: lookup.len(),
+                    acceptance: generation.ngram_acceptance,
+                    draft_ms: policy::COMMIT_MS,
+                    head: false,
+                });
+                lookups[slot] = Some(lookup);
+                continue;
+            }
             let remaining = generation.params.max_tokens - generation.stats.sampled_tokens;
             let position = generation.prompt.len() + generation.stats.sampled_tokens - 1;
-            let lookup_started = std::time::Instant::now();
-            let draft = self
-                .ngram
-                .enabled
-                .then(|| generation.suffixes.find(self.ngram.max_drafts))
-                .flatten();
-            generation.stats.ngram.lookup += lookup_started.elapsed();
-            if let Some(mut draft) = draft {
-                let adaptive = generation
-                    .lookup_policy
-                    .depth(draft.match_len, self.ngram.max_drafts);
-                let depth = draft_depth(adaptive, remaining, self.info.context, position);
-                draft.tokens.truncate(depth);
-                if !draft.tokens.is_empty() {
-                    candidates[slot] = Some(policy::Candidate {
-                        depth: draft.tokens.len(),
-                        acceptance: generation.ngram_acceptance,
-                        draft_ms: policy::COMMIT_MS,
-                        head: false,
-                    });
-                    lookups[slot] = Some(draft.tokens);
-                    continue;
-                }
-            }
             if let Some(head) = self.model.speculation()
                 && generation.lag.usable()
             {
@@ -553,6 +536,36 @@ impl BonsaiEngine {
             );
         }
         Ok(true)
+    }
+
+    /// `generation`'s n-gram lookup drafts for its next round, solo or
+    /// batched: the matched continuation, as deep as its lookup policy allows,
+    /// filled to its verify tile, and never past its token budget or the
+    /// context. Empty when nothing matches.
+    pub(super) fn lookup_draft(
+        ngram: NgramSettings,
+        context: usize,
+        generation: &mut ActiveGeneration,
+    ) -> Vec<u32> {
+        let remaining = generation.params.max_tokens - generation.stats.sampled_tokens;
+        let position = generation.prompt.len() + generation.stats.sampled_tokens - 1;
+        let started = std::time::Instant::now();
+        let draft = ngram
+            .enabled
+            .then(|| generation.suffixes.find(ngram.max_drafts))
+            .flatten();
+        generation.stats.ngram.lookup += started.elapsed();
+        draft.map_or_else(Vec::new, |mut draft| {
+            let adaptive = generation
+                .lookup_policy
+                .depth(draft.match_len, ngram.max_drafts);
+            let depth = draft_depth(adaptive, remaining, context, position);
+            let filled = fill_verify_tile(depth, draft.tokens.len());
+            draft
+                .tokens
+                .truncate(draft_depth(filled, remaining, context, position));
+            draft.tokens
+        })
     }
 
     /// The prompt whose next chunk this batched step prefills inside its
