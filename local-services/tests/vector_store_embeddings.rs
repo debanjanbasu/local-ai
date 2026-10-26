@@ -533,11 +533,14 @@ fn deletions_remove_vectors_through_the_outbox() {
     ));
 }
 
-/// Undo version 2 of the schema, as a database written before embeddings.
+/// Undo versions 3 and 2 of the schema, as a database written before
+/// embeddings.
 fn downgrade_to_version_1(store: &Store) {
     raw(store)
         .execute_batch(
             "BEGIN;
+             DROP INDEX vector_stores_project_seq;
+             ALTER TABLE vector_stores DROP COLUMN project_id;
              DROP INDEX vector_store_files_embedding;
              ALTER TABLE vector_store_files DROP COLUMN embedding_space;
              DROP TABLE vector_store_embeddings;
@@ -570,7 +573,7 @@ fn stores_from_before_embeddings_are_migrated_and_backfilled_in_the_background()
             &store,
             "SELECT version FROM schema_versions WHERE component = 'vector_stores'"
         ),
-        2
+        3
     );
     assert!(spaces(&store).values().all(Option::is_none));
     assert_eq!(search(&index, &id, "car", Ranker::None)[0].0, alpha);

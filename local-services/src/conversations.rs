@@ -167,6 +167,10 @@ pub struct History {
 ///
 /// Version 2: an applied append request keeps only its items' IDs, so an
 /// item deleted later leaves no copy of its content behind.
+///
+/// Version 3: the project that created the conversation (`NULL` for none,
+/// and for every conversation created before; see [`Store::scoped`]).
+/// Conversations are only read by ID, so the column needs no index.
 const MIGRATIONS: &[&str] = &[
     "
 CREATE TABLE conversations (
@@ -198,6 +202,9 @@ UPDATE conversation_appends SET items =
     (SELECT json_group_array(json_extract(value, '$.id')) FROM json_each(items));
 ALTER TABLE conversation_appends RENAME COLUMN items TO item_ids;
 ",
+    "
+ALTER TABLE conversations ADD COLUMN project_id TEXT;
+",
 ];
 
 /// Create or upgrade the conversation tables.
@@ -225,18 +232,24 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO conversations (id, created_at, metadata) VALUES (?1, ?2, ?3)",
-            params![id, signed(created_at)?, serde_json::to_string(metadata)?],
+            "INSERT INTO conversations (id, created_at, metadata, project_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                signed(created_at)?,
+                serde_json::to_string(metadata)?,
+                self.project()
+            ],
         )?;
         insert_items(&transaction, &id, &items, created_at)?;
-        let conversation = live(&transaction, &id)?;
+        let conversation = live(&transaction, &id, self.project())?;
         transaction.commit()?;
         Ok(conversation)
     }
 
     /// The live conversation `id`.
     pub fn get_conversation(&self, id: &str) -> Result<Conversation> {
-        live(&*self.connection()?, id)
+        live(&*self.connection()?, id, self.project())
     }
 
     /// Replace conversation `id`'s metadata.
@@ -244,12 +257,12 @@ impl Store {
         validate_metadata(metadata)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        live(&transaction, id)?;
+        live(&transaction, id, self.project())?;
         transaction.execute(
             "UPDATE conversations SET metadata = ?2 WHERE id = ?1",
             params![id, serde_json::to_string(metadata)?],
         )?;
-        let conversation = live(&transaction, id)?;
+        let conversation = live(&transaction, id, self.project())?;
         transaction.commit()?;
         Ok(conversation)
     }
@@ -259,7 +272,7 @@ impl Store {
     pub fn delete_conversation(&self, id: &str) -> Result<ConversationDeleted> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        live(&transaction, id)?;
+        live(&transaction, id, self.project())?;
         transaction.execute(
             "UPDATE conversations SET deleted_at = ?2 WHERE id = ?1",
             params![id, signed(now()?)?],
@@ -282,7 +295,7 @@ impl Store {
         let items = normalize_items(items)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        live(&transaction, id)?;
+        live(&transaction, id, self.project())?;
         insert_items(&transaction, id, &items, now()?)?;
         transaction.commit()?;
         Ok(Page::of(items, false))
@@ -299,7 +312,7 @@ impl Store {
         let mut connection = self.connection()?;
         // A read transaction: the cursor lookup and the page see one snapshot.
         let transaction = connection.transaction()?;
-        live(&transaction, id)?;
+        live(&transaction, id, self.project())?;
         let after = match &query.after {
             None => None,
             Some(after) => Some(
@@ -341,7 +354,7 @@ impl Store {
     /// Item `item_id` of conversation `id`.
     pub fn get_item(&self, id: &str, item_id: &str) -> Result<Item> {
         let connection = self.connection()?;
-        live(&connection, id)?;
+        live(&connection, id, self.project())?;
         select_items(
             &connection,
             "SELECT id, body FROM conversation_items WHERE conversation_id = ?1 AND id = ?2",
@@ -355,7 +368,7 @@ impl Store {
     pub fn delete_item(&self, id: &str, item_id: &str) -> Result<Conversation> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        live(&transaction, id)?;
+        live(&transaction, id, self.project())?;
         let deleted = transaction.execute(
             "DELETE FROM conversation_items WHERE conversation_id = ?1 AND id = ?2",
             params![id, item_id],
@@ -364,7 +377,7 @@ impl Store {
             return Err(item_not_found(id, item_id));
         }
         bump_version(&transaction, id)?;
-        let conversation = live(&transaction, id)?;
+        let conversation = live(&transaction, id, self.project())?;
         transaction.commit()?;
         Ok(conversation)
     }
@@ -374,7 +387,7 @@ impl Store {
     pub fn conversation_history(&self, id: &str) -> Result<History> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let conversation = live(&transaction, id)?;
+        let conversation = live(&transaction, id, self.project())?;
         let items = select_items(
             &transaction,
             "SELECT id, body FROM conversation_items WHERE conversation_id = ?1 ORDER BY seq ASC",
@@ -412,7 +425,7 @@ impl Store {
         let items = normalize_items(items)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let conversation = live(&transaction, id)?;
+        let conversation = live(&transaction, id, self.project())?;
         let applied: Option<(String, String)> = transaction
             .query_row(
                 "SELECT fingerprint, item_ids FROM conversation_appends
@@ -458,7 +471,7 @@ impl Store {
                 serde_json::to_string(&items.iter().map(|item| &item.id).collect::<Vec<_>>())?
             ],
         )?;
-        let conversation = live(&transaction, id)?;
+        let conversation = live(&transaction, id, self.project())?;
         transaction.commit()?;
         Ok(Appended {
             conversation,
@@ -491,13 +504,14 @@ fn unsigned(value: i64, what: &str) -> Result<u64> {
     u64::try_from(value).map_err(|_| corrupt(what))
 }
 
-/// The conversation `id`, unless it does not exist or was deleted.
-fn live(connection: &Connection, id: &str) -> Result<Conversation> {
+/// The conversation `id`, unless it does not exist, was deleted, or
+/// `project` (when given) does not own it.
+fn live(connection: &Connection, id: &str, project: Option<&str>) -> Result<Conversation> {
     let row: Option<(i64, String, i64)> = connection
         .query_row(
             "SELECT created_at, metadata, version FROM conversations
-             WHERE id = ?1 AND deleted_at IS NULL",
-            [id],
+             WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR project_id = ?2)",
+            params![id, project],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;

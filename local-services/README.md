@@ -105,6 +105,26 @@ this crate leaves off. Each connection is opened with:
 WAL lets several handles, threads and processes share the store. Identifiers
 carry 192 bits of OS randomness.
 
+### Projects
+
+Conversations, Files, Uploads, Batches and Vector Stores record the project
+that created them (a nullable `project_id` column, added by one migration
+per component; rows from before it are unowned). `Store::scoped(Some(id))`
+returns a handle, sharing the pool, that creates objects owned by that
+project and sees only those: any other object, unowned ones included, is
+the same `NotFound` as a missing ID, left out of lists (and refused as a
+list cursor), and refused where another call names it (a batch's input
+file, a vector store's files). The filter is in each SQL statement, and the
+listed tables (`files`, `batches`, `vector_stores`) have a
+`(project_id, seq)` index that a project's listing walks; conversations and
+uploads are only read by primary key. The file a completed upload makes
+belongs to the upload's project, and a batch's result files to the batch's.
+The handle `Store::open` returns, like `scoped(None)`, acts for no project:
+it creates unowned objects and sees everything. Children (conversation
+items, upload parts, a vector store's files and file batches) are reached
+only through their parent. `VectorIndex` searches whatever stores it is
+given; the server checks that the caller may see them first.
+
 **Data stays local but is stored as plaintext.** Owner-only permissions are the
 only protection. Nothing is encrypted at rest.
 

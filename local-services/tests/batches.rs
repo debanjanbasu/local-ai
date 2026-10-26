@@ -663,11 +663,13 @@ fn batches_stored_before_owners_were_kept_migrate_unattributed() {
     let id = {
         let store = root.open();
         let id = create(&store, &["a"]).id;
-        // Undo version 2 of the schema, as a database written before owners.
+        // Undo versions 3 and 2 of the schema, as a database written
+        // before owners.
         rusqlite::Connection::open(store.root().join("services.sqlite3"))
             .unwrap()
             .execute_batch(
                 "BEGIN;
+                 DROP INDEX batches_project_seq;
                  ALTER TABLE batches DROP COLUMN project_id;
                  ALTER TABLE batches DROP COLUMN api_key_id;
                  UPDATE schema_versions SET version = 1 WHERE component = 'batches';

@@ -100,7 +100,9 @@ const EXPIRED_MESSAGE: &str =
 /// Version 1: batches and their lines. `ending` is the terminal status a
 /// finalizing or cancelling batch is moving to. Version 2: the batch's
 /// [`Owner`], `NULL` for batches created before it was kept and for
-/// unattributed callers.
+/// unattributed callers. Version 3: an index for listing one project's
+/// batches, since `project_id` is also the project that owns the batch
+/// (see [`Store::scoped`]).
 const MIGRATIONS: &[&str] = &[
     "
 CREATE TABLE batches (
@@ -147,6 +149,9 @@ CREATE INDEX batch_lines_state ON batch_lines (batch_id, state, line);
     "
 ALTER TABLE batches ADD COLUMN project_id TEXT;
 ALTER TABLE batches ADD COLUMN api_key_id TEXT;
+",
+    "
+CREATE INDEX batches_project_seq ON batches (project_id, seq);
 ",
 ];
 
@@ -416,7 +421,8 @@ impl Store {
     }
 
     /// [`Self::create_batch`] for `owner`, whose project and key the lines'
-    /// usage is attributed to (see [`PendingLine::owner`]).
+    /// usage is attributed to (see [`PendingLine::owner`]). The batch belongs
+    /// to `owner`'s project, or else to this handle's (see [`Store::scoped`]).
     pub fn create_batch_for(
         &self,
         request: &CreateBatch,
@@ -481,7 +487,9 @@ impl Store {
                 signed(created_at)?,
                 signed(created_at.saturating_add(COMPLETION_WINDOW_SECONDS))?,
                 signed(count(lines.len()))?,
-                owner.map(|owner| owner.project_id.as_str()),
+                owner
+                    .map(|owner| owner.project_id.as_str())
+                    .or_else(|| self.project()),
                 owner.map(|owner| owner.api_key_id.as_str()),
             ],
         )?;
@@ -501,12 +509,12 @@ impl Store {
             }
         }
         transaction.commit()?;
-        load(&connection, &id)
+        load(&connection, &id, None)
     }
 
     /// The batch `id`.
     pub fn get_batch(&self, id: &str) -> Result<Batch> {
-        load(&*self.connection()?, id)
+        load(&*self.connection()?, id, self.project())
     }
 
     /// Batches, newest first.
@@ -520,18 +528,27 @@ impl Store {
         let connection = self.connection()?;
         let cursor = match &query.after {
             Some(after) => connection
-                .query_row("SELECT seq FROM batches WHERE id = ?1", [after], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row(
+                    "SELECT seq FROM batches WHERE id = ?1 AND (?2 IS NULL OR project_id = ?2)",
+                    params![after, self.project()],
+                    |row| row.get::<_, i64>(0),
+                )
                 .optional()?
                 .ok_or_else(|| not_found(after))?,
             None => i64::MAX,
         };
+        // A literal condition rather than `?3 IS NULL OR ...`, so a
+        // project's listing walks the `(project_id, seq)` index.
+        let owned = if self.project().is_some() {
+            "project_id = ?3"
+        } else {
+            "?3 IS NULL"
+        };
         let mut statement = connection.prepare(&format!(
-            "SELECT {COLUMNS} FROM batches WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2"
+            "SELECT {COLUMNS} FROM batches WHERE seq < ?1 AND {owned} ORDER BY seq DESC LIMIT ?2"
         ))?;
         let rows = statement
-            .query_map(params![cursor, i64::from(limit) + 1], raw)?
+            .query_map(params![cursor, i64::from(limit) + 1, self.project()], raw)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let page = usize::try_from(limit).unwrap_or(usize::MAX);
         let has_more = rows.len() > page;
@@ -555,7 +572,7 @@ impl Store {
     pub fn cancel_batch(&self, id: &str) -> Result<Batch> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let batch = load(&transaction, id)?;
+        let batch = load(&transaction, id, self.project())?;
         match batch.status {
             BatchStatus::InProgress => {
                 transaction.execute(
@@ -572,7 +589,7 @@ impl Store {
             }
         }
         transaction.commit()?;
-        load(&connection, id)
+        load(&connection, id, None)
     }
 
     /// Batches a worker still has to run or finish, oldest first.
@@ -592,7 +609,7 @@ impl Store {
     /// another holder (in this process or another) has it.
     pub fn lease_batch(&self, id: &str) -> Result<Option<BatchLease>> {
         validate_id(id)?;
-        load(&*self.connection()?, id)?;
+        load(&*self.connection()?, id, self.project())?;
         let dir = self.root().join(LOCK_DIR);
         private_dir(&dir)?;
         let file = private_file(&dir.join(format!("{id}.lock")))?;
@@ -611,7 +628,7 @@ impl Store {
     pub fn next_batch_line(&self, lease: &BatchLease) -> Result<NextLine> {
         self.check_lease(lease)?;
         let connection = self.connection()?;
-        let batch = load(&connection, &lease.id)?;
+        let batch = load(&connection, &lease.id, self.project())?;
         match batch.status {
             BatchStatus::InProgress if now()? < batch.expires_at => {}
             BatchStatus::InProgress | BatchStatus::Cancelling | BatchStatus::Finalizing => {
@@ -676,7 +693,7 @@ impl Store {
         self.check_lease(lease)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let status = load(&transaction, &lease.id)?.status;
+        let status = load(&transaction, &lease.id, self.project())?.status;
         let finishing = transaction
             .query_row(
                 "SELECT ending FROM batches WHERE id = ?1",
@@ -774,7 +791,7 @@ impl Store {
                 )?;
             }
         }
-        load(&connection, &lease.id)
+        load(&connection, &lease.id, self.project())
     }
 
     /// Move the batch to finalizing (or keep it cancelling) and return the
@@ -782,7 +799,7 @@ impl Store {
     fn begin_finish(&self, lease: &BatchLease) -> Result<Option<BatchStatus>> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let batch = load(&transaction, &lease.id)?;
+        let batch = load(&transaction, &lease.id, self.project())?;
         let ending = match batch.status {
             status if status.is_terminal() => return Ok(None),
             BatchStatus::Cancelling => {
@@ -875,6 +892,12 @@ impl Store {
         if !any {
             return Ok(None);
         }
+        // The result files belong to the batch's project.
+        let project: Option<String> = connection.query_row(
+            "SELECT project_id FROM batches WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
         let records = Records {
             connection,
             batch: id.to_owned(),
@@ -885,7 +908,7 @@ impl Store {
             done: false,
         };
         let file_id = format!("file_{id}_{kind}");
-        let file = self.create_internal_file(
+        let file = self.scoped(project.as_deref()).create_internal_file(
             &file_id,
             &format!("{id}_{kind}.jsonl"),
             FilePurpose::BatchOutput,
@@ -1235,11 +1258,14 @@ impl Raw {
     }
 }
 
-fn load(connection: &Connection, id: &str) -> Result<Batch> {
+/// Batch `id`, unless `project` (when given) does not own it.
+fn load(connection: &Connection, id: &str, project: Option<&str>) -> Result<Batch> {
     connection
         .query_row(
-            &format!("SELECT {COLUMNS} FROM batches WHERE id = ?1"),
-            [id],
+            &format!(
+                "SELECT {COLUMNS} FROM batches WHERE id = ?1 AND (?2 IS NULL OR project_id = ?2)"
+            ),
+            params![id, project],
             raw,
         )
         .optional()?

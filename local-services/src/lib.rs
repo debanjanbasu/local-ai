@@ -6,6 +6,18 @@
 //!
 //! Each component owns and versions its own tables; this
 //! module only provides the hardened connection and the shared vocabulary.
+//!
+//! # Projects
+//!
+//! Conversations, Files, Uploads, Batches and Vector Stores each record the
+//! project that created them (`project_id`, `NULL` for none). A handle from
+//! [`Store::scoped`] with a project creates objects owned by that project
+//! and sees only those: any other object, unowned ones included, is reported
+//! exactly as a missing one (the same [`Error::NotFound`], left out of
+//! lists, refused where another call names it). A handle without a project,
+//! such as the one [`Store::open`] returns, creates unowned objects and sees
+//! every object. The filter is part of each SQL statement; listed tables
+//! carry an index on `(project_id, seq)`.
 
 pub mod admin;
 pub mod batches;
@@ -79,6 +91,8 @@ const MAX_IDLE_CONNECTIONS: usize = 8;
 pub struct Store {
     root: Arc<PathBuf>,
     idle: Arc<Mutex<Vec<Connection>>>,
+    /// The project this handle acts for (see [`Store::scoped`]).
+    project: Option<Arc<str>>,
 }
 
 /// A connection taken from a [`Store`]'s pool, returned to it when dropped
@@ -136,6 +150,7 @@ impl Store {
         let store = Self {
             root: Arc::new(root.canonicalize()?),
             idle: Arc::new(Mutex::new(Vec::new())),
+            project: None,
         };
         let mut connection = store.connection()?;
         conversations::initialize(&mut connection)?;
@@ -150,6 +165,24 @@ impl Store {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// This store acting for `project`: objects it creates are owned by
+    /// `project`, and it sees only objects `project` owns. `None` acts for
+    /// no project: it creates unowned objects and sees every object (see
+    /// the module docs). Shares this handle's connection pool.
+    #[must_use]
+    pub fn scoped(&self, project: Option<&str>) -> Self {
+        Self {
+            project: project.map(Arc::from),
+            ..self.clone()
+        }
+    }
+
+    /// The project this handle acts for, if any (see [`Self::scoped`]).
+    #[must_use]
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
     }
 
     /// A hardened connection to the store's database, reused from the pool
