@@ -1013,15 +1013,16 @@ is fetched by the server, through the hosted fetch tool's transport
   read, a document an agent pasted), so a server reachable by others must
   not become a way to probe or `GET` its own network. Media on the local
   machine or LAN goes as a data URL or through `/v1/files`.
-- At most five redirects, each target checked anew; `https` verified by the
-  macOS trust store.
+- At most five redirects, each target checked anew, never from `https` to
+  `http`; `https` verified by the macOS trust store.
 - At most 64 MiB (the generation request body limit), refused (not
   truncated) by `Content-Length` or while reading; one 60-second deadline
   for the whole exchange.
 - The response's `Content-Type` must be `image/*` for images and `video/*`
   (or `application/mp4`) for videos; none, `application/octet-stream` and
   `binary/octet-stream` pass and the decoder decides. Anything else (an HTML
-  error page, say) is a 400 naming the type.
+  error page, say) is a 400 naming the type, refused from the headers before
+  any of the body is read.
 - Fetched bytes are kept by URL for ten minutes (256 MiB in all), so a
   conversation replaying the URL in its history every turn fetches it once.
 
@@ -1552,8 +1553,10 @@ preparation and generation blocking tasks, never on runtime workers.
   optional `md5`. At most 4 multipart transfers and 16 downloads run at once;
   past that the answer is a 503 with `Retry-After: 1`. Expired objects are a
   404, and changes to an expired or cancelled upload are a 410. Expiry is
-  enforced on access. Bytes are purged physically only at startup or through
-  the native `purge_file_storage`. A `purpose` is stored and echoed only; it
+  enforced on access. Bytes are purged physically at startup, every 15
+  minutes by the vector store indexer, or through the native
+  `purge_file_storage`; vector store searches leave an expired File out at
+  once. A `purpose` is stored and echoed only; it
   enables no processing.
 - **Batches.** These run `/v1/responses` and `/v1/chat/completions`, with
   `completion_window: "24h"`, on the loaded model, whatever generation model

@@ -156,7 +156,10 @@
 //!   change. Each batch replaces a file's vectors and sets its space in one
 //!   transaction, only if it is still the same completed attachment. A new
 //!   attachment interrupts the backfill after the current batch, so new
-//!   files are indexed first.
+//!   files are indexed first. A file whose embedding fails is skipped (the
+//!   rest of its batch is still committed) and, for the life of the
+//!   process, retried only once no other file waits, so one file the model
+//!   cannot embed never holds the backfill up.
 //! * Opening the index ([`VectorIndex::check`]) deletes vector rows outside
 //!   the invariant and drops the vectors of any embedded file whose rows do
 //!   not match its chunks one to one (the backfill embeds it again).
@@ -193,7 +196,8 @@
 //! A store with `expires_after` expires `days` after its `last_active_at`,
 //! which creating it, modifying it, attaching files and searching it update
 //! (searches at most once per [`ACTIVITY_GRANULARITY_SECONDS`], so a
-//! burst of searches costs one database write).
+//! burst of searches costs one database write; that write is best-effort,
+//! skipped rather than failing the search when the database is busy).
 //! An expired store reports `status: expired`; it can still be read,
 //! modified and deleted, but searching it or attaching files is a conflict.
 
@@ -201,6 +205,7 @@ use std::collections::HashSet;
 use std::io::Read as _;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -929,7 +934,7 @@ impl Store {
 
     /// The store `id`.
     pub fn get_vector_store(&self, id: &str) -> Result<VectorStore> {
-        load_store(&self.connection()?, id)
+        load_store(&*self.connection()?, id)
     }
 
     /// Stores, newest first by default.
@@ -937,9 +942,12 @@ impl Store {
         if query.filter.is_some() {
             return Err(invalid("filter applies only to vector store files"));
         }
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
+        // One snapshot: a store deleted between reading the window and
+        // loading it must not turn the listing into a not-found.
+        let snapshot = connection.transaction()?;
         let seq = |id: &str| {
-            connection
+            snapshot
                 .query_row("SELECT seq FROM vector_stores WHERE id = ?1", [id], |row| {
                     row.get::<_, i64>(0)
                 })
@@ -948,14 +956,14 @@ impl Store {
         };
         let window = Window::new(query, seq)?;
         let ids = window.ids(
-            &connection,
+            &snapshot,
             "SELECT id FROM vector_stores WHERE seq > ?1 AND seq < ?2",
             &[],
         )?;
         let (ids, has_more) = window.finish(ids);
         let data = ids
             .iter()
-            .map(|id| load_store(&connection, id))
+            .map(|id| load_store(&snapshot, id))
             .collect::<Result<Vec<_>>>()?;
         Ok(page(data, has_more, |store| store.id.clone()))
     }
@@ -1057,9 +1065,10 @@ impl Store {
         store_id: &str,
         query: &ListQuery,
     ) -> Result<Page<VectorStoreFile>> {
-        let connection = self.connection()?;
-        load_store(&connection, store_id)?;
-        list_files(&connection, store_id, None, query)
+        let mut connection = self.connection()?;
+        let snapshot = connection.transaction()?;
+        load_store(&snapshot, store_id)?;
+        list_files(&snapshot, store_id, None, query)
     }
 
     /// Replace a file's attributes.
@@ -1231,10 +1240,11 @@ impl Store {
         batch_id: &str,
         query: &ListQuery,
     ) -> Result<Page<VectorStoreFile>> {
-        let connection = self.connection()?;
-        load_store(&connection, store_id)?;
-        load_batch(&connection, store_id, batch_id)?;
-        list_files(&connection, store_id, Some(batch_id), query)
+        let mut connection = self.connection()?;
+        let snapshot = connection.transaction()?;
+        load_store(&snapshot, store_id)?;
+        load_batch(&snapshot, store_id, batch_id)?;
+        list_files(&snapshot, store_id, Some(batch_id), query)
     }
 
     /// Read and chunk a pending file, or say why it fails.
@@ -1442,20 +1452,25 @@ fn writable_store(connection: &Connection, store_id: &str) -> Result<VectorStore
 }
 
 /// The attachment IDs of the completed files of `store_id` that `filter`
-/// admits (attributes are only parsed when there is a filter).
+/// admits (attributes are only parsed when there is a filter), leaving out
+/// those whose source File has expired: expiry hides a File at once, while
+/// its attachment is only removed when the purge deletes the File.
 fn searchable_files(
     connection: &Connection,
     store_id: &str,
     filter: Option<&Filter>,
 ) -> Result<Vec<String>> {
     let mut statement = connection.prepare(
-        "SELECT attach_id, CASE WHEN ?2 THEN attributes END FROM vector_store_files
-         WHERE store_id = ?1 AND status = 'completed'",
+        "SELECT v.attach_id, CASE WHEN ?2 THEN v.attributes END FROM vector_store_files v
+         WHERE v.store_id = ?1 AND v.status = 'completed'
+           AND EXISTS (SELECT 1 FROM files f WHERE f.id = v.file_id
+                       AND (f.expires_at IS NULL OR f.expires_at > ?3))",
     )?;
     let rows = statement
-        .query_map(params![store_id, filter.is_some()], |row| {
-            Ok((row.get(0)?, row.get::<_, Option<String>>(1)?))
-        })?
+        .query_map(
+            params![store_id, filter.is_some(), signed(now()?)?],
+            |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<(String, Option<String>)>>>()?;
     let mut files = Vec::with_capacity(rows.len());
     for (attach_id, attributes) in rows {
@@ -1740,6 +1755,8 @@ fn page<T>(data: Vec<T>, has_more: bool, id: impl Fn(&T) -> String) -> Page<T> {
     }
 }
 
+/// A page of a store's files; run it in one read transaction, so a file
+/// removed meanwhile cannot fail the listing.
 fn list_files(
     connection: &Connection,
     store_id: &str,
@@ -1951,7 +1968,8 @@ fn load_file(connection: &Connection, store_id: &str, file_id: &str) -> Result<V
 }
 
 /// The background indexer: one thread that indexes `in_progress` files when
-/// notified, never polling.
+/// notified, never polling, and every [`PURGE_INTERVAL`] purges expired
+/// Files.
 ///
 /// It runs once when started (resuming files a stopped process left
 /// `in_progress`), then once per [`Self::notify`] (coalesced). Each run
@@ -2041,21 +2059,43 @@ impl Drop for VectorStoreIndexer {
     }
 }
 
+/// How often the indexer purges the storage of expired Files.
+///
+/// [`Store::purge_file_storage`] also removes them from every vector store.
+/// Expiry is time passing, which no event announces, so this one job runs
+/// on a timer; searches already leave expired Files out.
+pub const PURGE_INTERVAL: Duration = Duration::from_mins(15);
+
 fn run_indexer(index: &VectorIndex, shared: &Shared) {
+    let mut next_purge = Instant::now() + PURGE_INTERVAL;
     loop {
-        let target = {
+        let (target, purge) = {
             let mut signals = shared.lock();
-            while signals.finished == signals.requested && !signals.stopping {
+            loop {
+                if signals.stopping {
+                    return;
+                }
+                if signals.finished != signals.requested {
+                    break (signals.requested, false);
+                }
+                let now = Instant::now();
+                if now >= next_purge {
+                    break (signals.requested, true);
+                }
                 signals = shared
                     .changed
-                    .wait(signals)
-                    .unwrap_or_else(PoisonError::into_inner);
+                    .wait_timeout(signals, next_purge - now)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
-            if signals.stopping {
-                return;
-            }
-            signals.requested
         };
+        if purge {
+            next_purge = Instant::now() + PURGE_INTERVAL;
+            // Its deletions queue the attachments for the collection below.
+            if let Err(error) = index.store().purge_file_storage() {
+                eprintln!("warning: purging expired files failed: {error}");
+            }
+        }
         if let Err(error) = index.collect_garbage() {
             // Still queued; the next run or start retries.
             eprintln!(

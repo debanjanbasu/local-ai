@@ -24,8 +24,6 @@
 //! read from the database on every check, so the command takes effect on a
 //! running server at once.
 
-use std::sync::{Mutex, PoisonError};
-
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
 use serde::Serialize;
@@ -518,18 +516,12 @@ fn now_signed() -> Result<i64> {
 #[derive(Debug)]
 pub struct Admin {
     store: Store,
-    /// One connection reused by the per-request authentication check, so it
-    /// does not open a database connection for every request.
-    hot: Mutex<Option<Connection>>,
 }
 
 impl Admin {
     #[must_use]
     pub const fn new(store: Store) -> Self {
-        Self {
-            store,
-            hot: Mutex::new(None),
-        }
+        Self { store }
     }
 
     /// The underlying store.
@@ -540,12 +532,12 @@ impl Admin {
 
     /// The local owner.
     pub fn owner(&self) -> Result<Owner> {
-        owner(&self.store.connection()?)
+        owner(&*self.store.connection()?)
     }
 
     /// Whether authentication is on.
     pub fn auth_enabled(&self) -> Result<bool> {
-        auth_enabled(&self.store.connection()?)
+        auth_enabled(&*self.store.connection()?)
     }
 
     /// Turn authentication off (the command line's `disable-auth`); keys are kept.
@@ -581,19 +573,7 @@ impl Admin {
 
     /// Check bearer token `token` (without the `Bearer ` prefix).
     pub fn authenticate(&self, token: Option<&str>) -> Result<Verdict> {
-        let mut hot = self.hot.lock().unwrap_or_else(PoisonError::into_inner);
-        if hot.is_none() {
-            *hot = Some(self.store.connection()?);
-        }
-        let Some(connection) = hot.as_ref() else {
-            return Err(Error::Io(std::io::Error::other("no connection")));
-        };
-        let verdict = authenticate(connection, token);
-        if verdict.is_err() {
-            // A broken connection is reopened by the next check.
-            *hot = None;
-        }
-        verdict
+        authenticate(&self.store, token)
     }
 
     /// Create an admin API key, turning authentication on.
@@ -659,7 +639,7 @@ impl Admin {
     }
 
     pub fn get_admin_key(&self, id: &str) -> Result<AdminApiKey> {
-        admin_key_by_id(&self.store.connection()?, id)
+        admin_key_by_id(&*self.store.connection()?, id)
     }
 
     pub fn delete_admin_key(&self, id: &str, actor: &Actor) -> Result<()> {
@@ -715,7 +695,7 @@ impl Admin {
             "archived_at IS NULL"
         };
         list(
-            &self.store.connection()?,
+            &*self.store.connection()?,
             "admin_projects",
             PROJECT_COLUMNS,
             filter,
@@ -726,7 +706,7 @@ impl Admin {
     }
 
     pub fn get_project(&self, id: &str) -> Result<Project> {
-        project_by_id(&self.store.connection()?, id)
+        project_by_id(&*self.store.connection()?, id)
     }
 
     pub fn modify_project(
@@ -1159,8 +1139,12 @@ type Found = (
     Option<i64>,
 );
 
-fn authenticate(connection: &Connection, token: Option<&str>) -> Result<Verdict> {
-    if !auth_enabled(connection)? {
+/// Check `token`, reading through a pooled connection. The once-a-minute
+/// `last_used_at` update is best-effort: a busy or failing write is skipped,
+/// never turned into a failed check.
+fn authenticate(store: &Store, token: Option<&str>) -> Result<Verdict> {
+    let connection = store.connection()?;
+    if !auth_enabled(&connection)? {
         return Ok(Verdict::Open);
     }
     let Some(token) = token else {
@@ -1211,14 +1195,18 @@ fn authenticate(connection: &Connection, token: Option<&str>) -> Result<Verdict>
     if archived.is_some() {
         return Ok(Verdict::Refused("the API key's project is archived"));
     }
+    drop(connection);
     if last_used.is_none_or(|last| now - last >= LAST_USED_GRANULARITY) {
-        connection.execute(
-            &format!(
-                "UPDATE {} SET last_used_at = ?2 WHERE id = ?1",
-                kind.table()
-            ),
-            params![id, now],
-        )?;
+        store.write_best_effort(|connection| {
+            connection.execute(
+                &format!(
+                    "UPDATE {} SET last_used_at = ?2 WHERE id = ?1",
+                    kind.table()
+                ),
+                params![id, now],
+            )?;
+            Ok(())
+        });
     }
     Ok(Verdict::Granted(match (kind, project, account) {
         (KeyKind::Project, Some(project_id), Some(service_account_id)) => Credential::Project {

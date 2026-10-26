@@ -99,7 +99,10 @@ Support/local-ai/services`, owner-only) keeps the lookup, the redacted form
 salt; never the key. Verification recomputes the HMAC and compares tags with
 `ring::hmac::verify` (constant time). The `--api-key` key is compared the same
 way, under a random per-process HMAC key. A 256-bit random key needs no slow
-password hash. `last_used_at` is written at most once a minute per key.
+password hash. `last_used_at` is written at most once a minute per key, as a
+best-effort write: if another writer holds the database for more than 50 ms,
+or the write fails, it is skipped and the request is still authenticated.
+Checks share no lock; each reads through a pooled database connection.
 
 ## Endpoints
 

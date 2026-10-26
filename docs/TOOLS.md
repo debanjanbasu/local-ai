@@ -181,9 +181,12 @@ capability handle on the root (`cap-std`), which cannot resolve outside it
 even if a component is swapped between check and open. Reads, listings and
 searches are bounded by the workspace limits and marked when truncated.
 Writes and edits need `--tools-allow-write`, create missing directories and
-are capped at 4 MiB; edits replace exactly one occurrence. A file with more
-than one hard link is never written (its other name may be outside the
-root), and the shell sandbox refuses to create a hard link to a file outside
+are capped at 4 MiB; edits replace exactly one occurrence. The file itself is
+opened with `O_NOFOLLOW` and checked through that handle (a regular file, the
+inode that was checked) before it is truncated, read and written through the
+same handle, so a symlink swapped in after the check is refused, not
+followed. A file with more than one hard link is never written (its other
+name may be outside the root), and the shell sandbox refuses to create a hard link to a file outside
 the root.
 
 **Shell** (`tools::shell`): `/bin/sh -c` under `sandbox-exec` with a
@@ -192,12 +195,22 @@ lookups (so it cannot ask launchd to start anything outside the sandbox),
 reads limited to system directories, the root and a per-call scratch
 directory (metadata is readable everywhere), writes limited to the scratch
 directory, `/dev/null` and, only with `--tools-allow-write`, the root minus
-`.git`. In the child before `exec`: `RLIMIT_CPU` 10 s, `RLIMIT_FSIZE` 16 MiB,
+every `.git` directory (at any depth, matched case-insensitively, as the file
+tools refuse them). In the child before `exec`: `RLIMIT_CPU` 10 s, `RLIMIT_FSIZE` 16 MiB,
 `RLIMIT_NOFILE` 256, `RLIMIT_CORE` 0 and `RLIMIT_NPROC` set to the user's
 current process count plus 64 (the limit is per user on macOS). The child
 leads a new process group; at the deadline, when the command exits, or when
 the call is dropped, that group (and only it) receives `SIGKILL`, always
-before the leader is reaped so the group ID cannot have been reused. Each
+before the leader is reaped so the group ID cannot have been reused. At the
+deadline, and when the call is dropped, the leader is also killed by PID (it
+is still unreaped), so a leader that moved itself into another group cannot
+outlive the call; a call still unreaped 2 s after its deadline is abandoned
+(and killed again). Descriptors the server holds are marked close-on-exec in
+the child, so the command inherits only its three standard streams. The
+scratch directory is measured every 250 ms (polling, because macOS has no
+per-directory quota and no event that reports bytes written) and a command
+whose scratch tree passes 1 GiB allocated or 20,000 entries is killed
+(reported as `SIGKILL`, with a marker on stderr). Each
 output stream keeps 32 KiB and reports the rest as a truncation marker. The
 environment is cleared (`PATH`, `HOME`/`TMPDIR` = scratch, `LANG`), stdin is
 `/dev/null`.
@@ -212,17 +225,24 @@ verified by the macOS trust store. The body is capped at 256 KiB.
 
 Remote image and video URLs in chat requests use the same transport
 (`tools::fetch::download`) with the same address checks but no allowlist,
-public IP literals allowed, up to five redirects each checked anew, and a
-64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
+public IP literals allowed, up to five redirects each checked anew (never
+from `https` to `http`), the media type checked before the body is read, and
+a 64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
 
 **Known gaps** (stated, not papered over):
 
 - macOS rejects `RLIMIT_AS` and does not enforce `RLIMIT_DATA`/`RLIMIT_RSS`,
   so a command's memory is bounded only indirectly by CPU time and the
   deadline.
-- A process that calls `setsid` leaves the process group and survives the
-  deadline kill; it stays inside the sandbox, its CPU limit and the process
-  limit.
+- A process other than the leader that calls `setsid` or `setpgid` leaves
+  the process group and survives the deadline kill; it stays inside the
+  sandbox, its CPU limit and the process limit.
+- Disk use is bounded only in the scratch directory, and only to within what
+  a command writes in one 250 ms check interval. With
+  `--tools-allow-write`, writes to the root are bounded per file
+  (`RLIMIT_FSIZE`, 16 MiB) and by the deadline, CPU and process limits, not
+  in total; and a process that escaped the group can keep writing after
+  the call ends (to the root, or to scratch files it still holds open).
 - `RLIMIT_NPROC` counts all of the user's processes, so the margin is shared
   with anything else the user starts meanwhile.
 - The shell can read system directories (`/usr`, `/System`, `/private/etc`,

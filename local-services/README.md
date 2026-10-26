@@ -18,7 +18,7 @@ There is one fixed implementation per job, not a set of optional backends:
 
 | Job | Implementation |
 | --- | --- |
-| Durable state | One bundled SQLite database through [`rusqlite` 0.40.2](https://docs.rs/rusqlite/0.40.2/rusqlite/) (`bundled` feature, no other features) |
+| Durable state | One bundled SQLite database through [`rusqlite` 0.40.2](https://docs.rs/rusqlite/0.40.2/rusqlite/) (`bundled` and `blob` features, no others) |
 | File bytes | Owner-only blob files beside the database, tracked by SQLite rows |
 | Ranked repository search | A fresh in-RAM [Tantivy 0.26.2](https://docs.rs/tantivy/0.26.2/tantivy/) index built for each call (default features off; `mmap` and `stemmer` on) |
 | Vector store search | One persistent Tantivy index beside the database, derived from it (BM25, no embeddings) |
@@ -83,7 +83,12 @@ immediate transaction. A database written by a newer build is refused. The
 directory must be `0700` and the database and its `-wal`, `-shm` and
 `-journal` sidecars `0600`. A symlink, the wrong file type, or any group or
 other permission bit is refused with `PermissionDenied`, never repaired. Every
-operation opens its own connection with:
+operation re-checks those paths and then takes a connection from a small pool
+(at most 8 idle, shared by the `Store`'s clones; one with a transaction left
+open is discarded, not reused), opening one when none is idle. Reuse makes a
+read about 6.5 µs instead of 0.9 ms (2,000 `get_conversation` calls, M4 Pro).
+Statements are prepared per call: `rusqlite`'s statement cache is a feature
+this crate leaves off. Each connection is opened with:
 
 - [`SQLITE_OPEN_NOFOLLOW`](https://sqlite.org/c3ref/open.html) and a 5 s
   [busy timeout](https://sqlite.org/c3ref/busy_timeout.html);
@@ -126,9 +131,13 @@ the metadata), `delete_conversation`, `add_items`, `list_items`, `get_item`,
   takes an idempotency `request_id` and an `expected_version`. A retry with
   the same request returns the stored items with `replayed: true`. A stale
   version, or the same key with different items, is a `Conflict`, and nothing
-  is stored.
-- Deletion is logical. The conversation and its items become unreachable,
-  but its item rows stay in the database. No purge exists for them.
+  is stored. The record of an applied request keeps only a fingerprint of
+  the items and their IDs, so a replay returns the items that still exist.
+- `delete_item` deletes the item's row; no copy of its content is kept.
+  Deleting a conversation is logical. The conversation and its items become
+  unreachable, but its item rows stay in the database. No purge exists for
+  them. Neither deletion overwrites freed database pages (SQLite's
+  `secure_delete` is off).
 
 ## Files and Uploads
 
@@ -153,8 +162,9 @@ the metadata), `delete_conversation`, `add_items`, `list_items`, `get_item`,
   left out of listings, and expired uploads refuse every change. Bytes are
   removed physically only by `purge_file_storage()`, which also deletes
   expired upload parts, staging blobs abandoned for more than 24 hours, and
-  orphaned disk entries. The server calls it once at startup. There is no
-  background sweeper. Upload rows remain as small metadata records.
+  orphaned disk entries. The server calls it at startup, and the vector
+  store indexer every 15 minutes (a timer, since no event announces that an
+  expiry time has passed). Upload rows remain as small metadata records.
 
 ## Batches
 
@@ -213,10 +223,13 @@ contract, limits and semantics are the module docs; the essentials:
   `invalid_file`) and the file ends `completed`, `failed` or, after its
   batch is cancelled, `cancelled`. Chunk sizes (`auto` = 800/400,
   `static` = 100 to 4,096 with overlap at most half) count whitespace words,
-  not model tokens. Deleting the source File removes it from every store.
+  not model tokens. Deleting the source File removes it from every store;
+  an expired one is left out of searches at once and removed by the next
+  purge.
 - **Expiry.** `expires_after` (`last_active_at`, 1 to 365 days); an expired
   store reads as `expired` and refuses search and attachments with a
-  conflict. Searches record activity at most once a minute per store.
+  conflict. Searches record activity at most once a minute per store,
+  best-effort (skipped, not failing the search, when the database is busy).
 - **Filters.** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `and`, `or`
   over file attributes (at most 16 per file), bounded in depth and size.
 
@@ -226,7 +239,9 @@ process gets a conflict) and is the native search API (`search`, and
 `file_search` tool); `VectorStoreIndexer` is the event-driven worker thread
 (woken by `notify`, never polling) that calls `collect_garbage`,
 `index_next` and then `embed_next`, the embedding backfill of completed
-files without vectors in the installed model's space.
+files without vectors in the installed model's space (a file that fails to
+embed is skipped and retried only after the others, so it cannot hold the
+backfill up).
 
 ### Index consistency
 
@@ -350,8 +365,8 @@ the one Tantivy path instead.
 The following are not part of this crate:
 
 - Encryption at rest.
-- A background sweeper or poller (the vector store indexer runs only when
-  notified).
+- A background poller (the vector store indexer runs when notified, plus
+  the 15-minute purge of expired Files).
 - An embedding model: vector stores take one through the `ChunkEmbedder`
   trait (the server supplies the native encoder) and are lexical without it.
 - Physical purge of deleted conversations.

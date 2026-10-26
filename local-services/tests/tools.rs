@@ -2,8 +2,10 @@
 //!
 //! Safety: every command run here is a fixed, harmless, strictly bounded one
 //! (`echo`, `wc`, `printf` of a fixed size, `ulimit` queries, `sleep` stopped
-//! by a short deadline, at most two background `sleep`s). Refusals are
-//! checked on inert strings that are validated and never executed.
+//! by a short deadline, one 2 MiB file of zeros, at most two background
+//! `sleep`s, one `perl` that leaves its process group and sleeps until the
+//! deadline). Refusals are checked on inert strings that are validated and
+//! never executed.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -316,6 +318,53 @@ async fn write_and_edit_inside_the_root() {
 }
 
 #[tokio::test]
+async fn writes_never_follow_a_symlink_swapped_in_at_the_last_component() {
+    let root = tempfile::tempdir().expect("root");
+    let target = root.path().join("target.txt");
+    std::fs::write(&target, "original\n").expect("target");
+    std::fs::write(root.path().join("x"), "plain\n").expect("x");
+    // A racing process keeps swapping `x` between a regular file and a
+    // symlink to `target.txt` (inside the root, so cap-std alone would
+    // follow it), by atomic renames, for a bounded number of writes. The
+    // race is probabilistic; following the link loses it in most runs.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let stop = std::sync::Arc::clone(&stop);
+        let dir = root.path().to_owned();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::os::unix::fs::symlink("target.txt", dir.join(".link"));
+                let _ = std::fs::rename(dir.join(".link"), dir.join("x"));
+                let _ = std::fs::write(dir.join(".file"), "plain\n");
+                let _ = std::fs::rename(dir.join(".file"), dir.join("x"));
+            }
+        })
+    };
+    let tools = toolbox(root.path(), true, false);
+    for round in 0..10_000 {
+        let request = if round % 2 == 0 {
+            Request::Write {
+                path: "x".into(),
+                content: "written\n".into(),
+            }
+        } else {
+            Request::Edit {
+                path: "x".into(),
+                old: "original".into(),
+                new: "edited".into(),
+            }
+        };
+        let _ = tools.run(request, SECOND).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().expect("swapper");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("target"),
+        "original\n"
+    );
+}
+
+#[tokio::test]
 async fn shell_runs_harmless_commands_in_the_root() {
     let root = tempfile::tempdir().expect("root");
     std::fs::write(root.path().join("a.txt"), "hello\n").expect("write");
@@ -413,6 +462,47 @@ async fn shell_rlimits_are_set_in_the_child() {
 }
 
 #[tokio::test]
+async fn shell_scratch_directory_is_bounded() {
+    let root = tempfile::tempdir().expect("root");
+    let tools = Toolbox::new(
+        Permissions {
+            root: Some(root.path().to_owned()),
+            shell: true,
+            ..Permissions::default()
+        },
+        Limits {
+            shell_scratch_bytes: 1024 * 1024,
+            ..Limits::default()
+        },
+    )
+    .expect("toolbox");
+    let started = Instant::now();
+    // 2 MiB, once, against a 1 MiB quota; the sleep only keeps the command
+    // alive until the quota check sees the file.
+    let runs = runs(
+        tools
+            .run(
+                sh(
+                    &["head -c 2097152 /dev/zero > \"$TMPDIR/big\" && sleep 5"],
+                    None,
+                ),
+                10 * SECOND,
+            )
+            .await
+            .expect("shell"),
+    );
+    assert_eq!(runs[0].outcome, Outcome::Signal(9), "{:?}", runs[0]);
+    assert!(
+        runs[0]
+            .stderr
+            .contains("[killed: the scratch directory passed"),
+        "{:?}",
+        runs[0]
+    );
+    assert!(started.elapsed() < 4 * SECOND, "{:?}", started.elapsed());
+}
+
+#[tokio::test]
 async fn shell_has_no_network() {
     let root = tempfile::tempdir().expect("root");
     let tools = toolbox(root.path(), false, true);
@@ -463,6 +553,29 @@ async fn shell_writes_are_confined() {
     assert!(root.join("inside.txt").exists());
     assert!(!root.join(".git/inside.txt").exists());
     assert!(!outside.exists());
+    // A nested repository's `.git`, in any case, is as closed as the root's;
+    // names that only resemble it are not.
+    std::fs::create_dir_all(root.join("sub/.git")).expect("nested .git");
+    writable
+        .run(
+            sh(
+                &[
+                    "echo x > sub/.git/config",
+                    "echo x > sub/.GIT/hooks",
+                    "mkdir -p deep/.Git",
+                    "echo x > sub/.github; echo x > sub/x.git",
+                ],
+                None,
+            ),
+            10 * SECOND,
+        )
+        .await
+        .expect("shell");
+    assert!(!root.join("sub/.git/config").exists());
+    assert!(!root.join("sub/.git/hooks").exists());
+    assert!(!root.join("deep/.Git").exists());
+    assert!(root.join("sub/.github").exists());
+    assert!(root.join("sub/x.git").exists());
     // A hard link would make a file outside the root writable through it.
     let source = outer.path().join("source.txt");
     std::fs::write(&source, "outside\n").expect("source");
@@ -496,6 +609,38 @@ async fn shell_kills_its_process_group_when_the_command_exits() {
     assert_eq!(runs[0].outcome, Outcome::Exit(0));
     assert!(runs[0].stdout.starts_with("started"), "{:?}", runs[0]);
     assert!(started.elapsed() < 5 * SECOND, "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn shell_deadline_kills_a_leader_that_left_its_group() {
+    let root = tempfile::tempdir().expect("root");
+    let tools = toolbox(root.path(), false, true);
+    let started = Instant::now();
+    // One escape attempt: the shell becomes perl (same PID, the group's
+    // leader), which moves itself into this test process's group, out of
+    // reach of the group kill. The hang guard bounds the test either way;
+    // dropping the call kills the leader by PID.
+    let escape = "echo $$; exec /usr/bin/perl -e 'setpgrp(0, getpgrp(getppid())) or die \"setpgrp: $!\\n\"; sleep 1e9'";
+    let call = tools.run(sh(&[escape], Some(SECOND)), 10 * SECOND);
+    let runs = runs(
+        tokio::time::timeout(8 * SECOND, call)
+            .await
+            .expect("the call outlived its deadline")
+            .expect("shell"),
+    );
+    assert_eq!(runs[0].outcome, Outcome::TimedOut, "{:?}", runs[0]);
+    assert!(runs[0].stderr.is_empty(), "{:?}", runs[0]);
+    assert!(started.elapsed() < 5 * SECOND, "{:?}", started.elapsed());
+    let pid = runs[0].stdout.trim();
+    let status = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .expect("ps");
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.trim().is_empty() || status.trim().starts_with('Z'),
+        "{status:?}"
+    );
 }
 
 #[tokio::test]
@@ -607,5 +752,28 @@ async fn fetch_refuses_names_resolving_to_loopback() {
     assert!(
         matches!(&error, ToolError::Denied(message) if message.contains("non-public")),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn shell_inherits_no_descriptors_beyond_its_standard_streams() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let root = tempfile::tempdir().expect("root");
+    let file = std::fs::File::open("/etc/hosts").expect("open");
+    // A descriptor without close-on-exec, as a C library might leave one.
+    // SAFETY: `dup` of an open descriptor; the result is owned below.
+    #[allow(unsafe_code)]
+    let leaked = unsafe { OwnedFd::from_raw_fd(libc::dup(file.as_raw_fd())) };
+    let tools = toolbox(root.path(), false, true);
+    let runs = runs(
+        tools
+            .run(sh(&["ls /dev/fd"], None), 10 * SECOND)
+            .await
+            .expect("shell"),
+    );
+    let open: Vec<&str> = runs[0].stdout.lines().collect();
+    assert!(
+        !open.contains(&leaked.as_raw_fd().to_string().as_str()),
+        "{open:?}"
     );
 }

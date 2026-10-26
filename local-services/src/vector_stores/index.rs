@@ -88,6 +88,9 @@ pub struct VectorIndex {
     fields: Fields,
     /// The embedding model, when installed (see [`Self::set_embedder`]).
     embedder: RwLock<Option<Arc<dyn ChunkEmbedder>>>,
+    /// Attachments whose backfill embedding failed in this process: tried
+    /// again only once no other file waits (see [`Self::embed_next`]).
+    embed_failed: Mutex<HashSet<String>>,
 }
 
 /// How [`VectorIndex::search_with`] ranks chunks.
@@ -227,6 +230,7 @@ impl VectorIndex {
             writer: Mutex::new(writer),
             fields,
             embedder: RwLock::new(None),
+            embed_failed: Mutex::new(HashSet::new()),
         };
         let check = opened.check()?;
         if check.rebuilt {
@@ -381,9 +385,10 @@ impl VectorIndex {
                 .last_active_at
                 .is_none_or(|at| now.saturating_sub(at) >= ACTIVITY_GRANULARITY_SECONDS)
             {
-                // A write (and its fsync) at most once per granularity period.
-                let writer = self.store.connection()?;
-                touch(&writer, store_id)?;
+                // A write (and its fsync) at most once per granularity
+                // period, best-effort: a busy database never fails a search.
+                self.store
+                    .write_best_effort(|connection| touch(connection, store_id));
             }
             files.extend(searchable_files(
                 &snapshot,
@@ -404,20 +409,28 @@ impl VectorIndex {
         hits.truncate(plan.limit);
         let mut data = Vec::with_capacity(hits.len());
         for ((attach_id, ordinal), score) in hits {
-            let row: Option<(String, String, String, Vec<u8>)> = snapshot
+            let row: Option<(i64, String, String, String, i64, i64)> = snapshot
                 .query_row(
-                    "SELECT f.file_id, f.filename, f.attributes,
-                            substr(f.text, c.start + 1, c.end - c.start)
+                    "SELECT f.seq, f.file_id, f.filename, f.attributes, c.start, c.end
                      FROM vector_store_chunks c JOIN vector_store_files f
                        ON f.attach_id = c.attach_id
                      WHERE c.attach_id = ?1 AND c.ordinal = ?2 AND f.status = 'completed'",
                     params![attach_id, signed(ordinal)?],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
             // Every admitted document has its chunk row in this snapshot; a
             // missing one would be skipped, never shown.
-            let Some((file_id, filename, attributes, text)) = row else {
+            let Some((seq, file_id, filename, attributes, start, end)) = row else {
                 continue;
             };
             data.push(SearchResult {
@@ -427,7 +440,7 @@ impl VectorIndex {
                 attributes: serde_json::from_str(&attributes)?,
                 content: vec![ContentPart {
                     kind: "text".to_owned(),
-                    text: String::from_utf8(text).map_err(|_| corrupt("chunk text"))?,
+                    text: chunk_text(&snapshot, seq, start, end)?,
                 }],
             });
         }
@@ -582,7 +595,7 @@ impl VectorIndex {
         } else {
             INDEX_BATCH_BYTES
         };
-        let pending = next_pending(&self.store.connection()?, INDEX_BATCH_FILES)?;
+        let pending = next_pending(&*self.store.connection()?, INDEX_BATCH_FILES)?;
         let mut parsed = Vec::new();
         let mut failed = Vec::new();
         let mut bytes = 0;
@@ -726,6 +739,11 @@ impl VectorIndex {
     /// it is still the same completed attachment; nothing else changes, so
     /// a crash at any point leaves the file as it was (embedded again on
     /// the next run).
+    ///
+    /// A file whose embedding fails is skipped (logged) and the others are
+    /// still committed; it is remembered and tried again only in a batch of
+    /// such files, once no other file waits, so it can never hold the
+    /// backfill up. A batch in which every file failed is an error.
     pub fn embed_next(&self) -> Result<usize> {
         self.embed_batch(&|| false)
     }
@@ -738,40 +756,46 @@ impl VectorIndex {
         };
         let space = embedder.space();
         let mut connection = self.store.connection()?;
-        let candidates: Vec<(String, i64)> = {
-            let mut statement = connection.prepare(
-                "SELECT attach_id, length(text) FROM vector_store_files
-                 WHERE status = 'completed' AND (embedding_space IS NULL OR embedding_space != ?1)
-                 ORDER BY seq LIMIT ?2",
-            )?;
-            statement
-                .query_map(params![space, signed(count(INDEX_BATCH_FILES))?], |row| {
-                    Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0)))
-                })?
-                .collect::<rusqlite::Result<_>>()?
-        };
+        let failed: Vec<String> = self
+            .embed_failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        let candidates = backfill_candidates(&connection, space, &failed)?;
+        // Files that failed before are retried only when nothing else waits.
+        let retrying = candidates.first().is_some_and(|(_, _, failed)| *failed);
         let mut done = Vec::new();
+        let mut first_error = None;
         let mut bytes = 0_usize;
-        for (attach_id, length) in candidates {
-            if bytes >= EMBED_BATCH_BYTES {
+        for (attach_id, length, failed) in candidates {
+            if bytes >= EMBED_BATCH_BYTES || (failed && !retrying) {
                 break;
             }
             bytes += usize::try_from(length).unwrap_or(0);
-            let snapshot = connection.transaction()?;
-            let text: Option<Vec<u8>> = snapshot
-                .query_row(
-                    "SELECT text FROM vector_store_files WHERE attach_id = ?1",
-                    [&attach_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
-            let ranges = chunk_ranges(&snapshot, &attach_id)?;
-            drop(snapshot);
-            let Some(text) = text else { continue };
-            let text = String::from_utf8(text).map_err(|_| corrupt("vector store file text"))?;
-            let encoded = embed_chunks(embedder.as_ref(), &text, &ranges, stop)?;
-            done.push((attach_id, ranges.len(), encoded));
+            match embed_file(&mut connection, embedder.as_ref(), &attach_id, stop) {
+                Ok(Some(file)) => done.push(file),
+                Ok(None) => {}
+                Err(error) if stop() => return Err(error),
+                Err(error) => {
+                    eprintln!(
+                        "warning: embedding vector store attachment {attach_id} failed \
+                         ({error}); it stays searchable by keywords and is retried after \
+                         the other files"
+                    );
+                    self.embed_failed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(attach_id);
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if done.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         let processed = done.len();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -802,6 +826,14 @@ impl VectorIndex {
             )?;
         }
         transaction.commit()?;
+        let mut failed = self
+            .embed_failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (attach_id, _, _) in &done {
+            failed.remove(attach_id);
+        }
+        drop(failed);
         Ok(processed)
     }
 
@@ -867,7 +899,7 @@ impl VectorIndex {
     fn collect(&self, writer: &mut IndexWriter) -> Result<u64> {
         let mut collected = 0;
         loop {
-            let batch = garbage(&self.store.connection()?, GARBAGE_BATCH)?;
+            let batch = garbage(&*self.store.connection()?, GARBAGE_BATCH)?;
             if batch.is_empty() {
                 return Ok(collected);
             }
@@ -1167,6 +1199,70 @@ fn check_vectors(vectors: &[Vec<f32>], expected: usize, width: usize) -> Result<
     Ok(())
 }
 
+/// A backfilled file: its attachment ID, chunk count and encoded vectors.
+type Embedded = (String, usize, Vec<Vec<u8>>);
+
+/// Completed attachments without vectors in `space`, oldest first but those
+/// in `failed` last: ID, text length and whether it failed before.
+fn backfill_candidates(
+    connection: &rusqlite::Connection,
+    space: &str,
+    failed: &[String],
+) -> Result<Vec<(String, i64, bool)>> {
+    let mut statement = connection.prepare(
+        "SELECT attach_id, length(text),
+                attach_id IN (SELECT value FROM json_each(?3)) AS failed
+         FROM vector_store_files
+         WHERE status = 'completed' AND (embedding_space IS NULL OR embedding_space != ?1)
+         ORDER BY failed, seq LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                space,
+                signed(count(INDEX_BATCH_FILES))?,
+                serde_json::to_string(failed)?
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Embed the chunks of attachment `attach_id` from one snapshot of its
+/// text and chunk ranges: its ID, chunk count and encoded vectors, or
+/// `None` when it has no text.
+fn embed_file(
+    connection: &mut rusqlite::Connection,
+    embedder: &dyn ChunkEmbedder,
+    attach_id: &str,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<Embedded>> {
+    let snapshot = connection.transaction()?;
+    let text: Option<Vec<u8>> = snapshot
+        .query_row(
+            "SELECT text FROM vector_store_files WHERE attach_id = ?1",
+            [attach_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let ranges = chunk_ranges(&snapshot, attach_id)?;
+    drop(snapshot);
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(text).map_err(|_| corrupt("vector store file text"))?;
+    let encoded = embed_chunks(embedder, &text, &ranges, stop)?;
+    Ok(Some((attach_id.to_owned(), ranges.len(), encoded)))
+}
+
 /// Embed the chunks `ranges` of `text` with the document prompt, a group at
 /// a time, as stored vectors (F16, little-endian).
 fn embed_chunks(
@@ -1189,6 +1285,22 @@ fn embed_chunks(
         encoded.extend(vectors.iter().map(|vector| encode(vector)));
     }
     Ok(encoded)
+}
+
+/// The bytes `start..end` of the stored text of the file at row `seq`, read
+/// incrementally (`sqlite3_blob_read`) so a hit costs its chunk, not the
+/// whole text (up to 16 MiB).
+fn chunk_text(connection: &rusqlite::Connection, seq: i64, start: i64, end: i64) -> Result<String> {
+    let start = usize::try_from(start).map_err(|_| corrupt("chunk boundary"))?;
+    let length = usize::try_from(end)
+        .ok()
+        .and_then(|end| end.checked_sub(start))
+        .ok_or_else(|| corrupt("chunk boundary"))?;
+    let blob =
+        connection.blob_open(rusqlite::MAIN_DB, c"vector_store_files", c"text", seq, true)?;
+    let mut bytes = vec![0; length];
+    blob.read_at_exact(&mut bytes, start)?;
+    String::from_utf8(bytes).map_err(|_| corrupt("chunk text"))
 }
 
 /// The chunk byte ranges of an attachment, by ordinal.

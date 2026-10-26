@@ -29,12 +29,14 @@
 //!
 //! # Expiry and physical cleanup
 //!
-//! There is no background task. Expiry is enforced on access: expired files are
-//! reported as not found and omitted from listings, and expired uploads reject
-//! every mutation. Bytes of expired files, parts of expired uploads, abandoned
-//! staging blobs, and orphaned disk entries are physically removed only when
-//! [`Store::purge_file_storage`] is called (for example at startup or from an
-//! operator-triggered maintenance step). Upload rows themselves (pending,
+//! Expiry is enforced on access: expired files are reported as not found and
+//! omitted from listings, and expired uploads reject every mutation. Bytes of
+//! expired files, parts of expired uploads, abandoned staging blobs, and
+//! orphaned disk entries are physically removed only when
+//! [`Store::purge_file_storage`] is called: by the server at startup, by the
+//! vector store indexer every
+//! [`PURGE_INTERVAL`](crate::vector_stores::PURGE_INTERVAL), or from an
+//! operator-triggered maintenance step. Upload rows themselves (pending,
 //! expired, completed, cancelled) are retained as small metadata records.
 //!
 //! # Purposes
@@ -820,8 +822,9 @@ impl Store {
     }
 
     /// Physically removes expired files, parts of expired uploads, abandoned
-    /// staging blobs, and disk entries without metadata. Never runs
-    /// automatically.
+    /// staging blobs, and disk entries without metadata. Safe to run
+    /// alongside other operations; the vector store indexer runs it every
+    /// [`PURGE_INTERVAL`](crate::vector_stores::PURGE_INTERVAL).
     pub fn purge_file_storage(&self) -> Result<FileStoragePurge> {
         let dirs = self.file_dirs()?;
         let mut conn = self.files_connection()?;
@@ -880,7 +883,7 @@ impl Store {
         Ok(report)
     }
 
-    fn files_connection(&self) -> Result<Connection> {
+    fn files_connection(&self) -> Result<crate::Pooled> {
         self.connection()
     }
 

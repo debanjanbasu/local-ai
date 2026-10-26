@@ -13,8 +13,9 @@
 //!   profile that denies all network access and every file write outside a
 //!   per-call scratch directory (and, with `write`, the root), with CPU-time,
 //!   file-size, open-file and process-count `setrlimit`s applied in the child
-//!   before `exec`, a wall-clock deadline, output byte caps and termination
-//!   of the child's own process group.
+//!   before `exec`, a wall-clock deadline, a scratch-directory quota, output
+//!   byte caps and termination of the child's own process group (and, at the
+//!   deadline, of the child itself).
 //! - **Web fetch** ([`fetch`]): one `GET` to a host on an explicit domain
 //!   allowlist, refusing private, loopback and other non-public addresses,
 //!   never following redirects, with time and size limits.
@@ -24,9 +25,10 @@
 //!
 //! What the OS cannot enforce is documented rather than imitated: macOS
 //! rejects `RLIMIT_AS`, so a sandboxed command's memory is bounded only by
-//! its CPU time and deadline, and a command that moves itself into a new
-//! session (`setsid`) leaves the process group that is terminated at the end
-//! of the call. See `docs/TOOLS.md`.
+//! its CPU time and deadline, and a process the command starts that moves
+//! itself into a new session or group (`setsid`, `setpgid`) leaves the
+//! process group that is terminated at the end of the call. See
+//! `docs/TOOLS.md`.
 
 pub mod fetch;
 pub mod fs;
@@ -75,6 +77,9 @@ pub struct Limits {
     /// already runs (`RLIMIT_NPROC` is per user, so it is set to the user's
     /// current count plus this).
     pub shell_processes: u64,
+    /// Allocated bytes a shell command's scratch directory may hold; past
+    /// them (or past [`shell::MAX_SCRATCH_ENTRIES`] entries) it is killed.
+    pub shell_scratch_bytes: u64,
     /// Bytes of body web fetch reads before it stops and marks truncation.
     pub fetch_max_bytes: usize,
     /// Largest file a write or edit may produce.
@@ -90,6 +95,7 @@ impl Default for Limits {
             shell_file_bytes: 16 * 1024 * 1024,
             shell_open_files: 256,
             shell_processes: 64,
+            shell_scratch_bytes: 1024 * 1024 * 1024,
             fetch_max_bytes: 256 * 1024,
             max_write_bytes: 4 * 1024 * 1024,
         }
@@ -324,16 +330,23 @@ impl Toolbox {
         } = request
         {
             // The shell enforces its own deadlines, killing the process group
-            // and keeping the output so far, so it is not cut off from outside.
+            // and the leader and keeping the output so far. The outer bound
+            // only catches a command that outlives that kill: dropping the
+            // run kills the group and, by PID, the leader again.
             let root = self.root_path()?;
             let policy = shell::Policy::new(root, self.inner.permissions.write, &self.inner.limits);
             let per_command = asked.map_or(timeout, |asked| asked.min(timeout));
             let cap = max_output_bytes.map_or(self.inner.limits.max_output_bytes, |asked| {
                 asked.clamp(1, self.inner.limits.max_output_bytes)
             });
-            return shell::run_all(&policy, &commands, per_command, timeout, cap)
-                .await
-                .map(Output::Shell);
+            let bound = timeout + shell::DRAIN_GRACE + shell::REAP_GRACE;
+            return tokio::time::timeout(
+                bound,
+                shell::run_all(&policy, &commands, per_command, timeout, cap),
+            )
+            .await
+            .unwrap_or(Err(ToolError::TimedOut(timeout)))
+            .map(Output::Shell);
         }
         let work = async {
             match request {
