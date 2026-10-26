@@ -4,7 +4,7 @@ use super::{
     BonsaiEngine, BonsaiGeneration, BonsaiModel, CancelToken, GenerateParams, GenerationStats,
     HeadLag, Instant, LookupPolicy, MtpStats, PrefillProgress, PromptCacheSource, PromptCheckpoint,
     PromptPrefill, Sampler, SamplingParams, SamplingResult, SequenceState, StopReason,
-    SuffixSession, VOCAB, fill_verify_tile,
+    SuffixSession, VOCAB,
 };
 use std::sync::Arc;
 
@@ -284,7 +284,7 @@ impl BonsaiEngine {
             done: false,
             sampler,
             decoder: StreamDecodeState::default(),
-            suffixes: self.suffix_store.session(&[], self.ngram.min_match),
+            suffixes: SuffixSession::default(),
             lookup_policy: LookupPolicy::new(self.ngram.max_drafts),
             pending: VecDeque::new(),
             logprobs: Vec::new(),
@@ -383,6 +383,8 @@ impl BonsaiEngine {
         self.model.set_cancel(generation.cancel.clone());
         self.model
             .set_device_greedy(generation.sampler.selects_argmax());
+        self.model
+            .set_device_top_k(generation.sampler.device_top_k());
         self.model.set_logprobs(generation.sampler.logprobs());
         let id = generation.id;
         let chunks = &mut generation.prefill_chunks;
@@ -509,31 +511,16 @@ impl BonsaiEngine {
         self.model.set_cancel(generation.cancel.clone());
         self.model
             .set_device_greedy(generation.sampler.selects_argmax());
+        self.model
+            .set_device_top_k(generation.sampler.device_top_k());
         self.model.set_logprobs(generation.sampler.logprobs());
         let head = self.model.speculation().is_some() && generation.lag.usable();
         if head && !generation.lag.is_empty() {
             self.model.catch_up_head(&mut generation.lag)?;
         }
+        let drafts = Self::lookup_draft(self.ngram, self.info.context, generation);
         let stats = &mut generation.stats;
         let remaining = generation.params.max_tokens - stats.sampled_tokens;
-        let lookup_started = Instant::now();
-        let draft = self
-            .ngram
-            .enabled
-            .then(|| generation.suffixes.find(self.ngram.max_drafts))
-            .flatten();
-        stats.ngram.lookup += lookup_started.elapsed();
-        let position = generation.prompt.len() + stats.sampled_tokens - 1;
-        let drafts = draft.map_or_else(Vec::new, |mut draft| {
-            let adaptive = generation
-                .lookup_policy
-                .depth(draft.match_len, self.ngram.max_drafts);
-            let depth = draft_depth(adaptive, remaining, self.info.context, position);
-            let filled = fill_verify_tile(depth, draft.tokens.len());
-            let limit = draft_depth(filled, remaining, self.info.context, position);
-            draft.tokens.truncate(limit);
-            draft.tokens
-        });
         let pending = &mut generation.pending;
         if !drafts.is_empty() {
             let batch = self

@@ -3,7 +3,9 @@
 use local_metal::batch::CommandBatch;
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::MetalContext;
-use local_metal::sampling::{GpuTopK, LogprobRows, MAX_TOP_K, MAX_TOP_LOGPROBS, TopKCandidate};
+use local_metal::sampling::{
+    GpuTopK, LogprobRows, MAX_TOP_K, MAX_TOP_LOGPROBS, TopKCandidate, TopKRows,
+};
 use local_metal::shaders::ShaderLibrary;
 
 /// `None` when this machine exposes no Metal device, so GPU tests skip
@@ -147,6 +149,44 @@ fn rejects_invalid_bounds_before_dispatch() {
         assert!(topk.encode(&mut batch, &short, 0, vocab, k).is_err());
         assert_eq!(batch.dispatch_count(), 0);
         batch.commit_and_wait().expect("wait");
+    }
+}
+
+/// Every row of a multi-row selection is the row's own exact top k, ties to
+/// the lower id, special bit patterns preserved, at every k up to 64.
+#[test]
+fn topk_rows_match_total_cmp_per_row() {
+    let Some(context) = gpu_or_skip() else { return };
+    let shaders = ShaderLibrary::new(context.device()).expect("shaders");
+    for vocab in [65, 4_097, 248_320] {
+        let rows = 4;
+        let workspace = TopKRows::new(&context, &shaders, vocab, 8).expect("workspace");
+        let mut input = Vec::with_capacity(rows * vocab);
+        input.extend(values(vocab));
+        input.extend((0..vocab).map(|i| (i % 7) as f32 - 30.0));
+        input.extend((0..vocab).map(|i| match i % 97 {
+            0 => f32::from_bits(0x7fc0_0001),
+            1 => f32::INFINITY,
+            2 => f32::from_bits(0xffc0_0002),
+            3 => -0.0,
+            4 => 0.0,
+            _ => -(i as f32 % 13.0),
+        }));
+        input.extend(values(vocab).iter().rev().map(|value| value / 8.0));
+        let logits = MetalBuffer::from_slice(context.device(), &input).expect("logits");
+        for k in [1, 20, MAX_TOP_K] {
+            let mut batch = CommandBatch::new(&context).expect("batch");
+            workspace
+                .encode(&mut batch, &logits, rows, k)
+                .expect("encode");
+            batch.commit_and_wait().expect("wait");
+            for row in 0..rows {
+                assert_exact(
+                    &workspace.row(row, k),
+                    &reference(&input[row * vocab..(row + 1) * vocab], k),
+                );
+            }
+        }
     }
 }
 

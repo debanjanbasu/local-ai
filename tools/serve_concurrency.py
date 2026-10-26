@@ -24,7 +24,9 @@ Phases, for each stream count N (default 1, 2, 4, 8):
   as sub-agents fanned out at once; reports their TTFTs.
 
 Greedy sampling with reasoning off, so outputs are comparable across builds:
-`outputs` in `results.json` maps each request to a hash of its text. A gap is
+`outputs` in `results.json` maps each request to a hash of its text.
+`--sampled` uses the server's default sampling (temperature 1.0, top-p 0.95,
+top-k 20) instead, with a fixed seed per request, so outputs stay comparable. A gap is
 the wait between engine steps that streamed a stream text: chunks within 5 ms
 of each other (the tokens of one step) count once. `--report DIR` recomputes
 the summary from a run's saved timings.
@@ -110,6 +112,10 @@ class Server:
                 self.process.wait()
 
 
+# Request fields that choose sampling; `--sampled` replaces them.
+SAMPLING: dict = {"temperature": 0}
+
+
 def stream(port: int, name: str, prompt: str | list, max_tokens: int, start: float,
            out: dict) -> None:
     """One streaming request (a user message, or the messages themselves);
@@ -119,7 +125,7 @@ def stream(port: int, name: str, prompt: str | list, max_tokens: int, start: flo
         "model": "ternary-bonsai-2-27b",
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0,
+        **SAMPLING,
         "reasoning_effort": "none",
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -354,7 +360,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--mixed-tokens", type=int, default=512)
     parser.add_argument("--long-chars", type=int, default=24000)
     parser.add_argument("--long-delay", type=float, default=3.0)
+    parser.add_argument("--sampled", action="store_true",
+                        help="server default sampling, seeded, instead of greedy")
     args = parser.parse_args(argv)
+    if args.sampled:
+        SAMPLING.clear()
+        SAMPLING["seed"] = 11
     if args.report:
         report(args.report)
         return 0

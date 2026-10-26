@@ -536,34 +536,38 @@ impl Engine {
             grammar,
             images,
         )?;
-        let reasoning_tokens = crate::bonsai_tokenizer::answer_start(&output.token_ids, thinking)
-            .unwrap_or(output.token_ids.len());
-        let (finished, stop_reason) = splitter.close(output.stop_reason, &mut callback);
+        Self::close_generation(&mut splitter, output, &mut callback)
+    }
+
+    /// The events that close a generation, sent through `splitter` to
+    /// `callback` here and by the server's worker alike: the splitter's
+    /// held-back text, the token ids, then [`Event::Finished`].
+    ///
+    /// A tool-call parse failure is the error. A consumer that stops before
+    /// [`Event::Finished`] gets no further event, and the statistics report
+    /// [`StopReason::Cancelled`].
+    fn close_generation(
+        splitter: &mut EventSplitter,
+        output: crate::bonsai_model::BonsaiGeneration,
+        callback: &mut impl FnMut(Event) -> ControlFlow<()>,
+    ) -> crate::Result<Stats> {
+        let reasoning_tokens =
+            crate::bonsai_tokenizer::answer_start(&output.token_ids, splitter.thinking)
+                .unwrap_or(output.token_ids.len());
+        let (finished, stop_reason) = splitter.close(output.stop_reason, callback);
         if let Some(failure) = splitter.take_failure() {
             return Err(crate::Error::Generation(failure));
         }
-        if finished.is_break() {
-            return Ok(Stats {
-                stop_reason: StopReason::Cancelled,
-                cache_source: output.cache_source,
-                reasoning_tokens,
-                generation: output.stats,
-            });
-        }
-        if callback(Event::TokenIds(output.token_ids.clone())).is_break() {
-            return Ok(Stats {
-                stop_reason: StopReason::Cancelled,
-                cache_source: output.cache_source,
-                reasoning_tokens,
-                generation: output.stats,
-            });
-        }
-        let stats = Stats {
+        let mut stats = Stats {
             stop_reason,
             cache_source: output.cache_source,
             reasoning_tokens,
             generation: output.stats,
         };
+        if finished.is_break() || callback(Event::TokenIds(output.token_ids)).is_break() {
+            stats.stop_reason = StopReason::Cancelled;
+            return Ok(stats);
+        }
         let _ = callback(Event::Finished(Box::new(stats.clone())));
         Ok(stats)
     }

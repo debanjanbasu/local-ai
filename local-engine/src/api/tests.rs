@@ -1033,3 +1033,71 @@ fn a_strict_call_is_parsed_by_its_exact_layout_after_reasoning() {
         "{events:?}"
     );
 }
+
+/// A request whose prompt and `max_tokens` can never fit the context fails at
+/// once, instead of holding the queue until the request ahead of it finishes.
+#[test]
+#[ignore = "requires the pinned model and the GPU"]
+fn a_request_that_can_never_fit_fails_without_waiting_for_the_engine() {
+    let handle = Engine::open().expect("open engine").into_handle();
+    let mut running = long_prompt(0, 2048);
+    running.messages = vec![message(
+        "user",
+        "Write every number from 1 to 3000, one per line.",
+    )];
+    running.sampling.0.temperature = 0.0;
+    let mut oversized = running.clone();
+    oversized.max_tokens = 1 << 40;
+    let mut first = handle.chat(running).expect("queue");
+    assert!(
+        matches!(first.next(), Some(Event::Content(_))),
+        "the first request is decoding"
+    );
+    let mut events = handle.chat(oversized).expect("queue");
+    match events.next_timeout(Duration::from_secs(20)) {
+        Ok(Some(Event::Error(error))) => assert!(error.contains("exceed"), "{error}"),
+        other => panic!("the oversized request was not refused at once: {other:?}"),
+    }
+    first.cancel_handle().cancel();
+}
+
+/// A finished request whose reader stopped reading does not keep the idle
+/// worker from taking the next job: its last events wait for room while
+/// later requests run.
+#[test]
+#[ignore = "requires the pinned model and the GPU"]
+fn an_unread_finished_request_does_not_hold_up_the_next_one() {
+    let handle = Engine::open().expect("open engine").into_handle();
+    let request = |max_tokens| {
+        let mut request = long_prompt(0, max_tokens);
+        request.messages = vec![message(
+            "user",
+            "Write every number from 1 to 3000, one per line.",
+        )];
+        request.sampling.0.temperature = 0.0;
+        request
+    };
+    // More events than its channel holds, never read: once it finishes beside
+    // the second request, its last events are left undelivered.
+    let unread = handle
+        .chat(request(4 * crate::runtime::EVENT_BUFFER))
+        .expect("queue");
+    let second = handle
+        .chat(request(8 * crate::runtime::EVENT_BUFFER))
+        .expect("queue");
+    let mut finished = false;
+    for event in second {
+        match event {
+            Event::Finished(_) => finished = true,
+            Event::Error(error) => panic!("the second request failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(finished, "the second request finished");
+    let mut third = handle.chat(request(4)).expect("queue");
+    match third.next_timeout(Duration::from_secs(60)) {
+        Ok(Some(Event::Content(_))) => {}
+        other => panic!("the next request did not start: {other:?}"),
+    }
+    drop(unread);
+}

@@ -883,7 +883,10 @@ worker blocks inside its emit callback upstream of every cancellation
 checkpoint, and the generation holds its queue slot indefinitely. (Beside other
 requests the worker no longer waits on a slow reader at all: events queue per
 request and reach the channel without blocking, so only the stalled request
-is held.) When the budget is exceeded the server logs, cancels
+is held. A finished request's undelivered last events never hold up the
+next job either: the idle worker waits for the next job and for room in
+those channels together, so a stalled reader's leftovers wait for its stall
+timer while later requests run.) When the budget is exceeded the server logs, cancels
 that generation, releases the queue slot, and drops the request, leaving the
 engine free for the next client. The default is 30 seconds; a value outside
 10 to 3600 inclusive, or one that is not a whole number of seconds, is refused
@@ -907,7 +910,8 @@ otherwise), and a file download whose client stops reading for
 Both HTTP body pumps share an event-driven backpressure wait. A full channel
 parks the pump thread until capacity becomes available, the receiver closes,
 or the single stall deadline expires. It does not retry every few milliseconds.
-The engine's worker likewise blocks on its request channel when idle; its
+The engine's worker likewise blocks on its request channel when idle (and on
+room in finished requests' channels while they hold events); its
 nonblocking admission checks between GPU steps are active scheduling, not
 idle polling.
 
@@ -1725,7 +1729,12 @@ recurrent layers and the K/V append and attention of the 16 full-attention
 layers. Each request owns its recurrent state, convolution history, K/V caches,
 position and MTP-head caches; one set is resident in the model and the others
 are parked, and a swap exchanges buffer handles, never bytes. Requests join
-between steps and leave when they finish or are cancelled.
+between steps and leave when they finish or are cancelled. A failure that
+belongs to one request ends that request alone: every sequence's caches grow
+for its rows before the step's GPU work, so running out of memory fails that
+sequence; a sequence whose drafting or selection fails leaves the pass or
+commits only its seed row; a failed batched pass ends only the requests whose
+state it wrote, and a request still waiting to prefill keeps its place.
 
 A request alone runs exactly the single-sequence rounds it always ran, with
 speculation; its text and speed are unchanged. Taking speculative rounds in
@@ -1929,7 +1938,15 @@ top twos after each depth and applies each chain's EOS and margin gate, and
 rows whose chain stopped leave the next pass. The first pass also feeds each
 head the rows it missed in batched steps, as K/V-only rows beside the
 drafting rows (a lag too long for one pass is fed first, in K/V-only passes),
-so no sequence is swapped in to draft. A pass costs about 2.1 ms plus 0.5 ms
+so no sequence is swapped in to draft. A sequence that does not draft for a
+long time (eight seeds fill a pass, so eight streams seldom draft) has its
+lag fed the same way before it would pass 512 rows. A lag used to grow until
+4,096 rows and then give the head up for the rest of the request, so a long
+reasoning request lost MTP for good after batching beside others, even once
+it ran alone again (about 38 against 31 tok/s), and its 80 MB of owed hidden
+rows stayed allocated; now the lag buffer stays at 10 MB, and after 552
+batched rows a head caught up this way drafts exactly what a head that
+ingested every row in prefill blocks drafts. A pass costs about 2.1 ms plus 0.5 ms
 per drafting sequence (2.5 ms for one, 4.4 for three, 6.1 for eight, against
 3.0, 8.9 and 23.5 ms for the same chains drafted one sequence at a time,
 `batched_head_draft_timings`), so a full depth-3 round for four sequences
@@ -2054,7 +2071,7 @@ against 2.30 GB for `f088159`.
 Each extra stream costs its own state: 81 MB of F16 recurrent state and
 convolution history, 34 KiB of Q8 K/V per token (initially 1,024 tokens,
 36 MB) plus 4 KiB of head K/V per token, and 20 KiB per batched token of
-hidden rows owed to its MTP head. A verifying step keeps each recurrent
+hidden rows owed to its MTP head (at most 512 rows, 10 MB). A verifying step keeps each recurrent
 layer's raw QKV rows, decay and beta for its rows (about 2 MB per stacked row,
 allocated on first use at the next power of two of the rows, up to 126 MB at
 64 rows) plus one spare state, and batched logits grow to the stacked rows
@@ -2063,8 +2080,10 @@ lengths. Admission shares the context the memory policy sized for one
 sequence: a request joins only while the running requests'
 prompt-plus-`max_tokens` reservations, plus each extra sequence's fixed state
 expressed in K/V tokens (about 2,340), fit in it; otherwise it waits for a
-running request to finish. At most eight decode together, in at most 64
-stacked rows.
+running request to finish. A request whose own prompt and `max_tokens`
+exceed the context fails as soon as it reaches the head of the queue,
+rather than holding the requests behind it until the engine is idle. At most
+eight decode together, in at most 64 stacked rows.
 
 ## Resource policy
 
@@ -2110,6 +2129,20 @@ against "of all entries"), deterministically, the same way on every run.
 
 The suffix store finds a matching generated-token suffix and proposes the
 known continuation. Draft depth adapts to match length and remaining context.
+Each of the last eight requests (at most 131,072 tokens in all) is indexed
+once, every 12-token anchor by a rolling 64-bit hash whose matches are
+confirmed token by token, and shared with every later request, so admitting a
+request indexes only its own prompt. Rebuilding one map of every anchor's
+tokens per admission (twice, counting an empty placeholder) cost 10-19 ms and
+a 2-3 ms drop on the engine thread for 128K remembered tokens and a 30K-token
+prompt, M4 Pro; the shared index costs 0.2 ms for the prompt (1.2 ms the
+first time it indexes the remembered requests) and, from the structures'
+sizes, about 28 bytes per anchor against about 160. 72,000 lookups over
+random token streams with repeats (anchors of 1, 3 and 12) drafted exactly
+what the rebuilt map drafted, and on a real edit (rename a field in 35 quoted
+lines of this repository's Rust, 265 greedy tokens) both builds ran 18 lookup
+rounds proposing 218 drafts and accepting 147 (67.4%), with identical text,
+at 57.06 and 57.31 tok/s best of two (lookup 0.28 and 0.23 µs per token).
 When the optional head is installed, it drafts up to three tokens. A gate
 avoids head work where measured acceptance does not repay its cost.
 
@@ -2185,7 +2218,11 @@ With a greedy sampler and no penalty, the verify block (and a plain decode
 step) also selects each row's argmax in its own command buffer, with the same
 `total_cmp` order and ties to the lower id as the GPU top-k, and flags any
 non-finite logit; the host reads one id per row instead of submitting a top-k
-per row and scanning every logit. Other samplers keep the host path.
+per row and scanning every logit. Every other sampler gets the same
+non-finite flag, and one that draws from the plain top k (no penalty, no
+masking grammar) gets each row's top k from the same command buffer too (see
+[Sampled decoding](#sampled-decoding)); penalties and grammars keep the host
+path.
 
 Drafting stays on the GPU. Each draft step is one submission: the token's
 `token_embd` row is decoded and inverse-rotated on the device
@@ -3227,6 +3264,45 @@ decoded at 105.60 tok/s median with `top_logprobs: 0` and 105.51 with 20
 Against an f64 reference the kernel's log-sum-exp is within 1e-5 relative
 and its top 20 are bit-exact, ties going to the lower id like argmax.
 
+### Sampled decoding
+
+A sampler that is not greedy (the server's defaults are temperature 1.0,
+top-p 0.95 and top-k 20) selects from the GPU's top k of each row. The top-k
+kernels have the log-probability kernels' shape: each group of 4,096 logits
+selects its best k in one dispatch and each row merges its groups' candidates
+in a second, where the former kernels sorted 970 chunks of 256 and merged
+them in ten more dispatches. GPU time per 248,320-logit row, M4 Pro, 50
+selections per command buffer: 170, 177 and 183 µs at k = 1, 20 and 64
+before, 11, 43 and 127 µs after. The candidates are bit-exact against a
+`total_cmp` reference, ties to the lower id, special bit patterns included.
+
+Every block and batched pass that produces logits now selects each row's top
+k in its own command buffer while a sampler draws from the plain top k (no
+presence or repetition penalty, no masking grammar; a batch selects the
+largest k any of its requests uses, and each takes its prefix), and every
+such pass flags non-finite rows with the argmax kernel. Before, each sampled
+row submitted a top-k command buffer of its own and waited for it, and every
+non-greedy pass scanned its logits on the host for non-finite values (1 MB a
+row); head drafting also cloned the request's sampler, about 250 KB of
+seen-token flags (2 MB of candidates at `top_k: 0`), only to ask whether it
+applies penalties. Penalties and grammars keep the submitted top k, whose
+candidates they must see. `tools/benchmark.py --sampled` and
+`tools/serve_concurrency.py --sampled` measure the default settings with a
+fixed seed. M4 Pro, 2026-10-26, back to back under the GPU lock but with
+other builds loading the CPU (load average about 9 of 14), one build before
+and after this change, every sampled output byte-identical between them:
+
+| Default sampling, default speculation | Before | After |
+| --- | ---: | ---: |
+| `bonsai`, planets prompt, 203 tokens, best / median of 3 | 34.89 / 33.83 tok/s | 35.10 / 35.07 tok/s |
+| `serve`, 1 stream, 300 tokens | 32.61 tok/s | 33.05 tok/s |
+| `serve`, 8 streams, 300 tokens each, aggregate | 74.36 tok/s | 76.25 tok/s |
+
+Greedy decoding, which already selected on the device, measured 37.08 and
+37.28 tok/s (`bonsai`), and 35.38 / 74.80 and 35.16 / 73.92 tok/s at one and
+eight streams (`serve`, one run each, inside its run-to-run spread), with
+identical text.
+
 ## Tried and rejected
 
 Entries are measured on the build current when they were tried. Decode rates
@@ -3557,6 +3633,23 @@ their own entry, not with current rates.
   prompt on an M2, so a budget below that abandons healthy non-streaming
   requests. The floor is 10 rather than a rounder number because it sits an
   order of magnitude above the worst gap actually observed.
+- Pipelining greedy plain decode (October 2026): encoding and committing
+  token N+1 before waiting on token N, with the argmax left on the device
+  and `draft_embed_inverse` gathering the next embedding row from it. Not
+  built: the most it can recover is the GPU's idle time between tokens,
+  0.32 ms of a 31.17 ms token in the per-token profile above (1.0%), and it
+  is not free. Plain decode updates recurrent state in place, so the token
+  run past an end of sequence cannot be discarded without a 151 MB state
+  copy per token or a verify-style rollback; left in place, the sequence
+  holds one token more than the request, and the request's closing prompt
+  checkpoint, which needs the state at exactly its tokens, is lost (the GPU
+  tier is cleared). The extra token also costs a whole decode step at the end
+  of every request (0.3% of a 300-token answer), and the scheduler, which
+  admits requests and swaps sequences between steps, would have to drain the
+  token in flight first. A gain under 1% sits inside the 4% spread of
+  `tools/benchmark.py` runs, against a lost prompt checkpoint per request,
+  so it was rejected without a prototype. It would apply only to
+  `--no-speculation` and to models without the MTP head.
 
 ## Verification
 

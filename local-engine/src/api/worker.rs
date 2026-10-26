@@ -4,10 +4,11 @@
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::task::Poll;
 
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
-use super::{ChatJob, Delivered, Engine, Event, EventSplitter, Job, Stats};
+use super::{ChatJob, Delivered, Engine, Event, EventSplitter, Job};
 use crate::GenerateParams;
 use crate::bonsai_model::CancelToken;
 use crate::judgment::{Decision, JudgmentHead, PreparedDecision};
@@ -27,6 +28,27 @@ use crate::tools::ToolSet;
 fn reporter(sender: &async_mpsc::Sender<Delivered>) -> impl FnMut(PrefillProgress) {
     move |progress| {
         let _ = sender.try_send(Delivered::Progress(progress));
+    }
+}
+
+/// Run `future` to completion on this thread, parked until its waker fires.
+/// The worker is a plain thread without a runtime; tokio's channel futures
+/// need none.
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+        std::thread::park();
     }
 }
 
@@ -140,27 +162,17 @@ impl Delivery {
             &mut self.splitter,
             EventSplitter::new(false, None, Vec::new()),
         );
-        let (finished, stop_reason) =
-            splitter.close(output.stop_reason, &mut |event| self.push(event));
-        if let Some(failure) = splitter.take_failure() {
+        let closed = Engine::close_generation(&mut splitter, output, &mut |event| self.push(event));
+        self.splitter = splitter;
+        if let Err(error) = closed {
             // A parse failure is terminal: report it, never `Finished`.
+            let failure = match error {
+                crate::Error::Generation(failure) => failure,
+                other => other.to_string(),
+            };
             self.outbox
                 .push_back(Delivered::Event(Event::Error(failure)));
-            return;
         }
-        let reasoning_tokens =
-            crate::bonsai_tokenizer::answer_start(&output.token_ids, splitter.thinking)
-                .unwrap_or(output.token_ids.len());
-        if finished.is_break() || self.push(Event::TokenIds(output.token_ids)).is_break() {
-            return;
-        }
-        let stats = Stats {
-            stop_reason,
-            cache_source: output.cache_source,
-            reasoning_tokens,
-            generation: output.stats,
-        };
-        let _ = self.push(Event::Finished(Box::new(stats)));
     }
 
     /// Hand queued events to the channel; `wait` blocks for room. Returns
@@ -230,11 +242,7 @@ impl Worker {
     pub(super) fn run(mut self) {
         loop {
             if self.running.is_empty() && self.waiting.is_none() {
-                for mut delivery in std::mem::take(&mut self.draining) {
-                    delivery.flush(true);
-                    delivery.cancel.cancel();
-                }
-                let Some(job) = self.receiver.blocking_recv() else {
+                let Some(job) = self.next_job() else {
                     return;
                 };
                 self.waiting = Self::prepare(job);
@@ -266,6 +274,44 @@ impl Worker {
                 self.activity.stepped(!self.running.is_empty());
             }
             self.flush();
+        }
+    }
+
+    /// Wait, idle, for the next job, handing finished requests' last events
+    /// to their channels as their readers make room. A reader that stopped
+    /// never holds up the next job: the server's stall timer closes its
+    /// channel eventually, which drops what is left. `None` once the queue
+    /// is closed.
+    fn next_job(&mut self) -> Option<Job> {
+        loop {
+            self.flush_draining();
+            if self.draining.is_empty() {
+                return self.receiver.blocking_recv();
+            }
+            let receiver = &mut self.receiver;
+            let mut room = self
+                .draining
+                .iter()
+                .map(|delivery| Box::pin(delivery.events.reserve()))
+                .collect::<Vec<_>>();
+            let woken = block_on(std::future::poll_fn(|context| {
+                if let Poll::Ready(job) = receiver.poll_recv(context) {
+                    return Poll::Ready(Some(job));
+                }
+                // A permit (dropped at once, returning its slot) or a
+                // closed channel: either way the next flush settles it.
+                if room
+                    .iter_mut()
+                    .any(|reserve| reserve.as_mut().poll(context).is_ready())
+                {
+                    return Poll::Ready(None);
+                }
+                Poll::Pending
+            }));
+            drop(room);
+            if let Some(job) = woken {
+                return job;
+            }
         }
     }
 
@@ -309,6 +355,19 @@ impl Worker {
                 }
             };
             if prepared.cancel.is_cancelled() || prepared.events.is_closed() {
+                prepared.cancel.cancel();
+                continue;
+            }
+            // A request that can never fit fails now rather than holding the
+            // queue until the engine is idle.
+            if let Err(error) = self.engine.inner.validate_with_images(
+                &prepared.ids,
+                &prepared.params,
+                prepared.images.as_deref(),
+            ) {
+                let _ = prepared
+                    .events
+                    .try_send(Delivered::Event(Event::Error(error.to_string())));
                 prepared.cancel.cancel();
                 continue;
             }
@@ -409,6 +468,12 @@ impl Worker {
         for delivery in self.running.values_mut() {
             delivery.flush(wait);
         }
+        self.flush_draining();
+    }
+
+    /// Hand finished requests' queued events to their channels without
+    /// waiting, releasing each once nothing is left.
+    fn flush_draining(&mut self) {
         self.draining.retain_mut(|delivery| {
             let left = delivery.flush(false);
             if !left {

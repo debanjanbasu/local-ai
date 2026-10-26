@@ -8,79 +8,6 @@ static inline int total_key(uint bits) {
     return key ^ int(uint(key >> 31) >> 1);
 }
 
-static inline bool better(uint a_bits, uint a_id, uint b_bits, uint b_id) {
-    if (a_id == UINT_MAX) return false;
-    if (b_id == UINT_MAX) return true;
-    const int a_key = total_key(a_bits);
-    const int b_key = total_key(b_bits);
-    return a_key > b_key || (a_key == b_key && a_id < b_id);
-}
-
-kernel void sampling_chunk_topk(
-    device const uint *logit_bits [[buffer(0)]],
-    device TopKCandidate *partial [[buffer(1)]],
-    constant uint &vocab [[buffer(2)]],
-    constant uint &k [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup uint bits[256];
-    threadgroup uint ids[256];
-    const uint id = group * 256 + tid;
-    uint current_id = id < vocab ? id : UINT_MAX;
-    uint current_bits = id < vocab ? logit_bits[id] : 0;
-    ids[tid] = current_id;
-    bits[tid] = current_bits;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Sort each chunk once, rather than performing k full reductions/reloads.
-    for (uint width = 2; width <= 256; width <<= 1) {
-        for (uint stride = width >> 1; stride > 0; stride >>= 1) {
-            const uint other = tid ^ stride;
-            const uint other_bits = bits[other], other_id = ids[other];
-            const bool take_better = ((tid & stride) == 0) == ((tid & width) == 0);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (take_better ? better(other_bits, other_id, current_bits, current_id)
-                            : better(current_bits, current_id, other_bits, other_id)) {
-                current_bits = other_bits;
-                current_id = other_id;
-            }
-            bits[tid] = current_bits;
-            ids[tid] = current_id;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-    if (tid < k) partial[group * k + tid] = TopKCandidate{current_id, as_type<float>(current_bits)};
-}
-
-kernel void sampling_merge_topk(
-    device const TopKCandidate *partial [[buffer(0)]],
-    device TopKCandidate *output [[buffer(1)]],
-    constant uint &groups [[buffer(2)]],
-    constant uint &k [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    if (tid >= 2 * k) return;
-    const bool right = tid >= k;
-    const uint own_list = group * 2 + uint(right);
-    if (own_list >= groups) return;
-    const uint own_rank = tid % k;
-    const TopKCandidate item = partial[own_list * k + own_rank];
-    const uint other_list = group * 2 + uint(!right);
-    uint lo = 0, hi = other_list < groups ? k : 0;
-    // Every candidate finds its merged rank in parallel. Prefer the left list
-    // for identical sentinels, so even padding has unique, deterministic ranks.
-    while (lo < hi) {
-        const uint mid = lo + (hi - lo) / 2;
-        const TopKCandidate other = partial[other_list * k + mid];
-        const bool precedes = better(as_type<uint>(other.logit), other.token_id,
-                                     as_type<uint>(item.logit), item.token_id)
-                              || (right && other.token_id == item.token_id);
-        if (precedes) lo = mid + 1; else hi = mid;
-    }
-    const uint rank = own_rank + lo;
-    if (rank < k) output[group * k + rank] = item;
-}
-
 // Raw log-probabilities of logit rows: each row's log-sum-exp and its `k`
 // best logits (k <= 20), in `f32::total_cmp` order with ties to the lower id,
 // the order of the top-k and greedy kernels. Logits are only read.
@@ -248,6 +175,115 @@ kernel void logprob_rows_final(
         if (own != UINT_MAX && own == id) ids[index] = UINT_MAX;
         if (tid == 0) {
             top_out[row * LOGPROB_MAX_TOP + round] =
+                TopKCandidate{id, as_type<float>(uint(total_key(uint(key))))};
+        }
+    }
+}
+
+// Top-k of logit rows (k <= 64), in `f32::total_cmp` order with ties to the
+// lower id and every logit's exact bits: the two-dispatch shape of the
+// log-probability kernels above, without the log-sum-exp.
+//
+// Stage 1, grid (groups, rows), 256 threads: group x of row y selects the
+// best k of its 4096 logits, one round per rank.
+// Stage 2, grid (rows), 256 threads: row y merges its groups' candidates
+// (at most 64 groups of 64, 16 per thread) into the row's top k.
+
+constant constexpr uint TOPK_GROUP = 4096;
+constant constexpr uint TOPK_PER_THREAD = TOPK_GROUP / 256;
+constant constexpr uint TOPK_MAX = 64;
+constant constexpr uint TOPK_FINAL_PER_THREAD = 16;
+
+kernel void topk_rows_partial(
+    device const uint *logit_bits [[buffer(0)]],
+    device TopKCandidate *partial [[buffer(1)]],
+    constant uint &vocab [[buffer(2)]],
+    constant uint &k [[buffer(3)]],
+    constant uint &row_stride [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 groups [[threadgroups_per_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup int shared_keys[8];
+    threadgroup uint shared_ids[8];
+    device const uint *row = logit_bits + ulong(group.y) * row_stride;
+    const uint base = group.x * TOPK_GROUP + tid;
+    int keys[TOPK_PER_THREAD];
+    uint valid = 0;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < TOPK_PER_THREAD; ++i) {
+        const uint id = base + i * 256;
+        const bool inside = id < vocab;
+        keys[i] = inside ? total_key(row[id]) : INT_MIN;
+        valid |= uint(inside) << i;
+    }
+    const uint slot = group.y * groups.x + group.x;
+    for (uint round = 0; round < k; ++round) {
+        int key = INT_MIN;
+        uint id = UINT_MAX;
+        uint index = 0;
+        // Ascending index is ascending id, so strict > keeps the lowest id.
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < TOPK_PER_THREAD; ++i) {
+            if ((valid & (1u << i)) && (id == UINT_MAX || keys[i] > key)) {
+                key = keys[i];
+                id = base + i * 256;
+                index = i;
+            }
+        }
+        const uint own = id;
+        best_group(key, id, shared_keys, shared_ids, lane, simd);
+        if (own != UINT_MAX && own == id) valid &= ~(1u << index);
+        if (tid == 0) {
+            partial[slot * TOPK_MAX + round] =
+                TopKCandidate{id, as_type<float>(uint(total_key(uint(key))))};
+        }
+    }
+}
+
+kernel void topk_rows_final(
+    device const TopKCandidate *partial [[buffer(0)]],
+    device TopKCandidate *top_out [[buffer(1)]],
+    constant uint &groups [[buffer(2)]],
+    constant uint &k [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup int shared_keys[8];
+    threadgroup uint shared_ids[8];
+    int keys[TOPK_FINAL_PER_THREAD];
+    uint ids[TOPK_FINAL_PER_THREAD];
+    const uint candidates = groups * k;
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < TOPK_FINAL_PER_THREAD; ++j) {
+        const uint c = tid + j * 256;
+        ids[j] = UINT_MAX;
+        keys[j] = INT_MIN;
+        if (c < candidates) {
+            const TopKCandidate item = partial[(row * groups + c / k) * TOPK_MAX + c % k];
+            ids[j] = item.token_id;
+            keys[j] = total_key(as_type<uint>(item.logit));
+        }
+    }
+    for (uint round = 0; round < k; ++round) {
+        int key = INT_MIN;
+        uint id = UINT_MAX;
+        uint index = 0;
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < TOPK_FINAL_PER_THREAD; ++j) {
+            if (key_better(keys[j], ids[j], key, id)) {
+                key = keys[j];
+                id = ids[j];
+                index = j;
+            }
+        }
+        const uint own = id;
+        best_group(key, id, shared_keys, shared_ids, lane, simd);
+        if (own != UINT_MAX && own == id) ids[index] = UINT_MAX;
+        if (tid == 0) {
+            top_out[row * TOPK_MAX + round] =
                 TopKCandidate{id, as_type<float>(uint(total_key(uint(key))))};
         }
     }

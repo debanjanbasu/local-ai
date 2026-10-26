@@ -74,6 +74,57 @@ fn seeded_gpu_sampling_preserves_penalties_filters_ties_and_cpu_fallbacks() {
     }
 }
 
+/// Drawing from a block's precomputed top k selects exactly what a top-k
+/// submission of its own selects, for every sampler that may use it, and a
+/// sampler with penalties ignores it.
+#[test]
+fn precomputed_top_k_selects_what_a_submission_selects() {
+    let Some(context) = gpu_or_skip() else {
+        return;
+    };
+    let shaders = ShaderLibrary::new(context.device()).expect("shaders");
+    let vocab = 248_320;
+    let topk = GpuTopK::new(&context, &shaders, vocab).expect("top-k");
+    let rows = local_metal::sampling::TopKRows::new(&context, &shaders, vocab, 1).expect("rows");
+    for (k, temperature, presence_penalty, repetition_penalty) in [
+        (20, 1.0, 0.0, 1.0),
+        (64, 0.7, 0.0, 1.0),
+        (5, 1.3, 0.0, 1.0),
+        (20, 1.0, 0.5, 1.1),
+    ] {
+        let config = SamplingParams {
+            top_k: k,
+            temperature,
+            presence_penalty,
+            repetition_penalty,
+            ..params()
+        };
+        let mut reference = Sampler::new(vocab, config.clone());
+        let mut device = Sampler::new(vocab, config);
+        assert_eq!(device.device_top_k().is_some(), presence_penalty == 0.0);
+        for step in 0..8 {
+            let original = (0..vocab)
+                .map(|i| ((i * 173 + step * 13) % 7_919) as f32 / 613.0 - 3.0)
+                .collect::<Vec<_>>();
+            let mut a = MetalBuffer::from_slice(context.device(), &original).expect("logits");
+            let mut b = MetalBuffer::from_slice(context.device(), &original).expect("logits");
+            let mut batch = CommandBatch::new(&context).expect("batch");
+            rows.encode(&mut batch, &b, 1, 64).expect("encode");
+            batch.commit_and_wait().expect("wait");
+            let top = rows.row(0, 64);
+            let expected = reference
+                .select_row(&mut a, 0, &context, &topk, None, None, None)
+                .expect("submitted");
+            let actual = device
+                .select_row(&mut b, 0, &context, &topk, None, Some(&top), None)
+                .expect("precomputed");
+            assert_eq!(actual, expected, "k={k} step={step}");
+            reference.observe(&[expected.token_id]);
+            device.observe(&[actual.token_id]);
+        }
+    }
+}
+
 #[test]
 fn draft_margin_is_the_penalized_lead_over_the_runner_up_on_gpu_and_cpu() {
     let Some(context) = gpu_or_skip() else {
@@ -287,10 +338,10 @@ fn recorded_logprobs_are_raw_and_leave_selection_unchanged() {
             batch.commit_and_wait().expect("wait");
             let distribution = gpu_distribution.then(|| (rows.log_sum_exp(0), rows.top(0, 3)));
             let expected = plain
-                .select_row(&mut a, 0, &context, &topk, None, None)
+                .select_row(&mut a, 0, &context, &topk, None, None, None)
                 .expect("plain");
             let actual = recorded
-                .select_row(&mut b, 0, &context, &topk, None, distribution)
+                .select_row(&mut b, 0, &context, &topk, None, None, distribution)
                 .expect("recorded");
             assert_eq!(actual, expected, "temperature={temperature} step={step}");
             assert_eq!(plain.take_logprob(), None);

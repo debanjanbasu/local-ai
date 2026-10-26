@@ -41,8 +41,17 @@ pub use heads::HeadDraft;
 pub const MAX_BATCH_SEQUENCES: usize = 8;
 
 /// Most decoded rows a sequence may owe its MTP head before it gives the head
-/// up for the rest of its generation (20 KiB of hidden per row).
+/// up for the rest of its generation (20 KiB of hidden per row). A batched
+/// pass catches a lag up first once it would pass [`HEAD_LAG_CATCH_UP`], so
+/// this is reached only when a catch-up cannot run.
 const MAX_HEAD_LAG: usize = 4096;
+
+/// Rows a sequence may owe its MTP head before a batched pass feeds them to
+/// it, in K/V-only head passes: a long generation among several streams that
+/// never draft (eight seeds fill a pass) keeps its head, and its lag buffer
+/// stays at 10 MB. One catch-up of 512 rows costs a few head passes every
+/// 512 steps.
+const HEAD_LAG_CATCH_UP: usize = 512;
 
 static NEXT_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -381,6 +390,7 @@ impl BonsaiModel {
         }
         self.selection = Selection::None;
         self.distributions.described = Described::None;
+        self.candidates.described = Described::None;
         Ok(())
     }
 
@@ -417,6 +427,24 @@ impl BonsaiModel {
         }
         state.kv_allocated = target;
         Ok(())
+    }
+
+    /// Grow a batched sequence's caches (`state`, `None` for the resident
+    /// sequence) for `rows` more rows, as [`Self::decode_batch_prefilling`]
+    /// would, so a caller can do it before any GPU work and fail only that
+    /// sequence when it cannot.
+    pub(crate) fn reserve_sequence(
+        &mut self,
+        state: Option<&mut SequenceState>,
+        rows: usize,
+    ) -> crate::Result<()> {
+        match state {
+            Some(state) => {
+                let end = state.position + rows;
+                self.reserve_parked(state, end)
+            }
+            None => self.reserve_kv(self.position + rows, None),
+        }
     }
 
     /// [`Self::decode_batch_prefilling`] without a prompt chunk.
@@ -517,6 +545,9 @@ impl BonsaiModel {
         if self.scratch.attention.max_context() < longest as u32 {
             self.scratch.attention = AttentionWorkspace::new(&self.context, longest as u32)?;
         }
+        if self.speculation.is_some() {
+            self.catch_up_lags(rows)?;
+        }
         let lag_offsets = rows
             .iter_mut()
             .map(|row| {
@@ -528,8 +559,12 @@ impl BonsaiModel {
             .collect::<Vec<_>>();
         self.selection = Selection::None;
         self.distributions.described = Described::None;
+        self.candidates.described = Described::None;
         if self.logprobs.is_some() {
             self.distributions.reserve(&self.context, decoded)?;
+        }
+        if self.top_k.is_some() {
+            self.candidates.reserve(&self.context, decoded)?;
         }
         let tokens = rows
             .iter()
@@ -615,9 +650,13 @@ impl BonsaiModel {
             &output.logits,
             decoded as u32,
         )?;
+        // The argmax kernel also flags non-finite rows, so the host never
+        // scans the logits; its selection is used only for greedy samplers.
         let selected = self.device_greedy;
-        if selected {
-            output.greedy.encode(&mut batch, &output.logits, decoded)?;
+        output.greedy.encode(&mut batch, &output.logits, decoded)?;
+        if let Some(k) = self.top_k {
+            self.candidates
+                .encode(&mut batch, &output.logits, decoded, k)?;
         }
         if let Some(top) = self.logprobs {
             self.distributions
@@ -676,22 +715,16 @@ impl BonsaiModel {
             self.distributions.described = Described::Batch;
             self.distributions.top = top;
         }
+        if let Some(k) = self.top_k {
+            self.candidates.described = Described::Batch;
+            self.candidates.k = k;
+        }
         output.starts = spans[..count].iter().map(|&(start, _)| start).collect();
-        let nonfinite = if selected {
-            output
-                .greedy
-                .results(decoded)
-                .iter()
-                .any(|result| result.nonfinite != 0)
-        } else {
-            // SAFETY: the batch above has completed and nothing writes the
-            // logits while they are scanned.
-            unsafe {
-                output.logits.as_slice::<f32>()[..decoded * VOCAB]
-                    .iter()
-                    .any(|value| !value.is_finite())
-            }
-        };
+        let nonfinite = output
+            .greedy
+            .results(decoded)
+            .iter()
+            .any(|result| result.nonfinite != 0);
         if nonfinite {
             return Err(crate::Error::Generation("non-finite Bonsai logits".into()));
         }
@@ -778,12 +811,14 @@ impl BonsaiModel {
         let distribution = sampler
             .logprobs()
             .and_then(|top| self.distributions.row(Described::Batch, row, top));
+        let top_k = self.candidates.row(Described::Batch, row);
         sampler.select_row(
             &mut output.logits,
             row * VOCAB * size_of::<f32>(),
             &self.context,
             &self.sampling,
             argmax,
+            top_k.as_deref(),
             distribution,
         )
     }
@@ -965,11 +1000,10 @@ impl BonsaiModel {
                 return Ok(Vec::new());
             }
             self.reserve_kv(self.position + depth + 1, Some(&mut speculation))?;
-            let mut draft_sampler = sampler.greedy_draft();
-            let drafts = if draft_sampler.applies_penalties() {
+            let drafts = if sampler.applies_penalties() {
                 self.draft_on_host(
                     &mut speculation,
-                    &mut draft_sampler,
+                    &mut sampler.greedy_draft(),
                     seed,
                     depth,
                     super::DRAFT_CHAIN_MIN_MARGIN,
@@ -977,7 +1011,7 @@ impl BonsaiModel {
             } else {
                 self.draft_on_device(
                     &mut speculation,
-                    &draft_sampler,
+                    sampler,
                     seed,
                     depth,
                     super::DRAFT_CHAIN_MIN_MARGIN,

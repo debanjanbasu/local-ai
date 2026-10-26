@@ -22,7 +22,7 @@ use local_metal::bonsai_ops::{
 use local_metal::buffer::MetalBuffer;
 use local_metal::context::{DeviceCaps, MetalContext};
 use local_metal::draft::GreedyRows;
-use local_metal::sampling::{GpuTopK, LogprobRows, TopKCandidate};
+use local_metal::sampling::{GpuTopK, LogprobRows, TopKCandidate, TopKRows};
 use local_metal::shaders::ShaderLibrary;
 
 use crate::bonsai::{
@@ -654,6 +654,60 @@ impl Distributions {
     }
 }
 
+/// The best logits of each logit row the last block or batched step
+/// produced, selected in its own command buffer while a sampler draws from
+/// the plain top k ([`BonsaiModel::set_device_top_k`]): the host then reads
+/// its candidates instead of submitting a selection per row. The workspace is
+/// made on first use.
+struct Candidates {
+    rows: Option<TopKRows>,
+    described: Described,
+    /// Candidates each described row holds.
+    k: usize,
+}
+
+impl Candidates {
+    /// Make room for the candidates of `rows` rows.
+    fn reserve(&mut self, context: &MetalContext, rows: usize) -> crate::Result<()> {
+        if self
+            .rows
+            .as_ref()
+            .is_none_or(|workspace| workspace.max_rows() < rows)
+        {
+            let shaders = ShaderLibrary::new(context.device())?;
+            self.rows = Some(TopKRows::new(
+                context,
+                &shaders,
+                VOCAB,
+                rows.max(batch::MAX_BATCH_ROWS),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Encode the best `k` of the first `rows` rows of `logits`, after
+    /// [`Self::reserve`]; the caller records what they describe.
+    fn encode(
+        &self,
+        batch: &mut CommandBatch,
+        logits: &MetalBuffer,
+        rows: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        self.rows
+            .as_ref()
+            .ok_or_else(|| crate::Error::InvalidArgument("no top-k workspace".into()))?
+            .encode(batch, logits, rows, k)
+            .map_err(Into::into)
+    }
+
+    /// Row `row` of `logits`'s candidates, when they describe it.
+    fn row(&self, logits: Described, row: usize) -> Option<Vec<TopKCandidate>> {
+        let workspace = self.rows.as_ref()?;
+        (self.described == logits && row < workspace.max_rows()).then(|| workspace.row(row, self.k))
+    }
+}
+
 /// The loaded native graph plus its per-request state.
 pub struct BonsaiModel {
     context: MetalContext,
@@ -686,6 +740,9 @@ pub struct BonsaiModel {
     /// Alternatives per row while the request asks for log-probabilities.
     logprobs: Option<usize>,
     distributions: Distributions,
+    /// Candidates per row while a sampler draws from the plain top k.
+    top_k: Option<usize>,
+    candidates: Candidates,
     epsilon: f32,
     rope_base: f32,
     position: usize,
@@ -875,6 +932,12 @@ impl BonsaiModel {
                 rows: None,
                 described: Described::None,
                 top: 0,
+            },
+            top_k: None,
+            candidates: Candidates {
+                rows: None,
+                described: Described::None,
+                k: 0,
             },
             epsilon: package.metadata_f32("qwen35.attention.layer_norm_rms_epsilon")?,
             rope_base: package.metadata_f32("qwen35.rope.freq_base")?,
@@ -1392,9 +1455,17 @@ impl BonsaiModel {
         self.logprobs = top;
     }
 
+    /// Select the best `k` logits of each produced logit row inside the
+    /// block's own command buffer from now on, for samplers that draw from
+    /// the plain top k ([`Sampler::device_top_k`]); `None` stops.
+    pub(crate) const fn set_device_top_k(&mut self, k: Option<usize>) {
+        self.top_k = k;
+    }
+
     /// Sample from the logits of the newest committed token on the GPU.
     pub(crate) fn sample(&mut self, sampler: &mut Sampler) -> crate::Result<SamplingResult> {
         let argmax = (self.selection == Selection::Last).then(|| self.greedy.results(1)[0].best_id);
+        let top_k = self.candidates.row(Described::Last, 0);
         let distribution = sampler
             .logprobs()
             .and_then(|top| self.distributions.row(Described::Last, 0, top));
@@ -1404,6 +1475,7 @@ impl BonsaiModel {
             &self.context,
             &self.sampling,
             argmax,
+            top_k.as_deref(),
             distribution,
         )
     }
@@ -1425,12 +1497,14 @@ impl BonsaiModel {
             let distribution = sampler
                 .logprobs()
                 .and_then(|top| self.distributions.row(Described::Rows(rows), row, top));
+            let top_k = self.candidates.row(Described::Rows(rows), row);
             sampler.select_row(
                 logits,
                 row * VOCAB * size_of::<f32>(),
                 &self.context,
                 &self.sampling,
                 selected.as_ref().map(|results| results[row].best_id),
+                top_k.as_deref(),
                 distribution,
             )
         })
