@@ -314,7 +314,15 @@ pub struct BonsaiOps {
 impl BonsaiOps {
     pub fn new(context: &MetalContext, shaders: &ShaderLibrary) -> crate::Result<Self> {
         Self::new_with_attention_kernel(context, shaders, AttentionKernel::TensorF32).or_else(
-            |_| Self::new_with_attention_kernel(context, shaders, AttentionKernel::SimdF32),
+            |error| {
+                // Older SDKs omit the tensor kernels; unsupported devices
+                // reject their pipelines.
+                eprintln!(
+                    "metal: tensor attention kernels unavailable, using the slower SIMD \
+                     kernels: {error}"
+                );
+                Self::new_with_attention_kernel(context, shaders, AttentionKernel::SimdF32)
+            },
         )
     }
 

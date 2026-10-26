@@ -2895,6 +2895,11 @@ run the same kernels as before: six prompts, 300 greedy tokens, plain decode
 30.52 against 30.39 tok/s geomean and speculative 38.02 against 38.12, text
 byte-identical in both modes (the six chat prompts are 27-45 tokens).
 
+If the SDK lacks the tensor kernels or the device rejects their attention
+pipelines, startup prints the reason to stderr (`metal: tensor attention
+kernels unavailable, ...`) and continues on the slower SIMD kernels, which
+the policy's `attention_kernel: simd_f32` also shows.
+
 Prefill blocks then grew from 128 to 512 rows (`PREFILL_CHUNK`,
 `MAX_PREFILL_TOKENS`). Rows are independent in every projection and attention
 kernel (attention walks absolute 32-key tiles and groups rows from the block's
