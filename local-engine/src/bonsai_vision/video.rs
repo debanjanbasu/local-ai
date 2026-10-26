@@ -285,7 +285,7 @@ pub fn prepare_video(bytes: &[u8]) -> crate::Result<Arc<PreparedVideo>> {
         },
         |frame| {
             let (height, width) = size.get();
-            frames.push(resize_bicubic(&frame, height, width));
+            frames.push(resize_bicubic(frame, height, width));
             Ok(())
         },
     )?;
@@ -357,8 +357,8 @@ fn container_suffix(bytes: &[u8]) -> crate::Result<&'static str> {
 /// `AVFoundation` decoding.
 ///
 /// [`decode::decode`] probes the track, lets its caller choose the frame
-/// indices (ascending), and hands each selected frame, at its source size,
-/// over in order. A video whose decoder yields fewer frames than probed
+/// indices (ascending), and lends each selected frame, at its source size,
+/// in order. A video whose decoder yields fewer frames than probed
 /// repeats its last decoded frame for the rest.
 #[allow(unsafe_code)]
 pub mod decode {
@@ -542,7 +542,7 @@ pub mod decode {
     pub fn decode(
         bytes: &[u8],
         select: impl FnOnce(&Probe) -> crate::Result<Vec<usize>>,
-        mut frame: impl FnMut(RgbImage) -> crate::Result<()>,
+        mut frame: impl FnMut(&RgbImage) -> crate::Result<()>,
     ) -> crate::Result<Probe> {
         let suffix = container_suffix(bytes)?;
         let mut file = tempfile::Builder::new()
@@ -612,7 +612,7 @@ pub mod decode {
                     Next::Frame(image) => {
                         while wanted.peek() == Some(&index) {
                             wanted.next();
-                            frame(image.clone())?;
+                            frame(&image)?;
                         }
                         last = Some(image);
                         index += 1;
@@ -624,7 +624,7 @@ pub mod decode {
             finished(&reader).or_else(|error| if last.is_some() { Ok(()) } else { Err(error) })?;
             let last = last.ok_or_else(|| invalid("the video decoded to no frames"))?;
             for _ in wanted {
-                frame(last.clone())?;
+                frame(&last)?;
             }
             Ok(probe)
         })
@@ -700,7 +700,7 @@ pub fn decode_sampled(bytes: &[u8]) -> crate::Result<(Probe, Vec<usize>, Vec<Rgb
             Ok(sampled.clone())
         },
         |frame| {
-            frames.push(frame);
+            frames.push(frame.clone());
             Ok(())
         },
     )?;

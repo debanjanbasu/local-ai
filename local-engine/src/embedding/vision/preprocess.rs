@@ -325,7 +325,8 @@ fn convolve(sum: i64, precision: u32) -> u8 {
 /// `F.interpolate(..., mode="bicubic", antialias=True)` on `uint8`).
 #[must_use]
 pub fn resize_bicubic(image: &RgbImage, height: usize, width: usize) -> RgbImage {
-    let mut current = image.clone();
+    // The source is only read: the first pass borrows it.
+    let mut current = std::borrow::Cow::Borrowed(image);
     if width != current.width {
         let w = axis_weights(current.width, width);
         let mut out = vec![0_u8; current.height * width * 3];
@@ -343,11 +344,11 @@ pub fn resize_bicubic(image: &RgbImage, height: usize, width: usize) -> RgbImage
                 }
             }
         }
-        current = RgbImage {
+        current = std::borrow::Cow::Owned(RgbImage {
             width,
             height: current.height,
             pixels: out,
-        };
+        });
     }
     if height != current.height {
         let w = axis_weights(current.height, height);
@@ -366,13 +367,13 @@ pub fn resize_bicubic(image: &RgbImage, height: usize, width: usize) -> RgbImage
                 out[y * row + i] = convolve(sum, w.precision);
             }
         }
-        current = RgbImage {
+        current = std::borrow::Cow::Owned(RgbImage {
             width: current.width,
             height,
             pixels: out,
-        };
+        });
     }
-    current
+    current.into_owned()
 }
 
 /// Resize (if needed), rescale and patchify one image for a budget of
