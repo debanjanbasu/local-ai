@@ -18,9 +18,15 @@ axum = { version = "0.8", default-features = false, features = ["http1", "http2"
 base64 = "0.22"
 half.workspace = true
 bytes = "1"
+http-body = "1"
 http-body-util = "0.1"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
+# Already in the lock through axum; used directly to serve connections with a
+# timer, so hyper's HTTP/1 header-read timeout applies (see serve/connection.rs).
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+tower-service = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "fs", "io-util", "time"] }

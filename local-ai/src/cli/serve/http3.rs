@@ -1,10 +1,11 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use http_body_util::BodyExt;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -50,8 +51,15 @@ pub(super) async fn serve_h3(
             let Ok(connection) = incoming.await else {
                 return;
             };
-            let Ok(mut connection) =
-                h3::server::Connection::new(h3_quinn::Connection::new(connection)).await
+            // Kept to notice the client going away while a request is still
+            // being answered, when nothing is being written to it.
+            let quic = connection.clone();
+            // The header block a request may carry, like the TCP listener's
+            // bounded header buffer; h3's default is unlimited.
+            let Ok(mut connection) = h3::server::builder()
+                .max_field_section_size(MAX_FIELD_SECTION_BYTES)
+                .build(h3_quinn::Connection::new(connection))
+                .await
             else {
                 return;
             };
@@ -60,57 +68,149 @@ pub(super) async fn serve_h3(
                     break;
                 };
                 let state = state.clone();
-                tokio::spawn(async move {
-                    let Ok((request, stream)) = resolver.resolve_request().await else {
-                        return;
-                    };
-                    let (parts, ()) = request.into_parts();
-                    let (mut stream, mut input) = stream.split();
-                    let (sender, receiver) = tokio::sync::mpsc::channel(4);
-                    let receiving = tokio::spawn(async move {
-                        loop {
-                            let data = match input.recv_data().await {
-                                Ok(Some(mut chunk)) => {
-                                    let size = chunk.remaining();
-                                    Ok(chunk.copy_to_bytes(size))
-                                }
-                                Ok(None) => break,
-                                Err(error) => Err(std::io::Error::other(error.to_string())),
-                            };
-                            let failed = data.is_err();
-                            if sender.send(data).await.is_err() || failed {
-                                input.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-                                break;
-                            }
-                        }
-                    });
-                    // The authenticated route enforces its own bounded JSON or
-                    // multipart limit, identically to HTTP/1 and HTTP/2.
-                    let request = Request::from_parts(
-                        parts,
-                        Body::from_stream(ReceiverStream::new(receiver)),
-                    );
-                    let response = route(State(state), request).await;
-                    receiving.abort();
-                    let (parts, mut body) = response.into_parts();
-                    if stream
-                        .send_response(axum::http::Response::from_parts(parts, ()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    while let Some(Ok(frame)) = body.frame().await {
-                        if let Ok(data) = frame.into_data()
-                            && stream.send_data(data).await.is_err()
-                        {
-                            return;
-                        }
-                    }
-                    let _ = stream.finish().await;
-                });
+                let quic = quic.clone();
+                tokio::spawn(answer(resolver, state, quic));
             }
         });
     }
     Ok(())
+}
+
+/// Answer one HTTP/3 request on `quic`.
+async fn answer(
+    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+    state: AppState,
+    quic: quinn::Connection,
+) {
+    let Ok((request, stream)) = resolver.resolve_request().await else {
+        return;
+    };
+    let (parts, ()) = request.into_parts();
+    let (mut stream, mut input) = stream.split();
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let receiving = tokio::spawn(async move {
+        loop {
+            let data = match input.recv_data().await {
+                Ok(Some(mut chunk)) => {
+                    let size = chunk.remaining();
+                    Ok(chunk.copy_to_bytes(size))
+                }
+                Ok(None) => break,
+                Err(error) => Err(std::io::Error::other(error.to_string())),
+            };
+            let failed = data.is_err();
+            if sender.send(data).await.is_err() || failed {
+                input.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+                break;
+            }
+        }
+    });
+    // The authenticated route enforces its own bounded JSON or multipart
+    // limit, identically to HTTP/1 and HTTP/2.
+    let request = Request::from_parts(parts, Body::from_stream(ReceiverStream::new(receiver)));
+    // A vanished client drops the request: its handler, and with it any
+    // generation it started, is cancelled.
+    let response = tokio::select! {
+        response = route(State(state), request) => response,
+        _ = quic.closed() => {
+            receiving.abort();
+            return;
+        }
+    };
+    receiving.abort();
+    let (parts, mut body) = response.into_parts();
+    if stream
+        .send_response(axum::http::Response::from_parts(parts, ()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let ended = tokio::select! {
+        ended = forward(&mut body, &mut stream) => ended,
+        _ = quic.closed() => Ended::Gone,
+    };
+    match ended {
+        Ended::Complete => {
+            let _ = stream.finish().await;
+        }
+        // A body that failed partway (a speech stream whose synthesis
+        // failed) is reset, never finished, so the client cannot take the
+        // truncated body for whole.
+        Ended::Failed => stream.stop_stream(h3::error::Code::H3_INTERNAL_ERROR),
+        Ended::Gone => {}
+    }
+}
+
+/// Largest request header block accepted over HTTP/3: 64 KiB.
+const MAX_FIELD_SECTION_BYTES: u64 = 64 << 10;
+
+/// How a response body ended on its stream.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// Every frame was sent.
+    Complete,
+    /// The body failed partway.
+    Failed,
+    /// The client is gone.
+    Gone,
+}
+
+/// Where response data goes: the HTTP/3 request stream.
+trait Sink {
+    /// Send `data`, `false` once the client is gone.
+    fn send(&mut self, data: Bytes) -> impl Future<Output = bool> + Send;
+}
+
+impl Sink for h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes> {
+    async fn send(&mut self, data: Bytes) -> bool {
+        self.send_data(data).await.is_ok()
+    }
+}
+
+/// Send `body`'s data to `sink` until it ends, fails or the client leaves.
+async fn forward(body: &mut Body, sink: &mut impl Sink) -> Ended {
+    loop {
+        match body.frame().await {
+            None => return Ended::Complete,
+            Some(Err(_)) => return Ended::Failed,
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data()
+                    && !sink.send(data).await
+                {
+                    return Ended::Gone;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+
+    use super::{Body, Bytes, Ended, Sink, forward};
+
+    impl Sink for Vec<Bytes> {
+        fn send(&mut self, data: Bytes) -> impl Future<Output = bool> + Send {
+            self.push(data);
+            std::future::ready(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_that_fails_partway_is_not_reported_complete() {
+        let frames = [
+            Ok(Bytes::from_static(b"RIFF")),
+            Err(std::io::Error::other("synthesis failed")),
+        ];
+        let mut failing = Body::from_stream(tokio_stream::iter(frames));
+        let mut sent = Vec::new();
+        assert_eq!(forward(&mut failing, &mut sent).await, Ended::Failed);
+        assert_eq!(sent, [Bytes::from_static(b"RIFF")]);
+        let mut whole = Body::from("RIFF....");
+        let mut sent = Vec::new();
+        assert_eq!(forward(&mut whole, &mut sent).await, Ended::Complete);
+        assert_eq!(sent, [Bytes::from_static(b"RIFF....")]);
+    }
 }

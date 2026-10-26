@@ -147,7 +147,7 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
             response
         }
         Reply::Content(download) => {
-            let mut response = download.into_response();
+            let mut response = download.into_response(state.stall);
             add_alt_svc(&mut response, state);
             response
         }
@@ -653,19 +653,40 @@ pub(super) struct Download {
 
 impl Download {
     /// The raw bytes, streamed without buffering or compression.
-    pub(super) fn into_response(self) -> Response {
+    ///
+    /// A task reads the file into a one-chunk channel and holds the download
+    /// slot. A client that stops reading for `stall` (`--stall-timeout`) is
+    /// dropped: the task ends and releases the slot, and the body stops short
+    /// of its `Content-Length`, so the client cannot take it for complete.
+    pub(super) fn into_response(self, stall: std::time::Duration) -> Response {
         let Self {
             bytes,
             file,
             permit,
         } = self;
-        let stream =
-            ReaderStream::with_capacity(tokio::fs::File::from_std(file), DOWNLOAD_CHUNK_BYTES).map(
-                move |chunk| {
-                    let _slot = &permit;
-                    chunk
-                },
-            );
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let _slot = permit;
+            let mut chunks =
+                ReaderStream::with_capacity(tokio::fs::File::from_std(file), DOWNLOAD_CHUNK_BYTES);
+            while let Some(chunk) = chunks.next().await {
+                let failed = chunk.is_err();
+                match tokio::time::timeout(stall, sender.send(chunk)).await {
+                    Ok(Ok(())) if !failed => {}
+                    // The read failed (and the client was told), or the
+                    // client went away.
+                    Ok(_) => return,
+                    Err(_) => {
+                        eprintln!(
+                            "dropping a file download: the client stopped reading for {} s",
+                            stall.as_secs()
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+        let stream = tokio_stream::wrappers::ReceiverStream::new(receiver);
         let mut response = Response::new(Body::from_stream(stream));
         let headers = response.headers_mut();
         headers.insert(

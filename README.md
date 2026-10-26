@@ -47,7 +47,11 @@ A client that stops reading its
 socket without closing it is invisible to TCP, so `serve`
 takes `--stall-timeout SECONDS` (default 30, accepted 10 to 3600) to bound how
 long a generation may go undelivered before it is cancelled and the engine
-released; the budgets, measurements and limits are in
+released. The same budget bounds what clients send: a request body must
+deliver 64 KiB (or end) in every budget, HTTP/1 headers must arrive within
+30 s, and a connection that sends no request in 30 s is closed. On SIGINT or
+SIGTERM, foreground requests get 10 s to finish before their generations are
+cancelled. The budgets, measurements and limits are in
 [docs/BONSAI.md](docs/BONSAI.md#server-api).
 
 Responses are stored by default, as on OpenAI, in
@@ -123,10 +127,10 @@ expired bytes are purged at startup. The same crate offers native repository sea
 
 Authentication is off by default: on `127.0.0.1` any local process may use
 the server (and `serve` warns when bound elsewhere without it). Web pages a
-local browser opens may not: requests addressed to a non-loopback host name
-(DNS rebinding) and cross-site browser requests are refused with `403`;
-pages on loopback hosts and local apps are admitted, and `--allow-origin`
-admits more. CLIs and SDKs send none of the headers involved and are never
+local browser opens may not: requests addressed to a host name that is not
+local (DNS rebinding; `--allow-host` admits more names) and cross-site
+browser requests are refused with `403`; pages on loopback hosts and local
+apps are admitted, and `--allow-origin` admits more. CLIs and SDKs send none of the headers involved and are never
 affected; see [docs/ADMIN.md](docs/ADMIN.md#browsers). `local-ai admin
 create-key` creates the first admin API key, prints it once, and turns
 authentication on: every request then needs `Authorization: Bearer <key>`.

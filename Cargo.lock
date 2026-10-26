@@ -1705,7 +1705,10 @@ dependencies = [
  "h3",
  "h3-quinn",
  "half",
+ "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "jsonschema",
  "local-engine",
  "local-services",
@@ -1719,6 +1722,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "zstd",
 ]
 

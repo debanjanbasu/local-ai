@@ -181,6 +181,27 @@ fn set_once(slot: &mut Option<String>, name: &str, value: String) -> Result<(), 
     Ok(())
 }
 
+/// [`read_form`], failing with `408` unless the whole form arrives within
+/// `deadline`.
+async fn read_form_within(
+    parts: &Parts,
+    body: Body,
+    task: Task,
+    deadline: Duration,
+) -> Result<RawForm, Failure> {
+    tokio::time::timeout(deadline, read_form(parts, body, task))
+        .await
+        .unwrap_or_else(|_| {
+            Err((
+                StatusCode::REQUEST_TIMEOUT,
+                format!(
+                    "the form did not arrive within {} s (--stall-timeout)",
+                    deadline.as_secs()
+                ),
+            ))
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn read_form(parts: &Parts, body: Body, task: Task) -> Result<RawForm, Failure> {
     let content_type = parts
@@ -633,10 +654,14 @@ pub(super) async fn handle(
     } else {
         Task::Transcribe
     };
+    // The slot bounds the forms held in memory (each up to 25 MiB), so it is
+    // taken first, and the form must then arrive within the stall budget: a
+    // client trickling its upload loses the slot instead of holding one of
+    // the few there are.
     let Ok(permit) = Arc::clone(&service.slots).try_acquire_owned() else {
         return busy(state, headers).await;
     };
-    let form = match read_form(parts, body, task)
+    let form = match read_form_within(parts, body, task, state.stall)
         .await
         .and_then(|raw| validate(raw, task))
     {
@@ -829,6 +854,36 @@ mod tests {
             }
         }
         form
+    }
+
+    #[tokio::test]
+    async fn a_trickling_form_gives_its_slot_back_at_the_deadline() {
+        // The form's first bytes, then nothing: the request holds a slot.
+        let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        sender
+            .send(Ok(Bytes::from_static(
+                b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhis",
+            )))
+            .await
+            .expect("sent");
+        let request = axum::http::Request::builder()
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
+            .body(())
+            .expect("request");
+        let (parts, ()) = request.into_parts();
+        let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        let deadline = Duration::from_millis(200);
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_form_within(&parts, body, Task::Transcribe, deadline),
+        )
+        .await
+        .expect("the read ends at its deadline");
+        let Err((status, message)) = read else {
+            unreachable!("a form that never ends was read");
+        };
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{message}");
+        drop(sender);
     }
 
     #[test]

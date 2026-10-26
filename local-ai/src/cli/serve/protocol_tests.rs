@@ -782,6 +782,96 @@ fn chat_stream_error_is_one_terminal_server_error_frame() {
     );
 }
 
+const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn boundary() -> Signal {
+    Signal::Progress(PrefillProgress {
+        tokens: 512,
+        chunks: 1,
+    })
+}
+
+async fn next_frame(
+    frames: &mut tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+) -> String {
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames.recv())
+        .await
+        .expect("a frame in time")
+        .expect("a frame")
+        .expect("bytes");
+    String::from_utf8(frame.to_vec()).expect("utf-8")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_streamed_chat_starts_during_prefill_and_keeps_the_client_alive() {
+    let (relay, events) = local_engine::EventStream::relay();
+    let foreground = Arc::new(super::Foreground::default());
+    assert!(relay.send(boundary()).await);
+    // The headers go out on the first prefill boundary, not the first token.
+    let started = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::sse::start_stream(
+            events,
+            chat_reply(false),
+            super::QueueDepth::default().admit(),
+            &foreground,
+            STALL,
+        ),
+    )
+    .await
+    .expect("answered while the prompt prefills");
+    let mut frames = started.expect("started");
+    assert_eq!(next_frame(&mut frames).await, super::sse::KEEP_ALIVE);
+    assert!(relay.send(boundary()).await);
+    assert_eq!(next_frame(&mut frames).await, super::sse::KEEP_ALIVE);
+    assert!(relay.send(Signal::Event(Event::Content("Hi".into()))).await);
+    let content = parse_data(&next_frame(&mut frames).await);
+    assert_eq!(content["choices"][0]["delta"]["content"], "Hi");
+    assert!(
+        relay
+            .send(Signal::Event(Event::Finished(stats(StopReason::Eos))))
+            .await
+    );
+    let finish = parse_data(&next_frame(&mut frames).await);
+    assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+    assert_eq!(next_frame(&mut frames).await, "data: [DONE]\n\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_leaving_before_the_first_signal_cancels_its_generation() {
+    for chunked in [false, true] {
+        let (relay, events) = local_engine::EventStream::relay();
+        let request = tokio::spawn(async move {
+            let foreground = Arc::new(super::Foreground::default());
+            let admitted = super::QueueDepth::default().admit();
+            let reply = chat_reply(false);
+            if chunked {
+                let started = super::chunked::start_chunked(
+                    events,
+                    reply,
+                    admitted,
+                    &foreground,
+                    STALL,
+                    false,
+                );
+                started.await.map(|_| ())
+            } else {
+                let started = super::sse::start_stream(events, reply, admitted, &foreground, STALL);
+                started.await.map(|_| ())
+            }
+        });
+        // Queued: nothing arrives. The client leaves, which drops the handler.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        request.abort();
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_secs(5), relay.cancelled()).await;
+        assert!(
+            cancelled.is_ok(),
+            "chunked={chunked}: the queued generation was not cancelled"
+        );
+    }
+}
+
 /// Fold signals through a buffered body as the pump does and return the bytes.
 fn body_bytes(reply: Reply, signals: Vec<Signal>) -> Vec<u8> {
     let (mut body, _) = Body::open(reply, false);

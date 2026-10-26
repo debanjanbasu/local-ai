@@ -14,7 +14,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
-use local_engine::{ChatRequest, Engine, EngineHandle};
+use local_engine::{CancelHandle, ChatRequest, Engine, EngineHandle};
 
 use crate::resources::Resources;
 
@@ -25,6 +25,7 @@ mod batches;
 mod browser;
 mod chunked;
 mod compaction;
+mod connection;
 mod decisions;
 mod embeddings;
 mod file_search;
@@ -94,6 +95,9 @@ struct Args {
     /// `--allow-origin` values: browser origins admitted while
     /// authentication is off (see [`browser`]).
     allowed_origins: Vec<String>,
+    /// `--allow-host` names: `Host` values admitted besides IP addresses and
+    /// local names (see [`browser`]).
+    allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -121,6 +125,10 @@ struct AppState {
     cipher: Option<Arc<ReasoningCipher>>,
     /// Background Responses running on this server.
     background: Arc<Background>,
+    /// Places for background-response streams ([`resume::MAX_SUBSCRIBERS`]).
+    subscribers: Arc<tokio::sync::Semaphore>,
+    /// Foreground generations, cancelled at the shutdown drain deadline.
+    foreground: Arc<Foreground>,
     /// Where background `store: false` Responses are kept briefly; `None`
     /// when no private temporary store could be created.
     temporary: Option<Arc<Temporary>>,
@@ -183,6 +191,64 @@ impl QueueDepth {
 
 struct Admitted(Arc<Depth>);
 
+/// The foreground generations running on this server (Chat Completions and
+/// Responses requests a client is waiting on), so shutdown can cancel those
+/// still running at its drain deadline.
+#[derive(Default)]
+struct Foreground {
+    next: std::sync::atomic::AtomicU64,
+    live: std::sync::Mutex<std::collections::HashMap<u64, CancelHandle>>,
+}
+
+impl Foreground {
+    /// Track the generation `cancel` controls until the returned guard drops.
+    fn track(self: &Arc<Self>, cancel: CancelHandle) -> Generation {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(id, cancel.clone());
+        Generation {
+            foreground: Arc::clone(self),
+            id,
+            cancel,
+        }
+    }
+
+    /// Cancel every tracked generation, returning how many there were.
+    fn cancel_all(&self) -> usize {
+        let live = self.lock();
+        for cancel in live.values() {
+            cancel.cancel();
+        }
+        live.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, CancelHandle>> {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One tracked foreground generation, cancelled when this guard drops.
+///
+/// The guard is what ties a generation to the request waiting for it. The
+/// request's handler holds it while the first signal is awaited on the
+/// blocking pool, so a client that leaves while its request is queued or
+/// prefilling drops the handler, and with it the guard, which cancels the job
+/// that thread is still waiting on. The body pump then holds it until the
+/// body ends. Cancelling a generation that already ended does nothing.
+struct Generation {
+    foreground: Arc<Foreground>,
+    id: u64,
+    cancel: CancelHandle,
+}
+
+impl Drop for Generation {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.foreground.lock().remove(&self.id);
+    }
+}
+
 impl Drop for Admitted {
     fn drop(&mut self) {
         self.0.count.fetch_sub(1, Ordering::SeqCst);
@@ -194,7 +260,11 @@ impl Drop for Admitted {
 /// [`browser`]), authentication, then [`dispatch`].
 async fn route(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    if let Some(message) = state.browsers.host_refusal(&parts) {
+    let body = connection::paced(body, state.stall);
+    if let Some(refused) = state.browsers.host_refusal(&parts)
+        && !(refused.unless_authenticated && admin::enabled(&state).await)
+    {
+        let message = refused.message;
         return error_response(StatusCode::FORBIDDEN, &message, &state, &parts.headers).await;
     }
     let origin = state.browsers.origin(&parts.headers);
@@ -241,7 +311,7 @@ async fn route(State(state): State<AppState>, request: Request) -> Response {
 }
 
 /// Serve an admitted request.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 async fn dispatch(
     state: AppState,
     parts: axum::http::request::Parts,
@@ -351,7 +421,9 @@ async fn dispatch(
         .collect()
         .await
     {
-        Ok(value) => value.to_bytes().to_vec(),
+        // `Vec::from` takes over the collected buffer instead of copying up
+        // to 64 MiB again.
+        Ok(value) => Vec::from(value.to_bytes()),
         Err(error) => {
             let status = if error.is::<LengthLimitError>() {
                 StatusCode::PAYLOAD_TOO_LARGE
@@ -478,6 +550,15 @@ async fn dispatch(
         )
         .await;
     }
+    // A streamed background request takes its stream's place before any
+    // engine work, so a full house refuses it rather than starting a job
+    // whose stream it then refuses. (The place is held until the stream
+    // starts, which is what the lint cannot see.)
+    let slot =
+        match (background && stream).then(|| Arc::clone(&state.subscribers).try_acquire_owned()) {
+            Some(Err(_)) => return subscribers_full(&state, &parts.headers).await,
+            slot => slot.and_then(Result::ok),
+        };
     let responses = matches!(&reply.protocol, Protocol::Responses(_));
     // Submission compiles a structured response format synchronously before
     // queueing (about half a second the first time, building the tokenizer's
@@ -534,8 +615,8 @@ async fn dispatch(
             .await;
         }
     };
-    let admitted = state.depth.admit();
     if background {
+        let admitted = state.depth.admit();
         // Not waiting for the first event: a pre-generation failure becomes a
         // `failed` status on the stored response, not this request's status.
         let started = background::start(
@@ -546,21 +627,24 @@ async fn dispatch(
             stream,
         )
         .await;
-        return match started {
-            Ok(queued) if stream => {
+        return match (started, slot) {
+            (Ok(queued), Some(slot)) => {
                 // The client follows the journal from its first event; going
                 // away only ends this stream, never the job.
                 let id = queued["id"].as_str().unwrap_or_default().to_owned();
-                stream_events(&state, id, None, &parts.headers).await
+                stream_events(&state, id, None, slot, &parts.headers).await
             }
-            Ok(queued) => json_response(StatusCode::OK, queued, &state, &parts.headers).await,
-            Err((status, message)) => {
+            (Ok(queued), None) => {
+                json_response(StatusCode::OK, queued, &state, &parts.headers).await
+            }
+            (Err((status, message)), _) => {
                 error_response(status, &message, &state, &parts.headers).await
             }
         };
     }
+    let admitted = state.depth.admit();
     if stream {
-        match start_stream(events, reply, admitted, state.stall).await {
+        match start_stream(events, reply, admitted, &state.foreground, state.stall).await {
             Ok(events) => event_stream(events, &state),
             Err(error) => {
                 error_response(error_status_message(&error), &error, &state, &parts.headers).await
@@ -573,7 +657,15 @@ async fn dispatch(
         // request here and reported back from the body, because the response may
         // only claim an encoding it is really using.
         let zstd = wants_zstd(&parts.headers);
-        match start_chunked(events, reply, admitted, state.stall, zstd).await {
+        let started = start_chunked(
+            events,
+            reply,
+            admitted,
+            &state.foreground,
+            state.stall,
+            zstd,
+        );
+        match started.await {
             Ok((frames, compressed)) => {
                 let mut response = Response::new(Body::from_stream(ReceiverStream::new(frames)));
                 response.headers_mut().insert(
@@ -670,12 +762,13 @@ fn event_stream(
     response
 }
 
-/// Stream background response `id`'s events after `after`, or answer with
-/// the status that refuses it before any stream starts.
+/// Stream background response `id`'s events after `after` in `slot`, or
+/// answer with the status that refuses it before any stream starts.
 async fn stream_events(
     state: &AppState,
     id: String,
     after: Option<u64>,
+    slot: tokio::sync::OwnedSemaphorePermit,
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let not_found = format!("response with id {id:?} not found");
@@ -708,10 +801,27 @@ async fn stream_events(
         ))
     });
     match subscribed {
-        Ok(Some(subscription)) => event_stream(resume::start(subscription, state.stall), state),
+        Ok(Some(subscription)) => {
+            event_stream(resume::start(subscription, state.stall, slot), state)
+        }
         Ok(None) => error_response(StatusCode::NOT_FOUND, &not_found, state, headers).await,
         Err((status, message)) => error_response(status, &message, state, headers).await,
     }
+}
+
+/// The `503` refusing a background-response stream past
+/// [`resume::MAX_SUBSCRIBERS`].
+async fn subscribers_full(state: &AppState, headers: &axum::http::HeaderMap) -> Response {
+    let message = format!(
+        "{} background response streams are already open; retry after 1s with your own backoff",
+        resume::MAX_SUBSCRIBERS
+    );
+    let mut response =
+        error_response(StatusCode::SERVICE_UNAVAILABLE, &message, state, headers).await;
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+    response
 }
 
 #[derive(Clone, Copy)]
@@ -812,7 +922,10 @@ async fn stored_response(
     }
     let outcome = match stored_request(method, items, query) {
         Ok(Retrieval::Stream(after)) => {
-            return stream_events(state, id.to_owned(), after, headers).await;
+            let Ok(slot) = state.subscribers.clone().try_acquire_owned() else {
+                return subscribers_full(state, headers).await;
+            };
+            return stream_events(state, id.to_owned(), after, slot, headers).await;
         }
         Ok(retrieval) => {
             let page = retrieval.into_page();
@@ -1058,6 +1171,16 @@ fn deleted(id: &str) -> serde_json::Value {
     json!({"id":id,"object":"response.deleted","deleted":true})
 }
 
+/// The `500` for a response store that failed: the error, which can name
+/// files on this machine, goes to the server log, not to the client.
+fn store_failure(error: &std::io::Error) -> Failure {
+    eprintln!("response store failed: {error}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the response store failed; the server log has the details".to_owned(),
+    )
+}
+
 /// Read, list or delete stored response `id`; `Ok(None)` is a 404.
 fn stored_answer(
     store: &ResponseStore,
@@ -1065,12 +1188,7 @@ fn stored_answer(
     id: &str,
     page: Option<&ItemPage>,
 ) -> Result<Option<serde_json::Value>, (StatusCode, String)> {
-    let failed = |error: std::io::Error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("response store failed: {error}"),
-        )
-    };
+    let failed = |error: std::io::Error| store_failure(&error);
     if *method == Method::DELETE {
         return Ok(background::delete_unowned(store, id)?.then(|| deleted(id)));
     }
@@ -1226,7 +1344,11 @@ async fn run_async(args: Args) -> crate::Result<()> {
             ))),
             args.api_key.as_deref(),
         )?),
-        browsers: Arc::new(browser::Browsers::new(args.host, args.allowed_origins)),
+        browsers: Arc::new(browser::Browsers::new(
+            args.host,
+            args.allowed_origins,
+            args.allowed_hosts,
+        )),
         alt_svc: resources
             .tls
             .as_ref()
@@ -1236,6 +1358,8 @@ async fn run_async(args: Args) -> crate::Result<()> {
         responses,
         cipher,
         background: Arc::default(),
+        subscribers: Arc::new(tokio::sync::Semaphore::new(resume::MAX_SUBSCRIBERS)),
+        foreground: Arc::default(),
         temporary: temporary.clone(),
         decisions: decisions.clone(),
         services: Some(services),
@@ -1271,23 +1395,32 @@ async fn run_async(args: Args) -> crate::Result<()> {
     admin::announce(&state.auth, args.host);
     eprintln!("Bonsai server listening on http://{address}");
     let background = Arc::clone(&state.background);
+    let app_foreground = Arc::clone(&state.foreground);
     let app = Router::new().fallback(any(route)).with_state(state);
     // Background jobs are settled and cancelled as soon as shutdown begins,
     // while axum is still draining foreground connections.
     let closing = Arc::clone(&background);
     let closing_decisions = decisions.clone();
     let closing_batches = Arc::clone(&batches);
-    let served = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
+    // Foreground generations still running at the drain deadline are
+    // cancelled, so a long one cannot hold shutdown until a SIGKILL that
+    // might cut the prompt-cache writes below.
+    let foreground = Arc::clone(&app_foreground);
+    connection::serve(
+        listener,
+        app,
+        connection::Limits::default(),
+        async move {
             shutdown().await;
             closing_batches.close();
             // Waiting decisions end at once, cancelling their engine work,
             // so they never hold up the drain.
             decisions::close(closing_decisions.as_deref());
             let _ = tokio::task::spawn_blocking(move || closing.close()).await;
-        })
-        .await
-        .map_err(crate::Error::Io);
+        },
+        move || foreground.cancel_all(),
+    )
+    .await;
     // Again, for a server that stopped without the signal; settling is idempotent.
     decisions::close(decisions.as_deref());
     batches.close();
@@ -1323,7 +1456,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
             PROMPT_CACHE_CLOSE_DEADLINE.as_secs()
         );
     }
-    served
+    Ok(())
 }
 
 /// How long the default response store keeps a settled response, as
@@ -1347,6 +1480,10 @@ fn open_responses(dir: &std::path::Path) -> crate::Result<Arc<ResponseStore>> {
 /// a slower disk while still bounding the stop; past it the write in flight
 /// is aborted and its temporary removed.
 const PROMPT_CACHE_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// How long the runtime waits for its remaining tasks once the server has
+/// shut down.
+const RUNTIME_EXIT_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The hosted tools `args` grant (none without flags) and the tool loop's
 /// bounds, which tools needing no permission (`file_search`) run within.
@@ -1408,13 +1545,20 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
             .enable_all()
             .build()
         {
-            Ok(runtime) => match runtime.block_on(run_async(args)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
+            Ok(runtime) => {
+                let served = runtime.block_on(run_async(args));
+                // Everything that writes has finished by now; a blocking task
+                // still waiting on a cancelled job must not hold the exit
+                // (dropping the runtime would wait for it indefinitely).
+                runtime.shutdown_timeout(RUNTIME_EXIT_DEADLINE);
+                match served {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::FAILURE
+                    }
                 }
-            },
+            }
             Err(error) => {
                 eprintln!("error: could not start Tokio runtime: {error}");
                 ExitCode::FAILURE

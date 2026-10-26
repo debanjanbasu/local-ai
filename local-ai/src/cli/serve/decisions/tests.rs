@@ -329,3 +329,29 @@ fn the_flag_is_explicit_and_the_route_explains_itself_without_it() {
         assert!(message.contains(expected), "{message}");
     }
 }
+
+#[tokio::test]
+async fn an_oversized_body_is_refused_without_being_read_to_its_end() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const CHUNK: usize = 64 * 1024;
+    let pulled = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&pulled);
+    // Ten times the limit, counted as the server pulls it.
+    let chunks = (0..10 * super::MAX_REQUEST_BYTES / CHUNK).map(move |_| {
+        counter.fetch_add(CHUNK, Ordering::SeqCst);
+        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b' '; CHUNK]))
+    });
+    let body = axum::body::Body::from_stream(tokio_stream::iter(chunks));
+    let (status, message) = super::read_body(body).await.expect_err("refused");
+    assert_eq!(
+        status,
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        "{message}"
+    );
+    let read = pulled.load(Ordering::SeqCst);
+    assert!(
+        read <= super::MAX_REQUEST_BYTES + CHUNK,
+        "read {read} bytes of a body refused at {}",
+        super::MAX_REQUEST_BYTES
+    );
+}

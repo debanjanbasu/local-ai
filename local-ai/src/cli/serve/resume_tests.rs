@@ -259,6 +259,67 @@ fn a_live_subscriber_follows_and_one_that_leaves_does_not_cancel() {
 }
 
 #[test]
+fn parked_subscribers_hold_no_blocking_thread() {
+    const SUBSCRIBERS: usize = 8;
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let background = Arc::new(Background::default());
+    let depth = QueueDepth::default();
+    let (id, pump, stopped) = admit(&background, &store, &depth, |_| finished_steps());
+    // One blocking thread, as if every other were taken: a subscriber parked
+    // on its queued job must not need it, or nothing else (authentication,
+    // /health) can run.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    let slots = Arc::new(tokio::sync::Semaphore::new(SUBSCRIBERS));
+    let receivers = runtime.block_on(async {
+        let mut receivers = Vec::new();
+        for _ in 0..SUBSCRIBERS {
+            let mut receiver = super::resume::start(
+                open(&background, &store, &id, None),
+                STALL,
+                Arc::clone(&slots).try_acquire_owned().expect("slot"),
+            );
+            // Each has read what the queued job published and is parked.
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .expect("a subscriber runs beside the parked ones")
+                    .expect("frame")
+                    .expect("bytes");
+            }
+            receivers.push(receiver);
+        }
+        let answered =
+            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| 7)).await;
+        assert_eq!(
+            answered.expect("the blocking pool is free").expect("task"),
+            7
+        );
+        receivers
+    });
+    // A client leaving gives its place back.
+    drop(receivers);
+    runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            slots.acquire_many(SUBSCRIBERS as u32),
+        )
+        .await
+        .expect("every place released")
+        .expect("permits")
+        .forget();
+    });
+    pump.run();
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert_eq!(status(&store, &id), "completed");
+    assert_eq!(depth.load(), 0);
+}
+
+#[test]
 fn a_stalled_subscriber_is_dropped_without_blocking_generation() {
     let scratch = Scratch::new();
     let store = scratch.open();
@@ -789,4 +850,29 @@ fn a_temporary_streamed_response_replays_until_it_expires() {
         super::locate(Some(&temporary), Some(&durable), &background, &id).expect_err("expired");
     assert_eq!(code, StatusCode::NOT_FOUND);
     assert_eq!(store.open_journal(&id).expect("readable").map(|_| ()), None);
+}
+
+#[test]
+fn a_store_failure_reaches_the_client_without_its_details() {
+    let scratch = Scratch::new();
+    let store = scratch.open();
+    let background = Arc::new(Background::default());
+    let depth = QueueDepth::default();
+    let (id, pump, _) = admit(&background, &store, &depth, |_| finished_steps());
+    pump.run();
+    // An unreadable record, whose error names the scratch directory.
+    let record = scratch.0.join(format!("{id}.json"));
+    std::fs::remove_file(&record).expect("record");
+    std::fs::create_dir(&record).expect("a directory where the record was");
+    let failure = super::stored_answer(&store, &axum::http::Method::GET, &id, None)
+        .expect_err("the store failed");
+    let streamed = subscribe(&background, &store, &id, None)
+        .err()
+        .expect("the store failed");
+    let directory = scratch.0.to_string_lossy();
+    for (status, message) in [failure, streamed] {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!message.contains(directory.as_ref()), "{message}");
+        assert!(!message.contains("os error"), "{message}");
+    }
 }

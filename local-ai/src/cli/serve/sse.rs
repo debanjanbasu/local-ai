@@ -4,42 +4,58 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use local_engine::{Event, EventStream};
+use local_engine::{Event, EventStream, Signal};
 
-use super::Admitted;
 use super::backpressure::{FrameOutcome, send_frame};
 use super::response::{
     Protocol, Reply, arguments_text, chat_finish_reason, chat_tool_call, checked, logprob_json,
     usage_json,
 };
 use super::responses::{ResponsesState, sse_frame};
+use super::{Admitted, Foreground, Generation};
+
+/// The SSE comment written for each prefill boundary.
+///
+/// Every SSE parser ignores a line starting with `:`, so it carries nothing,
+/// but it puts the headers and then a byte on the wire while a long prompt
+/// prefills, and a client that has gone away fails the write, which cancels
+/// the prefill instead of letting it run to the end.
+pub(super) const KEEP_ALIVE: &str = ": keep-alive\n\n";
 
 /// Start a streaming response and hand the frame receiver to axum.
 ///
-/// The first event is awaited here, before the caller builds a response, so a
+/// The first signal is awaited here, before the caller builds a response, so a
 /// pre-generation validation error becomes a real HTTP status code instead of
 /// a 200 whose first frame is an error.
 pub(super) async fn start_stream(
     mut events: EventStream,
     reply: Reply,
     admitted: Admitted,
+    foreground: &std::sync::Arc<Foreground>,
     stall: Duration,
 ) -> Result<mpsc::Receiver<Result<Bytes, std::io::Error>>, String> {
-    // The first event has no deadline, deliberately and not by accident: it is
-    // prefill, not a stall. Nothing is emitted while the prompt is prefilled,
-    // `PREFILL_CHUNK` is 512 and this M2 prefills at 3.6-4.2 tok/s, so one
-    // chunk is over two minutes of complete silence and a prompt over 512
-    // tokens is ordinary. A stall means the engine was producing and the client stopped
-    // consuming, which is only knowable once the engine has produced
-    // something, so every budget on this path starts after this call returns.
-    // `response::event_wait` is the same rule for the non-streaming path.
+    // Held here, not by the blocking task: a client that leaves while the
+    // request is queued drops this future and the guard with it, which
+    // cancels the job the task is waiting on (see [`Generation`]).
+    let generation = foreground.track(events.cancel_handle());
+    // The first signal has no deadline, deliberately and not by accident: it
+    // is queueing or prefill, not a stall. A stall means the engine was
+    // producing and the client stopped consuming, which is only knowable once
+    // the engine has produced something, so every budget on this path starts
+    // after this call returns. A prefill boundary counts as the first signal,
+    // as on the non-streaming path (`response::event_wait` is the same rule):
+    // validation errors arrive before any boundary, and once one arrives the
+    // headers go out and the pump writes [`KEEP_ALIVE`] per boundary.
     let (first, events) = tokio::task::spawn_blocking(move || {
-        let first = events.next();
+        // No deadline, so the wait cannot report a timeout; a closed channel
+        // is `Ok(None)`.
+        let first = events.next_signal(None).ok().flatten();
         (first, events)
     })
     .await
     .map_err(|error| format!("generation task failed: {error}"))?;
-    if let Some(Event::Error(error)) = &first {
+    let first = first.ok_or_else(|| "engine worker stopped".to_owned())?;
+    if let Signal::Event(Event::Error(error)) = &first {
         return Err(error.clone());
     }
     // Capacity 1 is deliberate backpressure, not a buffer: a slow reader stops
@@ -58,7 +74,7 @@ pub(super) async fn start_stream(
         }));
     }
     tokio::task::spawn_blocking(move || {
-        pump(first, events, frames, sender, admitted, stall);
+        pump(first, events, frames, sender, (admitted, generation), stall);
     });
     Ok(receiver)
 }
@@ -70,6 +86,9 @@ pub(super) async fn start_stream(
 /// drops, `send_frame` reports `Closed`, the loop breaks, this function
 /// returns, `events` drops, and `EventStream`'s `Drop` cancels the generation.
 /// Ignoring it would let a disconnected client run a full-length generation.
+/// Prefill boundaries are written as [`KEEP_ALIVE`] comments for the same
+/// reason: without a write, a client that left during prefill would only be
+/// noticed at the first token.
 ///
 /// A client that stops reading with its socket still open has no such event —
 /// TCP cannot tell it from a slow one and axum surfaces no per-response signal —
@@ -77,24 +96,38 @@ pub(super) async fn start_stream(
 /// from here on the same terms, and the cascade above is what stops the engine
 /// and frees the queue slot.
 ///
-/// `_admission` is a drop guard held for the pump's lifetime, so the queue slot
-/// is released exactly when this function returns, on every path out of it.
+/// `_guards` are drop guards held for the pump's lifetime, so the queue slot is
+/// released, and the generation's cancellation and shutdown tracking end,
+/// exactly when this function returns, on every path out of it.
 // `sender` is owned because the detached task has to keep it alive for the
 // whole pump; it is not consumed by the body.
 #[allow(clippy::needless_pass_by_value)]
 fn pump(
-    first: Option<Event>,
-    events: EventStream,
+    first: Signal,
+    mut events: EventStream,
     mut frames: Frames,
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
-    _admission: Admitted,
+    _guards: (Admitted, Generation),
     stall: Duration,
 ) {
     if !deliver(&sender, frames.start(), stall) {
         return;
     }
-    for event in first.into_iter().chain(events) {
-        let (out, terminal) = frames.event(event);
+    let mut queued = Some(first);
+    loop {
+        let signal = match queued.take() {
+            Some(signal) => signal,
+            // No deadline here either: the stall budget is the client's, and
+            // it applies to each frame handed over below.
+            None => match events.next_signal(None) {
+                Ok(Some(signal)) => signal,
+                Ok(None) | Err(_) => return,
+            },
+        };
+        let (out, terminal) = match signal {
+            Signal::Progress(_) => (vec![KEEP_ALIVE.to_owned()], false),
+            Signal::Event(event) => frames.event(event),
+        };
         if !deliver(&sender, out, stall) || terminal {
             return;
         }

@@ -20,9 +20,11 @@
 //! polling a file this process is not told about. A cursor at or past the end
 //! of a finished stream is an empty 200 stream.
 //!
-//! A subscriber holds one open journal file, one line and one channel slot,
-//! never a copy of the log. One that disconnects or stops reading for the
-//! stall budget is dropped without touching the job, which runs on.
+//! A subscriber is a runtime task holding one open journal file, at most one
+//! read batch and one channel slot, never a copy of the log, and no thread
+//! while it waits; at most [`MAX_SUBSCRIBERS`] are open at once. One that
+//! disconnects or stops reading for the stall budget is dropped without
+//! touching the job, which runs on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,13 +32,13 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 
 use super::background::{Background, Failure, Published, pending};
-use super::backpressure::{FrameOutcome, park_until, send_frame};
-use super::journal::{JournalReader, terminal_events};
+use super::journal::{JournalReader, Line, terminal_events};
 use super::responses::sse_frame;
 use super::store::{ItemPage, ResponseStore, query_pairs};
+use super::store_failure;
 
 /// What a stored-response request asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -124,7 +126,8 @@ pub(super) fn retrieval(query: Option<&str>) -> Result<Retrieval, String> {
 pub(super) struct Subscription {
     store: Arc<ResponseStore>,
     id: String,
-    reader: JournalReader,
+    /// `None` only while a blocking read has it.
+    reader: Option<JournalReader>,
     /// The job's watch while this server generates it; `None` replays.
     live: Option<watch::Receiver<Published>>,
     after: Option<u64>,
@@ -141,12 +144,7 @@ pub(super) fn subscribe(
     id: &str,
     after: Option<u64>,
 ) -> Result<Option<Subscription>, Failure> {
-    let failed = |error: std::io::Error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("response store failed: {error}"),
-        )
-    };
+    let failed = |error: std::io::Error| store_failure(&error);
     // Watched before the record is read, so a job that settles in between is
     // still followed to its end rather than missed.
     let live = background.watch(id);
@@ -189,28 +187,63 @@ pub(super) fn subscribe(
     Ok(Some(Subscription {
         store: Arc::clone(store),
         id: id.to_owned(),
-        reader,
+        reader: Some(reader),
         live,
         after,
     }))
 }
 
 /// Start sending `subscription` and hand the frame receiver to axum.
+///
+/// The subscriber is a runtime task, not a blocking thread: it waits for the
+/// job's notifications and for the client asynchronously and goes to the
+/// blocking pool only to read the journal and the record, so subscribers
+/// parked on a queued or prefilling job cannot fill the pool that every
+/// request (authentication included) needs. `slot` is its place among the
+/// [`MAX_SUBSCRIBERS`], released when the stream ends.
 pub(super) fn start(
     subscription: Subscription,
     stall: Duration,
+    slot: OwnedSemaphorePermit,
 ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
     // Capacity 1, as for every streamed body: a subscriber's memory is one
     // frame, and a slow one waits here, not in the job.
     let (sender, receiver) = mpsc::channel(1);
-    tokio::task::spawn_blocking(move || subscription.run(&sender, stall));
+    tokio::spawn(async move {
+        let _slot = slot;
+        subscription.follow(&sender, stall).await;
+    });
     receiver
 }
 
+/// Background-response streams open at once on this server; another is a
+/// `503` with `Retry-After`.
+///
+/// Each holds an open journal file and a runtime task. 64 is eight for each
+/// of the engine's eight running requests, far more than reconnecting
+/// clients need, and it bounds the descriptors a client can pin by opening
+/// streams it never reads.
+pub(super) const MAX_SUBSCRIBERS: usize = 64;
+
+/// Journal bytes one blocking read hands back at most (or one longer line).
+const READ_BATCH_BYTES: usize = 64 * 1024;
+
 impl Subscription {
+    /// [`Self::follow`] on the calling thread, for tests that drive a
+    /// subscriber beside a scripted job.
+    #[cfg(test)]
+    pub(super) fn run(self, sender: &mpsc::Sender<Result<Bytes, std::io::Error>>, stall: Duration) {
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        {
+            runtime.block_on(self.follow(sender, stall));
+        }
+    }
+
     /// Send every event after the cursor until the stream ends, the response
-    /// is deleted, or the client goes away or stalls. Blocks the thread.
-    pub(super) fn run(
+    /// is deleted, or the client goes away or stalls.
+    pub(super) async fn follow(
         mut self,
         sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
         stall: Duration,
@@ -231,19 +264,23 @@ impl Subscription {
                 None => (u64::MAX, true, false),
             };
             loop {
-                let line = match self.reader.next_line(limit) {
-                    Ok(Some(line)) => line,
-                    Ok(None) => break,
+                let lines = match self.read(limit).await {
+                    Ok(lines) => lines,
                     Err(error) => {
                         eprintln!("response {}: event journal unreadable: {error}", self.id);
                         return;
                     }
                 };
-                ended = line.terminal;
-                if self.wanted(line.sequence) && !deliver(sender, line.frame(), stall) {
-                    return;
+                if lines.is_empty() {
+                    break;
                 }
-                opened_end = (line.kind == "error" && !line.terminal).then_some(line);
+                for line in lines {
+                    ended = line.terminal;
+                    if self.wanted(line.sequence) && !deliver(sender, line.frame(), stall).await {
+                        return;
+                    }
+                    opened_end = (line.kind == "error" && !line.terminal).then_some(line);
+                }
             }
             if torn {
                 // A failed write left lines past the published ones that may
@@ -258,13 +295,11 @@ impl Subscription {
             let Some(live) = self.live.as_mut() else {
                 break;
             };
-            let woke = park_until(async {
-                tokio::select! {
-                    biased;
-                    () = sender.closed() => None,
-                    changed = live.changed() => Some(changed.is_ok()),
-                }
-            });
+            let woke = tokio::select! {
+                biased;
+                () = sender.closed() => None,
+                changed = live.changed() => Some(changed.is_ok()),
+            };
             match woke {
                 None => return,
                 Some(true) => {}
@@ -281,7 +316,9 @@ impl Subscription {
         // lines read: every line on disk once the writer is gone, or, while
         // it runs, every line it published, its failed batch having been cut
         // back off (otherwise the stream stopped above).
-        let Ok(Some(stored)) = self.store.load(&self.id) else {
+        let (store, id) = (Arc::clone(&self.store), self.id.clone());
+        let Ok(Ok(Some(stored))) = tokio::task::spawn_blocking(move || store.load(&id)).await
+        else {
             return;
         };
         if pending(&stored.response) {
@@ -297,12 +334,44 @@ impl Subscription {
                 events.remove(0);
             }
         }
-        for (sequence, mut event) in (self.reader.next_sequence()..).zip(events) {
+        let next = self.reader.as_ref().map_or(0, JournalReader::next_sequence);
+        for (sequence, mut event) in (next..).zip(events) {
             event["sequence_number"] = json!(sequence);
-            if self.wanted(sequence) && !deliver(sender, sse_frame(&event), stall) {
+            if self.wanted(sequence) && !deliver(sender, sse_frame(&event), stall).await {
                 return;
             }
         }
+    }
+
+    /// The next complete journal lines within the first `limit` bytes, read
+    /// on the blocking pool: up to [`READ_BATCH_BYTES`] of them, or one
+    /// longer line; none at the end of what is there.
+    async fn read(&mut self, limit: u64) -> std::io::Result<Vec<Line>> {
+        let Some(mut reader) = self.reader.take() else {
+            return Ok(Vec::new());
+        };
+        let (reader, lines) = tokio::task::spawn_blocking(move || {
+            let mut lines = Vec::new();
+            let mut bytes = 0;
+            let read = loop {
+                if bytes >= READ_BATCH_BYTES {
+                    break Ok(());
+                }
+                match reader.next_line(limit) {
+                    Ok(Some(line)) => {
+                        bytes += line.text.len();
+                        lines.push(line);
+                    }
+                    Ok(None) => break Ok(()),
+                    Err(error) => break Err(error),
+                }
+            };
+            (reader, read.map(|()| lines))
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        self.reader = Some(reader);
+        lines
     }
 
     fn wanted(&self, sequence: u64) -> bool {
@@ -312,15 +381,15 @@ impl Subscription {
 
 /// Hand one frame to the client: `false` once it has gone or stalled. A
 /// stalled subscriber is only disconnected; the job it watched runs on.
-fn deliver(
+async fn deliver(
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     frame: String,
     stall: Duration,
 ) -> bool {
-    match send_frame(sender, Bytes::from(frame), stall) {
-        FrameOutcome::Sent => true,
-        FrameOutcome::Closed => false,
-        FrameOutcome::Stalled => {
+    match tokio::time::timeout(stall, sender.send(Ok(Bytes::from(frame)))).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
             eprintln!(
                 "dropping a background response stream: the client stopped accepting frames for \
                  {}s; the response keeps running and the stream can be resumed",

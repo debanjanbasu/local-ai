@@ -43,7 +43,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
-use http_body_util::BodyExt;
+use bytes::Bytes;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -358,17 +359,10 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
     if service.closing() {
         return shutting_down(state, headers).await;
     }
-    let body = match body.collect().await {
-        Ok(value) => value.to_bytes(),
-        Err(error) => {
-            let message = format!("invalid HTTP body: {error}");
-            return error_response(StatusCode::BAD_REQUEST, &message, state, headers).await;
-        }
+    let body = match read_body(body).await {
+        Ok(body) => body,
+        Err((status, message)) => return error_response(status, &message, state, headers).await,
     };
-    if body.len() > MAX_REQUEST_BYTES {
-        let message = "HTTP request is too large";
-        return error_response(StatusCode::PAYLOAD_TOO_LARGE, message, state, headers).await;
-    }
     let prepared = tokio::task::spawn_blocking(move || prepare(&body))
         .await
         .unwrap_or_else(|error| Err(format!("request preparation failed: {error}")));
@@ -436,6 +430,22 @@ pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) ->
         Err(Failure::Engine(error)) => {
             error_response(error_status(&error), &error.to_string(), state, headers).await
         }
+    }
+}
+
+/// The request body, read no further than [`MAX_REQUEST_BYTES`]: a larger one
+/// is a `413` as soon as the limit is crossed, not after it has all arrived.
+async fn read_body(body: Body) -> Result<Bytes, (StatusCode, String)> {
+    match Limited::new(body, MAX_REQUEST_BYTES).collect().await {
+        Ok(value) => Ok(value.to_bytes()),
+        Err(error) if error.is::<LengthLimitError>() => Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "HTTP request is too large".to_owned(),
+        )),
+        Err(error) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid HTTP body: {error}"),
+        )),
     }
 }
 
