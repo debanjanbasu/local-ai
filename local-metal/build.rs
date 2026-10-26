@@ -13,6 +13,7 @@ const SHADER_FILES: &[&str] = &[
     "bonsai_ops.metal",
     "bonsai_small_batch.metal",
     "bonsai_int8.metal",
+    "bonsai_ane.metal",
     "sampling.metal",
     "draft.metal",
     "embedding.metal",

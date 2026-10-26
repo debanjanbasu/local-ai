@@ -56,6 +56,27 @@ the Apache License, Version 2.0
 (<https://www.apache.org/licenses/LICENSE-2.0>). They were modified to read this
 runtime's capture shards and frozen tables and to match its draft chain layout.
 
+## Neural Engine prefill FFN (Kapitsa, Splash)
+
+The private `AppleNeuralEngine.framework` client in `local-metal/src/ane.rs`
+(its interface declarations and method-signature table, IOSurface layout, MIL
+program caching with purge-and-recompile, and the shared-event handoff with
+its watchdog), the pack, weight-staging and join kernels in
+`shaders/bonsai_ane.metal`, and the W8A8 FFN program, wavefront schedule and
+keepalive in `local-engine/src/bonsai_native/ane_split.rs` are adapted from
+[Kapitsa](https://github.com/nace-ai/kapitsa/tree/a6a7bcac98daedfeaea323baa86d3a28a59905d6)
+(Copyright 2026 Nace AI), revision
+`a6a7bcac98daedfeaea323baa86d3a28a59905d6`: `src/ane/ane.{h,mm}`,
+`src/ane/ffn_split.{h,cpp}`, `src/kernels/ane_ffn.metal` and
+`src/model/qwen35_ane.cpp`. Kapitsa adapted the interface declarations and
+signature table from [Splash](https://github.com/incoai/splash) (Inco). Both
+are licensed under the Apache License, Version 2.0
+(<https://www.apache.org/licenses/LICENSE-2.0>); these portions remain under
+it. They were rewritten in Rust and Metal for this runtime: Bonsai's
+activations and weights are already in the checkpoint's Hadamard basis, so
+nothing is rotated again; ternary weights become per-row int8 by new block
+scales; the whole FFN runs on the Neural Engine.
+
 ## llguidance, toktrie and derivre
 
 Schema-constrained generation and the native tool-call grammar (llguidance's
