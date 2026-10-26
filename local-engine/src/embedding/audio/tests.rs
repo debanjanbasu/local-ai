@@ -101,6 +101,35 @@ fn decoding_rejects_garbage_and_reads_wav() {
     assert!((samples[800] - 0.25).abs() < 1e-3, "{}", samples[800]);
 }
 
+/// A rate outside [`SAMPLE_RATES`] is refused before decoding buffers
+/// `MAX_DECODE_SECONDS` of it or the resampler is sized for it.
+#[test]
+fn sample_rates_outside_the_range_are_refused() {
+    let wav = |rate: u32| {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36_u32 + 128).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&rate.wrapping_mul(2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&128_u32.to_le_bytes());
+        wav.extend_from_slice(&[0; 128]);
+        wav
+    };
+    for rate in [200_000_000, 384_001, 3_999] {
+        let error = decode_audio(wav(rate)).expect_err("refused");
+        assert!(error.to_string().contains("sample rate"), "{rate}: {error}");
+        assert!(to_mono_16k(&[0.0; 4], 1, rate).is_err(), "{rate}");
+    }
+    decode_audio(wav(8_000)).expect("accepted");
+}
+
 /// The signal every file in `tests/fixtures/audio-formats/` encodes: 0.5 s
 /// of `0.4 sin(2π·440 t) + 0.2 sin(2π·1250 t)` at 16 kHz mono, quantized to
 /// 16 bits (`ffmpeg -f lavfi -i aevalsrc=…:s=16000:d=0.5`, then one encoder

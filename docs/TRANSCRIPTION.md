@@ -77,7 +77,9 @@ SHA-256 on every load.
   filterbank, `log10` clamped at 1e-10, floor at max − 8, `(x + 4) / 4` —
   over the audio plus 30 s of zeros, as `transcribe()` does.
 - **Audio** (`local_engine::transcription::audio`): Symphonia 0.6 decodes FLAC, MP3,
-  WAV, AAC/ALAC in MP4/M4A and Vorbis in Ogg/WebM; channels are averaged,
+  WAV, AAC/ALAC in MP4/M4A and Vorbis in Ogg/WebM at 4 to 384 kHz (other
+  declared rates are a `400`: the resampler's kernel grows with the rate);
+  channels are averaged,
   other rates are resampled to 16 kHz with a Kaiser-windowed sinc (16 zero
   crossings, β 9, pass band 0.97 of Nyquist, like FFmpeg's default), and
   samples are rounded to 16-bit steps because the reference reads FFmpeg's
