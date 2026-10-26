@@ -532,8 +532,11 @@ fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
 }
 
 /// Deep cancellation: a tripped [`CancelToken`] stops a request between GPU
-/// dispatches and is a successful [`StopReason::Cancelled`], never an error,
-/// and it must leave the reusable prompt-cache tiers empty.
+/// dispatches and is a successful [`StopReason::Cancelled`], never an error.
+/// It drops only the checkpoints past where it stopped: the one it restored
+/// still describes intact K/V rows, so a retry restores it and generates
+/// exactly what a cold run does. (It used to clear the whole GPU tier, and the
+/// retry prefilled from scratch.)
 ///
 /// The trip is taken **during prefill**. With speculation and n-gram drafting
 /// off, decode calls `BonsaiModel::decode`, which polls nothing, so prefill's
@@ -545,7 +548,7 @@ fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
 /// both sides of the last poll.
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
-fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
+fn deep_cancellation_stops_in_prefill_and_a_retry_restores_what_it_kept() {
     let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
     let open = || {
         BonsaiEngine::open_with_options(
@@ -580,9 +583,8 @@ fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
         full.len()
     );
     // Diverge from the cancelled prompt at exactly one chunk boundary. The
-    // cancelled request therefore restores a shared-prefix checkpoint and then
-    // commits no further chunk, leaving that checkpoint behind unless the
-    // `Cancelled` tail clears it.
+    // cancelled request therefore restores the warmup's penultimate checkpoint
+    // and prefills past it over rows no checkpoint it keeps relies on.
     let mut warmup = full[..DEFAULT_PREFILL_CHUNK].to_vec();
     let sentinel = engine
         .encode_prompt(" alpha", true, false)
@@ -590,8 +592,6 @@ fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
     assert_ne!(sentinel, full[DEFAULT_PREFILL_CHUNK]);
     warmup.push(sentinel);
     let extended = full[..4 * DEFAULT_PREFILL_CHUNK].to_vec();
-    let mut follow_up = extended.clone();
-    follow_up.push(sentinel);
 
     engine
         .generate(&warmup, &params, |_| true)
@@ -620,26 +620,24 @@ fn deep_cancellation_stops_in_prefill_and_leaves_the_prompt_cache_empty() {
         cancelled.token_ids.len()
     );
 
-    // The follow-up shares the cancelled prompt's whole prefix, so any tier
-    // the cancelled request failed to clear would be restored here. No session
-    // cache is configured, so host and disk tiers are empty by construction and
-    // `PromptCacheSource::None` is the only reachable outcome after the clear.
-    let after = engine
-        .generate(&follow_up, &params, |_| true)
-        .expect("request after cancellation");
-    assert_eq!(
-        after.stats.reused_prompt_tokens, 0,
-        "a cancelled request must leave no reusable prompt prefix behind"
+    // The retry restores from the GPU tier (no session cache is configured,
+    // so host and disk tiers are empty by construction): at least the
+    // checkpoint the cancelled request restored.
+    let retry = engine
+        .generate(&extended, &params, |_| true)
+        .expect("retry after cancellation");
+    assert!(
+        retry.stats.reused_prompt_tokens >= DEFAULT_PREFILL_CHUNK
+            && retry.cache_source == PromptCacheSource::Gpu,
+        "the retry reused {} tokens from {:?}; the checkpoint the cancelled request kept is at {}",
+        retry.stats.reused_prompt_tokens,
+        retry.cache_source,
+        DEFAULT_PREFILL_CHUNK
     );
     assert_eq!(
-        after.cache_source,
-        PromptCacheSource::None,
-        "a cancelled request must leave no prompt-cache tier behind"
-    );
-    assert_eq!(
-        after.token_ids,
+        retry.token_ids,
         open()
-            .generate(&follow_up, &params, |_| true)
+            .generate(&extended, &params, |_| true)
             .expect("cold reference")
             .token_ids,
         "a cancelled request must not corrupt the next request's output"

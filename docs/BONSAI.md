@@ -1692,8 +1692,12 @@ behind a long prompt is admitted, and can start its own shorter prefill,
 within a block; each block is its own GPU round trip either way, so this
 costs the prompt nothing (measured with 128-token blocks, before blocks grew
 to 512: 6.6K tokens alone, 51.9 s at one block a step against 52.1 s at
-four). A cancellation between two chunks ends the request with
-no tokens and clears the prompt cache, as a cancelled single-pass prefill did.
+four). A cancellation between two chunks ends the request with no tokens.
+Its sequence's K/V rows still hold the prompt up to where it stopped, so
+the GPU checkpoints of prefixes of that stay and only those past it go: a
+retry restores the checkpoint the cancelled request restored. A cancelled
+request used to clear the whole GPU tier, while the same client disconnect
+seen by the stream instead of the token (a stop) kept it.
 
 The chunk size trades the running requests' inter-token gap against the
 prompt's own time to first token. A prefill block costs about 9.2 ms a row at

@@ -181,6 +181,24 @@ impl BonsaiEngine {
         })
     }
 
+    /// Keep what the resident set still holds after a request on it ended
+    /// without its position matching the tokens it emitted (cancelled, or
+    /// with rows committed past its last emitted token): its K/V rows hold
+    /// the prompt up to the position it reached, so the checkpoints of
+    /// prefixes of that, and only they, still restore.
+    /// The tier is left alone when it describes another set, which the
+    /// request never touched.
+    pub(super) fn keep_reached_prompt(&mut self, prompt: &[u32]) {
+        if self.cache_state != self.model.state_id() {
+            return;
+        }
+        let reached = &prompt[..self.model.position().min(prompt.len())];
+        self.cached_tokens.clear();
+        self.cached_tokens.extend_from_slice(reached);
+        self.prompt_checkpoints
+            .retain(|checkpoint| reached.starts_with(&checkpoint.tokens));
+    }
+
     /// Index the disk snapshots the writer has committed since the last call,
     /// and forget the ones its trim deleted.
     ///

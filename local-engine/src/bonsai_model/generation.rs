@@ -135,9 +135,11 @@ impl BonsaiEngine {
     /// committed command buffer, so a trip submits no further work and leaves
     /// the K/V cache and position cursor on the last committed boundary.
     ///
-    /// A trip is the success value [`StopReason::Cancelled`], never an error,
-    /// and it clears the reusable prompt-cache tiers below, so a cancelled
-    /// request cannot poison the next one.
+    /// A trip is the success value [`StopReason::Cancelled`], never an error.
+    /// The GPU prompt-cache tier keeps the checkpoints of prefixes of the
+    /// prompt up to where the request stopped, whose K/V rows are intact, and
+    /// drops every other, so a cancelled request cannot poison the next one
+    /// and a retry still restores what it shares.
     pub fn generate_session_cancellable(
         &mut self,
         prompt: &[u32],
@@ -381,7 +383,7 @@ impl BonsaiEngine {
         if self.model.take_cancel_observed() {
             // Prefill stopped between chunks, so `scratch.logits` holds no row
             // of this prompt: there is nothing to sample. The shared tail
-            // clears the prompt cache for a cancelled stop.
+            // drops the checkpoints past where it stopped.
             generation.stop_reason = StopReason::Cancelled;
             generation.done = true;
             return Ok(());
@@ -552,8 +554,8 @@ impl BonsaiEngine {
     }
 
     /// Close the resident `generation`: catch its state up to everything it
-    /// emitted and record it in the prompt cache, or clear the cache after a
-    /// cancellation.
+    /// emitted and record it in the prompt cache, or after a cancellation
+    /// drop what its prefill or decode overwrote.
     pub(super) fn finish_generation(
         &mut self,
         mut generation: ActiveGeneration,
@@ -579,7 +581,7 @@ impl BonsaiEngine {
             });
         }
         if generation.stop_reason == StopReason::Cancelled {
-            self.clear_gpu_cache();
+            self.keep_reached_prompt(prompt);
         } else {
             if self.model.speculation().is_some()
                 && generation.lag.usable()
@@ -619,7 +621,7 @@ impl BonsaiEngine {
                 // rarely a later prefix: keep it in (volatile) host memory only.
                 self.save_session_snapshot(&represented_tokens, session_id, None, false, false)?;
             } else {
-                self.clear_gpu_cache();
+                self.keep_reached_prompt(prompt);
             }
         }
         stats.elapsed = generation.started.elapsed();
