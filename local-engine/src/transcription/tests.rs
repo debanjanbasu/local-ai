@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss)]
 
 use std::collections::BTreeMap;
 use std::path::Path;

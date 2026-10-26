@@ -291,6 +291,5 @@ impl http_body::Body for Paced {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "connection_tests.rs"]
 mod tests;

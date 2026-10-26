@@ -116,7 +116,6 @@ impl MetalContext {
 pub type SharedMetalContext = Arc<MetalContext>;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -659,6 +659,5 @@ impl Citations {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)]
 #[path = "file_search_tests.rs"]
 mod tests;

@@ -27,7 +27,7 @@ mod head;
 mod policy;
 mod ternary;
 #[cfg(test)]
-#[allow(unsafe_code, clippy::expect_used)]
+#[allow(unsafe_code)]
 mod tests;
 mod weights;
 

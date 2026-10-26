@@ -59,7 +59,6 @@ use super::response::json_response;
 use super::store::query_pairs;
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #[path = "admin_tests.rs"]
 mod tests;
 

@@ -457,5 +457,4 @@ impl EmbeddingCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests;

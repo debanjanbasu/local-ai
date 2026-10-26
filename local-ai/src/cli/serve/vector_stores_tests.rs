@@ -1,4 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! HTTP-level tests for the Vector Stores adapter: real `Request`s against a
 //! real store and indexer in a private temporary directory, without a model.
 //! Every successful answer is checked against the pinned `OpenAI` schemas in

@@ -610,7 +610,6 @@ pub(crate) struct StreamDecodeState {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 impl BonsaiTokenizer {
     /// The real pre-tokenizer/byte-level pipeline over a tiny vocabulary: the
     /// 256 byte symbols, merges `a b` and `ab c`, and one special token `<|x|>`.
@@ -662,7 +661,6 @@ impl BonsaiTokenizer {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         BonsaiTokenizer, ChatMessage, DEFAULT_REASONING_INSTRUCTION, THINK_END,

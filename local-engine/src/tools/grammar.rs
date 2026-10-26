@@ -919,5 +919,4 @@ fn check_references(schema: &Value) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)]
 mod tests;

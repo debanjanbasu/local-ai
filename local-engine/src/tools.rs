@@ -1342,5 +1342,4 @@ fn invalid<T>(message: impl Into<String>) -> crate::Result<T> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)]
 mod tests;

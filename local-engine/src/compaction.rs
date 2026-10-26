@@ -211,7 +211,6 @@ pub fn reasoning_summary_request(reasoning: &str, detail: SummaryDetail) -> Chat
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

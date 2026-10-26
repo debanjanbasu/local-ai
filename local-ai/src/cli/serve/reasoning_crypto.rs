@@ -520,7 +520,6 @@ fn write_temp_key(temp_path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};

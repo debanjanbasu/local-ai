@@ -445,7 +445,6 @@ impl tokio_stream::Stream for CancelStream {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

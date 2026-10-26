@@ -292,7 +292,7 @@ impl BonsaiModel {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code, clippy::expect_used)]
+#[allow(unsafe_code)]
 mod tests {
     use super::super::{KvOptions, NgramSettings};
     use super::*;

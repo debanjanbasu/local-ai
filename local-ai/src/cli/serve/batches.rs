@@ -794,6 +794,5 @@ fn route_not_found() -> Failure {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "batch_tests.rs"]
 mod tests;

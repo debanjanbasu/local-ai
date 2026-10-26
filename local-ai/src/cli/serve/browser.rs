@@ -278,7 +278,6 @@ pub(super) fn allow(response: &mut Response, origin: HeaderValue) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use axum::http::Request;

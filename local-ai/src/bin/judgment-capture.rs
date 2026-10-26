@@ -347,7 +347,6 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{Row, parse};
     use local_engine::judgment::{DecisionKind, DecisionValue};

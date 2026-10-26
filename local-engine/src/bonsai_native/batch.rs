@@ -1479,5 +1479,5 @@ fn mismatch() -> crate::Error {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code, clippy::expect_used)]
+#[allow(unsafe_code)]
 mod tests;

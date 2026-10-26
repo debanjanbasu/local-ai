@@ -1181,6 +1181,5 @@ fn create_private_dir(path: &Path) -> local_services::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "services_tests.rs"]
 mod tests;

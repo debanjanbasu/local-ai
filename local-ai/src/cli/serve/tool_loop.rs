@@ -513,6 +513,5 @@ impl Driver {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)]
 #[path = "tool_tests.rs"]
 mod tests;

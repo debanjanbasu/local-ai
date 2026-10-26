@@ -374,7 +374,6 @@ fn measure_write_rate(path: &Path) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::{FREE_DISK_SHARE, PHYSICAL_MEMORY_SHARE, disk_cache_budget, readable_bytes};
 

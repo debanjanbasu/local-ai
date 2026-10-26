@@ -442,7 +442,6 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     #[test]
     fn redirect_locations_resolve_against_the_request() {

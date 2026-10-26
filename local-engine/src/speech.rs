@@ -504,5 +504,4 @@ fn chunk_tokens(tokens: &[Token], limit: usize) -> Vec<Chunk> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests;

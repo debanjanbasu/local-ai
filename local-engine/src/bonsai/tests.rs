@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::too_many_lines)]
+#![allow(clippy::too_many_lines)]
 use super::*;
 
 fn wire_string(value: &str) -> Vec<u8> {

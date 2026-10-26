@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used)]
-
 use serde_json::{Map, Value, json};
 
 use local_engine::embedding::EMBEDDING_DIMENSIONS;

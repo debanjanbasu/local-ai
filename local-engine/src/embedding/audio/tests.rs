@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::float_cmp)]
+#![allow(clippy::float_cmp)]
 
 use super::*;
 

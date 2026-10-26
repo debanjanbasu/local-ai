@@ -455,5 +455,4 @@ async fn shutting_down(state: &AppState, headers: &HeaderMap) -> Response {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests;

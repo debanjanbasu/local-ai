@@ -1599,29 +1599,22 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod protocol_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod store_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod background_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod resume_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod recovery_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod combos_tests;

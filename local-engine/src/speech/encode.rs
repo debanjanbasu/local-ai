@@ -387,7 +387,6 @@ pub fn encode(samples: &[f32], format: Format, sample_rate: u32) -> crate::Resul
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

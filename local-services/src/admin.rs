@@ -34,7 +34,6 @@ use crate::{Error, Result, Store, new_id, now};
 pub mod usage;
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests;
 
 /// Prefix of an admin API key.

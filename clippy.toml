@@ -1,0 +1,5 @@
+# Tests may unwrap, expect and panic: the workspace denies them everywhere
+# else (Cargo.toml), and a failing test is the intended outcome there.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

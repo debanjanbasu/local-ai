@@ -403,7 +403,6 @@ fn block_on<T: Send>(future: impl Future<Output = T> + Send) -> crate::Result<T>
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 

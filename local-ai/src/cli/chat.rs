@@ -130,7 +130,6 @@ pub fn main_with_args(args: &[String]) -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

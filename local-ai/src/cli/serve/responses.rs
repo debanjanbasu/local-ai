@@ -107,11 +107,9 @@ pub(super) use self::parse::{
 pub(super) use self::state::{ResponsesState, sse_frame};
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "conversation_response_tests.rs"]
 mod conversation_response_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[path = "compaction_tests.rs"]
 pub(super) mod compaction_tests;

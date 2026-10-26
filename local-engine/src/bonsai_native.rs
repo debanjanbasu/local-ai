@@ -1794,5 +1794,5 @@ fn invalid<T>(message: impl Into<String>) -> crate::Result<T> {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code, clippy::expect_used)]
+#[allow(unsafe_code)]
 mod tests;

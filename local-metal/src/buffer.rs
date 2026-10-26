@@ -270,7 +270,7 @@ pub fn get_default_device() -> crate::Result<Retained<ProtocolObject<dyn MTLDevi
 }
 
 #[cfg(test)]
-#[allow(unsafe_code, clippy::expect_used)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
