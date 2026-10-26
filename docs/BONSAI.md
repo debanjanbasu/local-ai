@@ -2520,6 +2520,17 @@ an `UNTRUSTED` result. There is no background power-polling loop.
 | Cold prefill, 32,796 tokens | 110.0 → 115.6 tok/s | same |
 | Cold prefill, 131,146 tokens | 69.7 → 74.8 tok/s | same, one round (56 tok/s on the [original build](https://github.com/debanjanbasu/local-ai/commit/b389329)) |
 
+Shaders compile with `-fmetal-math-mode=relaxed`. Metal's default fast mode
+also assumes no infinities or NaNs, yet online softmax starts each running
+maximum at `-INFINITY` and relies on `exp(-inf) = 0`, and sampling and the
+greedy selectors must see non-finite logits. Relaxed keeps the other
+fast-math freedoms (reassociation, contraction, approximate functions); the
+generated AIR differs only in the dropped no-NaN/no-infinity flags. Against
+the fast-mode build it measured the same: plain decode 32.07 against 32.07
+tok/s, best of four interleaved rounds on the default prompt with a 300-token
+cap (while other builds loaded the CPU), and greedy text identical on six
+prompts at 300 tokens with and without speculation.
+
 Decode spends 97–98% of wall time on the GPU. PTQ1 decode moves 5.65 GB of
 weights per token. The packed projections were ALU-bound, not bandwidth-bound:
 with weights pinned in cache the floor-based matvec took the same 135 us on

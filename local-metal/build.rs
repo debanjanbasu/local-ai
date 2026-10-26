@@ -40,6 +40,10 @@ fn main() {
                 sdk,
                 "metal",
                 "-c",
+                // Fast math (the default) also assumes no INF or NaN, but
+                // online softmax starts from -INFINITY and the selectors must
+                // see non-finite logits. Relaxed keeps the other freedoms.
+                "-fmetal-math-mode=relaxed",
                 "-frecord-sources",
                 "-I",
                 shader_dir.to_str().unwrap(),
