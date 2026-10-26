@@ -14,6 +14,11 @@ pub(super) struct CachedCheckpoint {
     tokens: Vec<u32>,
     pub(super) state: PromptCheckpoint,
     reusable_boundary: bool,
+    /// A request tail no other tier holds: it is read back and written to
+    /// disk only when something is about to overwrite its K/V rows (see
+    /// [`BonsaiEngine::persist_owed_checkpoints`]).
+    owed_to_disk: bool,
+    session_id: Option<String>,
 }
 
 mod boundary;
@@ -38,6 +43,8 @@ impl BonsaiEngine {
             tokens: tokens.to_vec(),
             state: self.model.prompt_checkpoint()?,
             reusable_boundary,
+            owed_to_disk: false,
+            session_id: None,
         });
         if self.prompt_checkpoints.len() > self.max_prompt_checkpoints {
             // The disk tier's policy: a boundary a few tokens past a kept one
@@ -66,6 +73,7 @@ impl BonsaiEngine {
         session_id: Option<&str>,
     ) -> crate::Result<(PromptPrefill, PromptCacheSource)> {
         self.collect_disk_writes();
+        self.persist_owed_checkpoints(prompt)?;
         let bounds: ReuseBounds = self.reuse_bounds(prompt);
         let (reused, source) = self.restore_reusable_prefix(prompt, &bounds, session_id)?;
         Ok((self.plan_prefill(prompt, &bounds, reused), source))
@@ -201,6 +209,70 @@ impl BonsaiEngine {
                 reusable_boundary,
                 self.prompt_cache_disk_bytes,
             )
+    }
+
+    /// Whether the GPU tier holds a checkpoint of exactly `tokens`.
+    pub(super) fn holds_checkpoint(&self, tokens: &[u32]) -> bool {
+        self.prompt_checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.tokens == tokens)
+    }
+
+    /// Owe the request tail checkpointed at `tokens` to the disk tier: no
+    /// other tier holds it, and its GPU checkpoint is the snapshot the
+    /// session's next turn restores.
+    pub(super) fn owe_to_disk(&mut self, tokens: &[u32], session_id: Option<&str>) {
+        if let Some(checkpoint) = self
+            .prompt_checkpoints
+            .iter_mut()
+            .find(|checkpoint| !checkpoint.reusable_boundary && checkpoint.tokens == tokens)
+        {
+            checkpoint.owed_to_disk = true;
+            checkpoint.session_id = session_id.map(str::to_owned);
+        }
+    }
+
+    /// Before `prompt` runs on the resident set, write to disk each owed
+    /// checkpoint it is about to overwrite: one `prompt` does not extend,
+    /// whose K/V rows its prefill or decode rewrites. One `prompt` extends is
+    /// superseded by this request's own tail and owes nothing more.
+    ///
+    /// Reading a request tail back costs about 38 KiB a token on the engine
+    /// thread, which an agent session's next turn, restoring the checkpoint
+    /// from the GPU, never needs. So a tail that also persisted a boundary is
+    /// read back only here, when a request of another session takes the set,
+    /// rather than at its end: dropped there, as it used to be, it was gone
+    /// for good once another session prefilled over it, and the session's next
+    /// turn fell back to a boundary turns older.
+    fn persist_owed_checkpoints(&mut self, prompt: &[u32]) -> crate::Result<()> {
+        if self.cache_state != self.model.state_id() {
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < self.prompt_checkpoints.len() {
+            let checkpoint = &mut self.prompt_checkpoints[index];
+            if !checkpoint.owed_to_disk || prompt.starts_with(&checkpoint.tokens) {
+                checkpoint.owed_to_disk = false;
+                index += 1;
+                continue;
+            }
+            let checkpoint = self.prompt_checkpoints.remove(index);
+            if !self.disk_would_keep(&checkpoint.tokens, false) {
+                continue;
+            }
+            // Purged by the OS, or no longer behind the set's position: a
+            // cache miss like any other.
+            if let Ok(Some(snapshot)) = self.model.prompt_snapshot_at(&checkpoint.state) {
+                self.save_session_snapshot(
+                    &checkpoint.tokens,
+                    checkpoint.session_id.as_deref(),
+                    Some(snapshot),
+                    true,
+                    false,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Keep what the resident set still holds after a request on it ended

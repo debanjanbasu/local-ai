@@ -2294,7 +2294,19 @@ bonsai --json --greedy --no-thinking --max-tokens 1`, cold, host tier off,
 MTP head; two interleaved runs per arm with other jobs loading the CPU) the
 time from the first token to the end of the request fell from 80 and 85 ms
 to 38 and 39 ms and the peak footprint from 2,620 and 2,629 MB to 2,059 and
-2,064 MB, the 0.56 GB copy (3.8 GB at 100K tokens).
+2,064 MB, the 0.56 GB copy (3.8 GB at 100K tokens). The GPU tier describes
+one buffer set, though, so that checkpoint was the only copy of the tail and
+was lost whenever another session's request took the tier: a request of
+another session running at the same time claims it at its milestones and end, and
+one that runs next prefills over its rows. The tail now goes to disk before
+its GPU copy does: at the request's end when the copy is already gone or
+another request is running, else when a request that does not extend it
+takes the set. `concurrent_sessions_each_restore_their_previous_tail`
+reproduces it with two sessions admitted together: on the old code the
+session whose turn ended first restored 245 tokens (its system turn) where
+its tail is at 286. Keeping per-set checkpoint lists would have avoided the
+readback but needs the scheduler's pooled and parked sets to keep their
+rows for it, and up to four 81 MB checkpoints per set.
 
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename

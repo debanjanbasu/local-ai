@@ -626,7 +626,14 @@ impl BonsaiEngine {
                 self.cached_tokens.extend_from_slice(&token_ids);
                 let represented_tokens = self.cached_tokens.clone();
                 let tail = &prompt[..prompt.len() - 1];
-                let persist = !generation.persisted_reusable_boundary;
+                // A request that persisted a boundary leaves its tail to the
+                // GPU checkpoint, which its session's next turn restores,
+                // unless that copy is already gone or about to be: another
+                // buffer set claimed the tier meanwhile, or another request
+                // is running, whose next milestone or end will.
+                let gpu_tail = self.holds_checkpoint(tail);
+                let persist =
+                    !generation.persisted_reusable_boundary || !gpu_tail || !self.active.is_empty();
                 let keep = self.host_would_keep(tail.len())
                     || (persist && self.disk_would_keep(tail, false));
                 // The prompt boundary's snapshot, read back now that decode
@@ -639,6 +646,9 @@ impl BonsaiEngine {
                 self.save_prompt_checkpoint(&represented_tokens, false)?;
                 if let Some(snapshot) = prompt_snapshot {
                     self.save_session_snapshot(tail, session_id, Some(snapshot), persist, false)?;
+                }
+                if !persist && !self.host_would_keep(tail.len()) {
+                    self.owe_to_disk(tail, session_id);
                 }
                 // Chat templates re-render assistant turns, so the output end is
                 // rarely a later prefix: keep it in (volatile) host memory only.

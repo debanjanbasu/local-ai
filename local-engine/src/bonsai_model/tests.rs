@@ -481,6 +481,98 @@ fn a_turn_after_a_new_boundary_restores_the_penultimate_checkpoint() {
     );
 }
 
+/// The GPU tier describes one buffer set, so two sessions whose turns run at
+/// once take it from each other: each request's milestones and end claim it
+/// for its own set and drop the other's checkpoints. With no host tier, the
+/// penultimate checkpoint of a request that persisted its system-turn
+/// boundary was the only copy of its tail, so the session whose turn ended
+/// first lost it, and its next turn restored only the system turn. Each
+/// session's next turn must restore its previous prompt's tail.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn concurrent_sessions_each_restore_their_previous_tail() {
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
+    let open = || {
+        BonsaiEngine::open_with_options(
+            Path::new(&path),
+            Some(2048),
+            DEFAULT_PREFILL_CHUNK,
+            None,
+            &MtpMode::Off(None),
+            NgramSettings::default(),
+            KvOptions::default(),
+        )
+        .expect("load model")
+    };
+    let params = GenerateParams {
+        temperature: 0.0,
+        max_tokens: 4,
+        ..GenerateParams::default()
+    };
+    let cache = tempfile::tempdir().expect("cache directory");
+    let mut engine = open();
+    engine.set_prompt_cache_checkpoints(4).expect("checkpoints");
+    engine.set_session_cache(0, Some(cache.path().to_owned()));
+    let encode = |engine: &BonsaiEngine, text: &str| engine.tokenizer.encode(text).expect("prompt");
+    // Distinct system turns, so each request persists its own boundary.
+    let sessions = [
+        "You are a careful filing clerk who keeps an inventory. ",
+        "You are a patient librarian who shelves returned books. ",
+    ]
+    .map(|role| {
+        encode(
+            &engine,
+            &format!(
+                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n\
+                 <|im_start|>assistant\n",
+                role.repeat(24),
+                "Describe the next task in one line. ".repeat(4)
+            ),
+        )
+    });
+    let ids = sessions
+        .iter()
+        .zip(["a", "b"])
+        .map(|(prompt, session)| {
+            engine
+                .admit(prompt, &params, Some(session), CancelToken::new())
+                .expect("admit")
+        })
+        .collect::<Vec<_>>();
+    let mut finished = 0;
+    while finished < ids.len() {
+        for (id, result) in engine.step(&mut |_, _, _| true, &mut |_, _| {}) {
+            assert!(ids.contains(&id));
+            result.expect("first turn");
+            finished += 1;
+        }
+    }
+    for (prompt, session) in sessions.iter().zip(["a", "b"]) {
+        let mut next = prompt[..prompt.len() - 1].to_vec();
+        next.extend(encode(
+            &engine,
+            " Then file it.<|im_end|>\n<|im_start|>assistant\n",
+        ));
+        let run = engine
+            .generate_session(&next, &params, Some(session), |_| true)
+            .expect("next turn");
+        assert!(
+            run.stats.reused_prompt_tokens >= prompt.len() - 1,
+            "session {session} reused {} from {:?}; its previous tail is at {}",
+            run.stats.reused_prompt_tokens,
+            run.cache_source,
+            prompt.len() - 1
+        );
+        assert_eq!(
+            run.token_ids,
+            open()
+                .generate(&next, &params, |_| true)
+                .expect("cold reference")
+                .token_ids
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device"]
 fn purged_gpu_and_host_snapshots_fall_back_to_disk_with_identical_tokens() {
