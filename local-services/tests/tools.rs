@@ -2,9 +2,10 @@
 //!
 //! Safety: every command run here is a fixed, harmless, strictly bounded one
 //! (`echo`, `wc`, `printf` of a fixed size, `ulimit` queries, `sleep` stopped
-//! by a short deadline, at most two background `sleep`s, one `perl` that
-//! leaves its process group and sleeps until the deadline). Refusals are
-//! checked on inert strings that are validated and never executed.
+//! by a short deadline, one 2 MiB file of zeros, at most two background
+//! `sleep`s, one `perl` that leaves its process group and sleeps until the
+//! deadline). Refusals are checked on inert strings that are validated and
+//! never executed.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -458,6 +459,47 @@ async fn shell_rlimits_are_set_in_the_child() {
     // never unlimited.
     let processes: u64 = lines[4].parse().expect("a number");
     assert!(processes > limits.shell_processes, "{processes}");
+}
+
+#[tokio::test]
+async fn shell_scratch_directory_is_bounded() {
+    let root = tempfile::tempdir().expect("root");
+    let tools = Toolbox::new(
+        Permissions {
+            root: Some(root.path().to_owned()),
+            shell: true,
+            ..Permissions::default()
+        },
+        Limits {
+            shell_scratch_bytes: 1024 * 1024,
+            ..Limits::default()
+        },
+    )
+    .expect("toolbox");
+    let started = Instant::now();
+    // 2 MiB, once, against a 1 MiB quota; the sleep only keeps the command
+    // alive until the quota check sees the file.
+    let runs = runs(
+        tools
+            .run(
+                sh(
+                    &["head -c 2097152 /dev/zero > \"$TMPDIR/big\" && sleep 5"],
+                    None,
+                ),
+                10 * SECOND,
+            )
+            .await
+            .expect("shell"),
+    );
+    assert_eq!(runs[0].outcome, Outcome::Signal(9), "{:?}", runs[0]);
+    assert!(
+        runs[0]
+            .stderr
+            .contains("[killed: the scratch directory passed"),
+        "{:?}",
+        runs[0]
+    );
+    assert!(started.elapsed() < 4 * SECOND, "{:?}", started.elapsed());
 }
 
 #[tokio::test]

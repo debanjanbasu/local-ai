@@ -206,7 +206,11 @@ deadline, and when the call is dropped, the leader is also killed by PID (it
 is still unreaped), so a leader that moved itself into another group cannot
 outlive the call; a call still unreaped 2 s after its deadline is abandoned
 (and killed again). Descriptors the server holds are marked close-on-exec in
-the child, so the command inherits only its three standard streams. Each
+the child, so the command inherits only its three standard streams. The
+scratch directory is measured every 250 ms (polling, because macOS has no
+per-directory quota and no event that reports bytes written) and a command
+whose scratch tree passes 1 GiB allocated or 20,000 entries is killed
+(reported as `SIGKILL`, with a marker on stderr). Each
 output stream keeps 32 KiB and reports the rest as a truncation marker. The
 environment is cleared (`PATH`, `HOME`/`TMPDIR` = scratch, `LANG`), stdin is
 `/dev/null`.
@@ -232,6 +236,12 @@ public IP literals allowed, up to five redirects each checked anew, and a
 - A process other than the leader that calls `setsid` or `setpgid` leaves
   the process group and survives the deadline kill; it stays inside the
   sandbox, its CPU limit and the process limit.
+- Disk use is bounded only in the scratch directory, and only to within what
+  a command writes in one 250 ms check interval. With
+  `--tools-allow-write`, writes to the root are bounded per file
+  (`RLIMIT_FSIZE`, 16 MiB) and by the deadline, CPU and process limits, not
+  in total; and a process that escaped the group can keep writing after
+  the call ends (to the root, or to scratch files it still holds open).
 - `RLIMIT_NPROC` counts all of the user's processes, so the margin is shared
   with anything else the user starts meanwhile.
 - The shell can read system directories (`/usr`, `/System`, `/private/etc`,

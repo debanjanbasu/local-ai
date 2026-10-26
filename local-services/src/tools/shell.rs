@@ -26,6 +26,11 @@
 //!   Nothing else is ever signalled.
 //! - Every descriptor above the standard streams is marked close-on-exec in
 //!   the child, so nothing the server holds open reaches the command.
+//! - **A scratch quota**: the scratch directory is measured every 250 ms
+//!   (macOS has no per-directory quota or write-size event), and a command
+//!   whose scratch tree passes [`super::Limits::shell_scratch_bytes`]
+//!   allocated bytes or [`MAX_SCRATCH_ENTRIES`] entries is killed like one
+//!   that timed out, reported as `SIGKILL` with a marker on `stderr`.
 //! - **Output caps**: each stream keeps at most the cap and counts the rest,
 //!   and a cut stream ends with a marker giving both numbers.
 //! - A clean environment (`PATH`, `HOME` and `TMPDIR` pointing at the
@@ -75,6 +80,7 @@ pub struct Policy {
     file_bytes: u64,
     open_files: u64,
     processes: u64,
+    scratch_bytes: u64,
 }
 
 impl Policy {
@@ -89,6 +95,7 @@ impl Policy {
             file_bytes: limits.shell_file_bytes,
             open_files: limits.shell_open_files,
             processes: limits.shell_processes,
+            scratch_bytes: limits.shell_scratch_bytes,
         }
     }
 }
@@ -428,6 +435,67 @@ async fn capture(stream: Option<impl AsyncRead + Unpin>, cap: usize, until: Inst
     }
 }
 
+/// Why [`run`] stopped waiting for a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    Exited,
+    TimedOut,
+    ScratchFull,
+}
+
+/// How often the scratch directory is measured while a command runs. This
+/// is polling because macOS offers nothing better: no per-directory quota,
+/// and no event that reports bytes written (`FSEvents` reports paths,
+/// coalesced and late).
+const SCRATCH_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+/// Entries (files, directories, links) the scratch directory may hold.
+pub const MAX_SCRATCH_ENTRIES: u64 = 20_000;
+
+/// Resolves once the tree at `dir` holds more than `max_bytes` allocated
+/// bytes or [`MAX_SCRATCH_ENTRIES`] entries; never otherwise.
+async fn scratch_full(dir: PathBuf, max_bytes: u64) {
+    loop {
+        tokio::time::sleep(SCRATCH_CHECK_INTERVAL).await;
+        let dir = dir.clone();
+        let over = tokio::task::spawn_blocking(move || tree_over(&dir, max_bytes))
+            .await
+            .unwrap_or(false);
+        if over {
+            return;
+        }
+    }
+}
+
+/// Whether the tree at `root` holds more than `max_bytes` allocated bytes or
+/// [`MAX_SCRATCH_ENTRIES`] entries, stopping as soon as it does. Symlinks
+/// are counted, never followed; an entry that vanishes mid-walk is skipped.
+fn tree_over(root: &Path, max_bytes: u64) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut bytes = 0_u64;
+    let mut entries = 0_u64;
+    let mut pending = vec![root.to_owned()];
+    while let Some(dir) = pending.pop() {
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in listing.flatten() {
+            entries += 1;
+            // `DirEntry::metadata` does not follow a symlink.
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+            if bytes > max_bytes || entries > MAX_SCRATCH_ENTRIES {
+                return true;
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    false
+}
+
 /// Run one command under `policy` for at most `timeout`.
 pub async fn run(
     policy: &Policy,
@@ -476,9 +544,14 @@ pub async fn run(
         )
         .map(drop)
     });
-    let timed_out = tokio::time::timeout_at(deadline, exited).await.is_err();
+    let ended = tokio::select! {
+        exited = tokio::time::timeout_at(deadline, exited) => {
+            if exited.is_err() { Ended::TimedOut } else { Ended::Exited }
+        }
+        () = scratch_full(scratch_path.clone(), policy.scratch_bytes) => Ended::ScratchFull,
+    };
     group.kill();
-    if timed_out {
+    if ended != Ended::Exited {
         // Also by PID, for a leader that left its group (`setpgid`). It is
         // unreaped (`WNOWAIT`), so the PID cannot have been reused.
         let _ = child.start_kill();
@@ -498,15 +571,26 @@ pub async fn run(
     // Reaped: the group ID may now be reused, so it is never signalled again.
     group.armed = false;
     drop(scratch);
-    let outcome = if timed_out {
-        Outcome::TimedOut
-    } else if let Some(code) = status.code() {
-        Outcome::Exit(code)
-    } else {
-        Outcome::Signal(status.signal().unwrap_or_default())
+    let outcome = match ended {
+        Ended::TimedOut => Outcome::TimedOut,
+        Ended::ScratchFull => Outcome::Signal(libc::SIGKILL),
+        Ended::Exited => status.code().map_or_else(
+            || Outcome::Signal(status.signal().unwrap_or_default()),
+            Outcome::Exit,
+        ),
     };
     let (stdout, out_cut) = stdout.text(cap);
-    let (stderr, err_cut) = stderr.text(cap);
+    let (mut stderr, err_cut) = stderr.text(cap);
+    if ended == Ended::ScratchFull {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        let _ = write!(
+            stderr,
+            "[killed: the scratch directory passed {} bytes or {MAX_SCRATCH_ENTRIES} entries]",
+            policy.scratch_bytes
+        );
+    }
     Ok(CommandRun {
         command: command.to_owned(),
         stdout,

@@ -76,6 +76,9 @@ pub struct Limits {
     /// already runs (`RLIMIT_NPROC` is per user, so it is set to the user's
     /// current count plus this).
     pub shell_processes: u64,
+    /// Allocated bytes a shell command's scratch directory may hold; past
+    /// them (or past [`shell::MAX_SCRATCH_ENTRIES`] entries) it is killed.
+    pub shell_scratch_bytes: u64,
     /// Bytes of body web fetch reads before it stops and marks truncation.
     pub fetch_max_bytes: usize,
     /// Largest file a write or edit may produce.
@@ -91,6 +94,7 @@ impl Default for Limits {
             shell_file_bytes: 16 * 1024 * 1024,
             shell_open_files: 256,
             shell_processes: 64,
+            shell_scratch_bytes: 1024 * 1024 * 1024,
             fetch_max_bytes: 256 * 1024,
             max_write_bytes: 4 * 1024 * 1024,
         }
