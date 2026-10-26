@@ -1150,7 +1150,12 @@ fn large_values_round_trip_through_blobs_byte_for_byte() {
     let request = json!({"input":input_items, "background":true});
     let creator = json!({"project_id":"proj_1","api_key_id":"key_1"});
     store
-        .save_with(&response, &input_items, Some((&request, Some(&creator))))
+        .save_with(
+            &response,
+            &input_items,
+            Some((&request, Some(&creator))),
+            Some("proj_1"),
+        )
         .expect("saved");
 
     let stored = scratch
@@ -1162,6 +1167,7 @@ fn large_values_round_trip_through_blobs_byte_for_byte() {
     assert_eq!(stored.input_items, input_items);
     assert_eq!(stored.request, Some(request));
     assert_eq!(stored.creator, Some(creator));
+    assert_eq!(stored.project.as_deref(), Some("proj_1"));
     // What the endpoints serialize is what was saved, byte for byte.
     assert_eq!(stored.response.to_string(), response.to_string());
     assert_eq!(
