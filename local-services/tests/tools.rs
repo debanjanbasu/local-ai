@@ -2,7 +2,8 @@
 //!
 //! Safety: every command run here is a fixed, harmless, strictly bounded one
 //! (`echo`, `wc`, `printf` of a fixed size, `ulimit` queries, `sleep` stopped
-//! by a short deadline, at most two background `sleep`s). Refusals are
+//! by a short deadline, at most two background `sleep`s, one `perl` that
+//! leaves its process group and sleeps until the deadline). Refusals are
 //! checked on inert strings that are validated and never executed.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -499,6 +500,38 @@ async fn shell_kills_its_process_group_when_the_command_exits() {
 }
 
 #[tokio::test]
+async fn shell_deadline_kills_a_leader_that_left_its_group() {
+    let root = tempfile::tempdir().expect("root");
+    let tools = toolbox(root.path(), false, true);
+    let started = Instant::now();
+    // One escape attempt: the shell becomes perl (same PID, the group's
+    // leader), which moves itself into this test process's group, out of
+    // reach of the group kill. The hang guard bounds the test either way;
+    // dropping the call kills the leader by PID.
+    let escape = "echo $$; exec /usr/bin/perl -e 'setpgrp(0, getpgrp(getppid())) or die \"setpgrp: $!\\n\"; sleep 1e9'";
+    let call = tools.run(sh(&[escape], Some(SECOND)), 10 * SECOND);
+    let runs = runs(
+        tokio::time::timeout(8 * SECOND, call)
+            .await
+            .expect("the call outlived its deadline")
+            .expect("shell"),
+    );
+    assert_eq!(runs[0].outcome, Outcome::TimedOut, "{:?}", runs[0]);
+    assert!(runs[0].stderr.is_empty(), "{:?}", runs[0]);
+    assert!(started.elapsed() < 5 * SECOND, "{:?}", started.elapsed());
+    let pid = runs[0].stdout.trim();
+    let status = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .expect("ps");
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.trim().is_empty() || status.trim().starts_with('Z'),
+        "{status:?}"
+    );
+}
+
+#[tokio::test]
 async fn dropping_a_shell_call_kills_it() {
     let root = tempfile::tempdir().expect("root");
     let tools = toolbox(root.path(), true, true);
@@ -607,5 +640,28 @@ async fn fetch_refuses_names_resolving_to_loopback() {
     assert!(
         matches!(&error, ToolError::Denied(message) if message.contains("non-public")),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn shell_inherits_no_descriptors_beyond_its_standard_streams() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let root = tempfile::tempdir().expect("root");
+    let file = std::fs::File::open("/etc/hosts").expect("open");
+    // A descriptor without close-on-exec, as a C library might leave one.
+    // SAFETY: `dup` of an open descriptor; the result is owned below.
+    #[allow(unsafe_code)]
+    let leaked = unsafe { OwnedFd::from_raw_fd(libc::dup(file.as_raw_fd())) };
+    let tools = toolbox(root.path(), false, true);
+    let runs = runs(
+        tools
+            .run(sh(&["ls /dev/fd"], None), 10 * SECOND)
+            .await
+            .expect("shell"),
+    );
+    let open: Vec<&str> = runs[0].stdout.lines().collect();
+    assert!(
+        !open.contains(&leaked.as_raw_fd().to_string().as_str()),
+        "{open:?}"
     );
 }

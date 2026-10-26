@@ -197,7 +197,12 @@ directory, `/dev/null` and, only with `--tools-allow-write`, the root minus
 current process count plus 64 (the limit is per user on macOS). The child
 leads a new process group; at the deadline, when the command exits, or when
 the call is dropped, that group (and only it) receives `SIGKILL`, always
-before the leader is reaped so the group ID cannot have been reused. Each
+before the leader is reaped so the group ID cannot have been reused. At the
+deadline, and when the call is dropped, the leader is also killed by PID (it
+is still unreaped), so a leader that moved itself into another group cannot
+outlive the call; a call still unreaped 2 s after its deadline is abandoned
+(and killed again). Descriptors the server holds are marked close-on-exec in
+the child, so the command inherits only its three standard streams. Each
 output stream keeps 32 KiB and reports the rest as a truncation marker. The
 environment is cleared (`PATH`, `HOME`/`TMPDIR` = scratch, `LANG`), stdin is
 `/dev/null`.
@@ -220,9 +225,9 @@ public IP literals allowed, up to five redirects each checked anew, and a
 - macOS rejects `RLIMIT_AS` and does not enforce `RLIMIT_DATA`/`RLIMIT_RSS`,
   so a command's memory is bounded only indirectly by CPU time and the
   deadline.
-- A process that calls `setsid` leaves the process group and survives the
-  deadline kill; it stays inside the sandbox, its CPU limit and the process
-  limit.
+- A process other than the leader that calls `setsid` or `setpgid` leaves
+  the process group and survives the deadline kill; it stays inside the
+  sandbox, its CPU limit and the process limit.
 - `RLIMIT_NPROC` counts all of the user's processes, so the margin is shared
   with anything else the user starts meanwhile.
 - The shell can read system directories (`/usr`, `/System`, `/private/etc`,

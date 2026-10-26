@@ -24,9 +24,10 @@
 //!
 //! What the OS cannot enforce is documented rather than imitated: macOS
 //! rejects `RLIMIT_AS`, so a sandboxed command's memory is bounded only by
-//! its CPU time and deadline, and a command that moves itself into a new
-//! session (`setsid`) leaves the process group that is terminated at the end
-//! of the call. See `docs/TOOLS.md`.
+//! its CPU time and deadline, and a process the command starts that moves
+//! itself into a new session or group (`setsid`, `setpgid`) leaves the
+//! process group that is terminated at the end of the call. See
+//! `docs/TOOLS.md`.
 
 pub mod fetch;
 pub mod fs;
@@ -324,16 +325,23 @@ impl Toolbox {
         } = request
         {
             // The shell enforces its own deadlines, killing the process group
-            // and keeping the output so far, so it is not cut off from outside.
+            // and the leader and keeping the output so far. The outer bound
+            // only catches a command that outlives that kill: dropping the
+            // run kills the group and, by PID, the leader again.
             let root = self.root_path()?;
             let policy = shell::Policy::new(root, self.inner.permissions.write, &self.inner.limits);
             let per_command = asked.map_or(timeout, |asked| asked.min(timeout));
             let cap = max_output_bytes.map_or(self.inner.limits.max_output_bytes, |asked| {
                 asked.clamp(1, self.inner.limits.max_output_bytes)
             });
-            return shell::run_all(&policy, &commands, per_command, timeout, cap)
-                .await
-                .map(Output::Shell);
+            let bound = timeout + shell::DRAIN_GRACE + shell::REAP_GRACE;
+            return tokio::time::timeout(
+                bound,
+                shell::run_all(&policy, &commands, per_command, timeout, cap),
+            )
+            .await
+            .unwrap_or(Err(ToolError::TimedOut(timeout)))
+            .map(Output::Shell);
         }
         let work = async {
             match request {

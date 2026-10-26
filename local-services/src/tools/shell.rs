@@ -16,12 +16,15 @@
 //!   `RLIMIT_NPROC` counts every process of the user, so it is set to the
 //!   user's current count plus [`super::Limits::shell_processes`].
 //! - **A wall-clock deadline**, after which the child's own process group
-//!   (it is started as the leader of a new one) receives `SIGKILL`. The group
-//!   is also killed when the command exits, so nothing it left in the
+//!   (it is started as the leader of a new one) receives `SIGKILL`, and so
+//!   does the leader by PID, in case it moved itself into another group. The
+//!   group is also killed when the command exits, so nothing it left in the
 //!   background outlives the call, and when the caller drops the future. The
-//!   group is always signalled while its leader is still unreaped, so its ID
-//!   cannot have been reused by an unrelated process. Nothing else is ever
-//!   signalled.
+//!   group and the leader are always signalled while the leader is still
+//!   unreaped, so neither ID can have been reused by an unrelated process.
+//!   Nothing else is ever signalled.
+//! - Every descriptor above the standard streams is marked close-on-exec in
+//!   the child, so nothing the server holds open reaches the command.
 //! - **Output caps**: each stream keeps at most the cap and counts the rest,
 //!   and a cut stream ends with a marker giving both numbers.
 //! - A clean environment (`PATH`, `HOME` and `TMPDIR` pointing at the
@@ -29,11 +32,11 @@
 //!
 //! Gaps, stated rather than papered over: macOS rejects `RLIMIT_AS` and does
 //! not enforce `RLIMIT_DATA`/`RLIMIT_RSS`, so memory is bounded only through
-//! CPU time and the deadline; a process that calls `setsid` leaves the
-//! process group and is not killed at the deadline (it remains confined by
-//! the sandbox, its CPU limit and the process limit); and file reads of
-//! system directories are allowed, so a command can read what any local
-//! user can read there.
+//! CPU time and the deadline; a process other than the leader that calls
+//! `setsid` or `setpgid` leaves the process group and is not killed at the
+//! deadline (it remains confined by the sandbox, its CPU limit and the
+//! process limit); and file reads of system directories are allowed, so a
+//! command can read what any local user can read there.
 
 use std::fmt::Write as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -57,7 +60,10 @@ pub const MAX_COMMANDS: usize = 16;
 pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
 /// How long output is still collected after the group was killed, for a
 /// process that escaped the group while holding a pipe.
-const DRAIN_GRACE: Duration = Duration::from_secs(1);
+pub const DRAIN_GRACE: Duration = Duration::from_secs(1);
+/// How long a killed command may take to be reaped after the output drain,
+/// past which the caller abandons the call (killing it again on drop).
+pub const REAP_GRACE: Duration = Duration::from_secs(1);
 
 /// What one command may do, fixed by the server's grants.
 #[derive(Debug, Clone)]
@@ -242,6 +248,8 @@ struct ChildLimits {
     file_bytes: u64,
     open_files: u64,
     processes: u64,
+    /// The highest descriptor the child marks close-on-exec.
+    last_fd: i32,
 }
 
 impl ChildLimits {
@@ -264,6 +272,7 @@ impl ChildLimits {
                     .unwrap_or(u64::MAX),
             ),
             processes: wanted.min(hard),
+            last_fd: highest_fd().saturating_add(FD_MARGIN),
         })
     }
 
@@ -287,8 +296,35 @@ impl ChildLimits {
         rustix::process::setrlimit(Resource::Nofile, both(self.open_files))?;
         rustix::process::setrlimit(Resource::Core, both(0))?;
         rustix::process::setrlimit(Resource::Nproc, both(self.processes))?;
+        // Descriptors the server holds without close-on-exec (opened by a
+        // library) must not reach the command. Marking them, rather than
+        // closing them, keeps the descriptor through which the standard
+        // library reports a failed `exec`, which is already close-on-exec.
+        for fd in 3..=self.last_fd {
+            // SAFETY: `fcntl` is async-signal-safe; a descriptor that is not
+            // open fails with `EBADF`, which is ignored.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
         Ok(())
     }
+}
+
+/// Descriptors above the highest one seen open that the child still marks
+/// close-on-exec, for those opened between the scan and the `fork`.
+const FD_MARGIN: i32 = 64;
+
+/// The highest descriptor this process has open now (from `/dev/fd`), or 2
+/// when it cannot be listed.
+fn highest_fd() -> i32 {
+    std::fs::read_dir("/dev/fd").map_or(2, |entries| {
+        entries
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+            .max()
+            .unwrap_or(2)
+    })
 }
 
 /// `PROC_RUID_ONLY` from `<sys/proc_info.h>`: processes by real user ID,
@@ -405,39 +441,7 @@ pub async fn run(
         .map_err(|error| failed("cannot resolve the scratch directory", error))?;
     let root = std::fs::canonicalize(&policy.root)
         .map_err(|error| failed("cannot resolve the tools root", error))?;
-    let limits = ChildLimits::for_policy(policy)?;
-    let mut builder = tokio::process::Command::new(SANDBOX_EXEC);
-    builder
-        .arg("-p")
-        .arg(profile(policy.write))
-        .arg("-D")
-        .arg(param("ROOT", &root))
-        .arg("-D")
-        .arg(param("SCRATCH", &scratch_path))
-        .arg("-D")
-        .arg(param("GIT", &root.join(".git")))
-        .arg(SHELL)
-        .arg("-c")
-        .arg(command)
-        .current_dir(&root)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("HOME", &scratch_path)
-        .env("TMPDIR", &scratch_path)
-        .env("LANG", "en_US.UTF-8")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // The leader of its own new group, so the group can be killed
-        // without touching any other process.
-        .process_group(0)
-        .kill_on_drop(true);
-    // SAFETY: the closure only calls `setrlimit`, which is async-signal-safe,
-    // and touches nothing but the copied `limits`.
-    #[allow(unsafe_code)]
-    unsafe {
-        builder.pre_exec(move || limits.apply());
-    }
+    let mut builder = sandboxed(policy, &root, &scratch_path, command)?;
     let mut child = builder
         .spawn()
         .map_err(|error| failed("cannot start the sandboxed shell", error))?;
@@ -469,6 +473,11 @@ pub async fn run(
     });
     let timed_out = tokio::time::timeout_at(deadline, exited).await.is_err();
     group.kill();
+    if timed_out {
+        // Also by PID, for a leader that left its group (`setpgid`). It is
+        // unreaped (`WNOWAIT`), so the PID cannot have been reused.
+        let _ = child.start_kill();
+    }
     let stdout = stdout.await.unwrap_or(Capture {
         kept: Vec::new(),
         total: 0,
@@ -500,6 +509,50 @@ pub async fn run(
         outcome,
         truncated: out_cut || err_cut,
     })
+}
+
+/// The sandboxed `/bin/sh -c command` for `policy`, run in `root` (canonical)
+/// with the scratch directory `scratch` (canonical), not yet started.
+fn sandboxed(
+    policy: &Policy,
+    root: &Path,
+    scratch: &Path,
+    command: &str,
+) -> Result<tokio::process::Command, ToolError> {
+    let limits = ChildLimits::for_policy(policy)?;
+    let mut builder = tokio::process::Command::new(SANDBOX_EXEC);
+    builder
+        .arg("-p")
+        .arg(profile(policy.write))
+        .arg("-D")
+        .arg(param("ROOT", root))
+        .arg("-D")
+        .arg(param("SCRATCH", scratch))
+        .arg("-D")
+        .arg(param("GIT", &root.join(".git")))
+        .arg(SHELL)
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", scratch)
+        .env("TMPDIR", scratch)
+        .env("LANG", "en_US.UTF-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // The leader of its own new group, so the group can be killed
+        // without touching any other process.
+        .process_group(0)
+        .kill_on_drop(true);
+    // SAFETY: the closure only calls `setrlimit` and `fcntl`, which are
+    // async-signal-safe, and touches nothing but the copied `limits`.
+    #[allow(unsafe_code)]
+    unsafe {
+        builder.pre_exec(move || limits.apply());
+    }
+    Ok(builder)
 }
 
 fn param(name: &str, path: &Path) -> std::ffi::OsString {
