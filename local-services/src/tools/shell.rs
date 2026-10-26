@@ -9,7 +9,8 @@
 //!   sandbox), file reads only of the system directories a shell needs, the
 //!   root and a per-call scratch directory (metadata is readable everywhere),
 //!   and file writes only to the scratch directory, `/dev/null` and, with the
-//!   `write` grant, the root outside `.git`.
+//!   `write` grant, the root outside any `.git` directory (at any depth, in
+//!   any case).
 //! - **`setrlimit`** in the child, before `exec`: `RLIMIT_CPU`,
 //!   `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, `RLIMIT_CORE` (zero) and
 //!   `RLIMIT_NPROC`, soft and hard alike so the command cannot raise them.
@@ -201,8 +202,8 @@ pub async fn run_all(
     Ok(runs)
 }
 
-/// The Seatbelt profile. `ROOT`, `SCRATCH` and `GIT` (the root's `.git`) are
-/// passed as parameters, never spliced into the text.
+/// The Seatbelt profile. `ROOT` and `SCRATCH` are passed as parameters,
+/// never spliced into the text.
 #[must_use]
 pub fn profile(write: bool) -> String {
     let mut profile = String::from(
@@ -232,9 +233,13 @@ pub fn profile(write: bool) -> String {
 "#,
     );
     if write {
+        // Never a `.git` component, at any depth and in any case, as the
+        // file tools refuse it (macOS file systems usually ignore case).
         profile.push_str(
-            "(allow file-write*\n  (require-all (subpath (param \"ROOT\")) \
-             (require-not (subpath (param \"GIT\")))))\n",
+            r#"(allow file-write*
+  (require-all (subpath (param "ROOT"))
+    (require-not (regex #"/\.[Gg][Ii][Tt](/|$)"))))
+"#,
         );
     }
     profile.push_str("(deny network*)\n");
@@ -528,8 +533,6 @@ fn sandboxed(
         .arg(param("ROOT", root))
         .arg("-D")
         .arg(param("SCRATCH", scratch))
-        .arg("-D")
-        .arg(param("GIT", &root.join(".git")))
         .arg(SHELL)
         .arg("-c")
         .arg(command)

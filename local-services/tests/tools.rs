@@ -464,6 +464,29 @@ async fn shell_writes_are_confined() {
     assert!(root.join("inside.txt").exists());
     assert!(!root.join(".git/inside.txt").exists());
     assert!(!outside.exists());
+    // A nested repository's `.git`, in any case, is as closed as the root's;
+    // names that only resemble it are not.
+    std::fs::create_dir_all(root.join("sub/.git")).expect("nested .git");
+    writable
+        .run(
+            sh(
+                &[
+                    "echo x > sub/.git/config",
+                    "echo x > sub/.GIT/hooks",
+                    "mkdir -p deep/.Git",
+                    "echo x > sub/.github; echo x > sub/x.git",
+                ],
+                None,
+            ),
+            10 * SECOND,
+        )
+        .await
+        .expect("shell");
+    assert!(!root.join("sub/.git/config").exists());
+    assert!(!root.join("sub/.git/hooks").exists());
+    assert!(!root.join("deep/.Git").exists());
+    assert!(root.join("sub/.github").exists());
+    assert!(root.join("sub/x.git").exists());
     // A hard link would make a file outside the root writable through it.
     let source = outer.path().join("source.txt");
     std::fs::write(&source, "outside\n").expect("source");

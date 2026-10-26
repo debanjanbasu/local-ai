@@ -192,7 +192,8 @@ lookups (so it cannot ask launchd to start anything outside the sandbox),
 reads limited to system directories, the root and a per-call scratch
 directory (metadata is readable everywhere), writes limited to the scratch
 directory, `/dev/null` and, only with `--tools-allow-write`, the root minus
-`.git`. In the child before `exec`: `RLIMIT_CPU` 10 s, `RLIMIT_FSIZE` 16 MiB,
+every `.git` directory (at any depth, matched case-insensitively, as the file
+tools refuse them). In the child before `exec`: `RLIMIT_CPU` 10 s, `RLIMIT_FSIZE` 16 MiB,
 `RLIMIT_NOFILE` 256, `RLIMIT_CORE` 0 and `RLIMIT_NPROC` set to the user's
 current process count plus 64 (the limit is per user on macOS). The child
 leads a new process group; at the deadline, when the command exits, or when
