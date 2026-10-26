@@ -1666,8 +1666,10 @@ asks the prompt cache again for a longer prefix than admission restored and
 restores that one when it gains at least one token in 64 of it: requests
 admitted together that share a long uncached prefix (sub-agents fanned out
 at once) prefill one after another, and each later one starts from the
-snapshot the first wrote at the end of that prefix, waiting for it if the
-write is still in flight, instead of prefilling it again (see
+snapshot the first wrote at the end of that prefix instead of prefilling it
+again. While that write is still in flight the later one skips its prefill
+each step another request decodes, so their tokens keep coming, and waits for
+the write only when none does; admission never waits for it (see
 [Concurrency measurements](#concurrency-measurements)). A prompt of at most 128 tokens to prefill (a typical
 chat turn) goes whole, in a pass of its own after the step's decode round. A
 longer one, beside two or more decoding requests, prefills inside their
@@ -2286,8 +2288,11 @@ the GPU tier where the penultimate checkpoint is at 396.
 Disk snapshots are written by one background thread the engine owns. The
 engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
 and trim run behind the request. A snapshot is indexed for reuse only after
-its rename is reported, so a file still being written is never loaded; a
-request whose best disk match is still in flight waits for that one write.
+its rename is reported, so a file still being written is never loaded. A
+request whose best disk match is still in flight is not held up at
+admission; its first prefill step asks again and skips steps while other
+requests decode, or waits for that one write when none does (see
+[Prompts prefill inside the decode steps](#prompts-prefill-inside-the-decode-steps)).
 At most one job is in flight and one queued: a newer job replaces the queued
 one, except that a request tail never displaces a shared boundary. Dropping
 the engine finishes pending writes; the server, whose engine is never

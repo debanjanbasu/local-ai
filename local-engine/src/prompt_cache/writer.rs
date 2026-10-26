@@ -242,6 +242,22 @@ impl Writer {
             .unwrap_or_else(PoisonError::into_inner);
     }
 
+    /// The length of the longest pending job whose tokens satisfy `matches`,
+    /// without waiting for it.
+    pub fn longest_pending(&self, mut matches: impl FnMut(&[u32]) -> bool) -> Option<usize> {
+        let state = self.shared.lock();
+        if state.dead {
+            return None;
+        }
+        state
+            .in_flight
+            .iter()
+            .chain(state.queued.as_ref().map(|job| &job.tokens))
+            .filter(|tokens| matches(tokens))
+            .map(Vec::len)
+            .max()
+    }
+
     /// Block until every accepted job has finished.
     pub fn flush(&self) {
         self.wait_for(|_| true);

@@ -56,6 +56,9 @@ pub(super) struct ActiveGeneration {
     pub(super) lag: HeadLag,
     /// The prompt's remaining prefill, until its first sample is taken.
     pub(super) prefill: Option<PromptPrefill>,
+    /// Skip this step's prefill: a disk write that restores more of the
+    /// prompt is still in flight (see [`BonsaiEngine::refresh_prefix`]).
+    defer_prefill: bool,
     /// Prefill chunks reported to the caller.
     pub(super) prefill_chunks: usize,
     /// Running estimates of the chance a lookup or head draft is accepted,
@@ -292,6 +295,7 @@ impl BonsaiEngine {
             state: None,
             lag: HeadLag::default(),
             prefill: None,
+            defer_prefill: false,
             prefill_chunks: 0,
             ngram_acceptance: INITIAL_NGRAM_ACCEPTANCE,
             mtp_acceptance: INITIAL_MTP_ACCEPTANCE,
@@ -315,7 +319,9 @@ impl BonsaiEngine {
     /// admission: requests admitted together that share a long uncached
     /// prefix (sub-agents fanned out at once) prefill one at a time, and each
     /// later one then starts from the snapshot the first left at that prefix
-    /// instead of prefilling it again.
+    /// instead of prefilling it again. While that snapshot's disk write is
+    /// still in flight, the generation skips its prefill each step another
+    /// request decodes, and waits for the write only when none does.
     pub(super) fn refresh_prefix(
         &mut self,
         generation: &mut ActiveGeneration,
@@ -327,10 +333,25 @@ impl BonsaiEngine {
         if plan.done() != reused {
             return Ok(());
         }
-        let best = self.reusable_prefix(&generation.prompt);
         // A restore costs in proportion to the prefix it copies, prefill in
         // proportion to the tokens it saves (about 8 ms against 0.1 ms each).
-        if best <= reused || (best - reused) * 64 < best {
+        let worth = |best: usize| best > reused && (best - reused) * 64 >= best;
+        let mut best = self.reusable_prefix(&generation.prompt);
+        let held = best.max(reused);
+        if self
+            .pending_disk_prefix(&generation.prompt, held)
+            .is_some_and(worth)
+        {
+            if self.active.iter().any(ActiveGeneration::decoding) {
+                // Waiting here would stall every decoding request for the
+                // rest of the write: sit this step out and ask again next one.
+                generation.defer_prefill = true;
+                return Ok(());
+            }
+            self.await_disk_prefix(&generation.prompt, held);
+            best = self.reusable_prefix(&generation.prompt);
+        }
+        if !worth(best) {
             return Ok(());
         }
         self.model.take_gpu_time();
@@ -352,6 +373,9 @@ impl BonsaiEngine {
         budget: usize,
         progress: &mut dyn FnMut(u64, PrefillProgress),
     ) -> crate::Result<()> {
+        if std::mem::take(&mut generation.defer_prefill) {
+            return Ok(());
+        }
         let Some(mut plan) = generation.prefill.take() else {
             return Ok(());
         };
