@@ -333,8 +333,10 @@ async fn dispatch(
     if admin::matches(parts.uri.path()) {
         return admin::handle(&state, &parts, body, &caller).await;
     }
+    // Stored objects are the caller's project's (see `admin::Caller::project`).
+    let project = caller.project();
     if services::matches(parts.uri.path()) {
-        let response = services::handle(&state, &parts, body).await;
+        let response = services::handle(&state, &parts, body, project).await;
         if parts.method == Method::DELETE
             && parts.uri.path().starts_with("/v1/files/")
             && response.status().is_success()
@@ -349,7 +351,7 @@ async fn dispatch(
         return batches::handle(&state, &parts, body, &caller).await;
     }
     if vector_stores::matches(parts.uri.path()) {
-        return vector_stores::handle(&state, &parts, body).await;
+        return vector_stores::handle(&state, &parts, body, project).await;
     }
     if parts.method == Method::GET && parts.uri.path() == "/health" {
         return json_response(
@@ -398,13 +400,13 @@ async fn dispatch(
     }
     if parts.method == Method::POST && parts.uri.path() == compaction::ROUTE {
         let meter = admin::Meter::completions(&state, &caller);
-        return compaction::handle(&state, &parts.headers, body, &meter).await;
+        return compaction::handle(&state, &parts.headers, body, (&meter, project)).await;
     }
     if parts.method == Method::POST && parts.uri.path() == decisions::ROUTE {
         return decisions::handle(&state, &parts.headers, body).await;
     }
     // Authentication has already passed, so a stored response is never read or
-    // deleted for a caller without the key.
+    // deleted for a caller without the key, nor one of another project.
     if let Some(rest) = parts.uri.path().strip_prefix("/v1/responses/")
         && (matches!(parts.method, Method::GET | Method::DELETE)
             || (parts.method == Method::POST && rest.ends_with("/cancel")))
@@ -414,6 +416,7 @@ async fn dispatch(
             &parts.method,
             rest,
             parts.uri.query(),
+            project,
             &parts.headers,
         )
         .await;
@@ -455,7 +458,11 @@ async fn dispatch(
     let (thinking, store) = (state.thinking, state.responses.clone());
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
     let temporary = state.temporary.clone();
-    let services = state.services.clone();
+    let services = state
+        .services
+        .as_ref()
+        .map(|services| services.store().scoped(project));
+    let owner = project.map(str::to_owned);
     if count_tokens {
         let engine = state.engine.clone();
         let counted = tokio::task::spawn_blocking(move || {
@@ -463,7 +470,7 @@ async fn dispatch(
                 &body,
                 thinking,
                 store.as_ref(),
-                services.as_deref().map(services::Services::store),
+                (services.as_ref(), owner.as_deref()),
                 cipher.as_ref(),
                 &model,
             )?;
@@ -494,8 +501,8 @@ async fn dispatch(
     }
     let prepared = if matches!(api, Api::Responses) {
         // Compaction and reasoning summaries run engine work of their own.
-        compaction::prepare_responses(&state, body, &admin::Meter::completions(&state, &caller))
-            .await
+        let meter = admin::Meter::completions(&state, &caller);
+        compaction::prepare_responses(&state, body, (&meter, project)).await
     } else {
         tokio::task::spawn_blocking(move || {
             prepare_retaining(
@@ -503,7 +510,7 @@ async fn dispatch(
                 &body,
                 thinking,
                 (store.as_ref(), temporary.as_ref()),
-                services.as_deref().map(services::Services::store),
+                (services.as_ref(), owner.as_deref()),
                 cipher.as_ref(),
                 &model,
             )
@@ -540,7 +547,7 @@ async fn dispatch(
         && let (Some(config), Some(vector_stores)) =
             (echo.kinds().file_search(), &state.vector_stores)
         && let Err(message) = vector_stores
-            .check_searchable(config.vector_store_ids.clone())
+            .check_searchable(config.vector_store_ids.clone(), project)
             .await
     {
         let message = format!("file_search: {message}");
@@ -653,7 +660,7 @@ async fn dispatch(
                 // The client follows the journal from its first event; going
                 // away only ends this stream, never the job.
                 let id = queued["id"].as_str().unwrap_or_default().to_owned();
-                stream_events(&state, id, None, slot, &parts.headers).await
+                stream_events(&state, id, None, project, slot, &parts.headers).await
             }
             (Ok(queued), None) => {
                 json_response(StatusCode::OK, queued, &state, &parts.headers).await
@@ -783,17 +790,20 @@ fn event_stream(
     response
 }
 
-/// Stream background response `id`'s events after `after` in `slot`, or
-/// answer with the status that refuses it before any stream starts.
+/// Stream background response `id`'s events after `after` in `slot`, to a
+/// caller acting for `project`, or answer with the status that refuses it
+/// before any stream starts.
 async fn stream_events(
     state: &AppState,
     id: String,
     after: Option<u64>,
+    project: Option<&str>,
     slot: tokio::sync::OwnedSemaphorePermit,
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let not_found = format!("response with id {id:?} not found");
     let resuming = state.clone();
+    let project = project.map(str::to_owned);
     let subscribed = tokio::task::spawn_blocking(move || {
         let state = resuming;
         let background = &state.background;
@@ -802,6 +812,7 @@ async fn stream_events(
             state.responses.as_ref(),
             background,
             &id,
+            project.as_deref(),
         )?;
         if adopt_orphan(&state, &located, &id)? {
             return Err((
@@ -872,17 +883,27 @@ fn prepare(
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<(bool, ChatRequest, Protocol)> {
-    prepare_retaining(api, body, thinking, (store, None), None, cipher, model)
+    prepare_retaining(
+        api,
+        body,
+        thinking,
+        (store, None),
+        (None, None),
+        cipher,
+        model,
+    )
 }
 
 /// Parse a request body for `api` into the engine request and how to answer
-/// it, keeping background `store: false` Responses in `temporary`.
+/// it, keeping background `store: false` Responses in `temporary`, for a
+/// caller acting for `project` (see [`prepare_responses_conversing`];
+/// `conversations` is scoped to it).
 fn prepare_retaining(
     api: Api,
     body: &[u8],
     thinking: bool,
     (store, temporary): (Option<&Arc<ResponseStore>>, Option<&Arc<Temporary>>),
-    conversations: Option<&local_services::Store>,
+    (conversations, project): (Option<&local_services::Store>, Option<&str>),
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<(bool, ChatRequest, Protocol)> {
@@ -901,7 +922,7 @@ fn prepare_retaining(
                 thinking,
                 store,
                 temporary,
-                conversations,
+                (conversations, project),
                 cipher,
                 model,
             )?;
@@ -915,17 +936,19 @@ fn prepare_retaining(
 }
 
 /// `GET` and `DELETE /v1/responses/{id}`, `GET .../{id}/input_items` and
-/// `POST .../{id}/cancel`.
+/// `POST .../{id}/cancel`, for a caller acting for `project`.
 ///
 /// `rest` is the path after `/v1/responses/`. Unknown, malformed, deleted,
 /// expired and never-stored IDs are all the same 404, and so is every ID but
 /// a retained temporary one when no store is configured: none of them names a
-/// response this server can produce. See [`locate`] for which store answers.
+/// response this server can produce. So is a Response `project` may not see.
+/// See [`locate`] for which store answers.
 async fn stored_response(
     state: &AppState,
     method: &Method,
     rest: &str,
     query: Option<&str>,
+    project: Option<&str>,
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let (id, items, cancel) = match rest.split_once('/') {
@@ -946,7 +969,7 @@ async fn stored_response(
             let Ok(slot) = state.subscribers.clone().try_acquire_owned() else {
                 return subscribers_full(state, headers).await;
             };
-            return stream_events(state, id.to_owned(), after, slot, headers).await;
+            return stream_events(state, id.to_owned(), after, project, slot, headers).await;
         }
         Ok(retrieval) => {
             let page = retrieval.into_page();
@@ -954,8 +977,15 @@ async fn stored_response(
             let background = Arc::clone(&state.background);
             let (temporary, durable) = (state.temporary.clone(), state.responses.clone());
             let resuming = state.clone();
+            let project = project.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
-                let located = locate(temporary.as_ref(), durable.as_ref(), &background, &id)?;
+                let located = locate(
+                    temporary.as_ref(),
+                    durable.as_ref(),
+                    &background,
+                    &id,
+                    project.as_deref(),
+                )?;
                 let store = &located.store;
                 if method == Method::GET && page.is_none() {
                     // Retrieving an orphaned job resumes it; one waiting for a
@@ -1136,40 +1166,40 @@ struct Located {
 /// never looked up in, or confused with, the durable store.
 ///
 /// A temporary response whose retention has ended is deleted here and is
-/// then the same 404 as any unknown ID. Blocks on the store.
+/// then the same 404 as any unknown ID, and so is a response a caller acting
+/// for `project` may not see ([`responses::visible`]). Blocks on the store.
 fn locate(
     temporary: Option<&Arc<Temporary>>,
     durable: Option<&Arc<ResponseStore>>,
     background: &Background,
     id: &str,
+    project: Option<&str>,
 ) -> Result<Located, Failure> {
     let not_found = format!("response with id {id:?} not found");
-    if let Some(temporary) = temporary {
-        match temporary.holds(background, id) {
-            Some(true) => {
-                return Ok(Located {
-                    store: Arc::clone(temporary.store()),
-                    temporary: Some(Arc::clone(temporary)),
-                });
-            }
-            Some(false) => return Err((StatusCode::NOT_FOUND, not_found)),
-            None => {}
-        }
-    }
-    durable.map_or_else(
-        || {
-            Err((
-                StatusCode::NOT_FOUND,
-                format!("{not_found}: {WITHOUT_STORE}"),
-            ))
+    let located = match temporary.map(|temporary| (temporary, temporary.holds(background, id))) {
+        Some((temporary, Some(true))) => Located {
+            store: Arc::clone(temporary.store()),
+            temporary: Some(Arc::clone(temporary)),
         },
-        |store| {
-            Ok(Located {
+        Some((_, Some(false))) => return Err((StatusCode::NOT_FOUND, not_found)),
+        _ => match durable {
+            Some(store) => Located {
                 store: Arc::clone(store),
                 temporary: None,
-            })
+            },
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("{not_found}: {WITHOUT_STORE}"),
+                ));
+            }
         },
-    )
+    };
+    if responses::visible(&located.store, id, project).map_err(|error| store_failure(&error))? {
+        Ok(located)
+    } else {
+        Err((StatusCode::NOT_FOUND, not_found))
+    }
 }
 
 /// Validate the query of a stored-response request.
@@ -1623,3 +1653,6 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod combos_tests;
+
+#[cfg(test)]
+mod projects_tests;

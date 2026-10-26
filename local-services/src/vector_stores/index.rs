@@ -380,7 +380,7 @@ impl VectorIndex {
         let mut files = Vec::new();
         let mut embedded = HashSet::new();
         for store_id in stores {
-            let target = writable_store(&snapshot, store_id)?;
+            let target = writable_store(&snapshot, store_id, None)?;
             if target
                 .last_active_at
                 .is_none_or(|at| now.saturating_sub(at) >= ACTIVITY_GRANULARITY_SECONDS)

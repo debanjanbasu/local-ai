@@ -53,7 +53,7 @@ impl Answer {
 
 async fn send(services: &Services, request: Request<Body>) -> Answer {
     let (parts, body) = request.into_parts();
-    match services.dispatch(&parts, body).await {
+    match services.dispatch(&parts, body, None).await {
         Reply::Json(status, json) => Answer {
             status,
             json,
@@ -181,7 +181,7 @@ async fn a_stalled_download_gives_its_slot_back() {
         .to_owned();
     let request = request(Method::GET, &format!("/v1/files/{id}/content"), "");
     let (parts, body) = request.into_parts();
-    let Reply::Content(download) = services.dispatch(&parts, body).await else {
+    let Reply::Content(download) = services.dispatch(&parts, body, None).await else {
         unreachable!("not a download");
     };
     assert_eq!(

@@ -820,7 +820,7 @@ fn a_temporary_streamed_response_replays_until_it_expires() {
         .admit(doc, script(finished_steps()), stop, None)
         .expect("admitted");
     let store = Arc::clone(
-        &super::locate(Some(&temporary), Some(&durable), &background, &id)
+        &super::locate(Some(&temporary), Some(&durable), &background, &id, None)
             .expect("located")
             .store,
     );
@@ -846,8 +846,8 @@ fn a_temporary_streamed_response_replays_until_it_expires() {
         assert_eq!(resumed, frames[after as usize + 1..], "after {after}");
     }
     advance(&clock, Duration::from_secs(1));
-    let (code, _) =
-        super::locate(Some(&temporary), Some(&durable), &background, &id).expect_err("expired");
+    let (code, _) = super::locate(Some(&temporary), Some(&durable), &background, &id, None)
+        .expect_err("expired");
     assert_eq!(code, StatusCode::NOT_FOUND);
     assert_eq!(store.open_journal(&id).expect("readable").map(|_| ()), None);
 }

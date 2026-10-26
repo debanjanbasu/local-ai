@@ -81,7 +81,7 @@ fn prepare(
         true,
         responses,
         None,
-        conversations,
+        (conversations, None),
         cipher,
         "m",
     )
@@ -274,7 +274,7 @@ fn input_token_counting_reads_the_conversation_without_changing_it() {
             body.to_string().as_bytes(),
             true,
             None,
-            Some(&conversations),
+            (Some(&conversations), None),
             None,
             "m",
         )
@@ -299,7 +299,7 @@ fn input_token_counting_reads_the_conversation_without_changing_it() {
             .as_bytes(),
         true,
         None,
-        None,
+        (None, None),
         None,
         "m",
     )

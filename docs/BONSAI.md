@@ -568,7 +568,9 @@ non-empty `include` are refused, as there are no extra fields to add.
 100, default 20) and `order` (`desc` by default), reporting `first_id`,
 `last_id` and `has_more`; an unknown `after` is 404. `DELETE` returns `response.deleted`.
 Unknown, malformed, deleted and never-stored IDs are the same 404, and all of
-these routes sit behind `--api-key` when it is set. `item_reference` inputs
+these routes sit behind `--api-key` when it is set. With project keys, a
+Response belongs to the project that created it, and another project's is
+the same 404 ([ADMIN.md](ADMIN.md#limits)). `item_reference` inputs
 remain unsupported; Responses `conversation` uses the separate
 [native services](#native-services) store, not `--response-store`.
 
@@ -1601,7 +1603,9 @@ it cannot. There is no flag and no alternative backend. The store is separate
 from the Responses store. Storage, limits, crash safety and
 the native API, including the workspace search that has no HTTP route, are in
 [local-services/README.md](../local-services/README.md). Routes sit behind
-`--api-key` and are also served over HTTP/3. Service CRUD uses a bounded
+`--api-key` and are also served over HTTP/3. Each object belongs to the
+project whose key created it, and other projects' are the same 404 as a
+missing ID ([ADMIN.md](ADMIN.md#limits)). Service CRUD uses a bounded
 blocking pool; conversation reads and appends run on the existing Response
 preparation and generation blocking tasks, never on runtime workers.
 

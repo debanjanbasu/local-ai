@@ -70,7 +70,7 @@ async fn send(
         .body(body.map_or_else(Body::empty, |text| Body::from(text.to_owned())))
         .unwrap();
     let (parts, body) = request.into_parts();
-    match service.dispatch(&parts, body).await {
+    match service.dispatch(&parts, body, None).await {
         Ok(value) => (StatusCode::OK, value),
         Err((status, message)) => (status, json!({"error": {"message": message}})),
     }

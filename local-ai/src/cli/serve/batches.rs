@@ -221,13 +221,18 @@ impl Batches {
     }
 
     /// Answer one request, independent of the server's other state.
-    /// `owner` is the caller's project key, which a created batch keeps.
+    /// `owner` is the caller's project key, which a created batch keeps; the
+    /// caller sees only its project's batches and files (see
+    /// [`Store::scoped`]), every batch without one.
     pub(super) async fn dispatch(
         &self,
         parts: &Parts,
         body: Body,
         owner: Option<Owner>,
     ) -> Result<Value, Failure> {
+        let store = self
+            .store
+            .scoped(owner.as_ref().map(|owner| owner.project_id.as_str()));
         let rest = parts.uri.path().strip_prefix(PREFIX).unwrap_or_default();
         let segments: Vec<&str> = rest.split('/').skip(1).collect();
         if segments.iter().any(|segment| segment.is_empty()) {
@@ -237,24 +242,28 @@ impl Batches {
         match (parts.method.clone(), segments.as_slice()) {
             (Method::POST, []) => {
                 no_query(query)?;
-                self.create(body, owner).await
+                self.create(store, body, owner).await
             }
             (Method::GET, []) => {
                 let list = list_query(query)?;
-                self.call(move |store| store.list_batches(&list).map(|page| to_json(&page)))
-                    .await
+                self.call(store, move |store| {
+                    store.list_batches(&list).map(|page| to_json(&page))
+                })
+                .await
             }
             (Method::GET, [id]) => {
                 no_query(query)?;
                 let id = (*id).to_owned();
-                self.call(move |store| store.get_batch(&id).map(|batch| to_json(&batch)))
-                    .await
+                self.call(store, move |store| {
+                    store.get_batch(&id).map(|batch| to_json(&batch))
+                })
+                .await
             }
             (Method::POST, [id, "cancel"]) => {
                 no_query(query)?;
                 let id = (*id).to_owned();
                 let worker = Arc::clone(&self.worker);
-                self.call(move |store| {
+                self.call(store, move |store| {
                     let batch = store.cancel_batch(&id)?;
                     worker.cancelled(&id);
                     Ok(to_json(&batch))
@@ -265,7 +274,12 @@ impl Batches {
         }
     }
 
-    async fn create(&self, body: Body, owner: Option<Owner>) -> Result<Value, Failure> {
+    async fn create(
+        &self,
+        store: Store,
+        body: Body,
+        owner: Option<Owner>,
+    ) -> Result<Value, Failure> {
         let request: CreateBody = read_json(body).await?;
         let create = CreateBatch {
             input_file_id: request.input_file_id,
@@ -278,15 +292,17 @@ impl Batches {
                 .map_or(Ok(()), |refusal| Err(format!("body.model {refusal}")))
         };
         let batch = self
-            .call(move |store| store.create_batch_accepting(&create, accept, owner.as_ref()))
+            .call(store, move |store| {
+                store.create_batch_accepting(&create, accept, owner.as_ref())
+            })
             .await?;
         self.worker.notify();
         Ok(to_json(&batch))
     }
 
-    /// Run `work` against the store on the blocking pool, at most
-    /// [`MAX_BLOCKING`] at once.
-    async fn call<T, F>(&self, work: F) -> Result<T, Failure>
+    /// Run `work` against `store` (this service's, scoped to the caller) on
+    /// the blocking pool, at most [`MAX_BLOCKING`] at once.
+    async fn call<T, F>(&self, store: Store, work: F) -> Result<T, Failure>
     where
         T: Send + 'static,
         F: FnOnce(&Store) -> local_services::Result<T> + Send + 'static,
@@ -300,7 +316,6 @@ impl Batches {
                     "the batch service is shutting down".to_owned(),
                 )
             })?;
-        let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             work(&store)
@@ -490,7 +505,7 @@ impl Worker {
             &body,
             config.thinking,
             (None, None),
-            None,
+            (None, None),
             config.cipher.as_ref(),
             &config.model,
         );

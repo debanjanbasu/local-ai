@@ -153,6 +153,15 @@ CREATE TABLE internal_files (
 ) STRICT;
 ";
 
+/// Version 3: the project that created each file and upload (`NULL` for
+/// none, and for every one created before; see [`Store::scoped`]), indexed
+/// for file listings. Uploads are only read by ID.
+const PROJECTS: &str = "
+ALTER TABLE files ADD COLUMN project_id TEXT;
+ALTER TABLE uploads ADD COLUMN project_id TEXT;
+CREATE INDEX files_project_seq ON files (project_id, seq);
+";
+
 /// Validated file purpose. Stored verbatim; implies no processing capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FilePurpose {
@@ -428,7 +437,7 @@ impl Store {
             filename: request.filename.clone(),
             purpose: request.purpose,
         };
-        if let Err(error) = commit_new_file(&mut conn, &blob_id, &object) {
+        if let Err(error) = commit_new_file(&mut conn, &blob_id, &object, self.project()) {
             discard_blob(&conn, &dirs, &blob_id);
             return Err(error);
         }
@@ -439,7 +448,7 @@ impl Store {
     pub fn get_file(&self, file_id: &str) -> Result<FileObject> {
         let conn = self.files_connection()?;
         let now = sql_int(crate::now()?)?;
-        live_file_row(&conn, file_id, now)?
+        live_file_row(&conn, file_id, now, self.project())?
             .ok_or_else(|| file_not_found(file_id))?
             .into_object()
     }
@@ -457,8 +466,8 @@ impl Store {
         let cursor = match &query.after {
             Some(after) => Some(
                 conn.query_row(
-                    "SELECT seq FROM files WHERE id = ?1",
-                    params![after],
+                    "SELECT seq FROM files WHERE id = ?1 AND (?2 IS NULL OR project_id = ?2)",
+                    params![after, self.project()],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()?
@@ -470,11 +479,18 @@ impl Store {
             SortOrder::Desc => ("<", "DESC", i64::MAX),
             SortOrder::Asc => (">", "ASC", i64::MIN),
         };
+        // A literal condition rather than `?5 IS NULL OR ...`, so a
+        // project's listing walks the `(project_id, seq)` index.
+        let owned = if self.project().is_some() {
+            "AND project_id = ?5"
+        } else {
+            "AND ?5 IS NULL"
+        };
         let sql = format!(
             "SELECT {FILE_COLUMNS} FROM files \
              WHERE seq {comparison} ?1 \
                AND (expires_at IS NULL OR expires_at > ?2) \
-               AND (?3 IS NULL OR purpose = ?3) \
+               AND (?3 IS NULL OR purpose = ?3) {owned} \
              ORDER BY seq {direction} LIMIT ?4"
         );
         let mut statement = conn.prepare(&sql)?;
@@ -484,7 +500,8 @@ impl Store {
                     cursor.unwrap_or(start),
                     now,
                     query.purpose.map(FilePurpose::as_str),
-                    i64::from(limit) + 1
+                    i64::from(limit) + 1,
+                    self.project(),
                 ],
                 read_file_row,
             )?
@@ -514,7 +531,8 @@ impl Store {
         // Read the clock only once the write lock is held, so a lock wait
         // cannot make an expired file look live.
         let now = sql_int(crate::now()?)?;
-        let row = live_file_row(&tx, file_id, now)?.ok_or_else(|| file_not_found(file_id))?;
+        let row = live_file_row(&tx, file_id, now, self.project())?
+            .ok_or_else(|| file_not_found(file_id))?;
         tx.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
         tx.execute("DELETE FROM file_blobs WHERE id = ?1", params![row.blob_id])?;
         tx.commit()?;
@@ -531,14 +549,16 @@ impl Store {
         let dirs = self.file_dirs()?;
         let conn = self.files_connection()?;
         let now = sql_int(crate::now()?)?;
-        let row = live_file_row(&conn, file_id, now)?.ok_or_else(|| file_not_found(file_id))?;
+        let row = live_file_row(&conn, file_id, now, self.project())?
+            .ok_or_else(|| file_not_found(file_id))?;
         let blob_id = row.blob_id.clone();
         let file = row.into_object()?;
         let content = dirs.open_blob(&blob_id, file.bytes)?;
         Ok(FileContent { file, content })
     }
 
-    /// Streams `content` into the internal file `file_id`, at most once.
+    /// Streams `content` into the internal file `file_id`, owned by this
+    /// handle's project (see [`Store::scoped`]), at most once.
     ///
     /// Idempotent per id: when a file was already committed under `file_id`
     /// (with this purpose and filename) nothing is written and that file is
@@ -579,7 +599,10 @@ impl Store {
                 return Err(error);
             }
         };
-        match commit_internal_file(&mut conn, &blob_id, file_id, filename, purpose, bytes) {
+        let owner = self.project();
+        match commit_internal_file(
+            &mut conn, &blob_id, file_id, filename, purpose, bytes, owner,
+        ) {
             Ok((file, true)) => Ok(file),
             Ok((found, false)) => {
                 discard_blob(&conn, &dirs, &blob_id);
@@ -612,8 +635,8 @@ impl Store {
         let conn = self.files_connection()?;
         conn.execute(
             "INSERT INTO uploads (id, filename, purpose, mime_type, bytes, created_at, expires_at, \
-                                  status, file_expires_after, file_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL)",
+                                  status, file_expires_after, file_id, project_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, ?9)",
             params![
                 id,
                 request.filename,
@@ -623,6 +646,7 @@ impl Store {
                 sql_int(created_at)?,
                 sql_int(expires_at)?,
                 file_expires_after.map(sql_int).transpose()?,
+                self.project(),
             ],
         )?;
         Ok(UploadObject {
@@ -642,7 +666,7 @@ impl Store {
     pub fn get_upload(&self, upload_id: &str) -> Result<UploadObject> {
         let conn = self.files_connection()?;
         let now = crate::now()?;
-        let row = upload_row(&conn, upload_id)?;
+        let row = upload_row(&conn, upload_id, self.project())?;
         upload_object(&conn, row, now)
     }
 
@@ -651,7 +675,7 @@ impl Store {
     pub fn add_upload_part(&self, upload_id: &str, content: impl Read) -> Result<UploadPart> {
         let dirs = self.file_dirs()?;
         let mut conn = self.files_connection()?;
-        let upload = upload_row(&conn, upload_id)?;
+        let upload = upload_row(&conn, upload_id, self.project())?;
         ensure_mutable(&upload, crate::now()?)?;
         let declared = unsigned(upload.bytes)?;
         let remaining = declared.saturating_sub(parts_total(&conn, upload_id)?);
@@ -716,7 +740,7 @@ impl Store {
 
         let dirs = self.file_dirs()?;
         let mut conn = self.files_connection()?;
-        let upload = upload_row(&conn, upload_id)?;
+        let upload = upload_row(&conn, upload_id, self.project())?;
         ensure_mutable(&upload, crate::now()?)?;
         let declared = unsigned(upload.bytes)?;
         let parts = resolve_parts(&conn, upload_id, &request.part_ids)?;
@@ -796,7 +820,7 @@ impl Store {
         for part_blob in &released {
             let _ = dirs.remove_blob(part_blob);
         }
-        let row = upload_row(&conn, upload_id)?;
+        let row = upload_row(&conn, upload_id, self.project())?;
         upload_object(&conn, row, file.created_at)
     }
 
@@ -806,7 +830,7 @@ impl Store {
         let mut conn = self.files_connection()?;
         let tx = immediate(&mut conn)?;
         let now = crate::now()?;
-        let upload = upload_row(&tx, upload_id)?;
+        let upload = upload_row(&tx, upload_id, self.project())?;
         ensure_mutable(&upload, now)?;
         tx.execute(
             "UPDATE uploads SET status = 'cancelled' WHERE id = ?1 AND status = 'pending'",
@@ -817,7 +841,7 @@ impl Store {
         for blob_id in &released {
             let _ = dirs.remove_blob(blob_id);
         }
-        let row = upload_row(&conn, upload_id)?;
+        let row = upload_row(&conn, upload_id, self.project())?;
         upload_object(&conn, row, now)
     }
 
@@ -900,10 +924,10 @@ impl Store {
 
 const FILE_COLUMNS: &str = "id, blob_id, filename, purpose, bytes, created_at, expires_at";
 const UPLOAD_COLUMNS: &str = "id, filename, purpose, mime_type, bytes, created_at, expires_at, \
-                              status, file_expires_after, file_id";
+                              status, file_expires_after, file_id, project_id";
 
 pub(crate) fn initialize(connection: &mut Connection) -> Result<()> {
-    crate::migrate(connection, "files", &[SCHEMA, INTERNAL_FILES])
+    crate::migrate(connection, "files", &[SCHEMA, INTERNAL_FILES, PROJECTS])
 }
 
 struct FileRow {
@@ -952,6 +976,7 @@ struct UploadRow {
     status: String,
     file_expires_after: Option<i64>,
     file_id: Option<String>,
+    project_id: Option<String>,
 }
 
 struct PartRow {
@@ -963,23 +988,34 @@ fn immediate(conn: &mut Connection) -> Result<Transaction<'_>> {
     Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
 }
 
-fn live_file_row(conn: &Connection, file_id: &str, now: i64) -> Result<Option<FileRow>> {
+/// The live file `file_id`, unless `project` (when given) does not own it.
+fn live_file_row(
+    conn: &Connection,
+    file_id: &str,
+    now: i64,
+    project: Option<&str>,
+) -> Result<Option<FileRow>> {
     Ok(conn
         .query_row(
             &format!(
                 "SELECT {FILE_COLUMNS} FROM files \
-                 WHERE id = ?1 AND (expires_at IS NULL OR expires_at > ?2)"
+                 WHERE id = ?1 AND (expires_at IS NULL OR expires_at > ?2) \
+                   AND (?3 IS NULL OR project_id = ?3)"
             ),
-            params![file_id, now],
+            params![file_id, now, project],
             read_file_row,
         )
         .optional()?)
 }
 
-fn upload_row(conn: &Connection, upload_id: &str) -> Result<UploadRow> {
+/// Upload `upload_id`, unless `project` (when given) does not own it.
+fn upload_row(conn: &Connection, upload_id: &str, project: Option<&str>) -> Result<UploadRow> {
     conn.query_row(
-        &format!("SELECT {UPLOAD_COLUMNS} FROM uploads WHERE id = ?1"),
-        params![upload_id],
+        &format!(
+            "SELECT {UPLOAD_COLUMNS} FROM uploads WHERE id = ?1 \
+             AND (?2 IS NULL OR project_id = ?2)"
+        ),
+        params![upload_id, project],
         |row| {
             Ok(UploadRow {
                 id: row.get(0)?,
@@ -992,6 +1028,7 @@ fn upload_row(conn: &Connection, upload_id: &str) -> Result<UploadRow> {
                 status: row.get(7)?,
                 file_expires_after: row.get(8)?,
                 file_id: row.get(9)?,
+                project_id: row.get(10)?,
             })
         },
     )
@@ -1029,9 +1066,12 @@ fn ensure_mutable(row: &UploadRow, now: u64) -> Result<()> {
 fn upload_object(conn: &Connection, row: UploadRow, now: u64) -> Result<UploadObject> {
     let status = upload_status(&row, now)?;
     let file = match (&row.file_id, status) {
-        (Some(file_id), UploadStatus::Completed) => live_file_row(conn, file_id, sql_int(now)?)?
-            .map(FileRow::into_object)
-            .transpose()?,
+        // The upload's own file: whoever may see the upload may see it.
+        (Some(file_id), UploadStatus::Completed) => {
+            live_file_row(conn, file_id, sql_int(now)?, None)?
+                .map(FileRow::into_object)
+                .transpose()?
+        }
         _ => None,
     };
     Ok(UploadObject {
@@ -1131,10 +1171,17 @@ fn commit_blob(tx: &Transaction<'_>, blob_id: &str) -> Result<()> {
     }
 }
 
-fn insert_file_row(tx: &Transaction<'_>, blob_id: &str, file: &FileObject) -> Result<()> {
+/// Insert `file`'s row, owned by `project`.
+fn insert_file_row(
+    tx: &Transaction<'_>,
+    blob_id: &str,
+    file: &FileObject,
+    project: Option<&str>,
+) -> Result<()> {
     tx.execute(
-        "INSERT INTO files (id, blob_id, filename, purpose, bytes, created_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO files (id, blob_id, filename, purpose, bytes, created_at, expires_at, \
+                            project_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             file.id,
             blob_id,
@@ -1143,15 +1190,21 @@ fn insert_file_row(tx: &Transaction<'_>, blob_id: &str, file: &FileObject) -> Re
             sql_int(file.bytes)?,
             sql_int(file.created_at)?,
             file.expires_at.map(sql_int).transpose()?,
+            project,
         ],
     )?;
     Ok(())
 }
 
-fn commit_new_file(conn: &mut Connection, blob_id: &str, file: &FileObject) -> Result<()> {
+fn commit_new_file(
+    conn: &mut Connection,
+    blob_id: &str,
+    file: &FileObject,
+    project: Option<&str>,
+) -> Result<()> {
     let tx = immediate(conn)?;
     commit_blob(&tx, blob_id)?;
-    insert_file_row(&tx, blob_id, file)?;
+    insert_file_row(&tx, blob_id, file, project)?;
     tx.commit()?;
     Ok(())
 }
@@ -1177,7 +1230,7 @@ fn committed_internal(
             if stored_purpose == purpose.as_str() && stored_filename == filename =>
         {
             Ok(Some(
-                live_file_row(conn, file_id, now)?
+                live_file_row(conn, file_id, now, None)?
                     .map(FileRow::into_object)
                     .transpose()?
                     .map_or(InternalFile::Gone, InternalFile::Live),
@@ -1201,9 +1254,9 @@ fn committed_internal(
     }
 }
 
-/// Commits a staged internal blob as file `file_id`; `false` with the earlier
-/// outcome when another attempt committed that id first (the caller then
-/// discards its blob).
+/// Commits a staged internal blob as file `file_id`, owned by `project`;
+/// `false` with the earlier outcome when another attempt committed that id
+/// first (the caller then discards its blob).
 fn commit_internal_file(
     conn: &mut Connection,
     blob_id: &str,
@@ -1211,6 +1264,7 @@ fn commit_internal_file(
     filename: &str,
     purpose: FilePurpose,
     bytes: u64,
+    project: Option<&str>,
 ) -> Result<(InternalFile, bool)> {
     let tx = immediate(conn)?;
     // The lifetime starts at the commit, read under the write lock.
@@ -1230,7 +1284,7 @@ fn commit_internal_file(
         purpose,
     };
     commit_blob(&tx, blob_id)?;
-    insert_file_row(&tx, blob_id, &file)?;
+    insert_file_row(&tx, blob_id, &file, project)?;
     tx.execute(
         "INSERT INTO internal_files (id, purpose, filename, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![file_id, purpose.as_str(), filename, sql_int(created_at)?],
@@ -1249,7 +1303,7 @@ fn commit_new_part(
     // The terminal/expiry check uses a clock read under the write lock: the
     // stream and any lock wait may have outlived the upload.
     part.created_at = crate::now()?;
-    let upload = upload_row(&tx, &part.upload_id)?;
+    let upload = upload_row(&tx, &part.upload_id, None)?;
     ensure_mutable(&upload, part.created_at)?;
     let used = parts_total(&tx, &part.upload_id)?;
     if used.saturating_add(part.bytes) > declared {
@@ -1287,7 +1341,7 @@ fn commit_completion(
     let created_at = crate::now()?;
     file.created_at = created_at;
     file.expires_at = file_expires_after.map(|seconds| created_at.saturating_add(seconds));
-    let upload = upload_row(&tx, upload_id)?;
+    let upload = upload_row(&tx, upload_id, None)?;
     ensure_mutable(&upload, file.created_at)?;
     let parts = resolve_parts(&tx, upload_id, part_ids)?;
     let total = parts
@@ -1300,7 +1354,8 @@ fn commit_completion(
         )));
     }
     commit_blob(&tx, blob_id)?;
-    insert_file_row(&tx, blob_id, file)?;
+    // The file belongs to whoever owns the upload.
+    insert_file_row(&tx, blob_id, file, upload.project_id.as_deref())?;
     tx.execute(
         "UPDATE uploads SET status = 'completed', file_id = ?2 WHERE id = ?1 AND status = 'pending'",
         params![upload_id, file.id],

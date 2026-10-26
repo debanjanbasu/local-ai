@@ -45,12 +45,18 @@ impl Scratch {
     }
 
     fn input(&self, lines: &[Value]) -> String {
+        self.input_as(None, lines)
+    }
+
+    /// [`Self::input`], owned by `project`.
+    fn input_as(&self, project: Option<&str>, lines: &[Value]) -> String {
         let content = lines.iter().fold(String::new(), |mut content, line| {
             content.push_str(&line.to_string());
             content.push('\n');
             content
         });
         self.store
+            .scoped(project)
             .create_file(
                 &CreateFile {
                     filename: "input.jsonl".to_owned(),
@@ -709,7 +715,9 @@ async fn lines_are_attributed_to_the_project_key_that_created_the_batch() {
     };
     let mut ids = Vec::new();
     for owner in [Some(owner), None] {
-        let file = scratch.input(&[chat("a", "hello"), chat("b", "world")]);
+        // A project's batch reads its own project's input file.
+        let project = owner.as_ref().map(|owner| owner.project_id.as_str());
+        let file = scratch.input_as(project, &[chat("a", "hello"), chat("b", "world")]);
         let body = json!({"input_file_id":file,"endpoint":"/v1/chat/completions",
                           "completion_window":"24h"});
         let request = Request::builder()

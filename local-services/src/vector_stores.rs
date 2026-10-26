@@ -353,6 +353,13 @@ CREATE TABLE vector_store_embeddings (
 ) STRICT;
 CREATE UNIQUE INDEX vector_store_embeddings_chunk ON vector_store_embeddings (attach_id, ordinal);
 ",
+    // Version 3: the project that created each store (`NULL` for none, and
+    // for every store created before; see `Store::scoped`), indexed for
+    // listings. A store's files and file batches are reached through it.
+    "
+ALTER TABLE vector_stores ADD COLUMN project_id TEXT;
+CREATE INDEX vector_stores_project_seq ON vector_stores (project_id, seq);
+",
 ];
 
 const STORE_COLUMNS: &str = "id, name, metadata, created_at, last_active_at, expires_after_days";
@@ -916,25 +923,26 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO vector_stores (id, name, description, metadata, created_at,
-                                        last_active_at, expires_after_days)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                                        last_active_at, expires_after_days, project_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
             params![
                 id,
                 name,
                 request.description,
                 serde_json::to_string(&metadata)?,
                 at,
-                days
+                days,
+                self.project()
             ],
         )?;
-        attach(&transaction, &id, None, &attachments, at)?;
+        attach(&transaction, &id, None, &attachments, (at, self.project()))?;
         transaction.commit()?;
-        load_store(&connection, &id)
+        load_store(&connection, &id, None)
     }
 
     /// The store `id`.
     pub fn get_vector_store(&self, id: &str) -> Result<VectorStore> {
-        load_store(&*self.connection()?, id)
+        load_store(&*self.connection()?, id, self.project())
     }
 
     /// Stores, newest first by default.
@@ -948,22 +956,27 @@ impl Store {
         let snapshot = connection.transaction()?;
         let seq = |id: &str| {
             snapshot
-                .query_row("SELECT seq FROM vector_stores WHERE id = ?1", [id], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row(
+                    "SELECT seq FROM vector_stores WHERE id = ?1 AND (?2 IS NULL OR project_id = ?2)",
+                    params![id, self.project()],
+                    |row| row.get::<_, i64>(0),
+                )
                 .optional()?
                 .ok_or_else(|| store_not_found(id))
         };
         let window = Window::new(query, seq)?;
-        let ids = window.ids(
-            &snapshot,
-            "SELECT id FROM vector_stores WHERE seq > ?1 AND seq < ?2",
-            &[],
-        )?;
+        // A literal condition rather than `?3 IS NULL OR ...`, so a
+        // project's listing walks the `(project_id, seq)` index.
+        let sql = if self.project().is_some() {
+            "SELECT id FROM vector_stores WHERE seq > ?1 AND seq < ?2 AND project_id = ?3"
+        } else {
+            "SELECT id FROM vector_stores WHERE seq > ?1 AND seq < ?2 AND ?3 IS NULL"
+        };
+        let ids = window.ids(&snapshot, sql, &[&self.project()])?;
         let (ids, has_more) = window.finish(ids);
         let data = ids
             .iter()
-            .map(|id| load_store(&snapshot, id))
+            .map(|id| load_store(&snapshot, id, None))
             .collect::<Result<Vec<_>>>()?;
         Ok(page(data, has_more, |store| store.id.clone()))
     }
@@ -988,7 +1001,7 @@ impl Store {
         };
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_store(&transaction, id)?;
+        load_store(&transaction, id, self.project())?;
         if let Some(name) = &request.name {
             transaction.execute(
                 "UPDATE vector_stores SET name = ?2 WHERE id = ?1",
@@ -1012,14 +1025,14 @@ impl Store {
         }
         touch(&transaction, id)?;
         transaction.commit()?;
-        load_store(&connection, id)
+        load_store(&connection, id, None)
     }
 
     /// Delete a store, its files, batches and index entries, atomically.
     pub fn delete_vector_store(&self, id: &str) -> Result<VectorStoreDeleted> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_store(&transaction, id)?;
+        load_store(&transaction, id, self.project())?;
         transaction.execute("DELETE FROM vector_store_files WHERE store_id = ?1", [id])?;
         transaction.execute(
             "DELETE FROM vector_store_file_batches WHERE store_id = ?1",
@@ -1044,9 +1057,15 @@ impl Store {
         let attachments = resolve_files(std::slice::from_ref(request))?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        writable_store(&transaction, store_id)?;
+        writable_store(&transaction, store_id, self.project())?;
         let at = signed(now()?)?;
-        attach(&transaction, store_id, None, &attachments, at)?;
+        attach(
+            &transaction,
+            store_id,
+            None,
+            &attachments,
+            (at, self.project()),
+        )?;
         touch(&transaction, store_id)?;
         transaction.commit()?;
         load_file(&connection, store_id, &request.file_id)
@@ -1055,7 +1074,7 @@ impl Store {
     /// The file `file_id` of store `store_id`.
     pub fn get_vector_store_file(&self, store_id: &str, file_id: &str) -> Result<VectorStoreFile> {
         let connection = self.connection()?;
-        load_store(&connection, store_id)?;
+        load_store(&connection, store_id, self.project())?;
         load_file(&connection, store_id, file_id)
     }
 
@@ -1067,7 +1086,7 @@ impl Store {
     ) -> Result<Page<VectorStoreFile>> {
         let mut connection = self.connection()?;
         let snapshot = connection.transaction()?;
-        load_store(&snapshot, store_id)?;
+        load_store(&snapshot, store_id, self.project())?;
         list_files(&snapshot, store_id, None, query)
     }
 
@@ -1081,7 +1100,7 @@ impl Store {
         validate_attributes(attributes)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_store(&transaction, store_id)?;
+        load_store(&transaction, store_id, self.project())?;
         let changed = transaction.execute(
             "UPDATE vector_store_files SET attributes = ?3 WHERE store_id = ?1 AND file_id = ?2",
             params![store_id, file_id, serde_json::to_string(attributes)?],
@@ -1102,7 +1121,7 @@ impl Store {
     ) -> Result<VectorStoreFileDeleted> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_store(&transaction, store_id)?;
+        load_store(&transaction, store_id, self.project())?;
         if !detach(&transaction, store_id, file_id)? {
             return Err(file_not_found(store_id, file_id));
         }
@@ -1120,7 +1139,7 @@ impl Store {
         file_id: &str,
     ) -> Result<VectorStoreFileContent> {
         let connection = self.connection()?;
-        load_store(&connection, store_id)?;
+        load_store(&connection, store_id, self.project())?;
         let text: Option<Option<Vec<u8>>> = connection
             .query_row(
                 "SELECT text FROM vector_store_files WHERE store_id = ?1 AND file_id = ?2",
@@ -1177,14 +1196,20 @@ impl Store {
         let id = new_id(BATCH_PREFIX)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        writable_store(&transaction, store_id)?;
+        writable_store(&transaction, store_id, self.project())?;
         let at = signed(now()?)?;
         transaction.execute(
             "INSERT INTO vector_store_file_batches (id, store_id, created_at, total)
              VALUES (?1, ?2, ?3, ?4)",
             params![id, store_id, at, signed(count(attachments.len()))?],
         )?;
-        attach(&transaction, store_id, Some(&id), &attachments, at)?;
+        attach(
+            &transaction,
+            store_id,
+            Some(&id),
+            &attachments,
+            (at, self.project()),
+        )?;
         touch(&transaction, store_id)?;
         transaction.commit()?;
         load_batch(&connection, store_id, &id)
@@ -1193,7 +1218,7 @@ impl Store {
     /// The batch `batch_id` of store `store_id`.
     pub fn get_vector_store_file_batch(&self, store_id: &str, batch_id: &str) -> Result<FileBatch> {
         let connection = self.connection()?;
-        load_store(&connection, store_id)?;
+        load_store(&connection, store_id, self.project())?;
         load_batch(&connection, store_id, batch_id)
     }
 
@@ -1207,7 +1232,7 @@ impl Store {
     ) -> Result<FileBatch> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_store(&transaction, store_id)?;
+        load_store(&transaction, store_id, self.project())?;
         let batch = load_batch(&transaction, store_id, batch_id)?;
         match batch.status {
             BatchStatus::InProgress => {
@@ -1242,7 +1267,7 @@ impl Store {
     ) -> Result<Page<VectorStoreFile>> {
         let mut connection = self.connection()?;
         let snapshot = connection.transaction()?;
-        load_store(&snapshot, store_id)?;
+        load_store(&snapshot, store_id, self.project())?;
         load_batch(&snapshot, store_id, batch_id)?;
         list_files(&snapshot, store_id, Some(batch_id), query)
     }
@@ -1369,21 +1394,23 @@ fn resolve_files(files: &[CreateVectorStoreFile]) -> Result<Vec<Attachment>> {
         .collect()
 }
 
-/// Attach (or re-attach) files to a store inside `transaction`.
+/// Attach (or re-attach) files to a store inside `transaction` at `at`,
+/// each a live File that `project` (when given) owns.
 fn attach(
     transaction: &Transaction<'_>,
     store_id: &str,
     batch_id: Option<&str>,
     attachments: &[Attachment],
-    at: i64,
+    (at, project): (i64, Option<&str>),
 ) -> Result<()> {
     let now = at;
     for attachment in attachments {
         let filename: Option<String> = transaction
             .query_row(
                 "SELECT filename FROM files
-                 WHERE id = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
-                params![attachment.file_id, now],
+                 WHERE id = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+                   AND (?3 IS NULL OR project_id = ?3)",
+                params![attachment.file_id, now, project],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1440,9 +1467,14 @@ fn touch(connection: &Connection, store_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The store, refusing an expired one.
-fn writable_store(connection: &Connection, store_id: &str) -> Result<VectorStore> {
-    let store = load_store(connection, store_id)?;
+/// The store, refusing an expired one (and, as [`load_store`], one
+/// `project` does not own).
+fn writable_store(
+    connection: &Connection,
+    store_id: &str,
+    project: Option<&str>,
+) -> Result<VectorStore> {
+    let store = load_store(connection, store_id, project)?;
     if store.status == StoreStatus::Expired {
         return Err(Error::Conflict(format!(
             "vector store {store_id} has expired"
@@ -1813,11 +1845,15 @@ fn counts(connection: &Connection, column: &str, id: &str) -> Result<FileCounts>
     Ok(counts)
 }
 
-fn load_store(connection: &Connection, id: &str) -> Result<VectorStore> {
+/// Store `id`, unless `project` (when given) does not own it.
+fn load_store(connection: &Connection, id: &str, project: Option<&str>) -> Result<VectorStore> {
     let row = connection
         .query_row(
-            &format!("SELECT {STORE_COLUMNS} FROM vector_stores WHERE id = ?1"),
-            [id],
+            &format!(
+                "SELECT {STORE_COLUMNS} FROM vector_stores WHERE id = ?1 \
+                 AND (?2 IS NULL OR project_id = ?2)"
+            ),
+            params![id, project],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,

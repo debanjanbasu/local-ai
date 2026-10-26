@@ -190,7 +190,7 @@ fn prepare(
         true,
         None,
         None,
-        conversations,
+        (conversations, None),
         cipher,
         "m",
     )
@@ -336,7 +336,7 @@ fn compact(
     cipher: &Arc<ReasoningCipher>,
 ) -> (Vec<Value>, Vec<ChatMessage>) {
     let body = json!({"model":"m","input":items,"instructions":"sys"});
-    let prepared = prepare_compact(body.to_string().as_bytes(), None, Some(cipher), "m")
+    let prepared = prepare_compact(body.to_string().as_bytes(), None, None, Some(cipher), "m")
         .expect("compact request is valid");
     let pass = prepared
         .history
@@ -542,7 +542,7 @@ fn compaction_needs_the_key_and_an_authentic_sealed_item() {
     let scratch = Scratch::new();
     let cipher = scratch.cipher();
     let body = json!({"model":"m","input":"hi"});
-    let refused = prepare_compact(body.to_string().as_bytes(), None, None, "m")
+    let refused = prepare_compact(body.to_string().as_bytes(), None, None, None, "m")
         .err()
         .map(|error| error.to_string())
         .unwrap_or_default();
@@ -554,7 +554,7 @@ fn compaction_needs_the_key_and_an_authentic_sealed_item() {
             "--response-store",
         ),
     ] {
-        let message = prepare_compact(body.to_string().as_bytes(), None, Some(&cipher), "m")
+        let message = prepare_compact(body.to_string().as_bytes(), None, None, Some(&cipher), "m")
             .err()
             .map(|error| error.to_string())
             .unwrap_or_default();

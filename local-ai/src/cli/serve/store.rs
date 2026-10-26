@@ -240,6 +240,10 @@ pub(super) struct StoredResponse {
     /// "api_key_id"}` for a project API key. `None` for an unattributed
     /// caller.
     pub(super) creator: Option<Value>,
+    /// The project that created the Response, the only one whose API keys
+    /// may see it (`"project"` in the record); `None` for an unowned one,
+    /// including every record written before owners were kept.
+    pub(super) project: Option<String>,
 }
 
 impl StoredResponse {
@@ -647,7 +651,12 @@ impl ResponseStore {
                 json!({"code":"server_error","message":format!("{INTERRUPTED_MESSAGE}: {reason}")}),
             );
         }
-        self.save(&stored.response, &stored.input_items)?;
+        self.save_with(
+            &stored.response,
+            &stored.input_items,
+            None,
+            stored.project.as_deref(),
+        )?;
         if let Some(reader) = journal {
             let events = if ended {
                 Vec::new()
@@ -808,19 +817,24 @@ impl ResponseStore {
         self.journal_path(id)
     }
 
-    /// Persist `response` and its resolved input, durably, before returning.
+    /// Persist `response` and its resolved input, durably, before returning,
+    /// unowned. The server saves through [`Self::save_with`], which keeps
+    /// the owner.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn save(&self, response: &Value, input_items: &[Value]) -> std::io::Result<()> {
-        self.save_with(response, input_items, None)
+        self.save_with(response, input_items, None, None)
     }
 
     /// [`Self::save`], keeping `pending` in the record as well: the body a
     /// pending background Response is regenerated from after a restart, and
-    /// who created it.
+    /// who created it; and the `project` that owns it (see
+    /// [`StoredResponse::project`]).
     pub(super) fn save_with(
         &self,
         response: &Value,
         input_items: &[Value],
         pending: Option<(&Value, Option<&Value>)>,
+        project: Option<&str>,
     ) -> std::io::Result<()> {
         let id = response.get("id").and_then(Value::as_str).unwrap_or("");
         let path = self.path(id).ok_or_else(|| invalid_id(id))?;
@@ -835,6 +849,9 @@ impl ResponseStore {
             if let Some(creator) = creator {
                 record["creator"] = creator.clone();
             }
+        }
+        if let Some(project) = project {
+            record["project"] = json!(project);
         }
         // A sweep reads only records with a lease sidecar, so a pending
         // background record always has one, even one saved without its lease.
@@ -882,6 +899,10 @@ impl ResponseStore {
             .get_mut("creator")
             .map(Value::take)
             .filter(|creator| request.is_some() && creator.is_object());
+        let project = record
+            .get("project")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         match (version, response, input_items) {
             (Some(RECORD_VERSION), Some(response), Some(Value::Array(input_items)))
                 if response.get("id").and_then(Value::as_str) == Some(id) =>
@@ -891,6 +912,7 @@ impl ResponseStore {
                     input_items,
                     request,
                     creator,
+                    project,
                 }))
             }
             _ => Err(std::io::Error::new(

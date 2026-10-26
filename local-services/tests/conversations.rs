@@ -500,7 +500,8 @@ fn a_deleted_item_leaves_no_copy_in_the_append_record() {
     let stored = serde_json::to_string(&first.items).expect("json");
     database
         .execute_batch(&format!(
-            "ALTER TABLE conversation_appends RENAME COLUMN item_ids TO items;
+            "ALTER TABLE conversations DROP COLUMN project_id;
+             ALTER TABLE conversation_appends RENAME COLUMN item_ids TO items;
              UPDATE conversation_appends SET items = '{}';
              UPDATE schema_versions SET version = 1 WHERE component = 'conversations';",
             stored.replace('\'', "''")

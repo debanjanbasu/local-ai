@@ -73,8 +73,14 @@ pub(super) fn matches(path: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// Answer a Vector Stores request. Authentication has already passed.
-pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Response {
+/// Answer a Vector Stores request from a caller acting for `project` (see
+/// [`Store::scoped`]). Authentication has already passed.
+pub(super) async fn handle(
+    state: &AppState,
+    parts: &Parts,
+    body: Body,
+    project: Option<&str>,
+) -> Response {
     let Some(vector_stores) = state.vector_stores.as_ref() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -85,7 +91,7 @@ pub(super) async fn handle(state: &AppState, parts: &Parts, body: Body) -> Respo
         )
         .await;
     };
-    match vector_stores.dispatch(parts, body).await {
+    match vector_stores.dispatch(parts, body, project).await {
         Ok(value) => json_response(StatusCode::OK, value, state, &parts.headers).await,
         Err((status, message)) => error_response(status, &message, state, &parts.headers).await,
     }
@@ -135,13 +141,21 @@ impl VectorStores {
         self.index.embeds()
     }
 
-    /// Refuse store IDs a `file_search` tool cannot search: unknown or
-    /// expired stores, with the reason.
-    pub(super) async fn check_searchable(&self, ids: Vec<String>) -> Result<(), String> {
+    /// Refuse store IDs a `file_search` tool of a caller acting for
+    /// `project` cannot search: unknown, expired, or (for a project) not the
+    /// project's own stores, with the reason. The tool loop searches only
+    /// the IDs checked here when the Response is created (a resumed one was
+    /// checked by its creator, who still owns the stores it named).
+    pub(super) async fn check_searchable(
+        &self,
+        ids: Vec<String>,
+        project: Option<&str>,
+    ) -> Result<(), String> {
+        let project = project.map(str::to_owned);
         self.blocking(move |index| {
+            let scoped = index.store().scoped(project.as_deref());
             for id in &ids {
-                let store = index
-                    .store()
+                let store = scoped
                     .get_vector_store(id)
                     .map_err(|error| super::file_search::service_message(&error))?;
                 if store.status == StoreStatus::Expired {
@@ -207,9 +221,16 @@ impl VectorStores {
         self.indexer.wait_idle();
     }
 
-    /// Answer one request.
+    /// Answer one request from a caller acting for `project`, which sees
+    /// (and creates) only its project's stores and attaches only its files.
     #[allow(clippy::too_many_lines)]
-    pub(super) async fn dispatch(&self, parts: &Parts, body: Body) -> Result<Value, Failure> {
+    pub(super) async fn dispatch(
+        &self,
+        parts: &Parts,
+        body: Body,
+        project: Option<&str>,
+    ) -> Result<Value, Failure> {
+        let store = self.index.store().scoped(project);
         let segments: Vec<String> = parts
             .uri
             .path()
@@ -229,7 +250,7 @@ impl VectorStores {
                 let request: CreateVectorStore = typed(read_json(body).await?.unwrap_or_default())?;
                 let attached = !request.file_ids.is_empty();
                 let value = self
-                    .call(move |index| index.store().create_vector_store(&request))
+                    .call(store, move |store| store.create_vector_store(&request))
                     .await?;
                 if attached {
                     self.indexer.notify();
@@ -238,13 +259,13 @@ impl VectorStores {
             }
             (Method::GET, ["vector_stores"]) => {
                 let list = list_query(query, false)?;
-                self.call(move |index| index.store().list_vector_stores(&list))
+                self.call(store, move |store| store.list_vector_stores(&list))
                     .await
             }
             (Method::GET, ["vector_stores", id]) => {
                 no_query(query)?;
                 let id = (*id).to_owned();
-                self.call(move |index| index.store().get_vector_store(&id))
+                self.call(store, move |store| store.get_vector_store(&id))
                     .await
             }
             (Method::POST, ["vector_stores", id]) => {
@@ -252,14 +273,14 @@ impl VectorStores {
                 let request: UpdateVectorStore =
                     typed(read_json(body).await?.ok_or_else(body_required)?)?;
                 let id = (*id).to_owned();
-                self.call(move |index| index.store().update_vector_store(&id, &request))
+                self.call(store, move |store| store.update_vector_store(&id, &request))
                     .await
             }
             (Method::DELETE, ["vector_stores", id]) => {
                 no_query(query)?;
                 let id = (*id).to_owned();
                 let value = self
-                    .call(move |index| index.store().delete_vector_store(&id))
+                    .call(store, move |store| store.delete_vector_store(&id))
                     .await?;
                 // The indexer drops the removed files' index documents.
                 self.indexer.notify();
@@ -271,7 +292,9 @@ impl VectorStores {
                     typed(read_json(body).await?.ok_or_else(body_required)?)?;
                 let id = (*id).to_owned();
                 let value = self
-                    .call(move |index| index.store().create_vector_store_file(&id, &request))
+                    .call(store, move |store| {
+                        store.create_vector_store_file(&id, &request)
+                    })
                     .await?;
                 self.indexer.notify();
                 Ok(value)
@@ -279,13 +302,15 @@ impl VectorStores {
             (Method::GET, ["vector_stores", id, "files"]) => {
                 let list = list_query(query, true)?;
                 let id = (*id).to_owned();
-                self.call(move |index| index.store().list_vector_store_files(&id, &list))
-                    .await
+                self.call(store, move |store| {
+                    store.list_vector_store_files(&id, &list)
+                })
+                .await
             }
             (Method::GET, ["vector_stores", id, "files", file]) => {
                 no_query(query)?;
                 let (id, file) = ((*id).to_owned(), (*file).to_owned());
-                self.call(move |index| index.store().get_vector_store_file(&id, &file))
+                self.call(store, move |store| store.get_vector_store_file(&id, &file))
                     .await
             }
             (Method::POST, ["vector_stores", id, "files", file]) => {
@@ -301,10 +326,8 @@ impl VectorStores {
                 }
                 let attributes = typed::<Update>(object)?.attributes.unwrap_or_default();
                 let (id, file) = ((*id).to_owned(), (*file).to_owned());
-                self.call(move |index| {
-                    index
-                        .store()
-                        .update_vector_store_file(&id, &file, &attributes)
+                self.call(store, move |store| {
+                    store.update_vector_store_file(&id, &file, &attributes)
                 })
                 .await
             }
@@ -312,7 +335,9 @@ impl VectorStores {
                 no_query(query)?;
                 let (id, file) = ((*id).to_owned(), (*file).to_owned());
                 let value = self
-                    .call(move |index| index.store().delete_vector_store_file(&id, &file))
+                    .call(store, move |store| {
+                        store.delete_vector_store_file(&id, &file)
+                    })
                     .await?;
                 self.indexer.notify();
                 Ok(value)
@@ -320,8 +345,10 @@ impl VectorStores {
             (Method::GET, ["vector_stores", id, "files", file, "content"]) => {
                 no_query(query)?;
                 let (id, file) = ((*id).to_owned(), (*file).to_owned());
-                self.call(move |index| index.store().vector_store_file_content(&id, &file))
-                    .await
+                self.call(store, move |store| {
+                    store.vector_store_file_content(&id, &file)
+                })
+                .await
             }
             (Method::POST, ["vector_stores", id, "file_batches"]) => {
                 no_query(query)?;
@@ -329,7 +356,9 @@ impl VectorStores {
                     typed(read_json(body).await?.ok_or_else(body_required)?)?;
                 let id = (*id).to_owned();
                 let value = self
-                    .call(move |index| index.store().create_vector_store_file_batch(&id, &request))
+                    .call(store, move |store| {
+                        store.create_vector_store_file_batch(&id, &request)
+                    })
                     .await?;
                 self.indexer.notify();
                 Ok(value)
@@ -337,8 +366,10 @@ impl VectorStores {
             (Method::GET, ["vector_stores", id, "file_batches", batch]) => {
                 no_query(query)?;
                 let (id, batch) = ((*id).to_owned(), (*batch).to_owned());
-                self.call(move |index| index.store().get_vector_store_file_batch(&id, &batch))
-                    .await
+                self.call(store, move |store| {
+                    store.get_vector_store_file_batch(&id, &batch)
+                })
+                .await
             }
             (Method::POST, ["vector_stores", id, "file_batches", batch, "cancel"]) => {
                 no_query(query)?;
@@ -346,16 +377,16 @@ impl VectorStores {
                     return Err(bad_request(format!("unknown field {key:?}")));
                 }
                 let (id, batch) = ((*id).to_owned(), (*batch).to_owned());
-                self.call(move |index| index.store().cancel_vector_store_file_batch(&id, &batch))
-                    .await
+                self.call(store, move |store| {
+                    store.cancel_vector_store_file_batch(&id, &batch)
+                })
+                .await
             }
             (Method::GET, ["vector_stores", id, "file_batches", batch, "files"]) => {
                 let list = list_query(query, true)?;
                 let (id, batch) = ((*id).to_owned(), (*batch).to_owned());
-                self.call(move |index| {
-                    index
-                        .store()
-                        .list_vector_store_file_batch_files(&id, &batch, &list)
+                self.call(store, move |store| {
+                    store.list_vector_store_file_batch_files(&id, &batch, &list)
                 })
                 .await
             }
@@ -364,27 +395,33 @@ impl VectorStores {
                 let request: SearchRequest =
                     typed(read_json(body).await?.ok_or_else(body_required)?)?;
                 let id = (*id).to_owned();
-                self.call(move |index| index.search(&id, &request)).await
+                // The index searches every store; the caller's must be its own.
+                let index = Arc::clone(&self.index);
+                self.call(store, move |store| {
+                    store.get_vector_store(&id)?;
+                    index.search(&id, &request)
+                })
+                .await
             }
             _ => Err(route_not_found()),
         }
     }
 
-    /// Run one store call on the blocking pool, at most [`MAX_BLOCKING`] at
-    /// once, and serialize its answer.
-    async fn call<T, F>(&self, work: F) -> Result<Value, Failure>
+    /// Run one call on `store` (the index's, scoped to the caller) on the
+    /// blocking pool, at most [`MAX_BLOCKING`] at once, and serialize its
+    /// answer.
+    async fn call<T, F>(&self, store: Store, work: F) -> Result<Value, Failure>
     where
         T: serde::Serialize + Send + 'static,
-        F: FnOnce(&VectorIndex) -> local_services::Result<T> + Send + 'static,
+        F: FnOnce(&Store) -> local_services::Result<T> + Send + 'static,
     {
         let permit = Arc::clone(&self.blocking)
             .acquire_owned()
             .await
             .map_err(|_| unavailable("the vector stores are shutting down"))?;
-        let index = Arc::clone(&self.index);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            work(&index).map_err(failure).and_then(|value| {
+            work(&store).map_err(failure).and_then(|value| {
                 serde_json::to_value(value).map_err(|error| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,

@@ -314,7 +314,7 @@ fn a_temporary_response_expires_only_after_it_ends_and_never_reaches_the_durable
         "nothing durable"
     );
     let located =
-        super::locate(Some(&temporary), Some(&durable), &background, &id).expect("located");
+        super::locate(Some(&temporary), Some(&durable), &background, &id, None).expect("located");
     assert!(Arc::ptr_eq(&located.store, temporary.store()));
     assert!(located.temporary.is_some());
 
@@ -342,8 +342,8 @@ fn a_temporary_response_expires_only_after_it_ends_and_never_reaches_the_durable
     // Retrievable, and cancelling is idempotent, until the retention ends.
     advance(&clock, TTL.saturating_sub(Duration::from_secs(1)));
     assert_eq!(temporary.expire_due(&background), 0);
-    let located =
-        super::locate(Some(&temporary), Some(&durable), &background, &id).expect("still retained");
+    let located = super::locate(Some(&temporary), Some(&durable), &background, &id, None)
+        .expect("still retained");
     assert_eq!(
         super::stored_answer(&located.store, &axum::http::Method::GET, &id, None).expect("get"),
         Some(done.clone())
@@ -355,7 +355,8 @@ fn a_temporary_response_expires_only_after_it_ends_and_never_reaches_the_durable
     // Lazily on access: the first lookup past the deadline deletes it.
     advance(&clock, Duration::from_secs(1));
     let (status_code, message) =
-        super::locate(Some(&temporary), Some(&durable), &background, &id).expect_err("expired");
+        super::locate(Some(&temporary), Some(&durable), &background, &id, None)
+            .expect_err("expired");
     assert_eq!(status_code, StatusCode::NOT_FOUND);
     assert!(message.contains("not found"), "{message}");
     assert!(
@@ -365,15 +366,15 @@ fn a_temporary_response_expires_only_after_it_ends_and_never_reaches_the_durable
     );
     assert!(!temporary.knows(&id) && temporary.next_deadline().is_none());
     // From then on the ID is an ordinary unknown one, wherever it is looked up.
-    let located = super::locate(Some(&temporary), Some(&durable), &background, &id)
+    let located = super::locate(Some(&temporary), Some(&durable), &background, &id, None)
         .expect("the durable store answers");
     assert!(located.temporary.is_none());
     assert_eq!(
         super::stored_answer(&located.store, &axum::http::Method::GET, &id, None).expect("get"),
         None
     );
-    let (_, message) =
-        super::locate(Some(&temporary), None, &background, &id).expect_err("no durable store");
+    let (_, message) = super::locate(Some(&temporary), None, &background, &id, None)
+        .expect_err("no durable store");
     assert!(message.contains("--response-store"), "{message}");
 }
 
@@ -402,7 +403,7 @@ fn durable_responses_are_never_answered_from_the_temporary_store() {
     advance(&clock, TTL * 10);
     assert_eq!(temporary.expire_due(&background), 0);
     let located =
-        super::locate(Some(&temporary), Some(&durable), &background, &id).expect("located");
+        super::locate(Some(&temporary), Some(&durable), &background, &id, None).expect("located");
     assert!(Arc::ptr_eq(&located.store, &durable));
     assert_eq!(status(&durable, &id), "completed", "never expired");
     assert_eq!(stored(&durable, &id).expect("stored")["store"], true);

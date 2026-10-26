@@ -24,8 +24,8 @@ state is read from the store on every request). From then on every request,
 | key | authorizes |
 |---|---|
 | admin key `sk-admin-...` | only `/v1/organization/*` |
-| project key `sk-proj-...` | every other route; usage is attributed to its project and key |
-| `serve --api-key KEY` (optional) | every route except `/v1/organization/*`; usage is unattributed |
+| project key `sk-proj-...` | every other route, on its project's data only; usage is attributed to its project and key |
+| `serve --api-key KEY` (optional) | every route except `/v1/organization/*`, on every project's data; usage is unattributed |
 
 A missing or invalid key is a `401` (`invalid_api_key`); the wrong kind of key
 is a `403` (`insufficient_permissions`). Expired keys, keys of archived
@@ -177,14 +177,35 @@ limits, data retention, model and hosted-tool permissions, external storage.
 
 ## Limits
 
-- Projects separate usage, not data. Every project key, and the `--api-key`
-  key, reaches the same stored responses, files, uploads, conversations,
-  vector stores and batches: a key of one project can list, read, cancel and
-  delete another project's, given its ID (or by listing, where the API lists).
-  Only the usage records and the creator kept for later work are per project.
-  Do not give a project key to anyone who must not see the other projects'
-  data; run a separate server for them, as another user (whose home holds
-  its own data directory).
+- Projects separate data as well as usage. Every stored object records the
+  project whose key created it: Responses (durable and background, and the
+  temporary `store: false` background ones), conversations and their items,
+  files, uploads, vector stores with their files and file batches, and
+  batches. The file a completed upload makes belongs to the upload's
+  project, and a batch's output and error files to the batch's. A project
+  key sees only its own project's objects. Any other one, including every
+  unowned one, answers exactly as a missing ID does: the same `404` and
+  message on every route (retrieve, list, modify, cancel, delete,
+  `input_items`, `?stream=true`), left out of lists and refused as a list
+  cursor, and refused as unknown where a request names it
+  (`previous_response_id`, Responses `conversation`, `file_id` media parts
+  of Chat Completions and Responses, a batch's `input_file_id`, a vector
+  store's `file_ids`, and the `file_search` tool's `vector_store_ids`).
+- Requests with authentication off, and with the `--api-key` key (the
+  operator's), act for no project: what they create is unowned, and they see
+  and may change every project's objects as well. Objects stored before
+  projects were recorded are unowned too: the services database gains
+  nullable owner columns and old response records have no owner, so they
+  stay readable without a project and are invisible to project keys. Where a
+  project-less caller combines objects (attaching a project's file to an
+  unowned vector store, say), whoever may see the container sees what is in
+  it.
+- Projects share the one engine: its queue, and its prompt cache, so a
+  response's `cached_tokens` (and its latency) can show that a recent request
+  of any project began with the same tokens. Hosted tools (`--tools-*`) act
+  on the same roots for every project. Do not give a project key to anyone
+  who must not learn that much; run a separate server for them, as another
+  user (whose home holds its own data directory).
 - Work that runs after its request ended is attributed to the project key
   that created it, which is stored with it: batch lines in the services
   database, and a pending durable background Response in its record beside
