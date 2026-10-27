@@ -45,6 +45,10 @@ pub const CONVERSION_STACK: usize = 32 << 20;
 pub enum Kind {
     /// `text/html` or `application/xhtml+xml`: converted to Markdown.
     Html { charset: Option<String> },
+    /// `application/pdf`, or a URL path ending in `.pdf` with a media type
+    /// that is neither HTML nor text: its text is extracted
+    /// ([`super::pdf`]).
+    Pdf,
     /// Other text (`text/*`, JSON, XML, JavaScript): decoded from its
     /// charset.
     Text { charset: Option<String> },
@@ -53,11 +57,16 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The kind a `Content-Type` value names.
+    /// The kind a `Content-Type` value names for a response to `path` (the
+    /// request's path and query).
     #[must_use]
-    pub fn of(content_type: Option<&str>) -> Self {
+    pub fn of(content_type: Option<&str>, path: &str) -> Self {
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        let pdf_path = path
+            .get(path.len().saturating_sub(4)..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(".pdf"));
         let Some(content_type) = content_type else {
-            return Self::Other;
+            return if pdf_path { Self::Pdf } else { Self::Other };
         };
         let mut parameters = content_type.split(';');
         let essence = parameters
@@ -73,6 +82,8 @@ impl Kind {
         });
         if essence == "text/html" || essence == "application/xhtml+xml" {
             Self::Html { charset }
+        } else if essence == "application/pdf" || essence == "application/x-pdf" {
+            Self::Pdf
         } else if essence.starts_with("text/")
             || essence.ends_with("+json")
             || essence.ends_with("+xml")
@@ -82,6 +93,8 @@ impl Kind {
             )
         {
             Self::Text { charset }
+        } else if pdf_path {
+            Self::Pdf
         } else {
             Self::Other
         }
@@ -418,9 +431,26 @@ mod tests {
             ("image/png", Kind::Other),
             ("application/octet-stream", Kind::Other),
         ] {
-            assert_eq!(Kind::of(Some(content_type)), expected, "{content_type}");
+            assert_eq!(
+                Kind::of(Some(content_type), "/"),
+                expected,
+                "{content_type}"
+            );
         }
-        assert_eq!(Kind::of(None), Kind::Other);
+        assert_eq!(Kind::of(None, "/"), Kind::Other);
+        // PDFs by media type, or by a `.pdf` path when the media type says
+        // neither HTML nor text.
+        assert_eq!(Kind::of(Some("application/pdf"), "/paper"), Kind::Pdf);
+        assert_eq!(Kind::of(Some("Application/X-PDF"), "/"), Kind::Pdf);
+        for path in ["/rfc/rfc9114.pdf", "/a/B.PDF?download=1", "/x.pdf#page=2"] {
+            assert_eq!(Kind::of(Some("application/octet-stream"), path), Kind::Pdf);
+            assert_eq!(Kind::of(None, path), Kind::Pdf);
+        }
+        assert_eq!(
+            Kind::of(Some("text/html"), "/viewer.pdf"),
+            Kind::Html { charset: None }
+        );
+        assert_eq!(Kind::of(Some("image/png"), "/pdf"), Kind::Other);
     }
 
     fn fails(_: &str, _: &str) -> Option<String> {

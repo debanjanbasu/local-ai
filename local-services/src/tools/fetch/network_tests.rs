@@ -43,6 +43,16 @@ fn bomb(coding: Coding) -> Vec<u8> {
     super::body::tests::encode(coding, &vec![0; 16 << 20])
 }
 
+fn pdf() -> Vec<u8> {
+    super::pdf::tests::pdf_of(
+        vec![super::pdf::tests::lines(&[
+            "A PDF fetched",
+            "over the network",
+        ])],
+        None,
+    )
+}
+
 const PAGE: &str = r#"<html><head><title>T</title><script>SCRIPT</script></head>
 <body><nav><a href="/">NAV</a></nav><main><h1>Fixture page</h1>
 <p>See <a href="docs/next.html">the next page</a>.</p></main></body></html>"#;
@@ -94,6 +104,15 @@ fn reply(path: &str, alt_svc: Option<u16>) -> Reply {
                 b"<p>caf\xe9</p>".to_vec(),
             ),
             "/image" => ok("image/png", vec![0x89, b'P', b'N', b'G']),
+            "/paper" => ok("application/pdf", pdf()),
+            "/files/paper.pdf" => ok("application/octet-stream", pdf()),
+            "/files/locked.pdf" => ok(
+                "application/pdf",
+                super::pdf::tests::pdf_of(
+                    vec![super::pdf::tests::lines(&["Private"])],
+                    Some(("owner", "secret")),
+                ),
+            ),
             "/skippable" => {
                 // zstd skippable frames: megabytes on the wire, nothing decoded.
                 let mut frames = Vec::new();
@@ -645,6 +664,42 @@ async fn html_arrives_as_markdown_within_the_limits() {
             "\n[truncated: the page was cut at 4096 bytes of HTML before conversion]\
              \n[truncated: the Markdown was cut at 1024 bytes]"
         ),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn pdfs_arrive_as_text() {
+    let server = tcp_server(Some(&[b"h2"]), None).await;
+    let client = client();
+    let expected =
+        "\n[converted from PDF to text: 1 pages]\n\n## Page 1\n\nA PDF fetched\n\nover the network";
+    for (path, content_type) in [
+        ("/paper", "application/pdf"),
+        ("/files/paper.pdf", "application/octet-stream"),
+    ] {
+        let (body, truncated) = text(
+            super::fetch_target(&client, &target("https", server.port, path), 4096)
+                .await
+                .expect("fetch"),
+        );
+        assert!(!truncated);
+        assert_eq!(
+            body,
+            format!("HTTP 200\ncontent-type: {content_type}\n{expected}")
+        );
+    }
+    let (body, _) = text(
+        super::fetch_target(
+            &client,
+            &target("https", server.port, "/files/locked.pdf"),
+            4096,
+        )
+        .await
+        .expect("fetch"),
+    );
+    assert!(
+        body.ends_with("\n[the PDF is encrypted with a password; its text cannot be read]"),
         "{body}"
     );
 }

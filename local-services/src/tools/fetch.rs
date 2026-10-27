@@ -20,9 +20,10 @@
 //!   decoded while it streams ([`body`]), up to the byte limit (both decoded
 //!   and encoded bytes are bounded, so a decompression bomb stops at the
 //!   limit). HTML is reduced to its main content ([`extract`]) and
-//!   converted to Markdown ([`markdown`]). A cut body says so with a
-//!   marker; the caller's deadline bounds the whole exchange, conversion
-//!   included, and dropping the future abandons the connection.
+//!   converted to Markdown ([`markdown`]); a PDF's text is extracted
+//!   ([`pdf`]). A cut body says so with a marker; the caller's deadline
+//!   bounds the whole exchange, conversion included, and dropping the
+//!   future abandons the connection (and stops a PDF at its next page).
 
 mod altsvc;
 mod body;
@@ -32,6 +33,7 @@ mod extract;
 mod markdown;
 #[cfg(test)]
 mod network_tests;
+mod pdf;
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -153,12 +155,17 @@ const FETCH_ACCEPT: &str =
 /// Decoded HTML read per byte of the limit: Markdown keeps a fraction of a
 /// page's bytes, so a page may be four times the limit before conversion.
 const HTML_INPUT_FACTOR: usize = 4;
+/// PDF bytes read per byte of the limit: a PDF's text is a small part of
+/// the file (fonts, images, compressed streams), so a file may be 64 times
+/// the limit (16 MiB at the default 256 KiB).
+const PDF_INPUT_FACTOR: usize = 64;
 
 /// Fetch `url`, returning at most `max_bytes` of body text.
 ///
 /// HTML is reduced to its main content and converted to Markdown (from at
 /// most four times `max_bytes` of decoded HTML, the Markdown then capped at
-/// `max_bytes`); other text is
+/// `max_bytes`); a PDF's text is extracted (from at most 64 times
+/// `max_bytes` of file, the text capped at `max_bytes`); other text is
 /// decoded from its charset; anything else is shown as UTF-8 as before.
 pub async fn fetch(url: &str, max_bytes: usize) -> Result<Output, ToolError> {
     let target = target(url)?;
@@ -194,9 +201,11 @@ async fn fetch_target(
             .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
+        &target.path,
     );
     let limit = match kind {
         markdown::Kind::Html { .. } => max_bytes.saturating_mul(HTML_INPUT_FACTOR),
+        markdown::Kind::Pdf => max_bytes.saturating_mul(PDF_INPUT_FACTOR),
         markdown::Kind::Text { .. } | markdown::Kind::Other => max_bytes,
     };
     let read = body::read(&mut response, limit).await?;
@@ -235,6 +244,18 @@ async fn fetch_target(
                 );
             }
             read.cut || end < converted.len()
+        }
+        markdown::Kind::Pdf => {
+            // Tens to hundreds of milliseconds per file, off the async
+            // threads; bounded by the input limit, the stream limit and the
+            // page and text caps, and stopped at the next page once the
+            // caller's deadline drops this future.
+            let (converted, truncated) =
+                on_thread(move |stopped| pdf::to_text(&read.bytes, read.cut, max_bytes, stopped))
+                    .await?;
+            text.push('\n');
+            text.push_str(&converted);
+            truncated
         }
         markdown::Kind::Text { charset } => {
             text.push('\n');
