@@ -982,6 +982,8 @@ struct HandoffInner {
     outstanding: usize,
     retired: Option<String>,
     stop: bool,
+    /// When the work [`Handoff::arm`]ed must be finished.
+    deadline: Option<Instant>,
 }
 
 struct HandoffState {
@@ -1055,6 +1057,14 @@ impl HandoffState {
                 );
                 self.retire_locked(&mut inner, &why);
             }
+            match inner.deadline {
+                Some(deadline) if deadline <= now => {
+                    inner.deadline = None;
+                    self.retire_locked(&mut inner, "a Neural Engine chunk passed its deadline");
+                }
+                Some(deadline) => earliest = Some(earliest.map_or(deadline, |e| e.min(deadline))),
+                None => {}
+            }
             inner = match earliest {
                 Some(deadline) => {
                     self.changed
@@ -1106,6 +1116,7 @@ impl Handoff {
             outstanding: 0,
             retired: None,
             stop: false,
+            deadline: None,
         };
         let state = Arc::new(HandoffState {
             ready,
@@ -1219,11 +1230,20 @@ impl Handoff {
         }
     }
 
+    /// Retire unless [`Self::finish`] is called within `limit`: the last
+    /// resort for an ANE job whose ready event never reports, which no
+    /// per-job watchdog would see start.
+    pub fn arm(&self, limit: Duration) {
+        lock(&self.state.inner).deadline = Some(Instant::now() + limit);
+        self.state.changed.notify_all();
+    }
+
     /// Wait (at most one bound) for the jobs queued since the last finish.
-    /// `false` if any failed or did not report.
+    /// `false` if any failed or did not report. Disarms [`Self::arm`].
     pub fn finish(&self) -> bool {
         let state = &self.state;
         let mut inner = lock(&state.inner);
+        inner.deadline = None;
         let settled = |inner: &HandoffInner| {
             inner.jobs.values().any(|phase| *phase == Phase::Failed)
                 || inner.jobs.values().all(|phase| *phase == Phase::Succeeded)
