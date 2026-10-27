@@ -118,6 +118,13 @@ const MIXED: usize = 6144;
 pub(super) const OUT_STEPS: [u32; 7] = [0, 512, 1024, 1536, 2048, 2560, 3072];
 /// Where [`OutSplit`] starts on a machine without a learned split.
 const OUT_START: usize = 6;
+/// Blocks starting before this position take no output rows: there
+/// attention is cheapest and the GPU's half-block mixer about as short as
+/// the ANE's FFN, so output rows make the ANE the bottleneck. On the M4 Pro
+/// a 2,049-token prompt's first block took 3.02 s with 3,072 rows against
+/// 2.74 s with none, while its second took 2.71 s with 2,560 rows against
+/// 2.79 s with 512.
+const OUT_MIN_POSITION: usize = 1024;
 /// [`OutSplit`] moves to a probed split whose chunk ran faster per row by
 /// more than this fraction, and takes a step away when the GPU waited over
 /// [`OUT_WAIT_LIMIT_MS`] per layer on the ANE's FFNs.
@@ -1223,6 +1230,18 @@ impl OutSplit {
         if self.end != Some(start) {
             self.history.clear();
         }
+        #[cfg(test)]
+        if let Some(step) = OUT_STEP_OVERRIDE
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .checked_sub(1)
+        {
+            self.current = None;
+            return step;
+        }
+        if start < OUT_MIN_POSITION {
+            self.current = None;
+            return 0;
+        }
         let base = self.steps[function];
         let mut chunk = Chunk {
             function,
@@ -1249,13 +1268,6 @@ impl OutSplit {
             };
             chunk.probe = true;
         }
-        #[cfg(test)]
-        if let Some(step) = OUT_STEP_OVERRIDE
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .checked_sub(1)
-        {
-            chunk.step = step;
-        }
         self.current = Some(chunk);
         chunk.step
     }
@@ -1264,14 +1276,10 @@ impl OutSplit {
     /// `ms`, its GPU having waited `wait` ms per layer on average for the
     /// ANE's FFNs: whether the split changed.
     fn learn(&mut self, end: usize, ms: f64, wait: Option<f64>) -> bool {
+        self.end = Some(end);
         let Some(mut chunk) = self.current.take() else {
             return false;
         };
-        self.end = Some(end);
-        #[cfg(test)]
-        if OUT_STEP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-            return false;
-        }
         let step = &mut self.steps[chunk.function];
         let before = *step;
         if wait.is_some_and(|wait| wait > OUT_WAIT_LIMIT_MS) {
@@ -2259,7 +2267,10 @@ mod tests {
         assert_eq!(text.matches("-> (y);").count(), ffns + outs);
     }
 
+    /// Plan and learn a chunk at `start` past the first [`OUT_MIN_POSITION`]
+    /// positions.
     fn finish(split: &mut OutSplit, rows: usize, start: usize, ms: f64) -> (usize, bool) {
+        let start = start + OUT_MIN_POSITION;
         let step = split.plan(3, rows, start);
         let changed = split.learn(start + rows, ms, Some(0.0));
         (step, changed)
@@ -2280,7 +2291,7 @@ mod tests {
         assert_eq!(split.steps[3], 3);
         assert_eq!(split.steps[0], 4, "other functions keep theirs");
         // The next chunk probes up from the new split.
-        assert_eq!(split.plan(3, 1024, 5120), 4);
+        assert_eq!(split.plan(3, 1024, 5120 + OUT_MIN_POSITION), 4);
     }
 
     #[test]
@@ -2298,21 +2309,30 @@ mod tests {
         let top = OUT_STEPS.len() - 1;
         let mut edge = OutSplit::new([top; FUNCTION_ROWS.len()]);
         finish(&mut edge, 1024, 0, 2000.0);
-        assert_eq!(edge.plan(3, 1024, 1024), top - 1);
+        assert_eq!(edge.plan(3, 1024, 1024 + OUT_MIN_POSITION), top - 1);
         let mut edge = OutSplit::new([0; FUNCTION_ROWS.len()]);
         edge.probe_up = [false; FUNCTION_ROWS.len()];
         finish(&mut edge, 1024, 0, 2000.0);
-        assert_eq!(edge.plan(3, 1024, 1024), 1);
+        assert_eq!(edge.plan(3, 1024, 1024 + OUT_MIN_POSITION), 1);
+        // A prompt's first positions take no output rows and teach nothing.
+        let mut first = OutSplit::new([4; FUNCTION_ROWS.len()]);
+        assert_eq!(first.plan(3, 1024, 0), 0);
+        assert!(!first.learn(1024, 1.0, Some(0.0)));
+        assert_eq!(
+            first.plan(3, 1024, 1024),
+            4,
+            "the next block is a base block"
+        );
     }
 
     #[test]
     fn out_split_backs_off_when_the_gpu_waits_on_the_ane() {
         let mut split = OutSplit::new([4; FUNCTION_ROWS.len()]);
-        split.plan(3, 1024, 0);
-        assert!(split.learn(1024, 2000.0, Some(0.8)));
+        split.plan(3, 1024, 2048);
+        assert!(split.learn(3072, 2000.0, Some(0.8)));
         assert_eq!(split.steps[3], 3);
-        split.plan(3, 1024, 1024);
-        assert!(!split.learn(2048, 2000.0, Some(0.2)));
+        split.plan(3, 1024, 3072);
+        assert!(!split.learn(4096, 2000.0, Some(0.2)));
         assert_eq!(OUT_STEPS[0], 0, "step 0 leaves the projection to the GPU");
     }
 

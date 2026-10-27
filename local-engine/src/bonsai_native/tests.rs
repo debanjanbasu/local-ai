@@ -1367,15 +1367,18 @@ fn short_attention_splits_track_128_token_splits_next_token_distribution() {
     }
 }
 
-/// Prefill with every FFN on the Neural Engine (int8 weights x int8
-/// activations, the wavefront of two half blocks) against the same model's
-/// GPU prefill, teacher-forced over 64 greedy tokens after a 1,000-token
-/// prompt (one uneven wavefront block) and an 8,192-token one (eight full
-/// blocks) of this repository's text. Decode runs on the GPU in both, so
-/// only the prefill FFN's rounding differs. Measured on the M4 Pro: mean
-/// next-token KL about 7e-5 (Kapitsa gates its own at 3.84e-4). The bounds
-/// leave headroom over that: mean at most 2e-4, no row over 2e-3, and at
-/// least 60/64 top-1. A broken program or handoff lands far outside them.
+/// Prefill with every FFN and up to 3,072 rows of each mixer output
+/// projection on the Neural Engine (int8 weights x int8 activations, the
+/// wavefront of two half blocks) against the same model's GPU prefill,
+/// teacher-forced over 64 greedy tokens after a 1,000-token prompt (one
+/// uneven wavefront block) and an 8,192-token one (eight full blocks) of
+/// this repository's text. Decode runs on the GPU in both, so only the
+/// prefill's ANE rounding differs. Measured on the M4 Pro: mean next-token
+/// KL about 7e-5 (5.5e-5 to 8.4e-5 across runs and splits; 1.4e-4 once with
+/// 3,584 output rows, beyond today's steps; Kapitsa gates its own at
+/// 3.84e-4). The bounds leave headroom over that: mean at most 2e-4, no row
+/// over 2e-3, and at least 60/64 top-1. A broken program or handoff lands
+/// far outside them.
 #[test]
 #[ignore = "requires the pinned model, a Metal device and the Neural Engine"]
 #[expect(clippy::cast_precision_loss)]
@@ -1643,9 +1646,10 @@ fn ane_prefill_block_timings() {
 /// Cold prefill time of 4,096 tokens (four wavefront blocks; set
 /// `ANE_SPLIT_ROWS` for another length) with every layer's mixer output
 /// projection split at each fixed number of ANE rows (`ANE_SPLIT_STEPS`, a
-/// list of `OUT_STEPS` indices, for a subset), best of two after a warm-up:
-/// what the split controller chooses between. Measurement only; nothing is
-/// asserted.
+/// list of `OUT_STEPS` indices, for a subset), best of two after a warm-up
+/// (reported apart, with the model's first prefill paying for building the
+/// ANE path): what the split controller chooses between. Measurement only;
+/// nothing is asserted.
 #[test]
 #[ignore = "measurement; requires the pinned model, a Metal device and the Neural Engine"]
 fn ane_out_split_timings() {
@@ -1669,19 +1673,18 @@ fn ane_out_split_timings() {
         KvOptions::default(),
     )
     .expect("load");
+    // The first run of each split, which loads its ANE functions, apart.
     let time = |model: &mut BonsaiModel| {
-        let mut best = f64::INFINITY;
-        for repeat in 0..3 {
+        let mut runs = [0.0; 3];
+        for run in &mut runs {
             model.reset();
             let started = std::time::Instant::now();
             model
                 .prefill(&corpus[..rows], &mut |_| {})
                 .expect("prefill");
-            if repeat > 0 {
-                best = best.min(started.elapsed().as_secs_f64() * 1e3);
-            }
+            *run = started.elapsed().as_secs_f64() * 1e3;
         }
-        best
+        (runs[0], runs[1].min(runs[2]))
     };
     let steps = std::env::var("ANE_SPLIT_STEPS").map_or_else(
         |_| (0..ane_split::OUT_STEPS.len()).collect::<Vec<usize>>(),
@@ -1694,11 +1697,11 @@ fn ane_out_split_timings() {
     );
     for step in steps {
         ane_split::OUT_STEP_OVERRIDE.store(step + 1, Ordering::Relaxed);
-        let ms = time(&mut model);
+        let (first, ms) = time(&mut model);
         assert!(model.ane_active(), "{}", model.neural_engine_policy());
         println!(
             "{}",
-            serde_json::json!({"rows": rows, "step": step, "ms": ms, "tok_s": rows as f64 / ms * 1e3})
+            serde_json::json!({"rows": rows, "step": step, "first_ms": first, "ms": ms, "tok_s": rows as f64 / ms * 1e3})
         );
     }
     ane_split::OUT_STEP_OVERRIDE.store(0, Ordering::Relaxed);
