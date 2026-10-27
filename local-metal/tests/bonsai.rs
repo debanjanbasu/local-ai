@@ -855,8 +855,9 @@ fn kernels_with_small_batch_max(context: &MetalContext, tokens: u32) -> BonsaiKe
 }
 
 // Every exact-token kernel, the wide kernel alone and with each scalar tail
-// (9 -> 7 + 2, 12 -> 8 + 4, 17 -> 8 + 7 + 2), partial row groups, partial
-// four-block iterations and real projection widths. The
+// (9 -> 7 + 2, 12 -> 8 + 4, 17 -> 8 + 7 + 2), partial row groups of both wide
+// variants (8 rows per threadgroup up to 2048 rows, 16 above), partial block
+// iterations and real projection widths. The
 // small-batch path repeats the decode matvec's arithmetic per token, but the
 // compiler contracts the per-token FMAs differently, so results are not bit
 // identical (first run: 3.7e-7 gap on a 1.4-magnitude row); the gap is bounded
@@ -880,6 +881,8 @@ fn small_batch_matches_tokenwise_matvec_reference_and_tile_for_all_chunks() {
         (6, 3, 5120),
         (7, 31, 896),
         (8, 32, 1024),
+        (5, 2049, 384),
+        (8, 2063, 256),
         (9, 7, 2048),
         (12, 5, 384),
         (16, 2, 128),
