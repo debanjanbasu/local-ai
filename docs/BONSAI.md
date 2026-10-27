@@ -2273,6 +2273,20 @@ exceed the context fails as soon as it reaches the head of the queue,
 rather than holding the requests behind it until the engine is idle. At most
 eight decode together, in at most 64 stacked rows.
 
+KFlash leaves batched passes as they are: they write no taps and verify only
+head and lookup drafts (see [KFlash cycles](#kflash-cycles)). With the
+drafter installed, `tools/serve_concurrency.py --phases decode` (300-token
+greedy essays, back to back against `d25b277`) measured 34.9, 49.4, 60.2
+and 80.4 tok/s aggregate at 1, 2, 4 and 8 streams against 35.4, 50.5, 60.2
+and 76.5; an earlier pair gave 38.6, 49.7, 60.8 and 77.1 against 35.6,
+50.6, 60.4 and 77.1. At two streams both requests finish their batched
+passes together with main's (4.2 s for the first), and the second's solo
+essay tail, where the head's chain leads and the tree's trial cycles cost
+a little, takes 12.15 against 11.87 s. Every text matched main's but one
+per pair, the earlier pair's one-stream essay and the later pair's eighth
+stream at eight, each a near-tie resolved the other way: the batched
+passes are main's, so solo cycles (trees in that essay's case) took it.
+
 ## Resource policy
 
 All choices and reasons are reported in startup JSON.
@@ -2471,6 +2485,162 @@ That is -0.2 to +2.1%, against 1-6% in Kapitsa. `BonsaiModel::set_taps` adds the
 drafter's residual taps, the residual after layers 5, 19, 33, 47 and 61 of
 every committed position, in a 2048-position ring (210 MB). The taps cost
 nothing while off and stay within run-to-run noise while on.
+
+#### KFlash cycles
+
+With the drafter installed, startup turns on the residual taps and tree
+verify beside the MTP head, loads the drafter, measures on this machine the
+verify cost of 1 to 8 rows (the faster of a warm-up pass and one timed pass of
+each size) and the drafting pass, and reports it all under `policy.kflash`
+(`resources.dflash_reason` says why when it is off). The context fit counts
+the drafter's 2.05 GB of mapped weights, its 67 MB of context ring and
+scratch, the 217 MB tap ring with its verify staging rows and the 105 MB tree
+verifier. Without the drafter nothing changes.
+
+Each solo round then picks one source for its cycle, before any drafting, by
+measured tokens per millisecond: the DFlash2 tree, the head's gated depth-3
+chain, or suffix lookup when it has a 12-token match. Each source's tokens
+per cycle and wall milliseconds per cycle are averaged over the cycles it ran
+(evenly for the first ten, then decaying by a tenth), and the cycle goes to
+the leader. A source that has not run in the request runs first; a trailing
+one runs again after `base · (leader rate / its rate)³` cycles (base 16 for
+the tree, 32 for the head chain, 8 for lookup, at most 512), so a change in
+the text is noticed without paying for it every cycle. Because the choice
+comes first, no drafting pass is drafted only to be compared and thrown away.
+
+A tree cycle is three submissions:
+
+```text
+draft:   append the positions committed since the drafter last drafted (from
+         the tap ring, in 64-row chunks), drafting pass at the anchor, 8-row
+         best-first tree                                     one command buffer
+choose:  n = argmax E(n) - r * cost(n) over the first n rows, depth capped by
+         the request's remaining tokens and the context     host, ~µs
+verify:  tree_verify (one row: decode step; a chain: chain verify block;
+         else the tree kernels), accept the longest agreeing path with the
+         sampler's own draw per position                     early-submitted
+commit:  gather and replay the path, its taps to the ring, its rows into the
+         MTP head                                            one command buffer
+learn:   record the tested nodes, refit every 16 cycles, upload; fold the
+         verify's GPU time into the per-row cost drift       host
+```
+
+`E(n)` is 1 plus the calibrated path probabilities of rows 1 to n − 1, read
+back with the tree; `cost(n)` is the load-time verify cost of n rows plus n
+times a per-row drift that every verify's GPU time updates, so it follows the
+history the rows attend as the context grows; `r` is the request's recent
+tokens per millisecond over all sources (before four cycles,
+`E(n) / (draft + cost(n))`). A tree whose best size is the anchor alone is
+handed to the head's chain instead of a bare decode step, which costs at most
+one head step when the head is no surer than the drafter.
+
+The drafter's context follows the tap ring lazily. Cycles that verify head
+or lookup drafts append nothing; the next drafting pass appends every
+position committed since in a few 8-row chunks (one row costs 0.83 ms, a
+64-row chunk about 8 ms), and a backlog over 64 rows (a prompt, or a long run
+of head cycles) is appended in its own command buffer first so it does not
+count against the cycle. The ring records which consecutive positions of
+which buffer set it holds. When that span breaks (rows decoded in a batched
+pass, another sequence's prefill, a restored prefix) the drafter restarts at
+the first position tapped since, at most a window back, and attends only
+what it has from there, as a sequence that started there would. Unless that
+is position 0 it first waits for 64 tapped positions, decoding on the old
+rule (lookup, else the head) meanwhile, since trees drafted from a handful
+of positions would be worth little and would rank the tree behind for many
+cycles (the 64 is a choice, not a measured optimum). Once it can draft
+again the tree counts as untried. A request that restores a prompt-cache
+prefix of the previous drafting request's tokens (the next turn of a
+conversation) continues that request's context from the prefix instead, at
+once, provided the drafter's ring still holds it. A disk snapshot restored
+in a new process has no drafter context: those requests draft once they
+have tapped 64 positions past it.
+
+Batched serving keeps its passes as they were: no taps, no trees, head and
+lookup drafts priced by the cost model. A sequence that becomes the only one
+decoding takes its solo rounds on the old rule (lookup, else the head),
+which tap its committed rows, and after 64 of them drafts trees from a
+restarted context. Per-sequence taps in batched passes, a drafter context per
+sequence and DFlash chains in the batched cost model were not built: the
+drafting pass runs one sequence at a time (12.6 ms each, against a 49 to 89
+ms pass for two to eight sequences), a second sequence's context ring and
+taps would add about 260 MB each, and the batched passes' kernels would need
+a tap write per sequence at a row offset.
+
+Measured on the M4 Pro with the shipped drafter (`bonsai --greedy --json`,
+300 tokens, six prompts of the depth/margin sweep, cold prompt cache, best
+of two, builds interleaved; main is `d25b277`). Startup measured 30.5,
+44.0, 57.9, 69.9, 72.1, 72.7, 73.6 and 77.2 ms to verify 1 to 8 rows and
+13.1 ms to draft. Cycles are tree cycles, trees declined to the head's
+chain, head cycles and lookup cycles; tokens per cycle are the tree cycles'
+emitted tokens against the calibrated `E(n)` they were chosen for:
+
+| Prompt | KFlash | Main | Cycles (tree / declined / head / lookup) | Tokens per tree cycle (expected) |
+| --- | ---: | ---: | --- | ---: |
+| prose | 40.8 | 37.5 | 54 / 2 / 1 / 0 | 3.80 (3.95) |
+| explanation | 46.5 | 39.3 | 64 / 6 / 1 / 2 | 4.28 (4.33) |
+| arithmetic | 63.3 | 41.6 | 48 / 9 / 1 / 0 | 5.90 (5.36) |
+| code | 58.5 | 42.3 | 56 / 3 / 1 / 0 | 5.21 (5.01) |
+| essay | 34.9 | 35.5 | 5 / 0 / 154 / 0 | 2.20 (2.76) |
+| thinking | 66.5 | 43.7 | 41 / 6 / 1 / 0 | 6.59 (6.25) |
+| geomean | **50.4** | 39.9 | | 5.01 over all tree cycles |
+
+An earlier run of the same code measured 50.9 against 40.1 and 32.8
+without speculation, every KFlash text byte-identical to `--no-speculation`.
+Main's essay was not: its head chain resolves a near-tie at token 123
+differently from a decode step. The essay runs on the head's chain under
+KFlash too, and in the later run above took main's text. The six trace
+prompts at 512 tokens (one round) gave 49.2 against 39.9 (32.2 without
+speculation): prose 39.6, explanation 41.0, arithmetic 63.0, code 59.6,
+essay 34.8 and thinking 67.2, against 37.4, 38.3, 42.3, 43.2, 35.2 and
+43.5, at 4.98 tokens per tree cycle. Five match `--no-speculation`; the
+essay (269 head cycles, 4 trees) differs at the same token as main's. The
+two 600-token copy-edit prompts reached 79.7 and 93.1 against 71.9 and
+93.9 tok/s, both identical to `--no-speculation`: the rename edit split
+its cycles between 18 lookups and 14 trees (7.93 tokens each), the other
+stayed on lookup. Through `serve`, a 600-token coding answer decoded at
+53.1 against 41.6 tok/s and an agent turn with tools at 61.9 against 55.2,
+with the same text as main; a 53-token pair of tool calls, 15 cycles
+mostly on the head, at 40.2 against 43.9. Two 300-token essays through
+`serve` gave the same text as a server with neither the head nor the
+drafter installed. The `kflash_generation_matches_plain_decoding` test
+(ignored; GGUF, head and drafter) compares a code and a prose answer,
+greedy, and a seeded sampled one with plain decoding, then a greedy answer
+decoded first in a batch and then solo (14 batched tokens, 27 head cycles
+while the restarted context rebuilt, 38 tree cycles). Greedy answers may
+first differ only where plain decoding's two best logits are within 0.03.
+One earlier run, which still required exact equality, saw the code answer
+differ at token 132 (its margin was not recorded) under a calibration other
+runs had moved; the two runs since matched throughout.
+
+A long prompt pays for the drafter's context once, after its first token.
+Summarizing a 2,573-token section of this file (128 tokens, two runs) took
+the same prefill (19.2-19.3 s against 19.5-20.3 s to the first token), then
+appended its last 2,047 positions to the drafter in 0.26 s, drafted one
+tree (2 tokens against an expected 2.94) and gave the other 67 cycles to
+the head: 31.7-31.8 tok/s against 33.9-34.5, the difference being that
+append. Short prompts reach their first token sooner (0.46 s against
+0.88-0.92 s for 45 tokens), likely because the cost measurement at load
+leaves the GPU warm.
+
+Simulated over the trace lattices the shipped drafter yields 4.97 tokens
+per 8-row cycle against the first pin's 4.68 (×1.059). Through this engine,
+same six prompts and run (the tree cycles stay the target's own path, so
+both drafters emit the same text):
+
+| Prompt | Shipped | First pin | Shipped tokens per tree cycle | First pin |
+| --- | ---: | ---: | ---: | ---: |
+| prose | 39.3 | 38.3 | 3.62 | 3.91 |
+| explanation | 46.4 | 42.4 | 4.35 | 4.25 |
+| arithmetic | 64.6 | 59.3 | 6.36 | 5.82 |
+| code | 58.2 | 53.9 | 5.35 | 5.03 |
+| essay | 35.1 | 35.0 | 2.20 | 2.50 |
+| thinking | 67.4 | 65.4 | 6.90 | 6.28 |
+| geomean | **50.3** | 47.8 | 5.10 over all | 4.92 over all |
+
+×1.052 end to end and ×1.037 per tree cycle: the gain trained on PQ2_0
+packing carries over to `PTQ1_0`. The first pin also declined more of its
+trees to the head (446 against 389 head or declined cycles over both
+rounds).
 
 ### What the speculation gain is made of
 
@@ -2892,6 +3062,19 @@ that end-of-request readback (673 MB) on its way to the disk writer; a
 request that already wrote a boundary skips it when no host tier keeps the
 snapshot (see Prompt cache).
 
+With the DFlash2 drafter installed, its 2.05 GB of int8 weights are mapped
+and file-backed like the head's, and KFlash adds about 380 MB that stays
+resident: the drafter's context ring and scratch (67 MB), the tap ring
+(210 MB) and the tree verifier (105 MB). The context fit counts all of it
+(`state_bytes` 389 MB higher, estimated working set 20.47 against 18.03 GB)
+and still selects 262,144 tokens. Peak footprint (`/usr/bin/time -l`, cold
+prompt cache, two runs each against `d25b277`): 1.44-1.47 against
+1.08-1.11 GB for a 45-token prompt and 300 tokens, 1.71 against 1.30-1.33
+GB for a 2,573-token prompt and 128 tokens. Maximum resident set size,
+which counts the drafter's mapped pages, is 2.69 and 2.84 against
+0.64-0.67 and 0.77-0.80 GB. Loading takes 3.2-3.3 s against 0.3 s: the
+drafter's payload digest and the verify and drafting cost measurement.
+
 ## Performance
 
 End-to-end summary (M4 Pro, greedy). Each row names where it was measured;
@@ -2918,6 +3101,8 @@ test run, and every relink repeats whole-program optimization.
 | --- | ---: | --- |
 | Plain short-prompt decode, six-prompt geomean | 30.4–32.3 tok/s | best-of-two A/B runs below, across recent kernel changes |
 | Default speculative decode, six-prompt geomean | 38.0–39.2 tok/s | same runs; 38.6 in the depth/margin sweep |
+| KFlash with the DFlash2 drafter installed, six-prompt geomean | 50.3–50.9 tok/s (main 39.9–40.1 in two of the runs) | best of two, cold prompt cache, three runs ([KFlash cycles](#kflash-cycles)) |
+| Two 600-token copy-edit prompts, KFlash | 79.7 and 93.1 tok/s (main 71.9 and 93.9) | best of two, cold prompt cache, one run |
 | Two 600-token copy-edit prompts, suffix lookup | 89.8 and 90.5 tok/s | 5- to 128-row kernel change |
 | Cold prefill, 2K–8K tokens | 133.7 and 131.4 tok/s (128-row blocks: 128.3 and 125.7) | 512-row blocks, uncontended A/B against `b09e22f` (2026-10-22) |
 | Cold prefill, 32,796 tokens | 110.0 → 115.6 tok/s | same |

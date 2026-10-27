@@ -235,7 +235,7 @@ Startup prints every decision and reason under `experimental_bonsai`.
 | Context | Largest value up to 262,144 whose fully grown state fits 90% of Metal's recommended working set |
 | K/V | Hadamard-rotated Q8 (8.5 bits/value); start at 1,024 tokens and grow on demand |
 | Kernels | Metal 4 tensor kernels where supported, SIMD fallbacks elsewhere |
-| Speculation | Lossless suffix lookup; gated depth-3 MTP when the mixed ternary/int8 head artifact is installed |
+| Speculation | Lossless suffix lookup; gated depth-3 MTP when the mixed ternary/int8 head artifact is installed; with the DFlash2 drafter installed, KFlash trees of up to 8 rows, each solo cycle going to the tree, the MTP chain or lookup by measured tokens per millisecond and the tree sized by E(n) − r·cost(n) |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache` |
 | Server | Up to eight requests decoded together in one batched pass per step, verifying lookup and MTP drafts where a cost model finds them worth their rows; a long prompt prefills 24 to 31 tokens per step inside that pass (32 in a pass of its own beside a single stream); eight more queued; HTTP/3 when its certificate and key are discovered |
@@ -249,6 +249,13 @@ Startup prints every decision and reason under `experimental_bonsai`.
   measured 30–32 and 38–39 tok/s. Two 600-token copy-edit prompts reached
   about 90 tok/s with suffix lookup. Run-by-run provenance is in
   [docs/BONSAI.md](docs/BONSAI.md#performance).
+- KFlash, with the DFlash2 drafter installed: 50.4 tok/s geomean on the
+  same six prompts against 39.9 for main in the same run (35–67: thinking
+  66.5, arithmetic 63.3, code 58.5; essays stay on the MTP chain at 34.9),
+  5.0 tokens per tree cycle, greedy text byte-identical to
+  `--no-speculation` wherever main's is. Copy-edit prompts: 79.7 and 93.1
+  against 71.9 and 93.9 tok/s. It adds about 380 MB of resident memory
+  and 3 s of load time ([details](docs/BONSAI.md#kflash-cycles)).
 - Server: concurrent requests decode in one batched pass per step, their MTP
   heads drafting together in one head pass per depth; 300-token chat
   requests reach 50, 59 and 74 tok/s aggregate at 2, 4 and 8 streams
