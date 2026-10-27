@@ -249,6 +249,62 @@ impl std::ops::DerefMut for PageBytes {
     }
 }
 
+/// The first `length` bytes of `buffer`, to restore a snapshot section into.
+///
+/// Called on the engine thread between steps, with no command buffer using
+/// the model's buffers in flight, and each buffer borrowed once, so nothing
+/// else reads or writes these bytes while the slice lives.
+#[expect(unsafe_code)]
+fn restore_destination(buffer: &mut MetalBuffer, length: usize) -> crate::Result<&mut [u8]> {
+    // SAFETY: see above; `as_mut_slice::<u8>` has no alignment requirement.
+    unsafe { buffer.as_mut_slice::<u8>() }
+        .get_mut(..length)
+        .ok_or_else(|| crate::Error::InvalidFormat("prompt snapshot section too large".into()))
+}
+
+/// Threads restoring a snapshot copy its sections on at once.
+const RESTORE_COPY_THREADS: usize = 8;
+
+/// Bytes one restoring thread copies at a time.
+const RESTORE_COPY_PIECE: usize = 8 * 1024 * 1024;
+
+/// Copy each source into its destination, in pieces spread over
+/// [`RESTORE_COPY_THREADS`] threads: one core's `memcpy` does not reach the
+/// memory bandwidth a restore of tens of thousands of tokens can use.
+fn copy_in_parallel(copies: Vec<(&mut [u8], &[u8])>) {
+    let pieces = copies
+        .into_iter()
+        .flat_map(|(destination, source)| {
+            destination
+                .chunks_mut(RESTORE_COPY_PIECE)
+                .zip(source.chunks(RESTORE_COPY_PIECE))
+        })
+        .collect::<Vec<_>>();
+    let threads = RESTORE_COPY_THREADS.min(pieces.len());
+    let pieces = std::sync::Mutex::new(pieces.into_iter());
+    let work = || {
+        loop {
+            let next = pieces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next();
+            let Some((destination, source)) = next else {
+                return;
+            };
+            destination.copy_from_slice(source);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            // A helper that cannot be spawned leaves its share to the others.
+            let _ = std::thread::Builder::new()
+                .name("prompt-restore-copy".into())
+                .spawn_scoped(scope, work);
+        }
+        work();
+    });
+}
+
 /// CPU-owned, persistence-safe copy of one exact recurrent/K/V boundary.
 pub struct PromptSnapshot {
     pub position: usize,
@@ -1288,6 +1344,7 @@ impl BonsaiModel {
         self.reserve_kv(snapshot.position, None)?;
         let mut recurrent = &*snapshot.recurrent;
         let mut target_kv = &*snapshot.target_kv;
+        let mut copies = Vec::with_capacity(2 * self.layers.len());
         for layer in &mut self.layers {
             match &mut layer.attention {
                 AttentionLayer::Recurrent(layer) => {
@@ -1300,8 +1357,11 @@ impl BonsaiModel {
                         rest.split_at_checked(CONV_STATE_BYTES).ok_or_else(|| {
                             crate::Error::InvalidFormat("truncated prompt snapshot history".into())
                         })?;
-                    layer.state.copy_from_bytes(state, 0);
-                    layer.history.copy_from_bytes(history, 0);
+                    copies.push((restore_destination(&mut layer.state, state.len())?, state));
+                    copies.push((
+                        restore_destination(&mut layer.history, history.len())?,
+                        history,
+                    ));
                     recurrent = rest;
                 }
                 AttentionLayer::Full(layer) => {
@@ -1313,8 +1373,11 @@ impl BonsaiModel {
                     let (value, rest) = rest.split_at_checked(value_bytes).ok_or_else(|| {
                         crate::Error::InvalidFormat("truncated prompt snapshot values".into())
                     })?;
-                    layer.key_cache.copy_from_bytes(key, 0);
-                    layer.value_cache.copy_from_bytes(value, 0);
+                    copies.push((restore_destination(&mut layer.key_cache, key.len())?, key));
+                    copies.push((
+                        restore_destination(&mut layer.value_cache, value.len())?,
+                        value,
+                    ));
                     target_kv = rest;
                 }
             }
@@ -1324,6 +1387,7 @@ impl BonsaiModel {
                 "prompt snapshot has trailing state bytes".into(),
             ));
         }
+        copy_in_parallel(copies);
         match (&mut self.speculation, snapshot.mtp_prev_hidden.is_empty()) {
             (Some(speculation), false) => {
                 if snapshot.mtp_prev_hidden.len() != WIDTH * size_of::<f32>() {
