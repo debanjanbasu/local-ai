@@ -282,7 +282,12 @@ flag turns any of it off or tunes it.
   under the shared GPU lock while other agents worked. Mean next-token KL
   against GPU prefill about 7e-5, top-1 64/64
   ([details](docs/BONSAI.md#neural-engine-prefill-ffn)). The GPU alone
-  measured 75 tok/s at 128K; 128K was not re-measured.
+  measured 75 tok/s at 128K; 128K was not re-measured. Faster GPU mixers
+  (the recurrence's loads a token ahead, a four-lane attention softmax: 9%
+  less attention kernel time at 32K-128K) then measured 228 against 219 tok/s
+  at 32K with the Neural Engine and 114 against 105 on the GPU alone, best
+  of two on a power-limited 20 W adapter where both builds ran slower than
+  above; 2K and 8K unchanged.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s. After a server restart a
   new session sharing a ~5.9K-token system prompt and tools reaches its first
