@@ -18,9 +18,9 @@ There is one fixed implementation per job, not a set of optional backends:
 
 | Job | Implementation |
 | --- | --- |
-| Durable state | One bundled SQLite database through [`rusqlite` 0.40.2](https://docs.rs/rusqlite/0.40.2/rusqlite/) (`bundled` and `blob` features, no others) |
+| Durable state | One bundled SQLite database through [`rusqlite` 0.41.0](https://docs.rs/rusqlite/0.41.0/rusqlite/) (`bundled` and `blob` features, no others) |
 | File bytes | Owner-only blob files beside the database, tracked by SQLite rows |
-| Ranked repository search | A fresh in-RAM [Tantivy 0.26.2](https://docs.rs/tantivy/0.26.2/tantivy/) index built for each call (default features off; `mmap` and `stemmer` on) |
+| Ranked repository search | A fresh in-RAM [Tantivy 0.27.0](https://docs.rs/tantivy/0.27.0/tantivy/) index built for each call (default features off; `mmap` and `stemmer` on) |
 | Vector store search | One persistent Tantivy index beside the database, derived from it (BM25, no embeddings) |
 | Exact or regex matches | ripgrep's [`grep-searcher` 0.1.17](https://docs.rs/grep-searcher/0.1.17/grep_searcher/) and [`grep-regex` 0.1.14](https://docs.rs/grep-regex/0.1.14/grep_regex/) |
 | Discovery walk | [`ignore` 0.4.33](https://docs.rs/ignore/0.4.33/ignore/) (`.gitignore`, `.ignore`, `.git/info/exclude`) |
@@ -327,7 +327,7 @@ tree. It never writes, executes or spawns processes.
 - **`search(query)`**, the default ranked search, indexes the current visible
   text files into a new `Index::create_in_ram` index on every call. It uses
   `path` and `body` fields, Tantivy's
-  [default tokenizer](https://docs.rs/tantivy/0.26.2/tantivy/tokenizer/index.html)
+  [default tokenizer](https://docs.rs/tantivy/0.27.0/tantivy/tokenizer/index.html)
   and one indexing thread that is joined before the call returns. Edits,
   deletions and new files are therefore always reflected, and nothing is
   persisted, cached or left running. The query is never parsed as query

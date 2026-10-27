@@ -15,7 +15,7 @@ workspace = true
 local-engine = { path = "../local-engine" }
 local-services = { path = "../local-services" }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "multipart"] }
-base64 = "0.22"
+base64 = "0.23.1"
 half.workspace = true
 bytes.workspace = true
 http-body = "1"

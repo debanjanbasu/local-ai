@@ -355,6 +355,31 @@ fn enforces_pattern_unique_items_and_dependent_required() {
     }
 }
 
+/// Object-valued `enum` and `const` compare objects regardless of key order,
+/// although this crate keeps keys in order (`serde_json/preserve_order`).
+#[test]
+fn object_enum_and_const_ignore_key_order() {
+    let definition = tool(json!({
+        "type":"object",
+        "properties":{
+            "pick":{"enum":[{"a":1,"b":2}]},
+            "fixed":{"const":{"x":true,"y":[1]}}
+        }
+    }));
+    let accepted = single_call(
+        definition.clone(),
+        "<parameter=pick>\n{\"b\": 2, \"a\": 1}\n</parameter>\n<parameter=fixed>\n{\"y\": [1], \"x\": true}\n</parameter>\n",
+    );
+    assert!(accepted.is_ok(), "{accepted:?}");
+    assert!(
+        single_call(
+            definition,
+            "<parameter=pick>\n{\"a\": 2, \"b\": 1}\n</parameter>\n"
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn raw_text_stays_a_string_when_the_parameter_schema_accepts_text() {
     let definition = tool(json!({
