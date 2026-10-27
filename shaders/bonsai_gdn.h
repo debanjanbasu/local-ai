@@ -84,4 +84,79 @@ static inline void bonsai_gdn_rows(
     }
 }
 
+// bonsai_gdn_rows for prefill blocks, with the same arithmetic in the same
+// order (so bitwise the same outputs and state): each token's Q, K, V and
+// gates are loaded while the previous token's chain runs, instead of at the
+// top of its own step, where every step waited on a device load first. A
+// 512-row block with F16 state took 1.34 ms against 1.52-1.77 (M4 Pro);
+// loading two tokens ahead, or two and four SIMD groups per threadgroup, was
+// no faster, and two or eight value rows per SIMD group slower.
+template<uint rows, typename Qkv, typename Decay, typename Beta,
+         typename State, typename Output, typename FinalState>
+static inline void bonsai_gdn_prefill_rows(
+    Qkv qkv, Decay decay, Beta beta, State initial_state,
+    Output output, FinalState final_state, uint tokens, uint group, uint lane
+) {
+    const uint first_row = group * rows, head = first_row / 128, key_group = head % 16;
+    float values[rows][4];
+    for (uint r = 0; r < rows; ++r) {
+        for (uint i = 0; i < 4; ++i) {
+            values[r][i] = float(initial_state[(first_row + r) * 128 + lane + i * 32]);
+        }
+    }
+    float next_q[4], next_k[4], next_v[rows], next_d, next_b;
+    auto load = [&](uint token) {
+        const uint token_offset = token * 10240;
+        next_d = decay[token * 48 + head];
+        next_b = beta[token * 48 + head];
+        for (uint i = 0; i < 4; ++i) {
+            const uint column = key_group * 128 + lane + i * 32;
+            next_q[i] = qkv[token_offset + column];
+            next_k[i] = qkv[token_offset + 2048 + column];
+        }
+        for (uint r = 0; r < rows; ++r) next_v[r] = qkv[token_offset + 4096 + first_row + r];
+    };
+    load(0);
+    for (uint token = 0; token < tokens; ++token) {
+        float q[4], k[4], v[rows];
+        const float d = next_d, b = next_b;
+        for (uint i = 0; i < 4; ++i) {
+            q[i] = next_q[i];
+            k[i] = next_k[i];
+        }
+        for (uint r = 0; r < rows; ++r) v[r] = next_v[r];
+        if (token + 1 < tokens) load(token + 1);
+        float prediction[rows] = {};
+        for (uint i = 0; i < 4; ++i) {
+            for (uint r = 0; r < rows; ++r) {
+                values[r][i] *= d;
+                prediction[r] = fma(values[r][i], k[i], prediction[r]);
+            }
+        }
+        for (uint r = 0; r < rows; ++r) {
+            const float correction = (v[r] - simd_sum(prediction[r])) * b;
+            float result = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                values[r][i] = fma(k[i], correction, values[r][i]);
+                result = fma(values[r][i], q[i], result);
+            }
+            result = simd_sum(result);
+            if (lane == 0) output[token * 6144 + first_row + r] = result * 0.08838834764831845f;
+        }
+        if ((token + 1) % bonsai_gdn_round_rows == 0 && token + 1 < tokens) {
+            for (uint r = 0; r < rows; ++r) {
+                for (uint i = 0; i < 4; ++i) {
+                    values[r][i] = bonsai_round_state(
+                        final_state[(first_row + r) * 128 + lane + i * 32], values[r][i]);
+                }
+            }
+        }
+    }
+    for (uint r = 0; r < rows; ++r) {
+        for (uint i = 0; i < 4; ++i) {
+            bonsai_store_state(final_state[(first_row + r) * 128 + lane + i * 32], values[r][i]);
+        }
+    }
+}
+
 #endif

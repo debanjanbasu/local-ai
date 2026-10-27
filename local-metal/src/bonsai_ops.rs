@@ -409,6 +409,10 @@ impl BonsaiOps {
             "bo_attn_tree_tail",
             "bo_copy_rows",
             "bo_gather_rows",
+            // Prefill recurrence (`GdnStateFormat::prefill_pipeline`).
+            "bo_gdn_prefill_rows_4",
+            "bo_gdn_prefill_rows_4_f16",
+            "bo_gdn_prefill_rows_4_bf16",
         ];
         // Quantized layouts with tensor kernels of their own (decode split and
         // causal prefill), each K/V tile dequantized to half in threadgroup

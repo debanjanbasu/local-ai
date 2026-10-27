@@ -195,7 +195,14 @@ kernel void bo_gdn_rows_4##SUFFIX( \
     device float *output [[buffer(4)]], device STATE *final_state [[buffer(5)]], \
     constant uint &tokens [[buffer(6)]], \
     uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]] \
-) { bonsai_gdn_rows<4>(qkv, decay, beta, state, output, final_state, tokens, group, lane); }
+) { bonsai_gdn_rows<4>(qkv, decay, beta, state, output, final_state, tokens, group, lane); } \
+kernel void bo_gdn_prefill_rows_4##SUFFIX( \
+    device const float *qkv [[buffer(0)]], device const float *decay [[buffer(1)]], \
+    device const float *beta [[buffer(2)]], device const STATE *state [[buffer(3)]], \
+    device float *output [[buffer(4)]], device STATE *final_state [[buffer(5)]], \
+    constant uint &tokens [[buffer(6)]], \
+    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]] \
+) { bonsai_gdn_prefill_rows<4>(qkv, decay, beta, state, output, final_state, tokens, group, lane); }
 
 BONSAI_GDN(, float)
 BONSAI_GDN(_f16, half)
