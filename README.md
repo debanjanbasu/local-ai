@@ -235,6 +235,7 @@ Startup prints every decision and reason under `experimental_bonsai`.
 | Context | Largest value up to 262,144 whose fully grown state fits 90% of Metal's recommended working set |
 | K/V | Hadamard-rotated Q8 (8.5 bits/value); start at 1,024 tokens and grow on demand |
 | Kernels | Metal 4 tensor kernels where supported, SIMD fallbacks elsewhere |
+| Prefill | On M4 and later, 1,024-token blocks as two 512-row halves: the Neural Engine runs every layer's FFN (int8 weights x int8 activations) while the GPU runs attention and Gated DeltaNet; 512-token GPU blocks elsewhere, and from the first block whose Neural Engine work fails (that block reruns on the GPU) |
 | Speculation | Lossless suffix lookup; gated depth-3 MTP when the mixed ternary/int8 head artifact is installed |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache` |
@@ -258,16 +259,25 @@ Startup prints every decision and reason under `experimental_bonsai`.
   suffix-lookup drafts inside the batch: 37.9 against 34.9 tok/s aggregate
   at four streams for the previous build, byte-identical to each request
   alone.
-- Prefill (cold, no speculation), 512-token blocks: 131 tok/s at 8K,
-  116 tok/s at 32K and 75 tok/s at 128K (126, 110 and 70 with the former
-  128-token blocks, interleaved in the same uncontended runs).
+- Prefill (cold, no speculation), FFN on the Neural Engine beside the GPU's
+  mixers: 362 tok/s at 2K, 337 tok/s at 8K and 226 tok/s at 32K, against
+  134, 132 and 113 on the GPU alone (main `d25b277`, interleaved under the
+  shared GPU lock while other agents' builds ran). Mean next-token KL
+  against GPU prefill 5.7e-5 to 6.3e-5, top-1 64/64
+  ([details](docs/BONSAI.md#neural-engine-prefill-ffn)). The GPU alone
+  measured 75 tok/s at 128K; 128K was not re-measured.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s. After a server restart a
   new session sharing a ~5.9K-token system prompt and tools reaches its first
-  token in about 1.0 s against 45-47 s cold (`tools/benchmark.py --ttft`).
+  token in about 1.0 s against 17.8 s cold (46.4 s before Neural Engine
+  prefill; `tools/benchmark.py --ttft`).
 - Memory: 0.8–0.9 GB peak for a short request and 2.09 GB peak footprint for
   a 16K-token prompt plus 500 generated tokens (F16 recurrent state, copy-free
-  verify rollback, 4K-step K/V growth). File-backed weights remain
+  verify rollback, 4K-step K/V growth). Neural Engine prefill adds about
+  0.75 GB once a prompt of 512 tokens or more uses it (two int8 weight sets
+  and the second half's rows): 1.51 → 2.25 GB at 8K, and 2.68 → 3.41 GB at
+  16K plus 500 tokens (main measured 2.68 GB there in this A/B, against the
+  2.09 GB recorded earlier). File-backed weights remain
   demand-paged.
 
 ### Other hardware

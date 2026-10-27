@@ -2131,10 +2131,15 @@ All choices and reasons are reported in startup JSON.
   fits 90% of Metal's recommended working set.
 - **K/V:** Hadamard-rotated Q8 for the target, always (see
   [K/V cache](#kv-cache)); the MTP head's one-layer cache is F16.
-- **Prefill:** fixed 512-token chunks with Metal 4 kernels where supported;
-  beside two or more decoding requests, a long prompt prefills 24 to 31
-  tokens per step inside their batched pass, and 32 per step in a pass of its
-  own beside one.
+- **Prefill:** on Apple M4 and later, 1,024-token blocks run as two
+  512-row halves, the Neural Engine computing every layer's FFN while the
+  GPU runs the mixers ([Neural Engine prefill
+  FFN](#neural-engine-prefill-ffn)); elsewhere, and from the first block
+  whose Neural Engine work fails (that block reruns on the GPU), fixed
+  512-token chunks on the GPU. Metal 4 kernels where supported. Beside two or
+  more decoding requests, a long prompt prefills 24 to 31 tokens per step
+  inside their batched pass, and 32 per step in a pass of its own beside
+  one, on the GPU. The policy JSON reports `neural_engine_prefill`.
 - **Speculation:** suffix lookup is enabled; the mixed ternary/int8 MTP head
   artifact, when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`,
   adds gated depth-3 drafting. Without it MTP is off and the policy says why.
@@ -2695,6 +2700,14 @@ that end-of-request readback (673 MB) on its way to the disk writer; a
 request that already wrote a boundary skips it when no host tier keeps the
 snapshot (see Prompt cache).
 
+[Neural Engine prefill](#neural-engine-prefill-ffn) allocates, on its first
+block of 512 rows or more, two int8 FFN weight sets (539 MB of IOSurfaces),
+two lanes of input and output surfaces (16 MB), F32 rows for the second
+half's residual stream and both halves' joined FFN outputs (52 MB) and an
+81 MB recurrent checkpoint for a GPU rerun: about 0.69 GB,
+counted in the admission estimate whenever the Neural Engine may be used.
+Peak footprint rose by 0.73-0.75 GB in the A/B there.
+
 ## Performance
 
 End-to-end summary (M4 Pro, greedy). Each row names where it was measured;
@@ -2722,9 +2735,9 @@ test run, and every relink repeats whole-program optimization.
 | Plain short-prompt decode, six-prompt geomean | 30.4–32.3 tok/s | best-of-two A/B runs below, across recent kernel changes |
 | Default speculative decode, six-prompt geomean | 38.0–39.2 tok/s | same runs; 38.6 in the depth/margin sweep |
 | Two 600-token copy-edit prompts, suffix lookup | 89.8 and 90.5 tok/s | 5- to 128-row kernel change |
-| Cold prefill, 2K–8K tokens | 133.7 and 131.4 tok/s (128-row blocks: 128.3 and 125.7) | 512-row blocks, uncontended A/B against `b09e22f` (2026-10-22) |
-| Cold prefill, 32,796 tokens | 110.0 → 115.6 tok/s | same |
-| Cold prefill, 131,146 tokens | 69.7 → 74.8 tok/s | same, one round (56 tok/s on the [original build](https://github.com/debanjanbasu/local-ai/commit/b389329)) |
+| Cold prefill, 2K–8K tokens | 134.4 → 361.7 and 131.6 → 337.1 tok/s | FFN on the Neural Engine, A/B against main `d25b277`, best of two interleaved rounds (2026-10-27, [below](#neural-engine-prefill-ffn)) |
+| Cold prefill, 32,726 tokens | 113.1 → 225.6 tok/s | same, one round |
+| Cold prefill, 131,146 tokens | 69.7 → 74.8 tok/s | GPU only, 512-row blocks against 128-row blocks, one round (2026-10-22; 56 tok/s on the [original build](https://github.com/debanjanbasu/local-ai/commit/b389329)); not re-measured with the Neural Engine |
 
 Shaders compile with `-fmetal-math-mode=relaxed`. Metal's default fast mode
 also assumes no infinities or NaNs, yet online softmax starts each running
@@ -3224,6 +3237,125 @@ than 45. What an agent still pays is new text: a tool result prefills at the
 short-prompt rate (about 125-130 tok/s), and at 2K-8K tokens prefill is set by
 the ternary projections at about 85% of the 8x8 multiplies' measured peak.
 
+### Neural Engine prefill FFN
+
+On Apple M4 and later, prefill runs every layer's FFN (gate and up
+projections, `SiLU`, the checkpoint's 17,408-wide rotation, down
+projection) on the Neural Engine while the GPU runs the mixers (Gated
+`DeltaNet` and full attention), as Kapitsa does
+(`local-engine/src/bonsai_native/ane_split.rs`, `local-metal/src/ane.rs`,
+`shaders/bonsai_ane.metal`; adapted from Kapitsa `a6a7bca`, Apache-2.0, see
+`THIRD_PARTY_NOTICES.md`). It is on by default with no flag; correctness
+never depends on it.
+
+- **Program.** One MIL program with functions for 256, 384 and 512 rows,
+  compiled on a background thread from model load through the private
+  `AppleNeuralEngine.framework` (every selector's type encoding checked
+  before its first call) and cached by the daemon under
+  `$(DARWIN_USER_CACHE_DIR)/local-ai-bonsai-ffn/<hash>`; a held compilation
+  that fails to load is purged and compiled again. The rotation is the
+  program's only constant (a grouped convolution, 36 MB); `SiLU` is
+  `g/2 (1 + tanh(g/2))`.
+- **Precision: int8 weights x int8 activations.** Weights are surfaces with
+  one fp16 scale per row; the GPU converts each layer's ternary blocks into
+  one of two weight sets (0.54 GB together) while the ANE runs the previous
+  layer from the other, so there is no resident int8 copy. A ternary row is
+  its trits times block scales, so its codes are the trits times
+  `rint(127 s_b / max |s|)`. Activations are packed int8 per token; the
+  rotated intermediate is re-quantized per token on the ANE, which returns
+  the down projection before its scales plus a scale row that the GPU joins
+  in F32.
+- **Wavefront.** A prefill block of up to 1,024 rows runs as two halves of
+  at most 512 (the GPU scratch rows; the first half is half the block
+  rounded up to 128). Per layer the GPU runs half A's mixer and hands its
+  FFN to the ANE, joins half B's previous FFN, runs half B's mixer and hands
+  that over, converts the next layer's weights, then joins half A: the ANE
+  works on one half while the GPU runs the other's mixer. Recurrent state
+  and K/V flow from half A to half B in the GPU's order. Blocks under 512
+  rows (a short prompt or a short last block) and everything that is not
+  prefill (decode, verification, folded chunks, capture) stay on the GPU.
+  The MTP head ingests each half after the last layer.
+- **Ordering.** Two `MTLSharedEvent`s carry GPU-to-ANE and ANE-to-GPU order
+  (set on each `_ANERequest`), so no host thread waits mid-block. A
+  watchdog retires the handoff when an evaluation runs 2 s past its release
+  (one takes about 19 ms) or a block runs 300 s, raising both events so
+  every GPU wait passes.
+- **Fallback.** No M4-class chip, no framework, a failed compile or a
+  start-up check (layer 0's FFN on 256 pseudo-random rows against the GPU
+  FFN, at most 10% relative difference; int8 x int8 measured 0.42%) leaves
+  prefill on the GPU with
+  the reason in `neural_engine_prefill`. A block whose ANE work fails,
+  times out or returns non-finite rows (the join flags them), or whose
+  logits are non-finite, is restored from an 81 MB recurrent checkpoint
+  refreshed before every block and rerun on the GPU, and the model keeps
+  prefill on the GPU from then on (stderr says why).
+  `ane_fault_reruns_the_chunk_on_the_gpu` skips one evaluation and checks
+  the rerun's logits bitwise against GPU prefill.
+- **Keepalive.** The ANE sleeps after about a second idle and its first
+  evaluation then takes 70-120 ms longer. Within 60 s of the last block a
+  side thread runs one 256-row evaluation every 0.8 s (about 12 ms each);
+  the ANE offers no idle or wake notification to wait on instead.
+
+Cold prefill, `tools/benchmark.py --prefill --no-speculation`, raw
+repository text, main `d25b277` against this build, interleaved, best of two
+rounds (32K: one round), M4 Pro, 2026-10-27, every job holding
+`lockf -k /tmp/local-ai-gpu.lock`. Other agents' builds and downloads were
+running (`--allow-busy`, load average 7-19), so read small differences as
+noise. Every sample of a size, both builds, cold and restored, generated the
+same 16 greedy tokens:
+
+| Prompt | GPU only (main) | FFN on the Neural Engine | Cold TTFT |
+| ---: | ---: | ---: | ---: |
+| 2,049 tokens | 134.4 tok/s | 361.7 tok/s | 15.2 → 5.7 s |
+| 8,200 tokens | 131.6 tok/s | 337.1 tok/s | 62.3 → 24.3 s |
+| 32,726 tokens | 113.1 tok/s | 225.6 tok/s | 289.5 → 145.1 s |
+
+The gain shrinks with context because only the FFN moves: full attention
+grows with the prefix and stays on the GPU, which sets the pace once its
+mixers outlast the ANE's 19 ms per 512-row FFN. Round 1 at 2K was slower
+for both builds (110.9 and 215.9 tok/s) under the other agents' load. A
+process loads the daemon's held compilation in about 30 ms; the first
+wavefront block waited 135 ms for the background compile thread (which also
+generates the 36 MB rotation) and the start-up check. Restored (warm) TTFT
+is unchanged (0.58-1.08 s at 2K-8K, 2.9-3.7 s at 32K).
+
+Through `serve` (`tools/benchmark.py --ttft`, default settings, one run
+each, same conditions), time to the first streamed delta:
+
+| Step | Prompt / reused tokens | GPU only (main) | FFN on the Neural Engine |
+| --- | ---: | ---: | ---: |
+| Cold first request | 5,846 / 0 | 46.38 s | 17.82 s |
+| New session, same system prompt and tools | 5,848 / 5,827 (GPU) | 0.46 s | 0.45 s |
+| Follow-up with a 2K tool result | 7,805 / 5,845 (disk) | 15.92 s | 6.88 s |
+| After a restart: new session | 5,846 / 5,831 (disk) | 2.45 s | 1.02 s |
+| After a restart: the same follow-up | 7,805 / 7,804 (disk) | 0.43 s | 0.43 s |
+
+Restores do not prefill, so only the cold request and the tool result move
+(the 2.45 s restart is main's one run; it measured 1.01-1.02 s before).
+
+Decode is unchanged: 36.20 against 36.14 tok/s best of two interleaved
+rounds with the default speculation (`tools/benchmark.py --rounds 2`, same
+conditions). Peak footprint (`/usr/bin/time -l`, cold scratch `HOME`) rises
+by the weight sets, the second half's rows and the rerun checkpoint: 1.51 →
+2.25 GB for an 8,200-token prompt (`--no-speculation`, 16 tokens) and
+2.68 → 3.41 GB for a 16,361-token prompt plus 500 tokens with speculation
+(prefill there 124.1 → 296.5 tok/s with head ingestion; decode 44.1 and
+43.2 tok/s, one run each).
+
+Next-token distribution (`ane_prefill_tracks_gpu_prefill_next_token_distribution`,
+64 greedy tokens teacher-forced after prompts of this repository's text, the
+same model with and without the Neural Engine, decode on the GPU in both):
+mean KL 6.3e-5 (max 4.4e-4) after 1,000 tokens and 5.7e-5 (max 2.1e-4) after
+8,192, top-1 64/64 in both. This is above the 1e-5 bar earlier prefill
+changes were held to: int8 x int8 was chosen for speed. Kapitsa gates its
+own at 3.84e-4. The test asserts mean at most 2e-4, no row over 2e-3 and at
+least 60/64 top-1. `ane_prefill_feeds_the_head_like_gpu_prefill` checks the
+MTP head's keys for each half and the following GPU block within 5%
+relative of GPU prefill (measured 0.8%, 1.7% and 1.2%; leaving half A's
+embeddings staged for half B measured 47%) and the same next draft.
+`prefill_block_size_leaves_identical_logits` now pins the GPU path, where
+block size still leaves the logits bitwise identical.
+
 Single-token decode encodes 835 dispatches per token, down from 1,364, and
 every fused kernel is bitwise identical to the dispatches it replaces
 (`local-metal/tests/bonsai_fusion.rs`):
@@ -3411,6 +3543,16 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 [the original build](https://github.com/debanjanbasu/local-ai/commit/b389329),
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
+
+- Other Neural Engine FFN configurations (October 2026, a spike before the
+  [Neural Engine prefill FFN](#neural-engine-prefill-ffn)): fp16
+  activations with int8 weights took 32.7 ms per 512-row FFN on the ANE
+  against 18.5 for int8 x int8, longer than the 20-25 ms mixer it has to
+  hide behind, for a mean KL of about 2e-5 instead of 6e-5. A 512-row block
+  as two 256-row halves left the ANE bound by fetching weights (11.9 ms for
+  256 rows); 1,024-row blocks of 512-row halves projected fastest. Splitting
+  the FFN's channels between the GPU and the ANE was not needed once the
+  whole FFN fit behind the other half's mixer.
 
 - Pooled Bonsai hidden states as retrieval embeddings (October 2026):
   BEIR SciFact, all 300 test queries against a 1,000-document subset (the
