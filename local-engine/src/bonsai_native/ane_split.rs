@@ -18,7 +18,7 @@
 //!   token), so the ANE returns a partial result and a scale row that the GPU
 //!   joins in F32.
 //! - **Weights.** No resident int8 copy: the GPU converts each layer's
-//!   ternary blocks into one of two weight sets (about 0.54 GB) while the ANE
+//!   ternary blocks into one of two weight sets (about 0.60 GB) while the ANE
 //!   runs the previous layer from the other. A ternary row is its trits
 //!   times block scales, so a row's codes are the trits times
 //!   `rint(127 s_b / max |s|)`.
@@ -33,8 +33,8 @@
 //!   than the GPU's mixer and staging (21-27 ms, growing with context), so
 //!   each half's output projection is split by output row: the ANE takes the
 //!   leading rows in its idle time between FFNs while the GPU computes the
-//!   rest, and the GPU joins both. [`OutSplit`] chooses the split per layer
-//!   type and row count from the handoff timeline as prefill runs.
+//!   rest, and the GPU joins both. [`OutSplit`] chooses the split per
+//!   half-block size from measured chunk times as prefill runs.
 //! - **Ordering.** Two `MTLSharedEvent`s ([`Handoff`]) carry GPU-to-ANE and
 //!   ANE-to-GPU order. A watchdog retires a handoff whose evaluation stops
 //!   answering, which releases every GPU wait.
@@ -110,16 +110,16 @@ const CACHE_TAG: &str = "local-ai-bonsai-ffn";
 const MIXED: usize = 6144;
 /// Leading output rows of a mixer's output projection the ANE may take (0:
 /// none); the GPU computes the rest at the same time. [`OutSplit`] picks one
-/// per layer type and function from measured timing. The ANE computes 1,024
-/// rows of 512 tokens in about 0.95 ms, the GPU's rate, so the gain is the
-/// overlap and the split is bounded by the ANE's idle time between FFNs.
+/// per function from measured timing. The ANE computes 1,024 rows of 512
+/// tokens in about 0.95 ms, about the GPU's rate, so the gain is the overlap.
 const OUT_STEPS: [u32; 9] = [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096];
-/// Where [`OutSplit`] starts on a machine without a learned split: 2,048 rows.
-const OUT_START: usize = 4;
-/// [`OutSplit`] moves to the probed split when its layers' mean interval is
-/// shorter by more than this, and takes ANE work away from both layer types
-/// when the GPU's mean wait for an FFN exceeds [`OUT_WAIT_LIMIT_MS`].
-const OUT_MARGIN_MS: f64 = 0.05;
+/// Where [`OutSplit`] starts on a machine without a learned split: 3,584
+/// rows, the best fixed split for 4K prompts on the M4 Pro.
+const OUT_START: usize = 7;
+/// [`OutSplit`] moves to a probed split whose chunk ran faster per row by
+/// more than this fraction, and takes a step away when the GPU waited over
+/// [`OUT_WAIT_LIMIT_MS`] per layer on the ANE's FFNs.
+const OUT_MARGIN: f64 = 0.002;
 const OUT_WAIT_LIMIT_MS: f64 = 0.5;
 /// The learned splits, under the program cache directory.
 const OUT_SPLIT_FILE: &str = "out-split.json";
@@ -535,6 +535,12 @@ fn wave_min_rows() -> usize {
     WAVE_MIN_ROWS
 }
 
+/// Tests fix every layer's output projection split at step `n - 1` (0:
+/// learn).
+#[cfg(test)]
+pub(super) static OUT_STEP_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 pub(super) static WAVE_MIN_ROWS_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -841,8 +847,8 @@ impl AneSplit {
         &self.out_bindings[((set * 2 + lane) * FUNCTION_ROWS.len() + function) * splits + step - 1]
     }
 
-    /// Convert the first `split` rows of a mixer's output projection
-    /// `weights` into weight set `set`.
+    /// Convert the first `split` rows (none for 0) of a mixer's output
+    /// projection `weights` into weight set `set`.
     fn stage_out(
         &self,
         batch: &mut CommandBatch,
@@ -850,6 +856,9 @@ impl AneSplit {
         set: usize,
         split: u32,
     ) -> crate::Result<()> {
+        if split == 0 {
+            return Ok(());
+        }
         let set = &self.sets[set];
         let matrix = weights.ptq1_matrix()?;
         if matrix.rows() != WIDTH as u32 || matrix.columns() != MIXED as u32 {
@@ -1094,42 +1103,25 @@ struct Job {
     layer: usize,
 }
 
-/// What a chunk's timing says about its output projection splits.
-#[derive(Debug, Default, PartialEq)]
-struct Samples {
-    /// Per layer, the GPU's time from handing over the first half's FFN to
-    /// handing over the second's (ms): the second half's mixer, whose output
-    /// projection waits for the longer of the GPU's rows and the ANE's
-    /// (queued behind the first half's FFN). Only the layer's own split
-    /// changes it.
-    interval: Vec<Option<f64>>,
-    /// Per layer after the first, how long the GPU waited for the second
-    /// half's previous FFN after handing over the first half's (ms).
-    wait: Vec<f64>,
-}
-
-impl Samples {
-    /// From a chunk's `jobs` and their release and report times, in queue
-    /// order.
-    fn new(jobs: &[Job], timeline: &[(Option<Instant>, Option<Instant>)], layers: usize) -> Self {
-        let mut ffn = vec![[(None, None); 2]; layers];
-        for (job, &(ready, done)) in jobs.iter().zip(timeline) {
-            if !job.out && job.layer < layers {
-                ffn[job.layer][job.lane] = (ready, done);
-            }
+/// How long the GPU waited, on average over a chunk's layers after the
+/// first, for the second half's previous FFN after handing over the first
+/// half's (ms), from the chunk's `jobs` and their release and report times
+/// in queue order: above zero when the ANE has no time to spare.
+fn mean_ffn_wait(
+    jobs: &[Job],
+    timeline: &[(Option<Instant>, Option<Instant>)],
+    layers: usize,
+) -> Option<f64> {
+    let mut ffn = vec![[(None, None); 2]; layers];
+    for (job, &(ready, done)) in jobs.iter().zip(timeline) {
+        if !job.out && job.layer < layers {
+            ffn[job.layer][job.lane] = (ready, done);
         }
-        let ms = |later: Instant, earlier: Instant| {
-            later.saturating_duration_since(earlier).as_secs_f64() * 1e3
-        };
-        let interval = ffn
-            .iter()
-            .map(|[first, second]| Some(ms(second.0?, first.0?)))
-            .collect();
-        let wait = (1..layers)
-            .filter_map(|layer| Some(ms(ffn[layer - 1][1].1?, ffn[layer][0].0?)))
-            .collect();
-        Self { interval, wait }
     }
+    mean((1..layers).filter_map(|layer| {
+        let (done, ready): (Instant, Instant) = (ffn[layer - 1][1].1?, ffn[layer][0].0?);
+        Some(done.saturating_duration_since(ready).as_secs_f64() * 1e3)
+    }))
 }
 
 fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
@@ -1137,31 +1129,49 @@ fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
     (count > 0).then(|| sum / f64::from(count))
 }
 
+/// One finished wavefront chunk, as [`OutSplit`] compares them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Chunk {
+    function: usize,
+    rows: usize,
+    step: usize,
+    probe: bool,
+    ms_per_row: f64,
+}
+
 /// How many leading rows of each mixer's output projection the ANE takes,
-/// per function (half-block rows) and layer type (recurrent, attention), as
-/// an index into [`OUT_STEPS`], tuned online from measured timing: in every
-/// chunk the odd layers of each type probe one step up or down (alternating
-/// by chunk) and the type moves to the probe when its handoff interval
-/// ([`Samples::interval`]) is shorter. Both types step down when the GPU
-/// waits on the ANE's FFNs (the ANE has no room left). Attention's GPU work
-/// grows with context, so the best split moves as a prompt grows and is
-/// followed chunk by chunk. Learned splits persist per machine.
+/// per function (half-block rows), as an index into [`OUT_STEPS`], tuned
+/// online from measured chunk times. Contiguous chunks of a prompt
+/// alternate between the current split and a probe one step up or down
+/// (alternating by comparison); a probe chunk that ran faster per row than
+/// the mean of the equal-sized chunks on either side, by more than
+/// [`OUT_MARGIN`], becomes the split. Averaging the neighbours cancels the
+/// steady growth of chunk time with context, so the split follows the prompt
+/// as attention's GPU work grows. A chunk whose GPU waited on the ANE's
+/// FFNs takes a step away instead. Splits persist per machine.
+///
+/// Per layer comparisons do not work: a layer's extra ANE rows delay the
+/// FFN the next layer joins, so its cost lands on its neighbour.
 #[derive(Debug, PartialEq)]
 struct OutSplit {
-    steps: [[usize; 2]; FUNCTION_ROWS.len()],
-    probe_up: bool,
-    /// The chunk in flight: its function and per-layer steps.
-    function: usize,
-    plan: Vec<usize>,
+    steps: [usize; FUNCTION_ROWS.len()],
+    probe_up: [bool; FUNCTION_ROWS.len()],
+    /// The last finished chunks of the current prompt, oldest first.
+    history: Vec<Chunk>,
+    /// Where the last finished chunk ended.
+    end: Option<usize>,
+    /// The chunk in flight.
+    current: Option<Chunk>,
 }
 
 impl OutSplit {
-    const fn new(steps: [[usize; 2]; FUNCTION_ROWS.len()]) -> Self {
+    const fn new(steps: [usize; FUNCTION_ROWS.len()]) -> Self {
         Self {
             steps,
-            probe_up: true,
-            function: 0,
-            plan: Vec::new(),
+            probe_up: [true; FUNCTION_ROWS.len()],
+            history: Vec::new(),
+            end: None,
+            current: None,
         }
     }
 
@@ -1176,19 +1186,17 @@ impl OutSplit {
 
     /// The learned splits, or [`OUT_START`] everywhere.
     fn load() -> Self {
-        let mut steps = [[OUT_START; 2]; FUNCTION_ROWS.len()];
+        let mut steps = [OUT_START; FUNCTION_ROWS.len()];
         let learned = Self::path()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
         if let Some(rows) = learned.as_ref().and_then(|value| value["rows"].as_array()) {
             for (step, rows) in steps.iter_mut().zip(rows) {
-                for (step, rows) in step.iter_mut().zip(rows.as_array().into_iter().flatten()) {
-                    if let Some(index) = rows
-                        .as_u64()
-                        .and_then(|rows| OUT_STEPS.iter().position(|&s| u64::from(s) == rows))
-                    {
-                        *step = index;
-                    }
+                if let Some(index) = rows
+                    .as_u64()
+                    .and_then(|rows| OUT_STEPS.iter().position(|&s| u64::from(s) == rows))
+                {
+                    *step = index;
                 }
             }
         }
@@ -1196,7 +1204,7 @@ impl OutSplit {
     }
 
     fn rows(&self) -> serde_json::Value {
-        serde_json::json!(self.steps.map(|types| types.map(|step| OUT_STEPS[step])))
+        serde_json::json!(self.steps.map(|step| OUT_STEPS[step]))
     }
 
     /// Best effort: a split that cannot be saved is learned again.
@@ -1207,63 +1215,86 @@ impl OutSplit {
         }
     }
 
-    /// Per-layer steps for a chunk of `function`'s halves over layers of
-    /// `types` (0 recurrent, 1 attention).
-    fn plan(&mut self, types: &[usize], function: usize) -> &[usize] {
-        let mut seen = [0_usize; 2];
-        self.function = function;
-        self.plan = types
-            .iter()
-            .map(|&kind| {
-                let base = self.steps[function][kind];
-                seen[kind] += 1;
-                if seen[kind] % 2 == 1 {
-                    base
-                } else if self.probe_up {
-                    (base + 1).min(OUT_STEPS.len() - 1)
-                } else {
-                    base.saturating_sub(1)
-                }
-            })
-            .collect();
-        &self.plan
+    /// The step for a chunk of `rows` rows from position `start` whose halves
+    /// run `function`.
+    fn plan(&mut self, function: usize, rows: usize, start: usize) -> usize {
+        if self.end != Some(start) {
+            self.history.clear();
+        }
+        let base = self.steps[function];
+        let mut chunk = Chunk {
+            function,
+            rows,
+            step: base,
+            probe: false,
+            ms_per_row: 0.0,
+        };
+        if self
+            .history
+            .last()
+            .is_some_and(|last| !last.probe && last.function == function && last.rows == rows)
+        {
+            chunk.step = if self.probe_up[function] {
+                (base + 1).min(OUT_STEPS.len() - 1)
+            } else {
+                base.saturating_sub(1)
+            };
+            chunk.probe = chunk.step != base;
+        }
+        #[cfg(test)]
+        if let Some(step) = OUT_STEP_OVERRIDE
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .checked_sub(1)
+        {
+            chunk.step = step;
+        }
+        self.current = Some(chunk);
+        chunk.step
     }
 
-    /// Learn from the planned chunk of layer `types`: whether the split
-    /// changed.
-    fn learn(&mut self, types: &[usize], samples: &Samples) -> bool {
-        let steps = &mut self.steps[self.function];
-        let before = *steps;
-        if mean(samples.wait.iter().copied()).is_some_and(|wait| wait > OUT_WAIT_LIMIT_MS) {
-            for step in steps.iter_mut() {
-                *step = step.saturating_sub(1);
-            }
-        } else {
-            for (kind, step) in steps.iter_mut().enumerate() {
-                let base = *step;
-                let of = |probe: bool| {
-                    mean(
-                        types
-                            .iter()
-                            .zip(&self.plan)
-                            .zip(&samples.interval)
-                            .filter(|&((&t, &planned), _)| t == kind && (planned != base) == probe)
-                            .filter_map(|(_, interval)| *interval),
-                    )
-                };
-                let probed =
-                    self.plan.iter().zip(types).find_map(|(&planned, &t)| {
-                        (t == kind && planned != base).then_some(planned)
-                    });
-                if let (Some(probed), Some(base_ms), Some(probe_ms)) = (probed, of(false), of(true))
-                    && probe_ms + OUT_MARGIN_MS < base_ms
-                {
-                    *step = probed;
-                }
-            }
+    /// Learn from the chunk in flight, which ended at position `end` after
+    /// `ms`, its GPU having waited `wait` ms per layer on average for the
+    /// ANE's FFNs: whether the split changed.
+    fn learn(&mut self, end: usize, ms: f64, wait: Option<f64>) -> bool {
+        let Some(mut chunk) = self.current.take() else {
+            return false;
+        };
+        self.end = Some(end);
+        #[cfg(test)]
+        if OUT_STEP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return false;
         }
-        self.probe_up = !self.probe_up;
-        *steps != before
+        let step = &mut self.steps[chunk.function];
+        let before = *step;
+        if wait.is_some_and(|wait| wait > OUT_WAIT_LIMIT_MS) {
+            *step = chunk.step.min(*step).saturating_sub(1);
+            self.history.clear();
+            return *step != before;
+        }
+        chunk.ms_per_row = ms / chunk.rows as f64;
+        self.history.push(chunk);
+        if self.history.len() > 3 {
+            self.history.remove(0);
+        }
+        if let [first, probe, last] = self.history[..]
+            && probe.probe
+            && [first, last].iter().all(|base| {
+                !base.probe
+                    && base.step == before
+                    && base.function == probe.function
+                    && base.rows == probe.rows
+            })
+        {
+            if probe.ms_per_row
+                < f64::midpoint(first.ms_per_row, last.ms_per_row) * (1.0 - OUT_MARGIN)
+            {
+                *step = probe.step;
+            }
+            self.probe_up[chunk.function] = !self.probe_up[chunk.function];
+            // The last base chunk opens the next comparison.
+            self.history.drain(..2);
+        }
+        *step != before
     }
 }
 
@@ -1728,6 +1759,7 @@ impl BonsaiModel {
                 return Err(error);
             }
         };
+        let started = Instant::now();
         let failure = if split.begin_chunk() {
             let mut speculation = self.speculation.take();
             let encoded = self.encode_wave(&split, tokens, output, speculation.as_mut(), first);
@@ -1735,14 +1767,14 @@ impl BonsaiModel {
             let finished = split.finish_chunk();
             match (encoded, finished) {
                 (Ok(()), Ok(())) => {
-                    let samples = Samples::new(
+                    let wait = mean_ffn_wait(
                         &split.jobs.borrow(),
                         &split.handoff.take_timeline(),
                         self.layers.len(),
                     );
-                    let types = self.layer_types();
+                    let ms = started.elapsed().as_secs_f64() * 1e3;
                     let mut out_split = split.out_split.borrow_mut();
-                    if out_split.learn(&types, &samples) {
+                    if out_split.learn(start + tokens.len(), ms, wait) {
                         out_split.save();
                     }
                     drop(out_split);
@@ -1923,14 +1955,14 @@ impl BonsaiModel {
                 HadamardDirection::Inverse,
             )?;
         }
-        let types = self.layer_types();
-        let plan = split
-            .out_split
-            .borrow_mut()
-            .plan(&types, function_for(halves[0].rows)?)
-            .to_vec();
+        let step = split.out_split.borrow_mut().plan(
+            function_for(halves[0].rows)?,
+            (halves[0].rows + halves[1].rows) as usize,
+            halves[0].position,
+        );
+        let split_rows = OUT_STEPS[step];
         split.stage(batch, &self.layers[0], 0)?;
-        split.stage_out(batch, self.layers[0].mixer_output(), 0, OUT_STEPS[plan[0]])?;
+        split.stage_out(batch, self.layers[0].mixer_output(), 0, split_rows)?;
         batch.submit_and_renew(&self.context)?;
         let launch = |batch: &mut CommandBatch, lane: usize, layer: usize| {
             split.launch(
@@ -1947,19 +1979,19 @@ impl BonsaiModel {
         // B's during half A's next mixer, and between them each half's
         // leading output projection rows while the GPU computes the rest.
         for (index, layer) in self.layers.iter().enumerate() {
-            self.wave_mixer(batch, split, layer, index, &halves[0], 0, plan[index])?;
+            self.wave_mixer(batch, split, layer, index, &halves[0], 0, step)?;
             launch(batch, 0, index)?;
             if index > 0 {
                 split.join(batch, 1, halves[1].rows)?;
             }
-            self.wave_mixer(batch, split, layer, index, &halves[1], 1, plan[index])?;
+            self.wave_mixer(batch, split, layer, index, &halves[1], 1, step)?;
             launch(batch, 1, index)?;
             // The other set's last readers (the previous layer's jobs) were
             // joined above.
             if let Some(next) = self.layers.get(index + 1) {
                 let set = (index + 1) & 1;
                 split.stage(batch, next, set)?;
-                split.stage_out(batch, next.mixer_output(), set, OUT_STEPS[plan[index + 1]])?;
+                split.stage_out(batch, next.mixer_output(), set, split_rows)?;
             }
             split.join(batch, 0, halves[0].rows)?;
         }
@@ -2013,14 +2045,6 @@ impl BonsaiModel {
             }
         }
         Ok(())
-    }
-
-    /// Each layer's type for [`OutSplit`]: 0 recurrent, 1 full attention.
-    fn layer_types(&self) -> Vec<usize> {
-        self.layers
-            .iter()
-            .map(|layer| usize::from(matches!(layer.attention, AttentionLayer::Full(_))))
-            .collect()
     }
 
     /// A layer's mixer for `half` in `lane`: the residual add of the
@@ -2227,55 +2251,61 @@ mod tests {
         assert_eq!(text.matches("-> (y);").count(), ffns + outs);
     }
 
-    /// Layer types of the model's first eight layers: three recurrent, then
-    /// one full attention.
-    const TYPES: [usize; 8] = [0, 0, 0, 1, 0, 0, 0, 1];
+    fn finish(split: &mut OutSplit, rows: usize, start: usize, ms: f64) -> (usize, bool) {
+        let step = split.plan(3, rows, start);
+        let changed = split.learn(start + rows, ms, Some(0.0));
+        (step, changed)
+    }
 
     #[test]
-    fn out_split_probes_every_other_layer_of_each_type() {
-        let mut split = OutSplit::new([[3, 5]; FUNCTION_ROWS.len()]);
-        assert_eq!(split.plan(&TYPES, 2), [3, 4, 3, 5, 4, 3, 4, 6]);
-        split.probe_up = false;
-        assert_eq!(split.plan(&TYPES, 2), [3, 2, 3, 5, 2, 3, 2, 4]);
-        let mut edge = OutSplit::new([[0, 8]; FUNCTION_ROWS.len()]);
-        edge.probe_up = false;
-        assert_eq!(edge.plan(&TYPES, 0), [0, 0, 0, 8, 0, 0, 0, 7]);
+    fn out_split_alternates_base_and_probe_chunks() {
+        let mut split = OutSplit::new([4; FUNCTION_ROWS.len()]);
+        // Base, probe up, base: the probe ran no faster, so nothing moves and
+        // the next probe goes down.
+        assert_eq!(finish(&mut split, 1024, 0, 2000.0), (4, false));
+        assert_eq!(finish(&mut split, 1024, 1024, 2010.0), (5, false));
+        assert_eq!(finish(&mut split, 1024, 2048, 2020.0), (4, false));
+        assert!(!split.probe_up[3]);
+        // Probe down, faster than its neighbours' mean by over the margin.
+        assert_eq!(finish(&mut split, 1024, 3072, 2000.0), (3, false));
+        assert_eq!(finish(&mut split, 1024, 4096, 2040.0), (4, true));
+        assert_eq!(split.steps[3], 3);
+        assert_eq!(split.steps[0], 4, "other functions keep theirs");
+        // The next chunk probes up from the new split.
+        assert_eq!(split.plan(3, 1024, 5120), 4);
+    }
+
+    #[test]
+    fn out_split_compares_only_contiguous_equal_chunks() {
+        let mut split = OutSplit::new([4; FUNCTION_ROWS.len()]);
+        assert_eq!(finish(&mut split, 1024, 0, 2000.0), (4, false));
+        assert_eq!(finish(&mut split, 1024, 1024, 1000.0), (5, false));
+        // A new prompt: the comparison restarts with a base chunk.
+        assert_eq!(finish(&mut split, 1024, 0, 2000.0), (4, false));
+        assert_eq!(finish(&mut split, 1024, 1024, 1000.0), (5, false));
+        // A shorter last chunk is not compared with full ones.
+        assert_eq!(finish(&mut split, 600, 2048, 100.0), (4, false));
+        assert_eq!(split.steps[3], 4);
+        // At the top the probe would equal the split: a base chunk instead.
+        let mut top = OutSplit::new([OUT_STEPS.len() - 1; FUNCTION_ROWS.len()]);
+        finish(&mut top, 1024, 0, 2000.0);
+        assert_eq!(top.plan(3, 1024, 1024), OUT_STEPS.len() - 1);
+        assert_eq!(top.current.map(|chunk| chunk.probe), Some(false));
+    }
+
+    #[test]
+    fn out_split_backs_off_when_the_gpu_waits_on_the_ane() {
+        let mut split = OutSplit::new([4; FUNCTION_ROWS.len()]);
+        split.plan(3, 1024, 0);
+        assert!(split.learn(1024, 2000.0, Some(0.8)));
+        assert_eq!(split.steps[3], 3);
+        split.plan(3, 1024, 1024);
+        assert!(!split.learn(2048, 2000.0, Some(0.2)));
         assert_eq!(OUT_STEPS[0], 0, "step 0 leaves the projection to the GPU");
     }
 
     #[test]
-    fn out_split_moves_to_a_faster_probe_and_backs_off_a_busy_ane() {
-        let samples = |recurrent: [f64; 2], attention: [f64; 2], wait: f64| Samples {
-            interval: TYPES
-                .iter()
-                .scan([0, 0], |seen, &kind| {
-                    seen[kind] += 1;
-                    let pair = if kind == 0 { recurrent } else { attention };
-                    Some(Some(pair[usize::from(seen[kind] % 2 == 0)]))
-                })
-                .collect(),
-            wait: vec![wait; TYPES.len() - 1],
-        };
-        let mut split = OutSplit::new([[3, 3]; FUNCTION_ROWS.len()]);
-        split.plan(&TYPES, 1);
-        // Recurrent probes (up) are faster by more than the margin;
-        // attention's are not.
-        assert!(split.learn(&TYPES, &samples([5.0, 4.0], [5.0, 4.99], 0.0)));
-        assert_eq!(split.steps[1], [4, 3]);
-        assert_eq!(split.steps[0], [3, 3], "other functions keep theirs");
-        assert!(!split.probe_up);
-        // Probing down, slower: no change.
-        assert_eq!(split.plan(&TYPES, 1), [4, 3, 4, 3, 3, 4, 3, 2]);
-        assert!(!split.learn(&TYPES, &samples([4.0, 6.0], [4.0, 6.0], 0.0)));
-        // The GPU waits on the ANE's FFNs: both types step down, whatever
-        // the probes say.
-        split.plan(&TYPES, 1);
-        assert!(split.learn(&TYPES, &samples([5.0, 1.0], [5.0, 1.0], 0.8)));
-        assert_eq!(split.steps[1], [3, 2]);
-    }
-
-    #[test]
-    fn samples_pair_each_halfs_jobs() {
+    fn ffn_wait_pairs_each_layers_halves() {
         let base = Instant::now();
         let at = |ms: u64| Some(base + Duration::from_millis(ms));
         let job = |out, lane, layer| Job { out, lane, layer };
@@ -2289,6 +2319,7 @@ mod tests {
             job(false, 0, 1),
             job(true, 1, 1),
             job(false, 1, 1),
+            job(false, 0, 2),
         ];
         let timeline = [
             (at(0), at(2)),
@@ -2298,15 +2329,13 @@ mod tests {
             (at(40), at(42)),
             (at(44), at(64)),
             (at(60), at(62)),
-            (at(70), None),
+            (at(70), at(90)),
+            (at(92), None),
         ];
-        let samples = Samples::new(&jobs, &timeline, 2);
-        assert_eq!(samples.interval, [Some(22.0), Some(26.0)]);
-        // FFN B of layer 0 reported at 47, 3 ms after FFN A of layer 1 left.
-        assert_eq!(samples.wait, [3.0]);
-        // A chunk cut short pairs what it has.
-        let samples = Samples::new(&jobs[..6], &timeline[..6], 2);
-        assert_eq!(samples.interval, [Some(22.0), None]);
+        // FFN B of layer 0 reported 3 ms after FFN A of layer 1 left; FFN B
+        // of layer 1 2 ms before FFN A of layer 2 did.
+        assert_eq!(mean_ffn_wait(&jobs, &timeline, 3), Some(1.5));
+        assert_eq!(mean_ffn_wait(&jobs[..2], &timeline[..2], 3), None);
     }
 
     #[test]

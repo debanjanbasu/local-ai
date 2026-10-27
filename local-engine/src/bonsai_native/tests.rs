@@ -1639,3 +1639,67 @@ fn ane_prefill_block_timings() {
         );
     }
 }
+
+/// Cold prefill time of 4,096 tokens (four wavefront blocks; set
+/// `ANE_SPLIT_ROWS` for another length) with every layer's mixer output
+/// projection split at each fixed number of ANE rows (`ANE_SPLIT_STEPS`, a
+/// list of `OUT_STEPS` indices, for a subset), best of two after a warm-up:
+/// what the split controller chooses between. Measurement only; nothing is
+/// asserted.
+#[test]
+#[ignore = "measurement; requires the pinned model, a Metal device and the Neural Engine"]
+fn ane_out_split_timings() {
+    use std::sync::atomic::Ordering;
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let corpus = tokenizer.encode(&text).expect("encode");
+    let rows = std::env::var("ANE_SPLIT_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(4096);
+    let mut model = BonsaiModel::load(
+        package,
+        rows + 64,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    let time = |model: &mut BonsaiModel| {
+        let mut best = f64::INFINITY;
+        for repeat in 0..3 {
+            model.reset();
+            let started = std::time::Instant::now();
+            model
+                .prefill(&corpus[..rows], &mut |_| {})
+                .expect("prefill");
+            if repeat > 0 {
+                best = best.min(started.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        best
+    };
+    let steps = std::env::var("ANE_SPLIT_STEPS").map_or_else(
+        |_| (0..9).collect::<Vec<usize>>(),
+        |steps| {
+            steps
+                .split(',')
+                .filter_map(|step| step.parse().ok())
+                .collect()
+        },
+    );
+    for step in steps {
+        ane_split::OUT_STEP_OVERRIDE.store(step + 1, Ordering::Relaxed);
+        let ms = time(&mut model);
+        assert!(model.ane_active(), "{}", model.neural_engine_policy());
+        println!(
+            "{}",
+            serde_json::json!({"rows": rows, "step": step, "ms": ms, "tok_s": rows as f64 / ms * 1e3})
+        );
+    }
+    ane_split::OUT_STEP_OVERRIDE.store(0, Ordering::Relaxed);
+}
