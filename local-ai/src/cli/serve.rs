@@ -1238,6 +1238,17 @@ fn stored_answer(
     }
 }
 
+/// A required model artifact that failed to load, naming where to reinstall
+/// it unless `message` already does (a missing file says so itself).
+fn artifact_error(message: String) -> crate::Error {
+    const HINT: &str = "see README Model install";
+    crate::Error::InvalidArgument(if message.contains(HINT) {
+        message
+    } else {
+        format!("{message} (reinstall it; {HINT})")
+    })
+}
+
 impl AppState {
     /// The models this server serves.
     fn catalog(&self) -> models::Catalog<'_> {

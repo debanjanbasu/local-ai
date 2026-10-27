@@ -91,7 +91,7 @@ impl Transcriber {
     ) -> crate::Result<Arc<Self>> {
         let dir = installed_model(models_dir)?;
         let model = TranscriptionModel::open(&dir).map_err(|error| {
-            crate::Error::InvalidArgument(format!(
+            super::artifact_error(format!(
                 "cannot load the transcription model in {}: {error}",
                 dir.display()
             ))

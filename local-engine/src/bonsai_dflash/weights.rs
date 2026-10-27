@@ -77,7 +77,8 @@ impl Weights {
             .map_err(|reason| {
                 crate::Error::InvalidFormat(format!(
                     "DFlash2 drafter artifact {} is unusable: {reason}; re-export it with \
-                     `local-ai bonsai --export dflash-head=<dir>` or remove it",
+                     `local-ai bonsai --export dflash-head=<dir>` or reinstall it (see README Model \
+                     install)",
                     path.display()
                 ))
             })?;

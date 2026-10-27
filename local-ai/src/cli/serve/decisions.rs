@@ -89,7 +89,7 @@ impl Decisions {
     /// Open and verify the artifact directory for a model of `width`.
     pub(super) fn open(dir: &Path, width: usize) -> crate::Result<Self> {
         let calibrated = CalibratedHead::open(dir).map_err(|error| {
-            crate::Error::InvalidArgument(format!(
+            super::artifact_error(format!(
                 "cannot open the decisions artifact {}: {error}",
                 dir.display()
             ))

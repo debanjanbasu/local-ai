@@ -172,7 +172,8 @@ impl Weights {
         let head = read_head_with(path, &bind).map_err(|reason| {
             crate::Error::InvalidFormat(format!(
                 "MTP head artifact {} is unusable: {reason}; re-export it with \
-                 `local-ai bonsai --export mtp-head=<dir>` or remove it",
+                 `local-ai bonsai --export mtp-head=<dir>` or reinstall it (see README Model \
+                 install)",
                 path.display()
             ))
         })?;

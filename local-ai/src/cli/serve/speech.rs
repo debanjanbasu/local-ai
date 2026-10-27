@@ -88,7 +88,7 @@ impl Speech {
     ) -> crate::Result<Arc<Self>> {
         let dir = installed_model(models_dir)?;
         let model = SpeechModel::open(&dir).map_err(|error| {
-            crate::Error::InvalidArgument(format!(
+            super::artifact_error(format!(
                 "cannot load the speech model in {}: {error}",
                 dir.display()
             ))

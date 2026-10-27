@@ -148,14 +148,16 @@ impl VisionEncoder {
         let bytes = std::fs::metadata(path)?.len();
         if bytes != VISION_PROJECTOR_BYTES {
             return Err(crate::Error::InvalidFormat(format!(
-                "vision projector {} is {bytes} bytes, not the pinned {VISION_PROJECTOR_BYTES}",
+                "vision projector {} is {bytes} bytes, not the pinned \
+                 {VISION_PROJECTOR_BYTES} (reinstall it; see README Model install)",
                 path.display()
             )));
         }
         let digest = sha256_file(path)?;
         if hex(&digest) != VISION_PROJECTOR_SHA256 {
             return Err(crate::Error::InvalidFormat(format!(
-                "vision projector {} has sha256 {}, not the pinned {VISION_PROJECTOR_SHA256}",
+                "vision projector {} has sha256 {}, not the pinned {VISION_PROJECTOR_SHA256} \
+                 (reinstall it; see README Model install)",
                 path.display(),
                 hex(&digest)
             )));

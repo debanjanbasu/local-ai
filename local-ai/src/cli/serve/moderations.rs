@@ -79,10 +79,8 @@ impl Moderations {
         embeddings: &Arc<Embeddings>,
     ) -> crate::Result<Arc<Self>> {
         let path = installed_heads(models_dir)?;
-        let heads =
-            ModerationHeads::open(&path, &embeddings.payload_sha256()).map_err(|error| {
-                crate::Error::InvalidArgument(format!("{}: {error}", path.display()))
-            })?;
+        let heads = ModerationHeads::open(&path, &embeddings.payload_sha256())
+            .map_err(|error| super::artifact_error(format!("{}: {error}", path.display())))?;
         eprintln!(
             "moderations at POST {ROUTE}: {MODERATION_MODEL_ID} from {} (sha256 {}); scored: {}",
             path.display(),
