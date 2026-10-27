@@ -53,8 +53,8 @@ pub(super) fn usage() {
     );
     eprintln!(
         "  --allow-host NAME  Answer requests addressed to host NAME besides IP addresses, \
-         localhost and *.local/*.internal names (DNS rebinding protection; applies on loopback, \
-         and elsewhere while authentication is off); repeatable"
+         localhost and *.local/*.internal names (DNS rebinding protection; applies on loopback); \
+         repeatable"
     );
     eprintln!(
         "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \
@@ -73,8 +73,7 @@ pub(super) fn usage() {
     eprintln!(
         "  Hosted tools (Responses API; see docs/TOOLS.md) are always on: file access and a \
          sandboxed shell with writes, rooted at the working directory, and web fetch of any \
-         public host. A non-loopback --host therefore needs authentication (--api-key or \
-         `local-ai admin create-key`)."
+         public host. A non-loopback --host therefore needs --api-key."
     );
 }
 

@@ -9,8 +9,10 @@ with a `400` whose `code` is `unsupported` and whose message gives the reason.
 
 Off by default. On `127.0.0.1` that means any local process can use the
 server; web pages a local browser opens cannot (see [Browsers](#browsers)).
-Bound to another address, anyone who can reach it can; `serve` prints a
-warning then.
+Because the [hosted tools](TOOLS.md) are always on, `serve` refuses to bind
+any other address without `--api-key`: anyone who can reach it could
+otherwise run shell commands and read and write files in its working
+directory.
 
 ```bash
 local-ai admin create-key --name ops   # prints sk-admin-... once on stdout
@@ -25,7 +27,7 @@ state is read from the store on every request). From then on every request,
 |---|---|
 | admin key `sk-admin-...` | only `/v1/organization/*` |
 | project key `sk-proj-...` | every other route, on its project's data only; usage is attributed to its project and key |
-| `serve --api-key KEY` (optional) | every route except `/v1/organization/*`, on every project's data; usage is unattributed |
+| `serve --api-key KEY` (required beyond loopback) | every route except `/v1/organization/*`, on every project's data; usage is unattributed |
 
 A missing or invalid key is a `401` (`invalid_api_key`); the wrong kind of key
 is a `403` (`insufficient_permissions`). Expired keys, keys of archived
@@ -62,13 +64,9 @@ version, is checked before authentication:
   DNS on the local network, never by public DNS), an IP address, or a name
   given with `serve --allow-host NAME` (repeatable, exact, any port). A
   rebinding page always sends its own name. While bound to a loopback address
-  this always applies. Bound to another address (`--host 0.0.0.0`) it applies
-  while authentication is off, where a rebinding page could otherwise read
-  files, stored responses and conversations from a browser on the network:
-  clients addressing the server by IP address or `name.local` are
-  unaffected, and one using a DNS name needs `--allow-host name`. Once
-  authentication is on it does not apply there, since a rebinding page has
-  no key.
+  this always applies. Bound to another address (`--host 0.0.0.0`, which
+  needs `--api-key`) authentication is always on, so it does not apply
+  there, since a rebinding page has no key.
 - **Origin.** While authentication is off, a request whose `Origin` is
   another site, or that has no `Origin` but `Sec-Fetch-Site: cross-site`, is
   refused (`403`). Admitted without configuration: `http(s)` pages on
