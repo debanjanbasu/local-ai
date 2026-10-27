@@ -2275,6 +2275,50 @@ gate, so the ungated steps cost more than the saved round trips. Requests with
 presence or repetition penalties keep the host draft loop, since the device
 top-two applies none.
 
+#### Tree verify
+
+A block drafter (`KFlash`, after Kapitsa) proposes a best-first tree of up to
+eight rows rather than a chain; `bonsai_native/tree.rs` verifies it in one
+pass. Row 0 is the anchor; every row names its parent and computes what plain
+decoding of its own path would. Its K/V row sits at cache row `start + r`
+with the rotary position `start + depth`. Attention reads the history below
+`start` through the decode split kernel of that prefix, or from three rows on
+a Q8 cache through the verify block's row kernel with every row's prefix
+pinned at `start`. It reads the tree zone, its ancestors and itself, key by
+key in path order in one more partial record (`bo_attn_tree_tail`), and
+`bo_attn_reduce` joins the records. The recurrent layers break the runner-up
+section's constraint: the state forks mid-block. Each row's short
+convolution reads its ancestors' inputs (`bo_conv_l2_decay_tree`). Its
+recurrence starts from its parent's state, which `bo_gdn_tree_rows_4*`
+rebuilds from the committed state by replaying the path's updates with the
+chain kernel's own operations, so its recurrence matches the chain kernel's
+on the same path bit for bit. Nothing writes the committed state. The commit gathers the
+accepted path's K/V, recurrence inputs and normalized rows into consecutive
+rows in place (`bo_gather_rows`) and replays them from the untouched state,
+as a rejected chain does. A chain goes to the chain verify and one row to a
+plain decode step, so both keep their numbers.
+
+A row's logits depend on `start`, its path and the projection class of the
+pass (one row, two to four, five to eight), never on the rest of the tree or
+on where its ancestors sit. The same path under two trees of a class is
+bitwise identical (19 pairs at 18 and 1100 tokens of history). Across classes
+it is within 0.008. Every row's GPU argmax equals plain decoding of its path
+over 144 random rows, and logits agree within 0.019 of the 3e-2 verify
+tolerance. GPU ms (median of 9) against the chain verify of the same row
+count; n = 2 trees are chains:
+
+| history | 3 rows | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|
+| 18, tree | 58.4 | 70.9 | 71.7 | 72.4 | 74.0 | 77.0 |
+| 18, chain | 57.3 | 69.6 | 71.8 | 71.2 | 72.6 | 75.4 |
+| 8192, tree | 61.4 | 74.0 | 78.0 | 78.8 | 81.5 | 84.7 |
+| 8192, chain | 61.0 | 73.4 | 77.3 | 77.8 | 80.4 | 83.2 |
+
+That is -0.2 to +2.1%, against 1-6% in Kapitsa. `BonsaiModel::set_taps` adds the
+drafter's residual taps, the residual after layers 5, 19, 33, 47 and 61 of
+every committed position, in a 2048-position ring (210 MB). The taps cost
+nothing while off and stay within run-to-run noise while on.
+
 ### What the speculation gain is made of
 
 `--no-speculation` disables two independent mechanisms under one flag: the MTP
