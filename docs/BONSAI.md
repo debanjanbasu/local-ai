@@ -185,6 +185,140 @@ Adopting a winner means a new release asset and pin in
 `tools/fetch_mtp_head.py` plus the digests at the top of this section, which
 needs approval to publish.
 
+### DFlash2 drafter
+
+The optional KFlash drafter (Kapitsa's
+[KFlash](https://github.com/nace-ai/kapitsa/blob/main/docs/kflash.md)) is
+z-lab's `DFlash2DraftModel`, pinned as
+[`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+at revision `015e795`. Five Qwen3 layers (32 query and 8 K/V heads of 128,
+FFN 17408), each attention and MLP wrapped in a grouped dynamic convolution
+(groups of 16 channels, kernel 2), draft an 8-row block in one pass: the
+anchor token and seven mask tokens (`mask_token_id` 248070) attend each
+other bidirectionally and a 2048-token sliding window of context. The
+context is the target's residual stream at layers 5, 19, 33, 47 and 61
+(standard Qwen basis, no unrotation), projected by `fc` (25600 to 5120) and
+`hidden_norm` into each layer's K/V. The seven draft rows go through the
+target's own `PTQ1_0` output matrix (forward-rotated first, as the target's
+hidden is) to the top 16 candidates per position, and a rank-256 candidate
+selector scores each candidate against each candidate of the position
+before it (the anchor for the first). Those scores make a first-order
+lattice; a best-first tree of up to 8 rows over it, scored with per-position
+calibrated path probabilities, is what the target verifies. The drafter has
+1.797B dense parameters plus 127M selector-codebook rows, which are only
+gathered, and shares the target's embedding and output matrix.
+
+```text
+file           = models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin
+file_bytes     = 2054275072   (SHA256 4d6879b40236bfc0549761a25e7298158a6c5653d135016ae2230502079de8f1)
+payload_bytes  = 2053443584
+payload_sha256 = 768b9f89dcdc09e9b3ccf11aac5baa6263ccad65168a75b0a1f5d0c18649614a
+source         = model.safetensors, 3848817896 bytes, SHA256 67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c
+```
+
+The artifact is the MTP head's container under its own magic (`DFLSH2`) and
+a 16 KiB header page: 128 named, page-aligned sections (every dense matrix as
+`<name>.int8` and `<name>.row_scales`, norms and convolution base kernels as
+`<name>.f32`, the two selector codebooks as `<name>.bf16`) and the payload
+digest, which every load re-derives. `bonsai --export dflash-head=DIR`
+writes it from `DIR/model.safetensors` and `DIR/config.json` of any
+`DFlash2DraftModel` with this configuration (BF16, F16 or F32; the codebooks
+may carry a `.weight` suffix), so fine-tuned drafters convert the same way.
+Discovery looks for exactly this file; absent, speculation stays with the MTP
+head and the policy records why, and a corrupt file is a hard error.
+
+#### Drafter precision
+
+Per-row int8 (`row_scale = absmax / 127`) through the existing int8 kernels.
+Output is lossless at any drafter precision, since the target verifies every
+token, so the choice is tokens per second. Acceptance of the formats, each
+regenerating every lattice of the seven trace prompts (3,047 anchors) and
+running `sim.py`'s leave-one-out calibrated 8-row tree, tokens per cycle,
+geomean:
+
+| Drafter weights | Tokens per cycle | Top-1 = fp32 | Top-16 overlap |
+| --- | ---: | ---: | ---: |
+| fp32 reference (`drafter_lib.py`) | 4.685 | | |
+| int8 per row, Metal (shipped) | 4.693 | 98.97% | 98.25% |
+| 4-bit affine, groups of 64 (CPU) | 4.665 | 92.5% | 88.6% |
+| ternary, TWN per 128 columns (CPU) | 1.436 | 7.1% | 15.7% |
+
+Ternary without training destroys the drafter, so the `PTQ1_0` kernels are
+out. 4-bit costs 0.6% of the tokens per cycle and would halve the bytes, but
+bytes are not what an 8-row pass is short of: the five layers' int8
+projections take 8.33 ms at 8 rows against 6.86 ms at one row (243 GB/s, the
+int8 bandwidth floor), and the 8-row simdgroup-matrix kernel is limited by
+its F32 multiplies, not by bytes: 26.6 GFLOP at 3.2 TFLOP/s, and on a
+cache-resident 2048x5120 matrix, where one row streams at 420 GB/s, it still
+tops out at 3.55 TFLOP/s (3.52 on 17408x5120 from memory), the limit
+`bonsai_int8.metal` documents. A 4-bit kernel built the same way keeps those
+multiplies, so it could save at most 0.7 ms of a 12.6 ms pass (under 1% of a
+cycle), against a new kernel and the 0.6% acceptance loss.
+
+#### Drafting pass
+
+Measured on the M4 Pro, holding the GPU lock, over the 3,047 trace anchors
+(`drafter_lattices_on_captures`): a drafting pass (embedding gather, five
+layers, output head, top 16, lattice and 8-row tree) takes **12.58 ms** of GPU
+time (median), and appending one committed position of taps to the context
+**0.83 ms**. With synthetic taps, a pass costs 12.16 ms at 60 positions of
+context, 12.44 ms at 500 and 13.23 ms at the full window; appending a
+2,048-row prompt costs 250 ms once (the int8 kernels take it in 8-row
+chunks). Of the pass, the int8 projections are 8.3 ms, the output head over
+seven rows 3.3 ms, top 16 0.14 ms, and block attention 0.03 ms per layer at
+60 context positions, 0.22 ms at the full window.
+
+Parity against `drafter_lib.py` (fp32, itself within 6.5e-6 of z-lab's class)
+on the captured Bonsai hidden states, every anchor of the seven prompts:
+
+| Prompt | Anchors | Top-1 equal | Top-16 overlap | Same top-16 set | Selector chain equal | Logit MAE | Edge MAE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| prose | 209 | 98.2% | 98.0% | 69.2% | 87.6% | 0.078 | 0.034 |
+| explanation | 511 | 98.9% | 98.4% | 74.6% | 91.8% | 0.112 | 0.038 |
+| arithmetic | 511 | 99.2% | 98.3% | 73.8% | 95.9% | 0.090 | 0.036 |
+| code | 511 | 99.3% | 98.2% | 72.9% | 96.7% | 0.081 | 0.035 |
+| essay | 511 | 97.9% | 98.2% | 72.6% | 86.5% | 0.098 | 0.030 |
+| thinking | 283 | 99.8% | 98.7% | 79.1% | 96.5% | 0.091 | 0.044 |
+| agent | 511 | 99.6% | 98.0% | 69.3% | 97.7% | 0.110 | 0.041 |
+
+Logit errors are in logits (the top candidate's is about 20); selector edge
+errors are against a mean magnitude of 1.2-2.5. The candidates that differ
+are the 16th-place near-ties. Every one of the 3,047 GPU trees equals
+`sim.py`'s `build_tree` on the same lattice, and the acceptance simulation on
+the Metal lattices gives 4.693 tokens per 8-row tree cycle against 4.685 for
+the fp32 lattices (report: 4.68):
+
+| Prompt | Metal, calibrated tree | fp32, calibrated tree | Metal, chain of 7 |
+| --- | ---: | ---: | ---: |
+| prose | 3.542 | 3.542 | 2.986 |
+| explanation | 4.024 | 4.088 | 3.476 |
+| arithmetic | 5.678 | 5.678 | 5.379 |
+| code | 5.742 | 5.678 | 5.323 |
+| essay | 2.594 | 2.621 | 2.222 |
+| thinking | 6.021 | 6.021 | 6.289 |
+| agent | 6.905 | 6.724 | 6.724 |
+| geomean | 4.693 | 4.685 | 4.316 |
+
+#### Interface
+
+`local-engine/src/bonsai_dflash.rs` documents the contract the verify side
+integrates against. In short: `DflashMode::resolve` finds or falls back;
+`DflashDrafter::append_context` takes `[n, 5, 5120]` F16 or F32 taps from a
+Metal buffer into a 2,112-slot F16 K/V ring per layer (the 2,047-position
+window plus 64 positions of `truncate_context` rollback); `draft` encodes
+the pass for an anchor at position `P` (host token or a `u32` the target
+wrote on the GPU) onto the caller's `CommandBatch`, leaving the
+`DflashLattice` on the GPU; `build_tree(max_rows)` encodes the tree kernel
+behind it, writing `DflashTree`: per row its token, parent, depth (position
+`P + depth`), lattice slot, ancestor mask, conditional log q and calibrated
+path log p, plus `E(n)` for `n = 1..=8`. The first `n` rows are the best
+`n`-row tree for every `n`. `Calibrator` turns each verified cycle into
+records (every node whose parent was accepted), refits `p = σ(α_d + β_d ·
+logit q)` every 16 cycles over the last 2,048 records per position, starting
+from `p = q`, and persists the fit to
+`~/Library/Caches/local-ai/dflash/<model>-<drafter>-<chip>.json`.
+`draft_gpu_time` reports the measured pass time.
+
 ## Commands
 
 ```text
@@ -227,7 +361,7 @@ local-ai bonsai [options] <prompt>
   --json             return token IDs and measured timings
   --tokenize         emit prompt token IDs without loading weights
   --export KIND      write an artifact instead of generating; takes no other
-                     options. Kinds: index, mtp-head=DIR
+                     options. Kinds: index, mtp-head=DIR, dflash-head=DIR
   --no-speculation   disable both MTP and suffix lookup for comparison
   --mtp-depth N      drafts per speculative round, 1 to 4 (default 3)
 ```
@@ -250,7 +384,10 @@ between two exports. Every kind decodes nothing and takes no prompt. `index`
 writes no file and therefore takes no directory; `mtp-head=DIR` needs only
 `DIR/model_mtp_ternary.safetensors`, starts no engine, opens no GGUF, writes
 `DIR/mtp-head-ptq1-v1.bin` (overwriting whatever was there), and prints the
-artifact record as JSON.
+artifact record as JSON. `dflash-head=DIR` needs `DIR/model.safetensors` and
+`DIR/config.json` of a DFlash2 drafter, likewise starts no engine and opens no
+GGUF, and writes `DIR/dflash2-drafter-int8-v1.bin`
+([DFlash2 drafter](#dflash2-drafter)).
 
 ## Server API
 

@@ -347,6 +347,7 @@ Weights are not included. The runtime validates these pinned files:
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` | always |
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | 931,145,856 | `e287342d92332fa3577ed1d42e921dac9370c08da58ba9337fa450f6cc76cfd7` | for image and video input to chat and responses |
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | for MTP speculation |
+| `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` | 2,054,275,072 | `4d6879b40236bfc0549761a25e7298158a6c5653d135016ae2230502079de8f1` | for KFlash tree drafting |
 | `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | for image/video embeddings (Rust API) |
@@ -502,6 +503,41 @@ python3 tools/kaggle_bonsai_mtp_job.py \
 
 Heads tried before the mixed one, and their measurements, are in
 [docs/BONSAI.md](docs/BONSAI.md#tried-and-rejected).
+
+### DFlash2 drafter artifact
+
+The optional KFlash drafter is
+[`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+at revision `015e795` (z-lab's `DFlash2DraftModel`: five layers conditioned on
+the target's residual stream, an 8-row drafting block and a candidate
+selector), converted to per-row int8. It shares the target's embedding and
+output matrix, so neither ships twice.
+
+| Field | Value |
+| --- | --- |
+| File | `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` |
+| Bytes | 2,054,275,072 |
+| `payload_bytes` | 2,053,443,584 |
+| `payload_sha256` | `768b9f89dcdc09e9b3ccf11aac5baa6263ccad65168a75b0a1f5d0c18649614a` |
+| Source `model.safetensors` | 3,848,817,896 bytes, SHA256 `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c` |
+
+As with the MTP head, every load re-derives the payload digest (128 named
+sections, padding skipped) and a corrupt, truncated or foreign file is a hard
+error; a missing file leaves speculation with the MTP head and the policy
+records why. Convert any DFlash2 checkpoint with this architecture (the
+published one or a fine-tune, BF16, F16 or F32) from a directory holding its
+`model.safetensors` and `config.json`:
+
+```bash
+target/release/local-ai bonsai --export dflash-head=DIR
+cp DIR/dflash2-drafter-int8-v1.bin models/bonsai2-27b-dflash2/
+```
+
+The conversion checks the config against the pinned architecture, quantizes
+every dense matrix per row to int8, keeps norms and convolution base kernels
+in F32 and the selector codebooks in BF16, and takes a few seconds. See
+[docs/BONSAI.md](docs/BONSAI.md#dflash2-drafter) for the format, the
+precision choice and the measurements.
 
 The 5,946,648,928-byte GGUF is not compressible in practice: the measured
 ceiling is 1.074x and the best measured result 1.29%.
