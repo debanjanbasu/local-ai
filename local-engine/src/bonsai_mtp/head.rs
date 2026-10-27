@@ -199,6 +199,12 @@ impl BonsaiMtp {
         &self.scratch.hidden_in
     }
 
+    /// The buffer behind [`Self::embedding_rows`], for a caller that stages
+    /// those rows with a GPU copy inside its own command batch.
+    pub const fn embedding_buffer(&self) -> &MetalBuffer {
+        &self.scratch.embedding
+    }
+
     /// Host-visible embedding rows the caller fills with inverse-rotation inputs.
     #[expect(unsafe_code)]
     pub fn embedding_rows(&mut self, rows: usize) -> crate::Result<&mut [f32]> {

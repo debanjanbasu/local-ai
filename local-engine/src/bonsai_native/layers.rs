@@ -338,6 +338,19 @@ impl BonsaiModel {
         tokens: u32,
         rope: Rope<'_>,
     ) -> crate::Result<()> {
+        self.full_attention_at(batch, layer, tokens, rope, self.position)
+    }
+
+    /// [`Self::full_attention`] of rows starting at cache position
+    /// `position` (a half block of the Neural Engine wavefront).
+    pub(super) fn full_attention_at(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &FullAttentionLayer,
+        tokens: u32,
+        rope: Rope<'_>,
+        position: usize,
+    ) -> crate::Result<()> {
         let scratch = &self.scratch;
         let projections = [
             (&layer.query_gate, &scratch.query_gate),
@@ -373,7 +386,7 @@ impl BonsaiModel {
             &scratch.gate,
             &layer.key_cache,
             &layer.value_cache,
-            self.position as u32,
+            position as u32,
             self.kv_allocated as u32,
             self.epsilon,
             self.rope_base,
@@ -389,7 +402,7 @@ impl BonsaiModel {
                 &layer.value_cache,
                 Some(&scratch.gate),
                 &scratch.attention_output,
-                self.position as u32 + 1,
+                position as u32 + 1,
                 &scratch.attention,
                 0,
             )?;
@@ -402,7 +415,7 @@ impl BonsaiModel {
                 &layer.value_cache,
                 Some(&scratch.gate),
                 &scratch.attention_output,
-                self.position as u32,
+                position as u32,
                 tokens,
                 &scratch.attention,
             )?;
