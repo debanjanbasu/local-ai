@@ -112,10 +112,12 @@ const MIXED: usize = 6144;
 /// none); the GPU computes the rest at the same time. [`OutSplit`] picks one
 /// per function from measured timing. The ANE computes 1,024 rows of 512
 /// tokens in about 0.95 ms, about the GPU's rate, so the gain is the overlap.
-const OUT_STEPS: [u32; 9] = [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096];
-/// Where [`OutSplit`] starts on a machine without a learned split: 3,584
-/// rows, the best fixed split for 4K prompts on the M4 Pro.
-const OUT_START: usize = 7;
+/// On the M4 Pro 4K prompts ran fastest at 3,072 and 3,584 rows (373.7 and
+/// 373.8 tok/s against 357.6 with none); more int8 rows raise the KL, so
+/// the steps stop at 3,072.
+pub(super) const OUT_STEPS: [u32; 7] = [0, 512, 1024, 1536, 2048, 2560, 3072];
+/// Where [`OutSplit`] starts on a machine without a learned split.
+const OUT_START: usize = 6;
 /// [`OutSplit`] moves to a probed split whose chunk ran faster per row by
 /// more than this fraction, and takes a step away when the GPU waited over
 /// [`OUT_WAIT_LIMIT_MS`] per layer on the ANE's FFNs.
@@ -1234,12 +1236,18 @@ impl OutSplit {
             .last()
             .is_some_and(|last| !last.probe && last.function == function && last.rows == rows)
         {
+            // At either end the probe goes the only way it can.
+            if base == OUT_STEPS.len() - 1 {
+                self.probe_up[function] = false;
+            } else if base == 0 {
+                self.probe_up[function] = true;
+            }
             chunk.step = if self.probe_up[function] {
-                (base + 1).min(OUT_STEPS.len() - 1)
+                base + 1
             } else {
-                base.saturating_sub(1)
+                base - 1
             };
-            chunk.probe = chunk.step != base;
+            chunk.probe = true;
         }
         #[cfg(test)]
         if let Some(step) = OUT_STEP_OVERRIDE
@@ -2286,11 +2294,15 @@ mod tests {
         // A shorter last chunk is not compared with full ones.
         assert_eq!(finish(&mut split, 600, 2048, 100.0), (4, false));
         assert_eq!(split.steps[3], 4);
-        // At the top the probe would equal the split: a base chunk instead.
-        let mut top = OutSplit::new([OUT_STEPS.len() - 1; FUNCTION_ROWS.len()]);
-        finish(&mut top, 1024, 0, 2000.0);
-        assert_eq!(top.plan(3, 1024, 1024), OUT_STEPS.len() - 1);
-        assert_eq!(top.current.map(|chunk| chunk.probe), Some(false));
+        // At either end the probe goes the only way it can.
+        let top = OUT_STEPS.len() - 1;
+        let mut edge = OutSplit::new([top; FUNCTION_ROWS.len()]);
+        finish(&mut edge, 1024, 0, 2000.0);
+        assert_eq!(edge.plan(3, 1024, 1024), top - 1);
+        let mut edge = OutSplit::new([0; FUNCTION_ROWS.len()]);
+        edge.probe_up = [false; FUNCTION_ROWS.len()];
+        finish(&mut edge, 1024, 0, 2000.0);
+        assert_eq!(edge.plan(3, 1024, 1024), 1);
     }
 
     #[test]

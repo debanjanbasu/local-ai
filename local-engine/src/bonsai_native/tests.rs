@@ -1684,7 +1684,7 @@ fn ane_out_split_timings() {
         best
     };
     let steps = std::env::var("ANE_SPLIT_STEPS").map_or_else(
-        |_| (0..9).collect::<Vec<usize>>(),
+        |_| (0..ane_split::OUT_STEPS.len()).collect::<Vec<usize>>(),
         |steps| {
             steps
                 .split(',')
