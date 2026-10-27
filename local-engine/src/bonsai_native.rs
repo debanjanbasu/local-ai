@@ -44,6 +44,7 @@ mod checkpoint;
 mod kflash;
 mod layers;
 mod speculation;
+mod tape;
 mod taps;
 mod tree;
 
@@ -79,6 +80,14 @@ const GDN_STATE_BYTES: usize = STATE_FORMAT.state_bytes();
 const RECURRENT_LAYERS: usize = LAYERS - LAYERS / FULL_INTERVAL;
 pub const PROMPT_CHECKPOINT_BYTES: usize =
     RECURRENT_LAYERS * (GDN_STATE_BYTES + CONV_STATE_BYTES) + WIDTH * size_of::<f32>();
+/// GPU memory a sequence's state needs beside its K/V caches: a prompt
+/// checkpoint's worth plus its GDN tape.
+pub const SEQUENCE_STATE_BYTES: usize =
+    PROMPT_CHECKPOINT_BYTES + tape::Tape::bytes(RECURRENT_LAYERS);
+/// Bytes of the block the tape folds' convolutions leave their rows in: one
+/// tape's rows per sequence of a batched step, its prefilling one included.
+const TAPE_SCRATCH_BYTES: usize =
+    (batch::MAX_BATCH_SEQUENCES + 1) * tape::TAPE_ROWS * RECURRENCE_FACTOR_WIDTH * size_of::<f32>();
 
 /// Recurrent state at one exact token boundary. Full-attention and MTP K/V
 /// rows are position indexed and remain in their existing allocations.
@@ -847,6 +856,11 @@ pub struct BonsaiModel {
     kflash: Option<kflash::Kflash>,
     /// The prefill FFN on the Neural Engine (see `ane_split`).
     ane: AnePrefill,
+    /// The resident sequence's GDN tape (see [`SequenceState`]).
+    tape: tape::Tape,
+    /// Where tape folds leave the pending rows convolved, a tape's rows per
+    /// sequence of a batched step.
+    tape_scratch: MetalBuffer,
 }
 
 impl BonsaiModel {
@@ -1066,6 +1080,8 @@ impl BonsaiModel {
             taps: None,
             kflash: None,
             ane,
+            tape: tape::Tape::new(&context, RECURRENT_LAYERS)?,
+            tape_scratch: MetalBuffer::empty(context.device(), TAPE_SCRATCH_BYTES)?,
             context,
             package,
         };
@@ -1098,6 +1114,7 @@ impl BonsaiModel {
         if let Some(speculation) = &self.speculation {
             speculation.mtp.reset();
         }
+        self.tape.clear();
         self.drop_tree_verify();
         self.forget_taps();
         // Attention reads only the newly written prefix; unused KV tails need
@@ -1224,6 +1241,7 @@ impl BonsaiModel {
     /// Copy an exact boundary to CPU memory. Cache tails are deliberately omitted.
     #[expect(unsafe_code)]
     pub(crate) fn prompt_snapshot(&self) -> crate::Result<PromptSnapshot> {
+        self.settle_tape()?;
         let recurrent = self
             .layers
             .iter()
@@ -1342,6 +1360,7 @@ impl BonsaiModel {
             ));
         }
         self.reserve_kv(snapshot.position, None)?;
+        self.tape.clear();
         let mut recurrent = &*snapshot.recurrent;
         let mut target_kv = &*snapshot.target_kv;
         let mut copies = Vec::with_capacity(2 * self.layers.len());
@@ -1848,8 +1867,10 @@ fn memory_plan(
     // Admission assumes the caches fully grown: a request may reach the
     // context, and refusing it mid-generation would be worse than refusing
     // the configuration up front.
-    let fixed_state_bytes =
-        (LAYERS - LAYERS / FULL_INTERVAL) * (GDN_STATE_BYTES + CONV_STATE_BYTES);
+    let fixed_state_bytes = (LAYERS - LAYERS / FULL_INTERVAL)
+        * (GDN_STATE_BYTES + CONV_STATE_BYTES)
+        + tape::Tape::bytes(RECURRENT_LAYERS)
+        + TAPE_SCRATCH_BYTES;
     // Conservative first implementation: count the entire mapped checkpoint,
     // a possible copied final tensor, F32 exceptions, and 512 MiB for tokenizer,
     // workspace, pipelines and command buffers, plus 1 MiB per prefill row

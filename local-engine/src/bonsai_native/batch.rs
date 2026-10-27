@@ -24,6 +24,7 @@ use local_metal::bonsai_ops::{AttentionWorkspace, Rope};
 use local_metal::draft::GreedyRows;
 use local_metal::shaders::ShaderLibrary;
 
+use super::tape::{TAPE_ROWS, Tape};
 use super::{
     AttentionLayer, BonsaiModel, BufferCopyRequest, CONV_STATE_BYTES, CommandBatch, Described,
     FullAttentionLayer, HadamardDirection, MetalBuffer, RecurrentLayer, Selection, VOCAB, WIDTH,
@@ -73,6 +74,8 @@ pub struct SequenceState {
     head: Option<HeadSequence>,
     /// Images of this sequence's prompt.
     images: Option<Arc<PromptImages>>,
+    /// Kept verify rows its next step folds in (see `tape`).
+    tape: Tape,
 }
 
 impl SequenceState {
@@ -95,6 +98,7 @@ impl SequenceState {
             .map(|(a, b)| a.length() + b.length())
             .sum::<usize>()
             + self.head.as_ref().map_or(0, HeadSequence::bytes)
+            + Tape::bytes(self.recurrent.len())
     }
 }
 
@@ -234,9 +238,11 @@ impl BatchScratch {
 ///
 /// A sequence with drafts reads its state and history and writes the block's
 /// final ones to the shared spares, which nobody reads: its own buffers keep
-/// the start of the round, and the commit replays exactly the rows it keeps
-/// (all of them when every draft is accepted), as a single sequence's partial
-/// commit does.
+/// the start of the round. A sequence of up to a tape's rows records them on
+/// its own tape, whose kept rows its next step folds in; a longer one keeps
+/// them here, and the commit replays exactly the rows it keeps (all of them
+/// when every draft is accepted), as a single sequence's partial commit
+/// does.
 struct BatchVerify {
     layers: Vec<VerifyLayer>,
     spare_state: MetalBuffer,
@@ -299,6 +305,8 @@ struct RowBuffers<'a> {
     /// `position + offset`, `Err` for explicit rows in `scratch.rope` from
     /// its first stacked row.
     ropes: Vec<Result<i32, ()>>,
+    /// Each sequence's tape.
+    tapes: Vec<&'a Tape>,
     /// Total stacked rows.
     rows: usize,
 }
@@ -341,6 +349,7 @@ impl BonsaiModel {
             .as_ref()
             .map(|_| HeadSequence::new(&self.context, self.kv_initial))
             .transpose()?;
+        let tape = Tape::new(&self.context, recurrent.len())?;
         Ok(SequenceState {
             id: next_state_id(),
             recurrent,
@@ -349,6 +358,7 @@ impl BonsaiModel {
             kv_allocated: self.kv_initial,
             head,
             images: None,
+            tape,
         })
     }
 
@@ -375,6 +385,7 @@ impl BonsaiModel {
         std::mem::swap(&mut self.kv_allocated, &mut parked.kv_allocated);
         std::mem::swap(&mut self.state_id, &mut parked.id);
         std::mem::swap(&mut self.images, &mut parked.images);
+        std::mem::swap(&mut self.tape, &mut parked.tape);
         match (&mut self.speculation, &mut parked.head) {
             (Some(speculation), Some(head)) => {
                 speculation
@@ -684,6 +695,10 @@ impl BonsaiModel {
         if let Some(chunk) = prefill.as_ref() {
             self.ingest_prefill_rows(&mut batch, chunk, decoded)?;
         }
+        // Every sequence's recurrent layers folded its pending tape rows in.
+        for tape in &buffers.tapes {
+            tape.clear();
+        }
         let spans = buffers.spans.clone();
         drop(buffers);
         self.finish(batch)?;
@@ -848,10 +863,11 @@ impl BonsaiModel {
 
     /// Settle the sequences that verified drafts in the last
     /// [`Self::decode_batch_prefilling`] (with the same `rows`): each keeps its first
-    /// `committed[index]` rows. Their recurrent state and history replay
-    /// those rows from the start of the round, in one submission for every
-    /// sequence; positions and head lags advance by the kept rows. Entries of
-    /// sequences without drafts are ignored.
+    /// `committed[index]` rows. A sequence of up to a tape's rows leaves them
+    /// on its GDN tape for its next step to fold in (no GPU work); longer
+    /// ones replay them from the start of the round, in one submission for
+    /// every such sequence. Positions and head lags advance by the kept
+    /// rows. Entries of sequences without drafts are ignored.
     #[expect(clippy::too_many_lines)]
     pub(crate) fn commit_batch(
         &mut self,
@@ -868,7 +884,19 @@ impl BonsaiModel {
                 "batched commit needs 1..=rows kept rows per verifying sequence".into(),
             ));
         }
-        if rows.iter().all(|row| row.drafts.is_empty()) {
+        // A sequence whose verify rows went to its tape leaves its kept rows
+        // there for its next step to fold in; only longer ones replay.
+        for (row, &kept) in rows.iter().zip(committed) {
+            if !row.drafts.is_empty() && row.rows() <= TAPE_ROWS {
+                row.state
+                    .as_deref()
+                    .map_or(&self.tape, |state| &state.tape)
+                    .keep(kept);
+            }
+        }
+        let replays = |row: &BatchRow<'_>| !row.drafts.is_empty() && row.rows() > TAPE_ROWS;
+        if !rows.iter().any(replays) {
+            self.advance_committed(rows, committed);
             return Ok(());
         }
         let verify = self
@@ -899,7 +927,7 @@ impl BonsaiModel {
             });
         for (index, (layer, kept)) in recurrent.zip(&verify.layers).enumerate() {
             let replays = (0..sequences)
-                .filter(|&sequence| !rows[sequence].drafts.is_empty())
+                .filter(|&sequence| replays(&rows[sequence]))
                 .map(|sequence| {
                     let (state, history) = buffers.recurrent[index * sequences + sequence];
                     (
@@ -953,6 +981,13 @@ impl BonsaiModel {
         }
         drop(buffers);
         self.finish(batch)?;
+        self.advance_committed(rows, committed);
+        Ok(())
+    }
+
+    /// Advance each verifying sequence of a batched step by its kept rows:
+    /// its position and its head's lag.
+    fn advance_committed(&mut self, rows: &mut [BatchRow<'_>], committed: &[usize]) {
         for (row, &kept) in rows.iter_mut().zip(committed) {
             if row.drafts.is_empty() {
                 continue;
@@ -968,7 +1003,6 @@ impl BonsaiModel {
                 lag.tokens.extend_from_slice(&row.drafts[..kept - 1]);
             }
         }
-        Ok(())
     }
 
     /// Draft up to the head's depth after `seed` for the resident sequence,
@@ -1086,6 +1120,7 @@ impl BonsaiModel {
             spans: Vec::new(),
             in_place: Vec::new(),
             ropes: Vec::new(),
+            tapes: Vec::new(),
             rows: 0,
         };
         let sequences = rows
@@ -1144,6 +1179,9 @@ impl BonsaiModel {
                     );
                 })
             }));
+            buffers
+                .tapes
+                .push(state.map_or(&self.tape, |state| &state.tape));
             buffers.positions.push(position);
             buffers.capacities.push(capacity);
             buffers.spans.push((buffers.rows, length));
@@ -1280,11 +1318,63 @@ impl BonsaiModel {
         })?;
         let sequence = &buffers.recurrent[layer_index * sequences..(layer_index + 1) * sequences];
         let inputs = [&layer.decay, &scratch.alpha, &layer.dt, &scratch.raw_beta];
+        let spares = || {
+            keep.map(|(verify, _)| verify)
+                .ok_or_else(|| crate::Error::InvalidArgument("verify rows without spares".into()))
+        };
+        // Each sequence's pending tape rows fold in first; verify rows of up
+        // to a tape's length go to its tape for the commit.
+        let tape_rows = |index: usize| {
+            let (start, length) = buffers.spans[index];
+            let tape = buffers.tapes[index];
+            let fold = tape.fold(
+                layer_index,
+                (
+                    &self.tape_scratch,
+                    index * TAPE_ROWS * QKV_WIDTH * size_of::<f32>(),
+                ),
+            );
+            let records = !buffers.in_place[index] && length > 1 && length <= TAPE_ROWS;
+            (start, length, fold, records.then(|| tape.step(layer_index)))
+        };
+        let row_bytes = |row: usize, width: usize| row * width * size_of::<f32>();
         batch.independent(|batch| {
-            for ((&(start, length), &(_, history)), &in_place) in
-                buffers.spans.iter().zip(sequence).zip(&buffers.in_place)
+            for (index, (&(_, history), &in_place)) in
+                sequence.iter().zip(&buffers.in_place).enumerate()
             {
-                if length == 1 {
+                let (start, length, fold, step) = tape_rows(index);
+                let final_history = if in_place || length == 1 {
+                    history
+                } else {
+                    &spares()?.spare_history
+                };
+                if fold.rows > 0 || step.is_some() {
+                    let scalar = row_bytes(start, GDN_HEADS);
+                    let (decay, beta) = step.map_or(((decay, scalar), (beta, scalar)), |step| {
+                        ((&step.decay, 0), (&step.beta, 0))
+                    });
+                    self.ops.conv_l2_decay_fold(
+                        batch,
+                        &layer.convolution,
+                        [history, final_history],
+                        local_metal::bonsai_ops::ConvRows {
+                            input: (raw, row_bytes(start, QKV_WIDTH)),
+                            out: (&scratch.convolved, row_bytes(start, QKV_WIDTH)),
+                            decay_inputs: [
+                                (&layer.decay, 0),
+                                (&scratch.alpha, scalar),
+                                (&layer.dt, 0),
+                                (&scratch.raw_beta, scalar),
+                            ],
+                            decay,
+                            beta,
+                            raw_copy: step.map(|step| &step.raw),
+                        },
+                        self.epsilon,
+                        fold,
+                        length as u32,
+                    )?;
+                } else if length == 1 {
                     self.ops.conv_l2_decay_row(
                         batch,
                         raw,
@@ -1298,21 +1388,11 @@ impl BonsaiModel {
                         start as u32,
                     )?;
                 } else {
-                    let spare = if in_place {
-                        history
-                    } else {
-                        &keep
-                            .ok_or_else(|| {
-                                crate::Error::InvalidArgument("verify rows without spares".into())
-                            })?
-                            .0
-                            .spare_history
-                    };
                     self.ops.conv_l2_decay_rows_at(
                         batch,
                         raw,
                         &layer.convolution,
-                        [history, spare],
+                        [history, final_history],
                         &scratch.convolved,
                         self.epsilon,
                         inputs,
@@ -1325,10 +1405,34 @@ impl BonsaiModel {
             crate::Result::Ok(())
         })?;
         batch.independent(|batch| {
-            for ((&(start, length), &(state, _)), &in_place) in
-                buffers.spans.iter().zip(sequence).zip(&buffers.in_place)
+            for (index, (&(state, _), &in_place)) in
+                sequence.iter().zip(&buffers.in_place).enumerate()
             {
-                if length == 1 {
+                let (start, length, fold, step) = tape_rows(index);
+                let final_state = if in_place || length == 1 {
+                    state
+                } else {
+                    &spares()?.spare_state
+                };
+                if fold.rows > 0 || step.is_some() {
+                    let scalar = row_bytes(start, GDN_HEADS);
+                    let (decay, beta) = step.map_or(((decay, scalar), (beta, scalar)), |step| {
+                        ((&step.decay, 0), (&step.beta, 0))
+                    });
+                    self.ops.gdn_fold(
+                        batch,
+                        self.state_format,
+                        [
+                            (&scratch.convolved, row_bytes(start, QKV_WIDTH)),
+                            decay,
+                            beta,
+                        ],
+                        [state, final_state],
+                        (&scratch.recurrent_output, row_bytes(start, 6144)),
+                        fold,
+                        length as u32,
+                    )?;
+                } else if length == 1 {
                     self.ops.gdn_row(
                         batch,
                         self.state_format,
@@ -1340,21 +1444,11 @@ impl BonsaiModel {
                         start as u32,
                     )?;
                 } else {
-                    let spare = if in_place {
-                        state
-                    } else {
-                        &keep
-                            .ok_or_else(|| {
-                                crate::Error::InvalidArgument("verify rows without spares".into())
-                            })?
-                            .0
-                            .spare_state
-                    };
                     self.ops.gdn_rows_at(
                         batch,
                         self.state_format,
                         [&scratch.convolved, decay, beta],
-                        [state, spare],
+                        [state, final_state],
                         &scratch.recurrent_output,
                         start as u32,
                         length as u32,

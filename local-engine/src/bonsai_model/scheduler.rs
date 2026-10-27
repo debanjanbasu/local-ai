@@ -121,7 +121,7 @@ impl BonsaiEngine {
     fn sequence_state_tokens(&self) -> usize {
         let per_token = self.model.kv_layout().token_bytes() * crate::bonsai::LAYERS
             / crate::bonsai::FULL_INTERVAL;
-        crate::bonsai_native::PROMPT_CHECKPOINT_BYTES.div_ceil(per_token.max(1))
+        crate::bonsai_native::SEQUENCE_STATE_BYTES.div_ceil(per_token.max(1))
     }
 
     /// Admit a request: restore its reusable prompt prefix and queue the rest

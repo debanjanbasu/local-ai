@@ -21,6 +21,8 @@ mod kv;
 mod matmul;
 mod norm;
 mod rows;
+mod tape;
+pub use tape::{At, ConvRows, TAPE_ROWS, TapeFold};
 mod tree;
 pub use tree::{TREE_DESCRIPTOR_WORDS, TREE_MASKS, TREE_PARENTS, TREE_PATH, TREE_ROWS};
 
@@ -413,6 +415,18 @@ impl BonsaiOps {
             "bo_gdn_prefill_rows_4",
             "bo_gdn_prefill_rows_4_f16",
             "bo_gdn_prefill_rows_4_bf16",
+            // The GDN tape's folds; `tape.rs` names their indexes.
+            "bo_conv_l2_decay_fold",
+            "bo_conv_l2_decay_tree_fold",
+            "bo_gdn_fold",
+            "bo_gdn_rows_4_fold",
+            "bo_gdn_tree_rows_4_fold",
+            "bo_gdn_fold_f16",
+            "bo_gdn_rows_4_fold_f16",
+            "bo_gdn_tree_rows_4_fold_f16",
+            "bo_gdn_fold_bf16",
+            "bo_gdn_rows_4_fold_bf16",
+            "bo_gdn_tree_rows_4_fold_bf16",
         ];
         // Quantized layouts with tensor kernels of their own (decode split and
         // causal prefill), each K/V tile dequantized to half in threadgroup

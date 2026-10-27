@@ -265,6 +265,12 @@ flag turns any of it off or tunes it.
   wherever main's is. Copy-edit prompts: 79.7 and 93.1
   against 71.9 and 93.9 tok/s. It adds about 380 MB of resident memory
   and 3 s of load time ([details](docs/BONSAI.md#kflash-cycles)).
+  With the GDN tape, a verify's kept rows are folded into the next step's
+  kernels instead of being replayed. The commit takes half the time
+  (0.79 to 0.38 ms per cycle), but the next verify writes the state back.
+  Solo decoding is unchanged within noise: seven interleaved rounds ran
+  0.1% slower on average, from 7.9% slower to 5.8% faster, with identical
+  text ([details](docs/BONSAI.md#lossless-speculation)).
 - Server: concurrent requests decode in one batched pass per step, their MTP
   heads drafting together in one head pass per depth; 300-token chat
   requests reach 50, 59 and 74 tok/s aggregate at 2, 4 and 8 streams
@@ -274,6 +280,13 @@ flag turns any of it off or tunes it.
   suffix-lookup drafts inside the batch: 37.9 against 34.9 tok/s aggregate
   at four streams for the previous build, byte-identical to each request
   alone.
+  Batched steps no longer replay kept drafts after each pass; the next pass
+  folds them in. In paired runs under another agent's load, two streams
+  rose from 33.8 and 30.8 to 36.6 and 35.3 tok/s, four streams from 46.6
+  and 44.6 to 46.6 and 49.4, and eight streams tied (65.1 and 66.5
+  against 64.5 and 67.4). Per-stream DFlash2 chains in batched passes
+  tied with the tape alone and were not kept
+  ([details](docs/BONSAI.md#kflash-cycles)).
 - Prefill (cold, no speculation), the FFN and up to 3,072 rows of each mixer
   output projection on the Neural Engine beside the GPU's mixers: 288 tok/s
   at 510 tokens, 365 tok/s at 2K, 347 tok/s at 8K and 252 tok/s at 32K,

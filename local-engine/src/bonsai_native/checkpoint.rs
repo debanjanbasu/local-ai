@@ -16,6 +16,11 @@ impl BonsaiModel {
         checkpoint: &PromptCheckpoint,
         restore: bool,
     ) -> crate::Result<()> {
+        if restore {
+            self.tape.clear();
+        } else {
+            self.settle_tape()?;
+        }
         let recurrent = self
             .layers
             .iter()
@@ -119,8 +124,10 @@ impl BonsaiModel {
     /// Settle the recurrent layers after a verify block of `rows` rows that
     /// committed its first `committed`: with every row committed, adopt the
     /// final state and history the block wrote to the verifier (a buffer
-    /// swap, no GPU work); with fewer, replay the committed rows' compact
-    /// inputs from the start state the layers kept, in a batch of its own.
+    /// swap, no GPU work); with fewer, leave the committed rows on the tape
+    /// for the next step to fold in (up to [`super::tape::TAPE_ROWS`] rows,
+    /// no GPU work either) or replay their compact inputs from the start
+    /// state the layers kept, in a batch of its own.
     pub(super) fn commit_verified(
         &mut self,
         verifier: &mut Verifier,
@@ -181,6 +188,12 @@ impl BonsaiModel {
         }
         if committed == rows {
             return self.adopt_verified(verifier);
+        }
+        if rows <= super::tape::TAPE_ROWS {
+            // The block recorded its rows on the tape: the next step folds
+            // the kept ones in.
+            self.tape.keep(committed);
+            return Ok(());
         }
         self.encode_replay_verified(batch, verifier, committed)
     }

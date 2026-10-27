@@ -2085,8 +2085,8 @@ where chunked prefill sits well below what time slicing would give both.
 
 #### Speculation in a batch
 
-A batched step verifies drafts too. Each sequence contributes its seed row
-and any drafts as consecutive rows of one stacked block, so a pass of four
+A batched step verifies drafts too. Each sequence contributes its seed row and
+any drafts as consecutive rows of one stacked block, so a pass of four
 sequences with three drafts each is one 16-row pass. A sequence's verify rows
 run its convolution and recurrence with the multi-row kernels at a row offset
 (the same pipelines bound with byte offsets, so its rows compute what a block
@@ -2094,11 +2094,13 @@ of only those rows computes), reading its state and history and writing the
 block's final ones to shared spares that nobody reads; the K/V rows are
 appended at its position and attended with the block attention kernel at the
 same offset. Every row is projected to logits and selected on the GPU; each
-sequence then verifies its drafts exactly as a single sequence does, and one
-submission replays every verifying sequence's kept rows from the start of the
-round (its raw QKV rows, decay and beta were kept per layer), as a partial
-commit always has, 2.5-12.7 ms for 2 to 8 sequences. Positions advance by the
-kept rows, and the kept rows' hidden reaches the MTP head through the same
+sequence then verifies its drafts exactly as a single sequence does. A
+sequence's verify rows go on its own GDN tape, and its kept rows are folded in
+by its next step, batched or alone, at the start of that step's kernels; only
+a verify longer than eight rows (a long lookup draft) is replayed from the
+start of the round, in one submission for all of them, as every partial commit
+was before the tape (2.5-12.7 ms for 2 to 8 sequences). Positions advance by
+the kept rows, and the kept rows' hidden reaches the MTP head through the same
 per-request lag a batched plain step uses.
 
 Drafts come from each sequence's suffix lookup, or from its own MTP head.
@@ -2417,6 +2419,54 @@ rather than 9.9 GB of per-row full checkpoints, and no state copy at all: the
 former scheme copied all 48 states into a snapshot before every verify block
 and back on every rejection.
 
+A verify of at most eight rows (every tree, every head or lookup chain, every
+sequence's drafts in a batched pass) no longer replays at all; this follows
+the GDN tape of [Splash](https://github.com/incoai/splash). It records each
+row's raw QKV projection, decay and beta on the sequence's tape (two halves
+of 48 layers × 8 rows, 31.8 MB per sequence) and leaves the state and the
+convolution history at the step's start. The commit only marks the kept rows
+pending, with no GPU work. The sequence's next step (a decode step, a verify,
+a tree or a batched pass) folds them in at the start of its own convolution
+and recurrence kernels (`bo_conv_l2_decay_fold`, `bo_gdn_fold`,
+`bo_gdn_rows_4_fold` and their tree forms): one threadgroup per head first
+runs the replay's arithmetic over the pending rows on the state it is about
+to read, then the step's own body. A step records into the half the pending
+rows are not in. A long prefill block, a prompt checkpoint and a snapshot
+replay the pending rows first (`encode_settle`), so everything that saves or
+restores state sees what the replay left. The folded state is bitwise the
+replayed one: `tape_folds_are_bitwise_the_replay` compares every logit row
+and every recurrent state, folded against replayed, after a partial chain, a
+full chain (whose buffers are swapped in, leaving nothing pending) and two
+tree paths, each folded into a decode step, a chain verify and a tree
+verify.
+
+Measured against the `kflash` base `adc358f`, interleaved under the GPU lock
+while other agents loaded the machine, so absolute rates sit below the KFlash
+table further down. Alone, the tape moves work rather than removing much. The
+commit's wall time halves (0.79 to 0.38, 2.33 to 1.21 and 0.56 to 0.27 ms per
+cycle over three runs of the six prompts), but the next verify now writes the
+state it folds, and its time per tree cycle rose by 0.7, 0.0 and 4.8 ms (the
+last run also verified 0.15 more rows per tree). Seven interleaved rounds of
+the six prompts at 300 tokens ended from 7.9% slower to 5.8% faster, 0.1%
+slower on average: 38.3, 44.4, 40.2, 34.7, 39.8, 38.7 and 41.4 tok/s against
+39.3, 43.5, 39.7, 32.8, 39.2, 42.0 and 41.7. The trace prompts through `serve`
+gave 45.1 against 43.8 (one run), and the copy-edit prompts 79.2 against 77.5
+in one run and 81.2 / 93.7 for both builds in another. Every text matched,
+except the essay's known near-tie at token 123 in one round.
+
+Batched steps gain more. There the replay was a submission of its own after
+every pass in which a sequence kept part of its drafts. Paired runs, base then
+tape, back to back in one hold of the GPU lock (`tools/serve_concurrency.py`,
+300-token answers, aggregate tok/s at 1, 2, 4 and 8 streams), gave 31.8 / 33.8
+/ 46.6 / 65.1 against 36.3 / 36.6 / 46.6 / 64.5, then 24.4 / 30.8 / 44.6 /
+66.5 against 37.7 / 35.3 / 49.4 / 67.4. The single stream's spread is the
+source choice, not the tape. Two unpaired rounds earlier read 38.7 and 40.2
+against 50.0 and 45.6 at two streams. At eight streams the seeds fill the pass
+and few sequences draft, so there was little replay to save. Within each pair
+all 15 outputs matched. The single stream's text differed between the pairs
+for both builds alike, because the base's own runs resolve that near-tie with
+whichever source the timing picked.
+
 With a greedy sampler and no penalty, the verify block (and a plain decode
 step) also selects each row's argmax in its own command buffer, with the same
 `total_cmp` order and ties to the lower id as the GPU top-k, and flags any
@@ -2462,9 +2512,10 @@ rebuilds from the committed state by replaying the path's updates with the
 chain kernel's own operations, so its recurrence matches the chain kernel's
 on the same path bit for bit. Nothing writes the committed state. The commit gathers the
 accepted path's K/V, recurrence inputs and normalized rows into consecutive
-rows in place (`bo_gather_rows`) and replays them from the untouched state,
-as a rejected chain does. A chain goes to the chain verify and one row to a
-plain decode step, so both keep their numbers.
+rows in place (`bo_gather_rows`) and leaves the recurrence inputs on the
+sequence's tape for the next step to fold in (see
+[Lossless speculation](#lossless-speculation)). A chain goes to the chain
+verify and one row to a plain decode step, so both keep their numbers.
 
 A row's logits depend on `start`, its path and the projection class of the
 pass (one row, two to four, five to eight), never on the rest of the tree or
@@ -2509,6 +2560,26 @@ the tree, 32 for the head chain, 8 for lookup, at most 512), so a change in
 the text is noticed without paying for it every cycle. Because the choice
 comes first, no drafting pass is drafted only to be compared and thrown away.
 
+The bases, the cap and the cube were swept on the six prompts (300 tokens, two
+rounds, every variant interleaved under the GPU lock while other agents
+worked; geomean of the cleaner round): 16/32/8 with cap 512 gave 42.0 tok/s,
+half the bases with cap 256 42.3, double the bases with cap 1,024 43.7, cap
+128 43.3, a square in place of the cube 40.9, and tree and lookup bases halved
+43.1. Run to run a single prompt varied by up to 20%. Doubling the bases
+against the shipped ones on a quiet machine (three rounds, best of three) gave
+50.7 against 50.4. The variants move only the few cycles a source sits out. On
+the essay, where the head leads, the tree ran 4 to 24 of about 160 cycles with
+the shipped bases and 2 to 3 with doubled ones: 35.3 against 33.1 tok/s at
+best, and a tie on the other five prompts. That is inside the run-to-run
+spread, and doubling the bases also doubles how long a source that has fallen
+behind waits to be tried again, so none was kept. The 64-position restart wait
+was swept the same way through `serve`: a 48-token request beside a 512-token
+one, which then decodes alone, over three prompt pairs. Waits of 16, 32, 64
+and 128 gave 43, 32, 44 and 28 tok/s geomean. The 32 and 128 runs were
+contended. The source choice after the restart decided more than the wait did:
+the hash-map and arithmetic answers each ran either 0 to 3 trees or about 60,
+at no consistent wait. So the wait stays at 64.
+
 A tree cycle is three submissions:
 
 ```text
@@ -2520,8 +2591,9 @@ choose:  n = argmax E(n) - r * cost(n) over the first n rows, depth capped by
 verify:  tree_verify (one row: decode step; a chain: chain verify block;
          else the tree kernels), accept the longest agreeing path with the
          sampler's own draw per position                     early-submitted
-commit:  gather and replay the path, its taps to the ring, its rows into the
-         MTP head                                            one command buffer
+commit:  gather the path, its taps to the ring, its rows into the MTP head;
+         its recurrence updates stay on the tape for the next
+         step's kernels to fold in                           one command buffer
 learn:   record the tested nodes, refit every 16 cycles, upload; fold the
          verify's GPU time into the per-row cost drift       host
 ```
@@ -2534,6 +2606,23 @@ tokens per millisecond over all sources (before four cycles,
 `E(n) / (draft + cost(n))`). A tree whose best size is the anchor alone is
 handed to the head's chain instead of a bare decode step, which costs at most
 one head step when the head is no surer than the drafter.
+
+Splash encodes a whole decode cycle as one command buffer (`decodeAsync`):
+draft, a fixed verify of every drafted row, acceptance and the row choice on
+the GPU, with the host reading results only at the end. That was not built,
+because the cycle's two host points cost almost nothing. Choosing the size
+reads back the tree's eight rows with their calibrated path probabilities and
+takes microseconds; the commit, now that the tape removed its replay, is a
+gather and the taps, 0.33 ms of wall time per cycle on the six prompts. A
+fixed graph has to verify all eight rows, and a size can only be picked once
+the tree is known. Over 481 tree cycles of the six prompts, 12% chose two
+rows, 2% three to six and 86% seven or eight. Verifying eight rows every time
+would cost 4.8 ms more per tree cycle (77.2 against a mean of 72.4 ms). The
+source choice before drafting also stays on the host: the head and lookup
+draft nothing on the GPU that a tree cycle could share. Folding the commit
+into the next cycle's drafting buffer would save at most that 0.33 ms (under
+0.5% of a cycle), and an earlier profile put all GPU idle time in decode at
+1.5-2.5% of wall time.
 
 The drafter's context follows the tap ring lazily. Cycles that verify head
 or lookup drafts append nothing; the next drafting pass appends every
@@ -2560,12 +2649,48 @@ Batched serving keeps its passes as they were: no taps, no trees, head and
 lookup drafts priced by the cost model. A sequence that becomes the only one
 decoding takes its solo rounds on the old rule (lookup, else the head),
 which tap its committed rows, and after 64 of them drafts trees from a
-restarted context. Per-sequence taps in batched passes, a drafter context per
-sequence and DFlash chains in the batched cost model were not built: the
-drafting pass runs one sequence at a time (12.6 ms each, against a 49 to 89
-ms pass for two to eight sequences), a second sequence's context ring and
-taps would add about 260 MB each, and the batched passes' kernels would need
-a tap write per sequence at a row offset.
+restarted context.
+
+Per-stream DFlash2 drafts in batched passes were built and measured, then
+reverted. The drafter's context followed one sequence: the one it already
+followed, else the participant with the most tokens left, the likeliest to
+finish alone. That sequence's rows wrote the residual taps at its row offset
+in every batched pass, and its commit recorded how many it kept. Its context
+never restarted, so once alone it drafted trees at once. Its DFlash2 chain
+competed in the cost model with every sequence's head and lookup chains. The
+batched kernels verify chains, not branching trees, so the candidate was the
+tree's most likely path, up to seven drafts. It was priced first at the
+sequence's running chain acceptance (0.75 to start) plus a drafting pass,
+then, once drafted, at its calibrated path probabilities. Batched output
+matched each sequence decoded alone (`batched_kflash_matches_each_alone`,
+three prompts, forced drafts: 41 chains, 130 of 211 drafts accepted, then
+solo trees from the same context).
+
+The cost model seldom picked a chain: two to five per 300-token request at
+two to four streams, on essays and on mixed prompts alike. A single path
+gives up the tree's branching, which is where the solo tree's lead over the
+head comes from. Its 12.6 ms drafting pass, for one sequence, costs about
+what a depth-3 head round costs for four sequences together. From five
+sequences a chain's rows also cross the eight-row step of the pass cost.
+Paired runs against the tape alone, back to back in one hold of the GPU
+lock (`tools/serve_concurrency.py`, aggregate tok/s at 1, 2, 4 and 8
+streams):
+
+| Run | With chains | Tape alone |
+| --- | --- | --- |
+| 1 | 28.8 / 28.3 / 40.6 / 60.4 | 32.2 / 38.8 / 49.1 / 66.7 |
+| 2 | 36.4 / 43.2 / 52.6 / 71.0 | 35.7 / 42.2 / 52.6 / 71.4 |
+
+The first run overlapped another agent's build. Mixed code, arithmetic and
+prose requests at 2, 3 and 4 streams gave 38.2 / 51.9 / 55.7 against
+38.1 / 52.3 / 56.4. Through `serve`, a 512-token request that runs alone
+after a 48-token one gave 56 / 37 / 43 tok/s on three prompt pairs with the
+continuous context, against 52 / 33 / 48 with the restart. The source choice
+after the hand-over varied from run to run more than that: one bad first
+tree measurement could keep the tree out for the rest of the request. A
+drafter context for every sequence (about 260 MB each at a 2,048-position
+window, the drafting pass still one sequence at a time) was not built,
+for the same reason.
 
 Measured on the M4 Pro with the shipped drafter (`bonsai --greedy --json`,
 300 tokens, six prompts of the depth/margin sweep, cold prompt cache, best
@@ -3176,6 +3301,12 @@ GB for a 2,573-token prompt and 128 tokens. Maximum resident set size,
 which counts the drafter's mapped pages, is 2.69 and 2.84 against
 0.64-0.67 and 0.77-0.80 GB. Loading takes 3.2-3.3 s against 0.3 s: the
 drafter's payload digest and the verify and drafting cost measurement.
+
+The GDN tape (see [Lossless speculation](#lossless-speculation)) keeps
+31.8 MB per sequence, for the resident sequence and for each parked batched
+one, plus a 2.9 MB block its folds' convolutions write to. The context fit
+and the batched admission count both (a parked sequence's state is now
+113 MB rather than 81 MB).
 
 [Neural Engine prefill](#neural-engine-prefill-ffn) allocates, on its first
 block of 192 rows or more, two weight sets of int8 FFN weights and output

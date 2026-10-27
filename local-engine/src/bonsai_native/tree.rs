@@ -23,9 +23,10 @@
 //! (`parent[r] = r - 1`) is verified by the existing chain verify block, and
 //! a one-row tree by a plain decode step, so both keep their numbers exactly.
 //!
-//! The commit moves the accepted path's K/V rows to consecutive positions,
-//! replays its recurrence inputs from the untouched committed state (the
-//! copy-free rollback of chain verification) and drops every other row.
+//! The commit moves the accepted path's K/V rows and its recurrence inputs
+//! (which the pass recorded on the sequence's GDN tape) to consecutive rows
+//! and drops every other row; the next step folds the path's recurrence
+//! inputs into the untouched committed state (see `tape`).
 
 use std::time::Duration;
 
@@ -35,8 +36,8 @@ use super::block::SUBMIT_BEFORE_LAYERS;
 use super::layers::decay_projection;
 use super::{
     AttentionLayer, BlockOutput, BonsaiModel, CommandBatch, Described, FullAttentionLayer,
-    HadamardDirection, MetalBuffer, RecurrentLayer, RollbackLayer, Rope, SamplingResult, Selection,
-    VOCAB, Verifier, WIDTH, decode_embeddings,
+    HadamardDirection, MetalBuffer, RecurrentLayer, Rope, SamplingResult, Selection, VOCAB,
+    Verifier, WIDTH, decode_embeddings,
 };
 use crate::sampler::{Sampler, verify_tree_drafts};
 
@@ -439,7 +440,8 @@ impl BonsaiModel {
                 if path.iter().enumerate().any(|(index, &row)| index != row) {
                     self.encode_gather_path(&mut batch, state, start, path)?;
                 }
-                self.encode_replay_verified(&mut batch, &state.verifier, committed)?;
+                // The next step folds the path's rows in.
+                self.tape.keep(committed);
                 self.encode_tap_commit(&mut batch, path, start)?;
             }
         }
@@ -490,7 +492,7 @@ impl BonsaiModel {
             self.kv_layout.key.token_bytes(),
             self.kv_layout.value.token_bytes(),
         );
-        let mut recurrent = state.verifier.rollback.iter();
+        let mut recurrent = 0;
         for layer in &self.layers {
             match &layer.attention {
                 AttentionLayer::Full(full) => self.ops.gather_rows(
@@ -503,15 +505,15 @@ impl BonsaiModel {
                     count,
                 )?,
                 AttentionLayer::Recurrent(_) => {
-                    let rollback = recurrent.next().ok_or_else(|| {
-                        crate::Error::InvalidArgument("tree verifier lacks a layer".into())
-                    })?;
+                    // The rows the tree recorded on the tape.
+                    let step = self.tape.step(recurrent);
+                    recurrent += 1;
                     self.ops.gather_rows(
                         batch,
                         &[
-                            (&rollback.inputs, 0, 10_240 * size_of::<f32>()),
-                            (&rollback.decay, 0, 48 * size_of::<f32>()),
-                            (&rollback.beta, 0, 48 * size_of::<f32>()),
+                            (&step.raw, 0, 10_240 * size_of::<f32>()),
+                            (&step.decay, 0, 48 * size_of::<f32>()),
+                            (&step.beta, 0, 48 * size_of::<f32>()),
                         ],
                         path_words,
                         count,
@@ -682,9 +684,14 @@ impl BonsaiModel {
             self.encode_taps(&mut batch, index, rows, true)?;
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
-                    let rollback = &state.verifier.rollback[recurrent_index];
+                    self.recurrent_tree(
+                        &mut batch,
+                        recurrent,
+                        recurrent_index,
+                        count,
+                        &state.descriptor,
+                    )?;
                     recurrent_index += 1;
-                    self.recurrent_tree(&mut batch, recurrent, count, rollback, &state.descriptor)?;
                 }
                 AttentionLayer::Full(full) => {
                     self.full_attention_tree(&mut batch, full, count, state)?;
@@ -699,6 +706,8 @@ impl BonsaiModel {
             )?;
             self.feed_forward_branch(&mut batch, layer, count)?;
         }
+        // Every recurrent layer folded the tape's pending rows in.
+        self.tape.clear();
         self.residual_normalize(
             &mut batch,
             &scratch.hidden_alt,
@@ -743,24 +752,28 @@ impl BonsaiModel {
     }
 
     /// [`Self::recurrent`] for a tree: the raw QKV rows, decay and beta go
-    /// to `rollback` for the commit's replay, the convolution and recurrence
-    /// follow each row's path, and the layer's state and history are read
-    /// only.
+    /// to the tape for the commit, the convolution and recurrence follow
+    /// each row's path, and the layer's state and history are only read,
+    /// once the tape's pending rows are folded in. `index` is the layer's
+    /// place among the recurrent layers.
     fn recurrent_tree(
         &self,
         batch: &mut CommandBatch,
         layer: &RecurrentLayer,
+        index: usize,
         tokens: u32,
-        rollback: &RollbackLayer,
         tree: &MetalBuffer,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
+        let rollback = self.tape.step(index);
+        let fold =
+            (self.tape.pending() > 0).then(|| self.tape.fold(index, (&self.tape_scratch, 0)));
         batch.independent(|batch| {
             self.project(
                 batch,
                 &layer.qkv,
                 &scratch.rotated_hidden,
-                &rollback.inputs,
+                &rollback.raw,
                 tokens,
             )?;
             self.project(
@@ -781,30 +794,59 @@ impl BonsaiModel {
             )?;
             crate::Result::Ok(())
         })?;
-        self.ops.conv_l2_decay_tree(
-            batch,
-            &rollback.inputs,
-            &layer.convolution,
-            &layer.history,
-            &scratch.convolved,
-            self.epsilon,
-            [&layer.decay, &scratch.alpha, &layer.dt, &scratch.raw_beta],
-            &rollback.decay,
-            &rollback.beta,
-            tree,
-            tokens,
-        )?;
-        self.ops.gdn_tree(
-            batch,
-            self.state_format,
-            &scratch.convolved,
-            &rollback.decay,
-            &rollback.beta,
-            &layer.state,
-            &scratch.recurrent_output,
-            tree,
-            tokens,
-        )?;
+        let decay_inputs = [&layer.decay, &scratch.alpha, &layer.dt, &scratch.raw_beta];
+        if let Some(fold) = fold {
+            self.ops.conv_l2_decay_tree_fold(
+                batch,
+                &rollback.raw,
+                &layer.convolution,
+                &layer.history,
+                &scratch.convolved,
+                self.epsilon,
+                decay_inputs,
+                [&rollback.decay, &rollback.beta],
+                tree,
+                fold,
+                tokens,
+            )?;
+            self.ops.gdn_tree_fold(
+                batch,
+                self.state_format,
+                &scratch.convolved,
+                &rollback.decay,
+                &rollback.beta,
+                &layer.state,
+                &scratch.recurrent_output,
+                tree,
+                fold,
+                tokens,
+            )?;
+        } else {
+            self.ops.conv_l2_decay_tree(
+                batch,
+                &rollback.raw,
+                &layer.convolution,
+                &layer.history,
+                &scratch.convolved,
+                self.epsilon,
+                decay_inputs,
+                &rollback.decay,
+                &rollback.beta,
+                tree,
+                tokens,
+            )?;
+            self.ops.gdn_tree(
+                batch,
+                self.state_format,
+                &scratch.convolved,
+                &rollback.decay,
+                &rollback.beta,
+                &layer.state,
+                &scratch.recurrent_output,
+                tree,
+                tokens,
+            )?;
+        }
         self.ops.gdn_postprocess_transform(
             batch,
             &scratch.recurrent_output,
