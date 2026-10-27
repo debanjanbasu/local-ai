@@ -1587,3 +1587,55 @@ fn ane_prefill_feeds_the_head_like_gpu_prefill() {
         assert!(relative < 0.05, "{name}: head keys differ by {relative:.4}");
     }
 }
+
+/// Time of one prefill block of each size with the Neural Engine FFN
+/// wavefront (the minimum block lowered to 129 rows) and on the GPU alone,
+/// best of three after a warm-up: where the ANE starts to pay. Measurement
+/// only; nothing is asserted.
+#[test]
+#[ignore = "measurement; requires the pinned model, a Metal device and the Neural Engine"]
+fn ane_prefill_block_timings() {
+    use std::sync::atomic::Ordering;
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let corpus = tokenizer.encode(&text).expect("encode");
+    let mut model = BonsaiModel::load(
+        package,
+        2048,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    ane_split::WAVE_MIN_ROWS_OVERRIDE.store(129, Ordering::Relaxed);
+    let sizes = [160, 192, 256, 320, 384, 448, 512, 768, 1024];
+    let time = |model: &mut BonsaiModel, rows: usize| {
+        let mut best = f64::INFINITY;
+        for repeat in 0..4 {
+            model.reset();
+            let started = std::time::Instant::now();
+            model
+                .prefill(&corpus[..rows], &mut |_| {})
+                .expect("prefill");
+            if repeat > 0 {
+                best = best.min(started.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        best
+    };
+    let ane = sizes.map(|rows| time(&mut model, rows));
+    assert!(model.ane_active(), "{}", model.neural_engine_policy());
+    model.disable_ane("reference");
+    let gpu = sizes.map(|rows| time(&mut model, rows));
+    ane_split::WAVE_MIN_ROWS_OVERRIDE.store(0, Ordering::Relaxed);
+    for ((rows, ane), gpu) in sizes.iter().zip(ane).zip(gpu) {
+        println!(
+            "{}",
+            serde_json::json!({"rows": rows, "ane_ms": ane, "gpu_ms": gpu, "speedup": gpu / ane})
+        );
+    }
+}
