@@ -2307,7 +2307,9 @@ All choices and reasons are reported in startup JSON.
 - **Prompt cache:** GPU checkpoint count (at most four) derives from
   working-set headroom. The disk budget is the smallest of the checkpoint's
   own size, an eighth of free disk and a quarter of physical memory; the
-  startup reason prints every term.
+  startup reason prints every term. Snapshot writes are paced to a daily
+  write budget of a quarter of the cache volume's capacity
+  (`daily_write_budget_bytes` and its reason in the policy).
 - **Host snapshots:** disabled when the startup write probe measures at least
   500 MiB/s, making the integrity-checked disk tier the first durable tier;
   otherwise capped at one quarter of remaining headroom or 4 GiB.
@@ -2751,10 +2753,10 @@ layout, MTP configuration, tokens, recurrent state, and target and head K/V.
 2. Host snapshots are purgeable Metal buffers, enabled only when the startup
    storage probe does not select SSD-first. Snapshot staging uses anonymous
    page mappings that return to the OS when dropped.
-3. Disk `.bpc` snapshots are versioned and SHA256-checked, written atomically,
-   discovered at startup, and trimmed within the automatic disk budget (at
-   startup too, so a store a previous process left over budget is trimmed
-   before the first request).
+3. Disk `.bpc` snapshots are versioned and checked (a CRC-32C per megabyte),
+   written atomically within a daily write budget, discovered at startup,
+   and trimmed within the automatic disk budget (at startup too, so a store
+   a previous process left over budget is trimmed before the first request).
 
 A request restores the longest prefix any tier holds, the cheaper tier on a
 tie, and a failed restore falls back to the next longest. The tiers used to
@@ -2821,7 +2823,7 @@ readback but needs the scheduler's pooled and parked sets to keep their
 rows for it, and up to four 81 MB checkpoints per set.
 
 Disk snapshots are written by one background thread the engine owns. The
-engine thread pays only the GPU readback; hashing, the write, `fsync`, rename
+engine thread pays only the GPU readback; checksums, the write, `fsync`, rename
 and trim run behind the request. A snapshot is indexed for reuse only after
 its rename is reported, so a file still being written is never loaded. A
 request whose best disk match is still in flight is not held up at
@@ -2830,7 +2832,7 @@ requests decode, or waits for that one write when none does (see
 [Prompts prefill inside the decode steps](#prompts-prefill-inside-the-decode-steps)).
 Reading a snapshot back is off the engine thread too. A request whose
 longest match is a disk snapshot starts a load, which reads the file and
-checks its SHA-256 on a thread of its own, and restores at most a GPU
+checks it on threads of its own, and restores at most a GPU
 checkpoint meanwhile, as a stand-in it does not prefill from. It stays out of
 prefill until the load ends: the step's prefill goes to another prompt, or is
 sat out while others decode, and the engine waits for the load only when
@@ -2838,7 +2840,7 @@ nothing else can run. Its first prefill step then copies the snapshot into
 its buffers, the one part left on the engine thread; a load that failed is a
 failed restore like any other, so its entry leaves the index and the tiers
 are asked again. A load dropped unfinished (its request cancelled) stops
-within a megabyte of reading.
+within a megabyte of reading on each reader.
 At most one job is in flight and one queued: a newer job replaces the queued
 one, except that a request tail never displaces a shared boundary. Dropping
 the engine finishes pending writes; the server, whose engine is never
@@ -2861,6 +2863,26 @@ staged long-context runs rely on it (see Verification). A failed write is a cach
 on stderr, not a request error. Trim keeps an in-memory index of the
 directory instead of re-reading every snapshot header after each store.
 
+The size budget bounds what the tier holds, not what it writes. A snapshot
+is about 38 KiB a prompt token plus 81 MB, and a request tail is persisted
+whenever its GPU copy is at risk, so agent sessions running side by side at
+30K tokens write about 1.2 GB a turn each: four sessions turning over every
+minute write over 2 TB in an eight-hour day, nearly 1% of the rated
+endurance of a typical 512 GB consumer SSD (about 600 writes of its
+capacity) every day. The writer therefore also keeps a daily write budget,
+a token bucket of a quarter of the cache volume's capacity a day (123 GB on
+this machine's 494 GB volume), refilled continuously up to one day's and
+starting each process at a quarter of that, so a restart cannot grant a
+full day. A job is written while the balance is positive and charged its
+whole file afterwards, so one snapshot larger than what is left (a
+128K-token prompt's is about 5 GB) still goes through, and a day's writes
+stay within the budget plus one snapshot. While it is
+overdrawn, snapshots are neither written nor read back from the GPU, so
+the cost is prefill a later request might have restored, never a stall or
+an error. Ordinary use stays far below it: one session writes a snapshot
+only when it reaches a new boundary or another request takes its GPU
+copy. The policy JSON reports `daily_write_budget_bytes` and its reason.
+
 Reading and checking a snapshot used to run inside the restoring request's
 admission, where every decoding stream waited for it. Synthetic snapshots
 without the head (34 KiB a token), file in the page cache, M4 Pro, best of
@@ -2880,6 +2902,86 @@ and 8.7 ms after. The stream's longest gap until that request's first token
 fell from 419 ms (one token in that window) to 167 ms (six tokens emitted
 while the snapshot loaded, the longest gap being the copy and the request's
 own last-token prefill).
+
+The load itself was then bound by one core: it read the file in 1 MiB
+pieces and hashed it with SHA-256 (about 1.6 GB/s end to end), whether the
+file was cached or not. Snapshots are now laid out for parallel reads
+(`local-engine/src/prompt_cache/blocks.rs`): the payload and each of its
+five sections start on a 16 KiB boundary, and the header holds a CRC-32C
+of every megabyte of every section. A load issues sixteen positioned reads
+at once, with `F_NOCACHE`, straight into the sections' pages, and each
+reader checks the block it just read while it is still in that core's
+cache, so verification overlaps the read instead of following it. The
+checksum uses the CPU's CRC instructions (1 GiB in 213 ms on one core,
+against 806 ms for SHA-256), and the copy into the model's buffers now runs
+on eight threads. Synthetic snapshots with the head (38 KiB a token plus
+81 MB), M4 Pro, idle machine under the GPU lock, two runs per build of six
+loads each, alternately uncached (evicted with `msync(MS_INVALIDATE)`,
+residency checked with `mincore`) and cached; the copy without the head's
+rows, two rounds after the one that grows the caches:
+
+| Tokens | Snapshot | Read and SHA-256, before | Read and CRC-32C, uncached | Cached | Copy, before | Copy, after |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 6,000 | 314 MB | 134–155 ms | 67–69 ms | 18 ms | 4 ms | 3 ms |
+| 33,000 | 1,365 MB | 573–645 ms | 293–294 ms | 76–78 ms | 19 ms (57 growing the caches) | 11 ms (34 growing) |
+| 128,000 | 5,062 MB | 2,147–2,360 ms | 1,087–1,093 ms | 281–287 ms | 69–70 ms (218 growing) | 39–40 ms (199 growing) |
+
+With other agents' builds loading the CPU, the same loads took 820–912 ms
+and 3,130–3,541 ms before at 33K and 128K, and 207–222 ms and 779–961 ms
+uncached after (72–76 ms and 276–283 ms cached); the copies 53–81 ms and
+215–458 ms before, 16–31 ms and 54–86 ms after. Uncached, the read runs at
+4.6–6.5 GB/s, the SSD's rate; sixteen readers measured 217 ms for 1.3 GB
+against 996 ms for one, 327 ms for four and 251 ms for eight, and 32 were
+no faster. `F_NOCACHE` measured 209 ms
+against 244 ms through the cache and is as fast when the file is cached
+(the cached pages are still served), and a 5 GB restore no longer evicts
+that much of the page cache, the demand-paged checkpoint's pages among it.
+Writing got cheaper too: storing the same snapshots (checksums, write and
+`fsync`, one run each on the loaded machine) took 165 ms, 707 ms and
+3,040 ms against 240 ms, 1,259 ms and 5,065 ms.
+
+Time to first token after a restart, for a new `local-ai bonsai --raw
+--greedy --json --max-tokens 16` process restoring the snapshot a cold run
+of the same repository-text prompt left (the new build reading the same
+payload rewritten in the block layout), the snapshot file cached or evicted
+first, interleaved under the GPU lock while other agents' jobs loaded the
+CPU, two or three runs per cell (2026-10-27):
+
+| Prompt | Snapshot | Before, cached | After, cached | Before, uncached | After, uncached |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 6,105 tokens | 319 MB | 0.22–0.29 s | 0.09–0.12 s | 0.23 s | 0.14–0.15 s |
+| 32,967 tokens | 1,364 MB | 0.77–0.89 s | 0.26 s | 0.83–0.87 s | 0.44–0.47 s |
+| 127,940 tokens | 5,060 MB | 3.10–5.31 s | 0.86–0.87 s | 3.18–3.21 s | 1.73–1.95 s |
+
+Every run generated the cold run's 16 greedy tokens. The new build reading
+the same snapshots in the SHA-256 layout measured as before (0.22–0.27 s
+and 0.76–0.82 s cached at 6K and 33K). In
+`a_stream_keeps_decoding_while_another_request_loads_a_disk_snapshot` the
+324 MB snapshot now loads in 25 ms (258–275 ms before), and the stream's
+longest gap until the restoring request's first token is 104 ms (167 ms).
+At 128K, of the 0.86 s left, the read takes about 0.28 s, growing the K/V
+caches from 1,024 to 128K tokens inside the restore about 0.16–0.25 s and
+the copy 40–86 ms; the rest is the last token's prefill and the first
+decode step.
+
+The checksum is for damage, not for a forged file. SHA-256 never
+authenticated a snapshot either: its digest sat in the same unkeyed file,
+which anyone able to write could rewrite with a matching digest, and the
+cache directory belongs to the user the engine runs as. Against what it is
+for, a snapshot damaged on disk or cut short, a CRC-32C per megabyte is
+enough: it detects every error burst of up to 32 bits within a block, any
+other damage to a block escapes it with probability about 2^-32 (2^-256
+for SHA-256), and the length of every section and of the whole file must
+match the header exactly. A load fails, and the snapshot leaves the index
+like any failed restore, for a flipped bit anywhere in the token ids or any
+section, a damaged checksum digit, an impossible section length, or a file
+a byte or a page short or long
+(`a_damaged_truncated_or_extended_block_snapshot_is_never_loaded`).
+The 16 KiB padding after each section is not checked: nothing reads it.
+Snapshots written with SHA-256 by earlier builds still load, checked by
+their SHA-256 as before. Earlier builds skip snapshots in the new layout
+as unreadable: after a downgrade they are a cache miss, and the older
+build neither counts them against its disk budget nor trims them.
 
 Measured on an M4 Pro (1.7 GB/s write probe, host tier off), six interleaved
 cold runs per arm of `local-ai bonsai --raw --json --greedy --max-tokens 16`,
