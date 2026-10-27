@@ -225,3 +225,62 @@ kernel void bonsai_ane_join(
         }
     }
 }
+
+struct BonsaiAneJoinSplitParams {
+    uint tokens;
+    uint width;
+    // Output channels the ANE computed (a multiple of 32).
+    uint split;
+    // Halves per row of the partial output.
+    uint ystride;
+};
+
+// A projection split by output channel: out[t][c] = y[c][t] * tx[t] in F32
+// for c < split (the ANE's channels before their token scales), and
+// rest[t][c - split] (the GPU's, `width - split` per row) above, for
+// t < tokens. A non-finite ANE value or scale sets *status.
+// grid: (ceil(tokens / 32), width / 32) x (32, 8).
+kernel void bonsai_ane_join_split(
+    device const half *y [[buffer(0)]],
+    device const half *tx [[buffer(1)]],
+    device const float *rest [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    device atomic_uint *status [[buffer(4)]],
+    constant BonsaiAneJoinSplitParams &p [[buffer(5)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint2 pos [[thread_position_in_threadgroup]]
+) {
+    threadgroup float staged[32][33];
+    const uint t0 = tile.x * 32;
+    const uint c0 = tile.y * 32;
+    if (c0 >= p.split) {
+        const uint columns = p.width - p.split;
+        for (uint j = pos.y; j < 32; j += 8) {
+            const uint row = t0 + j;
+            if (row < p.tokens) {
+                out[ulong(row) * p.width + c0 + pos.x] =
+                    rest[ulong(row) * columns + c0 - p.split + pos.x];
+            }
+        }
+        return;
+    }
+    const uint t = t0 + pos.x;
+    const bool inside = t < p.tokens;
+    const half scale = tx[t];
+    bool bad = inside && bonsai_ane_bad(scale);
+    for (uint j = pos.y; j < 32; j += 8) {
+        const half value = y[ulong(c0 + j) * p.ystride + t];
+        bad |= inside && bonsai_ane_bad(value);
+        staged[j][pos.x] = float(value) * float(scale);
+    }
+    if (bad) {
+        atomic_store_explicit(status, 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = pos.y; j < 32; j += 8) {
+        const uint row = t0 + j;
+        if (row < p.tokens) {
+            out[ulong(row) * p.width + c0 + pos.x] = staged[pos.x][j];
+        }
+    }
+}

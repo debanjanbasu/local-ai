@@ -984,6 +984,9 @@ struct HandoffInner {
     stop: bool,
     /// When the work [`Handoff::arm`]ed must be finished.
     deadline: Option<Instant>,
+    /// When each job queued since the last [`Handoff::take_timeline`] was
+    /// released by the GPU and when it reported, in queue order.
+    timeline: Vec<(u64, Option<Instant>, Option<Instant>)>,
 }
 
 struct HandoffState {
@@ -1013,6 +1016,10 @@ impl HandoffState {
 
     fn report(&self, job: u64, ok: bool) {
         let mut inner = lock(&self.inner);
+        let now = Instant::now();
+        if let Some(entry) = inner.timeline.iter_mut().rev().find(|entry| entry.0 == job) {
+            entry.2 = Some(now);
+        }
         inner.outstanding = inner.outstanding.saturating_sub(1);
         let phase = inner.jobs.get(&job).copied();
         if matches!(phase, Some(Phase::Queued | Phase::Started(_))) {
@@ -1117,6 +1124,7 @@ impl Handoff {
             retired: None,
             stop: false,
             deadline: None,
+            timeline: Vec::new(),
         };
         let state = Arc::new(HandoffState {
             ready,
@@ -1185,6 +1193,7 @@ impl Handoff {
                 return;
             }
             inner.jobs.insert(job, Phase::Queued);
+            inner.timeline.push((job, None, None));
             inner.outstanding += 1;
             job
         };
@@ -1213,10 +1222,16 @@ impl Handoff {
         let notify = RcBlock::new(
             move |_event: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _value: u64| {
                 let mut inner = lock(&watched.inner);
-                if let Some(phase @ Phase::Queued) = inner.jobs.get_mut(&job) {
-                    *phase = Phase::Started(Instant::now());
-                    watched.changed.notify_all();
+                let Some(phase @ Phase::Queued) = inner.jobs.get_mut(&job) else {
+                    return;
+                };
+                let now = Instant::now();
+                *phase = Phase::Started(now);
+                if let Some(entry) = inner.timeline.iter_mut().rev().find(|entry| entry.0 == job) {
+                    entry.1 = Some(now);
                 }
+                drop(inner);
+                watched.changed.notify_all();
             },
         );
         // SAFETY: the listener copies the block, which owns only Send + Sync
@@ -1269,6 +1284,17 @@ impl Handoff {
             inner.retired.is_none() && inner.jobs.values().all(|phase| *phase == Phase::Succeeded);
         inner.jobs.clear();
         ok
+    }
+
+    /// When each job queued since the last call was released by the GPU and
+    /// when it reported (`None` if it did not), in queue order. Jobs queued
+    /// after retirement are not listed.
+    #[must_use]
+    pub fn take_timeline(&self) -> Vec<(Option<Instant>, Option<Instant>)> {
+        std::mem::take(&mut lock(&self.state.inner).timeline)
+            .into_iter()
+            .map(|(_, ready, done)| (ready, done))
+            .collect()
     }
 
     pub fn retire(&self, why: &str) {

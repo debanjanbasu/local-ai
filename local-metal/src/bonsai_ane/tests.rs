@@ -266,3 +266,78 @@ fn join_applies_both_token_scales_and_flags_non_finite_rows() {
     batch.commit_and_wait().expect("gpu");
     assert_eq!(read::<u32>(&status)[0], 1);
 }
+
+#[test]
+fn join_split_takes_the_ane_channels_then_the_gpu_rest() {
+    let (context, kernels) = setup();
+    let (width, split, tokens) = (256_u32, 96_u32, 70_u32);
+    let mut rng = Rng(4);
+    // Taller than the split, as the engine's surfaces are.
+    let partial = Surface::new(&context, SurfaceLayout::new(width, 128, true)).expect("y");
+    let scales = Surface::new(&context, SurfaceLayout::new(1, 128, true)).expect("tx");
+    let stride = partial.layout().stride / 2;
+    let mut y = vec![f16::ZERO; partial.layout().bytes / 2];
+    for value in &mut y {
+        *value = f16::from_f32(rng.uniform() * 4.0);
+    }
+    let tx = (0..scales.layout().bytes / 2)
+        .map(|_| f16::from_f32(rng.uniform().abs() + 0.1))
+        .collect::<Vec<_>>();
+    let rest = (0..tokens * (width - split))
+        .map(|_| rng.uniform())
+        .collect::<Vec<_>>();
+    partial
+        .buffer()
+        .copy_from_bytes(bytemuck::cast_slice(&y), 0);
+    scales
+        .buffer()
+        .copy_from_bytes(bytemuck::cast_slice(&tx), 0);
+    let rest_buffer = MetalBuffer::from_slice(context.device(), &rest).expect("rest");
+    let output = MetalBuffer::empty(context.device(), (tokens * width) as usize * 4).expect("out");
+    let status = MetalBuffer::from_slice(context.device(), &[0_u32]).expect("status");
+    let join = |status: &MetalBuffer| {
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        kernels
+            .join_split(
+                &mut batch,
+                &partial,
+                &scales,
+                &rest_buffer,
+                &output,
+                status,
+                width,
+                split,
+                tokens,
+            )
+            .expect("join");
+        batch.commit_and_wait().expect("gpu");
+    };
+    join(&status);
+    let out = read::<f32>(&output);
+    let (width, split) = (width as usize, split as usize);
+    for t in 0..tokens as usize {
+        for c in 0..width {
+            let expected = if c < split {
+                y[c * stride + t].to_f32() * tx[t].to_f32()
+            } else {
+                rest[t * (width - split) + c - split]
+            };
+            assert_eq!(out[t * width + c], expected, "{t} {c}");
+        }
+    }
+    assert_eq!(read::<u32>(&status)[0], 0);
+    // Rows past the split and tokens past the block are not read.
+    y[(split + 1) * stride + 3] = f16::NAN;
+    y[3 * stride + tokens as usize + 1] = f16::INFINITY;
+    partial
+        .buffer()
+        .copy_from_bytes(bytemuck::cast_slice(&y), 0);
+    join(&status);
+    assert_eq!(read::<u32>(&status)[0], 0);
+    y[(split - 1) * stride + 5] = f16::NAN;
+    partial
+        .buffer()
+        .copy_from_bytes(bytemuck::cast_slice(&y), 0);
+    join(&status);
+    assert_eq!(read::<u32>(&status)[0], 1);
+}

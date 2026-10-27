@@ -51,6 +51,14 @@ struct JoinParams {
     ystride: u32,
 }
 
+#[repr(C)]
+struct JoinSplitParams {
+    tokens: u32,
+    width: u32,
+    split: u32,
+    ystride: u32,
+}
+
 fn arg(message: &str) -> Error {
     Error::InvalidArgument(format!("Neural Engine FFN: {message}"))
 }
@@ -61,6 +69,7 @@ pub struct AneKernels {
     pack: Pipeline,
     stage: Pipeline,
     join: Pipeline,
+    join_split: Pipeline,
 }
 
 #[expect(unsafe_code)]
@@ -123,6 +132,7 @@ impl AneKernels {
             pack: pipeline("bonsai_ane_pack")?,
             stage: pipeline("bonsai_ane_stage")?,
             join: pipeline("bonsai_ane_join")?,
+            join_split: pipeline("bonsai_ane_join_split")?,
         })
     }
 
@@ -198,9 +208,9 @@ impl AneKernels {
     }
 
     /// Convert the column blocks `first..first + count` of every row of a
-    /// ternary `matrix` into per-row int8 codes in `output` (`count * 128`
-    /// columns), and with `scales` write each row's fp16 scale (times 128)
-    /// there. Each row's scale is its largest block scale over 127, so the
+    /// ternary `matrix` into per-row int8 codes in the first rows of `output`
+    /// (`count * 128` columns), and with `scales` write each row's fp16 scale
+    /// (times 128) there. Each row's scale is its largest block scale over 127, so the
     /// codes are the trits times `rint(127 s_b / max |s|)`.
     #[expect(unsafe_code)]
     pub fn stage(
@@ -218,10 +228,10 @@ impl AneKernels {
             || first + count > blocks
             || !matrix.rows.is_multiple_of(8)
             || layout.fp16
-            || layout.rows != matrix.rows
+            || layout.rows < matrix.rows
             || layout.width != count * PTQ1_BLOCK_ELEMENTS as u32
             || scales
-                .is_some_and(|scales| !scales.layout().fp16 || scales.layout().rows != matrix.rows)
+                .is_some_and(|scales| !scales.layout().fp16 || scales.layout().rows < matrix.rows)
         {
             return Err(arg("staged surfaces do not match the matrix"));
         }
@@ -289,6 +299,67 @@ impl AneKernels {
             bind(encoder, output, 0, 2);
             bind(encoder, status, 0, 3);
             bytes(encoder, &params, 4);
+        }
+        dispatch(
+            encoder,
+            (tokens.div_ceil(32) as usize, (width / 32) as usize),
+            (32, 8),
+        );
+        batch.record_dispatch();
+        Ok(())
+    }
+
+    /// A projection split by output channel: `output[t][c] = partial[c][t] *
+    /// scales[t]` for `c < split` (the ANE's channels) and `rest[t][c -
+    /// split]` (the GPU's, `width - split` per row) above, for `t < tokens`,
+    /// in F32; a non-finite partial or scale sets the `u32` at `status`.
+    #[expect(unsafe_code)]
+    #[expect(clippy::too_many_arguments)]
+    pub fn join_split(
+        &self,
+        batch: &mut CommandBatch,
+        partial: &Surface,
+        scales: &Surface,
+        rest: &MetalBuffer,
+        output: &MetalBuffer,
+        status: &MetalBuffer,
+        width: u32,
+        split: u32,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        let layout = partial.layout();
+        let rows = tokens as usize;
+        if tokens == 0
+            || !width.is_multiple_of(32)
+            || !split.is_multiple_of(32)
+            || split > width
+            || !layout.fp16
+            || layout.rows < split
+            || layout.width < tokens.next_multiple_of(32)
+            || scales.layout().width < tokens.next_multiple_of(32)
+            || rest.length() < rows * (width - split) as usize * size_of::<f32>()
+            || output.length() < rows * width as usize * size_of::<f32>()
+            || std::ptr::eq(rest.raw(), output.raw())
+            || status.length() < size_of::<u32>()
+        {
+            return Err(arg("split join buffers do not match the block"));
+        }
+        let params = JoinSplitParams {
+            tokens,
+            width,
+            split,
+            ystride: (layout.stride / 2) as u32,
+        };
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.join_split);
+        // SAFETY: the buffers were checked above.
+        unsafe {
+            bind(encoder, partial.buffer(), 0, 0);
+            bind(encoder, scales.buffer(), 0, 1);
+            bind(encoder, rest, 0, 2);
+            bind(encoder, output, 0, 3);
+            bind(encoder, status, 0, 4);
+            bytes(encoder, &params, 5);
         }
         dispatch(
             encoder,
