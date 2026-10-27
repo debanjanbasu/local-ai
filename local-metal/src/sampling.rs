@@ -313,6 +313,14 @@ impl TopKRows {
     pub const fn max_rows(&self) -> usize {
         self.max_rows
     }
+
+    /// The selections on the GPU, for kernels that consume them in the same
+    /// command buffer: row `r`'s candidates are [`TopKCandidate`]s starting at
+    /// element `r * MAX_TOP_K`, best first.
+    #[must_use]
+    pub const fn output_buffer(&self) -> &MetalBuffer {
+        &self.output
+    }
 }
 
 /// Most alternatives [`LogprobRows`] reports per row: `OpenAI`'s `top_logprobs` limit.

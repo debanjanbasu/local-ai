@@ -4,6 +4,7 @@ pub mod bonsai_ops;
 pub mod bonsai_vision;
 pub mod buffer;
 pub mod context;
+pub mod dflash;
 pub mod draft;
 pub mod embedding;
 pub mod embedding_audio;
