@@ -85,9 +85,9 @@ const ROW_BLOCK_MIN_PREFIX: u32 = 1024;
 const SPLIT_TENSOR_ROWS: u32 = 4;
 /// Causal tensor Q8 blocks ending past this many cache positions pack the six
 /// query heads of `PREFILL_ROW_TOKENS` tokens per KV head into one threadgroup
-/// (`bo_attn_tensor_rows_q8`); shorter ones keep one threadgroup per query head.
+/// (`bo_attn_rows_q8`); shorter ones keep one threadgroup per query head.
 const PREFILL_ROWS_MIN_END: u32 = 1024;
-/// Must match `tokens_per_group` in the shader's `bo_attn_tensor_rows_q8`.
+/// Must match `TOKENS` in the shader's `bo_attn_rows_q8`.
 const PREFILL_ROW_TOKENS: u32 = 4;
 
 /// Full-attention prefill operands; all variants keep F32 softmax statistics,
@@ -315,8 +315,8 @@ impl KvLayout {
     }
 }
 
-/// Quantized layouts with tensor attention kernels; each names its
-/// `bo_attn_split_tensor_*` and `bo_attn_tensor_*` instantiations.
+/// Quantized layouts with kernels of their own on tensor builds; each names
+/// its `bo_attn_split_*` (decode split) and `bo_attn_tensor_*` instantiations.
 const QUANTIZED_TENSOR_LAYOUTS: [KvLayout; 1] = [KvLayout::Q8];
 
 /// Dynamic threadgroup memory of the quantized tensor attention kernels: their
@@ -325,6 +325,9 @@ const QUANTIZED_TENSOR_LAYOUTS: [KvLayout; 1] = [KvLayout::Q8];
 /// 32 KiB limit, so these kernels (16 KiB of tile plus their softmax state)
 /// aborted under `MTL_SHADER_VALIDATION=1` while the tile was static.
 const Q8_TILE_BYTES: usize = 32 * 256 * 2;
+/// Dynamic threadgroup memory of `bo_attn_rows_q8`: its four SIMD groups'
+/// 24-row score partials, rows padded to 36 floats (`partial` in the shader).
+const PREFILL_ROWS_PARTIAL_BYTES: usize = 4 * 24 * 36 * 4;
 
 pub struct BonsaiOps {
     /// Pipelines with the dynamic threadgroup bytes each takes at index 0.
@@ -441,7 +444,7 @@ impl BonsaiOps {
             .flat_map(|layout| {
                 let suffix = layout.name();
                 [
-                    format!("bo_attn_split_tensor_{suffix}"),
+                    format!("bo_attn_split_{suffix}"),
                     format!("bo_attn_tensor_{suffix}"),
                 ]
             })
@@ -452,7 +455,7 @@ impl BonsaiOps {
                 "bo_attn_split_tensor_rows_q8_2",
                 "bo_attn_split_tensor_rows_q8_3",
                 "bo_attn_split_tensor_rows_q8_4",
-                "bo_attn_tensor_rows_q8",
+                "bo_attn_rows_q8",
                 "bo_attn_split_tensor_rows_q8_tree_2",
                 "bo_attn_split_tensor_rows_q8_tree_3",
                 "bo_attn_split_tensor_rows_q8_tree_4",
@@ -484,9 +487,15 @@ impl BonsaiOps {
                     "Bonsai pipeline cannot support the required SIMD/threadgroup size",
                 ));
             }
-            // Every quantized and row kernel but the gather takes the tile.
-            let tiled = index >= names.len() && name != "bo_attn_gather_rows";
-            p.push((pipeline, if tiled { Q8_TILE_BYTES } else { 0 }));
+            // Every quantized and row kernel takes the tile but the gather and
+            // the register kernels (Q8 decode split, head-packed prefill).
+            let bytes = match name {
+                "bo_attn_rows_q8" => PREFILL_ROWS_PARTIAL_BYTES,
+                "bo_attn_gather_rows" | "bo_attn_split_q8" => 0,
+                _ if index >= names.len() => Q8_TILE_BYTES,
+                _ => 0,
+            };
+            p.push((pipeline, bytes));
         }
         let quantized_tensor = quantized
             .iter()

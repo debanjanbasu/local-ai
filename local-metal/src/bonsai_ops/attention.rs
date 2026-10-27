@@ -52,7 +52,7 @@ impl BonsaiOps {
     /// The caller supplies that row's causal prefix, not the full token block.
     ///
     /// On a tensor build, F16 caches use `bo_attn_split_tensor` and quantized
-    /// ones `bo_attn_split_tensor_<layout>` (the six GQA heads as one Q tile per
+    /// ones `bo_attn_split_<layout>` (the six GQA heads as one Q tile per
     /// split); the SIMD build uses `bo_attn_split` with `SPLIT_HEADS` heads per
     /// SIMD group, as do short prefixes on every build, with
     /// [`Self::short_split_tokens`] tokens per split below
@@ -401,7 +401,7 @@ impl BonsaiOps {
                 (tokens * Q_HEADS) as usize,
                 256,
             );
-            // `bo_attn_tensor_rows_q8` follows the gather and three split kernels.
+            // `bo_attn_rows_q8` follows the gather and three split kernels.
             self.go(
                 b,
                 pipeline + 4,

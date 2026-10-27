@@ -4165,6 +4165,84 @@ Rejected or not adopted, from the same profile and Splash's kernels
   other weight set is free there): not attempted; it is 7% of the half's
   GPU time at 4K, where the ANE sets the pace, and 1-3% from 32K.
 
+**Head-packed prefill attention in registers.** The stage-by-stage profile
+in [Performance](#performance) put the QK product at 1.8 T multiply-adds per
+second against P.V's 2.8 T: each SIMD group of the tensor-op kernel owned a
+24x8 score tile over the whole 256-long reduction (three dependent 32-deep
+accumulator chains), behind a K/V tile dequantized into 16 KB of
+threadgroup memory and four barriers per 32-key tile. `bo_attn_rows_q8`
+replaces it with explicit 8x8 SIMD-group products that split the head
+dimension instead: each of the four SIMD groups owns 64 dimensions for both
+products, so it loads and dequantizes only its own slice of each K/V tile,
+straight from the cache into operand registers (one 16-byte load and one
+scale per lane and key; the slice's dimensions are permuted so every operand
+register is one half2 of the existing exact dequantization, and Q and the
+output follow the same permutation). The scores become twelve independent
+8-deep chains per SIMD group (24x32 over 64 dimensions), the four slice
+partials meet in 13.5 KB of threadgroup memory, and the four-lane softmax
+adds them in slice order before P.V accumulates each slice's 24x64 output
+columns in registers. Two barriers per tile remain, and nothing waits on a
+dequantized tile. Values are still each Q8 code times its scale rounded
+once to half; only the products' summation order changes.
+
+Kernel GPU time per 512-row block (`attention_block_kv`, gather and
+unrotation included), synthetic Q8 cache, M4 Pro, both kernels selected in
+one process, interleaved, median of seven (minimum in brackets), two
+rounds:
+
+| Prefix | Tensor-op kernel | Register kernel |
+| ---: | ---: | ---: |
+| 8,192 | 21.78 (21.74) ms | 16.62-16.66 (16.50) ms (-24%) |
+| 32,768 | 90.6-91.1 (84.4) ms | 65.1-66.1 (63.7) ms (-25%) |
+| 131,072 | 388-398 (371) ms | 271.8-272.0 (264.5) ms (-29%) |
+
+At 32K that is 3.1 T multiply-adds per second against the 8x8 products'
+3.9-4.0 T peak. Probes on the new kernel at 8K (each dropping one stage)
+saved 31% without the QK products, 28% without P.V's and 4% without the
+dequantization; reading each Q row group from one address saved nothing. The
+rest is spread over the partial stores, softmax and barriers. The
+per-operation profile
+(`prefill_op_timings`, real 4,096-token prefix repeated, one layer's
+attention core per 512-row half, and whole blocks at each position, one
+sample each; best of two interleaved runs in opposite order, same build with
+the kernel switched):
+
+| Position | Attention core, one layer | Summed over 16 layers | Wavefront block (1,024 rows), wall | GPU block (512 rows), wall |
+| ---: | ---: | ---: | ---: | ---: |
+| 4K | 11.74 → 8.84 ms | 188 → 141 ms | 2,934 → 2,858 ms (-3%) | 3,875 → 3,855 ms |
+| 32K | 94.34 → 67.64 ms | 1,509 → 1,082 ms | 5,611 → 4,749 ms (-15%) | 5,162 → 4,782 ms |
+| 128K | 397.8 → 282.3 ms | 6,365 → 4,518 ms | 14,963 → 11,533 ms (-23%) | 9,963 → 8,229 ms |
+
+At 128K a wavefront block now prefills at 89 instead of 68 tok/s, at 32K
+216 instead of 183; cold prefill end to end was not re-measured with this
+change alone.
+
+Teacher-forced over 64 greedy tokens of repository text on the GPU path
+(the Neural Engine off), next-token KL of the register kernel against the
+tensor-op kernel was 2.7e-6, 4.7e-6 and 3.6e-6 (max 1.9e-5, 4.4e-5, 3.0e-5)
+after 2,048-, 8,192- and 16,384-token prompts, top-1 64/64 each, so greedy
+output is unchanged over those tokens.
+
+Single-row decode attention past 1,024 positions (`bo_attn_split_q8`, whose
+splits `bo_attn_reduce` combines) got the same layout: each SIMD group owns
+64 dimensions, Q's six rows (zero-padded to eight) stay in registers for the
+whole split, and K/V go from the cache straight into operand registers. One
+layer, synthetic Q8 cache, 16 dispatches per sample, interleaved, median of
+seven (minimum in brackets), two rounds:
+
+| Prefix | Tensor-op split | Register split |
+| ---: | ---: | ---: |
+| 32,768 | 404-414 (402) µs | 334-343 (328) µs (-17%) |
+| 131,072 | 1,449-1,453 (1,431) µs | 1,305-1,311 (1,283) µs (-10%) |
+
+285 MB of K/V in 1.3 ms at 128K is about 220 GB/s, close to what the memory
+delivers, so little is left there. (At 8K, 115-150 against 84-96 µs, but
+its 18 MB cache stays in the system-level cache across repeated samples,
+which real decode does not see.) Teacher-forced over 64 greedy tokens after
+2,048-, 8,192- and 16,384-token prompts, with the same prefill in both arms
+(the first logits bitwise equal), next-token KL against the tensor-op split
+was 2.8e-7, 5.0e-7 and 3.3e-7, top-1 64/64 each.
+
 Single-token decode encodes 835 dispatches per token, down from 1,364, and
 every fused kernel is bitwise identical to the dispatches it replaces
 (`local-metal/tests/bonsai_fusion.rs`):
@@ -4352,6 +4430,19 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 [the original build](https://github.com/debanjanbasu/local-ai/commit/b389329),
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
+
+- Variants of the register prefill attention kernel `bo_attn_rows_q8`
+  (October 2026, with [Neural Engine prefill FFN](#neural-engine-prefill-ffn)),
+  kernel time per 512-row block against it at 8K and 32K prefixes: Q held in
+  registers across tiles instead of reloaded per tile, +15-19% (register
+  pressure; Q's reloads cost nothing measurable); the next tile's K codes
+  loaded during P.V, +9-12%; V loaded after the softmax instead of before,
+  +2%; the softmax spread over all four SIMD groups (six rows each) instead
+  of three, +1%; partial rows unpadded (+2%) or XOR-swizzled (+5%) to cut
+  its threadgroup memory from 17.2 to 15.6 KB; K as the B operand
+  (two keys per register, so each register is assembled from two loads),
+  +1-2%. Padding its threadgroup memory from 17 to 23 KB cost 5%, to 29 KB
+  18%.
 
 - Splash's prefill attention and scan techniques that do not fit this
   engine (October 2026, listed with the profile in
