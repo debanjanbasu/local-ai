@@ -76,9 +76,9 @@ const JOB_BOUND: Duration = Duration::from_secs(2);
 const CHUNK_BOUND: Duration = Duration::from_secs(300);
 /// Longest the ANE daemon may take to compile and load the program.
 const COMPILE_LIMIT: Duration = Duration::from_secs(180);
-/// Rows and tolerance of the start-up comparison with the GPU FFN; W8A8
-/// differs from it by about 2-3% (relative Frobenius) on these rows, a
-/// broken program by about 100%.
+/// Rows and tolerance of the start-up comparison with the GPU FFN: W8A8
+/// measured 0.42% from it (relative Frobenius) on these rows; the bound only
+/// has to catch a program that computes something else.
 const CHECK_ROWS: u32 = 256;
 const CHECK_TOLERANCE: f64 = 0.1;
 /// Keepalive: the ANE sleeps after about a second idle and its first
@@ -526,13 +526,17 @@ impl WeightSet {
 }
 
 /// The ANE path once compiled and checked.
+///
+/// Fields drop in order: the keepalive thread and the handoff (which waits
+/// for evaluations in flight) go before the surfaces those evaluations use.
 pub(super) struct AneSplit {
+    keep: Option<Keepalive>,
+    handoff: Handoff,
     kernels: AneKernels,
     lanes: [Lane; 2],
     sets: [WeightSet; 2],
     /// `[set][lane][function]`.
     bindings: Vec<Arc<Binding>>,
-    handoff: Handoff,
     /// Set by a join that met a non-finite value.
     status: MetalBuffer,
     /// The second half's embeddings, residual stream and rotary rows (the
@@ -543,7 +547,6 @@ pub(super) struct AneSplit {
     rope: MetalBuffer,
     /// Recurrent state at the start of the chunk in flight, for a rerun.
     checkpoint: Option<PromptCheckpoint>,
-    keep: Option<Keepalive>,
     /// Test fault: the layer whose first-half evaluation is never started.
     #[cfg(test)]
     fault: Cell<Option<usize>>,
@@ -606,18 +609,18 @@ impl AneSplit {
             }
         }
         Ok(Self {
+            keep: None,
+            handoff: Handoff::new(context, JOB_BOUND)?,
             kernels: AneKernels::new(context, &shaders)?,
             lanes,
             sets,
             bindings,
-            handoff: Handoff::new(context, JOB_BOUND)?,
             status: MetalBuffer::empty(context.device(), 16)?,
             embedding: rows(WIDTH)?,
             hidden: rows(WIDTH)?,
             hidden_alt: rows(WIDTH)?,
             rope: MetalBuffer::empty(context.device(), HALF_ROWS * 4 * size_of::<u32>())?,
             checkpoint: None,
-            keep: None,
             #[cfg(test)]
             fault: Cell::new(None),
         })
