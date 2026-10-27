@@ -398,15 +398,14 @@ pub(super) struct PreparedGeneration {
 
 /// Parse a Chat Completions request body.
 #[cfg(test)]
-pub(super) fn prepare_generation(body: &[u8], thinking: bool) -> crate::Result<PreparedGeneration> {
-    prepare_generation_with(body, thinking, None)
+pub(super) fn prepare_generation(body: &[u8]) -> crate::Result<PreparedGeneration> {
+    prepare_generation_with(body, None)
 }
 
 /// Parse a Chat Completions request body, resolving `file_id` images
 /// against `files`.
 pub(super) fn prepare_generation_with(
     body: &[u8],
-    thinking: bool,
     files: Option<&local_services::Store>,
 ) -> crate::Result<PreparedGeneration> {
     let request: GenerateRequest = serde_json::from_slice(body)
@@ -450,7 +449,7 @@ pub(super) fn prepare_generation_with(
         }) => Some("none"),
         _ => request.reasoning_effort.as_deref(),
     };
-    let reasoning = effective_reasoning(effort, thinking)?;
+    let reasoning = effective_reasoning(effort)?;
     Ok(PreparedGeneration {
         stream,
         include_usage: stream && include_usage,
@@ -658,38 +657,25 @@ const fn invalid_format(message: String) -> crate::Error {
     crate::Error::InvalidArgument(message)
 }
 
-/// Resolve a reasoning effort against the server's `--no-thinking` choice:
-/// the level the model reasons at, or `None` for no reasoning.
+/// Resolve a request's reasoning effort: the level the model reasons at, or
+/// `None` for no reasoning.
 ///
-/// The checkpoint template knows `low`, `medium` and `xhigh`, or closes the
-/// thought block empty (`none`). `OpenAI`'s other levels run at the nearest
-/// one, `minimal` at `low` and `high` at `xhigh`, and a Response reports the
-/// level that ran. An operator who started the server with `--no-thinking`
-/// has decided, so a request cannot turn reasoning back on.
-pub(super) fn effective_reasoning(
-    effort: Option<&str>,
-    server: bool,
-) -> crate::Result<Option<ReasoningEffort>> {
-    let level = match effort {
-        None => return Ok(server.then_some(ReasoningEffort::XHigh)),
-        Some("none") => return Ok(None),
-        Some("minimal" | "low") => ReasoningEffort::Low,
-        Some("medium") => ReasoningEffort::Medium,
-        Some("high" | "xhigh") => ReasoningEffort::XHigh,
-        Some(other) => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "reasoning effort {other:?} is not supported; use none, minimal, low, medium, \
-                 high or xhigh"
-            )));
-        }
-    };
-    if !server {
-        return Err(crate::Error::InvalidArgument(format!(
-            "reasoning effort {:?} was requested but this server was started with --no-thinking",
-            effort.unwrap_or_default()
-        )));
+/// Thinking is the server's default, so a request without an effort reasons
+/// at `xhigh`. The checkpoint template knows `low`, `medium` and `xhigh`, or
+/// closes the thought block empty (`none`). `OpenAI`'s other levels run at the
+/// nearest one, `minimal` at `low` and `high` at `xhigh`, and a Response
+/// reports the level that ran.
+pub(super) fn effective_reasoning(effort: Option<&str>) -> crate::Result<Option<ReasoningEffort>> {
+    match effort {
+        None | Some("high" | "xhigh") => Ok(Some(ReasoningEffort::XHigh)),
+        Some("none") => Ok(None),
+        Some("minimal" | "low") => Ok(Some(ReasoningEffort::Low)),
+        Some("medium") => Ok(Some(ReasoningEffort::Medium)),
+        Some(other) => Err(crate::Error::InvalidArgument(format!(
+            "reasoning effort {other:?} is not supported; use none, minimal, low, medium, high \
+             or xhigh"
+        ))),
     }
-    Ok(Some(level))
 }
 
 /// Check `choice` against the declared `tools` before anything is queued.

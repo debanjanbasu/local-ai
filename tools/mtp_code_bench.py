@@ -45,7 +45,6 @@ from statistics import median
 
 REPO = Path(__file__).resolve().parents[1]
 BINARY = REPO / "target" / "release" / "local-ai"
-CHECKPOINT_DIR = "bonsai2-27b-ptq1"
 
 # --------------------------------------------------------------------------
 # Code tasks: (id, language, prompt, test appended to the extracted code).
@@ -649,13 +648,15 @@ def run_tasks(url, label, out, max_tokens, only=None):
 
 
 def scratch_root(base, label, head):
-    """A root whose models/ holds the pinned checkpoint and only `head`."""
+    """A root whose models/ holds every installed model, with `head` as the
+    MTP head (`serve` requires every model, so each is linked in)."""
     root = Path(base, "roots", label)
     models = root / "models"
     (models / "bonsai2-27b-mtp").mkdir(parents=True, exist_ok=True)
-    checkpoint = models / CHECKPOINT_DIR
-    if not checkpoint.exists():
-        checkpoint.symlink_to((REPO / "models" / CHECKPOINT_DIR).resolve())
+    for installed in sorted((REPO / "models").iterdir()):
+        target = models / installed.name
+        if installed.name != "bonsai2-27b-mtp" and not target.exists():
+            target.symlink_to(installed.resolve())
     link = models / "bonsai2-27b-mtp" / "mtp-head-ptq1-v1.bin"
     if link.is_symlink() or link.exists():
         link.unlink()
@@ -667,7 +668,7 @@ def scratch_root(base, label, head):
 def serve(root, port, log):
     env = dict(os.environ, HOME=str(root / "home"))
     process = subprocess.Popen(
-        [str(BINARY), "serve", "--port", str(port), "--no-response-store"],
+        [str(BINARY), "serve", "--port", str(port)],
         cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
     url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 300

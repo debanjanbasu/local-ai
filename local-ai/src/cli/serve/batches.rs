@@ -108,7 +108,6 @@ pub(super) type Submit = Arc<dyn Fn(ChatRequest) -> crate::Result<Generation> + 
 /// What the worker needs from the server, cloned from [`AppState`].
 pub(super) struct Config {
     pub(super) model: Arc<str>,
-    pub(super) thinking: bool,
     pub(super) cipher: Option<Arc<ReasoningCipher>>,
     pub(super) depth: QueueDepth,
     /// Records each line's generation as a batch completion, attributed to
@@ -167,7 +166,6 @@ impl Batches {
         record.batch = true;
         let config = Config {
             model: Arc::clone(&state.model),
-            thinking: state.thinking,
             cipher: state.cipher.clone(),
             depth: state.depth.clone(),
             meter: Meter::into_store(state.auth.admin(), record),
@@ -503,7 +501,6 @@ impl Worker {
         let prepared = prepare_retaining(
             api,
             &body,
-            config.thinking,
             (None, None),
             (None, None),
             config.cipher.as_ref(),

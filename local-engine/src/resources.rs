@@ -68,8 +68,10 @@ impl Resources {
         let model_bytes = file_bytes(&model);
         // The MTP head and the DFlash2 drafter are required beside the
         // model, like the checkpoint itself: a missing one stops startup
-        // here, and the loaders refuse a corrupt one. Only
-        // `--no-speculation` turns them off. Discovery never constructs
+        // here, and the loaders refuse a corrupt one. `speculation: false`
+        // is no user option: it is the plain-decoding reference of
+        // developer tools and of commands that load neither (exports,
+        // tokenizing). Discovery never constructs
         // `MtpMode::Auto`, which stays the default for an embedder that has
         // not called this.
         let root = model.parent().and_then(Path::parent);
@@ -94,7 +96,7 @@ impl Resources {
                 format!("DFlash2 drafter artifact {}", drafter.display()),
             )
         } else {
-            let reason = "disabled by --no-speculation";
+            let reason = "speculation off: plain-decoding reference";
             (
                 MtpMode::Off(Some(reason.into())),
                 reason.into(),

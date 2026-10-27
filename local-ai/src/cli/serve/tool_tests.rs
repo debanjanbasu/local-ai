@@ -71,7 +71,7 @@ fn prepare(tools: &str, extra: &Value) -> super::super::responses::PreparedRespo
     if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
         body.extend(extra.clone());
     }
-    prepare_responses(body.to_string().as_bytes(), true).expect("prepared")
+    prepare_responses(body.to_string().as_bytes()).expect("prepared")
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn malformed_tool_declarations_are_refused() {
     ] {
         let body =
             json!({"input":"hi","tools":serde_json::from_str::<Value>(tools).expect("tools")});
-        let error = prepare_responses(body.to_string().as_bytes(), true)
+        let error = prepare_responses(body.to_string().as_bytes())
             .err()
             .map(|error| error.to_string())
             .unwrap_or_default();
@@ -256,7 +256,7 @@ fn client_tool_calls_render_as_their_spec_items_and_replay() {
     input.push(json!({"type":"local_shell_call_output","call_id":"c2","output":"total 0"}));
     input.push(json!({"type":"apply_patch_call_output","call_id":"c3","status":"completed","output":"done"}));
     let body = json!({"input":input,"tools":serde_json::from_str::<Value>(TOOLS).expect("tools")});
-    let next = prepare_responses(body.to_string().as_bytes(), true).expect("replayed");
+    let next = prepare_responses(body.to_string().as_bytes()).expect("replayed");
     let messages = &next.request.messages;
     let calls = &messages[0].tool_calls;
     assert_eq!(calls.len(), 3);
@@ -730,7 +730,7 @@ fn codex_default_tools() -> Value {
 #[test]
 fn codex_default_tools_are_accepted_as_the_client_tools_they_are() {
     let body = json!({"input":"hi","tools":codex_default_tools(),"tool_choice":"auto","parallel_tool_calls":true});
-    let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("prepared");
+    let prepared = prepare_responses(body.to_string().as_bytes()).expect("prepared");
     let request = &prepared.request;
     let names: Vec<&str> = request
         .tools
@@ -811,7 +811,7 @@ fn codex_default_tools_are_accepted_as_the_client_tools_they_are() {
     input.push(json!({"type":"function_call_output","call_id":"c1","output":"agent 7"}));
     input.push(json!({"type":"custom_tool_call_output","call_id":"c2","output":"Done!"}));
     let body = json!({"input":input,"tools":codex_default_tools()});
-    let next = prepare_responses(body.to_string().as_bytes(), true).expect("replayed");
+    let next = prepare_responses(body.to_string().as_bytes()).expect("replayed");
     let calls = &next.request.messages[0].tool_calls;
     assert_eq!(calls[0].name, "multi_agent_v1.spawn_agent");
     assert_eq!(calls[1].name, "apply_patch");
@@ -835,7 +835,7 @@ fn web_search_is_never_forced_or_reported_as_searched() {
         if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
             body.extend(extra.clone());
         }
-        let error = prepare_responses(body.to_string().as_bytes(), true)
+        let error = prepare_responses(body.to_string().as_bytes())
             .err()
             .map(|error| error.to_string())
             .unwrap_or_default();
@@ -1064,7 +1064,7 @@ async fn file_search_runs_without_permissions_and_answers_with_citations() {
         input.extend(output.iter().cloned());
         let body =
             json!({"input":input,"tools":serde_json::from_str::<Value>(&tools).expect("tools")});
-        let next = prepare_responses(body.to_string().as_bytes(), true).expect("replayed");
+        let next = prepare_responses(body.to_string().as_bytes()).expect("replayed");
         let messages = &next.request.messages;
         let roles: Vec<&str> = messages
             .iter()

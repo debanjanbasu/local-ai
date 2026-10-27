@@ -113,7 +113,6 @@ fn prepare(
     let services = services.map(|store| store.scoped(project));
     prepare_responses_conversing(
         body.to_string().as_bytes(),
-        true,
         store,
         temporary,
         (services.as_ref(), project),
@@ -316,7 +315,7 @@ fn background_and_temporary_responses_keep_their_project() {
     doc.save(&doc.snapshot("queued")).unwrap();
     let stored = durable.load(&id).unwrap().unwrap();
     let request = stored.request.clone().expect("a resumable request");
-    let (_, reply) = prepare_resumed(&stored, &request, (true, None), &durable, None).unwrap();
+    let (_, reply) = prepare_resumed(&stored, &request, None, &durable, None).unwrap();
     let Protocol::Responses(echo) = &reply.protocol else {
         unreachable!("responses reply")
     };
@@ -367,7 +366,6 @@ fn generation_requests_reference_only_their_projects_conversations_and_files() {
         prepare_retaining(
             Api::Chat,
             body.to_string().as_bytes(),
-            true,
             (None, None),
             (Some(&scoped), project),
             None,
@@ -768,7 +766,6 @@ async fn batches_are_private_over_http() {
         submit,
         Config {
             model: "local".into(),
-            thinking: false,
             cipher: None,
             depth: QueueDepth::default(),
             meter: Meter::default(),

@@ -595,23 +595,19 @@ fn reasoning_options(reasoning: Option<&Reasoning>) -> crate::Result<(Option<&st
 
 /// [`prepare_responses_with`] on a server with no response store.
 #[cfg(test)]
-pub(in crate::cli::serve) fn prepare_responses(
-    body: &[u8],
-    thinking: bool,
-) -> crate::Result<PreparedResponses> {
-    prepare_responses_with(body, thinking, None, None, "m")
+pub(in crate::cli::serve) fn prepare_responses(body: &[u8]) -> crate::Result<PreparedResponses> {
+    prepare_responses_with(body, None, None, "m")
 }
 
 /// [`prepare_input_tokens_conversing`] on a server with no conversation store.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::cli::serve) fn prepare_input_tokens(
     body: &[u8],
-    thinking: bool,
     store: Option<&Arc<ResponseStore>>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<ChatRequest> {
-    prepare_input_tokens_conversing(body, thinking, store, (None, None), cipher, model)
+    prepare_input_tokens_conversing(body, store, (None, None), cipher, model)
 }
 
 /// Count requests use the generation input contract, but never persist a
@@ -623,7 +619,6 @@ pub(in crate::cli::serve) fn prepare_input_tokens(
 /// (see [`prepare_responses_conversing`]). Blocks on the stores.
 pub(in crate::cli::serve) fn prepare_input_tokens_conversing(
     body: &[u8],
-    thinking: bool,
     store: Option<&Arc<ResponseStore>>,
     (conversations, project): (Option<&ConversationStore>, Option<&str>),
     cipher: Option<&Arc<ReasoningCipher>>,
@@ -661,15 +656,8 @@ pub(in crate::cli::serve) fn prepare_input_tokens_conversing(
     object.insert("store".into(), json!(false));
     let body = serde_json::to_vec(&value)
         .map_err(|error| invalid(format!("invalid token count request: {error}")))?;
-    let prepared = prepare_responses_conversing(
-        &body,
-        thinking,
-        store,
-        None,
-        (conversations, project),
-        cipher,
-        model,
-    )?;
+    let prepared =
+        prepare_responses_conversing(&body, store, None, (conversations, project), cipher, model)?;
     Ok(prepared.request)
 }
 
@@ -677,33 +665,23 @@ pub(in crate::cli::serve) fn prepare_input_tokens_conversing(
 #[cfg(test)]
 pub(in crate::cli::serve) fn prepare_responses_with(
     body: &[u8],
-    thinking: bool,
     store: Option<&Arc<ResponseStore>>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedResponses> {
-    prepare_responses_retaining(body, thinking, store, None, cipher, model)
+    prepare_responses_retaining(body, store, None, cipher, model)
 }
 
 /// [`prepare_responses_conversing`] on a server with no conversation store.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::cli::serve) fn prepare_responses_retaining(
     body: &[u8],
-    thinking: bool,
     store: Option<&Arc<ResponseStore>>,
     temporary: Option<&Arc<Temporary>>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<PreparedResponses> {
-    prepare_responses_conversing(
-        body,
-        thinking,
-        store,
-        temporary,
-        (None, None),
-        cipher,
-        model,
-    )
+    prepare_responses_conversing(body, store, temporary, (None, None), cipher, model)
 }
 
 /// Parse a `POST /v1/responses` body, resolving `previous_response_id`
@@ -722,7 +700,6 @@ pub(in crate::cli::serve) fn prepare_responses_retaining(
 #[expect(clippy::too_many_lines)]
 pub(in crate::cli::serve) fn prepare_responses_conversing(
     body: &[u8],
-    thinking: bool,
     store: Option<&Arc<ResponseStore>>,
     temporary: Option<&Arc<Temporary>>,
     (conversations, project): (Option<&ConversationStore>, Option<&str>),
@@ -741,7 +718,7 @@ pub(in crate::cli::serve) fn prepare_responses_conversing(
     )?;
     let conversation_id = conversation_id(request.conversation.as_ref())?;
     let (effort, preserve_thinking) = reasoning_options(request.reasoning.as_ref())?;
-    let reasoning = effective_reasoning(effort, thinking)?;
+    let reasoning = effective_reasoning(effort)?;
     let thinking = reasoning.is_some();
     let summary = summary_detail(request.reasoning.as_ref())?;
     let context_compaction = context_compaction(request.context_management.as_ref())?;
@@ -917,8 +894,7 @@ pub(in crate::cli::serve) fn prepare_responses_conversing(
 ///
 /// The same request is prepared again, except that its input is the
 /// resolved input already in the record (so a `previous_response_id` deleted
-/// since is not read again) and its effort is the one the Response reports,
-/// whatever this server's default (`thinking`), which must still allow it.
+/// since is not read again) and its effort is the one the Response reports.
 /// The Response keeps its ID, creation time
 /// and model; the record keeps `request`, so a later restart can do the same.
 /// A compaction item the record already reports is reused rather than run
@@ -929,7 +905,7 @@ pub(in crate::cli::serve) fn prepare_responses_conversing(
 pub(in crate::cli::serve) fn prepare_resumed(
     stored: &StoredResponse,
     request: &Value,
-    (thinking, summarizer): (bool, Option<&Summarizer>),
+    summarizer: Option<&Summarizer>,
     store: &Arc<ResponseStore>,
     cipher: Option<&Arc<ReasoningCipher>>,
 ) -> crate::Result<(ChatRequest, Reply)> {
@@ -969,7 +945,7 @@ pub(in crate::cli::serve) fn prepare_resumed(
     // Stored again as the project's that owns it.
     let owner = (None, stored.project.as_deref());
     let mut prepared =
-        prepare_responses_conversing(&bytes, thinking, Some(store), None, owner, cipher, model)?;
+        prepare_responses_conversing(&bytes, Some(store), None, owner, cipher, model)?;
     let id = response
         .get("id")
         .and_then(Value::as_str)

@@ -122,7 +122,7 @@ run long prompts on a blocking pool.
 
 ## Text embeddings
 
-`embedding::EmbeddingModel` runs the optional `EmbeddingGemma` 2 text encoder
+`embedding::EmbeddingModel` runs the `EmbeddingGemma` 2 text encoder
 natively on Metal (BF16 weights, F32 activations; install and measurements in
 [docs/EMBEDDINGS.md](../docs/EMBEDDINGS.md)). Inputs are embedded as given;
 `EmbeddingPrompt` formats the model card's query and document prompts, and
@@ -132,7 +132,7 @@ natively on Metal (BF16 weights, F32 activations; install and measurements in
 use std::path::Path;
 use local_engine::embedding::{EmbeddingModel, EmbeddingPrompt, installed_model};
 
-let dir = installed_model(Path::new("models")).expect("model not installed");
+let dir = installed_model(Path::new("models"))?;
 let mut model = EmbeddingModel::open(&dir)?;
 let query = EmbeddingPrompt::Query { task: "search result" }.format("how do hash maps resize?");
 let document = EmbeddingPrompt::Document { title: None }.format("Open addressing doubles the table…");
@@ -146,8 +146,8 @@ The last argument is called between short GPU submissions: a server passes
 `EngineHandle::activity()`'s `yield_to_decode` there so embedding work waits
 for running Bonsai decode steps instead of delaying them.
 
-With the optional vision artifact installed beside it, the same model embeds
-images and video into the same space (preprocessing identical to the
+With the vision artifact beside it (required, like the audio one: `open`
+checks both digests), the same model embeds images and video into the same space (preprocessing identical to the
 reference processor; video files need `ffmpeg`/`ffprobe`):
 
 ```rust,no_run
@@ -156,7 +156,7 @@ reference processor; video files need `ffmpeg`/`ffprobe`):
 use local_engine::embedding::{MediaPart, prepare_image};
 use local_engine::embedding::vision::video::decode_video_file;
 
-# let dir = installed_model(Path::new("models")).expect("model not installed");
+# let dir = installed_model(Path::new("models"))?;
 # let mut model = EmbeddingModel::open(&dir)?;
 let image = prepare_image(&std::fs::read("photo.jpg")?)?;
 let photo = model.embed_image(&image, &mut || Ok(()))?;
@@ -417,9 +417,8 @@ numeric and nested JSON arguments, parallel limits and format/tool branches.
 
 `local-ai` exposes these native calls through Chat Completions and a
 text/function subset of Responses, including `tool_choice`,
-`parallel_tool_calls` and tool `strict`. Responses are stored by default
-(stateless with `--no-response-store`); background Responses work either
-way (with `store: false` they are kept only temporarily). The server maps Chat
+`parallel_tool_calls` and tool `strict`. Responses are stored by default;
+background Responses work with `store: false` too (kept only temporarily). The server maps Chat
 `response_format` and Responses `text.format` onto `ResponseFormat`. See
 [server API](../docs/BONSAI.md#server-api) for storage, background streams,
 structured output, encrypted reasoning replay, token counting, the
@@ -511,8 +510,6 @@ the system prompt in `instructions`, and leaves out the `developer` role and
 results become text placeholders. Presence and repetition penalties, `top_k`
 and `min_p` configured in Oh My Pi are honoured (it sends no frequency
 penalty to a Responses endpoint).
-For a server started with `--no-thinking`, set `reasoning: false` and remove
-`thinking`; Oh My Pi then sends no reasoning field.
 
 This configuration was checked by reading Oh My Pi at
 [`703a261`](https://github.com/can1357/oh-my-pi/tree/703a261df9533e74f16aa8d38e64eb41977ccf89)

@@ -62,7 +62,7 @@ pub(super) fn stats(stop_reason: StopReason) -> Box<Stats> {
 }
 
 fn prepare_error(body: &Value, store: Option<&Arc<ResponseStore>>) -> String {
-    prepare_responses_with(body.to_string().as_bytes(), true, store, None, "m")
+    prepare_responses_with(body.to_string().as_bytes(), store, None, "m")
         .err()
         .map(|error| error.to_string())
         .unwrap_or_default()
@@ -79,9 +79,8 @@ pub(super) fn streamed_doc(
     store: &Arc<ResponseStore>,
     streaming: bool,
 ) -> ResponsesState {
-    let prepared =
-        prepare_responses_with(body.to_string().as_bytes(), true, Some(store), None, "m")
-            .expect("request accepted");
+    let prepared = prepare_responses_with(body.to_string().as_bytes(), Some(store), None, "m")
+        .expect("request accepted");
     let reply = Reply::new(Protocol::Responses(Arc::new(prepared.echo)), "m".into());
     let Protocol::Responses(echo) = &reply.protocol else {
         unreachable!("responses reply")
@@ -180,7 +179,6 @@ pub(super) fn temporary_doc(
 ) -> ResponsesState {
     let prepared = prepare_responses_retaining(
         body.to_string().as_bytes(),
-        true,
         durable,
         Some(temporary),
         None,
@@ -249,7 +247,6 @@ fn background_store_false_is_temporary_and_refused_without_a_temporary_store() {
         json!({"input":"hi","background":true,"store":true})
             .to_string()
             .as_bytes(),
-        true,
         None,
         Some(&temporary),
         None,
@@ -264,7 +261,6 @@ fn background_store_false_is_temporary_and_refused_without_a_temporary_store() {
         json!({"input":"hi","store":false,"stream":true})
             .to_string()
             .as_bytes(),
-        true,
         Some(&durable),
         Some(&temporary),
         None,
@@ -276,7 +272,6 @@ fn background_store_false_is_temporary_and_refused_without_a_temporary_store() {
         json!({"input":"hi","background":true,"stream":true})
             .to_string()
             .as_bytes(),
-        true,
         Some(&durable),
         None,
         "m",
@@ -424,7 +419,6 @@ fn durable_responses_are_never_answered_from_the_temporary_store() {
         json!({"input":"next","previous_response_id":temporary_id})
             .to_string()
             .as_bytes(),
-        true,
         Some(&durable),
         Some(&temporary),
         None,

@@ -172,7 +172,7 @@ python tools/mtp_train/convert.py from-head models/bonsai2-27b-mtp/mtp-head-ptq1
 python tools/mtp_train/convert.py to-qat $R/v1-src/model_mtp_ternary.safetensors $R/v1-qat.safetensors
 python tools/mtp_train/convert.py from-ternary $R/v1-src/model_mtp_ternary.safetensors $R/v1-dense.safetensors --signs $R/signs
 # 1. baseline: tools/mtp_code_bench.py ab --head installed=models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin --rounds 1 --out ...
-# 2. rollouts: serve --no-response-store, then rollouts.py --out $R/rollouts.jsonl --repo . --repo <open-source checkouts>
+# 2. rollouts: serve, then rollouts.py --out $R/rollouts.jsonl --repo . --repo <open-source checkouts>
 # 3. target/release/mtp-capture capture --out $R/capture --max-doc-tokens 8192 $R/rollouts.jsonl
 # 4. train_ternary.py --capture $R/capture --tables $R/tables --teacher $R/v1-dense.safetensors \
 #      --signs $R/signs --init $R/v1-qat.safetensors --min-match 0.9 --kl-weight 1 --target-weight 1 \
@@ -340,9 +340,8 @@ from `p = q`, and persists the fit to
 ```text
 local-ai chat [options] <prompt>
   --max-tokens N     output cap (default 8192)
-  --no-thinking      skip the checkpoint's xhigh reasoning (default on)
   --greedy           disable sampling
-  --raw              skip the chat template
+  --raw              skip the chat template (and so reasoning)
 
 local-ai serve [options]
   --host IP          bind address (default 127.0.0.1)
@@ -354,35 +353,30 @@ local-ai serve [options]
   --allow-host NAME  answer requests addressed to NAME besides IP addresses,
                      localhost and *.local or *.internal names; repeatable
                      (DNS rebinding protection, see docs/ADMIN.md#browsers)
-  --no-thinking      disable reasoning
   --stall-timeout N  drop a generation or download whose client stopped
                      reading, or a request body that stopped arriving;
                      seconds, default 30, accepted 10 to 3600
   --response-store DIR  keep Responses API responses in DIR (owner-only,
                      unencrypted) until deleted; default: the user's data
                      directory, pruned of responses older than 30 days
-  --no-response-store  keep no Responses API responses
   --reasoning-key FILE  owner-only AES-256-GCM key for
                      reasoning.encrypted_content and compaction, created if
                      absent; default: the user's data directory
-  --decisions-artifact DIR  serve POST /v1/decisions from DIR; default:
-                     models/decisions-v2 when installed
 
 local-ai bonsai [options] <prompt>
   --max-tokens N     output cap (default 8192)
   --prompt-file PATH read a UTF-8 prompt instead of positional text
-  --raw              skip the chat template
-  --no-thinking      skip the checkpoint's xhigh reasoning (default on)
+  --raw              skip the chat template (and so reasoning)
   --greedy           disable sampling
   --json             return token IDs and measured timings
   --tokenize         emit prompt token IDs without loading weights
   --export KIND      write an artifact instead of generating; takes no other
                      options. Kinds: index, mtp-head=DIR, dflash-head=DIR
-  --no-speculation   disable both MTP and suffix lookup for comparison
-  --mtp-depth N      drafts per speculative round, 1 to 4 (default 3)
 ```
 
-There is no model flag. The engine runs one pinned checkpoint and discovers it
+There is no model flag, and no flag turns off or tunes any part of the
+[resource policy](#resource-policy): speculation, thinking, the response
+store and every model run as they ship. The engine runs one pinned checkpoint and discovers it
 under `./models`, beside the executable, or under
 `~/Library/Caches/local-ai/models`, and nothing at runtime reads an
 environment variable other than `HOME`, plus `TMPDIR` where `serve` places
@@ -390,9 +384,9 @@ its private [temporary background store](#temporary-background-responses)
 through the system temporary directory.
 
 `chat` and `bonsai` stream text to stdout. Startup policy JSON goes to stderr.
-`--no-thinking` skips the checkpoint's xhigh reasoning, which is on by default;
-there is no flag to turn it back on, since it is already on. `--raw` drops the
-chat template that reasoning is asked inside. Use `--` before prompt text that
+The checkpoint's xhigh reasoning is always on, and no flag turns it off (server
+requests choose their own effort). `--raw` drops the chat template that
+reasoning is asked inside. Use `--` before prompt text that
 starts with a hyphen.
 
 `--export` takes one kind, so passing it twice is an error rather than a choice
@@ -423,7 +417,7 @@ cancels its request even while nothing is being written to it.
 | `GET` | `/v1/models` | the loaded Bonsai model, `ternary-bonsai-2-27b`, with its admitted `context_length`/`max_model_len`, then every other served model (`embeddinggemma-2`, `embeddinggemma-2-moderation-1`, `kokoro-82m`, `whisper-large-v3`) |
 | `GET`, `DELETE` | `/v1/models/{model}` | one served model by id or alias ([model ids](#model-ids)); `DELETE` is for fine-tuned models, so a served base model is a 403 and any other name a 404 |
 | `POST` | `/v1/chat/completions` | templated text and function calling |
-| `POST` | `/v1/responses` | text and function calling; stored by default (`--no-response-store` makes it stateless) |
+| `POST` | `/v1/responses` | text and function calling; stored by default |
 | `POST` | `/v1/responses/input_tokens` | exact templated input-token count, no generation |
 | `POST` | `/v1/responses/compact` | compact a window with the loaded model ([compaction](#compaction-and-reasoning-summaries)) |
 | `GET`, `DELETE` | `/v1/responses/{id}` | retrieve or delete a stored or temporary background response, or (`GET ?stream=true`) resume a streamed background response |
@@ -685,15 +679,10 @@ are kept). The hourly pass is a timer because nothing signals a record turning
 30 days old; each pass reads only records whose file is that old, judged by
 the file's modification time, so a record written again later (a background
 response settled late, or a file copied without its times) is kept 30 days
-from that write. `--response-store DIR` uses DIR instead and prunes nothing,
-and `--no-response-store` stores nothing (conversations, files and batches
-use the always-on [native services](#native-services) store either way). With
-`--no-response-store` only background responses are kept, briefly, and the
-endpoint is otherwise stateless: responses report
-`store: false`, `store: true` and `previous_response_id` are refused, and
-`GET`/`DELETE /v1/responses/{id}` answer 404 for everything except a
-temporary background response (below); resend history in `input` instead.
-With a store configured, `store` takes OpenAI's default of `true`
+from that write. `--response-store DIR` uses DIR instead and prunes nothing
+(conversations, files and batches use the always-on
+[native services](#native-services) store either way). There is no way to
+run without the store. `store` takes OpenAI's default of `true`
 (an explicit `store: false` is honoured), and completed and incomplete
 responses are written durably before their terminal event is sent; a failed
 foreground generation is not stored, and a response whose write fails is
@@ -917,8 +906,7 @@ Reasoning controls are `reasoning_effort` (Chat) and `reasoning.effort`
 "keep your thinking brief" instruction), `medium` (no instruction) and
 `xhigh` (the default), or none: `none`, `low`, `medium` and `xhigh` run as
 named, `minimal` runs at `low` and `high` at `xhigh`, and a Response's
-`reasoning.effort` reports the level that ran. A server started with
-`--no-thinking` rejects every level but `none`. Usage counts reasoning tokens
+`reasoning.effort` reports the level that ran. Usage counts reasoning tokens
 from generated IDs through the first `</think>` token, inclusive; a response
 truncated before that token counts all generated tokens as reasoning.
 Prior reasoning is retained in replayed history by default, as the template's
@@ -2307,6 +2295,9 @@ All choices and reasons are reported in startup JSON.
   KFlash trees with the DFlash2 drafter; both artifacts are required.
 - **Vision:** image input with the required BF16 projector beside the GGUF
   ([image input](#image-input)); `vision_reason` names it.
+- **Reasoning:** the checkpoint's xhigh thinking for every request that asks
+  for no other effort (`reasoning_effort`, `reasoning.effort`,
+  `chat_template_kwargs.enable_thinking`); no flag turns it off.
 - **Prompt cache:** GPU checkpoint count (at most four) derives from
   working-set headroom. The disk budget is the smallest of the checkpoint's
   own size, an eighth of free disk and a quarter of physical memory; the
@@ -2325,7 +2316,7 @@ to floating-point rounding, as in other engines: a verify block runs the
 target over several rows with multi-row kernels whose summation order differs
 from single-row decode (logit differences around 1e-6 relative), so a greedy
 near-tie can resolve differently with and without speculation. Measured: the
-default settings matched `--no-speculation` token for token on the six
+default settings matched plain decoding token for token on the six
 benchmark prompts; one server prompt split at character 624 ("of entries"
 against "of all entries"), deterministically, the same way on every run.
 
@@ -2364,7 +2355,7 @@ for the margin to gate). Depth 3 at margin 4 (79%
 acceptance, 1.57 drafts per round) stays the default; the optimum is flat
 across depths 2-4 and margins 3-6, and stricter margins for later drafts (3/5,
 4/6 at depth 3; 2/4/6, 3/4/6, 4/5/6 at depth 4) measured 38.1-38.5. The default
-emitted the `--no-speculation` tokens on all six prompts. Some non-default
+emitted the plain-decoding tokens on all six prompts. Some non-default
 settings did not, each on one prompt: depth 2 or 4 ungated and depth 4 at
 margin 2 or 4 resolved a near-tie the other way (for example `So,\n` against
 `So, the` at token 178 of the arithmetic prompt), so verify blocks of different
@@ -2585,17 +2576,17 @@ emitted tokens against the calibrated `E(n)` they were chosen for:
 | geomean | **50.4** | 39.9 | | 5.01 over all tree cycles |
 
 An earlier run of the same code measured 50.9 against 40.1 and 32.8
-without speculation, every KFlash text byte-identical to `--no-speculation`.
+without speculation, every KFlash text byte-identical to plain decoding.
 Main's essay was not: its head chain resolves a near-tie at token 123
 differently from a decode step. The essay runs on the head's chain under
 KFlash too, and in the later run above took main's text. The six trace
 prompts at 512 tokens (one round) gave 49.2 against 39.9 (32.2 without
 speculation): prose 39.6, explanation 41.0, arithmetic 63.0, code 59.6,
 essay 34.8 and thinking 67.2, against 37.4, 38.3, 42.3, 43.2, 35.2 and
-43.5, at 4.98 tokens per tree cycle. Five match `--no-speculation`; the
+43.5, at 4.98 tokens per tree cycle. Five match plain decoding; the
 essay (269 head cycles, 4 trees) differs at the same token as main's. The
 two 600-token copy-edit prompts reached 79.7 and 93.1 against 71.9 and
-93.9 tok/s, both identical to `--no-speculation`: the rename edit split
+93.9 tok/s, both identical to plain decoding: the rename edit split
 its cycles between 18 lookups and 14 trees (7.93 tokens each), the other
 stayed on lookup. Through `serve`, a 600-token coding answer decoded at
 53.1 against 41.6 tok/s and an agent turn with tools at 61.9 against 55.2,
@@ -2644,19 +2635,20 @@ rounds).
 
 ### What the speculation gain is made of
 
-`--no-speculation` disables two independent mechanisms under one flag: the MTP
-head, which drafts speculatively ahead, and n-gram suffix lookup
-(`ngram_policy`, `min_match: 12`), which proposes the known continuation of a
-previously-seen 12-token suffix. Both are honestly called speculation, the flag
-disables both by design, and the startup policy reports the two separately, so
-an A/B against the flag measures speculation rather than the head alone. What
+Speculation combines two independent mechanisms: the MTP head, which drafts
+speculatively ahead, and n-gram suffix lookup (`ngram_policy`,
+`min_match: 12`), which proposes the known continuation of a previously-seen
+12-token suffix. Both are honestly called speculation, the opt-out flag these
+measurements used (since removed) disabled both, and the startup policy
+reports the two separately, so an A/B against plain decoding measures
+speculation rather than the head alone. What
 that A/B cannot show is how the gain divides between them.
 
 Measured on a 16 GB M2 MacBook Air, greedy decoding, `--max-tokens` 160 to 400,
 three repetitions per arm taking the median. Every arm produced byte-identical
 output, so the comparison is fair.
 
-| Workload | Speculation | `--no-speculation` | Speedup | MTP | n-gram |
+| Workload | Speculation | Plain decoding | Speedup | MTP | n-gram |
 | --- | ---: | ---: | ---: | --- | --- |
 | Varied prose: planets with one-line descriptions | 3.747 tok/s | 2.983 tok/s | 1.26x, and 1.22x on an independent second run | 75 rounds, 84/106 accepted | 0 rounds |
 | Repetitive: counting one to twenty and back | 4.824 tok/s | 2.975 tok/s | 1.62x | 28 rounds, 73 accepted | 0 rounds |
@@ -2804,7 +2796,7 @@ GPU checkpoint, which its session's next turn restores, and reads it back
 (about 38 KiB a prompt token) only for a tier that keeps it. It used to read
 it back at every request's end and, with no host tier (fast storage) and the
 boundary already written, drop it. On a 13,223-token chat prompt (`local-ai
-bonsai --json --greedy --no-thinking --max-tokens 1`, cold, host tier off,
+bonsai --json --greedy --max-tokens 1` with reasoning off, cold, host tier off,
 MTP head; two interleaved runs per arm with other jobs loading the CPU) the
 time from the first token to the end of the request fell from 80 and 85 ms
 to 38 and 39 ms and the peak footprint from 2,620 and 2,629 MB to 2,059 and
@@ -3427,9 +3419,9 @@ dispatches costing 452-720 us; its summation order differs, with gaps of
 267.6 / 372.2 ms at 4 / 8 / 16 / 24 rows, and the small-batch range now reaches
 60 rows (860.5 ms against the 64-token tile's 876.6 ms), so n-gram drafts are
 padded to fill a tile only past 60 rows. Greedy output is
-byte-identical to before and to `--no-speculation`. With `tools/benchmark.py`,
+byte-identical to before and to plain decoding. With `tools/benchmark.py`,
 best of three, the planets prompt went from 23.58 to 24.74 tok/s at
-`--mtp-depth 3` (19.02 to 19.18 without speculation), and a prompt asking for a
+depth 3 (19.02 to 19.18 without speculation), and a prompt asking for a
 short function three times verbatim from 25.26 to 31.95 tok/s.
 
 Blocks of 5 to 128 rows then got cheaper in three steps. The 48x5120 BF16
@@ -3520,7 +3512,7 @@ five after a warm-up), ms:
 | Before | 291.7 | 437.5 | 582.0 | 868.0 | 1,153.5 |
 | After | 289.7 | 433.7 | 504.1 | 797.9 | 984.2 |
 
-Cold prefill (prompt cache deleted, `--no-speculation`, this repository's
+Cold prefill (prompt cache deleted, no speculation, this repository's
 text), tok/s, interleaved runs of both builds, best of two: 512 tokens 100.7
 to 116.9, 2,048 tokens 107.5 to 126.3, 4,096 tokens 106.2 to 124.8 (one
 run), 8,192 tokens 104.8 to 123.3, 32,767 tokens 92.1 to 105.9 (one run;
@@ -3563,7 +3555,7 @@ head, so 128 rows made 1.6 waves on 80 resident threadgroups and 512 rows make
 6.4, and projection shapes such as 6144x5120 leave fewer partial waves.
 
 Cold prefill, `tools/benchmark.py --prefill`, raw repository text,
-`--no-speculation`, `b09e22f` (128-row blocks) against main `a4cf247`
+no speculation, `b09e22f` (128-row blocks) against main `a4cf247`
 (512-row blocks with the 128-row rounding), interleaved, best of two rounds
 (128K: one round), M4 Pro, 2026-10-22, with no other GPU job running (every
 job held `lockf -k /tmp/local-ai-gpu.lock`). Every sample of a size, both
@@ -3719,7 +3711,7 @@ followed by a buffer barrier except within a layer's group of independent
 projections. That measured 24.99 to 25.40 tok/s on speculative decode.
 
 Together, on the default benchmark prompt with identical greedy text: plain
-decode 18.84 to 21.64 tok/s and speculative decode (`--mtp-depth 3`) 23.58 to
+decode 18.84 to 21.64 tok/s and speculative decode (depth 3) 23.58 to
 25.44 tok/s, interleaved runs of both builds. Removing one fusion at a time
 cost: RMSNorm with rotation 3.4%, QKV/gate concatenation 4.0%, BF16 folding
 2.3%, SwiGLU 1.3%, convolution 0.8%. The BF16 load change alone took plain
@@ -4072,7 +4064,7 @@ their own entry, not with current rates.
   BF16's 98, the pair alone 8.6-10.3 µs against 10.9-11.7 at 1-8 rows but
   89-95 µs against 50 at 64, and 23.6 MB of codes (plus 0.8 or 3.1 MB of
   scales) in place of 47 MB.
-- `--mtp-depth 4` once five-row verify blocks cost 73.7 against four rows'
+- Depth 4 once five-row verify blocks cost 73.7 against four rows'
   72.2 ms: 36.4 against 36.2-36.5 tok/s on the planets prompt and 87.1
   against 89.5 on a copy-edit prompt.
 - Tensor Q8 attention that round-trips the P·V result through threadgroup
@@ -4128,7 +4120,8 @@ their own entry, not with current rates.
   between tokens 0.25–0.78 ms per token unpipelined (0.25–0.31 with the CPU
   quiet), 0.013–0.031 ms pipelined; wall time per token moved by 0.03–1.1 ms
   (best 33.17 to 32.84 ms) while GPU busy time moved 1.7 ms between rounds.
-  `tools/benchmark.py --no-speculation`, 300 tokens, the two builds
+  `tools/benchmark.py` without speculation (an option since removed),
+  300 tokens, the two builds
   interleaved, best of four (load average 4–8 of 14 from other agents' jobs):
 
   | Prompt | One pass at a time | Pipelined |

@@ -668,7 +668,7 @@ impl Background {
     /// read again; one that ended meanwhile, or whose journal already ends,
     /// is settled from that end; one that cannot be regenerated (no stored
     /// request, a conversation, a request this server refuses or an engine
-    /// error) is settled `failed`, saying why. `thinking`, `cipher` and
+    /// error) is settled `failed`, saying why. `cipher` and
     /// `summarizer` (which runs a requested reasoning summary) are this
     /// server's, as for a new request; `submit` also gets the rebuilt reply,
     /// for a Response whose hosted tools need their loop. `submit` queues the request on
@@ -679,7 +679,7 @@ impl Background {
         self: &Arc<Self>,
         store: &Arc<ResponseStore>,
         id: &str,
-        (thinking, cipher, summarizer): (bool, Option<&Arc<ReasoningCipher>>, Option<&Summarizer>),
+        (cipher, summarizer): (Option<&Arc<ReasoningCipher>>, Option<&Summarizer>),
         submit: impl FnOnce(ChatRequest, &Reply) -> crate::Result<(N, S, Option<Admitted>)>,
     ) -> Result<Resumed, Failure>
     where
@@ -737,11 +737,10 @@ impl Background {
                 }
             }
         }
-        let (request, reply) =
-            match prepare_resumed(&stored, request, (thinking, summarizer), store, cipher) {
-                Ok(prepared) => prepared,
-                Err(error) => return settle(&error.to_string()),
-            };
+        let (request, reply) = match prepare_resumed(&stored, request, summarizer, store, cipher) {
+            Ok(prepared) => prepared,
+            Err(error) => return settle(&error.to_string()),
+        };
         let Protocol::Responses(echo) = &reply.protocol else {
             return settle("it is not a Response");
         };

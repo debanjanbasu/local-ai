@@ -80,7 +80,6 @@ const MAX_GENERATION_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 struct Args {
     host: IpAddr,
     port: u16,
-    thinking: bool,
     api_key: Option<String>,
     /// How long a client may stop consuming before its generation is dropped.
     stall: Duration,
@@ -107,7 +106,6 @@ struct AppState {
     /// admitted them at load (`BonsaiInfo::context`). Requests over it fail
     /// with a context-overflow error rather than being truncated.
     context: usize,
-    thinking: bool,
     /// Who may call: the `--api-key` key and the opt-in admin store's keys.
     auth: Arc<admin::Gate>,
     /// Which browser requests are admitted (DNS rebinding and cross-site
@@ -117,8 +115,8 @@ struct AppState {
     depth: QueueDepth,
     /// How long a client may stop consuming before its generation is dropped.
     stall: Duration,
-    /// The opt-in Responses store; `None` serves Responses statelessly.
-    responses: Option<Arc<ResponseStore>>,
+    /// The Responses store (the user's data directory or `--response-store`).
+    responses: Arc<ResponseStore>,
     cipher: Option<Arc<ReasoningCipher>>,
     /// Background Responses running on this server.
     background: Arc<Background>,
@@ -451,7 +449,7 @@ async fn dispatch(
         }
     };
     // Off the runtime: resolving `previous_response_id` reads the store.
-    let (thinking, store) = (state.thinking, state.responses.clone());
+    let store = Arc::clone(&state.responses);
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
     let temporary = state.temporary.clone();
     let services = state
@@ -464,8 +462,7 @@ async fn dispatch(
         let counted = tokio::task::spawn_blocking(move || {
             let request = responses::prepare_input_tokens_conversing(
                 &body,
-                thinking,
-                store.as_ref(),
+                Some(&store),
                 (services.as_ref(), owner.as_deref()),
                 cipher.as_ref(),
                 &model,
@@ -504,8 +501,7 @@ async fn dispatch(
             prepare_retaining(
                 api,
                 &body,
-                thinking,
-                (store.as_ref(), temporary.as_ref()),
+                (Some(&store), temporary.as_ref()),
                 (services.as_ref(), owner.as_deref()),
                 cipher.as_ref(),
                 &model,
@@ -805,7 +801,7 @@ async fn stream_events(
         let background = &state.background;
         let located = locate(
             state.temporary.as_ref(),
-            state.responses.as_ref(),
+            Some(&state.responses),
             background,
             &id,
             project.as_deref(),
@@ -874,20 +870,11 @@ fn generation_api(method: &Method, path: &str) -> Option<Api> {
 fn prepare(
     api: Api,
     body: &[u8],
-    thinking: bool,
     store: Option<&Arc<ResponseStore>>,
     cipher: Option<&Arc<ReasoningCipher>>,
     model: &str,
 ) -> crate::Result<(bool, ChatRequest, Protocol)> {
-    prepare_retaining(
-        api,
-        body,
-        thinking,
-        (store, None),
-        (None, None),
-        cipher,
-        model,
-    )
+    prepare_retaining(api, body, (store, None), (None, None), cipher, model)
 }
 
 /// Parse a request body for `api` into the engine request and how to answer
@@ -897,7 +884,6 @@ fn prepare(
 fn prepare_retaining(
     api: Api,
     body: &[u8],
-    thinking: bool,
     (store, temporary): (Option<&Arc<ResponseStore>>, Option<&Arc<Temporary>>),
     (conversations, project): (Option<&local_services::Store>, Option<&str>),
     cipher: Option<&Arc<ReasoningCipher>>,
@@ -905,7 +891,7 @@ fn prepare_retaining(
 ) -> crate::Result<(bool, ChatRequest, Protocol)> {
     match api {
         Api::Chat => {
-            let prepared = request::prepare_generation_with(body, thinking, conversations)?;
+            let prepared = request::prepare_generation_with(body, conversations)?;
             let protocol = Protocol::Chat {
                 include_usage: prepared.include_usage,
                 logprobs: prepared.request.sampling.0.logprobs.is_some(),
@@ -915,7 +901,6 @@ fn prepare_retaining(
         Api::Responses => {
             let prepared = prepare_responses_conversing(
                 body,
-                thinking,
                 store,
                 temporary,
                 (conversations, project),
@@ -956,10 +941,6 @@ async fn stored_response(
         }
     };
     let not_found = format!("response with id {id:?} not found");
-    if state.responses.is_none() && state.temporary.is_none() {
-        let message = format!("{not_found}: this server was started without --response-store");
-        return error_response(StatusCode::NOT_FOUND, &message, state, headers).await;
-    }
     let outcome = match stored_request(method, items, query) {
         Ok(Retrieval::Stream(after)) => {
             let Ok(slot) = state.subscribers.clone().try_acquire_owned() else {
@@ -971,13 +952,13 @@ async fn stored_response(
             let page = retrieval.into_page();
             let (id, method) = (id.to_owned(), method.clone());
             let background = Arc::clone(&state.background);
-            let (temporary, durable) = (state.temporary.clone(), state.responses.clone());
+            let (temporary, durable) = (state.temporary.clone(), Arc::clone(&state.responses));
             let resuming = state.clone();
             let project = project.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 let located = locate(
                     temporary.as_ref(),
-                    durable.as_ref(),
+                    Some(&durable),
                     &background,
                     &id,
                     project.as_deref(),
@@ -1040,7 +1021,7 @@ fn resume_background(
     let resumed = state.background.resume(
         store,
         id,
-        (state.thinking, state.cipher.as_ref(), Some(&summarizer)),
+        (state.cipher.as_ref(), Some(&summarizer)),
         move |mut request, reply| {
             let tool_loop = match &reply.protocol {
                 Protocol::Responses(echo) => responses_loop(state, echo, &reply.id, &mut request)
@@ -1300,8 +1281,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         })?));
     // Opened before the model loads, so a bad directory fails in milliseconds.
     let responses = match &args.response_store {
-        options::ResponseStoreArg::Off => None,
-        options::ResponseStoreArg::Dir(dir) => Some(open_responses(dir)?),
+        options::ResponseStoreArg::Dir(dir) => open_responses(dir)?,
         options::ResponseStoreArg::Default => {
             let store = open_responses(&services::data_dir()?.join("responses"))?;
             match store.prune(RESPONSE_RETENTION) {
@@ -1312,7 +1292,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
                 ),
                 Err(error) => eprintln!("warning: old stored responses were not pruned: {error}"),
             }
-            Some(store)
+            store
         }
     };
     // Hosted tools are opened before the model loads too, so a bad root or
@@ -1370,7 +1350,6 @@ async fn run_async(args: Args) -> crate::Result<()> {
         model,
         created: response::unix_now(),
         context,
-        thinking: args.thinking,
         auth: Arc::new(admin::Gate::new(
             Some(Arc::new(local_services::admin::Admin::new(
                 services.store().clone(),
@@ -1422,9 +1401,8 @@ async fn run_async(args: Args) -> crate::Result<()> {
         eprintln!("warning: temporary responses expire only when accessed: {error}");
     }
     // Before serving, so a client finds every resumed job already running.
-    if let Some(store) = state.responses.clone() {
-        resume_interrupted(&state, &store).await;
-    }
+    let store = Arc::clone(&state.responses);
+    resume_interrupted(&state, &store).await;
     admin::announce(&state.auth, args.host);
     eprintln!("Bonsai server listening on http://{address}");
     let background = Arc::clone(&state.background);

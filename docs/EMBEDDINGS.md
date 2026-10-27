@@ -248,7 +248,7 @@ Corpus embedding during the retrieval runs: 7,700–8,200 tokens/s on SciFact an
 walks keys one at a time per head, quadratic in the input, which is why 2,048-token inputs run at
 a third of the short-input rate.
 
-Effect on concurrent Bonsai decode (server, `--no-thinking`, greedy, 300-token answers, a
+Effect on concurrent Bonsai decode (server, reasoning off, greedy, 300-token answers, a
 different prompt per request so suffix lookup cannot copy an earlier answer, conditions
 alternated over eight prompts; the load is a loop of 64-document SciFact embedding requests):
 

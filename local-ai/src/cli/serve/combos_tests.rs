@@ -73,7 +73,7 @@ fn prepared(
     store: &Arc<ResponseStore>,
     cipher: Option<&Arc<ReasoningCipher>>,
 ) -> PreparedResponses {
-    prepare_responses_with(body.to_string().as_bytes(), true, Some(store), cipher, "m")
+    prepare_responses_with(body.to_string().as_bytes(), Some(store), cipher, "m")
         .expect("request accepted")
 }
 
@@ -138,7 +138,7 @@ fn resume(
 ) -> (Arc<Background>, Pump) {
     let background = Arc::new(Background::default());
     let resumed = background
-        .resume(store, id, (true, cipher, summary), |request, _: &Reply| {
+        .resume(store, id, (cipher, summary), |request, _: &Reply| {
             asked.lock().expect("log").push(request);
             Ok((script(regenerated()), || {}, None))
         })
@@ -690,7 +690,7 @@ async fn the_hosted_tool_marker_is_recorded_once_before_any_call_runs() {
     .expect("toolbox");
     let body = json!({"input":"hi","tools":[{"type":"function","name":"local_fs_write"}]});
     let make = |before: super::tool_loop::BeforeTools| {
-        let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("prepared");
+        let prepared = prepare_responses(body.to_string().as_bytes()).expect("prepared");
         let first = generation(vec![
             write_call("a"),
             write_call("b"),

@@ -32,8 +32,8 @@ pub enum DflashMode {
     Auto,
     /// Use this artifact; its absence is an error.
     Drafter(PathBuf),
-    /// Never draft with `DFlash2`, for this reason (for example
-    /// `--no-speculation`).
+    /// Never draft with `DFlash2`, for this reason (the plain-decoding
+    /// reference of developer tools and tests; no command-line flag).
     Off(String),
 }
 

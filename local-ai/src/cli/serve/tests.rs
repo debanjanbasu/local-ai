@@ -18,15 +18,31 @@ fn args(values: &[&str]) -> Vec<String> {
 }
 #[test]
 fn defaults_and_bounds() {
-    let parsed = parse(&args(&["--no-thinking"])).expect("options");
-    assert!(!parsed.thinking);
+    let parsed = parse(&args(&[])).expect("defaults");
+    assert_eq!(parsed.port, 8080);
+    // Nothing can be turned off or tuned: every removed opt-out and tuning
+    // flag is a plain unknown option, with or without a value.
     for invalid in [
         vec!["--context", "4096"],
         vec!["--prefill-chunk", "128"],
         vec!["--max-queue", "8"],
+        vec!["--kv-cache", "q8"],
+        vec!["--kv-initial", "1024"],
+        vec!["--attention-kernel", "simd"],
+        vec!["--prompt-cache-checkpoints", "2"],
         vec!["--http3"],
+        vec!["--no-thinking"],
+        vec!["--no-speculation"],
+        vec!["--no-mtp"],
+        vec!["--no-ngram"],
+        vec!["--mtp-depth", "2"],
+        vec!["--no-response-store"],
+        vec!["--decisions-artifact", "models/decisions-v2"],
     ] {
-        assert!(parse(&args(&invalid)).is_err());
+        assert_eq!(
+            parse(&args(&invalid)).expect_err(invalid[0]),
+            format!("unknown option: {}", invalid[0])
+        );
     }
 }
 #[test]
@@ -74,12 +90,14 @@ fn allowed_hosts_are_normalized_names() {
     assert!(parse(&args(&["--allow-host"])).is_err());
 }
 #[test]
-fn thinking_is_not_a_flag_because_it_already_is_the_default() {
-    // Reasoning is on unless the flag turns it off, so a positive spelling
-    // could only ever be a no-op. The parser used to accept it anyway, which
-    // made it a flag that silently did nothing while the help never listed it.
-    let error = parse(&args(&["--thinking"])).expect_err("rejected");
-    assert_eq!(error, "unknown option: --thinking", "{error}");
+fn thinking_is_not_a_flag_because_it_is_always_on() {
+    // Reasoning is the server's default and no flag turns it off; requests
+    // choose their own effort (`reasoning_effort`, `reasoning.effort`,
+    // `chat_template_kwargs.enable_thinking`).
+    for flag in ["--thinking", "--no-thinking"] {
+        let error = parse(&args(&[flag])).expect_err("rejected");
+        assert_eq!(error, format!("unknown option: {flag}"), "{error}");
+    }
 }
 #[test]
 fn image_parts_keep_their_place_in_the_text() {
@@ -639,8 +657,7 @@ fn serve_real_bonsai_validates_before_streaming_and_preserves_history() {
         json!({"messages":user, "stream":true, "temperature":-1}),
         json!({"messages":user, "stream":true, "max_completion_tokens":usize::MAX}),
     ] {
-        let prepared =
-            prepare_generation(body.to_string().as_bytes(), true).expect("parse request");
+        let prepared = prepare_generation(body.to_string().as_bytes()).expect("parse request");
         // Refused before any token: a prompt that cannot be rendered fails the
         // submission itself (it is rendered there), invalid parameters and an
         // oversized output fail as the stream's first event. HTTP answers both
@@ -658,7 +675,7 @@ fn serve_real_bonsai_validates_before_streaming_and_preserves_history() {
             {"role":"assistant","content":"Answer","reasoning_content":"prior reasoning"},
             {"role":"user","content":"Second"}
         ], "max_completion_tokens":0});
-    let request = prepare_generation(body.to_string().as_bytes(), true)
+    let request = prepare_generation(body.to_string().as_bytes())
         .expect("prepare history")
         .request;
     assert!(

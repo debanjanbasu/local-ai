@@ -35,7 +35,7 @@ pub const MAX_MTP_DEPTH: usize = 4;
 /// at 81 %; depths 2 and 4 peak in the same 4–6 band. A stricter margin for
 /// later drafts (3 then 5, 4 then 6, or 2/4/6 and 3/4/6 at depth 4) never beat
 /// a flat 4 (38.1–38.5 against 38.6), so one margin serves every step. The
-/// default matched `--no-speculation` token for token on all six prompts;
+/// default matched plain decoding token for token on all six prompts;
 /// some non-default settings (depth 2 or 4 ungated, depth 4 at margin 2 or 4)
 /// did not, each on one prompt, apparently a near-tie that a different verify
 /// row count resolves the other way.
@@ -79,8 +79,8 @@ pub const DEFAULT_BONSAI_MTP_ARTIFACT: &str = concat!(
 ///
 /// Greedy tokens were identical with and without the head on every measured
 /// case; only the cost moved. On the M4 Pro the gated depth-3 default
-/// decodes at 20–26 tok/s against 17.5 plain. Speculation is therefore on
-/// by default; `bonsai --no-speculation` opts out for A/B runs.
+/// decodes at 20–26 tok/s against 17.5 plain. Speculation is therefore on,
+/// and no command-line flag turns it off.
 ///
 /// Only the [`MtpMode::Auto`] arm reads this, and
 /// [`Resources::discover`](crate::resources::Resources::discover) never builds an
@@ -93,19 +93,16 @@ pub const DEFAULT_MTP_ENABLED: bool = true;
 /// The record an `Off` mode falls back to when its constructor recorded none.
 ///
 /// `Off` carries its own reason, so a caller that knows why it turned speculation
-/// off — `Resources::discover` does, for both an explicit opt-out and a missing
-/// install — says so instead of landing here. The request is the remaining way to
-/// reach `Off`, and `--no-speculation` is the flag that asks for it: the CLI
-/// rejects `--no-mtp` as an unknown option, so naming that would name a flag no
-/// user can pass.
-pub const MTP_OFF_REASON: &str = "speculation disabled by request (--no-speculation)";
+/// off — `Resources::discover` does, for its plain-decoding reference — says so
+/// instead of landing here. No command-line flag reaches `Off`: it is the
+/// library's plain-decoding reference for developer tools and tests.
+pub const MTP_OFF_REASON: &str = "speculation off by request (plain-decoding reference)";
 
 /// Why `Auto` leaves speculation disabled when the build default is off.
 ///
-/// No flag re-enables it. `--no-speculation` is the only one that reaches the
-/// policy at all, and it asks for `Off`, which reports [`MTP_OFF_REASON`]
-/// instead; the CLI rejects `--mtp` as an unknown option, so naming that would
-/// name a flag no user can pass. [`DEFAULT_MTP_ENABLED`] is a compile-time
+/// No flag re-enables it: no command-line flag reaches the policy at all (the
+/// CLI rejects `--mtp` as an unknown option, so naming that would name a flag
+/// no user can pass). [`DEFAULT_MTP_ENABLED`] is a compile-time
 /// constant, so turning it back on means a build that sets it true, or naming
 /// the head directly with [`MtpMode::Head`], which skips this policy.
 ///

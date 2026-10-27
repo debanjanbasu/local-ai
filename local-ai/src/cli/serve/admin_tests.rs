@@ -1064,7 +1064,7 @@ async fn a_background_job_is_recorded_once_before_it_settles() {
     let store = scratch.open();
     let background = Arc::new(Background::default());
     let body = json!({"input":"hi","background":true}).to_string();
-    let prepared = prepare_responses_with(body.as_bytes(), true, Some(&store), None, "m").unwrap();
+    let prepared = prepare_responses_with(body.as_bytes(), Some(&store), None, "m").unwrap();
     let reply = Reply::new(Protocol::Responses(Arc::new(prepared.echo)), "m".into());
     let (source, events) = EventStream::relay();
     let queued = background::start(

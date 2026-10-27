@@ -234,7 +234,7 @@ after 0.73 s, all after 2.91 s (RTF 0.024). All 90 fixture syntheses (3 modes
 
 ### Beside Bonsai decode
 
-Server, `--no-thinking`, greedy, 300-token answers, a different prompt per
+Server, reasoning off, greedy, 300-token answers, a different prompt per
 request, conditions alternated over eight prompts; the load is a loop of
 `pcm` speech requests of 44 s of audio each (`.scratch/decode_bench.py`,
 under the shared GPU lock):

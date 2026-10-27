@@ -251,14 +251,14 @@ fn explicit_head_overrides_the_default() {
 /// `Off` carries the reason its own constructor recorded, so the record is
 /// carried rather than re-derived.
 ///
-/// Discovery builds `Off` for `--no-speculation` with its own reason; a mode
+/// Discovery builds `Off` for its plain-decoding reference with its own reason; a mode
 /// with no payload would report the generic opt-out text instead.
 #[test]
 fn off_reports_the_reason_it_carried() {
     let dir = tempfile::tempdir().expect("tempdir");
     let installed = dir.path().join(MTP_HEAD_ARTIFACT);
     std::fs::write(&installed, b"stub").expect("write head");
-    let absent = "disabled by --no-speculation";
+    let absent = "speculation off: plain-decoding reference";
 
     // The reason discovery recorded is reported verbatim.
     assert_eq!(

@@ -20,19 +20,19 @@ use super::response::{Protocol, Reply};
 use super::responses::{ResponsesState, prepare_responses};
 use super::sse::Frames;
 
-fn chat_request(body: &Value, thinking: bool) -> crate::Result<ChatRequest> {
-    Ok(prepare_generation(body.to_string().as_bytes(), thinking)?.request)
+fn chat_request(body: &Value) -> crate::Result<ChatRequest> {
+    Ok(prepare_generation(body.to_string().as_bytes())?.request)
 }
 
 fn chat_error(body: &Value) -> String {
-    chat_request(body, true)
+    chat_request(body)
         .err()
         .map(|error| error.to_string())
         .unwrap_or_default()
 }
 
 fn responses_error(body: &Value) -> String {
-    prepare_responses(body.to_string().as_bytes(), true)
+    prepare_responses(body.to_string().as_bytes())
         .err()
         .map(|error| error.to_string())
         .unwrap_or_default()
@@ -86,7 +86,7 @@ fn chat_parses_tools_history_and_nullable_content() {
         "prompt_cache_key":"cache",
         "safety_identifier":"user-1"
     });
-    let request = chat_request(&body, true).expect("valid chat request");
+    let request = chat_request(&body).expect("valid chat request");
     assert_eq!(request.max_tokens, 20);
     assert_eq!(request.session.as_deref(), Some("cache"));
     assert_eq!(request.tools.len(), 2);
@@ -108,10 +108,10 @@ fn chat_parses_tools_history_and_nullable_content() {
 #[test]
 fn chat_session_is_prompt_cache_key_alone() {
     let request =
-        chat_request(&json!({"messages":[user()],"prompt_cache_key":"k"}), true).expect("valid");
+        chat_request(&json!({"messages":[user()],"prompt_cache_key":"k"})).expect("valid");
     assert_eq!(request.session.as_deref(), Some("k"));
     assert_eq!(
-        chat_request(&json!({"messages":[user()]}), true)
+        chat_request(&json!({"messages":[user()]}))
             .expect("valid")
             .session,
         None
@@ -127,7 +127,7 @@ fn chat_honours_max_tokens_and_seed() {
         body.as_object_mut()
             .expect("object")
             .extend(extra.as_object().expect("object").clone());
-        chat_request(&body, true)
+        chat_request(&body)
     };
     assert_eq!(with(json!({"max_tokens":7})).expect("valid").max_tokens, 7);
     assert_eq!(
@@ -152,7 +152,6 @@ fn chat_accepts_local_server_extensions() {
     let request = chat_request(
         &json!({"messages":[user()],"frequency_penalty":0.5,"repetition_penalty":1.3,
                 "chat_template_kwargs":{"enable_thinking":false}}),
-        true,
     )
     .expect("valid");
     assert!((request.sampling.0.repetition_penalty - 1.3).abs() < f32::EPSILON);
@@ -160,11 +159,8 @@ fn chat_accepts_local_server_extensions() {
         !request.thinking,
         "enable_thinking false turns reasoning off"
     );
-    let request = chat_request(
-        &json!({"messages":[user()],"reasoning_effort":"low",
-                "chat_template_kwargs":{"enable_thinking":true}}),
-        true,
-    )
+    let request = chat_request(&json!({"messages":[user()],"reasoning_effort":"low",
+                "chat_template_kwargs":{"enable_thinking":true}}))
     .expect("valid");
     assert_eq!(
         request.thinking.then_some(request.effort),
@@ -174,12 +170,9 @@ fn chat_accepts_local_server_extensions() {
 
 #[test]
 fn chat_reasoning_effort_runs_at_the_nearest_template_level() {
-    let effort = |effort: &str, server: bool| {
-        chat_request(
-            &json!({"messages":[user()],"reasoning_effort":effort}),
-            server,
-        )
-        .map(|request| request.thinking.then_some(request.effort))
+    let effort = |effort: &str| {
+        chat_request(&json!({"messages":[user()],"reasoning_effort":effort}))
+            .map(|request| request.thinking.then_some(request.effort))
     };
     for (requested, level) in [
         ("none", None),
@@ -189,23 +182,19 @@ fn chat_reasoning_effort_runs_at_the_nearest_template_level() {
         ("high", Some(ReasoningEffort::XHigh)),
         ("xhigh", Some(ReasoningEffort::XHigh)),
     ] {
-        assert_eq!(
-            effort(requested, true).expect(requested),
-            level,
-            "{requested}"
-        );
-    }
-    assert_eq!(effort("none", false).expect("none without thinking"), None);
-    for requested in ["low", "xhigh"] {
-        let error = effort(requested, false).expect_err("operator disabled thinking");
-        assert!(error.to_string().contains("--no-thinking"), "{error}");
+        assert_eq!(effort(requested).expect(requested), level, "{requested}");
     }
     for invalid in ["max", "bogus"] {
-        let error = effort(invalid, true).expect_err(invalid);
+        let error = effort(invalid).expect_err(invalid);
         assert!(error.to_string().contains("reasoning effort"), "{error}");
     }
-    assert!(
-        chat_request(&json!({"messages":[user()]}), false).is_ok_and(|request| !request.thinking)
+    // Thinking is the server's default: a request without an effort reasons
+    // at xhigh.
+    assert_eq!(
+        chat_request(&json!({"messages":[user()]}))
+            .map(|request| request.thinking.then_some(request.effort))
+            .expect("default"),
+        Some(ReasoningEffort::XHigh)
     );
 }
 
@@ -223,7 +212,7 @@ fn responses_input_images_keep_their_place_and_detail() {
             {"type":"input_image","image_url":"data:image/png;base64,UE5H"},
         ]},
     ],"tools":[{"type":"function","name":"look","parameters":{"type":"object"}}]});
-    let request = prepare_responses(body.to_string().as_bytes(), true)
+    let request = prepare_responses(body.to_string().as_bytes())
         .expect("valid")
         .request;
     let images = request
@@ -276,7 +265,7 @@ fn responses_input_images_keep_their_place_and_detail() {
 fn responses_reasoning_context_and_effort_reach_the_engine() {
     let prepare = |reasoning: Value| {
         let body = json!({"input":"hi","reasoning":reasoning});
-        let request = prepare_responses(body.to_string().as_bytes(), true)
+        let request = prepare_responses(body.to_string().as_bytes())
             .expect("valid")
             .request;
         (
@@ -305,11 +294,8 @@ fn allowed_tools_choices_reach_the_engine_on_both_apis() {
         {"type":"function","function":{"name":"time"}}
     ]);
     let chat = |choice: Value| {
-        chat_request(
-            &json!({"messages":[user()],"tools":chat_tools,"tool_choice":choice}),
-            true,
-        )
-        .map(|request| request.tool_choice)
+        chat_request(&json!({"messages":[user()],"tools":chat_tools,"tool_choice":choice}))
+            .map(|request| request.tool_choice)
     };
     assert_eq!(
         chat(
@@ -336,7 +322,7 @@ fn allowed_tools_choices_reach_the_engine_on_both_apis() {
     ],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[
         {"type":"function","name":"weather"},{"type":"custom","name":"patch"}
     ]}});
-    let request = prepare_responses(body.to_string().as_bytes(), true)
+    let request = prepare_responses(body.to_string().as_bytes())
         .expect("valid")
         .request;
     assert_eq!(
@@ -355,10 +341,7 @@ fn chat_tool_choice_maps_onto_the_native_choice() {
         {"type":"function","function":{"name":"time"}}
     ]);
     let choose = |choice: Value| {
-        chat_request(
-            &json!({"messages":[user()],"tools":tools,"tool_choice":choice}),
-            true,
-        )
+        chat_request(&json!({"messages":[user()],"tools":tools,"tool_choice":choice}))
     };
     for (choice, native) in [
         (Value::Null, ToolChoice::Auto),
@@ -377,7 +360,7 @@ fn chat_tool_choice_maps_onto_the_native_choice() {
         assert_eq!(request.tools.len(), 2, "{choice}");
         assert!(request.parallel_tool_calls, "parallel calls by default");
     }
-    let request = chat_request(&json!({"messages":[user()]}), true).expect("no tools");
+    let request = chat_request(&json!({"messages":[user()]})).expect("no tools");
     assert_eq!(request.tool_choice, ToolChoice::Auto);
     assert_eq!(request.tools, []);
 }
@@ -443,7 +426,7 @@ fn chat_tool_choice_shape_is_exact_and_checked_against_tools() {
     assert!(error.contains("not declared in tools"), "{error}");
     // Without tools, `auto` and `none` change nothing and stay accepted.
     for choice in ["auto", "none"] {
-        assert!(chat_request(&json!({"messages":[user()],"tool_choice":choice}), true).is_ok());
+        assert!(chat_request(&json!({"messages":[user()],"tool_choice":choice})).is_ok());
     }
 }
 
@@ -457,17 +440,13 @@ fn chat_parallel_tool_calls_and_strict_reach_the_engine() {
         {"type":"function","function":{"name":"noop","strict":null}},
         {"type":"function","function":{"name":"plain"}}
     ]});
-    let request = chat_request(&body, true).expect("valid");
+    let request = chat_request(&body).expect("valid");
     assert!(!request.parallel_tool_calls);
     let strict: Vec<bool> = request.tools.iter().map(|tool| tool.strict).collect();
     assert_eq!(strict, [true, false, false, false]);
     let mut parallel = body;
     parallel["parallel_tool_calls"] = json!(true);
-    assert!(
-        chat_request(&parallel, true)
-            .expect("valid")
-            .parallel_tool_calls
-    );
+    assert!(chat_request(&parallel).expect("valid").parallel_tool_calls);
     let error = chat_error(&json!({"messages":[user()],"tools":[
         {"type":"function","function":{"name":"f","strict":"yes"}}]}));
     assert!(error.contains("invalid JSON request"), "{error}");
@@ -512,7 +491,7 @@ fn chat_rejects_options_it_cannot_honour() {
     let accepted = json!({"messages":[user()],"n":1,"stop":null,"logprobs":false,
         "response_format":{"type":"text"},"parallel_tool_calls":true,"service_tier":"auto",
         "stream":null});
-    assert!(chat_request(&accepted, true).is_ok());
+    assert!(chat_request(&accepted).is_ok());
 }
 
 /// `stop` is the engine's stop sequences; `verbosity` `low` and `high`
@@ -525,7 +504,7 @@ fn chat_maps_stop_and_verbosity() {
         body.as_object_mut()
             .expect("object")
             .extend(extra.as_object().expect("object").clone());
-        chat_request(&body, true).expect("valid")
+        chat_request(&body).expect("valid")
     };
     assert_eq!(with(json!({})).stop, Vec::<String>::new());
     assert_eq!(with(json!({"stop":"END"})).stop, ["END"]);
@@ -553,7 +532,7 @@ fn chat_maps_stop_and_verbosity() {
     }
     assert_ne!(lengths[0], lengths[1]);
     // With no instructions of its own, the instruction is the system turn.
-    let bare = chat_request(&json!({"messages":[user()],"verbosity":"low"}), true).expect("valid");
+    let bare = chat_request(&json!({"messages":[user()],"verbosity":"low"})).expect("valid");
     assert_eq!(roles(&bare)[0], ("system".to_owned(), lengths[0].clone()));
     // A stop sequence that ends the text after calls still reports them.
     assert_eq!(
@@ -968,7 +947,7 @@ fn responses_parse_instructions_history_and_tools() {
         "metadata":{"a":"b"},
         "temperature":0.5
     });
-    let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("valid");
+    let prepared = prepare_responses(body.to_string().as_bytes()).expect("valid");
     let request = prepared.request;
     assert!(!prepared.stream);
     assert!(!request.thinking);
@@ -1000,7 +979,6 @@ fn responses_string_input_is_one_user_message_and_instructions_lead() {
             "x-codex-turn-metadata":"{\"turn_id\":\"turn-1\"}"}})
         .to_string()
         .as_bytes(),
-        true,
     )
     .expect("valid");
     let roles: Vec<(&str, &str)> = prepared
@@ -1022,7 +1000,7 @@ fn responses_string_input_is_one_user_message_and_instructions_lead() {
 #[test]
 fn responses_accept_truncation_and_sampling_extensions() {
     let prepared =
-        |body: Value| prepare_responses(body.to_string().as_bytes(), true).expect("valid request");
+        |body: Value| prepare_responses(body.to_string().as_bytes()).expect("valid request");
     for truncation in ["disabled", "auto"] {
         let _ = prepared(json!({"input":"hi","truncation":truncation}));
     }
@@ -1133,18 +1111,18 @@ fn responses_reject_what_they_cannot_honour() {
         "background":false,"include":[],"text":{"format":{"type":"text"}},
         "tool_choice":"auto","parallel_tool_calls":true,"service_tier":"default",
         "reasoning":{"effort":"xhigh","summary":null},"conversation":null,"client_metadata":null});
-    assert!(prepare_responses(accepted.to_string().as_bytes(), true).is_ok());
+    assert!(prepare_responses(accepted.to_string().as_bytes()).is_ok());
     // Members this server does not know are ignored, as on Chat, at the top
     // level and inside the objects it reads.
     let vendor = json!({"input":"hi","frobnicate":1,"client_metadata":[],"extra_body":{"x":1},
         "reasoning":{"effort":"low","vendor":true},"text":{"verbosity":"low","vendor":1},
         "stream_options":{"vendor":1}});
-    let prepared = prepare_responses(vendor.to_string().as_bytes(), true).expect("ignored");
+    let prepared = prepare_responses(vendor.to_string().as_bytes()).expect("ignored");
     assert_eq!(prepared.request.effort, ReasoningEffort::Low);
 }
 
 fn responses_reply(body: &Value) -> Reply {
-    let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("valid");
+    let prepared = prepare_responses(body.to_string().as_bytes()).expect("valid");
     Reply {
         protocol: Protocol::Responses(Arc::new(prepared.echo)),
         id: "resp_abc".into(),
@@ -1438,7 +1416,7 @@ fn responses_accept_an_oh_my_pi_read_and_tool_result_turn() {
         {"type":"input_text","text":"Read main.rs and tell me what it prints."}
     ]});
     let first = omp_turn("xhigh", &json!([prompt]));
-    let prepared = prepare_responses(first.to_string().as_bytes(), true).expect("first turn");
+    let prepared = prepare_responses(first.to_string().as_bytes()).expect("first turn");
     assert!(prepared.stream);
     assert!(prepared.request.thinking);
     assert_eq!(
@@ -1486,7 +1464,7 @@ fn responses_accept_an_oh_my_pi_read_and_tool_result_turn() {
 
     // The user turned thinking off before the tool result went back.
     let second = omp_turn("none", &Value::Array(input));
-    let request = prepare_responses(second.to_string().as_bytes(), true)
+    let request = prepare_responses(second.to_string().as_bytes())
         .expect("tool-result turn")
         .request;
     assert!(!request.thinking);
@@ -1550,7 +1528,6 @@ fn route_preparation_maps_each_api_to_its_protocol() {
     let (stream, request, protocol) = prepare(
         super::Api::Responses,
         br#"{"input":"hi","stream":true}"#,
-        true,
         None,
         None,
         "m",
@@ -1562,7 +1539,6 @@ fn route_preparation_maps_each_api_to_its_protocol() {
     let (_, _, protocol) = prepare(
         super::Api::Chat,
         br#"{"messages":[{"role":"user","content":"x"}],"stream":true,"stream_options":{"include_usage":true}}"#,
-        true,
         None,
         None,
         "m",
@@ -1657,10 +1633,10 @@ fn chat_response_format_maps_onto_the_native_format() {
     let format = |format: Value| {
         let mut body = json!({"messages":[user()]});
         body["response_format"] = format;
-        chat_request(&body, true).map(|request| request.response_format)
+        chat_request(&body).map(|request| request.response_format)
     };
     assert_eq!(
-        chat_request(&json!({"messages":[user()]}), true)
+        chat_request(&json!({"messages":[user()]}))
             .expect("valid")
             .response_format,
         ResponseFormat::Text
@@ -1764,7 +1740,7 @@ fn structured_formats_combine_with_tools_and_every_choice() {
     ] {
         let body = json!({"messages":[user()],"tools":tools,"tool_choice":choice,
             "response_format":{"type":"json_object"}});
-        let request = chat_request(&body, true).expect("tools with a format");
+        let request = chat_request(&body).expect("tools with a format");
         assert_eq!(request.tools.len(), 1, "{choice}");
         assert_eq!(request.response_format, ResponseFormat::JsonObject);
     }
@@ -1773,7 +1749,7 @@ fn structured_formats_combine_with_tools_and_every_choice() {
     for choice in [json!("auto"), json!("none"), json!("required")] {
         let body = json!({"input":"hi","tools":tools,"tool_choice":choice,
             "text":{"format":{"type":"json_schema","name":"w","schema":schema()}}});
-        let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("combined");
+        let prepared = prepare_responses(body.to_string().as_bytes()).expect("combined");
         assert_eq!(prepared.request.tools.len(), 1, "{choice}");
         assert_eq!(
             prepared.request.response_format,
@@ -1799,7 +1775,7 @@ fn responses_tool_policy_maps_onto_the_engine_and_is_echoed_as_accepted() {
         {"type":"function","name":"plain"}
     ]);
     let defaults = json!({"input":"hi","tools":tools});
-    let prepared = prepare_responses(defaults.to_string().as_bytes(), true).expect("valid");
+    let prepared = prepare_responses(defaults.to_string().as_bytes()).expect("valid");
     assert_eq!(prepared.request.tool_choice, ToolChoice::Auto);
     assert!(prepared.request.parallel_tool_calls);
     let strict: Vec<bool> = prepared
@@ -1830,7 +1806,7 @@ fn responses_tool_policy_maps_onto_the_engine_and_is_echoed_as_accepted() {
     ] {
         let body = json!({"input":"hi","tools":tools,"tool_choice":choice,
             "parallel_tool_calls":false});
-        let prepared = prepare_responses(body.to_string().as_bytes(), true).expect("valid");
+        let prepared = prepare_responses(body.to_string().as_bytes()).expect("valid");
         assert_eq!(prepared.request.tool_choice, native, "{choice}");
         assert!(!prepared.request.parallel_tool_calls);
         assert_eq!(prepared.request.tools.len(), 3, "tools stay declared");
@@ -1910,14 +1886,14 @@ fn responses_text_format_maps_and_is_echoed_as_accepted() {
         json!({"format":{"type":"text"},"verbosity":"medium"})
     );
     // `low` and `high` are echoed and asked for after the instructions.
-    let plain_messages = prepare_responses(plain.to_string().as_bytes(), true)
+    let plain_messages = prepare_responses(plain.to_string().as_bytes())
         .expect("valid")
         .request
         .messages;
     for level in ["low", "high"] {
         let body = json!({"input":"hi","instructions":"sys","text":{"verbosity":level}});
         assert_eq!(terminal(&body)["response"]["text"]["verbosity"], level);
-        let messages = prepare_responses(body.to_string().as_bytes(), true)
+        let messages = prepare_responses(body.to_string().as_bytes())
             .expect("valid")
             .request
             .messages;
@@ -1929,7 +1905,7 @@ fn responses_text_format_maps_and_is_echoed_as_accepted() {
         assert_eq!(messages[2].content, "hi");
     }
     let object = json!({"input":"hi","text":{"format":{"type":"json_object"}}});
-    let prepared = prepare_responses(object.to_string().as_bytes(), true).expect("valid");
+    let prepared = prepare_responses(object.to_string().as_bytes()).expect("valid");
     assert_eq!(prepared.request.response_format, ResponseFormat::JsonObject);
     assert_eq!(
         terminal(&object)["response"]["text"]["format"],
@@ -1938,7 +1914,7 @@ fn responses_text_format_maps_and_is_echoed_as_accepted() {
     // `strict` is reported as sent, `false` when omitted; enforced either way.
     let flat = json!({"input":"hi","text":{"format":{"type":"json_schema","name":"weather",
         "description":"A city.","schema":schema()},"verbosity":"medium"}});
-    let prepared = prepare_responses(flat.to_string().as_bytes(), true).expect("valid");
+    let prepared = prepare_responses(flat.to_string().as_bytes()).expect("valid");
     assert_eq!(
         prepared.request.response_format,
         ResponseFormat::JsonSchema(schema())
@@ -2092,13 +2068,7 @@ fn logprob(
 /// (Responses) ask the engine for that many alternatives.
 #[test]
 fn logprobs_requests_ask_for_their_alternatives() {
-    let with = |body: Value| {
-        chat_request(&body, true)
-            .expect("valid")
-            .sampling
-            .0
-            .logprobs
-    };
+    let with = |body: Value| chat_request(&body).expect("valid").sampling.0.logprobs;
     assert_eq!(with(json!({"messages":[user()]})), None);
     assert_eq!(with(json!({"messages":[user()],"logprobs":true})), Some(0));
     assert_eq!(
@@ -2106,7 +2076,7 @@ fn logprobs_requests_ask_for_their_alternatives() {
         Some(3)
     );
     let responses = |body: Value| {
-        prepare_responses(body.to_string().as_bytes(), true)
+        prepare_responses(body.to_string().as_bytes())
             .expect("valid")
             .request
             .sampling

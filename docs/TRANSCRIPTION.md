@@ -204,7 +204,7 @@ Speed (`transcription-eval bench`, GPU otherwise idle):
 | LibriSpeech subset (202 short files, 1,518 s) | 307 s: RTF 0.20 (each file pays a whole 30 s window) |
 | Reference on the Kaggle CPU (4 cores, FP32) | RTF 4.2 |
 
-Effect on concurrent Bonsai decode (server, `--no-thinking`, greedy,
+Effect on concurrent Bonsai decode (server, reasoning off, greedy,
 300-token answers, 24 different prompts used once each in A-B-B-A order so
 suffix lookup cannot copy an earlier answer; the load is a loop of 75 s
 `verbose_json` transcriptions started 1 s before each answer; the machine was

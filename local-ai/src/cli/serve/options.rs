@@ -20,8 +20,6 @@ pub(super) enum ResponseStoreArg {
     Default,
     /// `--response-store DIR`, kept until deleted.
     Dir(PathBuf),
-    /// `--no-response-store`: nothing is kept.
-    Off,
 }
 
 /// Hosted tool permissions and bounds. The default grants nothing.
@@ -94,15 +92,10 @@ pub(super) fn usage() {
          localhost and *.local/*.internal names (DNS rebinding protection; applies on loopback, \
          and elsewhere while authentication is off); repeatable"
     );
-    eprintln!("  --no-thinking      Disable thinking");
     eprintln!(
         "  --response-store DIR  Keep Responses API responses in DIR (owner-only, \
          unencrypted) until deleted (default: ~/Library/Application Support/local-ai/responses, \
          where responses older than 30 days are removed at startup)"
-    );
-    eprintln!(
-        "  --no-response-store  Keep no Responses (no retrieval or previous_response_id; \
-         background responses are kept temporarily)"
     );
     eprintln!(
         "  --reasoning-key FILE  Owner-only key for encrypted reasoning and compaction, created \
@@ -147,7 +140,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
     let mut parsed = Args {
         host: "127.0.0.1".parse().map_err(|_| "invalid default host")?,
         port: 8080,
-        thinking: true,
         api_key: None,
         stall: Duration::from_secs(DEFAULT_STALL_SECONDS),
         response_store: ResponseStoreArg::Default,
@@ -161,16 +153,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         let flag = args[index].as_str();
         if matches!(flag, "--help" | "-h") {
             return Err(String::new());
-        }
-        if flag == "--no-thinking" {
-            parsed.thinking = false;
-            index += 1;
-            continue;
-        }
-        if flag == "--no-response-store" {
-            parsed.response_store = ResponseStoreArg::Off;
-            index += 1;
-            continue;
         }
         if matches!(flag, "--tools-allow-write" | "--tools-shell") {
             if flag == "--tools-shell" {

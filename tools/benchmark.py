@@ -31,12 +31,18 @@ all, since those are the ones that come and go. A constant background load is
 reported, not refused.
 
     tools/benchmark.py --rounds 3
-    tools/benchmark.py --sweep-depth
-    tools/benchmark.py --rounds 3 -- '--no-thinking' '--greedy'
+    tools/benchmark.py --rounds 3 --binary A --binary B
     tools/benchmark.py --rounds 3 --sampled
     tools/benchmark.py --check-only
-    tools/benchmark.py --prefill 2048,8192 --binary A --binary B -- --no-speculation
+    tools/benchmark.py --prefill 2048,8192 --binary A --binary B
     tools/benchmark.py --ttft
+
+Every configuration is a build (`--binary`, default target/release/local-ai)
+running the shipped automatic policy: the engine has no opt-out or tuning
+flags to compare, so speculation, thinking and every other policy run as they
+ship. The losslessness of speculation against plain decoding is proved by the
+engine's real-model tests (`kflash_generation_matches_plain_decoding`,
+`batched_speculation_matches_alone` and their neighbours), not here.
 
 `--sampled` measures the engine's default sampling (temperature 1.0, top-p
 0.95, top-k 20, the CLI's fixed seed) instead of `--greedy`; the seed keeps
@@ -80,7 +86,6 @@ import contextlib
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -236,10 +241,9 @@ class PowerGuard:
 
 @dataclass(frozen=True)
 class Config:
-    """One set of engine flags to measure."""
+    """One build to measure."""
 
     name: str
-    flags: tuple[str, ...] = ()
     # None is the default build, read when the command is made so tests can
     # patch `BINARY`; `--binary` names others to compare builds.
     binary: Path | None = None
@@ -255,11 +259,9 @@ class Config:
             self.executable(),
             "bonsai",
             *(["--greedy"] if self.greedy else []),
-            "--no-thinking",
             "--json",
             "--max-tokens",
             str(max_tokens),
-            *self.flags,
             prompt,
         ]
 
@@ -402,7 +404,9 @@ def run_once(
         tokens_per_second=float(stats["decode_tokens_per_second"]),
         generated=int(stats["generated_tokens"]),
         stop=str(stats["stop_reason"]),
-        text=stats["final_text"],
+        # The whole generation: thinking is always on, so a capped run may
+        # end inside its reasoning, before any final answer.
+        text=stats["text"],
         power=tuple(dict.fromkeys(power)),
     )
 
@@ -446,64 +450,13 @@ def measure(
     return report
 
 
-def depth_sweep() -> list[Config]:
-    """Every depth the engine accepts, plus a no-speculation reference."""
-    return [
-        Config("no-speculation", ("--no-speculation",)),
-        # Space-separated, not `--mtp-depth=N`: every value-taking flag in this
-        # CLI takes its value as a separate argument. `--export` is the only
-        # exception, because its own value grammar contains `=`.
-        *[
-            Config(f"depth {depth}", ("--mtp-depth", str(depth)))
-            for depth in (1, 2, 3, 4)
-        ],
-    ]
-
-
-def parse_configs(groups: list[str]) -> list[Config]:
-    """Build configurations from quoted flag groups on the command line.
-
-    A bare ``--`` separates one configuration from the next, so a comparison
-    reads as two groups either side of it::
-
-        tools/benchmark.py -- '--no-thinking' -- '--no-speculation'
-
-    An empty group is rejected rather than silently measured as the default:
-    a configuration that is not the one you asked for produces numbers that
-    look real and answer a different question, which is the failure this whole
-    tool exists to prevent.
-    """
-    if not groups or groups == ["--"]:
-        return [Config("default")]
-
-    configs: list[Config] = []
-    current: list[str] = []
-    for group in [*groups, "--"]:
-        if group != "--":
-            current.append(group)
-            continue
-        if not current:
-            raise RuntimeError(
-                "empty configuration: `--` must separate two flag groups, "
-                "not stand alone"
-            )
-        flags = tuple(shlex.split(" ".join(current)))
-        configs.append(Config(" ".join(flags), flags))
-        current = []
-    return configs
-
-
-def with_binaries(configs: list[Config], binaries: list[Path]) -> list[Config]:
-    """Every configuration once per `--binary`, labelled by its build."""
+def builds(binaries: list[Path]) -> list[Config]:
+    """One configuration per `--binary`, labelled by its build (the default
+    build when none is named)."""
     if not binaries:
-        return configs
+        return [Config("default")]
     return [
-        Config(
-            f"{binary.name} {config.name}" if len(binaries) > 1 else config.name,
-            config.flags,
-            binary,
-        )
-        for config in configs
+        Config(binary.name if len(binaries) > 1 else "default", binary)
         for binary in binaries
     ]
 
@@ -602,7 +555,6 @@ def run_prefill(
         "--json",
         "--max-tokens",
         str(PREFILL_OUTPUT_TOKENS),
-        *config.flags,
         "--prompt-file",
         str(prompt),
     ]
@@ -841,7 +793,7 @@ def measure_ttft(config: Config, directory: Path) -> list[str]:
 
     def serve() -> subprocess.Popen:
         process = subprocess.Popen(
-            keep_awake([config.executable(), "serve", "--port", str(port), *config.flags]),
+            keep_awake([config.executable(), "serve", "--port", str(port)]),
             cwd=REPO,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -907,11 +859,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="decode with the default sampling settings (seeded) instead of --greedy",
     )
     parser.add_argument(
-        "--sweep-depth",
-        action="store_true",
-        help="compare every --mtp-depth the engine accepts",
-    )
-    parser.add_argument(
         "--prefill",
         nargs="?",
         const=PREFILL_SIZES,
@@ -951,11 +898,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "downgrade sleep refusals to warnings (a waived sleep labels the "
         "results untrusted). Power source never blocks, with or without this",
     )
-    parser.add_argument(
-        "configs",
-        nargs="*",
-        help="quoted flag groups to compare, one per configuration, separated by `--`",
-    )
     return parser.parse_args(argv)
 
 
@@ -993,8 +935,7 @@ def main(argv: list[str]) -> int:
         if not args.allow_busy:
             require_idle()
 
-        configs = depth_sweep() if args.sweep_depth else parse_configs(args.configs)
-        configs = with_binaries(configs, args.binary)
+        configs = builds(args.binary)
         if args.sampled:
             configs = [replace(config, greedy=False) for config in configs]
         print(

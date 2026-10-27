@@ -187,7 +187,6 @@ fn prepare(
 ) -> crate::Result<PreparedResponses> {
     prepare_responses_conversing(
         body.to_string().as_bytes(),
-        true,
         None,
         None,
         (conversations, None),

@@ -117,7 +117,7 @@ fn resume(
     engine: &Engine,
 ) -> Pump {
     let Resumed::Started(pump) = background
-        .resume(store, id, (true, None, None), engine.submit(regenerated()))
+        .resume(store, id, (None, None), engine.submit(regenerated()))
         .expect("resumable")
     else {
         unreachable!("expected the job to start")
@@ -132,7 +132,7 @@ fn outcome(
     engine: &Engine,
 ) -> &'static str {
     match background
-        .resume(store, id, (true, None, None), engine.submit(regenerated()))
+        .resume(store, id, (None, None), engine.submit(regenerated()))
         .expect("resume ran")
     {
         Resumed::Started(_) => "started",
@@ -257,14 +257,9 @@ fn a_job_killed_while_queued_is_regenerated_from_its_request() {
     let engine = Engine::default();
     let pump = resume(&background, &store, &id, &engine);
     // The engine is asked exactly what the original request asked.
-    let original = prepare_responses_with(
-        body(true).to_string().as_bytes(),
-        true,
-        Some(&store),
-        None,
-        "m",
-    )
-    .expect("prepared");
+    let original =
+        prepare_responses_with(body(true).to_string().as_bytes(), Some(&store), None, "m")
+            .expect("prepared");
     assert_eq!(
         *engine.requests.lock().expect("log"),
         [format!("{:?}", original.request)]
@@ -409,7 +404,7 @@ fn a_job_killed_twice_keeps_one_consistent_stream_and_its_request() {
         .resume(
             &store,
             &id,
-            (true, None, None),
+            (None, None),
             engine.submit(vec![
                 event(Event::Content("two".into())),
                 event(Event::Content("!".into())),
@@ -768,7 +763,7 @@ fn a_full_queue_defers_without_writing_twice_and_unresumable_jobs_fail() {
         let background = Arc::new(Background::default());
         assert!(matches!(
             background
-                .resume(&store, &id, (true, None, None), full)
+                .resume(&store, &id, (None, None), full)
                 .expect("ran"),
             Resumed::Deferred
         ));
@@ -822,7 +817,7 @@ fn a_full_queue_defers_without_writing_twice_and_unresumable_jobs_fail() {
     let background = Arc::new(Background::default());
     assert!(matches!(
         background
-            .resume(&store, &id, (true, None, None), refused)
+            .resume(&store, &id, (None, None), refused)
             .expect("ran"),
         Resumed::Settled
     ));
@@ -885,14 +880,8 @@ fn a_continuation_resumes_from_its_stored_history_even_after_its_parent_is_delet
         "content":[{"type":"input_text","text":"first"}]});
     store.save(&parent, &[question]).expect("parent stored");
     let request = json!({"input":"next","previous_response_id":"resp_parent","background":true});
-    let original = prepare_responses_with(
-        request.to_string().as_bytes(),
-        true,
-        Some(&store),
-        None,
-        "m",
-    )
-    .expect("prepared");
+    let original = prepare_responses_with(request.to_string().as_bytes(), Some(&store), None, "m")
+        .expect("prepared");
     let doc = streamed_doc(&request, &store, false);
     let id = doc.id().to_owned();
     let (_, stop) = stopper();
@@ -975,14 +964,9 @@ fn a_resumed_job_keeps_its_creator_until_it_ends() {
         key_id: "key_a".into(),
         project_id: "proj_a".into(),
     };
-    let mut prepared = prepare_responses_with(
-        body(false).to_string().as_bytes(),
-        true,
-        Some(&store),
-        None,
-        "m",
-    )
-    .expect("prepared");
+    let mut prepared =
+        prepare_responses_with(body(false).to_string().as_bytes(), Some(&store), None, "m")
+            .expect("prepared");
     prepared.echo.set_creator(creator.creator());
     let reply = Reply::new(Protocol::Responses(Arc::new(prepared.echo)), "m".into());
     let Protocol::Responses(echo) = &reply.protocol else {

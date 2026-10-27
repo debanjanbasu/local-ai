@@ -64,8 +64,7 @@ string of 16 KiB or more (an image or file sent inline, a long text) is kept
 once, in an owner-only content-addressed blob that every record repeating it
 shares and that goes with the last record naming it, so an image sent in the
 first turn is stored once however long the conversation runs.
-`--response-store DIR` keeps them in DIR instead, until deleted, and
-`--no-response-store` keeps none. The store serves
+`--response-store DIR` keeps them in DIR instead, until deleted. The store serves
 `GET`/`DELETE /v1/responses/{id}`, `input_items` pagination and
 `previous_response_id`, which carries over conversation items but not
 `instructions`, tools or sampling settings. `background: true` requests are
@@ -74,13 +73,13 @@ written before they are acknowledged: without `stream` the `POST` returns the
 streams journaled events that
 `GET /v1/responses/{id}?stream=true&starting_after=N` resumes after any
 sequence number. A disconnected or stalled stream does not cancel the job;
-`POST /v1/responses/{id}/cancel` does. With `store: true` (the default once a
-store exists) the job lives in the response store, and its record and event
+`POST /v1/responses/{id}/cancel` does. With `store: true` (the default) the
+job lives in the response store, and its record and event
 journal survive a restart. A job interrupted by a crash or `kill -9` is
 resumed when a server next opens the store: generation restarts from the
 stored request, and a streamed job's journal continues after a restart
 boundary that finishes the items the lost generation left open (as
-`incomplete`). With `store: false` (the only choice without a store) it is kept
+`incomplete`). With `store: false` it is kept
 temporarily in a private owner-only directory under the system temporary
 directory: retrievable, cancellable and resumable until 10 minutes after it
 ends, reported as `store: false`, never continued by `previous_response_id`,
@@ -225,16 +224,19 @@ explicitly loaded judgment head
 
 ## Automatic policy
 
-Startup prints every decision and reason under `experimental_bonsai`.
+Startup prints every decision and reason under `experimental_bonsai`. No
+flag turns any of it off or tunes it.
 
 | Decision | Rule |
 | --- | --- |
-| Model | First pinned GGUF in `./models`, beside the executable, or in `~/Library/Caches/local-ai/models` |
+| Model | First pinned GGUF in `./models`, beside the executable, or in `~/Library/Caches/local-ai/models`; every other file in [Model install](#model-install) beside it, all required |
+| Reasoning | xhigh thinking unless a request asks for another effort (`reasoning_effort`, `reasoning.effort`, `chat_template_kwargs.enable_thinking`) |
 | Context | Largest value up to 262,144 whose fully grown state fits 90% of Metal's recommended working set |
 | K/V | Hadamard-rotated Q8 (8.5 bits/value); start at 1,024 tokens and grow on demand |
 | Kernels | Metal 4 tensor kernels where supported, SIMD fallbacks elsewhere |
 | Speculation | Lossless suffix lookup, gated depth-3 MTP and KFlash trees of up to 8 rows, each solo cycle going to the tree, the MTP chain or lookup by measured tokens per millisecond and the tree sized by E(n) − r·cost(n) |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
+| Responses | Stored in `~/Library/Application Support/local-ai/responses` (or `--response-store DIR`) |
 | Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache` |
 | Server | Up to eight requests decoded together in one batched pass per step, verifying lookup and MTP drafts where a cost model finds them worth their rows; a long prompt prefills 24 to 31 tokens per step inside that pass (32 in a pass of its own beside a single stream); eight more queued; HTTP/3 when its certificate and key are discovered |
 
@@ -250,8 +252,8 @@ Startup prints every decision and reason under `experimental_bonsai`.
 - KFlash: 50.4 tok/s geomean on the
   same six prompts against 39.9 for main in the same run (35–67: thinking
   66.5, arithmetic 63.3, code 58.5; essays stay on the MTP chain at 34.9),
-  5.0 tokens per tree cycle, greedy text byte-identical to
-  `--no-speculation` wherever main's is. Copy-edit prompts: 79.7 and 93.1
+  5.0 tokens per tree cycle, greedy text byte-identical to plain decoding
+  wherever main's is. Copy-edit prompts: 79.7 and 93.1
   against 71.9 and 93.9 tok/s. It adds about 380 MB of resident memory
   and 3 s of load time ([details](docs/BONSAI.md#kflash-cycles)).
 - Server: concurrent requests decode in one batched pass per step, their MTP
@@ -284,7 +286,7 @@ bandwidth:
 | Measurement | Value |
 | --- | ---: |
 | Decode, speculation on | 5.2 tok/s |
-| Decode, `bonsai --no-speculation` | 2.55 tok/s |
+| Decode, plain (no speculation) | 2.55 tok/s |
 | Speculation gain | 1.15x–1.96x |
 | Model load | 0.45 s |
 | Peak RSS | 361 MB |
@@ -293,7 +295,7 @@ bandwidth:
 | Automatically selected context | 61,538 tokens, under the former F16 K/V default |
 
 **Read the two decode rates as one session, not as constants.** Both come from
-the same machine with `--no-thinking --greedy`, but they are not comparable to
+the same machine, greedy with reasoning off, but they are not comparable to
 each other as published: the speculation run used a planets prompt and the
 baseline a counting prompt, so the original single "2.0x" was a ratio across two
 different workloads. Re-measured on one prompt with
@@ -331,8 +333,9 @@ selects Metal 4 tensor kernels for full-attention prefill
 
 ### Speculation, decomposed
 
-`--no-speculation` disables two independent mechanisms: the MTP head and
-n-gram suffix lookup (`min_match: 12`). On this M2, greedy, median of three
+Speculation combines two independent mechanisms: the MTP head and n-gram
+suffix lookup (`min_match: 12`). Measured against plain decoding (the
+measurements predate the removal of the opt-out flags), on this M2, greedy, median of three
 repetitions per arm, every arm byte-identical: varied prose gained **1.26x**
 (1.22x on a second run) and counting **1.62x** with n-gram lookup never
 firing, so those gains are the head alone. The **1.96x** verbatim-repetition

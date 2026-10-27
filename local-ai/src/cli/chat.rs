@@ -22,14 +22,12 @@ fn usage() {
     eprintln!("Usage: local-ai chat [options] <prompt>");
     eprintln!();
     eprintln!("  --max-tokens N    Maximum generated tokens (default: 8192)");
-    eprintln!("  --no-thinking     Skip the checkpoint's xhigh reasoning (default: on)");
     eprintln!("  --greedy          Disable sampling");
-    eprintln!("  --raw             Skip the chat template");
+    eprintln!("  --raw             Skip the chat template (and so reasoning)");
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut max_tokens = None;
-    let mut no_thinking = false;
     let mut raw = false;
     let mut greedy = false;
     let mut prompt = Vec::new();
@@ -43,7 +41,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--raw" => raw = true,
             "--greedy" => greedy = true,
-            "--no-thinking" => no_thinking = true,
             "--help" | "-h" => return Err(String::new()),
             "--" => {
                 prompt.extend_from_slice(&args[index + 1..]);
@@ -59,7 +56,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     }
     Ok(Args {
         max_tokens,
-        thinking: !raw && !no_thinking,
+        thinking: !raw,
         raw,
         greedy,
         prompt: prompt.join(" "),
@@ -140,8 +137,9 @@ mod tests {
 
     #[test]
     fn defaults_to_bonsai_and_parses_options() {
-        let args = parse(&args(&["--no-thinking", "hi"])).expect("options");
-        assert!(!args.thinking);
+        let args = parse(&args(&["--greedy", "--max-tokens", "16", "hi"])).expect("options");
+        assert!(args.thinking && args.greedy && !args.raw);
+        assert_eq!(args.max_tokens, Some(16));
     }
 
     #[test]
@@ -150,6 +148,15 @@ mod tests {
             vec!["--prefill-chunk", "0", "hi"],
             vec!["--context", "4096", "hi"],
             vec!["--kv-cache", "q8", "hi"],
+            vec!["--kv-initial", "1024", "hi"],
+            vec!["--attention-kernel", "simd", "hi"],
+            vec!["--prompt-cache-checkpoints", "2", "hi"],
+            vec!["--max-queue", "8", "hi"],
+            vec!["--no-speculation", "hi"],
+            vec!["--no-mtp", "hi"],
+            vec!["--no-ngram", "hi"],
+            vec!["--mtp-depth", "2", "hi"],
+            vec!["--no-thinking", "hi"],
             vec!["--image", "cat.png", "hi"],
         ] {
             assert!(parse(&args(&invalid)).is_err(), "{invalid:?}");
@@ -163,11 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_not_a_flag_because_it_sets_the_default() {
-        assert_eq!(
-            parse(&args(&["--thinking", "hi"])).expect_err("rejected"),
-            "unknown option: --thinking"
-        );
-        assert!(parse(&args(&["--raw", "--no-thinking", "hi"])).is_ok());
+    fn thinking_is_not_a_flag_because_it_is_always_on() {
+        for flag in ["--thinking", "--no-thinking"] {
+            assert_eq!(
+                parse(&args(&[flag, "hi"])).expect_err("rejected"),
+                format!("unknown option: {flag}")
+            );
+        }
     }
 }

@@ -146,7 +146,7 @@ pub(super) async fn prepare_responses(
     body: Vec<u8>,
     (meter, project): (&Meter, Option<&str>),
 ) -> crate::Result<(bool, local_engine::ChatRequest, Protocol)> {
-    let (thinking, store) = (state.thinking, state.responses.clone());
+    let store = Arc::clone(&state.responses);
     let (cipher, model) = (state.cipher.clone(), Arc::clone(&state.model));
     let temporary = state.temporary.clone();
     let services = state
@@ -157,8 +157,7 @@ pub(super) async fn prepare_responses(
     let mut prepared = tokio::task::spawn_blocking(move || {
         prepare_responses_conversing(
             &body,
-            thinking,
-            store.as_ref(),
+            Some(&store),
             temporary.as_ref(),
             (services.as_ref(), project.as_deref()),
             cipher.as_ref(),
@@ -334,13 +333,13 @@ async fn compact(
     meter: &Meter,
     project: Option<&str>,
 ) -> crate::Result<serde_json::Value> {
-    let (store, cipher) = (state.responses.clone(), state.cipher.clone());
+    let (store, cipher) = (Arc::clone(&state.responses), state.cipher.clone());
     let (engine, model) = (state.engine.clone(), Arc::clone(&state.model));
     let project = project.map(str::to_owned);
     let (prepared, pass, template, tokens) = tokio::task::spawn_blocking(move || {
         let prepared = prepare_compact(
             &body,
-            store.as_ref(),
+            Some(&store),
             project.as_deref(),
             cipher.as_ref(),
             &model,

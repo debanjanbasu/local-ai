@@ -78,7 +78,6 @@ fn prepare(
 ) -> crate::Result<PreparedResponses> {
     prepare_responses_conversing(
         body.to_string().as_bytes(),
-        true,
         responses,
         None,
         (conversations, None),
@@ -272,7 +271,6 @@ fn input_token_counting_reads_the_conversation_without_changing_it() {
     let count = |body: &Value| {
         prepare_input_tokens_conversing(
             body.to_string().as_bytes(),
-            true,
             None,
             (Some(&conversations), None),
             None,
@@ -297,7 +295,6 @@ fn input_token_counting_reads_the_conversation_without_changing_it() {
         json!({"input":"x","conversation":id})
             .to_string()
             .as_bytes(),
-        true,
         None,
         (None, None),
         None,

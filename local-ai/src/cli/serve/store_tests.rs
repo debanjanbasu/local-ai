@@ -51,7 +51,7 @@ fn stats(stop_reason: StopReason) -> Box<Stats> {
 }
 
 fn prepare(body: &Value, store: Option<&Arc<ResponseStore>>) -> crate::Result<PreparedResponses> {
-    prepare_responses_with(body.to_string().as_bytes(), true, store, None, "m")
+    prepare_responses_with(body.to_string().as_bytes(), store, None, "m")
 }
 
 fn error(body: &Value, store: Option<&Arc<ResponseStore>>) -> String {
@@ -108,7 +108,7 @@ fn ids(items: &[Value]) -> Vec<&str> {
 }
 
 #[test]
-fn the_store_is_on_by_default_and_flags_move_or_disable_it() {
+fn the_store_is_on_by_default_and_a_flag_moves_it() {
     let to_vec = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
     assert_eq!(
         parse(&to_vec(&[])).expect("defaults").response_store,
@@ -119,8 +119,10 @@ fn the_store_is_on_by_default_and_flags_move_or_disable_it() {
         parsed.response_store,
         ResponseStoreArg::Dir(PathBuf::from("/tmp/r"))
     );
-    let parsed = parse(&to_vec(&["--no-response-store"])).expect("flag");
-    assert_eq!(parsed.response_store, ResponseStoreArg::Off);
+    assert_eq!(
+        parse(&to_vec(&["--no-response-store"])).expect_err("removed"),
+        "unknown option: --no-response-store"
+    );
     assert!(parse(&to_vec(&["--response-store"])).is_err());
     assert!(parse(&to_vec(&["--response-store", ""])).is_err());
 }
@@ -655,7 +657,7 @@ fn token_count_prepares_the_same_history_without_storing() {
     );
     let body = json!({"previous_response_id":response["id"],"reasoning":{"effort":"none"},
         "input":[{"type":"function_call_output","call_id":"call_1","output":"hello"}]});
-    let request = prepare_input_tokens(body.to_string().as_bytes(), true, Some(&store), None, "m")
+    let request = prepare_input_tokens(body.to_string().as_bytes(), Some(&store), None, "m")
         .expect("count input");
     assert!(!request.thinking);
     assert_eq!(request.messages[1].tool_calls, vec![read_call()]);
@@ -665,14 +667,7 @@ fn token_count_prepares_the_same_history_without_storing() {
         let mut invalid = body.clone();
         invalid[extra] = json!(true);
         assert!(
-            prepare_input_tokens(
-                invalid.to_string().as_bytes(),
-                true,
-                Some(&store),
-                None,
-                "m"
-            )
-            .is_err()
+            prepare_input_tokens(invalid.to_string().as_bytes(), Some(&store), None, "m").is_err()
         );
     }
 }
@@ -685,9 +680,8 @@ fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
     let path = scratch.0.join("reasoning.key");
     let cipher = Arc::new(ReasoningCipher::open(&path).expect("cipher"));
     let body = json!({"input":"hi","store":false,"include":["reasoning.encrypted_content"]});
-    let prepared =
-        prepare_responses_with(body.to_string().as_bytes(), true, None, Some(&cipher), "m")
-            .expect("request");
+    let prepared = prepare_responses_with(body.to_string().as_bytes(), None, Some(&cipher), "m")
+        .expect("request");
     let (response, _) = run(
         prepared,
         vec![
@@ -707,13 +701,7 @@ fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
         response["output"][1],{"role":"user","content":"continue"}]});
     let reopened = Arc::new(ReasoningCipher::open(path).expect("reopened"));
     let replay = |body: &Value| {
-        prepare_responses_with(
-            body.to_string().as_bytes(),
-            true,
-            None,
-            Some(&reopened),
-            "m",
-        )
+        prepare_responses_with(body.to_string().as_bytes(), None, Some(&reopened), "m")
     };
     let request = replay(&follow).expect("authenticated history").request;
     assert_eq!(
@@ -722,7 +710,6 @@ fn encrypted_reasoning_replays_after_restart_and_rejects_tampering() {
     );
     let prepared = prepare_responses_with(
         follow.to_string().as_bytes(),
-        true,
         Some(&store),
         Some(&reopened),
         "m",
@@ -778,7 +765,6 @@ fn reasoning_is_sealed_only_when_include_asks_for_it() {
     let generate = |body: &Value| {
         let prepared = prepare_responses_with(
             body.to_string().as_bytes(),
-            true,
             Some(&store),
             Some(&cipher),
             "m",
@@ -819,7 +805,6 @@ fn reasoning_is_sealed_only_when_include_asks_for_it() {
     let follow = json!({"previous_response_id":id,"input":"continue"});
     let prepared = prepare_responses_with(
         follow.to_string().as_bytes(),
-        true,
         Some(&store),
         Some(&cipher),
         "m",
@@ -836,7 +821,6 @@ fn reasoning_is_sealed_only_when_include_asks_for_it() {
         response["output"][1],{"role":"user","content":"continue"}],"store":false});
     prepare_responses_with(
         stateless.to_string().as_bytes(),
-        true,
         Some(&store),
         Some(&cipher),
         "m",

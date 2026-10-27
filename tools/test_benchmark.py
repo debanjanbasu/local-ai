@@ -40,7 +40,7 @@ class FakeMachine:
             "decode_tokens_per_second": 20.0,
             "generated_tokens": 8,
             "stop_reason": "max_tokens",
-            "final_text": "Mercury",
+            "text": "Mercury",
         }
         return subprocess.CompletedProcess(argv, 0, json.dumps(stats), "")
 

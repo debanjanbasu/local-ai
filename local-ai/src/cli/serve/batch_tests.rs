@@ -167,7 +167,6 @@ fn start(store: &Store, submit: Submit) -> Arc<Batches> {
         submit,
         Config {
             model: "local".into(),
-            thinking: false,
             cipher: None,
             depth: QueueDepth::default(),
             meter: Meter::default(),
@@ -702,7 +701,6 @@ async fn lines_are_attributed_to_the_project_key_that_created_the_batch() {
         submit,
         Config {
             model: "local".into(),
-            thinking: false,
             cipher: None,
             depth: QueueDepth::default(),
             meter: Meter::into_store(Some(&admin), record),

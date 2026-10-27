@@ -12,7 +12,6 @@ use crate::bonsai_native::KvOptions;
 use crate::bonsai_ngram::NgramSettings;
 use crate::bonsai_tokenizer::BonsaiTokenizer;
 use crate::resources::{PREFILL_CHUNK, Resources};
-use crate::{DEFAULT_MTP_DEPTH, MAX_MTP_DEPTH};
 
 /// What `--export` writes instead of generating. The variants are the kinds as
 /// the command line names them, and the directory an export writes belongs to
@@ -72,7 +71,6 @@ fn parse_export(requested: &str) -> Result<ExportKind, String> {
     }
 }
 
-#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct Args {
     max_tokens: usize,
@@ -80,11 +78,8 @@ struct Args {
     prompt_file: Option<PathBuf>,
     raw: bool,
     thinking: bool,
-    no_thinking: bool,
     greedy: bool,
     output: OutputMode,
-    no_speculation: bool,
-    mtp_depth: usize,
 }
 
 fn usage() {
@@ -92,9 +87,7 @@ fn usage() {
     eprintln!("Bonsai 2 27B text inference: native Metal straight from the GGUF.");
     eprintln!("  --max-tokens N     Output cap (default: 8192)");
     eprintln!("  --prompt-file PATH Read a long UTF-8 prompt instead of positional text");
-    eprintln!("  --raw              No chat template");
-    eprintln!("  --no-thinking      Skip the checkpoint's xhigh reasoning (default: on);");
-    eprintln!("                     lower reasoning quality in our checks");
+    eprintln!("  --raw              No chat template (and so no reasoning)");
     eprintln!("  --greedy           Disable sampling for reference comparisons");
     eprintln!("  --json             Emit token IDs, stop reason, and measured timings");
     eprintln!("  --tokenize         Emit prompt token IDs without loading the model");
@@ -112,15 +105,8 @@ fn usage() {
     eprintln!("                         DIR/model.safetensors and DIR/config.json");
     eprintln!("                         into DIR/dflash2-drafter-int8-v1.bin");
     eprintln!("                         (per-row int8; no engine, no checkpoint)");
-    eprintln!("  --no-speculation   A/B baseline: disable MTP and suffix lookup");
-    eprintln!(
-        "  --mtp-depth N      Drafts per speculative round (1-{MAX_MTP_DEPTH}, \
-         default: {DEFAULT_MTP_DEPTH}); measures what the confidence gate leaves \
-         unused, not a tuned default"
-    );
 }
 
-#[expect(clippy::too_many_lines)]
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut result = Args {
         max_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -128,17 +114,14 @@ fn parse(args: &[String]) -> Result<Args, String> {
         prompt_file: None,
         raw: false,
         thinking: true,
-        no_thinking: false,
         greedy: false,
         output: OutputMode::Stream,
-        no_speculation: false,
-        mtp_depth: DEFAULT_MTP_DEPTH,
     };
     let mut positional = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--max-tokens" | "--mtp-depth" | "--prompt-file" => {
+            "--max-tokens" | "--prompt-file" => {
                 let flag = args[index].as_str();
                 index += 1;
                 let value = args
@@ -146,15 +129,12 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     .ok_or_else(|| format!("{flag} requires a value"))?;
                 match flag {
                     "--prompt-file" => result.prompt_file = Some(PathBuf::from(value)),
-                    "--mtp-depth" => result.mtp_depth = parse_mtp_depth(value)?,
                     _ => {
                         result.max_tokens = value.parse().map_err(|_| "invalid --max-tokens")?;
                     }
                 }
             }
             "--raw" => result.raw = true,
-            "--no-speculation" => result.no_speculation = true,
-            "--no-thinking" => result.no_thinking = true,
             "--greedy" => result.greedy = true,
             "--json" => {
                 if let OutputMode::Export(kind) = &result.output {
@@ -207,15 +187,13 @@ fn parse(args: &[String]) -> Result<Args, String> {
         }
         index += 1;
     }
-    result.thinking = !result.raw && !result.no_thinking;
+    result.thinking = !result.raw;
     if let OutputMode::Export(kind) = &result.output {
         if !positional.is_empty()
             || result.prompt_file.is_some()
             || result.raw
-            || result.no_thinking
             || result.greedy
             || result.max_tokens != crate::DEFAULT_MAX_OUTPUT_TOKENS
-            || result.mtp_depth != DEFAULT_MTP_DEPTH
         {
             return Err(format!("{} takes no other options", export_flag(kind)));
         }
@@ -224,24 +202,6 @@ fn parse(args: &[String]) -> Result<Args, String> {
     }
     result.prompt = positional.join(" ");
     Ok(result)
-}
-
-/// Parse a `--mtp-depth` value as a draft depth inside the engine's range.
-///
-/// The range is the engine's, not a second copy of it: a depth the MTP
-/// settings would refuse is refused at the flag too, so an unusable depth is
-/// named by the person who passed it instead of decoding at a depth nobody
-/// asked for.
-fn parse_mtp_depth(value: &str) -> Result<usize, String> {
-    let depth: usize = value
-        .parse()
-        .map_err(|_| format!("invalid --mtp-depth: {value:?} is not a whole number"))?;
-    if !(1..=MAX_MTP_DEPTH).contains(&depth) {
-        return Err(format!(
-            "--mtp-depth must be between 1 and {MAX_MTP_DEPTH}, not {depth}"
-        ));
-    }
-    Ok(depth)
 }
 
 /// Writes the artifact an [`ExportKind`] names and returns. No kind opens
@@ -275,7 +235,10 @@ fn mtp_summary(engine: &BonsaiEngine) -> Option<(serde_json::Value, serde_json::
 
 #[expect(clippy::too_many_lines)]
 fn run(args: &Args) -> crate::Result<()> {
-    let resources = Resources::discover_with_depth(None, !args.no_speculation, args.mtp_depth)?;
+    // Exports and tokenizing load neither the MTP head nor the drafter (an
+    // export may be writing one), so only generation requires them.
+    let generates = matches!(args.output, OutputMode::Stream | OutputMode::Json);
+    let resources = Resources::discover(None, generates)?;
     if let OutputMode::Export(kind) = &args.output {
         return export(&resources, kind);
     }
@@ -306,14 +269,7 @@ fn run(args: &Args) -> crate::Result<()> {
         None,
         &resources.mtp,
         &resources.dflash,
-        if args.no_speculation {
-            NgramSettings {
-                enabled: false,
-                ..NgramSettings::default()
-            }
-        } else {
-            NgramSettings::default()
-        },
+        NgramSettings::default(),
         KvOptions::default(),
     )?;
     engine.configure_prompt_cache(
@@ -571,10 +527,6 @@ mod tests {
             ),
             (vec!["--greedy"], "--export index takes no other options"),
             (vec!["--raw"], "--export index takes no other options"),
-            (
-                vec!["--no-thinking"],
-                "--export index takes no other options",
-            ),
             (vec!["--json"], "--json is incompatible with --export index"),
             (
                 vec!["--tokenize"],
@@ -610,67 +562,24 @@ mod tests {
     }
 
     #[test]
-    fn mtp_depth_defaults_to_the_shipped_depth() {
-        assert_eq!(
-            parse(&args(&["hello"])).expect("unset").mtp_depth,
-            DEFAULT_MTP_DEPTH
-        );
-    }
-
-    #[test]
-    fn mtp_depth_accepts_every_depth_the_engine_accepts() {
-        for depth in 1..=MAX_MTP_DEPTH {
-            let flag = depth.to_string();
-            let parsed = parse(&args(&["--mtp-depth", &flag, "hello"])).expect(&flag);
-            assert_eq!(parsed.mtp_depth, depth, "{flag}");
-        }
-    }
-
-    #[test]
-    fn mtp_depth_rejects_a_non_integer() {
-        for value in ["2.5", "-1", "three", ""] {
-            let error = parse(&args(&["--mtp-depth", value, "hello"])).expect_err(value);
-            assert_eq!(
-                error,
-                format!("invalid --mtp-depth: {value:?} is not a whole number")
-            );
-        }
-    }
-
-    #[test]
-    fn mtp_depth_rejects_zero_and_anything_above_the_maximum() {
-        for depth in [0, MAX_MTP_DEPTH + 1, 99] {
-            let flag = depth.to_string();
-            let error = parse(&args(&["--mtp-depth", &flag, "hello"])).expect_err(&flag);
-            assert_eq!(
-                error,
-                format!("--mtp-depth must be between 1 and {MAX_MTP_DEPTH}, not {depth}")
-            );
-        }
-    }
-
-    #[test]
-    fn export_refuses_a_depth_it_cannot_honour() {
-        let error = parse(&args(&["--export", "index", "--mtp-depth", "2"])).expect_err("depth");
-        assert_eq!(error, "--export index takes no other options");
-    }
-
-    #[test]
-    fn thinking_is_not_a_flag_because_it_already_is_the_default() {
-        assert_eq!(
-            parse(&args(&["--thinking", "hello"])).expect_err("rejected"),
-            "unknown option: --thinking"
-        );
-        let raw = parse(&args(&["--raw", "--no-thinking", "hello"])).expect("raw");
+    fn thinking_is_always_on_and_only_a_raw_prompt_drops_it() {
+        assert!(parse(&args(&["hello"])).expect("default").thinking);
+        let raw = parse(&args(&["--raw", "hello"])).expect("raw");
         assert!(!raw.thinking);
     }
 
     #[test]
     fn retired_and_model_selection_flags_are_unknown_options() {
-        // One pinned model is discovered, never named, and each automatic
-        // policy replaced a tuning flag; all of them are plain unknown options.
+        // One pinned model is discovered, never named, each automatic policy
+        // replaced a tuning flag, and nothing can be turned off; all of them
+        // are plain unknown options.
         for flag in [
             "--model",
+            "--thinking",
+            "--no-thinking",
+            "--no-speculation",
+            "--mtp-depth",
+            "--max-queue",
             "--mtp",
             "--mtp-head",
             "--no-mtp",

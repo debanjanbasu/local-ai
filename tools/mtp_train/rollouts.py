@@ -18,7 +18,7 @@ Prompts are generated from a fixed seed and never reuse the tasks of
 `tools/mtp_code_bench.py`. Output is appended and existing ids are skipped,
 so a run can stop and resume (lock the GPU around it, a chunk at a time).
 
-  lockf -k /tmp/local-ai-gpu.lock sh -c 'local-ai serve --no-response-store & ...;
+  lockf -k /tmp/local-ai-gpu.lock sh -c 'local-ai serve & ...;
       python3 tools/mtp_train/rollouts.py --out rollouts.jsonl --repo . --limit 40'
 """
 
