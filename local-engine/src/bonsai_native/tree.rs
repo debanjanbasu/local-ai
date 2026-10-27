@@ -393,7 +393,8 @@ impl BonsaiModel {
     /// Commit the pending tree verify's rows `path` (root first, each the
     /// previous one's child): their K/V rows move to consecutive positions,
     /// their recurrence and convolution updates fold into the committed
-    /// state, and the MTP head (if any) ingests them; every other row is dropped.
+    /// state, their taps reach the tap ring and the MTP head (if any) ingests
+    /// them; every other row is dropped.
     pub fn tree_commit(&mut self, path: &[usize]) -> crate::Result<()> {
         let Some(mut state) = self.tree.take() else {
             return Err(crate::Error::InvalidArgument(
@@ -437,6 +438,7 @@ impl BonsaiModel {
                     self.encode_gather_path(&mut batch, state, start, path)?;
                 }
                 self.encode_replay_verified(&mut batch, &state.verifier, committed)?;
+                self.encode_tap_commit(&mut batch, path, start)?;
             }
         }
         self.position = start + committed;
@@ -671,6 +673,7 @@ impl BonsaiModel {
                     count,
                 )?;
             }
+            self.encode_taps(&mut batch, index, rows, true)?;
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
                     let rollback = &state.verifier.rollback[recurrent_index];

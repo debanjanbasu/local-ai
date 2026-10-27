@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::super::{KvOptions, NgramSettings, PromptSnapshot};
+use super::super::{KvOptions, NgramSettings, PromptSnapshot, TAP_ROW_FLOATS};
 use super::*;
 use crate::bonsai::{BonsaiPackage, DEFAULT_BONSAI_GGUF};
 use crate::sampler::SamplingParams;
@@ -62,6 +62,22 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
+}
+
+fn greedy_sampler() -> Sampler {
+    Sampler::new(
+        VOCAB,
+        SamplingParams {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            repetition_penalty: 1.0,
+            eos_tokens: Vec::new(),
+            seed: 0,
+        },
+    )
 }
 
 /// A prefilled prefix: the state after it, the anchor (the prefix's greedy
@@ -462,9 +478,96 @@ fn tree_commits_continue_like_plain_decoding() {
     }
 }
 
+/// Taps hold the residual after layers 5, 19, 33, 47 and 61 of every
+/// committed position: prefill rows, plain decode steps and accepted tree
+/// rows (moved to their positions), tracking the same positions decoded
+/// one row at a time. Turning taps on changes no logit, of a chain verify or
+/// a tree verify.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn taps_follow_committed_positions_and_change_no_logit() {
+    let mut model = load(256);
+    let fixture = Fixture::new(&mut model, &PROMPT, 4);
+    let (a, greedy) = (fixture.anchor, fixture.greedy.clone());
+    let tree = DraftTree::from_parents(
+        &[a, 1234, greedy[0], greedy[1], 4321, greedy[2]],
+        &[-1, 0, 0, 2, 1, 3],
+    )
+    .expect("tree");
+    let chain = DraftTree::chain(&[a, greedy[0], 777, greedy[2]]);
+    let verify = |model: &mut BonsaiModel, tree: &DraftTree| {
+        fixture.restore(model);
+        model.tree_verify(tree).expect("verify");
+        (0..tree.len())
+            .map(|row| bits(&model.tree_logits(row).expect("logits")))
+            .collect::<Vec<_>>()
+    };
+    let untapped = (verify(&mut model, &tree), verify(&mut model, &chain));
+    model.set_taps(true).expect("taps on");
+    let tapped = (verify(&mut model, &tree), verify(&mut model, &chain));
+    assert!(untapped == tapped, "taps changed verify logits");
+
+    // Plain row-at-a-time taps of the prompt, the anchor and the continuation.
+    model.reset();
+    let sequence = PROMPT
+        .iter()
+        .copied()
+        .chain([a, greedy[0], greedy[1], greedy[2]])
+        .collect::<Vec<_>>();
+    for &token in &sequence {
+        model.forward(token, true).expect("plain decode");
+    }
+    let plain = model.tap_rows(0, sequence.len()).expect("plain taps");
+    assert!(plain.iter().all(|value| value.is_finite()));
+    assert!(model.tap_rows(0, sequence.len() + 1).is_none());
+
+    // Prefill, then a tree whose accepted path skips rows.
+    model.reset();
+    model.prefill(&PROMPT, &mut |_| {}).expect("prefill");
+    model.tree_verify(&tree).expect("tree verify");
+    let acceptance = model.tree_accept(&mut greedy_sampler()).expect("accept");
+    assert_eq!(acceptance.path, [0, 2, 3, 5]);
+    model.tree_commit(&acceptance.path).expect("commit");
+    let tapped = model.tap_rows(0, sequence.len()).expect("tree taps");
+    let mut worst = Vec::new();
+    for (position, (plain, tapped)) in plain
+        .chunks(TAP_ROW_FLOATS)
+        .zip(tapped.chunks(TAP_ROW_FLOATS))
+        .enumerate()
+    {
+        for (slot, (plain, tapped)) in plain.chunks(WIDTH).zip(tapped.chunks(WIDTH)).enumerate() {
+            let scale = plain
+                .iter()
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            let relative = max_abs(plain, tapped) / scale;
+            assert!(
+                relative < 1e-2,
+                "position {position} tap {slot}: relative difference {relative}"
+            );
+            if position == 0 || position >= PROMPT.len() {
+                worst.push((position, slot, relative));
+            }
+        }
+        // Layers deepen the residual: each tap differs from the one before.
+        assert!(
+            tapped
+                .chunks(WIDTH)
+                .zip(tapped.chunks(WIDTH).skip(1))
+                .all(|(a, b)| max_abs(a, b) > 1e-3)
+        );
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({ "relative_tap_differences": worst })
+    );
+    model.set_taps(false).expect("taps off");
+    assert!(model.tap_ring().is_none());
+}
+
 /// GPU time of tree verifies of one to eight rows against chain verifies of
-/// the same row counts, at a short history and at 2,048 and 8,192 tokens
-/// (median of nine passes each). Hold the GPU lock while it runs.
+/// the same row counts, and with the residual taps on, at a short history
+/// and at 2,048 and 8,192 tokens (median of nine passes each). Hold the GPU
+/// lock while it runs.
 #[test]
 #[ignore = "requires the Bonsai GGUF and a Metal device; a timing run"]
 fn tree_verify_cost_table() {
@@ -507,10 +610,15 @@ fn tree_verify_cost_table() {
             chain[rows - 1] = times[times.len() / 2];
         }
         model.drop_tree_verify();
+        // The same passes with the residual taps on.
+        model.set_taps(true).expect("taps on");
+        let tapped = model.tree_verify_costs(anchor, 9).expect("tapped costs");
+        model.set_taps(false).expect("taps off");
         let tree = tree.map(|time| time.as_secs_f64() * 1e3);
         table.push(serde_json::json!({
             "history": history,
             "tree_ms": tree,
+            "tree_ms_with_taps": tapped.map(|time| time.as_secs_f64() * 1e3),
             "chain_ms": chain,
             "tree_over_chain": tree.iter().zip(&chain).map(|(t, c)| t / c - 1.0).collect::<Vec<_>>(),
         }));

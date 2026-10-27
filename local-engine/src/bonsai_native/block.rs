@@ -153,6 +153,8 @@ impl BonsaiModel {
                     count,
                 )?;
             }
+            // `hidden` now holds the residual after the previous layer.
+            self.encode_taps(&mut batch, index, tokens.len(), verify.is_some())?;
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
                     let rollback = verify.map(|verifier| &verifier.rollback[recurrent_index]);
