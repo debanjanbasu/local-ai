@@ -43,8 +43,12 @@ const DIRECTORY: &str = "vector_index";
 /// only ever removed by its owner.
 const OWNER_LOCK: &str = "vector_index.lock";
 /// The analyzer name registered on every open (Tantivy does not persist
-/// analyzers, only their names).
-const ANALYZER: &str = "vector_store_text";
+/// analyzers, only their names). Renamed whenever the analyzer's output
+/// changes, so an index built by the old one has another schema and is
+/// rebuilt from the database on open: `_v2` since Tantivy 0.27's English
+/// stemmer (`frostem`), which stems some words differently from 0.26's
+/// (`rust-stemmers`).
+const ANALYZER: &str = "vector_store_text_v2";
 /// Memory arena of the single indexing thread: Tantivy's documented minimum
 /// (15 MB). Larger files flush more segments instead of growing it.
 const WRITER_MEMORY_BYTES: usize = 15_000_000;

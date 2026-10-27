@@ -26,7 +26,7 @@ mozjpeg = { version = "0.10", default-features = false, features = ["with_simd"]
 mozjpeg-sys = { version = "2", default-features = false, features = ["with_simd", "unwinding", "arith_dec"] }
 # Tool argument schemas. No default features: no HTTP or file `$ref`
 # retrieval (and no `idna`), so validation never leaves the process.
-jsonschema = { version = "0.58.6", default-features = false }
+jsonschema.workspace = true
 # Schema-constrained decoding. No default features: no `referencing`
 # (remote/file `$ref` retrieval), no rayon thread pool. The Lark front end
 # builds the native tool-call grammar.
@@ -37,17 +37,17 @@ memmap2 = "0.9"
 ogg = "0.9.2"
 rusty_mp3 = "1.0.0"
 rusty-opus = "1.0.1"
-objc2 = "0.6"
+objc2.workspace = true
 # Audio embeddings: STFT of the log-mel features and resampling to 16 kHz.
 realfft = "3.5"
 rubato = { version = "5", default-features = false, features = ["fft_resampler"] }
-objc2-metal = { version = "0.3", features = ["MTLBuffer", "MTLDevice"] }
+objc2-metal = { workspace = true, features = ["MTLBuffer", "MTLDevice"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
 sha2.workspace = true
 tokenizers.workspace = true
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 # Audio input (`transcription::audio`, `embedding::decode_audio`): pure-Rust
 # demuxers and decoders for the formats the OpenAI audio endpoints accept (no
 # Opus decoder exists).
@@ -55,13 +55,13 @@ symphonia = { version = "0.6.1", default-features = false, features = ["flac", "
 # The log-mel front end's 400-point FFT.
 rustfft = "6.4"
 # zlib itself (not a re-implementation) for Whisper's compression-ratio test.
-flate2 = { version = "1", default-features = false, features = ["zlib"] }
+flate2 = { workspace = true, features = ["zlib"] }
 # Video input (`bonsai_vision::video`): AVFoundation's demuxers and
 # VideoToolbox's decoders, the system's own (no bundled codec library).
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVMediaFormat", "objc2-core-foundation", "objc2-core-media"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMBase", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSArray"] }
+objc2-core-foundation = { workspace = true, features = ["std", "CFString"] }
+objc2-foundation = { workspace = true, features = ["std", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSArray"] }
 # The video file AVFoundation opens, deleted when dropped.
-tempfile = "3"
+tempfile.workspace = true

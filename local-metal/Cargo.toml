@@ -18,9 +18,9 @@ thiserror.workspace = true
 block2 = "0.6.2"
 # `exception`: the private Neural Engine client (`ane`) turns Objective-C
 # exceptions into errors instead of unwinding through Rust.
-objc2 = { version = "0.6", features = ["exception"] }
-objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLBuffer", "MTLAllocation", "MTLResource", "MTLLibrary", "MTLComputePipeline", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLCommandEncoder", "MTLTypes", "MTLEvent", "block2"] }
-objc2-foundation = "0.3"
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFString"] }
+objc2 = { workspace = true, features = ["exception"] }
+objc2-metal = { workspace = true, features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLBuffer", "MTLAllocation", "MTLResource", "MTLLibrary", "MTLComputePipeline", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLCommandEncoder", "MTLTypes", "MTLEvent", "block2"] }
+objc2-foundation = { workspace = true, default-features = true }
+objc2-core-foundation = { workspace = true, features = ["std", "CFDictionary", "CFString"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2", "objc2-core-foundation"] }
 dispatch2 = "0.3"

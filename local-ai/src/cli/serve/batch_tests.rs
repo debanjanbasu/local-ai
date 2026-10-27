@@ -746,3 +746,74 @@ async fn lines_are_attributed_to_the_project_key_that_created_the_batch() {
     assert_eq!(usage[1]["project_id"], Value::Null);
     assert_eq!(usage[1]["num_model_requests"], 2);
 }
+
+/// A line waiting on a full engine queue is submitted again as soon as one
+/// of the server's queue slots is released, not when its backoff ends.
+#[tokio::test]
+async fn a_full_queue_is_retried_when_a_slot_is_released() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let scratch = Scratch::new();
+    let depth = QueueDepth::default();
+    let held = depth.admit();
+    let full = Arc::new(AtomicBool::new(true));
+    let (attempted, attempts) = mpsc::channel();
+    let attempted = Mutex::new(attempted);
+    let still_full = Arc::clone(&full);
+    let submit: Submit = Arc::new(move |request: ChatRequest| -> crate::Result<Generation> {
+        let _ = attempted.lock().expect("attempts").send(Instant::now());
+        if still_full.load(Ordering::SeqCst) {
+            return Err(crate::Error::QueueFull);
+        }
+        Ok(scripted(vec![
+            Signal::Event(Event::Content(format!("echo:{}", prompt(&request)))),
+            Signal::Event(Event::Finished(Box::new(stats()))),
+        ]))
+    });
+    let batches = Batches::spawn(
+        scratch.store.clone(),
+        submit,
+        Config {
+            model: "local".into(),
+            cipher: None,
+            depth: depth.clone(),
+            meter: Meter::default(),
+        },
+    )
+    .expect("worker starts");
+    let file = scratch.input(&[chat("a", "hello")]);
+    let (status, created) = create(&batches, &file, "/v1/chat/completions").await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["id"].as_str().expect("id").to_owned();
+
+    // Five refusals (after waits of 50, 100, 200 and 400 ms): the next
+    // backoff is 800 ms.
+    let attempts = tokio::task::spawn_blocking(move || {
+        for _ in 0..5 {
+            attempts
+                .recv_timeout(Duration::from_secs(10))
+                .expect("attempt");
+        }
+        attempts
+    })
+    .await
+    .expect("wait task");
+    full.store(false, Ordering::SeqCst);
+    let freed = Instant::now();
+    drop(held);
+    let retried = tokio::task::spawn_blocking(move || {
+        attempts
+            .recv_timeout(Duration::from_secs(10))
+            .expect("retry")
+    })
+    .await
+    .expect("wait task");
+    let after = retried.saturating_duration_since(freed);
+    assert!(
+        after < Duration::from_millis(400),
+        "retried {after:?} after the release"
+    );
+    let done = settled(&scratch.store, &id).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    stop(&batches).await;
+}

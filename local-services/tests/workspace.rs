@@ -856,3 +856,44 @@ fn search_discloses_index_result_and_output_limits() {
             .all(|file| file.snippet.starts_with("hit"))
     );
 }
+
+/// A passed deadline stops listing, ranked search and matching before they
+/// walk the tree, with a timed-out error.
+#[test]
+fn a_passed_deadline_stops_the_walk() {
+    let dir = repo();
+    let workspace = Workspace::open(dir.path()).expect("open workspace");
+    let passed = Some(std::time::Instant::now());
+    let timed_out = |result: Result<(), Error>| matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut);
+    assert!(timed_out(
+        workspace
+            .list_files(&ListOptions {
+                deadline: passed,
+                ..ListOptions::default()
+            })
+            .map(drop)
+    ));
+    assert!(timed_out(
+        workspace.search_until("needle", passed).map(drop)
+    ));
+    assert!(timed_out(
+        workspace
+            .find_matches(&SearchOptions {
+                deadline: passed,
+                ..SearchOptions::literal("needle")
+            })
+            .map(drop)
+    ));
+    let later = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    assert_eq!(
+        workspace
+            .find_matches(&SearchOptions {
+                deadline: later,
+                ..SearchOptions::literal("needle")
+            })
+            .expect("search")
+            .matches
+            .len(),
+        3
+    );
+}

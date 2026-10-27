@@ -15,46 +15,46 @@ workspace = true
 # Bundled SQLite: one audited engine version (WAL, multi-process locking)
 # regardless of the host library; incremental BLOB reads (`blob`, no extra
 # crate) for a search hit's chunk; no statement cache or other extras.
-rusqlite = { version = "0.40.2", default-features = false, features = ["blob", "bundled"] }
+rusqlite = { version = "0.41.0", default-features = false, features = ["blob", "bundled"] }
 cap-std = "4.0.3"
 ignore = "0.4.33"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 grep-matcher = "0.1.9"
-tantivy = { version = "=0.26.2", default-features = false, features = ["mmap", "stemmer"] }
+tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "stemmer"] }
 md5 = "0.8"
 # OS randomness for identifiers; already in the lock through rustls.
-ring = "0.17"
+ring.workspace = true
 half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # Hosted tools (`tools`): the sandboxed shell's child process, deadlines and
-# pipes; its `setrlimit`, `waitid` and process-group kill; the file tools'
+# pipes; its `setrlimit`, kqueue exit wait and process-group kill; the file tools'
 # `O_NOFOLLOW` open of the final component; one `sysctl` process count; per-call scratch directories; and web fetch over HTTP/3 (QUIC),
 # HTTP/2 and HTTP/1.1 with TLS verified by the platform trust store. All but
 # `tokio-rustls` are already in the lock through the server.
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
-rustix = { version = "1", features = ["fs", "process"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+rustix = { workspace = true, features = ["event", "fs", "process"] }
 libc = "0.2"
-tempfile = "3"
-bytes = "1"
+tempfile.workspace = true
+bytes.workspace = true
 http = "1"
-http-body-util = "0.1"
-hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "0.7"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Web fetch's HTTP/3 client: the server's versions (local-ai/Cargo.toml).
-quinn = "0.11"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
 # Web fetch's content codings (`zstd`, `br`, `gzip`, `deflate`), its charset
 # decoding and its HTML-to-Markdown conversion. `zstd`, `flate2` and
 # `encoding_rs` are already in the lock.
-zstd = { version = "0.14.3", default-features = false }
-flate2 = { version = "1", default-features = false, features = ["zlib"] }
+zstd.workspace = true
+flate2 = { workspace = true, features = ["zlib"] }
 brotli-decompressor = "6.2"
 encoding_rs = "0.8"
 html-to-markdown-rs = { version = "3.18.7", default-features = false }
@@ -67,9 +67,9 @@ dom_query = "0.28"
 lopdf = { version = "0.46", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Web fetch tests: local HTTP/1.1, HTTP/2 and HTTP/3 servers, and a Brotli
 # encoder for the content-coding tests.
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
 brotli = "9.1"

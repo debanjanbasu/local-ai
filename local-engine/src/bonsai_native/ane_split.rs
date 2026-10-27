@@ -1359,25 +1359,42 @@ impl Keepalive {
         })
     }
 
+    /// Evaluate [`KEEP_PERIOD`] after the later of the last chunk and the
+    /// last keepalive evaluation, while within [`KEEP_WINDOW`] of the last
+    /// chunk; outside it, and during a chunk, wait untimed for
+    /// [`Self::leave`] (or the drop) to notify.
     #[expect(clippy::significant_drop_tightening)]
     fn run(state: &KeepState, binding: &Binding) {
         let mut inner = lock(state);
+        let mut last_keep: Option<Instant> = None;
         loop {
-            inner = state
-                .changed
-                .wait_timeout(inner, KEEP_PERIOD)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
             if inner.stop {
                 return;
             }
-            let idle = inner.last_use.elapsed();
-            if inner.in_chunk || idle < KEEP_PERIOD || idle > KEEP_WINDOW {
+            if inner.in_chunk || inner.last_use.elapsed() > KEEP_WINDOW {
+                inner = state
+                    .changed
+                    .wait(inner)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            let due =
+                last_keep.map_or(inner.last_use, |keep| keep.max(inner.last_use)) + KEEP_PERIOD;
+            let now = Instant::now();
+            if now < due {
+                // Woken early by a chunk boundary or the drop, the state is
+                // read again and the deadline recomputed.
+                inner = state
+                    .changed
+                    .wait_timeout(inner, due - now)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
                 continue;
             }
             inner.evaluating = true;
             drop(inner);
             let result = binding.evaluate();
+            last_keep = Some(Instant::now());
             inner = lock(state);
             inner.evaluating = false;
             state.changed.notify_all();
@@ -1414,6 +1431,9 @@ impl Keepalive {
         let mut inner = lock(&self.state);
         inner.in_chunk = false;
         inner.last_use = Instant::now();
+        drop(inner);
+        // Starts the keepalive window, so the thread leaves its untimed wait.
+        self.state.changed.notify_all();
     }
 }
 

@@ -334,6 +334,18 @@ pub async fn download(
     download_from(&client::global()?, url, max_bytes, accept).await
 }
 
+/// Run `future` (a [`download`], say) on the fetch client's own runtime,
+/// blocking the calling thread until it ends.
+///
+/// For synchronous callers: no thread or runtime is made per call, and the
+/// connections it opens stay pooled. A caller on an async worker thread
+/// must allow blocking first (`tokio::task::block_in_place`).
+pub fn block_on<T: Send + 'static>(
+    future: impl Future<Output = T> + Send + 'static,
+) -> Result<T, ToolError> {
+    client::global()?.block_on(future)
+}
+
 async fn download_from(
     client: &Arc<client::Client>,
     url: &str,

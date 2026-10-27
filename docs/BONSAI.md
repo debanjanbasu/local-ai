@@ -1816,8 +1816,10 @@ preparation and generation blocking tasks, never on runtime workers.
   runs one line at a time through the same preparation and collector as the
   HTTP endpoints. Lines are stateless: `store: true`, `previous_response_id`
   and `conversation` fail their line. Batch lines share the engine queue with
-  interactive requests. A full queue is retried with a 50 ms to 2 s capped
-  backoff. Other than that backoff, the worker does no polling: it scans for
+  interactive requests. A full queue is retried as soon as one of the
+  server's queue slots is released, and otherwise after a 50 ms to 2 s capped
+  backoff (a release can come just before the engine has taken its next
+  job). Other than that backoff, the worker does no polling: it scans for
   runnable batches at startup and after each create or cancel. A per-batch OS
   lock gives one server ownership of a batch. A restart reclaims batches with
   free leases and resumes their unsettled lines. A line interrupted before

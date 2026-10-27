@@ -386,7 +386,7 @@ fn a_crash_between_a_deletion_and_its_collection_is_recovered() {
 fn plant_ghost_document(root: &TempRoot) {
     let index = tantivy::Index::open_in_dir(root.0.join("store/vector_index")).unwrap();
     index.tokenizers().register(
-        "vector_store_text",
+        "vector_store_text_v2",
         tantivy::tokenizer::TextAnalyzer::from(tantivy::tokenizer::SimpleTokenizer::default()),
     );
     let schema = index.schema();
@@ -439,6 +439,78 @@ fn an_index_damaged_lost_or_unreadable_is_rebuilt() {
     let (_store, index) = root.open();
     assert_eq!(search(&index, &id, "postings")[0].0, alpha);
     assert_eq!(index.check().unwrap().chunks, 2);
+}
+
+/// An index written by an earlier analyzer (`vector_store_text`: Tantivy
+/// 0.26's stemmer, which stemmed `adding` to `ad`) has another schema, so
+/// opening it rebuilds it from the database, even when it agrees with the
+/// database in every count.
+#[test]
+fn an_index_from_an_earlier_analyzer_is_rebuilt() {
+    use tantivy::schema::{
+        IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value as _,
+    };
+
+    let root = TempRoot::new();
+    let id;
+    let alpha;
+    {
+        let (store, index) = root.open();
+        alpha = file(&store, "a.txt", "adding numbers");
+        id = vector_store(&store, &[&alpha]);
+        index_all(&index);
+    }
+    let directory = root.0.join("store/vector_index");
+    let attach_id = {
+        let index = tantivy::Index::open_in_dir(&directory).unwrap();
+        let field = index.schema().get_field("attach").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let doc: tantivy::TantivyDocument = searcher.doc(tantivy::DocAddress::new(0, 0)).unwrap();
+        doc.get_first(field)
+            .and_then(|value| value.as_str())
+            .unwrap()
+            .to_owned()
+    };
+    fs::remove_dir_all(&directory).unwrap();
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+    }
+    let mut builder = Schema::builder();
+    let attach = builder.add_text_field("attach", STRING | STORED);
+    let ordinal = builder.add_u64_field("ordinal", STORED);
+    let text = builder.add_text_field(
+        "text",
+        TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("vector_store_text")
+                .set_index_option(IndexRecordOption::WithFreqs),
+        ),
+    );
+    let old = tantivy::Index::create_in_dir(&directory, builder.build()).unwrap();
+    old.tokenizers().register(
+        "vector_store_text",
+        tantivy::tokenizer::TextAnalyzer::from(tantivy::tokenizer::SimpleTokenizer::default()),
+    );
+    let mut writer: tantivy::IndexWriter = old.writer_with_num_threads(1, 15_000_000).unwrap();
+    writer
+        .add_document(tantivy::doc!(
+            attach => attach_id.as_str(),
+            ordinal => 0_u64,
+            text => "ad number"
+        ))
+        .unwrap();
+    writer.commit().unwrap();
+    drop(writer);
+    drop(old);
+
+    let (_store, index) = root.open();
+    let hits = search(&index, &id, "added");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, alpha);
 }
 
 #[test]
