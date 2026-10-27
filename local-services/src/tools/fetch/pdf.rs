@@ -80,6 +80,7 @@ pub fn to_text(
     }
     let pages = document.get_pages();
     let mut text = format!("[converted from PDF to text: {} pages]\n", pages.len());
+    // Whether any page gave text or an error worth showing.
     let mut found = false;
     let mut read = 0;
     for (number, page) in pages.iter().take(MAX_PAGES) {
@@ -94,9 +95,13 @@ pub fn to_text(
                 clean(&page, &mut text);
             }
             Ok(Err(error)) => {
+                found = true;
                 let _ = writeln!(text, "[this page cannot be read: {error}]");
             }
-            Err(_) => text.push_str("[this page cannot be read: its content broke the reader]\n"),
+            Err(_) => {
+                found = true;
+                text.push_str("[this page cannot be read: its content broke the reader]\n");
+            }
         }
     }
     if !found && read == pages.len() {
