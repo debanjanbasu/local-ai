@@ -18,7 +18,9 @@
 //!   deadline, of the child itself).
 //! - **Web fetch** ([`fetch`]): one `GET` to a host on an explicit domain
 //!   allowlist, refusing private, loopback and other non-public addresses,
-//!   never following redirects, with time and size limits.
+//!   never following redirects, with time and size limits; over HTTP/3,
+//!   HTTP/2 or HTTP/1.1 on pooled connections, any content coding decoded
+//!   and HTML returned as Markdown.
 //!
 //! Every result that was cut short says so with an explicit marker, so a
 //! truncated answer is never mistaken for a complete one.
@@ -80,7 +82,9 @@ pub struct Limits {
     /// Allocated bytes a shell command's scratch directory may hold; past
     /// them (or past [`shell::MAX_SCRATCH_ENTRIES`] entries) it is killed.
     pub shell_scratch_bytes: u64,
-    /// Bytes of body web fetch reads before it stops and marks truncation.
+    /// Bytes of (decoded) body web fetch returns before it stops and marks
+    /// truncation; for HTML, bytes of Markdown, converted from at most four
+    /// times as much HTML.
     pub fetch_max_bytes: usize,
     /// Largest file a write or edit may produce.
     pub max_write_bytes: usize,
