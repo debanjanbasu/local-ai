@@ -16,7 +16,7 @@ mod loader;
 mod writer;
 
 pub use self::loader::Load;
-pub use self::writer::{Closed, Closer, StoreJob, Writer};
+pub use self::writer::{Closed, Closer, StoreJob, Writer, daily_write_budget};
 
 const MAGIC: &[u8; 8] = b"BPCACHE1";
 

@@ -180,6 +180,9 @@ pub struct BonsaiEngine {
     disk_closer: prompt_cache::Closer,
     prompt_cache_bytes: usize,
     prompt_cache_disk_bytes: u64,
+    /// Bytes the disk writer may write a day (see
+    /// [`prompt_cache::daily_write_budget`]); `None` for no limit.
+    prompt_cache_daily_writes: Option<u64>,
     prompt_cache_dir: Option<PathBuf>,
     prompt_cache_model_key: String,
     /// Generations between admission and their last token.

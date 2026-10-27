@@ -131,7 +131,10 @@ impl BonsaiEngine {
         }
         if save_to_disk && let Some(root) = self.prompt_cache_dir.clone() {
             if self.disk_writer.is_none() {
-                self.disk_writer = Some(prompt_cache::Writer::spawn_with(&self.disk_closer)?);
+                self.disk_writer = Some(prompt_cache::Writer::spawn_with(
+                    &self.disk_closer,
+                    self.prompt_cache_daily_writes,
+                )?);
             }
             if let Some(writer) = &self.disk_writer {
                 writer.submit(prompt_cache::StoreJob {
@@ -203,10 +206,15 @@ impl BonsaiEngine {
     /// Whether the disk writer would keep a snapshot of `tokens` beside the
     /// committed ones (see [`prompt_cache::would_admit`]): it refuses a
     /// boundary that only barely extends a kept one when the two cannot both
-    /// fit, and a request tail behind boundaries that fill the budget.
+    /// fit, a request tail behind boundaries that fill the budget, and
+    /// anything while its daily write budget is overdrawn.
     pub(super) fn disk_would_keep(&self, tokens: &[u32], reusable_boundary: bool) -> bool {
         self.prompt_cache_disk_bytes > 0
             && self.prompt_cache_dir.is_some()
+            && self
+                .disk_writer
+                .as_ref()
+                .is_none_or(prompt_cache::Writer::within_budget)
             && prompt_cache::would_admit(
                 &self.disk_snapshots,
                 tokens,

@@ -175,6 +175,7 @@ impl BonsaiEngine {
             disk_closer: prompt_cache::Closer::new(),
             prompt_cache_bytes: 0,
             prompt_cache_disk_bytes: 0,
+            prompt_cache_daily_writes: None,
             prompt_cache_dir: None,
             prompt_cache_model_key: String::new(),
             active: Vec::new(),

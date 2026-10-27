@@ -1,6 +1,6 @@
 use super::writer::{Completion, Submitted};
 use super::*;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 fn snapshot_fixture() -> PromptSnapshot {
     PromptSnapshot {
@@ -699,7 +699,7 @@ fn reclaim_at_startup_trims_to_the_budget_and_removes_orphans() {
 fn close_finishes_accepted_writes_and_then_refuses_new_ones() {
     let dir = tempfile::tempdir().expect("tempdir");
     let closer = Closer::new();
-    let writer = Writer::spawn_with(&closer).expect("writer");
+    let writer = Writer::spawn_with(&closer, None).expect("writer");
     let mut large = job(dir.path(), &[1, 2, 3], true, u64::MAX);
     large.snapshot.target_kv = PageBytes::zeroed(64 << 20).expect("bytes");
     assert_eq!(writer.submit(large), Submitted::Queued);
@@ -727,7 +727,7 @@ fn close_past_its_deadline_aborts_and_leaves_no_temporary() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join("model")).expect("create model dir");
     let closer = Closer::new();
-    let writer = Writer::spawn_with(&closer).expect("writer");
+    let writer = Writer::spawn_with(&closer, None).expect("writer");
     for tokens in [[1, 1], [2, 2]] {
         let mut large = job(dir.path(), &tokens, true, u64::MAX);
         large.snapshot.target_kv = PageBytes::zeroed(512 << 20).expect("bytes");
@@ -945,4 +945,56 @@ fn snapshots_written_with_sha256_still_load_and_are_still_checked() {
     assert!(load(&path, "model").is_err());
     fs::write(&path, &pristine[..pristine.len() - 1]).expect("truncate");
     assert!(load(&path, "model").is_err());
+}
+
+#[test]
+fn the_write_budget_refills_daily_and_admits_one_overdraft() {
+    let start = Instant::now();
+    let mut budget = writer::WriteBudget::new(4_000, start);
+    // A quarter of a day's at the start.
+    assert!(budget.admits(start));
+    budget.charge(999);
+    assert!(budget.admits(start));
+    // One write larger than what is left still goes through, overdrawing it.
+    budget.charge(5_000);
+    assert!(!budget.admits(start));
+    // A quarter of a day later 1,000 bytes have come back: still overdrawn.
+    assert!(!budget.admits(start + Duration::from_hours(6)));
+    // A day later it is back in credit, and never holds more than a day's.
+    assert!(budget.admits(start + Duration::from_hours(30)));
+    assert!(budget.admits(start + Duration::from_hours(1_000)));
+    budget.charge(4_000);
+    assert!(!budget.admits(start + Duration::from_hours(1_000)));
+}
+
+#[test]
+fn a_writer_over_its_daily_budget_skips_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let closer = Closer::new();
+    // Starts with a quarter of a day's: one byte, so the first snapshot is
+    // written, overdrawing it, and the next is not.
+    let writer = Writer::spawn_with(&closer, Some(4)).expect("writer");
+    assert!(writer.within_budget());
+    writer.submit(job(dir.path(), &[1, 2, 3], true, u64::MAX));
+    writer.flush();
+    assert!(!writer.within_budget());
+    writer.submit(job(dir.path(), &[4, 5, 6], true, u64::MAX));
+    writer.flush();
+    let stored = writer
+        .take_completed()
+        .into_iter()
+        .map(|completion| completion.stored.expect("background store"))
+        .map(|entry| entry.map(|entry| entry.tokens))
+        .collect::<Vec<_>>();
+    assert_eq!(stored, [Some(vec![1, 2, 3]), None]);
+    assert_eq!(discover(dir.path(), "model").len(), 1);
+}
+
+#[test]
+fn the_daily_write_budget_is_a_quarter_of_the_volume() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (daily, reason) = daily_write_budget(&dir.path().join("not/yet/created"));
+    let daily = daily.expect("a readable volume");
+    assert!(daily > 0, "{reason}");
+    assert!(reason.contains("a quarter"), "{reason}");
 }

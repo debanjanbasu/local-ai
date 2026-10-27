@@ -42,12 +42,16 @@
 //!   prefix it extends.
 //! - **Serial order.** Jobs run one at a time in submission order, so `trim`
 //!   never races another `store` from the same engine.
+//! - **Bounded wear.** With a daily write budget (see [`daily_write_budget`]),
+//!   a job is written only while the budget is not overdrawn, and what it
+//!   writes is charged to it, so a day's writes stay within the budget plus
+//!   one snapshot.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     DiskEntry, DiskIndex, PromptSnapshot, store_abortable, stored_bytes,
@@ -59,6 +63,97 @@ use super::{
 /// (64 MiB); only a final `fsync` already under way can take longer, and a
 /// write still unfinished past this is left to the next sweep.
 const ABORT_GRACE: Duration = Duration::from_secs(10);
+
+/// Divisor on the capacity of the cache's volume in the daily write budget.
+///
+/// Apple does not publish its SSDs' endurance; consumer TLC drives are
+/// commonly rated for about 600 writes of their whole capacity over a
+/// five-year warranty, 0.33 a day. A quarter of the volume a day keeps the
+/// prompt cache alone below that rate however hard it is used.
+const DAILY_WRITE_SHARE: u64 = 4;
+
+const DAY: Duration = Duration::from_hours(24);
+
+/// The bytes the writer may write a day for a cache under `dir`, and why: a
+/// quarter of its volume's capacity ([`DAILY_WRITE_SHARE`]), or no limit
+/// when the capacity cannot be read.
+pub fn daily_write_budget(dir: &Path) -> (Option<u64>, String) {
+    volume_capacity(dir).map_or_else(
+        || {
+            (
+                None,
+                "unbounded: the volume's capacity was unreadable".into(),
+            )
+        },
+        |capacity| {
+            let daily = capacity / DAILY_WRITE_SHARE;
+            let reason = format!(
+                "{} GB a day = a quarter of the {} GB volume's capacity",
+                daily / 1_000_000_000,
+                capacity / 1_000_000_000
+            );
+            (Some(daily), reason)
+        },
+    )
+}
+
+/// The capacity of the volume holding `dir`, or its nearest existing
+/// ancestor.
+#[expect(unsafe_code)]
+fn volume_capacity(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let existing = dir.ancestors().find(|path| path.exists())?;
+    let path = std::ffi::CString::new(existing.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stats` is writable for one
+    // `statvfs`, which the call fills when it returns zero.
+    let stats = unsafe {
+        if libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stats.assume_init()
+    };
+    u64::from(stats.f_blocks).checked_mul(stats.f_frsize)
+}
+
+/// A token bucket of the bytes the writer may still write.
+///
+/// It refills continuously at the daily budget up to one day's worth, and
+/// starts each process at a quarter of that, so restarts cannot reset it to
+/// a full day. A job is written while the balance is positive and then
+/// charged in full, so one snapshot larger than the balance (a 128K-token
+/// prompt's is about 5 GB) is still written, overdrawing it.
+pub(super) struct WriteBudget {
+    daily: u64,
+    balance: i128,
+    refilled: Instant,
+}
+
+impl WriteBudget {
+    pub(super) fn new(daily: u64, now: Instant) -> Self {
+        Self {
+            daily,
+            balance: i128::from(daily / 4),
+            refilled: now,
+        }
+    }
+
+    pub(super) fn admits(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled).as_nanos();
+        self.refilled = now;
+        let earned = i128::from(self.daily) * i128::try_from(elapsed).unwrap_or(i128::MAX / 2)
+            / i128::try_from(DAY.as_nanos()).unwrap_or(1);
+        self.balance = self
+            .balance
+            .saturating_add(earned)
+            .min(i128::from(self.daily));
+        self.balance > 0
+    }
+
+    pub(super) fn charge(&mut self, bytes: u64) {
+        self.balance -= i128::from(bytes);
+    }
+}
 
 /// One snapshot to persist, with everything `store` and `trim` need.
 pub struct StoreJob {
@@ -104,6 +199,8 @@ struct State {
     closed: bool,
     /// The thread is gone (it panicked); nothing pending will ever finish.
     dead: bool,
+    /// The daily write budget, if any.
+    budget: Option<WriteBudget>,
 }
 
 impl State {
@@ -194,13 +291,15 @@ impl Closer {
 impl Writer {
     #[cfg(test)]
     pub fn spawn() -> std::io::Result<Self> {
-        Self::spawn_with(&Closer::new())
+        Self::spawn_with(&Closer::new(), None)
     }
 
     /// Spawn the thread behind `closer`, so a [`Closer`] handed out before
-    /// the first write closes this writer.
-    pub fn spawn_with(closer: &Closer) -> std::io::Result<Self> {
+    /// the first write closes this writer, writing at most about
+    /// `daily_bytes` a day when given.
+    pub fn spawn_with(closer: &Closer, daily_bytes: Option<u64>) -> std::io::Result<Self> {
         let shared = Arc::clone(&closer.shared);
+        shared.lock().budget = daily_bytes.map(|daily| WriteBudget::new(daily, Instant::now()));
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("prompt-cache-writer".into())
@@ -262,6 +361,16 @@ impl Writer {
     pub fn flush(&self) {
         self.wait_for(|_| true);
     }
+
+    /// Whether the daily write budget would let a job be written now, so a
+    /// caller can skip reading back a snapshot that would not be.
+    pub fn within_budget(&self) -> bool {
+        self.shared
+            .lock()
+            .budget
+            .as_mut()
+            .is_none_or(|budget| budget.admits(Instant::now()))
+    }
 }
 
 /// The one-slot queue: a newer job replaces the waiting one, unless that would
@@ -307,7 +416,7 @@ fn run(shared: &Shared) {
     let _exit = Exit(shared);
     let mut index: Option<DiskIndex> = None;
     loop {
-        let job = {
+        let (job, within_budget) = {
             let state = shared.lock();
             let mut state = shared
                 .changed
@@ -318,10 +427,22 @@ fn run(shared: &Shared) {
                 return;
             };
             state.in_flight = Some(job.tokens.clone());
-            job
+            let within_budget = state
+                .budget
+                .as_mut()
+                .is_none_or(|budget| budget.admits(Instant::now()));
+            drop(state);
+            (job, within_budget)
         };
-        let completion = persist(job, &mut index, &shared.abort);
+        let (completion, written) = if within_budget {
+            persist(job, &mut index, &shared.abort)
+        } else {
+            (skipped(), 0)
+        };
         let mut state = shared.lock();
+        if let Some(budget) = &mut state.budget {
+            budget.charge(written);
+        }
         state.in_flight = None;
         state.completed.push(completion);
         drop(state);
@@ -329,13 +450,21 @@ fn run(shared: &Shared) {
     }
 }
 
+/// The outcome of a job that was not written and evicted nothing.
+const fn skipped() -> Completion {
+    Completion {
+        stored: Ok(None),
+        evicted: Vec::new(),
+    }
+}
+
 /// Admission, `store` then `trim`, against an in-memory index of the
-/// directory.
+/// directory, and the bytes written.
 ///
 /// The index is read from disk once per directory, with `discover`, and then
 /// kept current from this thread's own stores and evictions, so trimming no
 /// longer re-opens every `.bpc` to read its header and tokens after each store.
-fn persist(job: StoreJob, index: &mut Option<DiskIndex>, abort: &AtomicBool) -> Completion {
+fn persist(job: StoreJob, index: &mut Option<DiskIndex>, abort: &AtomicBool) -> (Completion, u64) {
     let index = match index {
         Some(index) if index.is_for(&job.root, &job.model_key) => index,
         _ => index.insert(DiskIndex::discover(&job.root, &job.model_key)),
@@ -348,10 +477,7 @@ fn persist(job: StoreJob, index: &mut Option<DiskIndex>, abort: &AtomicBool) -> 
         job.reusable_boundary,
     );
     if !index.admits(&job.tokens, bytes, job.reusable_boundary, job.budget) {
-        return Completion {
-            stored: Ok(None),
-            evicted: Vec::new(),
-        };
+        return (skipped(), 0);
     }
     let stored = store_abortable(
         &job.root,
@@ -364,6 +490,7 @@ fn persist(job: StoreJob, index: &mut Option<DiskIndex>, abort: &AtomicBool) -> 
     );
     // The payload is no longer needed; release it before the trim.
     drop(job.snapshot);
+    let written = if stored.is_ok() { bytes } else { 0 };
     let stored = stored.map(|path| {
         index.insert(&path, &job.tokens, job.reusable_boundary);
         Some(DiskEntry {
@@ -375,5 +502,5 @@ fn persist(job: StoreJob, index: &mut Option<DiskIndex>, abort: &AtomicBool) -> 
     });
     sweep_abandoned_temporaries(&job.root, &job.model_key);
     let evicted = index.evict_over(job.budget);
-    Completion { stored, evicted }
+    (Completion { stored, evicted }, written)
 }
