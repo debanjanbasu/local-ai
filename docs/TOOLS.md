@@ -221,13 +221,80 @@ subdomain. Every resolved address must be public (loopback, RFC 1918,
 link-local, CGNAT, documentation, multicast, unique-local and IPv4-mapped
 forms are refused), and the connection goes to a checked address, so the
 name is not re-resolved. Redirects are reported, not followed. TLS is
-verified by the macOS trust store. The body is capped at 256 KiB.
+verified by the macOS trust store. The body is capped at 256 KiB, and the
+call's deadline covers the whole exchange, decoding and conversion included
+(a call that runs out abandons its connection or stream).
+
+*Transport.* `https` origins known to serve HTTP/3 use QUIC (`quinn`, `h3`),
+raced against TCP: QUIC starts first and TCP 300 ms later, and whichever
+connects first carries the request. Support is learnt from `Alt-Svc`
+response headers (cached per origin for their `ma`, at most 7 days; `clear`
+forgets them) and from DNS HTTPS records (RFC 9460, asked of the system DNS
+service alongside the address lookup, so a first request can already use
+HTTP/3; the first fetch waits at most 30 ms for that answer). Only an
+alternative on the same host is used, at a port of its choosing (an origin
+on an unprivileged port cannot name a privileged one); one naming another
+host, an HTTPS record in alias mode or with another target, and its address
+hints are ignored, so an alternative never adds a host or an address. A
+QUIC failure (handshake over 3 s, blocked UDP, error) falls back to TCP
+without failing the call and keeps the origin off QUIC for 5 minutes,
+doubling per failure up to 48 hours. Other origins use TCP with ALPN `h2`
+then `http/1.1`. A host's addresses are tried in turn, 250 ms apart, IPv6
+and IPv4 alternating (RFC 8305).
+
+*Connections and TLS.* One rustls configuration (ring, platform verifier)
+is built once and shared by TCP and QUIC, with ALPN and a session cache per
+transport, so a returning origin resumes its TLS session. QUIC sends the
+request as 0-RTT early data when it holds a ticket: the tool only sends
+bodiless `GET`s, which are idempotent, so a replayed request changes
+nothing; a request lost to rejected early data is retried once on a full
+handshake. Connections are pooled on a small runtime of their own: per
+origin one multiplexed HTTP/2 or HTTP/3 connection and up to four idle
+HTTP/1.1 connections (keep-alive), for at most 32 origins, each closed
+after 30 s unused. An HTTP/1.1 connection returns to the pool only after
+its body was read to the end; a body cut at the limit or a cancelled call
+closes it, and a cancelled HTTP/2 or HTTP/3 stream is reset. A request that
+fails on a pooled connection before any response is retried once on a new
+one. Checked address lists are cached for 30 s (`getaddrinfo` reports no
+TTL); only a list whose every address passed the check is cached, and
+every TCP or UDP connection goes to an address from such a list, checked
+again just before connecting.
+
+*Compression.* Requests send `Accept-Encoding: zstd, br, gzip, deflate`;
+the body is decoded as it streams (raw deflate is accepted for `deflate`).
+Two limits bound it: the decoded bytes kept, and the encoded bytes read
+(the decoded limit plus 64 KiB), so a decompression bomb stops at the limit
+and a stream that decodes to nothing stops at the encoded one. The zstd
+window is capped at 8 MiB (RFC 9659). A corrupt stream, or an unknown or
+layered coding, fails the call.
+
+*HTML to Markdown.* `text/html` and `application/xhtml+xml` bodies are
+converted to Markdown (`html-to-markdown-rs`, html5ever-based; chosen over
+`htmd`, `fast_html2md` and `mdka` on eight real pages for its output:
+tables, code blocks and absolute links intact, where `htmd` lost table
+cells and overflowed the stack on deeply nested markup and `mdka` took
+10 s on it). Scripts, styles, comments, images, forms and navigation chrome
+are dropped; headings, paragraphs, lists, links (made absolute against the
+page URL and any `<base>`), code blocks and tables are kept. Up to four
+times the limit (1 MiB) of decoded HTML is read, the Markdown is capped at
+the limit (256 KiB), and each cut has its own marker (`[truncated: the page
+was cut at ... bytes of HTML before conversion]`, `[truncated: the Markdown
+was cut at ... bytes]`). The charset is the header's, else a `<meta>`
+declaration, else UTF-8. Conversion runs on its own thread with a 32 MiB
+stack and a depth limit of 512, taking milliseconds per page (about 70 ms
+for a 1 MB rustdoc page; at worst about 0.3 s per MiB of hostile markup).
+The request asks for `text/markdown` first, so a server that offers
+Markdown returns it as is. JSON and other text are decoded from their
+declared charset and passed through; other content is shown as UTF-8, as
+before.
 
 Remote image and video URLs in chat requests use the same transport
 (`tools::fetch::download`) with the same address checks but no allowlist,
 public IP literals allowed, up to five redirects each checked anew (never
 from `https` to `http`), the media type checked before the body is read, and
-a 64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
+a 64 MiB cap on the decoded body (a larger one fails rather than being cut;
+[docs/BONSAI.md](BONSAI.md#remote-media-urls)). They share the pool, the
+HTTP/3 race and the content codings; nothing is converted.
 
 **Known gaps** (stated, not papered over):
 
@@ -306,3 +373,41 @@ about 55 ms per HTTP request with embeddings and 1 ms with BM25. Whole
 Responses with a one-number answer and no reasoning took 2 to 6 s; what
 dominates is generation and the prefill of the returned chunks, not the
 search.
+
+## Live check: web fetch transport (2026-10-27, Apple Silicon, release build)
+
+One round per site from a corporate network whose proxy (Zscaler)
+intercepts TLS over TCP (certificates issued by a Zscaler CA, trusted by
+the macOS store) but let QUIC on UDP 443 through untouched (the QUIC
+certificate chains were the origins' own). Before: the previous transport
+(`main` at `d25b277`: HTTP/1.1, `identity`, a new connection per call, raw
+HTML up to 256 KiB). After: this transport, a fresh client per site; "warm"
+is the next request on the pooled connection, "new conn" a new connection
+after the pool was cleared with HTTP/3 support already learnt. Times are
+TTFB / total in ms (total includes decoding and Markdown conversion); wire
+is body bytes received (encoded; headers and TLS excluded); tokens are the
+Bonsai tokenizer's count (`local-ai bonsai --tokenize --raw`) of the text
+the model would read.
+
+| site | before cold | before warm | after cold | after warm | after new conn | wire before → after | tokens before → after |
+|---|---|---|---|---|---|---|---|
+| www.cloudflare.com | 435 / 492 | 399 / 453 | 158 / 159 h2 | 37 / 38 h2 | 69 / 69 h3 | 262,144 → 1,331 | 105,679 → 754 |
+| www.google.com | 394 / 420 | 424 / 458 | 374 / 425 h3 | 192 / 218 h3 | 304 / 341 h3 | 86,390 → 29,199 | 34,952 → 220 |
+| doc.rust-lang.org `Vec` (955 KB) | 270 / 360 | 129 / 186 | 372 / 543 h2 | 19 / 106 h2 | 160 / 379 h3 | 262,144 → 108,570 | 87,447 → 90,963 |
+| developer.mozilla.org `Alt-Svc` | 1629 / 1754 | 348 / 388 | 710 / 739 h2 | 97 / 110 h2 | 94 / 115 h2 | 209,790 → 21,305 | 61,350 → 1,590 |
+| www.gnu.org (HTTP/1.1 only) | 1228 / 1238 | 1299 / 1308 | 879 / 884 h1 | 286 / 289 h1 | 335 / 340 h1 | 31,743 → 9,886 | 9,977 → 3,089 |
+
+- `www.google.com` used HTTP/3 on its very first request, learnt from its
+  DNS HTTPS record; `www.cloudflare.com`'s record arrived after the 30 ms
+  grace, so its first request used HTTP/2 and later connections HTTP/3, as
+  did rustdoc's after its `Alt-Svc`. MDN and gnu.org advertise no HTTP/3.
+- `www.cloudflare.com` answered the `text/markdown` preference with its own
+  Markdown (1.3 KB on the wire instead of a 1.3 MB page); the other pages
+  were converted here.
+- rustdoc's `Vec` page is larger than either limit: before, the model got
+  the first 256 KiB of raw HTML (mostly the sidebar); after, the whole page
+  (108 KB of Brotli) is converted and the Markdown is cut at 256 KiB, so the
+  token count stays at the cap while the content is the page's text.
+- A second round minutes later, on a congested link, was 2 to 4 times slower
+  across the board (gnu.org timed out for both transports) with the same
+  protocols and byte counts.
