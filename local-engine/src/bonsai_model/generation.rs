@@ -20,9 +20,6 @@ use crate::structured::Grammar;
 const INITIAL_NGRAM_ACCEPTANCE: f64 = 0.8;
 /// Acceptance assumed for a sequence's first head drafts.
 pub(super) const INITIAL_MTP_ACCEPTANCE: f64 = 0.6;
-/// Prior chance a batched `DFlash2` chain draft is accepted given the one
-/// before it was.
-pub(super) const INITIAL_TREE_ACCEPTANCE: f64 = 0.75;
 
 /// One request between its prefill and its last token.
 ///
@@ -73,9 +70,6 @@ pub(super) struct ActiveGeneration {
     /// for the batched-speculation cost model.
     pub(super) ngram_acceptance: f64,
     pub(super) mtp_acceptance: f64,
-    /// The same for its `DFlash2` chain in a batched pass, while the drafter
-    /// follows it.
-    pub(super) tree_acceptance: f64,
     /// This sequence's measured rates for the solo cycle's source choice.
     pub(super) kflash: KflashBudget,
 }
@@ -320,7 +314,6 @@ impl BonsaiEngine {
             prefill_chunks: 0,
             ngram_acceptance: INITIAL_NGRAM_ACCEPTANCE,
             mtp_acceptance: INITIAL_MTP_ACCEPTANCE,
-            tree_acceptance: INITIAL_TREE_ACCEPTANCE,
             kflash: KflashBudget::default(),
         };
         if params.max_tokens == 0 {
@@ -620,17 +613,14 @@ impl BonsaiEngine {
         }
         if source == Some(Source::Tree) {
             // A long catch-up (a prompt, or a context restarted after
-            // decoding without taps) is not this cycle's cost; nor is any
-            // catch-up before the tree's first measured cycle (the rows
-            // batched passes tapped since the last batched draft), which
-            // would rank the tree behind for many cycles.
-            let threshold = if generation.kflash.tree_untried() {
-                0
-            } else {
-                crate::bonsai_native::KFLASH_CATCH_UP_ROWS
-            };
-            if let Some(rows) = self.model.kflash_pending().filter(|&rows| rows > threshold) {
-                self.model.kflash_catch_up(threshold)?;
+            // decoding without taps) is not this cycle's cost.
+            if let Some(rows) = self
+                .model
+                .kflash_pending()
+                .filter(|&rows| rows > crate::bonsai_native::KFLASH_CATCH_UP_ROWS)
+            {
+                self.model
+                    .kflash_catch_up(crate::bonsai_native::KFLASH_CATCH_UP_ROWS)?;
                 generation.stats.kflash.catch_up_rows += rows;
                 generation.stats.kflash.catch_up += started.elapsed();
                 started = Instant::now();

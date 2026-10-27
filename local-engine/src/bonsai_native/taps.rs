@@ -123,62 +123,11 @@ impl BonsaiModel {
     /// `start` is clamped to the ring's last [`TAP_WINDOW`] positions.
     #[must_use]
     pub fn tap_span(&self) -> Option<TapSpan> {
-        self.tap_span_of(self.state_id, self.position)
-    }
-
-    /// [`Self::tap_span`] of buffer set `state` at `position`: a parked
-    /// sequence whose batched rows the ring holds.
-    #[must_use]
-    pub fn tap_span_of(&self, state: u64, position: usize) -> Option<TapSpan> {
         let span = self.taps.as_ref()?.span.get()?;
-        (span.state == state && span.end == position).then(|| TapSpan {
+        (span.state == self.state_id && span.end == self.position).then(|| TapSpan {
             start: span.start.max(span.end.saturating_sub(TAP_WINDOW)),
             ..span
         })
-    }
-
-    /// Copy the `rows` residual rows from stacked row `first` of
-    /// `scratch.hidden`, at the input norm of layer `layer`, to the ring at
-    /// positions from `position`: one batched sequence's rows, before its
-    /// commit settles how many it keeps ([`Self::note_batch_taps`]).
-    pub(super) fn encode_batch_taps(
-        &self,
-        batch: &mut CommandBatch,
-        layer: usize,
-        first: usize,
-        rows: usize,
-        position: usize,
-    ) -> crate::Result<()> {
-        let (Some(taps), Some(slot)) = (&self.taps, slot(layer)) else {
-            return Ok(());
-        };
-        Ok(self.ops.copy_rows(
-            batch,
-            (&self.scratch.hidden, first * WIDTH * size_of::<f32>()),
-            (&taps.ring, slot * WIDTH * size_of::<f32>()),
-            WIDTH,
-            rows,
-            [WIDTH, TAP_ROW_FLOATS],
-            position % TAP_WINDOW,
-            TAP_WINDOW,
-        )?)
-    }
-
-    /// Record that a batched pass left the taps of positions `start..kept`
-    /// of buffer set `state` in the ring, having written rows up to
-    /// `written` (rejected drafts past `kept`, which overwrote the ring's
-    /// oldest rows).
-    pub(super) fn note_batch_taps(&self, state: u64, start: usize, kept: usize, written: usize) {
-        let Some(taps) = &self.taps else {
-            return;
-        };
-        taps.note(state, start, kept);
-        if let Some(span) = taps.span.get() {
-            taps.span.set(Some(TapSpan {
-                start: span.start.max(written.saturating_sub(TAP_WINDOW)),
-                ..span
-            }));
-        }
     }
 
     /// Forget which positions the ring holds: the committed state was

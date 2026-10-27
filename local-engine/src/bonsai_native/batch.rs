@@ -179,9 +179,6 @@ pub struct BatchRow<'a> {
     pub state: Option<&'a mut SequenceState>,
     /// Where the head's missed rows go, for a speculating model.
     pub lag: Option<&'a mut HeadLag>,
-    /// Whether its rows go to the residual tap ring: the sequence the
-    /// `DFlash2` drafter's context follows.
-    pub taps: bool,
 }
 
 impl BatchRow<'_> {
@@ -628,23 +625,11 @@ impl BonsaiModel {
             rows_u32,
             HadamardDirection::Inverse,
         )?;
-        let tapped = rows
-            .iter()
-            .zip(&buffers.spans)
-            .find_map(|(row, &(first, length))| {
-                row.taps.then(|| {
-                    let position = row.state.as_ref().map_or(self.position, |s| s.position);
-                    (first, length, position)
-                })
-            });
         let mut recurrent_index = 0;
         let mut full_index = 0;
         for (index, layer) in self.layers.iter().enumerate() {
             if index == 1 {
                 batch.submit_and_renew(&self.context)?;
-            }
-            if let Some((first, length, position)) = tapped {
-                self.encode_batch_taps(&mut batch, index, first, length, position)?;
             }
             self.normalize_input(&mut batch, &scratch.hidden, &layer.attention_norm, rows_u32)?;
             match &layer.attention {
@@ -726,13 +711,6 @@ impl BonsaiModel {
         for (row, offset) in rows.iter_mut().zip(lag_offsets) {
             if !row.drafts.is_empty() {
                 continue;
-            }
-            let (state, position) = row
-                .state
-                .as_ref()
-                .map_or((self.state_id, self.position), |s| (s.id, s.position));
-            if row.taps {
-                self.note_batch_taps(state, position, position + 1, position + 1);
             }
             match row.state.as_deref_mut() {
                 Some(state) => state.position += 1,
@@ -1013,13 +991,6 @@ impl BonsaiModel {
         for (row, &kept) in rows.iter_mut().zip(committed) {
             if row.drafts.is_empty() {
                 continue;
-            }
-            let (state, position) = row
-                .state
-                .as_ref()
-                .map_or((self.state_id, self.position), |s| (s.id, s.position));
-            if row.taps {
-                self.note_batch_taps(state, position, position + kept, position + row.rows());
             }
             match row.state.as_deref_mut() {
                 Some(state) => state.position += kept,

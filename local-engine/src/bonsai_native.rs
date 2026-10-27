@@ -53,8 +53,8 @@ pub use self::batch::{
     BatchRow, HeadDraft, HeadLag, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState,
 };
 pub use self::kflash::{
-    CATCH_UP_ROWS as KFLASH_CATCH_UP_ROWS, DraftSequence, KflashCosts, KflashCycle, KflashInfo,
-    expected_tokens, tree_chain, tree_rows,
+    CATCH_UP_ROWS as KFLASH_CATCH_UP_ROWS, KflashCosts, KflashCycle, KflashInfo, expected_tokens,
+    tree_rows,
 };
 pub use self::taps::{TAP_LAYERS, TAP_ROW_FLOATS, TAP_WINDOW, TapSpan};
 pub use self::tree::{DraftTree, MAX_TREE_ROWS, TestedNode, TreeAcceptance};

@@ -62,9 +62,6 @@ pub(super) fn pass_ms(rows: usize) -> f64 {
     ms + (rows - last) as f64 * (ms - before_ms) / (last - before) as f64
 }
 
-/// Most drafts of a chain whose per-position chances are known.
-pub(super) const MAX_SURVIVAL: usize = 7;
-
 /// One sequence's possible drafts.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Candidate {
@@ -72,10 +69,6 @@ pub(super) struct Candidate {
     pub(super) depth: usize,
     /// Estimated chance each draft is accepted given the previous one was.
     pub(super) acceptance: f64,
-    /// The chance that the first `d + 1` drafts are all accepted, when it is
-    /// known per position (a drafted `DFlash2` chain's calibrated path
-    /// probabilities); else `acceptance` compounds.
-    pub(super) survival: Option<[f64; MAX_SURVIVAL]>,
     /// Time to produce the drafts, paid only if they are used.
     pub(super) draft_ms: f64,
     /// Drafted by the sequence's MTP head: each draft also costs
@@ -93,16 +86,6 @@ fn expected(acceptance: f64, depth: usize) -> f64 {
         total += chance;
     }
     total
-}
-
-impl Candidate {
-    /// Expected accepted drafts of its first `depth` drafts.
-    pub(super) fn expected(&self, depth: usize) -> f64 {
-        self.survival.map_or_else(
-            || expected(self.acceptance, depth),
-            |survival| survival.iter().take(depth).sum(),
-        )
-    }
 }
 
 /// Expected tokens per millisecond of a step that verifies `plan[i]` drafts
@@ -123,7 +106,7 @@ fn rate(
         let Some(candidate) = candidate.filter(|_| depth > 0) else {
             continue;
         };
-        tokens += candidate.expected(depth);
+        tokens += expected(candidate.acceptance, depth);
         rows += depth;
         time += candidate.draft_ms;
         if candidate.head {
@@ -141,8 +124,7 @@ fn rate(
 
 /// Drafts to verify per sequence (0 for none) for a step of `sequences`
 /// sequences, each contributing one row plus its chosen drafts, beside
-/// `rows - sequences` rows of a prompt chunk, within `max_rows` stacked rows,
-/// and the step's expected tokens per millisecond.
+/// `rows - sequences` rows of a prompt chunk, within `max_rows` stacked rows.
 ///
 /// Pass time is not linear in rows (rows five to eight cost little more
 /// than four, the ninth starts another group), so a draft that does not pay
@@ -154,7 +136,7 @@ pub(super) fn choose(
     rows: usize,
     candidates: &[Option<Candidate>],
     max_rows: usize,
-) -> (Vec<usize>, f64) {
+) -> Vec<usize> {
     let rate = |plan: &[usize]| rate(sequences, rows, candidates, plan, max_rows);
     let mut order = candidates
         .iter()
@@ -164,8 +146,8 @@ pub(super) fn choose(
         .collect::<Vec<_>>();
     // Most expected tokens per row first.
     order.sort_by(|(_, a), (_, b)| {
-        let a = a.expected(a.depth) / a.depth as f64;
-        let b = b.expected(b.depth) / b.depth as f64;
+        let a = expected(a.acceptance, a.depth) / a.depth as f64;
+        let b = expected(b.acceptance, b.depth) / b.depth as f64;
         b.total_cmp(&a)
     });
     // The depth of `index` that maximizes the rate, from `least`.
@@ -197,8 +179,7 @@ pub(super) fn choose(
             best_depth(&mut plan, index, candidate.depth, 0);
         }
     }
-    let value = rate(&plan).unwrap_or(0.0);
-    (plan, value)
+    plan
 }
 
 #[cfg(test)]
@@ -221,9 +202,8 @@ mod tests {
             acceptance: 0.9,
             draft_ms: 0.0,
             head: false,
-            survival: None,
         };
-        let chosen = choose(5, 5, &[Some(confident), None, None, None, None], 64).0;
+        let chosen = choose(5, 5, &[Some(confident), None, None, None, None], 64);
         assert_eq!(chosen[0], 3);
         // A drafted chain that is rarely accepted is not worth its rows.
         let doubtful = Candidate {
@@ -231,9 +211,8 @@ mod tests {
             acceptance: 0.1,
             draft_ms: COMMIT_MS,
             head: true,
-            survival: None,
         };
-        assert_eq!(choose(2, 2, &[Some(doubtful), None], 64).0, vec![0, 0]);
+        assert_eq!(choose(2, 2, &[Some(doubtful), None], 64), vec![0, 0]);
     }
 
     #[test]
@@ -245,20 +224,19 @@ mod tests {
             acceptance: 0.65,
             draft_ms: COMMIT_MS,
             head: true,
-            survival: None,
         };
-        let chosen = choose(2, 2, &[Some(head), Some(head)], 64).0;
+        let chosen = choose(2, 2, &[Some(head), Some(head)], 64);
         assert!(chosen.iter().all(|&depth| depth > 0), "{chosen:?}");
         // Eight streams fill their eight-row group with seeds: drafts would
         // double the pass.
-        assert_eq!(choose(8, 8, &[Some(head); 8], 64).0, vec![0; 8]);
+        assert_eq!(choose(8, 8, &[Some(head); 8], 64), vec![0; 8]);
         // Beside a prompt chunk the pass is long and rows cost their full
         // price; uncertain drafts are not worth them.
         let doubtful = Candidate {
             acceptance: 0.3,
             ..head
         };
-        assert_eq!(choose(2, 40, &[Some(doubtful); 2], 64).0, vec![0, 0]);
+        assert_eq!(choose(2, 40, &[Some(doubtful); 2], 64), vec![0, 0]);
     }
 
     #[test]
@@ -268,9 +246,8 @@ mod tests {
             acceptance: 0.99,
             draft_ms: 0.0,
             head: false,
-            survival: None,
         };
-        let chosen = choose(4, 4, &[Some(long), Some(long), None, None], 64).0;
+        let chosen = choose(4, 4, &[Some(long), Some(long), None, None], 64);
         assert!(4 + chosen.iter().sum::<usize>() <= 64);
     }
 }

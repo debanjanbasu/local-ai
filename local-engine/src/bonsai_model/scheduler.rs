@@ -26,11 +26,7 @@ use super::{
     BatchRow, BonsaiEngine, BonsaiGeneration, CancelToken, GenerateParams, NgramSettings,
     PrefillProgress, draft_depth, fill_verify_tile,
 };
-use crate::bonsai_dflash::DflashTree;
-use crate::bonsai_native::{
-    DraftSequence, HeadDraft, KFLASH_CATCH_UP_ROWS, MAX_BATCH_SEQUENCES, PrefillRows,
-    SequenceState, tree_chain,
-};
+use crate::bonsai_native::{HeadDraft, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState};
 use crate::sampler::TokenLogprob;
 use crate::structured::Grammar;
 
@@ -429,7 +425,6 @@ impl BonsaiEngine {
                     candidates[slot] = (depth > 0).then_some(policy::Candidate {
                         depth,
                         acceptance: generation.mtp_acceptance,
-                        survival: None,
                         draft_ms: policy::COMMIT_MS,
                         head: true,
                     });
@@ -438,7 +433,6 @@ impl BonsaiEngine {
                 candidates[slot] = Some(policy::Candidate {
                     depth: lookup.len(),
                     acceptance: generation.ngram_acceptance,
-                    survival: None,
                     draft_ms: policy::COMMIT_MS,
                     head: false,
                 });
@@ -453,55 +447,11 @@ impl BonsaiEngine {
                 lookups[slot] = None;
             }
         }
-        let rows_before = participants.len() + fold_rows;
-        let (mut chosen, rate) = self.choose_drafts(rows_before, &candidates);
-        // The DFlash2 drafter follows one sequence through batched passes;
-        // its chain competes with the sequence's head chain.
-        let owner = self.kflash_owner_slot(&participants);
-        let mut tree = None;
-        if let Some(slot) = owner
-            && lookups[slot].is_none()
-            && !dropped[slot]
-            && let Some(candidate) = self.tree_candidate(participants[slot])
-        {
-            let mut with_tree = candidates.clone();
-            with_tree[slot] = Some(candidate);
-            let (plan, tree_rate) = self.choose_drafts(rows_before, &with_tree);
-            if plan[slot] > 0 && tree_rate > rate {
-                match self.draft_tree_chain(participants[slot], candidate) {
-                    Ok(Some((drafted, rows, exact))) => {
-                        // The drafting pass is spent: its chain competes at
-                        // its calibrated path probabilities.
-                        with_tree[slot] = Some(exact);
-                        chosen = self.choose_drafts(rows_before, &with_tree).0;
-                        candidates = with_tree;
-                        tree = Some((slot, drafted, rows));
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        failed.push((self.active[participants[slot]].id, error));
-                        dropped[slot] = true;
-                        candidates[slot] = None;
-                        chosen[slot] = 0;
-                    }
-                }
-            }
-        }
+        let chosen = self.choose_drafts(participants.len() + fold_rows, &candidates);
         let mut drafts = vec![Vec::new(); participants.len()];
         let mut from_head = vec![false; participants.len()];
-        let mut from_tree = vec![None; participants.len()];
         let mut heads = Vec::new();
         for (slot, &depth) in chosen.iter().enumerate() {
-            if let Some((_, drafted, rows)) = tree.as_ref().filter(|&&(at, ..)| at == slot) {
-                if depth > 0 {
-                    drafts[slot] = rows[1..=depth]
-                        .iter()
-                        .map(|&row| drafted.token[row])
-                        .collect();
-                    from_tree[slot] = Some((*drafted, rows[..=depth].to_vec()));
-                }
-                continue;
-            }
             if depth == 0 {
                 if candidates[slot].is_some_and(|candidate| candidate.head) {
                     let generation = &mut self.active[participants[slot]];
@@ -538,12 +488,6 @@ impl BonsaiEngine {
             slot += 1;
             !dropped[slot - 1]
         });
-        let mut slot = 0;
-        from_tree.retain(|_| {
-            slot += 1;
-            !dropped[slot - 1]
-        });
-        let owner_id = self.kflash_owner;
         if participants.is_empty() {
             return Ok(false);
         }
@@ -614,7 +558,6 @@ impl BonsaiEngine {
                 drafts: drafts.next().unwrap_or_default(),
                 state,
                 lag: speculating.then_some(&mut generation.lag),
-                taps: owner_id == Some(generation.id),
             });
             samplers.push(&mut generation.sampler);
         }
@@ -659,12 +602,8 @@ impl BonsaiEngine {
         let sampling = started.elapsed() / participants.len() as u32;
         let gpu = self.model.take_gpu_time() / participants.len() as u32;
         let commit_failure = commit.err().map(|error| error.to_string());
-        for (slot, (((&index, (proposed, verification)), head), chain)) in participants
-            .iter()
-            .zip(outcomes)
-            .zip(from_head)
-            .zip(from_tree)
-            .enumerate()
+        for (slot, ((&index, (proposed, verification)), head)) in
+            participants.iter().zip(outcomes).zip(from_head).enumerate()
         {
             let generation = &mut self.active[index];
             if let Some(message) = commit_failure.as_ref().filter(|_| verifying[slot]) {
@@ -684,19 +623,7 @@ impl BonsaiEngine {
             generation.stats.batched_tokens += verification.samples.len();
             if proposed > 0 {
                 let observed = accepted as f64 / proposed as f64;
-                if let Some((drafted, rows)) = chain {
-                    let kflash = &mut generation.stats.kflash;
-                    kflash.batched_cycles += 1;
-                    kflash.batched_drafts += proposed;
-                    kflash.batched_accepted += accepted;
-                    generation.tree_acceptance = blend(generation.tree_acceptance, observed);
-                    let target = verification
-                        .samples
-                        .iter()
-                        .map(|sample| sample.token_id)
-                        .collect::<Vec<_>>();
-                    self.model.kflash_learn_chain(&drafted, &rows, &target);
-                } else if head {
+                if head {
                     let mtp = &mut generation.stats.mtp;
                     mtp.rounds += 1;
                     mtp.proposed_tokens += proposed;
@@ -734,117 +661,6 @@ impl BonsaiEngine {
             );
         }
         Ok(true)
-    }
-
-    /// The participant (a slot of `participants`) whose rows the `DFlash2`
-    /// drafter's context follows in this batched step: the sequence it
-    /// already follows, or, when that one is gone, the one with the most
-    /// tokens left, the likeliest to finish alone and draft trees solo from
-    /// the same context. `None` without a drafter, or while the sequence it
-    /// follows is still running but not in this step.
-    fn kflash_owner_slot(&mut self, participants: &[usize]) -> Option<usize> {
-        self.model.kflash_costs()?;
-        if let Some(owner) = self.kflash_owner {
-            if let Some(slot) = participants
-                .iter()
-                .position(|&index| self.active[index].id == owner)
-            {
-                return Some(slot);
-            }
-            if self
-                .active
-                .iter()
-                .any(|generation| generation.id == owner && !generation.done)
-            {
-                return None;
-            }
-        }
-        let slot = (0..participants.len()).max_by_key(|&slot| {
-            let generation = &self.active[participants[slot]];
-            generation.params.max_tokens - generation.stats.sampled_tokens
-        })?;
-        self.kflash_owner = Some(self.active[participants[slot]].id);
-        self.kflash_history = None;
-        Some(slot)
-    }
-
-    /// The active generation at `index` as the drafter's context sees it.
-    fn draft_sequence(&self, index: usize) -> Option<DraftSequence> {
-        let generation = &self.active[index];
-        if self.resident == Some(generation.id) {
-            return Some(self.model.resident_sequence());
-        }
-        let state = generation.state.as_ref()?;
-        Some(DraftSequence {
-            state: state.id(),
-            position: state.position(),
-        })
-    }
-
-    /// A `DFlash2` chain the active generation at `index` could verify this
-    /// step, priced before drafting: as deep as its tokens and the context
-    /// allow (at most seven drafts), accepted at its running estimate, for a
-    /// drafting pass. `None` when its taps cannot draft yet or its caches
-    /// cannot grow for the chain.
-    fn tree_candidate(&mut self, index: usize) -> Option<policy::Candidate> {
-        let sequence = self.draft_sequence(index)?;
-        if !self.model.kflash_ready_of(sequence) {
-            return None;
-        }
-        let costs = self.model.kflash_costs()?;
-        let generation = &self.active[index];
-        let remaining = generation.params.max_tokens - generation.stats.sampled_tokens;
-        let depth = draft_depth(
-            policy::MAX_SURVIVAL,
-            remaining,
-            self.info.context,
-            sequence.position,
-        );
-        let acceptance = generation.tree_acceptance;
-        (depth > 0 && self.reserve_for(index, depth + 1).is_ok()).then_some(policy::Candidate {
-            depth,
-            acceptance,
-            survival: None,
-            draft_ms: costs.draft_ms + policy::COMMIT_MS,
-            head: false,
-        })
-    }
-
-    /// Draft the active generation at `index`'s tree from its taps and take
-    /// its most likely chain, up to `candidate`'s depth: the tree, the
-    /// chain's rows (root first) and the candidate priced at the chain's
-    /// calibrated path probabilities. `None` when the ring lost its rows.
-    fn draft_tree_chain(
-        &mut self,
-        index: usize,
-        candidate: policy::Candidate,
-    ) -> crate::Result<Option<(DflashTree, Vec<usize>, policy::Candidate)>> {
-        let Some(sequence) = self.draft_sequence(index) else {
-            return Ok(None);
-        };
-        let started = std::time::Instant::now();
-        self.model
-            .kflash_catch_up_of(sequence, KFLASH_CATCH_UP_ROWS)?;
-        let seed = self.active[index].seed.ok_or_else(|| {
-            crate::Error::InvalidArgument("batched generation has no seed".into())
-        })?;
-        let drafted = self.model.kflash_draft_of(sequence, seed)?;
-        self.active[index].stats.kflash.drafting += started.elapsed();
-        let Some(drafted) = drafted else {
-            return Ok(None);
-        };
-        let rows = tree_chain(&drafted, candidate.depth);
-        let mut survival = [0.0; policy::MAX_SURVIVAL];
-        for (chance, &row) in survival.iter_mut().zip(&rows[1..]) {
-            *chance = f64::from(drafted.path_log_p[row]).exp();
-        }
-        let exact = policy::Candidate {
-            depth: rows.len() - 1,
-            survival: Some(survival),
-            draft_ms: policy::COMMIT_MS,
-            ..candidate
-        };
-        Ok((exact.depth > 0).then_some((drafted, rows, exact)))
     }
 
     /// Grow the caches of the active generation at `index`, resident or
@@ -1033,11 +849,7 @@ impl BonsaiEngine {
     /// `rows` counts the step's rows before drafts: one per sequence and any
     /// prompt chunk prefilled in the same pass.
     #[cfg(not(test))]
-    fn choose_drafts(
-        &self,
-        rows: usize,
-        candidates: &[Option<policy::Candidate>],
-    ) -> (Vec<usize>, f64) {
+    fn choose_drafts(&self, rows: usize, candidates: &[Option<policy::Candidate>]) -> Vec<usize> {
         policy::choose(
             candidates.len(),
             rows,
@@ -1047,17 +859,13 @@ impl BonsaiEngine {
     }
 
     #[cfg(test)]
-    fn choose_drafts(
-        &self,
-        rows: usize,
-        candidates: &[Option<policy::Candidate>],
-    ) -> (Vec<usize>, f64) {
+    fn choose_drafts(&self, rows: usize, candidates: &[Option<policy::Candidate>]) -> Vec<usize> {
         let max_rows = self.model.max_batch_rows();
         if !self.force_batched_drafts {
             return policy::choose(candidates.len(), rows, candidates, max_rows);
         }
         let mut rows = rows;
-        let plan = candidates
+        candidates
             .iter()
             .map(|candidate| {
                 let depth = candidate
@@ -1066,10 +874,7 @@ impl BonsaiEngine {
                 rows += depth;
                 depth
             })
-            .collect();
-        // Forced drafts always prefer the longer chain.
-        let total = rows as f64;
-        (plan, total)
+            .collect()
     }
 
     /// Make the active generation at `index` resident, parking whichever

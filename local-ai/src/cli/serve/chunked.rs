@@ -530,7 +530,7 @@ fn timings_json(stats: &Stats) -> Value {
 
 fn speculation_json(stats: &Stats) -> Value {
     let generation = &stats.generation;
-    json!({"batched_tokens":generation.batched_tokens,"mtp":{"rounds":generation.mtp.rounds,"proposed_tokens":generation.mtp.proposed_tokens,"accepted_tokens":generation.mtp.accepted_tokens},"lookup":{"rounds":generation.ngram.rounds,"proposed_tokens":generation.ngram.proposed_tokens,"accepted_tokens":generation.ngram.accepted_tokens,"cpu_seconds":generation.ngram.lookup.as_secs_f64()},"kflash":{"cycles":generation.kflash.cycles,"verified_rows":generation.kflash.verified_rows,"accepted_tokens":generation.kflash.accepted_tokens,"mtp_cycles":generation.kflash.mtp_cycles,"lookup_cycles":generation.kflash.lookup_cycles,"batched_cycles":generation.kflash.batched_cycles,"batched_drafts":generation.kflash.batched_drafts,"batched_accepted":generation.kflash.batched_accepted}})
+    json!({"batched_tokens":generation.batched_tokens,"mtp":{"rounds":generation.mtp.rounds,"proposed_tokens":generation.mtp.proposed_tokens,"accepted_tokens":generation.mtp.accepted_tokens},"lookup":{"rounds":generation.ngram.rounds,"proposed_tokens":generation.ngram.proposed_tokens,"accepted_tokens":generation.ngram.accepted_tokens,"cpu_seconds":generation.ngram.lookup.as_secs_f64()},"kflash":{"cycles":generation.kflash.cycles,"verified_rows":generation.kflash.verified_rows,"accepted_tokens":generation.kflash.accepted_tokens,"mtp_cycles":generation.kflash.mtp_cycles,"lookup_cycles":generation.kflash.lookup_cycles}})
 }
 
 /// Serialize a value that cannot fail to serialize.

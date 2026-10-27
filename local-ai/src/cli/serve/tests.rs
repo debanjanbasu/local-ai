@@ -344,7 +344,7 @@ const STREAM_HEAD_CHAT: &str = "{\"choices\":[{\"index\":0,\"message\":{\"reason
 /// numbers here are all zero.
 fn expected(content: &str, reasoning: &str) -> Value {
     let choice = json!({"index":0,"message":{"content":content,"reasoning_content":reasoning,"role":"assistant"},"logprobs":null,"finish_reason":"stop"});
-    json!({"choices":[choice],"created":0,"id":"local","model":"local","object":"chat.completion","speculation":{"batched_tokens":0,"kflash":{"accepted_tokens":0,"batched_accepted":0,"batched_cycles":0,"batched_drafts":0,"cycles":0,"lookup_cycles":0,"mtp_cycles":0,"verified_rows":0},"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
+    json!({"choices":[choice],"created":0,"id":"local","model":"local","object":"chat.completion","speculation":{"batched_tokens":0,"kflash":{"accepted_tokens":0,"cycles":0,"lookup_cycles":0,"mtp_cycles":0,"verified_rows":0},"lookup":{"accepted_tokens":0,"cpu_seconds":0.0,"proposed_tokens":0,"rounds":0},"mtp":{"accepted_tokens":0,"proposed_tokens":0,"rounds":0}},"timings":{"elapsed_seconds":0.0,"first_token_seconds":null,"prefill_seconds":0.0},"usage":{"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":7,"prompt_tokens_details":{"cache_source":"none","cached_tokens":0},"total_tokens":7}})
 }
 
 /// A response identity fixed for comparison against `expected`.
