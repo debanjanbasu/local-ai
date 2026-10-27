@@ -134,7 +134,8 @@ impl Hosted {
                 ),
             ),
             Self::Fetch => (
-                "Fetch one http(s) URL on the server's allowlist and return its status and text.",
+                "Fetch one public http(s) URL and return its status and text; HTML pages \
+                 come back as Markdown.",
                 closed(json!({"url":{"type":"string"}}), &["url"]),
             ),
             Self::FileSearch => unreachable!("file_search is declared by file_search::Config"),

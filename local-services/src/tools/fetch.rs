@@ -12,17 +12,28 @@
 //!   itself, through the same checks. ([`download`] follows up to five, each
 //!   target checked anew, never from `https` to `http`.)
 //! - `https` is verified by the platform verifier (the macOS trust store).
-//! - The body is read up to the byte limit and the connection then dropped,
-//!   with a marker saying the text was cut; the caller's deadline bounds the
-//!   whole exchange and dropping the future closes the connection.
+//! - The transport ([`client`]) prefers HTTP/3 where an origin advertises
+//!   it, falls back to HTTP/2 or HTTP/1.1 over TCP, and reuses pooled
+//!   connections; any `Alt-Svc` or DNS HTTPS alternative is only used on
+//!   the same host, at its checked addresses.
+//! - The body arrives in any of `zstd`, `br`, `gzip` and `deflate` and is
+//!   decoded while it streams ([`body`]), up to the byte limit (both decoded
+//!   and encoded bytes are bounded, so a decompression bomb stops at the
+//!   limit). HTML is converted to Markdown ([`markdown`]). A cut body says
+//!   so with a marker; the caller's deadline bounds the whole exchange,
+//!   conversion included, and dropping the future abandons the connection.
+
+mod altsvc;
+mod body;
+mod client;
+mod dns;
+mod markdown;
+#[cfg(test)]
+mod network_tests;
 
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-
-use http_body_util::BodyExt as _;
-use hyper_util::rt::TokioIo;
-use rustls::pki_types::ServerName;
 
 use super::{Output, ToolError};
 
@@ -133,83 +144,35 @@ pub fn target(url: &str) -> Result<Target, ToolError> {
     Ok(target)
 }
 
-/// Resolve `target` and return an address, refusing the name if any of its
-/// addresses is not public.
-async fn resolve(target: &Target) -> Result<SocketAddr, ToolError> {
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((target.host.as_str(), target.port))
-        .await
-        .map_err(|error| ToolError::Failed(format!("cannot resolve {}: {error}", target.host)))?
-        .collect();
-    if let Some(private) = addresses.iter().find(|address| !is_public(address.ip())) {
-        return Err(ToolError::Denied(format!(
-            "{} resolves to the non-public address {}, which is never contacted",
-            target.host,
-            private.ip()
-        )));
-    }
-    addresses
-        .first()
-        .copied()
-        .ok_or_else(|| ToolError::Failed(format!("{} has no addresses", target.host)))
-}
+/// What [`fetch`] asks for: Markdown or HTML first (some servers answer
+/// `text/markdown` themselves), then plain text, then anything.
+const FETCH_ACCEPT: &str =
+    "text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.9, text/plain;q=0.8, */*;q=0.5";
+/// Decoded HTML read per byte of the limit: Markdown keeps a fraction of a
+/// page's bytes, so a page may be four times the limit before conversion.
+const HTML_INPUT_FACTOR: usize = 4;
 
-/// Aborts the connection task when dropped, so a cancelled fetch closes its
-/// socket.
-struct Connection(tokio::task::JoinHandle<()>);
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Connect to `target` (at a checked public address) and send one `GET`.
-async fn open(
-    target: &Target,
-) -> Result<(http::Response<hyper::body::Incoming>, Connection), ToolError> {
-    let address = resolve(target).await?;
-    let failed =
-        |error: &dyn std::fmt::Display| ToolError::Failed(format!("fetch failed: {error}"));
-    let tcp = tokio::net::TcpStream::connect(address)
-        .await
-        .map_err(|error| failed(&error))?;
-    let request = http::Request::get(target.path.as_str())
-        .header(http::header::HOST, host_header(target))
-        .header(http::header::USER_AGENT, "local-ai-tools/1")
-        .header(http::header::ACCEPT, "*/*")
-        .header(http::header::ACCEPT_ENCODING, "identity")
-        .header(http::header::CONNECTION, "close")
-        .body(http_body_util::Empty::<bytes::Bytes>::new())
-        .map_err(|error| failed(&error))?;
-    if !target.https {
-        return send(TokioIo::new(tcp), request).await;
-    }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))
-        .map_err(|error| failed(&error))?;
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|error| failed(&error))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    let name = ServerName::try_from(target.host.clone()).map_err(|error| failed(&error))?;
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(name, tcp)
-        .await
-        .map_err(|error| failed(&error))?;
-    send(TokioIo::new(tls), request).await
-}
-
-/// Fetch `url`, reading at most `max_bytes` of body.
+/// Fetch `url`, returning at most `max_bytes` of body text.
+///
+/// HTML is converted to Markdown (from at most four times `max_bytes` of
+/// decoded HTML, the Markdown then capped at `max_bytes`); other text is
+/// decoded from its charset; anything else is shown as UTF-8 as before.
 pub async fn fetch(url: &str, max_bytes: usize) -> Result<Output, ToolError> {
     let target = target(url)?;
-    let (response, _connection) = open(&target).await?;
-    let status = response.status();
+    fetch_target(&client::global()?, &target, max_bytes).await
+}
+
+async fn fetch_target(
+    client: &Arc<client::Client>,
+    target: &Target,
+    max_bytes: usize,
+) -> Result<Output, ToolError> {
+    let mut response = client.get(target, FETCH_ACCEPT).await?;
+    let status = response.status;
     let mut text = format!("HTTP {}\n", status.as_u16());
     for name in [http::header::CONTENT_TYPE, http::header::LOCATION] {
         if let Some(value) = response
-            .headers()
+            .headers
             .get(&name)
             .and_then(|value| value.to_str().ok())
         {
@@ -223,28 +186,72 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<Output, ToolError> {
             truncated: false,
         });
     }
-    text.push('\n');
-    let mut body = response.into_body();
-    let mut kept = Vec::new();
-    let mut truncated = false;
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|error| ToolError::Failed(format!("fetch failed: {error}")))?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        let room = max_bytes.saturating_sub(kept.len());
-        if data.len() > room {
-            kept.extend_from_slice(data.get(..room).unwrap_or_default());
-            truncated = true;
-            break;
+    let kind = markdown::Kind::of(
+        response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let html = matches!(kind, markdown::Kind::Html { .. });
+    let limit = if html {
+        max_bytes.saturating_mul(HTML_INPUT_FACTOR)
+    } else {
+        max_bytes
+    };
+    let read = body::read(&mut response, limit).await?;
+    drop(response);
+    let truncated = match kind {
+        markdown::Kind::Html { charset } => {
+            // Milliseconds of CPU per page, off the async threads; bounded
+            // by the input limit and the converter's depth limit.
+            let converted =
+                markdown::convert_on_thread(read.bytes, charset, url_of(target)).await?;
+            text.push_str("[converted from HTML to Markdown]\n\n");
+            let mut end = converted.len().min(max_bytes);
+            while !converted.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(converted.get(..end).unwrap_or_default());
+            if read.cut {
+                let _ = write!(
+                    text,
+                    "\n[truncated: the page was cut at {limit} bytes of HTML before conversion]"
+                );
+            }
+            if end < converted.len() {
+                let _ = write!(
+                    text,
+                    "\n[truncated: the Markdown was cut at {max_bytes} bytes]"
+                );
+            }
+            read.cut || end < converted.len()
         }
-        kept.extend_from_slice(&data);
-    }
-    text.push_str(&String::from_utf8_lossy(&kept));
-    if truncated {
+        markdown::Kind::Text { charset } => {
+            text.push('\n');
+            text.push_str(&markdown::decode(&read.bytes, charset.as_deref()));
+            body_cut(&mut text, read.cut, max_bytes)
+        }
+        markdown::Kind::Other => {
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(&read.bytes));
+            body_cut(&mut text, read.cut, max_bytes)
+        }
+    };
+    Ok(Output::Text { text, truncated })
+}
+
+/// Append the marker for a body cut at `max_bytes`, if it was.
+fn body_cut(text: &mut String, cut: bool, max_bytes: usize) -> bool {
+    if cut {
         let _ = write!(text, "\n[truncated: the body was cut at {max_bytes} bytes]");
     }
-    Ok(Output::Text { text, truncated })
+    cut
+}
+
+/// `target` as a URL, for resolving the links of its page.
+fn url_of(target: &Target) -> String {
+    let scheme = if target.https { "https" } else { "http" };
+    format!("{scheme}://{}{}", host_header(target), target.path)
 }
 
 /// Redirects [`download`] follows.
@@ -272,13 +279,22 @@ pub async fn download(
     max_bytes: usize,
     accept: impl Fn(Option<&str>) -> bool,
 ) -> Result<Download, ToolError> {
+    download_from(&client::global()?, url, max_bytes, accept).await
+}
+
+async fn download_from(
+    client: &Arc<client::Client>,
+    url: &str,
+    max_bytes: usize,
+    accept: impl Fn(Option<&str>) -> bool,
+) -> Result<Download, ToolError> {
     let mut target = parse(url)?;
     for _ in 0..=MAX_REDIRECTS {
-        let (response, _connection) = open(&target).await?;
-        let status = response.status();
+        let mut response = client.get(&target, "*/*").await?;
+        let status = response.status;
         if status.is_redirection() {
             let location = response
-                .headers()
+                .headers
                 .get(http::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| {
@@ -294,7 +310,7 @@ pub async fn download(
             )));
         }
         let too_large = || ToolError::Invalid(format!("the body is larger than {max_bytes} bytes"));
-        let headers = response.headers();
+        let headers = &response.headers;
         if headers
             .get(http::header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
@@ -312,22 +328,13 @@ pub async fn download(
                 content_type.as_deref().unwrap_or("(none)")
             )));
         }
-        let mut body = response.into_body();
-        let mut kept = Vec::new();
-        while let Some(frame) = body.frame().await {
-            let frame =
-                frame.map_err(|error| ToolError::Failed(format!("fetch failed: {error}")))?;
-            let Ok(data) = frame.into_data() else {
-                continue;
-            };
-            if data.len() > max_bytes - kept.len() {
-                return Err(too_large());
-            }
-            kept.extend_from_slice(&data);
+        let read = body::read(&mut response, max_bytes).await?;
+        if read.cut {
+            return Err(too_large());
         }
         return Ok(Download {
             content_type,
-            body: kept,
+            body: read.bytes,
         });
     }
     Err(ToolError::Failed(format!(
@@ -379,26 +386,6 @@ fn host_header(target: &Target) -> String {
     } else {
         format!("{host}:{}", target.port)
     }
-}
-
-async fn send<T>(
-    io: T,
-    request: http::Request<http_body_util::Empty<bytes::Bytes>>,
-) -> Result<(http::Response<hyper::body::Incoming>, Connection), ToolError>
-where
-    T: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-{
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|error| ToolError::Failed(format!("fetch failed: {error}")))?;
-    let connection = Connection(tokio::spawn(async move {
-        let _ = connection.await;
-    }));
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|error| ToolError::Failed(format!("fetch failed: {error}")))?;
-    Ok((response, connection))
 }
 
 #[cfg(test)]
