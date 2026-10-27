@@ -37,10 +37,31 @@ module_name_repetitions = "allow"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-half = { version = "2.7", features = ["use-intrinsics", "zerocopy", "bytemuck"] }
+half = { version = "2.7", features = ["bytemuck"] }
 bytemuck = { version = "1.25", features = ["aarch64_simd", "derive", "latest_stable_rust"] }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 sha2 = "0.11"
+# Shared by more than one crate, so they cannot diverge; each crate lists the
+# features it uses. `default-features = false` has to be set here to apply.
+tokio = "1"
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+http-body-util = "0.1"
+bytes = "1"
+rustls = { version = "0.23", default-features = false }
+ring = "0.17"
+rustix = "1"
+tempfile = "3"
+jsonschema = { version = "0.58.6", default-features = false }
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+zstd = { version = "0.14.3", default-features = false }
+flate2 = { version = "1", default-features = false }
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3", default-features = false }
+objc2-metal = "0.3"
+objc2-core-foundation = { version = "0.3.2", default-features = false }
 
 # Every `--release` build, tests included: whole-program optimization across
 # every crate and std (build-std), one codegen unit, and no symbol table, for
