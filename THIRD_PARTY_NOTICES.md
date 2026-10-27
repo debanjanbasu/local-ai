@@ -101,6 +101,22 @@ activations and weights are already in the checkpoint's Hadamard basis, so
 nothing is rotated again; ternary weights become per-row int8 by new block
 scales; the whole FFN runs on the Neural Engine.
 
+## Prefill attention softmax lanes (Splash)
+
+The per-tile softmax of the head-packed prefill attention kernel
+(`bonsai_attn_tensor_rows_q8_impl` in `shaders/bonsai_ops.metal`), four
+lanes per score row with eight adjacent keys each, two vector loads and
+stores and two XOR shuffles per row reduction, follows
+`splash_attention_page_softmax` in
+`runtime/metal/kernels/common/paged_attention_tile.h` of
+[Splash](https://github.com/incoai/splash/tree/39a97385f8560cf8a93972cec9b0a963c9195250)
+(Inco), revision `39a97385f8560cf8a93972cec9b0a963c9195250`, licensed under
+the Apache License, Version 2.0
+(<https://www.apache.org/licenses/LICENSE-2.0>); this portion remains under
+it. It was rewritten for this kernel's F32 scores, per-block K/V scales
+(applied when the tile is dequantized, not in the softmax), causal limits
+and running maxima.
+
 ## llguidance, toktrie and derivre
 
 Schema-constrained generation and the native tool-call grammar (llguidance's

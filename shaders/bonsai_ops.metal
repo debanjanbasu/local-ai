@@ -1520,8 +1520,9 @@ BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_tree_4, 4, 0)
 // gathered by bo_attn_gather_rows with a `stride`-token layout, share each
 // dequantized tile in one (6 * TOKENS)-row product. Per row, the tile values,
 // score scale, causal limit, online softmax and final division are those of
-// bo_attn_tensor_q8, and the products are bitwise equal (checked against it at
-// 0 to 131,072-token prefixes). Row r is token first + r / 6. Rows of tokens
+// bo_attn_tensor_q8; only each tile's row sum adds in another order (outputs
+// within 5e-7 of it, same F64 error). A row's output does not depend on the
+// block it is in. Row r is token first + r / 6. Rows of tokens
 // past the block's end repeat the last live token's visibility and are never
 // written; they read gathered rows that only feed their own outputs. The
 // output is ungated: quantized caches gate in bo_attn_unrotate.
@@ -1539,7 +1540,6 @@ static inline void bonsai_attn_tensor_rows_q8_impl(
     const uint kv_head = group % 4, first = (group / 4) * TOKENS;
     const uint live_tokens = min(TOKENS, tokens - first);
     const uint first_prefix = position + first + 1, end = position + first + live_tokens;
-    const uint row = tid / 16, lane = tid % 16;
     if (tid < uint(m)) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
     device float *packed = query + (ulong(kv_head) * 6 * stride + first * 6) * dimension;
     auto q = tensor(packed, dextents<int32_t, 2>(dimension, int(6 * TOKENS)),
@@ -1570,33 +1570,40 @@ static inline void bonsai_attn_tensor_rows_q8_impl(
         qk.run(q, k, products);
         products.store(tensor(scores, dextents<int32_t, 2>(nk, m)));
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        #pragma clang loop unroll(full)
-        for (uint j = 0; j < nt; ++j) {
-            const uint r = 8 * j + row;
+        // Four consecutive lanes own a row, eight adjacent columns each
+        // (after Splash's splash_attention_page_softmax, Apache-2.0, see
+        // THIRD_PARTY_NOTICES.md): two float4 loads and stores and two
+        // shuffles per reduction, one pass for all m rows. Sixteen lanes of
+        // two columns per row, in three passes, took 6-13% longer per block
+        // at 4K-128K prefixes.
+        if (tid < uint(4 * m)) {
+            const uint r = tid / 4, column = (tid % 4) * 8;
             const uint prefix = min(first_prefix + r / 6, end);
             const uint limit = prefix > start ? min(count, prefix - start) : 0;
-            // Each lane owns columns lane and lane + 16, written out in the
-            // loop order of bonsai_attn_rows_softmax (same values and sums):
-            // with the loops, skipping the rescale below gained 1%, not 4-5%.
-            threadgroup float *s = scores + j * nq * nk;
-            const uint i0 = row * nk + lane, i1 = i0 + 16;
-            const float s0 = lane < limit ? s[i0] * (1.0f / 16.0f) : -INFINITY;
-            s[i0] = s0;
-            const float s1 = lane + 16 < limit ? s[i1] * (1.0f / 16.0f) : -INFINITY;
-            s[i1] = s1;
-            float peak = max(max(-INFINITY, s0), s1);
-            for (ushort mask = 8; mask != 0; mask >>= 1) peak = max(peak, simd_shuffle_xor(peak, mask));
+            threadgroup float4 *s = reinterpret_cast<threadgroup float4 *>(scores + r * nk + column);
+            const float4 low = s[0], high = s[1];
+            float x[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+            float peak = -INFINITY;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+                x[i] = column + i < limit ? x[i] * (1.0f / 16.0f) : -INFINITY;
+                peak = max(peak, x[i]);
+            }
+            peak = max(peak, simd_shuffle_xor(peak, 1));
+            peak = max(peak, simd_shuffle_xor(peak, 2));
             const float next_maximum = max(maximum[r], peak);
             const float old_scale = exp(maximum[r] - next_maximum);
             float sum = 0.0f;
-            const float w0 = exp(s[i0] - next_maximum);
-            s[i0] = w0;
-            sum += w0;
-            const float w1 = exp(s[i1] - next_maximum);
-            s[i1] = w1;
-            sum += w1;
-            for (ushort mask = 8; mask != 0; mask >>= 1) sum += simd_shuffle_xor(sum, mask);
-            if (lane == 0) {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+                x[i] = exp(x[i] - next_maximum);
+                sum += x[i];
+            }
+            sum += simd_shuffle_xor(sum, 1);
+            sum += simd_shuffle_xor(sum, 2);
+            s[0] = float4(x[0], x[1], x[2], x[3]);
+            s[1] = float4(x[4], x[5], x[6], x[7]);
+            if (column == 0) {
                 correction[r] = old_scale;
                 maximum[r] = next_maximum;
                 denominator[r] = fma(denominator[r], old_scale, sum);
@@ -1645,7 +1652,9 @@ kernel void bo_attn_tensor_rows_q8(
     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
 ) {
     constexpr uint tokens_per_group = 4, m = (6 * tokens_per_group + 7) / 8 * 8;
-    threadgroup float scores[m * 32], correction[m], maximum[m], denominator[m];
+    // The softmax reads and writes scores as float4.
+    alignas(16) threadgroup float scores[m * 32];
+    threadgroup float correction[m], maximum[m], denominator[m];
     threadgroup uint rescaled[1];
     bonsai_attn_tensor_rows_q8_impl<tokens_per_group>(query, key, value, output, position,
         tokens, stride, group, tid, tile, scores, correction, maximum, denominator, rescaled);
