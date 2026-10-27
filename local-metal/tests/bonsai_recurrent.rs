@@ -322,3 +322,70 @@ fn f16_state_rounds_once_per_block_and_leaves_a_separate_initial_state_intact() 
         }
     }
 }
+
+/// The prefill recurrence (`bo_gdn_prefill_rows_4*`, each token's inputs
+/// loaded during the previous token's step) leaves exactly the outputs and
+/// final state of the four-row kernel, for every state format, over a block
+/// that crosses the 128-row state rounding twice and ends mid-way.
+#[test]
+fn prefill_recurrence_matches_the_four_row_kernel_bitwise() {
+    let Some(context) = gpu_or_skip() else { return };
+    let tokens = 300;
+    let (qkv, decay, beta, initial) = inputs(tokens);
+    let x = floats(&context, &qkv);
+    let a = floats(&context, &decay);
+    let b = floats(&context, &beta);
+    for (suffix, element) in [("", 4), ("_f16", 2), ("_bf16", 2)] {
+        let kernels = named_kernels(
+            &context,
+            [
+                (&format!("bo_gdn_rows_4{suffix}"), 4),
+                (&format!("bo_gdn_prefill_rows_4{suffix}"), 4),
+            ],
+        );
+        let start_bytes = match element {
+            4 => bytemuck::cast_slice::<f32, u8>(&initial).to_vec(),
+            _ if suffix == "_f16" => initial
+                .iter()
+                .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                .collect(),
+            _ => initial
+                .iter()
+                .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+                .collect(),
+        };
+        let results = kernels
+            .iter()
+            .map(|kernel| {
+                let start = MetalBuffer::from_slice(context.device(), &start_bytes).expect("start");
+                let end =
+                    MetalBuffer::from_slice(context.device(), &vec![0xff_u8; STATE * element])
+                        .expect("end");
+                let out = floats(&context, &vec![f32::NAN; tokens * OUTPUT]);
+                let mut batch = CommandBatch::new(&context).expect("batch");
+                encode_into(
+                    &mut batch,
+                    kernel,
+                    [&x, &a, &b, &start, &out, &end],
+                    tokens as u32,
+                );
+                batch.commit_and_wait().expect("completion");
+                // SAFETY: no GPU work on these buffers is in flight.
+                unsafe {
+                    (
+                        out.as_slice::<u32>().to_vec(),
+                        end.as_slice::<u8>().to_vec(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            results[0].0 == results[1].0,
+            "{suffix}: prefill outputs differ from the four-row kernel's"
+        );
+        assert!(
+            results[0].1 == results[1].1,
+            "{suffix}: prefill final state differs from the four-row kernel's"
+        );
+    }
+}

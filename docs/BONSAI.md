@@ -3811,6 +3811,127 @@ embeddings staged for half B measured 47%) and the same next draft.
 `prefill_block_size_leaves_identical_logits` now pins the GPU path, where
 block size still leaves the logits bitwise identical.
 
+**The GPU's side of the wavefront** was then profiled per operation
+(`prefill_op_timings` in `local-engine/src/bonsai_native/ane_split/profile.rs`:
+a real 4,096-token prefix repeated up to the position, each operation of a
+512-row half in a command buffer of its own, median of five GPU times,
+summed over the layers). GPU ms for one 512-row wavefront half (the GPU
+block adds the FFN, 3,059 ms, and runs every output projection row), M4 Pro,
+2026-10-28, on a 20 W adapter with the battery at 6-7%, so absolute times
+are above an unconstrained machine's (the projections by about 10% against
+the kernel table above):
+
+| Position | Total | GDN mixers | Attention core | Attention Q/K/V, prep | GPU output rows | Weight conversion | Norms, packs, joins |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4K | 1,540 | 795 (52%) | 245 (16%) | 207 (13%) | 138 (9%) | 107 (7%) | 49 (3%) |
+| 32K | 3,433 | 795 (23%) | 2,138 (62%) | 207 (6%) | 138 (4%) | 107 (3%) | 49 (1%) |
+| 128K | 10,951 | 795 (7%) | 9,655 (88%) | 207 (2%) | 138 (1%) | 107 (1%) | 49 (0.4%) |
+
+Per layer, a recurrent mixer is 16.6 ms: its QKV and gate projections 13.9
+(84%), the recurrence 1.73, the BF16 alpha/beta pair 0.44, convolution,
+L2 norm, decay and output gate 0.45. An attention layer's Q, K and V
+projections take 12.6 ms and its core 15.3 / 134 / 603 ms at 4K / 32K /
+128K; there are no history splits at these sizes (a 512-row half is 512
+threadgroups of the head-packed kernel). Converting a layer's ANE weights
+takes 3.3 ms per wavefront (half of it per half above). Whole blocks at
+128K took 13.2 s for a 512-row GPU block and 20.9 s for a 1,024-row
+wavefront (39 and 49 tok/s at that position). The projections already run
+near the 8x8 multiplies' peak (above), so the GPU mixers' headroom is the
+recurrence and, from 16K on, attention. Two prefill-only kernel changes:
+
+- **Recurrence loads a step ahead.** Blocks over 32 rows run
+  `bo_gdn_prefill_rows_4*`: the four-row recurrence with its arithmetic in
+  the same order, whose next token's Q, K, V, decay and beta loads issue
+  during the current token's chain instead of at the top of each step.
+  Bitwise the four-row kernel's outputs and final state in all three state
+  formats (`prefill_recurrence_matches_the_four_row_kernel_bitwise`);
+  1.52-1.77 to 1.34 ms per 512-row block (F16 state, interleaved). Splash's
+  prefill scan stages blocks of tokens in threadgroup memory while the next
+  block is prefetched for the same reason.
+- **Four softmax lanes per score row.** The head-packed prefill attention
+  gives each of a tile's 24 score rows four lanes of eight adjacent keys
+  (two float4 loads and stores and two shuffles per reduction, one pass),
+  after Splash's page softmax, where sixteen lanes of two keys each took
+  three passes. Only each tile's row sum adds in another order: outputs
+  within 1e-6 of the previous kernel's with the same F64 error, and a row's
+  output still does not depend on the block it is in. Kernel time per
+  512-row block, interleaved medians of seven, three runs: 12.05 to
+  11.33 ms at a 4K prefix, 94.8 to 86.5 ms at 32K, 436 to 396 ms at 128K
+  (-6%, -9%, -9%).
+
+Cold prefill (`tools/benchmark.py --prefill`, best of two interleaved rounds,
+32K one round per run with two runs in opposite order; the builds are
+`adc358f` and this one, the GPU-only pair with the Neural Engine switched
+off in the source; every process started from the same learned split,
+3,072 rows, held read-only), same day and adapter. In each run every
+sample of a size, both builds, cold and restored, generated the same 16
+greedy tokens:
+
+| Prompt | Neural Engine | GPU only |
+| ---: | ---: | ---: |
+| 2,052 tokens | 359.6 → 355.3 tok/s | 132.5 → 134.8 tok/s |
+| 8,202 tokens | 306.6 → 308.3 tok/s | 120.8 → 118.6 tok/s |
+| 32,741 tokens | 218.7 → 227.6 tok/s (runs: +8.3%, +3.7%) | 104.6 → 114.0 tok/s (runs: +9.0%, +1.0%) |
+
+From the kernel times the expected gain is about 4.5% at 32K with the
+Neural Engine (attention is 62% of the GPU's half) and 2-3% on the GPU
+alone (33% of its block, the FFN included); 2K and 8K are within noise, as
+there the ANE's FFN or the projections set the pace. A 128K prompt was not
+re-run (about 30 minutes per cold sample on this adapter); at 128K the
+attention core is 88% of the wavefront's GPU time, so the kernel's 9%
+should carry over at about 8%. Decode is unchanged (38.17 against
+38.17 tok/s, best of two with the default speculation; no decode kernel
+changed). With the change, `ane_prefill_tracks_gpu_prefill_next_token_distribution`
+measured mean KL 6.3e-5 (max 4.4e-4) after 1,000 tokens and 6.4e-5 (max
+2.7e-4) after 8,192, top-1 64/64, and
+`large_batch_prefill_tracks_small_batch_next_token_distribution` 2.3e-6 and
+4.2e-6.
+
+The output projection split still lands on the most ANE rows: the GPU's
+mixers got cheaper, but they still outlast the ANE's FFN. With every layer
+fixed at one split, 4,096-token prompts (`ane_out_split_timings`, best of
+two) measured 360.3, 365.4, 371.0 and 372.4 tok/s at 0, 1,024, 2,048 and
+3,072 rows before the change and 365.0, 368.0, 373.4 and 374.1 after.
+Starting from 3,072 rows everywhere, the learned split ended at 3,072 after
+fresh 2,052-, 8,202- and 16,404-token prompts on this build (16K: 276.5
+against 295.2 tok/s, one sample each); the previous build's 16K prompt
+ended with its 512-row halves at 2,560.
+
+Rejected or not adopted, from the same profile and Splash's kernels
+(`incoai/splash` `39a9738`), kernel time against the kernel of the time:
+
+- K read in place as int8 tensor operands, as Splash does: Splash's caches
+  hold one scale per token and head, so its scores take the key scale after
+  one product, but this cache has a scale per 32 dimensions, so eight block
+  products and per-key scaling: 70-130% slower, F64 error 2e-4 against
+  1.5e-6. One unscaled int8 product (wrong values, a speed probe) ran no
+  faster than dequantizing to half, and K and V both in place took 113%
+  longer.
+- The cache dequantized once per layer to a half copy that the products read
+  in place (no tile, no per-threadgroup dequantization): bitwise, 2-9%
+  slower, and 512 MB more at 128K.
+- Splash's history split: `clamp(32 / tiles, 1, 32)` splits for 8-row
+  tiles is one split for any half of 256 rows or more; only blocks of a few
+  rows split, as blocks of up to eight rows already do here.
+- KV-head-major threadgroup order, so co-resident groups share one head's
+  K/V (also with the longest token groups first): bitwise, within 2%.
+- QK as two or four dimension slices added afterwards: within 2%, and +9%
+  at 32K.
+- V's codes loaded before the softmax and stored after it: within noise;
+  with the next K's codes loaded across P.V as well, 4-20% slower (as the
+  earlier one-phase-early loads).
+- The recurrence two tokens ahead, or two or four SIMD groups per
+  threadgroup: no faster than one token ahead; two or eight value rows per
+  SIMD group, +13% and +68%. Splash's scan layout (eight lanes per state
+  row, sixteen columns each, three shuffle steps per dot product) changes
+  the dot products' summation order and was not tried; the recurrence is 5%
+  of the half at 4K.
+- A branch-free weight conversion kernel: bitwise, 29% slower. A
+  token-parallel convolution, L2 norm and decay: bitwise, 36% slower.
+- Overlapping the next layer's weight conversion with half B's mixer (the
+  other weight set is free there): not attempted; it is 7% of the half's
+  GPU time at 4K, where the ANE sets the pace, and 1-3% from 32K.
+
 Single-token decode encodes 835 dispatches per token, down from 1,364, and
 every fused kernel is bitwise identical to the dispatches it replaces
 (`local-metal/tests/bonsai_fusion.rs`):
@@ -3998,6 +4119,15 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 [the original build](https://github.com/debanjanbasu/local-ai/commit/b389329),
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
+
+- Splash's prefill attention and scan techniques that do not fit this
+  engine (October 2026, listed with the profile in
+  [Neural Engine prefill FFN](#neural-engine-prefill-ffn)): int8 K/V read
+  in place (this cache's per-32-dimension scales need eight products per
+  tile, 70-130% slower), a dequantized half cache read in place (2-9%
+  slower), KV-head-major threadgroup order and dimension-sliced QK (within
+  noise), earlier K/V loads (up to 20% slower) and wider or deeper
+  recurrence prefetch (no faster).
 
 - Other ways to move mixer work onto the Neural Engine (October 2026,
   with the output projection split in

@@ -46,7 +46,23 @@ impl GdnStateFormat {
             Self::Bf16 => (23, 24),
         }
     }
+
+    /// Index of the four-row prefill pipeline (`bo_gdn_prefill_rows_4*`):
+    /// the four-row kernel's arithmetic with each token's inputs loaded
+    /// during the previous token's step.
+    const fn prefill_pipeline(self) -> usize {
+        match self {
+            Self::F32 => 34,
+            Self::F16 => 35,
+            Self::Bf16 => 36,
+        }
+    }
 }
+
+/// Blocks of more rows than this (prefill chunks) take the prefill pipeline;
+/// shorter ones (decode, verification) keep the four-row kernel. Both leave
+/// the same bits.
+const PREFILL_MIN_ROWS: u32 = 32;
 
 impl BonsaiOps {
     pub fn decay_beta(
@@ -164,7 +180,9 @@ impl BonsaiOps {
         // keeps one row per SIMD group (the wider variant's gain was noisy),
         // four SIMD groups per threadgroup.
         let (single, wide) = format.pipelines();
-        let (pipeline, threads) = if tokens > 1 {
+        let (pipeline, threads) = if tokens > PREFILL_MIN_ROWS {
+            (format.prefill_pipeline(), 32)
+        } else if tokens > 1 {
             (wide, 32)
         } else {
             (single, 128)
