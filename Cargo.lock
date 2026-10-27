@@ -2178,6 +2178,7 @@ dependencies = [
  "half",
  "image",
  "jsonschema",
+ "libc",
  "llguidance",
  "local-metal",
  "memmap2",

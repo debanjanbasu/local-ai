@@ -246,7 +246,7 @@ flag turns any of it off or tunes it.
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Responses | Stored in `~/Library/Application Support/local-ai/responses` (or `--response-store DIR`) |
 | Hosted tools | All on, rooted at the canonicalized working directory of `serve`; 8 rounds, 20 s per call, 120 s per Response; a non-loopback `--host` needs `--api-key` |
-| Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache` |
+| Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache`; snapshot writes paced to a quarter of the volume's capacity a day |
 | Server | Up to eight requests decoded together in one batched pass per step, verifying lookup and MTP drafts where a cost model finds them worth their rows; a long prompt prefills 24 to 31 tokens per step inside that pass (32 in a pass of its own beside a single stream); eight more queued; HTTP/3 when its certificate and key are discovered |
 
 ## Performance
@@ -289,12 +289,17 @@ flag turns any of it off or tunes it.
   of two on a power-limited 20 W adapter where both builds ran slower than
   above; 2K and 8K unchanged.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
-  shared 6.7K-token prefix TTFT 1.2 s versus 73 s. After a server restart a
-  new session sharing a ~5.9K-token system prompt and tools reaches its first
-  token in about 1.0 s against 17.8 s cold (46.4 s before Neural Engine
-  prefill; `tools/benchmark.py --ttft`). A follow-up adding a 408-token tool
-  result to a 5.7K-token session reaches its first token in 2.30 s against
-  3.65 s when blocks under 512 tokens stayed on the GPU.
+  shared 6.7K-token prefix TTFT 1.2 s versus 73 s. A restarted process
+  restoring a disk snapshot reaches its first token in 0.09–0.12 s at 6K
+  tokens, 0.26 s at 33K and 0.87 s at 128K with the file cached (0.14, 0.44
+  and 1.7–2.0 s uncached), against 0.22–0.29, 0.77–0.89 and 3.1 s with one
+  reader hashing it with SHA-256 ([details](docs/BONSAI.md#prompt-cache)).
+  After a server restart a new session sharing a ~5.9K-token system prompt
+  and tools reaches its first token in about 1.0 s against 17.8 s cold
+  (46.4 s before Neural Engine prefill; `tools/benchmark.py --ttft`). A
+  follow-up adding a 408-token tool result to a 5.7K-token session reaches
+  its first token in 2.30 s against 3.65 s when blocks under 512 tokens
+  stayed on the GPU.
 - Memory: 0.8–0.9 GB peak for a short request and 2.09 GB peak footprint for
   a 16K-token prompt plus 500 generated tokens (F16 recurrent state, copy-free
   verify rollback, 4K-step K/V growth). Neural Engine prefill adds about

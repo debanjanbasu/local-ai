@@ -7,13 +7,15 @@ use std::thread::JoinHandle;
 
 use crate::bonsai_native::PromptSnapshot;
 
-/// A disk snapshot being read and SHA-256-checked on a thread of its own.
+/// A disk snapshot being read and checked on threads of its own.
 ///
 /// Both scale with the prompt (about 38 KiB a token), so on the engine thread
 /// they held up every decoding request for the whole read. The engine starts
 /// one of these instead, keeps the request out of prefill until
 /// [`Self::is_finished`], and then only copies the snapshot into the model's
-/// buffers. Dropping a load still running stops its read within one piece.
+/// buffers. The load reads the file's blocks in parallel (see
+/// `prompt_cache::blocks`). Dropping a load still running stops its read
+/// within one block per reader.
 pub struct Load {
     path: PathBuf,
     abort: Arc<AtomicBool>,

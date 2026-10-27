@@ -67,6 +67,11 @@ impl BonsaiEngine {
         } else {
             (remaining / 4).min(4 * 1024 * 1024 * 1024)
         };
+        let (daily_writes, daily_writes_reason) = directory.as_deref().map_or_else(
+            || (None, "no prompt cache directory".to_owned()),
+            prompt_cache::daily_write_budget,
+        );
+        self.prompt_cache_daily_writes = daily_writes;
         self.set_session_cache((host_bytes / (1024 * 1024)) as usize, directory);
         self.prompt_cache_disk_bytes = disk_budget_bytes;
         self.reclaim_disk_tier();
@@ -92,6 +97,8 @@ impl BonsaiEngine {
             "eviction_priority": "shared_prefix_before_request_tail",
         });
         self.info.policy["prompt_cache"]["disk_budget_bytes"] = disk_budget_bytes.into();
+        self.info.policy["prompt_cache"]["daily_write_budget_bytes"] = daily_writes.into();
+        self.info.policy["prompt_cache"]["daily_write_budget_reason"] = daily_writes_reason.into();
         Ok(())
     }
 

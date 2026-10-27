@@ -11,11 +11,12 @@ use sha2::{Digest, Sha256};
 
 use crate::bonsai_native::{PageBytes, PromptSnapshot};
 
+mod blocks;
 mod loader;
 mod writer;
 
 pub use self::loader::Load;
-pub use self::writer::{Closed, Closer, StoreJob, Writer};
+pub use self::writer::{Closed, Closer, StoreJob, Writer, daily_write_budget};
 
 const MAGIC: &[u8; 8] = b"BPCACHE1";
 
@@ -47,7 +48,14 @@ struct Header {
     mtp_hidden: usize,
     target_kv: usize,
     mtp_kv: usize,
-    payload_sha256: String,
+    /// SHA-256 of the contiguous payload, in files written before the block
+    /// layout; still read, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_sha256: Option<String>,
+    /// CRC-32C of each block of each section, in the block layout (see
+    /// [`blocks`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_crc32c: Option<String>,
     session_id: Option<String>,
     #[serde(default)]
     reusable_boundary: bool,
@@ -108,7 +116,7 @@ pub fn load(path: &Path, model_key: &str) -> crate::Result<PromptSnapshot> {
     load_abortable(path, model_key, &AtomicBool::new(false))
 }
 
-/// `load`, giving up between pieces once `abort` is set.
+/// `load`, giving up between blocks once `abort` is set.
 fn load_abortable(
     path: &Path,
     model_key: &str,
@@ -125,16 +133,47 @@ fn load_abortable(
         .token_count
         .checked_mul(4)
         .ok_or_else(|| crate::Error::InvalidFormat("prompt cache token size overflow".into()))?;
-    let payload_bytes = [
+    let lengths = [
         token_bytes,
         header.recurrent,
         header.mtp_hidden,
         header.target_kv,
         header.mtp_kv,
-    ]
-    .into_iter()
-    .try_fold(0_usize, usize::checked_add)
-    .ok_or_else(|| crate::Error::InvalidFormat("prompt cache section size overflow".into()))?;
+    ];
+    let start = file.stream_position()?;
+    let file_length = file.metadata()?.len();
+    let [_tokens, recurrent, mtp_prev_hidden, target_kv, mtp_kv] =
+        match (&header.payload_crc32c, &header.payload_sha256) {
+            (Some(digits), _) => blocks::read(&file, start, file_length, lengths, digits, abort)?,
+            (None, Some(digest)) => read_sha256_payload(&mut file, lengths, digest, abort)?,
+            (None, None) => {
+                return Err(crate::Error::InvalidFormat(
+                    "prompt cache has no checksum".into(),
+                ));
+            }
+        };
+    Ok(PromptSnapshot {
+        position: header.position,
+        layout: header.layout,
+        recurrent,
+        mtp_prev_hidden,
+        target_kv,
+        mtp_kv,
+    })
+}
+
+/// Read the contiguous payload of a snapshot written before the block layout
+/// from `file`'s position, and check it against its SHA-256 `digest`.
+fn read_sha256_payload(
+    file: &mut File,
+    lengths: [usize; 5],
+    digest: &str,
+    abort: &AtomicBool,
+) -> crate::Result<[PageBytes; 5]> {
+    let payload_bytes = lengths
+        .into_iter()
+        .try_fold(0_usize, usize::checked_add)
+        .ok_or_else(|| crate::Error::InvalidFormat("prompt cache section size overflow".into()))?;
     let remaining = file
         .metadata()?
         .len()
@@ -144,34 +183,25 @@ fn load_abortable(
             "truncated prompt cache section".into(),
         ));
     }
-    let mut digest = Sha256::new();
-    let mut stored_tokens = vec![0; token_bytes];
-    file.read_exact(&mut stored_tokens)?;
-    digest.update(&stored_tokens);
-    let recurrent = read_hashed(&mut file, header.recurrent, &mut digest, abort)?;
-    let mtp_prev_hidden = read_hashed(&mut file, header.mtp_hidden, &mut digest, abort)?;
-    let target_kv = read_hashed(&mut file, header.target_kv, &mut digest, abort)?;
-    let mtp_kv = read_hashed(&mut file, header.mtp_kv, &mut digest, abort)?;
+    let mut hasher = Sha256::new();
+    let mut sections = Vec::with_capacity(lengths.len());
+    for length in lengths {
+        sections.push(read_hashed(file, length, &mut hasher, abort)?);
+    }
     let mut trailing = [0];
     if file.read(&mut trailing)? != 0 {
         return Err(crate::Error::InvalidFormat(
             "prompt cache trailing bytes".into(),
         ));
     }
-    if hex(digest.finalize().as_slice()) != header.payload_sha256 {
+    if hex(hasher.finalize().as_slice()) != digest {
         return Err(crate::Error::InvalidFormat(
             "prompt cache checksum mismatch".into(),
         ));
     }
-    let snapshot = PromptSnapshot {
-        position: header.position,
-        layout: header.layout,
-        recurrent,
-        mtp_prev_hidden,
-        target_kv,
-        mtp_kv,
-    };
-    Ok(snapshot)
+    sections
+        .try_into()
+        .map_err(|_| crate::Error::InvalidFormat("prompt cache section count mismatch".into()))
 }
 
 #[cfg(test)]
@@ -194,14 +224,14 @@ pub fn store(
     )
 }
 
-/// The header `store` writes, with `digest` as its checksum.
+/// The header `store` writes, with `checksums` as the block checksums.
 fn header(
     model_key: &str,
     tokens: &[u32],
     session_id: Option<&str>,
     snapshot: &PromptSnapshot,
     reusable_boundary: bool,
-    digest: String,
+    checksums: String,
 ) -> Header {
     Header {
         model_key: model_key.to_owned(),
@@ -212,15 +242,42 @@ fn header(
         mtp_hidden: snapshot.mtp_prev_hidden.len(),
         target_kv: snapshot.target_kv.len(),
         mtp_kv: snapshot.mtp_kv.len(),
-        payload_sha256: digest,
+        payload_sha256: None,
+        payload_crc32c: Some(checksums),
         session_id: session_id.map(str::to_owned),
         reusable_boundary,
     }
 }
 
-/// The exact size of the file `store` would write, known before hashing: the
-/// checksum is always 64 hex digits, so a placeholder of that length encodes
-/// to the same header length.
+/// The section lengths of a snapshot of `tokens`, in file order.
+fn section_lengths(tokens: &[u32], snapshot: &PromptSnapshot) -> [usize; 5] {
+    [
+        tokens.len() * 4,
+        snapshot.recurrent.len(),
+        snapshot.mtp_prev_hidden.len(),
+        snapshot.target_kv.len(),
+        snapshot.mtp_kv.len(),
+    ]
+}
+
+/// What precedes the payload: the magic, the header's length and the header,
+/// padded with spaces (which JSON ignores) so the payload starts on a
+/// [`blocks::ALIGN`] boundary.
+fn preamble(header: &Header) -> crate::Result<Vec<u8>> {
+    let encoded = serde_json::to_vec(header)?;
+    let fixed = MAGIC.len() + 8;
+    let padded = (fixed + encoded.len()).next_multiple_of(blocks::ALIGN) - fixed;
+    let mut preamble = Vec::with_capacity(fixed + padded);
+    preamble.extend_from_slice(MAGIC);
+    preamble.extend_from_slice(&(padded as u64).to_le_bytes());
+    preamble.extend_from_slice(&encoded);
+    preamble.resize(fixed + padded, b' ');
+    Ok(preamble)
+}
+
+/// The exact size of the file `store` would write, known before checksumming:
+/// the checksums take a fixed number of digits per block, so a placeholder of
+/// that length encodes to the same header length.
 fn stored_bytes(
     model_key: &str,
     tokens: &[u32],
@@ -228,7 +285,8 @@ fn stored_bytes(
     snapshot: &PromptSnapshot,
     reusable_boundary: bool,
 ) -> u64 {
-    let placeholder = "0".repeat(64);
+    let lengths = section_lengths(tokens, snapshot);
+    let placeholder = "0".repeat(blocks::checksum_digits(lengths));
     let header = header(
         model_key,
         tokens,
@@ -237,20 +295,11 @@ fn stored_bytes(
         reusable_boundary,
         placeholder,
     );
-    let header = serde_json::to_vec(&header).map_or(0, |bytes| bytes.len());
-    [
-        MAGIC.len(),
-        8,
-        header,
-        tokens.len() * 4,
-        snapshot.recurrent.len(),
-        snapshot.mtp_prev_hidden.len(),
-        snapshot.target_kv.len(),
-        snapshot.mtp_kv.len(),
-    ]
-    .into_iter()
-    .map(|bytes| bytes as u64)
-    .sum()
+    let preamble = preamble(&header).map_or(0, |bytes| bytes.len());
+    std::iter::once(preamble)
+        .chain(lengths.map(blocks::padded))
+        .map(|bytes| bytes as u64)
+        .sum()
 }
 
 fn aborted() -> crate::Error {
@@ -274,29 +323,23 @@ fn store_abortable(
     let dir = root.join(model_key);
     fs::create_dir_all(&dir)?;
     let stored_tokens = token_bytes(tokens);
-    let mut digest = Sha256::new();
-    for section in sections(&stored_tokens, snapshot) {
-        for piece in section.chunks(WRITE_PIECE) {
-            if abort.load(Ordering::Acquire) {
-                return Err(aborted());
-            }
-            digest.update(piece);
-        }
-    }
-    let digest = hex(digest.finalize().as_slice());
-    let short_digest = digest.get(..16).unwrap_or(&digest).to_owned();
+    let sections = sections(&stored_tokens, snapshot);
+    let checksums = blocks::checksums(&sections, WRITE_PIECE, abort).ok_or_else(aborted)?;
+    // Named by its content, as before, so a snapshot rewritten unchanged
+    // replaces its file: the checksums of every block stand for it.
+    let name = hex(&Sha256::digest(checksums.as_bytes())[..8]);
     let header = header(
         model_key,
         tokens,
         session_id,
         snapshot,
         reusable_boundary,
-        digest,
+        checksums,
     );
-    let header = serde_json::to_vec(&header)?;
-    let path = dir.join(format!("{}-{short_digest}.bpc", snapshot.position));
+    let preamble = preamble(&header)?;
+    let path = dir.join(format!("{}-{name}.bpc", snapshot.position));
     let temporary = path.with_extension("tmp");
-    let committed = write_temporary(&temporary, &header, &stored_tokens, snapshot, abort)
+    let committed = write_temporary(&temporary, &preamble, &sections, abort)
         .and_then(|()| fs::rename(&temporary, &path).map_err(crate::Error::from));
     if committed.is_err() {
         // The temporary is invisible to `discover`, so nothing else would reclaim it.
@@ -336,25 +379,22 @@ fn create_locked(temporary: &Path) -> std::io::Result<File> {
 
 fn write_temporary(
     temporary: &Path,
-    header: &[u8],
-    tokens: &[u8],
-    snapshot: &PromptSnapshot,
+    preamble: &[u8],
+    sections: &[&[u8]],
     abort: &AtomicBool,
 ) -> crate::Result<()> {
     // Locked until `file` drops, after the caller's rename or removal.
     let mut file = create_locked(temporary)?;
-    let mut preamble = Vec::with_capacity(MAGIC.len() + 8 + header.len());
-    preamble.extend_from_slice(MAGIC);
-    preamble.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    preamble.extend_from_slice(header);
-    file.write_all(&preamble)?;
-    for section in sections(tokens, snapshot) {
+    file.write_all(preamble)?;
+    let padding = [0; blocks::ALIGN];
+    for section in sections {
         for piece in section.chunks(WRITE_PIECE) {
             if abort.load(Ordering::Acquire) {
                 return Err(aborted());
             }
             file.write_all(piece)?;
         }
+        file.write_all(&padding[..blocks::padded(section.len()) - section.len()])?;
     }
     file.sync_all()?;
     Ok(())
