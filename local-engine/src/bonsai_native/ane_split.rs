@@ -2183,6 +2183,9 @@ impl BonsaiModel {
 }
 
 #[cfg(test)]
+mod profile;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
