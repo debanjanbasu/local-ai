@@ -57,7 +57,7 @@ pub use bonsai_mtp::{
 };
 pub use runtime::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P,
-    EVENT_BUFFER, GenerateParams, GenerationStats, MAX_TOP_LOGPROBS, MtpStats, NgramStats,
-    PrefillProgress,
+    EVENT_BUFFER, GenerateParams, GenerationStats, KflashStats, MAX_TOP_LOGPROBS, MtpStats,
+    NgramStats, PrefillProgress,
 };
 pub use sampler::{TokenLogprob, TopLogprob};

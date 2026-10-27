@@ -68,12 +68,13 @@ fn parse(args: &[String]) -> Result<Args, String> {
 
 fn run(args: &Args) -> crate::Result<()> {
     let resources = Resources::discover(None, true)?;
-    let mut engine = BonsaiEngine::open_with_options(
+    let mut engine = BonsaiEngine::open_with_speculation(
         &resources.model,
         None,
         PREFILL_CHUNK,
         None,
         &resources.mtp,
+        &resources.dflash,
         NgramSettings::default(),
         KvOptions::default(),
     )?;

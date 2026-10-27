@@ -299,12 +299,13 @@ fn run(args: &Args) -> crate::Result<()> {
         return Ok(());
     }
     let started = Instant::now();
-    let mut engine = BonsaiEngine::open_with_options(
+    let mut engine = BonsaiEngine::open_with_speculation(
         &resources.model,
         None,
         PREFILL_CHUNK,
         None,
         &resources.mtp,
+        &resources.dflash,
         if args.no_speculation {
             NgramSettings {
                 enabled: false,
@@ -348,6 +349,28 @@ fn run(args: &Args) -> crate::Result<()> {
     let decode_rate = decode_seconds
         .filter(|&seconds| seconds > 0.0 && stats.sampled_tokens > 1)
         .map(|seconds| (stats.sampled_tokens - 1) as f64 / seconds);
+    let kflash = engine.kflash_enabled().then(|| {
+        json!({
+            "cycles": stats.kflash.cycles,
+            "mtp_cycles": stats.kflash.mtp_cycles,
+            "declined_trees": stats.kflash.declined_trees,
+            "lookup_cycles": stats.kflash.lookup_cycles,
+            "verified_rows": stats.kflash.verified_rows,
+            "rows_histogram": stats.kflash.rows_histogram,
+            "accepted_tokens": stats.kflash.accepted_tokens,
+            "off_chain_cycles": stats.kflash.off_chain_cycles,
+            "tokens_per_cycle": (stats.kflash.cycles > 0)
+                .then(|| (stats.kflash.accepted_tokens + stats.kflash.cycles) as f64
+                    / stats.kflash.cycles as f64),
+            "expected_tokens_per_cycle": (stats.kflash.cycles > 0)
+                .then(|| stats.kflash.expected_tokens / stats.kflash.cycles as f64),
+            "catch_up_rows": stats.kflash.catch_up_rows,
+            "catch_up_seconds": stats.kflash.catch_up.as_secs_f64(),
+            "drafting_seconds": stats.kflash.drafting.as_secs_f64(),
+            "verification_seconds": stats.kflash.verification.as_secs_f64(),
+            "commit_seconds": stats.kflash.commit.as_secs_f64(),
+        })
+    });
     let record = json!({
         "context": engine.info().context,
         "prefill_chunk_size": engine.info().prefill_chunk_size,
@@ -387,6 +410,7 @@ fn run(args: &Args) -> crate::Result<()> {
             "verification_seconds": stats.mtp.verification.as_secs_f64(),
             "commit_seconds": stats.mtp.commit.as_secs_f64(),
         })),
+        "kflash": kflash,
         "ngram": {
             "rounds": stats.ngram.rounds,
             "proposed_tokens": stats.ngram.proposed_tokens,

@@ -7,6 +7,8 @@
 //! reads, as the validated drafter trace captured it. Taps are off, and cost
 //! nothing, until [`BonsaiModel::set_taps`] turns them on.
 
+use std::cell::Cell;
+
 use super::{BonsaiModel, CommandBatch, MetalBuffer, WIDTH};
 
 /// Target layers whose output the drafter reads, in tap order.
@@ -28,6 +30,48 @@ pub(super) struct Taps {
     staging_rows: usize,
     /// Prefill leaves positions below this untapped.
     pub(super) floor: usize,
+    /// The consecutive positions the ring holds, if any.
+    span: Cell<Option<TapSpan>>,
+    /// Identity of the next span.
+    next_epoch: Cell<u64>,
+}
+
+/// Consecutive committed positions `start..end` of one buffer set whose taps
+/// the ring holds (only the last [`TAP_WINDOW`] are still there).
+///
+/// A write that does not continue the span (another buffer set, or a jump
+/// in position: rows decoded without taps, a restored prefix) starts a new
+/// span with a new `epoch`, so a reader that recorded the epoch it read up
+/// to knows whether the rows it has not read yet continue what it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapSpan {
+    pub epoch: u64,
+    state: u64,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Taps {
+    /// Record that the ring now holds `start..end` of buffer set `state`.
+    fn note(&self, state: u64, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let span = match self.span.get() {
+            Some(span) if span.state == state && span.end == start => TapSpan { end, ..span },
+            _ => {
+                let epoch = self.next_epoch.get();
+                self.next_epoch.set(epoch + 1);
+                TapSpan {
+                    epoch,
+                    state,
+                    start,
+                    end,
+                }
+            }
+        };
+        self.span.set(Some(span));
+    }
 }
 
 /// The tap slot that layer `layer`'s input norm fills (the residual after
@@ -66,8 +110,45 @@ impl BonsaiModel {
             staging: MetalBuffer::empty(self.context.device(), floats(staging_rows))?,
             staging_rows,
             floor: 0,
+            span: Cell::new(None),
+            next_epoch: Cell::new(0),
         });
         Ok(())
+    }
+
+    /// The consecutive committed positions of the resident sequence whose
+    /// taps the ring holds, ending at [`Self::position`]: `None` while taps
+    /// are off or when the newest committed positions were not tapped
+    /// (decoded in a batched pass, or restored from a prompt checkpoint).
+    /// `start` is clamped to the ring's last [`TAP_WINDOW`] positions.
+    #[must_use]
+    pub fn tap_span(&self) -> Option<TapSpan> {
+        let span = self.taps.as_ref()?.span.get()?;
+        (span.state == self.state_id && span.end == self.position).then(|| TapSpan {
+            start: span.start.max(span.end.saturating_sub(TAP_WINDOW)),
+            ..span
+        })
+    }
+
+    /// Forget which positions the ring holds: the committed state was
+    /// replaced (a reset or a restored prefix), so the rows describe
+    /// positions of some other text.
+    pub(super) fn forget_taps(&self) {
+        if let Some(taps) = &self.taps {
+            taps.span.set(None);
+        }
+    }
+
+    /// Keep only the newest `TAP_WINDOW - 1` positions of the current span:
+    /// a row was written at the position just past it and then dropped (the
+    /// cost table's decode steps), overwriting the oldest row of the window.
+    pub(super) fn trim_taps(&self, span: Option<TapSpan>) {
+        if let Some(taps) = &self.taps {
+            taps.span.set(span.map(|span| TapSpan {
+                start: span.start.max((span.end + 1).saturating_sub(TAP_WINDOW)),
+                ..span
+            }));
+        }
     }
 
     /// The tap ring, while taps are on: `[TAP_WINDOW][TAP_LAYERS.len()][WIDTH]`
@@ -134,6 +215,9 @@ impl BonsaiModel {
             )?);
         }
         let skip = taps.floor.saturating_sub(self.position).min(rows);
+        if slot == 0 {
+            taps.note(self.state_id, self.position + skip, self.position + rows);
+        }
         Ok(self.ops.copy_rows(
             batch,
             (&self.scratch.hidden, skip * WIDTH * size_of::<f32>()),
@@ -157,6 +241,7 @@ impl BonsaiModel {
         let Some(taps) = &self.taps else {
             return Ok(());
         };
+        taps.note(self.state_id, start, start + rows.len());
         let mut index = 0;
         while index < rows.len() {
             // Consecutive staged rows go to consecutive positions in one copy.

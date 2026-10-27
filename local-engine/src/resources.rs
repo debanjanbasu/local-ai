@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::bonsai::DEFAULT_BONSAI_GGUF;
+use crate::bonsai_dflash::{DFLASH_HEAD_ARTIFACT, DflashMode};
 use crate::bonsai_mtp::{DEFAULT_MTP_DEPTH, MTP_HEAD_ARTIFACT, MtpMode, MtpSettings};
 
 const MODEL_RELATIVE: &str = "models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
 /// The MTP head's directory under the models root.
 const MTP_DIRECTORY: &str = "bonsai2-27b-mtp";
+/// The `DFlash2` drafter's directory under the models root.
+const DFLASH_DIRECTORY: &str = "bonsai2-27b-dflash2";
 /// Prompt tokens per prefill block: the largest block the kernels take (see
 /// `local_metal::bonsai_ops::MAX_PREFILL_TOKENS`).
 pub const PREFILL_CHUNK: usize = local_metal::bonsai_ops::MAX_PREFILL_TOKENS as usize;
@@ -26,6 +29,9 @@ pub struct Resources {
     pub model_reason: String,
     pub mtp: MtpMode,
     pub mtp_reason: String,
+    /// `KFlash` drafting: the drafter beside the model, or why not.
+    pub dflash: DflashMode,
+    pub dflash_reason: String,
     /// The vision projector beside the model, when installed.
     pub vision: Option<PathBuf>,
     pub vision_reason: String,
@@ -82,6 +88,24 @@ impl Resources {
             let reason = "no MTP head artifact installed beside the model";
             (MtpMode::Off(Some(reason.into())), reason.into())
         };
+        // KFlash whenever the drafter is installed beside the model; the
+        // loader verifies its digest and keeps the MTP head for fallback.
+        let drafter = model
+            .parent()
+            .and_then(Path::parent)
+            .map(|root| root.join(DFLASH_DIRECTORY).join(DFLASH_HEAD_ARTIFACT))
+            .filter(|path| path.is_file());
+        let (dflash, dflash_reason) = if !speculation {
+            let reason = "disabled by --no-speculation";
+            (DflashMode::Off(reason.into()), reason.into())
+        } else if let Some(path) = drafter {
+            let reason = format!("DFlash2 drafter artifact {}", path.display());
+            (DflashMode::Drafter(path), reason)
+        } else {
+            let reason = "no DFlash2 drafter installed beside the model; speculating with \
+                          the MTP head and suffix lookup";
+            (DflashMode::Off(reason.into()), reason.into())
+        };
         // Image input whenever the projector is installed beside the model;
         // the loader verifies it against the pinned export.
         let vision = model
@@ -136,6 +160,8 @@ impl Resources {
             model_reason,
             mtp,
             mtp_reason,
+            dflash,
+            dflash_reason,
             vision,
             vision_reason,
             prompt_cache_dir,
@@ -154,6 +180,7 @@ impl Resources {
                 "model": self.model,
                 "model_reason": self.model_reason,
                 "mtp_reason": self.mtp_reason,
+                "dflash_reason": self.dflash_reason,
                 "vision": self.vision,
                 "vision_reason": self.vision_reason,
                 "physical_memory_bytes": self.physical_memory_bytes,

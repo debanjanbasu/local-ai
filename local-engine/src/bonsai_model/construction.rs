@@ -1,3 +1,5 @@
+use crate::bonsai_dflash::{DflashMode, DflashResolution};
+
 use super::{
     AttentionKernel, BonsaiEngine, BonsaiInfo, BonsaiModel, BonsaiPackage, BonsaiTokenizer,
     DRAFT_CHAIN_MIN_MARGIN, KvOptions, MtpMode, MtpResolution, NgramSettings, Path, SuffixStore,
@@ -34,7 +36,43 @@ impl BonsaiEngine {
         ngram: NgramSettings,
         kv: KvOptions,
     ) -> crate::Result<Self> {
+        Self::open_with_speculation(
+            path,
+            max_context,
+            prefill_chunk,
+            attention_kernel,
+            mtp,
+            &DflashMode::Off("not requested by this constructor".into()),
+            ngram,
+            kv,
+        )
+    }
+
+    /// [`Self::open_with_options`] with `KFlash` drafting following
+    /// `dflash`: a resolved drafter turns on the residual taps and tree
+    /// verify beside the MTP head, which stays loaded for the cycles where
+    /// its chain promises more. The decision and its reason are reported in
+    /// the policy JSON.
+    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn open_with_speculation(
+        path: &Path,
+        max_context: Option<usize>,
+        prefill_chunk: usize,
+        attention_kernel: Option<AttentionKernel>,
+        mtp: &MtpMode,
+        dflash: &DflashMode,
+        ngram: NgramSettings,
+        kv: KvOptions,
+    ) -> crate::Result<Self> {
         let package = BonsaiPackage::open(path)?;
+        let drafter = match dflash.resolve()? {
+            DflashResolution::Drafter(path) => Ok(path),
+            DflashResolution::Fallback(reason) => Err(reason),
+        };
+        let model_name = path.file_stem().map_or_else(
+            || "bonsai".into(),
+            |stem| stem.to_string_lossy().into_owned(),
+        );
         let context = max_context.unwrap_or(0);
         let (settings, disabled) = match mtp.resolve()? {
             MtpResolution::Native(settings) => (Some(settings), None),
@@ -42,7 +80,7 @@ impl BonsaiEngine {
             // the reason that turned it off, so nothing has to re-derive it here.
             MtpResolution::Disabled(reason) => (None, Some(reason)),
         };
-        let model = BonsaiModel::load(
+        let model = BonsaiModel::load_with_drafter(
             package,
             context,
             prefill_chunk,
@@ -50,6 +88,10 @@ impl BonsaiEngine {
             settings.as_ref(),
             ngram,
             kv,
+            drafter
+                .as_ref()
+                .ok()
+                .map(|path| (path.as_path(), model_name.as_str())),
         )?;
         let tokenizer = BonsaiTokenizer::from_package(model.package())?;
         if tokenizer.vocab_size() != VOCAB {
@@ -68,6 +110,26 @@ impl BonsaiEngine {
                 "checkpoint_bytes": speculation.checkpoint_bytes,
             }),
             _ => serde_json::json!({"enabled": false, "reason": disabled}),
+        };
+        let kflash_policy = match (model.kflash_info(), &drafter) {
+            (Some(kflash), _) => serde_json::json!({
+                "enabled": true,
+                "drafter": kflash.path,
+                "pinned": kflash.payload_sha256 == crate::bonsai_dflash::PINNED_DFLASH_SHA256,
+                "payload_sha256": kflash.payload_sha256,
+                "weight_bytes": kflash.weight_bytes,
+                "state_bytes": kflash.state_bytes,
+                "tap_bytes": crate::bonsai_native::TAP_WINDOW
+                    * crate::bonsai_native::TAP_ROW_FLOATS
+                    * size_of::<f32>(),
+                "max_tree_rows": crate::bonsai_native::MAX_TREE_ROWS,
+                "draft_ms": kflash.draft_ms,
+                "verify_ms": kflash.verify_ms,
+                "calibration": kflash.calibration,
+                "fallback": "MTP chain or suffix lookup when its measured tokens per millisecond lead",
+            }),
+            (None, Err(reason)) => serde_json::json!({"enabled": false, "reason": reason}),
+            (None, Ok(_)) => serde_json::json!({"enabled": false}),
         };
         let layout = model.kv_layout();
         let info = BonsaiInfo {
@@ -88,6 +150,7 @@ impl BonsaiEngine {
                     "max_bytes": model.kv_max_bytes(),
                 },
                 "mtp": mtp_policy,
+                "kflash": kflash_policy,
                 "ngram": {
                     "enabled": ngram.enabled,
                     "max_drafts": ngram.max_drafts,
@@ -118,6 +181,8 @@ impl BonsaiEngine {
             pool: Vec::new(),
             cache_state: 0,
             next_generation: 0,
+            kflash_owner: None,
+            kflash_history: None,
             #[cfg(test)]
             force_batched_drafts: false,
             #[cfg(test)]

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use super::checkpoints::Loaded;
+use super::kflash::{KflashBudget, Source, tree_size};
 use super::{
     BonsaiEngine, BonsaiGeneration, BonsaiModel, CancelToken, GenerateParams, GenerationStats,
     HeadLag, Instant, LookupPolicy, MtpStats, PrefillProgress, PromptCacheSource, PromptCheckpoint,
@@ -69,6 +70,8 @@ pub(super) struct ActiveGeneration {
     /// for the batched-speculation cost model.
     pub(super) ngram_acceptance: f64,
     pub(super) mtp_acceptance: f64,
+    /// This sequence's measured rates for the solo cycle's source choice.
+    pub(super) kflash: KflashBudget,
 }
 
 impl ActiveGeneration {
@@ -311,6 +314,7 @@ impl BonsaiEngine {
             prefill_chunks: 0,
             ngram_acceptance: INITIAL_NGRAM_ACCEPTANCE,
             mtp_acceptance: INITIAL_MTP_ACCEPTANCE,
+            kflash: KflashBudget::default(),
         };
         if params.max_tokens == 0 {
             generation.done = true;
@@ -550,9 +554,15 @@ impl BonsaiEngine {
         Ok(())
     }
 
-    /// One single-sequence round for the resident `generation`: n-gram
-    /// verification, an MTP speculative round, or a plain decode step,
-    /// exactly as an unbatched request runs it.
+    /// One single-sequence round for the resident `generation`: a `KFlash`
+    /// tree cycle, n-gram verification, an MTP speculative round, or a plain
+    /// decode step, exactly as an unbatched request runs it.
+    ///
+    /// With the `DFlash2` drafter loaded and the ring holding the
+    /// sequence's newest taps, the source is the one the sequence's budget
+    /// measures fastest ([`KflashBudget::choose`]); otherwise lookup drafts
+    /// when it matches, then the head.
+    #[expect(clippy::too_many_lines)]
     pub(super) fn solo_round(&mut self, generation: &mut ActiveGeneration) -> crate::Result<()> {
         let Some(seed) = generation.seed.take() else {
             return Ok(());
@@ -568,10 +578,101 @@ impl BonsaiEngine {
             self.model.catch_up_head(&mut generation.lag)?;
         }
         let drafts = Self::lookup_draft(self.ngram, self.info.context, generation);
+        let kflash = self.model.kflash_costs().is_some();
+        let source = if self.model.kflash_ready() {
+            generation.kflash.choose([true, head, !drafts.is_empty()])
+        } else if !drafts.is_empty() {
+            Some(Source::Lookup)
+        } else if head {
+            Some(Source::Mtp)
+        } else {
+            None
+        };
+        let mut started = Instant::now();
+        if source == Some(Source::Tree) && self.kflash_owner != Some(generation.id) {
+            // A restored prefix of the previous owner's tokens continues its
+            // context rather than restarting it at the first tapped position.
+            let prefix = generation.stats.reused_prompt_tokens;
+            if let Some(history) = self.kflash_history.take()
+                && prefix > 0
+                && history.get(..prefix) == generation.prompt.get(..prefix)
+            {
+                self.model.kflash_adopt(prefix);
+            }
+            self.kflash_owner = Some(generation.id);
+        }
+        if source == Some(Source::Tree) {
+            // A long catch-up (a prompt, or a context restarted after
+            // decoding without taps) is not this cycle's cost.
+            if let Some(rows) = self
+                .model
+                .kflash_pending()
+                .filter(|&rows| rows > crate::bonsai_native::KFLASH_CATCH_UP_ROWS)
+            {
+                self.model
+                    .kflash_catch_up(crate::bonsai_native::KFLASH_CATCH_UP_ROWS)?;
+                generation.stats.kflash.catch_up_rows += rows;
+                generation.stats.kflash.catch_up += started.elapsed();
+                started = Instant::now();
+            }
+        }
         let stats = &mut generation.stats;
         let remaining = generation.params.max_tokens - stats.sampled_tokens;
         let pending = &mut generation.pending;
-        if !drafts.is_empty() {
+        if source == Some(Source::Tree) {
+            let position = self.model.position();
+            let max_depth = draft_depth(
+                crate::bonsai_dflash::DFLASH_SLOTS,
+                remaining,
+                self.info.context,
+                position,
+            );
+            let drafting = Instant::now();
+            match self.model.kflash_draft(seed)? {
+                Some(tree) => {
+                    stats.kflash.drafting += drafting.elapsed();
+                    let mut rows = crate::bonsai_native::tree_rows(&tree, max_depth);
+                    rows.truncate(self.info.context.saturating_sub(position).max(1));
+                    let costs = self.model.kflash_costs().ok_or_else(|| {
+                        crate::Error::Generation("KFlash costs are unavailable".into())
+                    })?;
+                    let n = tree_size(&tree, &rows, &costs, generation.kflash.going_rate());
+                    if n == 1 && head && max_depth > 0 {
+                        // The tree is worth no draft row here: the head's
+                        // gated chain verifies the anchor with whatever it
+                        // is confident of, at no more than a head step's
+                        // cost when it is confident of nothing.
+                        let batch = self.model.speculative_step(
+                            seed,
+                            &mut generation.sampler,
+                            remaining,
+                        )?;
+                        stats.sampling += batch.sampling;
+                        accumulate_mtp(&mut stats.mtp, &batch.stats);
+                        stats.kflash.declined_trees += 1;
+                        pending.extend(batch.samples);
+                    } else if let Some(cycle) =
+                        self.model
+                            .kflash_verify(&tree, &rows[..n], &mut generation.sampler)?
+                    {
+                        let kflash = &mut stats.kflash;
+                        kflash.cycles += 1;
+                        kflash.verified_rows += n;
+                        kflash.rows_histogram[n - 1] += 1;
+                        kflash.accepted_tokens += cycle.accepted;
+                        kflash.off_chain_cycles += usize::from(cycle.off_chain);
+                        kflash.expected_tokens +=
+                            crate::bonsai_native::expected_tokens(&tree, &rows[..n]);
+                        kflash.verification += cycle.verification;
+                        kflash.commit += cycle.commit;
+                        pending.extend(cycle.samples);
+                    }
+                }
+                // The ring lost the sequence's span after the choice: decode.
+                None if !generation.cancel.is_cancelled() => self.model.decode(seed)?,
+                None => {}
+            }
+        } else if source == Some(Source::Lookup) {
             let batch = self
                 .model
                 .ngram_step(seed, &drafts, &mut generation.sampler)?;
@@ -585,7 +686,7 @@ impl BonsaiEngine {
                 self.ngram.max_drafts,
             );
             pending.extend(batch.samples);
-        } else if head {
+        } else if source == Some(Source::Mtp) {
             let batch = self
                 .model
                 .speculative_step(seed, &mut generation.sampler, remaining)?;
@@ -595,7 +696,22 @@ impl BonsaiEngine {
         } else {
             self.model.decode(seed)?;
         }
-        if self.model.take_cancel_observed() {
+        let cancelled = self.model.take_cancel_observed();
+        if kflash
+            && !cancelled
+            && let Some(source) = source
+        {
+            let emitted = pending.len().max(1);
+            generation
+                .kflash
+                .observe(source, emitted, started.elapsed().as_secs_f64() * 1e3);
+            match source {
+                Source::Mtp => stats.kflash.mtp_cycles += 1,
+                Source::Lookup => stats.kflash.lookup_cycles += 1,
+                Source::Tree => {}
+            }
+        }
+        if cancelled {
             // The round below was not submitted, so `pending` stayed empty:
             // do not refill it from logits that were never recomputed.
             generation.stop_reason = StopReason::Cancelled;
@@ -692,6 +808,14 @@ impl BonsaiEngine {
             } else {
                 self.keep_reached_prompt(prompt);
             }
+        }
+        if self.kflash_owner == Some(generation.id) {
+            self.kflash_owner = None;
+            self.kflash_history = (generation.stop_reason != StopReason::Cancelled).then(|| {
+                let mut history = generation.prompt.clone();
+                history.extend_from_slice(&token_ids);
+                history
+            });
         }
         stats.elapsed = generation.started.elapsed();
         stats.gpu += self.model.take_gpu_time();

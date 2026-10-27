@@ -560,6 +560,7 @@ impl BonsaiModel {
         };
         // A decode step commits, so restore its state after each one.
         let checkpoint = self.pinned_prompt_checkpoint()?;
+        let span = self.tap_span();
         let mut times = Vec::with_capacity(repetitions);
         for _ in 0..repetitions {
             self.take_gpu_time();
@@ -585,6 +586,9 @@ impl BonsaiModel {
         if let Some(state) = self.tree.as_mut() {
             state.pending = None;
         }
+        // The restores forgot the taps, which still hold every committed
+        // position but the one the decode steps overwrote.
+        self.trim_taps(span);
         self.take_gpu_time();
         debug_assert_eq!(self.position, start);
         Ok(costs)

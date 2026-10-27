@@ -319,12 +319,13 @@ impl Engine {
     /// caller that also needs the other discovered resources (TLS, paths) and
     /// should not pay for discovery twice.
     pub fn from_resources(resources: &Resources) -> crate::Result<Self> {
-        let mut inner = BonsaiEngine::open_with_options(
+        let mut inner = BonsaiEngine::open_with_speculation(
             &resources.model,
             None,
             PREFILL_CHUNK,
             None,
             &resources.mtp,
+            &resources.dflash,
             NgramSettings::default(),
             KvOptions::default(),
         )?;

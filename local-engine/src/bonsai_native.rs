@@ -40,6 +40,7 @@ mod batch;
 mod block;
 pub mod capture;
 mod checkpoint;
+mod kflash;
 mod layers;
 mod speculation;
 mod taps;
@@ -48,7 +49,11 @@ mod tree;
 pub use self::batch::{
     BatchRow, HeadDraft, HeadLag, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState,
 };
-pub use self::taps::{TAP_LAYERS, TAP_ROW_FLOATS, TAP_WINDOW};
+pub use self::kflash::{
+    CATCH_UP_ROWS as KFLASH_CATCH_UP_ROWS, KflashCosts, KflashCycle, KflashInfo, expected_tokens,
+    tree_rows,
+};
+pub use self::taps::{TAP_LAYERS, TAP_ROW_FLOATS, TAP_WINDOW, TapSpan};
 pub use self::tree::{DraftTree, MAX_TREE_ROWS, TestedNode, TreeAcceptance};
 
 /// What a loaded head costs, for the policy record.
@@ -780,10 +785,11 @@ pub struct BonsaiModel {
     tree: Option<tree::TreeVerifier>,
     /// Residual taps for a block drafter, while [`Self::set_taps`] has them on.
     taps: Option<taps::Taps>,
+    /// The `DFlash2` drafter, made by [`Self::enable_kflash`].
+    kflash: Option<kflash::Kflash>,
 }
 
 impl BonsaiModel {
-    #[expect(clippy::too_many_lines)]
     pub(crate) fn load(
         package: BonsaiPackage,
         capacity: usize,
@@ -792,6 +798,32 @@ impl BonsaiModel {
         mtp: Option<&MtpSettings>,
         ngram: NgramSettings,
         kv: KvOptions,
+    ) -> crate::Result<Self> {
+        Self::load_with_drafter(
+            package,
+            capacity,
+            prefill_chunk,
+            attention_kernel,
+            mtp,
+            ngram,
+            kv,
+            None,
+        )
+    }
+
+    /// [`Self::load`], then [`Self::enable_kflash`] with `drafter` when
+    /// given; the context is sized with the drafter's weights, state, taps
+    /// and tree verifier counted.
+    #[expect(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub(crate) fn load_with_drafter(
+        package: BonsaiPackage,
+        capacity: usize,
+        prefill_chunk: usize,
+        attention_kernel: Option<AttentionKernel>,
+        mtp: Option<&MtpSettings>,
+        ngram: NgramSettings,
+        kv: KvOptions,
+        drafter: Option<(&std::path::Path, &str)>,
     ) -> crate::Result<Self> {
         validate_profile(&package)?;
         if kv.initial_tokens == 0 {
@@ -817,12 +849,19 @@ impl BonsaiModel {
                         + (verify_depth + 1) * VOCAB * size_of::<f32>()) as u64
                 }
             });
+        let drafter_bytes = drafter
+            .as_ref()
+            .map(|(path, _)| -> crate::Result<u64> {
+                Ok(std::fs::metadata(path)?.len() + kflash::resident_bytes(verify_depth) as u64)
+            })
+            .transpose()?
+            .unwrap_or(0);
         let caps = context.caps();
         let mut info = memory_plan(
             &package,
             capacity,
             prefill_chunk,
-            mtp_bytes,
+            mtp_bytes + drafter_bytes,
             mtp.is_some(),
             kv.layout,
             &caps,
@@ -911,7 +950,7 @@ impl BonsaiModel {
         let ngram_verifier = (speculation.is_none() && verify_depth > 0)
             .then(|| Verifier::new(&context, STATE_FORMAT, verify_depth.min(3), verify_depth))
             .transpose()?;
-        Ok(Self {
+        let mut model = Self {
             info,
             kernels: BonsaiKernels::new(&context, &shaders)?,
             ops: match attention_kernel {
@@ -960,9 +999,14 @@ impl BonsaiModel {
             images: None,
             tree: None,
             taps: None,
+            kflash: None,
             context,
             package,
-        })
+        };
+        if let Some((path, name)) = drafter {
+            model.enable_kflash(path, name)?;
+        }
+        Ok(model)
     }
 
     /// Commit `batch`, wait for it, and add its GPU execution time to the
@@ -989,6 +1033,7 @@ impl BonsaiModel {
             speculation.mtp.reset();
         }
         self.drop_tree_verify();
+        self.forget_taps();
         // Attention reads only the newly written prefix; unused KV tails need
         // not be touched, even when a shorter request follows a longer one.
         self.position = 0;
@@ -1086,6 +1131,7 @@ impl BonsaiModel {
         self.copy_prompt_state(checkpoint, true)?;
         checkpoint.make_volatile();
         self.position = checkpoint.position;
+        self.forget_taps();
         Ok(true)
     }
 
@@ -1298,6 +1344,7 @@ impl BonsaiModel {
             }
         }
         self.position = snapshot.position;
+        self.forget_taps();
         Ok(())
     }
 

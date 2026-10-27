@@ -32,6 +32,7 @@ mod cache_policy;
 mod checkpoints;
 mod construction;
 mod generation;
+mod kflash;
 mod scheduler;
 
 pub use self::cache_policy::{DEFAULT_PROMPT_CACHE_CHECKPOINTS, MAX_PROMPT_CACHE_CHECKPOINTS};
@@ -190,6 +191,13 @@ pub struct BonsaiEngine {
     /// The buffer set `cached_tokens` and `prompt_checkpoints` describe.
     cache_state: u64,
     next_generation: u64,
+    /// The generation whose positions the `KFlash` drafter's context holds,
+    /// while it runs.
+    kflash_owner: Option<u64>,
+    /// The tokens of the finished generation whose positions the drafter's
+    /// context holds: a later request restoring a prefix of them continues
+    /// that context instead of restarting it.
+    kflash_history: Option<Vec<u32>>,
     /// Verify every available draft in batched steps, whatever the cost
     /// model says, so tests exercise batched speculation.
     #[cfg(test)]
@@ -209,6 +217,12 @@ impl BonsaiEngine {
     #[must_use]
     pub fn mtp_enabled(&self) -> bool {
         self.model.speculation().is_some()
+    }
+
+    /// Whether requests draft `KFlash` trees with a `DFlash2` drafter.
+    #[must_use]
+    pub fn kflash_enabled(&self) -> bool {
+        self.model.kflash_info().is_some()
     }
 
     /// The decode/prefill attention kernel in use.

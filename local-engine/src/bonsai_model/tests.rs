@@ -896,3 +896,131 @@ fn deep_cancellation_stops_in_prefill_and_a_retry_restores_what_it_kept() {
         "a cancelled request must not corrupt the next request's output"
     );
 }
+
+/// `KFlash` cycles emit exactly the tokens plain decoding emits: greedy on
+/// a code and a prose prompt over a few hundred tokens, including cycles
+/// whose accepted path took a branch off the tree's leading rows, and
+/// sampled with a fixed seed (each position draws the plain sampler's own
+/// random number).
+#[test]
+#[ignore = "requires the Bonsai GGUF, the DFlash2 drafter, the MTP head and a Metal device"]
+#[expect(clippy::too_many_lines)]
+fn kflash_generation_matches_plain_decoding() {
+    use crate::bonsai_dflash::{DEFAULT_BONSAI_DFLASH_ARTIFACT, DflashMode};
+    use crate::bonsai_mtp::{DEFAULT_BONSAI_MTP_ARTIFACT, DEFAULT_MTP_DEPTH, MtpSettings};
+
+    let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
+    let prompts = [
+        "Write a Python class implementing an LRU cache with get and put methods in O(1) time, \
+         with type hints, docstrings and a short usage example.",
+        "List the planets of the solar system in order, one per line, with a one sentence \
+         description of each.",
+    ];
+    let greedy = GenerateParams {
+        temperature: 0.0,
+        max_tokens: 320,
+        ..GenerateParams::default()
+    };
+    let sampled = GenerateParams {
+        max_tokens: 160,
+        ..GenerateParams::default()
+    };
+    let cases = [
+        (prompts[0], &greedy),
+        (prompts[1], &greedy),
+        (prompts[1], &sampled),
+    ];
+    let plain = {
+        let mut engine = BonsaiEngine::open_with_options(
+            Path::new(&path),
+            Some(2048),
+            DEFAULT_PREFILL_CHUNK,
+            None,
+            &MtpMode::Off(None),
+            NgramSettings {
+                enabled: false,
+                ..NgramSettings::default()
+            },
+            KvOptions::default(),
+        )
+        .expect("load plain model");
+        cases
+            .iter()
+            .map(|(prompt, params)| {
+                let ids = engine.encode_prompt(prompt, false, false).expect("prompt");
+                engine
+                    .generate(&ids, params, |_| true)
+                    .expect("plain")
+                    .token_ids
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut engine = BonsaiEngine::open_with_speculation(
+        Path::new(&path),
+        Some(2048),
+        DEFAULT_PREFILL_CHUNK,
+        None,
+        &MtpMode::Head(
+            MtpSettings::new(DEFAULT_BONSAI_MTP_ARTIFACT.into(), DEFAULT_MTP_DEPTH)
+                .expect("head settings"),
+        ),
+        &DflashMode::Drafter(DEFAULT_BONSAI_DFLASH_ARTIFACT.into()),
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load KFlash model");
+    assert!(engine.kflash_enabled());
+    let mut cycles = 0;
+    let mut off_chain = 0;
+    for ((prompt, params), plain) in cases.iter().zip(&plain) {
+        let ids = engine.encode_prompt(prompt, false, false).expect("prompt");
+        let output = engine.generate(&ids, params, |_| true).expect("KFlash");
+        let kflash = &output.stats.kflash;
+        eprintln!(
+            "{} tokens: {} tree cycles ({} off the leading rows, {} accepted drafts), \
+             {} MTP and {} lookup cycles",
+            output.token_ids.len(),
+            kflash.cycles,
+            kflash.off_chain_cycles,
+            kflash.accepted_tokens,
+            kflash.mtp_cycles,
+            kflash.lookup_cycles,
+        );
+        cycles += kflash.cycles;
+        off_chain += kflash.off_chain_cycles;
+        assert_eq!(&output.token_ids, plain, "{prompt}");
+    }
+    assert!(cycles > 20, "too few tree cycles: {cycles}");
+    assert!(off_chain > 0, "no accepted path left the leading rows");
+    // Admitted together, the two greedy prompts decode in batched passes
+    // (no taps) until the shorter one ends; the other then runs solo cycles
+    // again, its drafter restarted at the first position tapped since.
+    let short = GenerateParams {
+        max_tokens: 96,
+        ..greedy.clone()
+    };
+    let ids = cases[..2]
+        .iter()
+        .map(|(prompt, _)| engine.encode_prompt(prompt, false, false).expect("prompt"))
+        .collect::<Vec<_>>();
+    let long = engine
+        .admit(&ids[0], &greedy, None, CancelToken::new())
+        .expect("admit long");
+    let early = engine
+        .admit(&ids[1], &short, None, CancelToken::new())
+        .expect("admit short");
+    let mut outputs = std::collections::HashMap::new();
+    while engine.active_generations() > 0 {
+        for (id, result) in engine.step(&mut |_, _, _| true, &mut |_, _| {}) {
+            outputs.insert(id, result.expect("batched generation"));
+        }
+    }
+    let long = &outputs[&long];
+    assert_eq!(long.token_ids, plain[0], "batched, then solo");
+    assert_eq!(outputs[&early].token_ids, plain[1][..96], "batched");
+    assert!(long.stats.batched_tokens > 0, "nothing decoded in a batch");
+    assert!(
+        long.stats.kflash.cycles > 0,
+        "no tree cycle after the batch"
+    );
+}

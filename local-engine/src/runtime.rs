@@ -93,6 +93,38 @@ pub struct NgramStats {
     pub lookup: Duration,
 }
 
+/// `KFlash` counters accumulated over one generation request: the cycles
+/// that verified a `DFlash2` tree, and how the per-cycle budget chose.
+#[derive(Debug, Clone, Default)]
+pub struct KflashStats {
+    /// Cycles that drafted and verified a tree.
+    pub cycles: usize,
+    /// Tree rows verified, anchors included.
+    pub verified_rows: usize,
+    /// Cycles by verified rows (index `n - 1`).
+    pub rows_histogram: [usize; 8],
+    /// Drafts the target accepted.
+    pub accepted_tokens: usize,
+    /// Cycles whose accepted path left the tree's leading rows (took a
+    /// branch a chain would not have held).
+    pub off_chain_cycles: usize,
+    /// The tokens the chosen trees were expected to emit, summed.
+    pub expected_tokens: f64,
+    /// Drafted trees worth no draft row (the best size was the anchor
+    /// alone), verified as the MTP head's gated chain instead.
+    pub declined_trees: usize,
+    /// Cycles the budget gave to the MTP chain and to suffix lookup instead.
+    pub mtp_cycles: usize,
+    pub lookup_cycles: usize,
+    /// Context positions appended to the drafter outside a cycle (a prompt,
+    /// or a context restarted after decoding without taps).
+    pub catch_up_rows: usize,
+    pub catch_up: Duration,
+    pub drafting: Duration,
+    pub verification: Duration,
+    pub commit: Duration,
+}
+
 /// Measurements from actual token IDs, not a re-tokenized output string.
 #[derive(Debug, Clone, Default)]
 pub struct GenerationStats {
@@ -110,6 +142,7 @@ pub struct GenerationStats {
     pub gpu: Duration,
     pub mtp: MtpStats,
     pub ngram: NgramStats,
+    pub kflash: KflashStats,
     /// Tokens decoded in a batched step beside other requests.
     pub batched_tokens: usize,
     /// Time from request start to the first sampled token, even without visible text.
