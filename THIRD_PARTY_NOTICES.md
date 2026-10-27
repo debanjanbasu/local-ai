@@ -398,10 +398,21 @@ their authors chose (full texts in each crate's source):
 | `brotli-decompressor` 6.2 | `br` content decoding | BSD-3-Clause OR MIT, used under MIT |
 | `alloc-no-stdlib` 3.0, `alloc-stdlib` 0.3 | `brotli-decompressor`'s allocator | BSD-3-Clause |
 | `encoding_rs` 0.8 | charset decoding of fetched text | (Apache-2.0 OR MIT) AND BSD-3-Clause |
+| `dom_smoothie` 0.18 | main-content extraction (a port of Mozilla's Readability) | MIT |
+| `dom_query` 0.28, `html5ever` 0.39 (with `markup5ever` 0.39, `string_cache` 0.9, `web_atoms` 0.2), `html-escape` 0.2, `phf` 0.13, `servo_arc` 0.4, `dtoa` 1.0, `gjson` 0.8, `flagset` 0.4 | its HTML parsing and DOM | MIT; MIT OR Apache-2.0; Apache-2.0 (`flagset`) |
+| `selectors` 0.38, `cssparser` 0.37, `dtoa-short` 0.3 | `dom_query`'s CSS selectors | MPL-2.0 |
+| `lopdf` 0.46, `nom` 8, `rangemap` 1.8, `weezl` 0.2 | PDF parsing and its stream filters | MIT; MIT OR Apache-2.0 |
+| `aes` 0.9, `cbc` 0.2, `ecb` 0.2, `cipher` 0.5, `inout` 0.2, `block-padding` 0.4, `md-5` 0.11, `cpubits` 0.1 | opening PDFs encrypted with an empty user password | MIT OR Apache-2.0 |
+| `stringprep` 0.1, `unicode-bidi` 0.3, `unicode-normalization` 0.1, `unicode-properties` 0.1 | PDF password preparation | MIT OR Apache-2.0; `unicode-normalization` also Unicode-3.0 |
+| `brotli-decompressor` 5.0 (with `alloc-no-stdlib` 2.0, `alloc-stdlib` 0.2) | `lopdf`'s Brotli stream filter | BSD-3-Clause OR MIT, used under MIT; BSD-3-Clause |
+
+Build-time macro crates (`cssparser-macros` (MPL-2.0), `derive_more` (MIT),
+`phf_macros`, `phf_codegen`, `phf_generator`, `string_cache_codegen`) run
+during the build and are not linked into the binary.
 
 The notices those licences require in binary distributions:
 
-`alloc-no-stdlib` 3.0.0 and `alloc-stdlib` 0.3.0:
+`alloc-no-stdlib` 3.0.0 and 2.0.4, and `alloc-stdlib` 0.3.0 and 0.2.4:
 
 ```text
 Copyright (c) 2016 Dropbox, Inc.
@@ -433,7 +444,9 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-The ICU4X crates (version 2.4 and their companions):
+The ICU4X crates (version 2.4 and their companions), and the Unicode data
+in `unicode-normalization` 0.1.26 (Copyright © 1991-2023 Unicode, Inc.,
+under the same licence):
 
 ```text
 UNICODE LICENSE V3
@@ -481,6 +494,13 @@ SPDX-License-Identifier: Unicode-3.0
 Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
+
+`selectors` 0.38.0, `cssparser` 0.37.0 and `dtoa-short` 0.3.5 are subject
+to the terms of the Mozilla Public License, v. 2.0
+(<https://mozilla.org/MPL/2.0/>). They are linked unmodified; their source
+code is available from crates.io and from
+<https://github.com/servo/stylo>, <https://github.com/servo/rust-cssparser>
+and <https://github.com/upsuper/dtoa-short>.
 
 ## LibriSpeech test fixture
 

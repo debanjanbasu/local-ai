@@ -291,6 +291,66 @@ Markdown returns it as is. JSON and other text are decoded from their
 declared charset and passed through; other content is shown as UTF-8, as
 before.
 
+*Main content.* Before conversion, a page is cut to its main content, so
+headers, footers, cookie banners, sidebars and related-article lists do not
+reach the model (`[main content converted from HTML to Markdown]` says so).
+The scope is the page's `<main>` (or `role="main"`) if it holds at least a
+quarter of the page's text, else its largest `<article>` if that does, else
+the body; within it, `dom_smoothie` (MIT; a port of Mozilla's Readability
+on `dom_query`) scores blocks by their text, commas and link density and
+keeps the best one with its related siblings. It runs with Readability's
+`Raw` policy: the stricter passes, which drop elements by class name and
+clean blocks conditionally, removed rustdoc's method signatures and most of
+Wikipedia's section headings. Readability moves the title out of the text,
+so the page title comes back as the `<h1>`; its byline heuristic (which
+removed MDN's `<alt-authority>` definition, an element whose id names an
+author) is switched off by giving it a byline. Permalink anchors (`§`,
+`¶`, `#` linking within the page) and links without text to URLs over 128
+bytes (rustdoc's "Run code" playground links, each carrying its example's
+code again: a quarter of the `Vec` page's Markdown) are dropped. Links stay
+absolute (page URL and `<base>`), and code blocks (with their language)
+and tables are kept. The whole page is converted instead, as before, when the page has
+under 500 bytes of text, when the extraction keeps under a quarter of the
+page's text (measured after the elements the converter drops anyway), or
+when a scan of its tags finds over 100,000 elements or nesting over 512
+deep (parsing costs the square of the nesting; the converter has its own
+depth limit). Chosen over `readability` 0.3 (kept 0 to 5% of MDN and BBC
+pages, and 3% of rustdoc's `Vec`), `readabilityrs` (similar output, 7 to 20
+times slower: 0.9 s for rustdoc's `Vec`, 1.1 s for Wikipedia) and `legible`
+(Apache-2.0; as fast, but only Readability's stricter passes, which lose
+headings). `dom_query`'s CSS selector engine is Servo's `selectors` and
+`cssparser` (MPL-2.0, unmodified; see THIRD_PARTY_NOTICES.md).
+
+*PDF.* A body served as `application/pdf` (or `application/x-pdf`), or
+from a URL path ending in `.pdf` with a media type that is neither HTML
+nor text, has its text extracted in Rust and returned with a heading per
+page (`[converted from PDF to text: N pages]`, then `## Page 1`, ...).
+`lopdf` (MIT) parses the file: it bounds what any one stream may
+decompress to (8 MiB here: object streams, page content, font character
+maps), limits object nesting, repairs damaged cross-reference tables and
+opens files encrypted with an empty user password. The text is laid out
+from the content stream's text operators: a line break where the baseline
+moves by more than half a line, a blank line past one and a half, a space
+at a `TJ` gap of a fifth of an em, ligatures spelled out. Up to 64 times
+the limit (16 MiB) of file is read and up to 300 pages, and the text is
+capped at the limit, each with its marker; extraction runs on the
+conversion thread and stops at the next page once the call's deadline has
+dropped it. A file that needs a password, cannot be parsed, has no text
+(scanned images, which are not read), or is cut and cannot be repaired
+returns a one-line explanation instead; text drawn by form XObjects is not
+read. `lopdf` was chosen over `pdf-extract` (better line layout, but on
+`lopdf` 0.42 with unbounded stream decoding, an `unwrap` on page content,
+and twice the time: 0.3 s against 0.14 s for an arXiv paper) and
+`pdf_oxide` (image, layout and logging crates among its dependencies, and
+an interleaved title block on the arXiv paper).
+
+*Failures.* Extraction and conversion each run under `catch_unwind`: an
+extraction that panics converts the whole page, and a conversion that
+panics or fails returns the page's (or main content's) plain text, with
+tags, comments, scripts and styles dropped and character references
+decoded (`[converted from HTML to plain text: the Markdown conversion
+failed]`). A PDF parser panic is caught per file and per page.
+
 Remote image and video URLs in chat requests use the same transport
 (`tools::fetch::download`) with the same address checks,
 public IP literals allowed, up to five redirects each checked anew (never
@@ -412,3 +472,36 @@ the model would read.
 - A second round minutes later, on a congested link, was 2 to 4 times slower
   across the board (gnu.org timed out for both transports) with the same
   protocols and byte counts.
+
+## Live check: main content and PDF text (2026-10-27, Apple Silicon, release build)
+
+Nine real URLs, one fetch each through `tools::fetch::fetch` with the
+default 256 KiB limit, on the same corporate network as above and a
+heavily loaded machine. Before: `kflash` at `adc358f` (HTML converted
+whole; a PDF shown as UTF-8 bytes). After: main-content extraction and PDF
+text. Tokens are the Bonsai tokenizer's count (`local-ai bonsai --tokenize
+--raw`) of the whole tool output; times are wall-clock for a cold and a
+warm (pooled connection) fetch, network included, so they are noisy.
+
+| URL | tokens before → after | cold / warm ms before → after | what survived |
+|---|---|---|---|
+| doc.rust-lang.org `Vec` | 91,002 → 79,608 (−13%) | 1561 / 237 → 325 / 232 | both at the 256 KiB cap; method headings in it 127 → 171 (permalinks and "Run code" links gone) |
+| developer.mozilla.org `Alt-Svc` | 1,610 → 1,556 (−3%) | 476 / 47 → 119 / 24 | all 7 headings, both code blocks, the table, `<alt-authority>` |
+| bbc.com news article | 2,082 → 1,922 (−8%) | 228 / 128 → 176 / 42 | headline and every paragraph; masthead and share links gone |
+| github.com/tokio-rs/tokio | 5,240 → 2,509 (−52%) | 1313 / 186 → 763 / 103 | the README (all 3 code blocks); file list, stars and sidebar gone |
+| simonwillison.net blog post | 17,262 → 15,540 (−10%) | 341 / 142 → 79 / 30 | the article; "more recent articles", series and sponsor blocks gone |
+| en.wikipedia.org Rust | 71,690 → 66,563 (−7%) | 1546 / 730 → 1194 / 751 | all 57 headings, 29 code blocks, 29 table rows; 59-language list gone |
+| w3schools.com JS arrays (navigation-heavy) | 6,700 → 3,538 (−47%) | 271 / 79 → 527 / 115 | the tutorial and its examples; menus, progress and sign-in panels gone |
+| arxiv.org/pdf/1706.03762 (2.2 MB) | 200,236 → 10,313 (−95%) | 279 / 111 → 1022 / 749 | all 15 pages as text (before: the first 256 KiB of binary) |
+| rfc-editor.org RFC 9114 PDF (1.2 MB) | 164,261 → 37,499 (−77%) | 744 / 380 → 1260 / 449 | all 57 pages as text (before: binary) |
+
+- CPU per page, offline on the saved pages (best of five): the extraction
+  adds tens of milliseconds to the 1 MB pages (rustdoc's `Vec` 109 → 210
+  ms, Wikipedia 58 → 128 ms, both including conversion) and saves time on
+  the smaller ones, which then convert less (GitHub 31 → 12 ms, w3schools
+  18 → 10 ms). PDF text took 31 ms for the arXiv paper and 56 ms for the
+  RFC; the PDF rows' extra wall time is the whole file on the wire (2.2
+  and 1.2 MB instead of the first 256 KiB).
+- Every page was extracted (none fell back to the whole page); the
+  extraction kept 55% (w3schools) to 99% (rustdoc) of the text the
+  converter would have kept, well above the 25% floor.

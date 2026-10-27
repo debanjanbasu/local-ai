@@ -135,7 +135,7 @@ impl Hosted {
             ),
             Self::Fetch => (
                 "Fetch one public http(s) URL and return its status and text; HTML pages \
-                 come back as Markdown.",
+                 come back as Markdown of their main content, PDFs as their text page by page.",
                 closed(json!({"url":{"type":"string"}}), &["url"]),
             ),
             Self::FileSearch => unreachable!("file_search is declared by file_search::Config"),
