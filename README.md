@@ -301,7 +301,7 @@ flag turns any of it off or tunes it.
   at 32K with the Neural Engine and 114 against 105 on the GPU alone, best
   of two on a power-limited 20 W adapter where both builds ran slower than
   above; 2K and 8K unchanged.
-- Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
+- Prompt cache: follow-up turn 2.7 s versus 25 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s. A restarted process
   restoring a disk snapshot reaches its first token in 0.09–0.12 s at 6K
   tokens, 0.26 s at 33K and 0.87 s at 128K with the file cached (0.14, 0.44
