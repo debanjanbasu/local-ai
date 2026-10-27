@@ -320,7 +320,7 @@ fn native_audio_embeddings_match_the_reference_fixture() {
     let dir = super::super::installed_model(&Path::new(root).join("models")).expect("installed");
     let mut model = EmbeddingModel::open(&dir).expect("open");
     // The audio artifact loads on first use (no `load_audio`).
-    assert!(model.supports_audio() && !model.has_audio());
+    assert!(!model.has_audio());
     let clips: Vec<&[f32]> = rows.iter().map(|(_, wave)| wave.as_slice()).collect();
     let embeddings = model.embed_audio(&clips, &mut || Ok(())).expect("embed");
     assert!(model.has_audio());

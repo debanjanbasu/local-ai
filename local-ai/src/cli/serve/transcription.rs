@@ -1,10 +1,9 @@
 //! `POST /v1/audio/transcriptions` and `POST /v1/audio/translations` on the
 //! native Whisper large-v3 model ([`local_engine::transcription`]).
 //!
-//! Served only when the artifact is installed beside the Bonsai checkpoint
-//! (`models/whisper-large-v3/`, see `docs/TRANSCRIPTION.md`); there is no flag.
-//! Without it both routes answer `404` like any unknown route, and
-//! `/v1/models` does not list the model.
+//! The artifact beside the Bonsai checkpoint (`models/whisper-large-v3/`, see
+//! `docs/TRANSCRIPTION.md`) is required: the server does not start without
+//! it, and there is no flag.
 //!
 //! Requests follow the pinned `CreateTranscriptionRequest` and
 //! `CreateTranslationRequest` (multipart): `file` (flac, mp3, mp4, mpeg,
@@ -85,14 +84,12 @@ pub(super) struct Transcriber {
 }
 
 impl Transcriber {
-    /// The service, when the model is installed in `models_dir`.
+    /// The service, from the required install in `models_dir`.
     pub(super) fn start(
         models_dir: &Path,
         activity: Arc<EngineActivity>,
-    ) -> crate::Result<Option<Arc<Self>>> {
-        let Some(dir) = installed_model(models_dir) else {
-            return Ok(None);
-        };
+    ) -> crate::Result<Arc<Self>> {
+        let dir = installed_model(models_dir)?;
         let model = TranscriptionModel::open(&dir).map_err(|error| {
             crate::Error::InvalidArgument(format!(
                 "cannot load the transcription model in {}: {error}",
@@ -105,13 +102,13 @@ impl Transcriber {
             dir.display(),
             model.payload_sha256()
         );
-        Ok(Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             token_bytes: model.token_byte_table(),
             eot: model.eot(),
             model: Arc::new(Mutex::new(model)),
             slots: Arc::new(Semaphore::new(MAX_PENDING)),
             activity,
-        })))
+        }))
     }
 }
 
@@ -646,9 +643,7 @@ pub(super) async fn handle(
     caller: &Caller,
 ) -> Response {
     let headers = &parts.headers;
-    let Some(service) = state.transcription.clone() else {
-        return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
-    };
+    let service = Arc::clone(&state.transcription);
     let task = if parts.uri.path() == TRANSLATIONS {
         Task::Translate
     } else {

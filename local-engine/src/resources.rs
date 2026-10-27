@@ -32,8 +32,8 @@ pub struct Resources {
     /// `KFlash` drafting: the drafter beside the model, or why not.
     pub dflash: DflashMode,
     pub dflash_reason: String,
-    /// The vision projector beside the model, when installed.
-    pub vision: Option<PathBuf>,
+    /// The vision projector beside the model.
+    pub vision: PathBuf,
     pub vision_reason: String,
     pub prompt_cache_dir: Option<PathBuf>,
     pub disk_budget_bytes: u64,
@@ -102,21 +102,16 @@ impl Resources {
                 reason.into(),
             )
         };
-        // Image input whenever the projector is installed beside the model;
-        // the loader verifies it against the pinned export.
-        let vision = model
-            .parent()
-            .map(|dir| dir.join(crate::bonsai_vision::VISION_PROJECTOR_FILE))
-            .filter(|path| path.is_file());
-        let vision_reason = vision.as_ref().map_or_else(
-            || {
-                format!(
-                    "no {} installed beside the model; image and video input disabled",
-                    crate::bonsai_vision::VISION_PROJECTOR_FILE
-                )
-            },
-            |path| format!("vision projector {}", path.display()),
-        );
+        // Image and video input: the projector beside the model is required
+        // too; the loader verifies it against the pinned export.
+        let vision = model.with_file_name(crate::bonsai_vision::VISION_PROJECTOR_FILE);
+        if !vision.is_file() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "Bonsai vision projector not found: {} (required; see README Model install)",
+                vision.display()
+            )));
+        }
+        let vision_reason = format!("vision projector {}", vision.display());
         let cache = std::env::var_os("HOME")
             .map(PathBuf::from)
             .map(|home| home.join("Library/Caches/local-ai/prompt-cache"));
@@ -191,6 +186,28 @@ impl Resources {
             }
         })
     }
+}
+
+/// Check that every one of `files` is a file in `dir`.
+///
+/// `dir` is an installation of the model `what` names. Every model artifact
+/// is required, so the error names the first missing path and where
+/// installation is described.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidArgument`] naming the missing file.
+pub fn require_files(what: &str, dir: &Path, files: &[&str]) -> crate::Result<()> {
+    files
+        .iter()
+        .map(|file| dir.join(file))
+        .find(|path| !path.is_file())
+        .map_or(Ok(()), |missing| {
+            Err(crate::Error::InvalidArgument(format!(
+                "{what} file not found: {} (required; see README Model install)",
+                missing.display()
+            )))
+        })
 }
 
 fn discover_model(override_path: Option<&Path>) -> crate::Result<(PathBuf, String)> {

@@ -747,7 +747,8 @@ fn images_render_as_the_templates_vision_markers_where_they_sit() {
         assert!(super::render_messages(&messages, None, false, &tools).is_err());
     }
 
-    // Without the projector, image prompts fail to count as to generate.
+    // Without a vision tower (only tokenizer-only test encodings lack one),
+    // image prompts fail to count as to generate.
     let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::tiny_for_tests();
     let mut request = tool_history(false);
     request.messages = vec![user];
@@ -761,7 +762,7 @@ fn images_render_as_the_templates_vision_markers_where_they_sit() {
         panic!("generation needs the projector");
     };
     assert_eq!(counted.to_string(), generated.to_string());
-    assert!(counted.to_string().contains("mmproj"), "{counted}");
+    assert!(counted.to_string().contains("vision tower"), "{counted}");
 }
 
 /// A request holding `parts`, each at the start of one user message.

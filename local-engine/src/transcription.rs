@@ -48,13 +48,20 @@ const LAYERS: usize = 32;
 const VOCAB: usize = 51_866;
 const FFN: usize = 5120;
 
-/// The installation directory inside `models_dir`, if the artifact and the
-/// tokenizer are there.
-#[must_use]
-pub fn installed_model(models_dir: &Path) -> Option<PathBuf> {
+/// The installation directory inside `models_dir`.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidArgument`] naming the artifact or the tokenizer
+/// when one is missing: both are required.
+pub fn installed_model(models_dir: &Path) -> crate::Result<PathBuf> {
     let dir = models_dir.join(TRANSCRIPTION_MODEL_DIR);
-    (dir.join(TRANSCRIPTION_ARTIFACT).is_file() && dir.join("tokenizer.json").is_file())
-        .then_some(dir)
+    crate::resources::require_files(
+        "Whisper large-v3",
+        &dir,
+        &[TRANSCRIPTION_ARTIFACT, "tokenizer.json"],
+    )?;
+    Ok(dir)
 }
 
 /// Transcribe in the spoken language, or translate into English.

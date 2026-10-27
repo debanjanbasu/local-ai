@@ -77,7 +77,7 @@ fn reference() -> Reference {
     serde_json::from_slice(&std::fs::read(path).expect("fixture")).expect("fixture json")
 }
 
-fn installed() -> Option<PathBuf> {
+fn installed() -> crate::Result<PathBuf> {
     installed_model(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../models"))
 }
 

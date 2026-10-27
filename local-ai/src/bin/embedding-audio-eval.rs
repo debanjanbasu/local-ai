@@ -72,8 +72,7 @@ fn entries(dir: &Path) -> Result<Vec<Entry>> {
 }
 
 fn open() -> Result<EmbeddingModel> {
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/embeddinggemma2-text is not installed (see docs/EMBEDDINGS.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     let started = Instant::now();
     let mut model = EmbeddingModel::open(&dir)?;
     model.load_audio(&dir)?;

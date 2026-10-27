@@ -112,10 +112,6 @@ pub(super) fn usage() {
         "  --stall-timeout SECONDS  Drop a generation or download whose client stopped \
          reading, or a request body that stopped arriving (default: {DEFAULT_STALL_SECONDS})"
     );
-    eprintln!(
-        "  --decisions-artifact DIR  Serve POST /v1/decisions from this evaluated head, gate and \
-         calibration (default: models/decisions-v2 when installed)"
-    );
     eprintln!();
     eprintln!(
         "  Hosted tools (Responses API; default: none; file_search needs no flag; see docs/TOOLS.md):"
@@ -156,7 +152,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         stall: Duration::from_secs(DEFAULT_STALL_SECONDS),
         response_store: ResponseStoreArg::Default,
         reasoning_key: None,
-        decisions_artifact: None,
         tools: ToolArgs::default(),
         allowed_origins: Vec::new(),
         allowed_hosts: Vec::new(),
@@ -199,7 +194,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 | "--stall-timeout"
                 | "--response-store"
                 | "--reasoning-key"
-                | "--decisions-artifact"
                 | "--tools-root"
                 | "--tools-fetch-domain"
                 | "--tools-max-iterations"
@@ -223,12 +217,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                     return Err("--reasoning-key requires a file path".into());
                 }
                 parsed.reasoning_key = Some(value.into());
-            }
-            "--decisions-artifact" => {
-                if value.is_empty() {
-                    return Err("--decisions-artifact requires a directory path".into());
-                }
-                parsed.decisions_artifact = Some(value.into());
             }
             "--response-store" => {
                 if value.is_empty() {

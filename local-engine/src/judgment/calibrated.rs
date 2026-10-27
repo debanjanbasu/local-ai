@@ -291,6 +291,11 @@ impl CalibratedHead {
     /// Open and verify the artifact directory `dir` (see the module docs).
     pub fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
         let dir = dir.as_ref();
+        crate::resources::require_files(
+            "decisions artifact",
+            dir,
+            &[ARTIFACT_FILE, HEAD_FILE, GATE_FILE],
+        )?;
         let text = std::fs::read_to_string(dir.join(ARTIFACT_FILE))?;
         let head_bytes = std::fs::read(dir.join(HEAD_FILE))?;
         let gate_bytes = std::fs::read(dir.join(GATE_FILE))?;

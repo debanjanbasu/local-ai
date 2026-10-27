@@ -405,6 +405,24 @@ fn check_config(config: &serde_json::Value) -> crate::Result<()> {
     }
 }
 
+/// Verify the audio artifact of `dir` (an embedding install directory)
+/// without loading it onto the GPU.
+///
+/// # Errors
+///
+/// A missing, truncated, foreign or edited artifact, naming the file.
+pub(super) fn verify(dir: &Path) -> crate::Result<()> {
+    let path = dir.join(AUDIO_ARTIFACT);
+    Artifact::open_format(&path, *MAGIC, FORMAT, VERSION)
+        .and_then(|(_, config)| check_config(&config))
+        .map_err(|error| {
+            Error::InvalidArgument(format!(
+                "embedding audio artifact {}: {error} (required; see README Model install)",
+                path.display()
+            ))
+        })
+}
+
 impl AudioTower {
     pub(super) fn open(
         path: &Path,
@@ -870,8 +888,8 @@ impl EmbeddingModel {
     /// Load the audio encoder artifact from the installation directory
     /// (`dir/embeddinggemma2-audio-bf16.bin`, written by
     /// `tools/convert_embeddinggemma2_audio.py`). About 610 MB of GPU memory.
-    /// Optional: the first audio input loads it from the model's own install
-    /// directory.
+    /// Without this call the first audio input loads it from the model's own
+    /// install directory.
     ///
     /// # Errors
     ///
@@ -879,13 +897,6 @@ impl EmbeddingModel {
     pub fn load_audio(&mut self, dir: &Path) -> crate::Result<()> {
         self.audio = Some(AudioTower::open(&dir.join(AUDIO_ARTIFACT), &self.context)?);
         Ok(())
-    }
-
-    /// Whether the audio encoder is loaded or installed next to the text
-    /// artifact (audio inputs are refused otherwise).
-    #[must_use]
-    pub fn supports_audio(&self) -> bool {
-        self.audio.is_some() || self.dir.join(AUDIO_ARTIFACT).is_file()
     }
 
     /// Whether the audio encoder is loaded.
@@ -923,12 +934,6 @@ impl EmbeddingModel {
         }
         if self.audio.is_none() {
             let path = self.dir.join(AUDIO_ARTIFACT);
-            if !path.is_file() {
-                return Err(Error::InvalidArgument(format!(
-                    "audio embeddings need {} (see docs/EMBEDDINGS_AUDIO.md)",
-                    path.display()
-                )));
-            }
             self.audio = Some(AudioTower::open(&path, &self.context)?);
         }
         let tower = self
@@ -970,7 +975,7 @@ impl EmbeddingModel {
     ///
     /// # Errors
     ///
-    /// The audio artifact is not installed, a clip is invalid
+    /// The audio artifact fails to load, a clip is invalid
     /// ([`validate_clip`]), a `pace` error, or a Metal failure.
     pub fn embed_audio(
         &mut self,

@@ -148,11 +148,16 @@ pub struct ModerationHeads {
     sha256: String,
 }
 
-/// The artifact path inside `models_dir`, if installed.
-#[must_use]
-pub fn installed_heads(models_dir: &Path) -> Option<PathBuf> {
-    let path = models_dir.join(MODERATION_DIR).join(MODERATION_ARTIFACT);
-    path.is_file().then_some(path)
+/// The artifact path inside `models_dir`.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] naming the artifact when it is missing: it is
+/// required.
+pub fn installed_heads(models_dir: &Path) -> crate::Result<PathBuf> {
+    let dir = models_dir.join(MODERATION_DIR);
+    crate::resources::require_files("moderation heads", &dir, &[MODERATION_ARTIFACT])?;
+    Ok(dir.join(MODERATION_ARTIFACT))
 }
 
 fn invalid(message: impl Into<String>) -> Error {

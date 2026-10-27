@@ -26,7 +26,7 @@ fn a_declaration_is_echoed_with_its_defaults_and_offered_as_one_strict_function(
     assert_eq!(definition.name, NAME);
     assert!(definition.strict);
     assert_eq!(definition.parameters["required"], json!(["queries"]));
-    assert!(!config.needs_embeddings());
+    assert_eq!(config.ranking(), None);
     // The model's queries fill in the rest of the search.
     let request = config
         .request(&json!({"queries":["alpha","beta"]}))
@@ -59,7 +59,6 @@ fn a_declaration_is_echoed_with_its_defaults_and_offered_as_one_strict_function(
     let (config, _, echo) = declare(&json!({"type":"file_search","vector_store_ids":["vs_a"],
         "ranking_options":{"hybrid_search":{"embedding_weight":0.75,"text_weight":0.25}}}))
     .expect("ok");
-    assert!(config.needs_embeddings());
     assert_eq!(
         config.ranking(),
         Some(Ranking::Fused {

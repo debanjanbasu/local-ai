@@ -30,8 +30,7 @@ use serde_json::{Value, json};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn open() -> Result<EmbeddingModel> {
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/embeddinggemma2-text is not installed (see docs/EMBEDDINGS.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     Ok(EmbeddingModel::open(&dir)?)
 }
 
@@ -97,8 +96,7 @@ fn features(dataset: &str, prefix: &str, args: &[String]) -> Result<()> {
 
 fn score(path: &str) -> Result<()> {
     let mut model = open()?;
-    let heads_path = installed_heads(Path::new("models"))
-        .ok_or("models/moderation/moderation-heads.json is not installed")?;
+    let heads_path = installed_heads(Path::new("models"))?;
     let heads = ModerationHeads::open(&heads_path, model.payload_sha256())?;
     for row in rows(path)? {
         let text = row["text"].as_str().ok_or("row without text")?;

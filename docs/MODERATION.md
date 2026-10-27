@@ -3,8 +3,8 @@
 `POST /v1/moderations` scores text with small calibrated heads (one logistic
 regression per category) on the frozen native EmbeddingGemma 2 text
 embeddings ([EMBEDDINGS.md](EMBEDDINGS.md)). No new large model is involved.
-It is opt-in by installation: the route exists only when both the embedding
-model and the moderation artifact are installed; otherwise it is `404`.
+The embedding model and the moderation artifact are both required: `serve`
+does not start without them.
 
 **It scores only the categories that passed a pre-registered evaluation**
 (see [Acceptance criteria](#acceptance-criteria-pre-registered) and

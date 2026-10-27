@@ -69,8 +69,7 @@ struct G2pRow {
 }
 
 fn open() -> Result<SpeechModel> {
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/kokoro-82m is not installed (see docs/SPEECH.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     let started = Instant::now();
     let model = SpeechModel::open(&dir)?;
     eprintln!("loaded {} in {:.2?}", dir.display(), started.elapsed());
@@ -525,8 +524,7 @@ impl G2pOnly {
 }
 
 fn models_g2p() -> Result<G2pOnly> {
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/kokoro-82m is not installed (see docs/SPEECH.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     let (american, british) = local_engine::speech::open_g2p(&dir)?;
     let vocab = local_engine::speech::open_vocab(&dir)?;
     Ok(G2pOnly {
@@ -544,8 +542,7 @@ fn g2p(dir: &Path) -> Result<()> {
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<std::result::Result<_, _>>()?;
-    let dir_models = installed_model(Path::new("models"))
-        .ok_or("models/kokoro-82m is not installed (see docs/SPEECH.md)")?;
+    let dir_models = installed_model(Path::new("models"))?;
     let (american, british) = local_engine::speech::open_g2p(&dir_models)?;
     let mut stats: BTreeMap<(String, String), (usize, usize, usize, usize)> = BTreeMap::new();
     let mut shown = 0;

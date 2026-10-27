@@ -93,22 +93,11 @@ pub(super) fn check(
             }
             Some(_) => {}
             None => {
-                let Some(vector_stores) = vector_stores else {
+                if vector_stores.is_none() {
                     return Err(
                         "file_search is unavailable: this server has no vector stores \
                                 (no services store, or another local-ai process owns this data \
                                 directory's index)"
-                            .into(),
-                    );
-                };
-                if kinds
-                    .file_search()
-                    .is_some_and(file_search::Config::needs_embeddings)
-                    && !vector_stores.embeds()
-                {
-                    return Err(
-                        "file_search ranking_options.hybrid_search needs the embedding \
-                                model, which is not installed on this server"
                             .into(),
                     );
                 }

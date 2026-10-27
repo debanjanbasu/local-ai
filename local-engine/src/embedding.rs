@@ -154,11 +154,26 @@ fn normalize(values: &mut [f32]) {
 }
 
 /// The installation directory inside `models_dir`
-/// (`models_dir/embeddinggemma2-text`), if the artifact and tokenizer are there.
-#[must_use]
-pub fn installed_model(models_dir: &Path) -> Option<PathBuf> {
+/// (`models_dir/embeddinggemma2-text`).
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] naming the first of the text artifact, the
+/// tokenizer, the vision artifact or the audio artifact that is missing:
+/// every one is required.
+pub fn installed_model(models_dir: &Path) -> crate::Result<PathBuf> {
     let dir = models_dir.join(EMBEDDING_MODEL_DIR);
-    (dir.join(EMBEDDING_ARTIFACT).is_file() && dir.join("tokenizer.json").is_file()).then_some(dir)
+    crate::resources::require_files(
+        "EmbeddingGemma 2",
+        &dir,
+        &[
+            EMBEDDING_ARTIFACT,
+            "tokenizer.json",
+            vision::VISION_ARTIFACT,
+            AUDIO_ARTIFACT,
+        ],
+    )?;
+    Ok(dir)
 }
 
 struct LayerWeights {
@@ -257,14 +272,18 @@ pub struct EmbeddingModel {
 unsafe impl Send for EmbeddingModel {}
 
 impl EmbeddingModel {
-    /// Load and verify an installation directory (artifact + tokenizer).
+    /// Load and verify an installation directory: the text artifact and
+    /// tokenizer, and the vision and audio artifacts, whose digests are
+    /// checked here and whose towers load onto the GPU on first use.
     ///
     /// # Errors
     ///
-    /// Fails when a file is missing, the artifact does not verify, or Metal
+    /// Fails when a file is missing, an artifact does not verify, or Metal
     /// cannot be set up.
     pub fn open(dir: &Path) -> crate::Result<Self> {
         let artifact = Artifact::open(&dir.join(EMBEDDING_ARTIFACT))?;
+        vision::verify(dir)?;
+        audio::verify(dir)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|error| Error::Tokenizer(format!("embedding tokenizer: {error}")))?;
         let context = MetalContext::new()?;

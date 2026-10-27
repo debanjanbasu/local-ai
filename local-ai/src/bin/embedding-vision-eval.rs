@@ -90,14 +90,10 @@ struct Captions {
 }
 
 fn open() -> Result<EmbeddingModel> {
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/embeddinggemma2-text is not installed (see docs/EMBEDDINGS.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     let started = Instant::now();
     let model = EmbeddingModel::open(&dir)?;
     eprintln!("loaded {} in {:.2?}", dir.display(), started.elapsed());
-    if !model.supports_vision() {
-        return Err("the vision artifact is not installed (see docs/EMBEDDINGS.md)".into());
-    }
     Ok(model)
 }
 

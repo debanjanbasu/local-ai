@@ -11,8 +11,9 @@ embeddings request, so the server does not invent one. The text endpoint is unch
 
 ## Install
 
-The audio encoder is an optional add-on to the text installation. It lives in the same
-directory and needs the text artifact:
+The audio encoder is a required part of the text installation: it lives in the
+same directory, and the embedding model does not open without it (its digest
+is checked then; the weights load onto the GPU on first use):
 
 ```sh
 python3 tools/convert_embeddinggemma2_audio.py --source cache/embeddinggemma-2
@@ -45,7 +46,7 @@ use local_engine::embedding::{EmbeddingModel, decode_audio, installed_model};
 
 let dir = installed_model(Path::new("models")).unwrap();
 let mut model = EmbeddingModel::open(&dir)?;      // text encoder
-model.load_audio(&dir)?;      // optional preload (+ ~610 MB of GPU memory); else loaded on first use
+model.load_audio(&dir)?;      // preload (+ ~610 MB of GPU memory); else loaded on first use
 let clip = decode_audio(std::fs::read("dog.flac")?)?;  // 16 kHz mono f32
 let audio = model.embed_audio(&[clip.as_slice()], &mut || Ok(()))?;   // [768], L2-normalized
 let query = model.embed_texts(&["task: search result | query: a dog barks"], &mut || Ok(()))?;
@@ -272,7 +273,7 @@ milliseconds for a single 10 s clip (the whole clip takes 94 ms end to end). Con
 - `embedding-audio-eval bench [--clips N] [--seconds S]`.
 - `local-engine/tests/fixtures/embeddinggemma2-audio-reference.jsonl`: three AudioCaps crops
   (waveform, features, embedding) and the tone and silence embeddings. The log-mel test
-  always runs; the embedding test is ignored unless the model is installed.
+  always runs; the embedding test is `#[ignore]`d because it needs the installed model.
 - `local-engine/tests/fixtures/audio-formats/`: one short two-tone clip per supported
   container and codec, plus an Opus file that must be refused. The decode test always runs.
 

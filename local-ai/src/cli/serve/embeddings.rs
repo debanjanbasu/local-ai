@@ -1,10 +1,9 @@
 //! `POST /v1/embeddings` on the native `EmbeddingGemma` 2 text encoder
 //! ([`local_engine::embedding`]).
 //!
-//! Served only when the BF16 artifact is installed beside the Bonsai
-//! checkpoint (`models/embeddinggemma2-text/`, see `docs/EMBEDDINGS.md`);
-//! there is no flag. Without it the route answers `404` like any unknown
-//! route, and `/v1/models` lists only Bonsai.
+//! The BF16 artifact beside the Bonsai checkpoint
+//! (`models/embeddinggemma2-text/`, see `docs/EMBEDDINGS.md`) is required:
+//! the server does not start without it, and there is no flag.
 //!
 //! The request follows the pinned `CreateEmbeddingRequest`: `input` is a
 //! string, an array of strings, an array of token ids or an array of token-id
@@ -73,15 +72,13 @@ pub(super) struct Embeddings {
 }
 
 impl Embeddings {
-    /// The service, when the model is installed in `models_dir` (the
+    /// The service, from the required install in `models_dir` (the
     /// directory holding the Bonsai model's own folder).
     pub(super) fn start(
         models_dir: &Path,
         activity: Arc<EngineActivity>,
-    ) -> crate::Result<Option<Arc<Self>>> {
-        let Some(dir) = installed_model(models_dir) else {
-            return Ok(None);
-        };
+    ) -> crate::Result<Arc<Self>> {
+        let dir = installed_model(models_dir)?;
         let model = EmbeddingModel::open(&dir).map_err(|error| {
             crate::Error::InvalidArgument(format!(
                 "cannot load the embedding model in {}: {error}",
@@ -94,11 +91,11 @@ impl Embeddings {
             dir.display(),
             model.payload_sha256()
         );
-        Ok(Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             model: Arc::new(Mutex::new(model)),
             slots: Arc::new(Semaphore::new(MAX_PENDING)),
             activity,
-        })))
+        }))
     }
 
     /// SHA-256 of the loaded encoder's payload.
@@ -364,9 +361,7 @@ pub(super) async fn handle(
     body: Body,
     caller: &super::admin::Caller,
 ) -> Response {
-    let Some(service) = state.embeddings.clone() else {
-        return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
-    };
+    let service = Arc::clone(&state.embeddings);
     let body = match http_body_util::Limited::new(body, MAX_REQUEST_BYTES)
         .collect()
         .await

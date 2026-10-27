@@ -55,10 +55,20 @@ const EPSILON: f32 = 1e-6;
 /// A larger image (budget 560 or 1120) takes a pass of its own.
 const PASS_PATCHES: usize = 2520;
 
-/// Whether `dir` (an embedding install directory) holds the vision artifact.
-#[must_use]
-pub fn vision_installed(dir: &Path) -> bool {
-    dir.join(VISION_ARTIFACT).is_file()
+/// Verify the vision artifact of `dir` (an embedding install directory)
+/// without loading it onto the GPU.
+///
+/// # Errors
+///
+/// A missing, truncated, foreign or edited artifact, naming the file.
+pub(super) fn verify(dir: &Path) -> crate::Result<()> {
+    let path = dir.join(VISION_ARTIFACT);
+    VisionArtifact::open(&path).map(drop).map_err(|error| {
+        Error::InvalidArgument(format!(
+            "embedding vision artifact {}: {error} (required; see README Model install)",
+            path.display()
+        ))
+    })
 }
 
 /// Decode and preprocess an encoded image file for the default budget of
@@ -508,13 +518,6 @@ impl VisionTower {
 }
 
 impl EmbeddingModel {
-    /// Whether the vision artifact is installed next to the text artifact
-    /// (media inputs are refused otherwise).
-    #[must_use]
-    pub fn supports_vision(&self) -> bool {
-        self.vision.is_some() || vision_installed(&self.dir)
-    }
-
     /// SHA-256 of the vision artifact payload, once loaded.
     #[must_use]
     pub fn vision_payload_sha256(&self) -> Option<&str> {
@@ -564,12 +567,6 @@ impl EmbeddingModel {
     ) -> crate::Result<Vec<f32>> {
         if self.vision.is_none() {
             let path = self.dir.join(VISION_ARTIFACT);
-            if !path.is_file() {
-                return Err(Error::InvalidArgument(format!(
-                    "image and video embeddings need {} (see docs/EMBEDDINGS.md)",
-                    path.display()
-                )));
-            }
             self.vision = Some(VisionTower::open(&path, &self.context)?);
         }
         let vision = self

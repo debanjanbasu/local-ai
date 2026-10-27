@@ -156,9 +156,7 @@ pub struct Plan {
     pub prompt_cache_dir: Option<std::path::PathBuf>,
     /// Disk prompt-cache budget in bytes.
     pub prompt_cache_budget: u64,
-    /// Whether image input is available (the vision projector loaded).
-    pub vision: bool,
-    /// Why image input is or is not available.
+    /// The vision projector that serves image and video input.
     pub vision_reason: String,
 }
 
@@ -289,7 +287,7 @@ enum Delivered {
 pub struct Engine {
     inner: BonsaiEngine,
     info: EngineInfo,
-    vision: Option<Arc<VisionEncoder>>,
+    vision: Arc<VisionEncoder>,
     not_sync: std::marker::PhantomData<Cell<()>>,
 }
 
@@ -334,11 +332,10 @@ impl Engine {
             resources.disk_budget_bytes,
             resources.prompt_cache_write_bytes_per_second,
         )?;
-        let vision = resources
-            .vision
-            .as_deref()
-            .map(|path| VisionEncoder::open(path, inner.input_signs()?).map(Arc::new))
-            .transpose()?;
+        let vision = Arc::new(VisionEncoder::open(
+            &resources.vision,
+            inner.input_signs()?,
+        )?);
         let plan = Plan {
             model: resources.model.clone(),
             model_reason: resources.model_reason.clone(),
@@ -346,7 +343,6 @@ impl Engine {
             speculation_reason: resources.mtp_reason.clone(),
             prompt_cache_dir: resources.prompt_cache_dir.clone(),
             prompt_cache_budget: resources.disk_budget_bytes,
-            vision: vision.is_some(),
             vision_reason: resources.vision_reason.clone(),
         };
         let model = inner.info().clone();
@@ -408,7 +404,7 @@ impl Engine {
     /// compiled), and the count is not checked against the context window.
     /// CPU-only; no GPU work is submitted.
     pub fn count_chat_tokens(&self, request: &ChatRequest) -> crate::Result<usize> {
-        count_chat(self.inner.tokenizer(), self.vision.as_deref(), request)
+        count_chat(self.inner.tokenizer(), Some(&self.vision), request)
     }
 
     /// Chat with one user prompt and collect the final answer and statistics.
@@ -486,7 +482,7 @@ impl Engine {
     ) -> crate::Result<Stats> {
         let (tools, grammar) = chat_grammar(self.inner.tokenizer(), request)?;
         let encoding = Encoding {
-            vision: self.vision.as_deref(),
+            vision: Some(&self.vision),
             activity: None,
             cancel: Some(cancel),
             context: self.inner.info().context,
@@ -680,7 +676,9 @@ pub struct EngineHandle {
     activity: Arc<crate::activity::EngineActivity>,
     /// Closes the worker engine's prompt-cache disk writer at shutdown.
     prompt_cache: crate::prompt_cache::Closer,
-    /// The vision tower, run on the submitting thread.
+    /// The vision tower, run on the submitting thread. Every handle a
+    /// loaded engine makes has one; `None` is only the tokenizer-only
+    /// handles of unit tests.
     vision: Option<Arc<VisionEncoder>>,
     /// The worker engine's context, which a prompt with images must fit
     /// before its images are encoded.
@@ -703,7 +701,7 @@ impl EngineHandle {
     fn new(engine: Engine) -> Self {
         let tokenizer = engine.inner.tokenizer().clone();
         let prompt_cache = engine.inner.prompt_cache_closer();
-        let vision = engine.vision.clone();
+        let vision = Some(Arc::clone(&engine.vision));
         let context = engine.inner.info().context;
         let (sender, receiver) = async_mpsc::channel::<Job>(SERVE_QUEUE);
         let activity = Arc::new(crate::activity::EngineActivity::default());
@@ -1313,13 +1311,15 @@ fn has_images(request: &ChatRequest) -> bool {
         .any(|message| !message.images.is_empty())
 }
 
+/// The vision tower of an encoding. A loaded engine always has one (the
+/// projector is required at startup); only the tokenizer-only encodings of
+/// unit tests lack it.
 fn vision_required(vision: Option<&VisionEncoder>) -> crate::Result<&VisionEncoder> {
     vision.ok_or_else(|| {
-        crate::Error::InvalidArgument(format!(
-            "image and video input need the Bonsai vision projector {}, which is not installed beside \
-             the model",
-            crate::bonsai_vision::VISION_PROJECTOR_FILE
-        ))
+        crate::Error::InvalidArgument(
+            "image and video input need a vision tower, which this tokenizer-only encoding lacks"
+                .into(),
+        )
     })
 }
 

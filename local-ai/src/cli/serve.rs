@@ -87,9 +87,6 @@ struct Args {
     /// Where Responses are kept: the user's data directory by default.
     response_store: options::ResponseStoreArg,
     reasoning_key: Option<PathBuf>,
-    /// `--decisions-artifact`: the evaluated head, gate and calibration that
-    /// enable `POST /v1/decisions`. `None` refuses that route.
-    decisions_artifact: Option<PathBuf>,
     /// Hosted tool permissions and bounds; none by default.
     tools: options::ToolArgs,
     /// `--allow-origin` values: browser origins admitted while
@@ -132,9 +129,8 @@ struct AppState {
     /// Where background `store: false` Responses are kept briefly; `None`
     /// when no private temporary store could be created.
     temporary: Option<Arc<Temporary>>,
-    /// The calibrated `POST /v1/decisions` service; `None` without an
-    /// artifact (`--decisions-artifact` or an installed `models/decisions-v2`).
-    decisions: Option<Arc<decisions::Decisions>>,
+    /// The calibrated `POST /v1/decisions` service (`models/decisions-v2`).
+    decisions: Arc<decisions::Decisions>,
     /// Native durable services, available automatically in the user's data directory.
     services: Option<Arc<services::Services>>,
     batches: Option<Arc<batches::Batches>>,
@@ -142,14 +138,14 @@ struct AppState {
     /// Hosted tools this server may run for Responses: the toolbox grants
     /// (none without `--tools-*` flags) and the tool loop's bounds.
     tools: Arc<tool_loop::Tools>,
-    /// Native text embeddings, when the embedding model is installed.
-    embeddings: Option<Arc<embeddings::Embeddings>>,
-    /// Native text to speech, when the speech model is installed.
-    speech: Option<Arc<speech::Speech>>,
-    /// `POST /v1/moderations`, when the moderation artifact is installed too.
-    moderations: Option<Arc<moderations::Moderations>>,
-    /// Native speech recognition and translation, when Whisper is installed.
-    transcription: Option<Arc<transcription::Transcriber>>,
+    /// Native text embeddings.
+    embeddings: Arc<embeddings::Embeddings>,
+    /// Native text to speech.
+    speech: Arc<speech::Speech>,
+    /// `POST /v1/moderations`.
+    moderations: Arc<moderations::Moderations>,
+    /// Native speech recognition and translation.
+    transcription: Arc<transcription::Transcriber>,
 }
 
 /// Requests the engine has accepted and not finished yet: the queue depth as
@@ -1263,17 +1259,6 @@ fn stored_answer(
     }
 }
 
-impl models::Installed {
-    const fn of(state: &AppState) -> Self {
-        Self {
-            embeddings: state.embeddings.is_some(),
-            moderation: state.moderations.is_some(),
-            speech: state.speech.is_some(),
-            transcription: state.transcription.is_some(),
-        }
-    }
-}
-
 impl AppState {
     /// The models this server serves.
     fn catalog(&self) -> models::Catalog<'_> {
@@ -1281,7 +1266,6 @@ impl AppState {
             bonsai: &self.model,
             context: self.context,
             created: self.created,
-            installed: models::Installed::of(self),
         }
     }
 }
@@ -1348,45 +1332,39 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // One discovery serves both the engine and the TLS lookup: each one probes
     // the disk's write rate with a 16 MiB file, so a second is wasted startup.
     let resources = Resources::discover(None, true)?;
-    // Beside the Bonsai model's own folder: `models/embeddinggemma2-text`.
-    let models_dir = resources.model.parent().and_then(std::path::Path::parent);
+    // The folder holding the Bonsai model's own, where every other model is
+    // installed; each one is required, so a missing one stops startup.
+    let models_dir = resources
+        .model
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "the model {} is not inside a models directory",
+                resources.model.display()
+            ))
+        })?
+        .to_owned();
     // The calibrated route's artifact is verified (hashes, acceptance, scope)
-    // before the model loads: `--decisions-artifact`, or one installed as
-    // `models/decisions-v2`.
-    let decisions_artifact = args.decisions_artifact.clone().or_else(|| {
-        models_dir
-            .map(|models_dir| models_dir.join("decisions-v2"))
-            .filter(|dir| dir.is_dir())
-    });
-    let decisions = decisions::Decisions::start(decisions_artifact.as_deref())?;
+    // before the model loads: `models/decisions-v2`.
+    let decisions = decisions::Decisions::start(&models_dir)?;
     let model: Arc<str> = models::BONSAI_MODEL_ID.into();
     let engine = Engine::from_resources(&resources)?;
     eprintln!("{}", engine.info().json);
     let context = engine.info().model.context;
     let engine = engine.into_handle();
     let prompt_cache = engine.clone();
-    let embeddings = match models_dir {
-        Some(models_dir) => embeddings::Embeddings::start(models_dir, engine.activity())?,
-        None => None,
-    };
-    if let (Some(vector_stores), Some(embeddings)) = (&vector_stores, &embeddings) {
+    // `models/embeddinggemma2-text`, which also embeds vector-store chunks.
+    let embeddings = embeddings::Embeddings::start(&models_dir, engine.activity())?;
+    if let Some(vector_stores) = &vector_stores {
         vector_stores.set_embedder(embeddings.chunk_embedder());
     }
-    // Beside it: `models/kokoro-82m`.
-    let speech = match models_dir {
-        Some(models_dir) => speech::Speech::start(models_dir, engine.activity())?,
-        None => None,
-    };
-    // With the embedding model: `models/moderation`.
-    let moderations = match models_dir {
-        Some(models_dir) => moderations::Moderations::start(models_dir, embeddings.as_ref())?,
-        None => None,
-    };
+    // `models/kokoro-82m`.
+    let speech = speech::Speech::start(&models_dir, engine.activity())?;
+    // `models/moderation`, over the embedding model.
+    let moderations = moderations::Moderations::start(&models_dir, &embeddings)?;
     // And `models/whisper-large-v3`.
-    let transcription = match models_dir {
-        Some(models_dir) => transcription::Transcriber::start(models_dir, engine.activity())?,
-        None => None,
-    };
+    let transcription = transcription::Transcriber::start(&models_dir, engine.activity())?;
     let mut state = AppState {
         engine,
         model,
@@ -1416,7 +1394,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         subscribers: Arc::new(tokio::sync::Semaphore::new(resume::MAX_SUBSCRIBERS)),
         foreground: Arc::default(),
         temporary: temporary.clone(),
-        decisions: decisions.clone(),
+        decisions: Arc::clone(&decisions),
         services: Some(services),
         batches: None,
         vector_stores: vector_stores.clone(),
@@ -1455,7 +1433,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // Background jobs are settled and cancelled as soon as shutdown begins,
     // while axum is still draining foreground connections.
     let closing = Arc::clone(&background);
-    let closing_decisions = decisions.clone();
+    let closing_decisions = Arc::clone(&decisions);
     let closing_batches = Arc::clone(&batches);
     // Foreground generations still running at the drain deadline are
     // cancelled, so a long one cannot hold shutdown until a SIGKILL that
@@ -1470,14 +1448,14 @@ async fn run_async(args: Args) -> crate::Result<()> {
             closing_batches.close();
             // Waiting decisions end at once, cancelling their engine work,
             // so they never hold up the drain.
-            decisions::close(closing_decisions.as_deref());
+            closing_decisions.close();
             let _ = tokio::task::spawn_blocking(move || closing.close()).await;
         },
         move || foreground.cancel_all(),
     )
     .await;
     // Again, for a server that stopped without the signal; settling is idempotent.
-    decisions::close(decisions.as_deref());
+    decisions.close();
     batches.close();
     batches.drained().await;
     // The indexer finishes its current file; an unfinished one resumes on start.

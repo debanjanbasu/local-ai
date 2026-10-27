@@ -387,7 +387,10 @@ fn policy_requires_the_artifact() {
     let error = DflashMode::Auto
         .resolve_with_default(missing)
         .expect_err("a missing drafter must stop startup");
-    assert!(error.to_string().contains("dflash2-drafter-int8-v1.bin"), "{error}");
+    assert!(
+        error.to_string().contains("dflash2-drafter-int8-v1.bin"),
+        "{error}"
+    );
     assert!(DflashMode::Drafter(missing.to_owned()).resolve().is_err());
     assert_eq!(
         DflashMode::Off("off by request".into()).resolve().ok(),

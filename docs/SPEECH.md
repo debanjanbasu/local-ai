@@ -2,9 +2,9 @@
 
 The server can synthesize speech natively with hexgrad's **Kokoro-82M**
 (v1.0, Apache-2.0, 82 M parameters), on Metal, beside the Bonsai checkpoint.
-It is optional and opt-in by installation: install the artifact below and
-`POST /v1/audio/speech` appears (and `kokoro-82m` is listed by
-`GET /v1/models`); without it nothing changes and the route is `404`.
+The artifact below is required: `serve` does not start without it, and it
+serves `POST /v1/audio/speech` (and `kokoro-82m` is listed by
+`GET /v1/models`).
 
 ## Why Kokoro-82M
 

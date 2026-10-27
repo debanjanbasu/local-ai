@@ -1,9 +1,9 @@
 //! `POST /v1/moderations` on calibrated heads over the native `EmbeddingGemma`
 //! 2 text embeddings ([`local_engine::moderation`]).
 //!
-//! Served only when both the embedding model and the moderation artifact
+//! The embedding model and the moderation artifact
 //! (`models/moderation/moderation-heads.json`, see `docs/MODERATION.md`) are
-//! installed; there is no flag. The artifact is checked on startup against
+//! both required; there is no flag. The artifact is checked on startup against
 //! its pinned SHA-256 and the encoder payload it was trained on; a bad
 //! artifact stops the server rather than serving unvalidated scores.
 //!
@@ -72,35 +72,27 @@ pub(super) struct Moderations {
 }
 
 impl Moderations {
-    /// The service, when the artifact is installed in `models_dir` and the
-    /// embedding service runs.
+    /// The service, from the required artifact in `models_dir` and the
+    /// embedding service.
     pub(super) fn start(
         models_dir: &Path,
-        embeddings: Option<&Arc<Embeddings>>,
-    ) -> crate::Result<Option<Arc<Self>>> {
-        let Some(path) = installed_heads(models_dir) else {
-            return Ok(None);
-        };
-        let Some(embeddings) = embeddings else {
-            eprintln!(
-                "moderation artifact {} is installed but the embedding model is not; \
-                 {ROUTE} is not served",
-                path.display()
-            );
-            return Ok(None);
-        };
-        let heads = ModerationHeads::open(&path, &embeddings.payload_sha256())
-            .map_err(|error| crate::Error::InvalidArgument(error.to_string()))?;
+        embeddings: &Arc<Embeddings>,
+    ) -> crate::Result<Arc<Self>> {
+        let path = installed_heads(models_dir)?;
+        let heads =
+            ModerationHeads::open(&path, &embeddings.payload_sha256()).map_err(|error| {
+                crate::Error::InvalidArgument(format!("{}: {error}", path.display()))
+            })?;
         eprintln!(
             "moderations at POST {ROUTE}: {MODERATION_MODEL_ID} from {} (sha256 {}); scored: {}",
             path.display(),
             heads.sha256(),
             heads.supported().collect::<Vec<_>>().join(", ")
         );
-        Ok(Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             heads,
             embeddings: Arc::clone(embeddings),
-        })))
+        }))
     }
 }
 
@@ -266,9 +258,7 @@ pub(super) async fn handle(
     body: Body,
     caller: &Caller,
 ) -> Response {
-    let Some(service) = state.moderations.clone() else {
-        return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
-    };
+    let service = Arc::clone(&state.moderations);
     let body = match http_body_util::Limited::new(body, MAX_REQUEST_BYTES)
         .collect()
         .await

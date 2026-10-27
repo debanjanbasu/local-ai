@@ -538,10 +538,10 @@ reach 10% selective risk on 50 rows.
 
 ### 3c. A6 integrity and `POST /v1/decisions`
 
-**Decision: A1–A6 pass, so `POST /v1/decisions` is implemented, served only
-with `--decisions-artifact DIR`** (`head.safetensors`, `gate.safetensors`,
-`calibration.json`) and only within the declared scope. Without the flag the
-route stays a 404 with an explanation.
+**Decision: A1–A6 pass, so `POST /v1/decisions` is implemented, served from
+the required `models/decisions-v2` artifact** (`head.safetensors`,
+`gate.safetensors`, `calibration.json`) and only within the declared scope.
+`serve` does not start without it.
 
 - **Load-time validation** (`local_engine::judgment::CalibratedHead::open`):
   the artifact's content hash over its canonical JSON (keys sorted, compact,
@@ -567,7 +567,8 @@ route stays a 404 with an explanation.
   artifact's head, judged by `CalibratedHead::judge`, matches the offline
   decisions (`P(Yes)` and gate distance within 1e-9, same refusals; 10
   answered; `native_parity_with_the_offline_decisions`, one GPU-lock hold),
-  and the live server on port 8114 with `--decisions-artifact` answered the
+  and the live server on port 8114 with the artifact (then named by a
+`--decisions-artifact` flag, since removed) answered the
   same 26 requests identically (`judgment_reeval.py http-parity`: 26/26, 10
   predicate answers with `probability` within 1e-6, 16 refusals; one hold).
 - Served end to end on TEST (scope check, token limit, gate, family

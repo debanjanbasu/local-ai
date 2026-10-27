@@ -26,8 +26,8 @@
 //! `400`, an unknown object a `404`, and a state conflict (cancelling a
 //! finished batch, searching or attaching to an expired store) a `409`.
 //!
-//! Search is lexical BM25, or embedding (cosine) search for `ranker: auto`
-//! when the embedding model is installed; see the native module for the rankings,
+//! Search is embedding (cosine) search for `ranker: auto`, with the server's
+//! required embedding model, or lexical BM25; see the native module for the rankings,
 //! the score mapping and what `rewrite_query` and `ranking_options` do. Attaching
 //! files answers at once with `in_progress` objects and wakes the indexer;
 //! clients follow the status as they would with `OpenAI`.
@@ -134,11 +134,6 @@ impl VectorStores {
     ) {
         self.index.set_embedder(Some(embedder));
         self.indexer.notify();
-    }
-
-    /// Whether an embedding model is installed.
-    pub(super) fn embeds(&self) -> bool {
-        self.index.embeds()
     }
 
     /// Refuse store IDs a `file_search` tool of a caller acting for

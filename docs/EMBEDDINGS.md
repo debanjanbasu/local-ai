@@ -2,15 +2,14 @@
 
 The server can embed text natively with Google's **EmbeddingGemma 2**
 (`google/embeddinggemma-2`, 744 M parameters with its image, audio and video
-encoders; 271 M on the text path), on Metal, beside the Bonsai checkpoint. It
-is optional and opt-in by installation: install the artifact below and
-`POST /v1/embeddings` appears; without it nothing changes and the route is
-`404`. Text and code are served over HTTP; **images and video** are native
-through the Rust API once the optional vision artifact is installed (see
+encoders; 271 M on the text path), on Metal, beside the Bonsai checkpoint. The
+text, vision and audio artifacts are all required: `serve` does not start
+without them (each is checked against its digest), and the text encoder
+serves `POST /v1/embeddings`. Text and code are served over HTTP; **images
+and video** are native through the Rust API (see
 [Images and video](#images-and-video); OpenAI's embeddings API has no media
-input, so there is no HTTP surface for them), and so is **audio** once the
-optional audio artifact is installed (see [EMBEDDINGS_AUDIO.md](EMBEDDINGS_AUDIO.md)
-and [Modalities](#modalities)).
+input, so there is no HTTP surface for them), and so is **audio** (see
+[EMBEDDINGS_AUDIO.md](EMBEDDINGS_AUDIO.md) and [Modalities](#modalities)).
 
 ## Install
 
@@ -86,7 +85,7 @@ the reference to F32 rounding; it costs 136 MB more GPU memory than int8.
   of token-id arrays; at most 2,048 inputs, no empty strings, at most 300,000
   tokens in total. Token ids are EmbeddingGemma 2 ids and are used as given
   (no `<bos>`/`<eos>` added).
-- `model`: `embeddinggemma-2` (listed by `GET /v1/models` when installed).
+- `model`: `embeddinggemma-2` (listed by `GET /v1/models`).
 - `encoding_format`: `float` (default) or `base64` (little-endian F32).
 - `dimensions`: 768 (default), 512, 256 or 128, the trained Matryoshka widths;
   the vector is truncated, then renormalized. Other values are refused.
@@ -124,11 +123,9 @@ client that disconnects cancels its request at the next submission boundary.
 
 ## Vector stores
 
-When the artifact is installed, the server's vector stores
-(`/v1/vector_stores`) embed every chunk as it is indexed and rank
-`ranker: auto` searches by the cosine similarity of chunk and query
-embeddings; `ranker: none` stays BM25, and without the artifact everything
-is BM25 exactly as before. The full contract is the
+The server's vector stores (`/v1/vector_stores`) embed every chunk as it is
+indexed and rank `ranker: auto` searches by the cosine similarity of chunk
+and query embeddings; `ranker: none` stays BM25. The full contract is the
 `local_services::vector_stores` module docs ("Embeddings"); the essentials:
 
 - **Prompts:** chunks as `title: none | text: {chunk}`, queries as
@@ -268,7 +265,7 @@ absolute rates as indicative; the alternation shares that load between both cond
 
 Image and video embeddings run natively in the same 768-d space, through the
 Rust API only (see [Why no HTTP surface](#why-no-http-surface)). They need the
-optional **vision artifact** next to the text install:
+required **vision artifact** next to the text install:
 
 ```bash
 python3 tools/convert_embeddinggemma2_vision.py --source cache/embeddinggemma-2
@@ -281,9 +278,9 @@ python3 tools/convert_embeddinggemma2_vision.py --source cache/embeddinggemma-2
 It also writes `manifest-vision.json`. The converter is standard library
 only, checks `model.safetensors` and `config.json` against the same pins as
 the text converter and its own output against the pinned SHA-256. The engine
-verifies the payload hash when it loads the encoder (lazily, on the first
-media input; 335 MB more GPU memory). Without the file, media inputs are
-refused and nothing else changes.
+verifies the payload hash when the embedding model opens, and again when it
+loads the encoder onto the GPU (lazily, on the first media input; 335 MB more
+GPU memory). Without the file the embedding model does not open.
 
 ### What runs
 
@@ -457,8 +454,8 @@ refused as token-id input):
    reference's sequence, the one the parity gate measures). See
    [EMBEDDINGS_AUDIO.md](EMBEDDINGS_AUDIO.md).
 
-Each media encoder artifact is optional and loads on the first input that
-needs it. Mixed inputs (text with images or audio) are laid out part by part
+Each media encoder artifact is verified when the model opens and loads onto
+the GPU on the first input that needs it. Mixed inputs (text with images or audio) are laid out part by part
 in order.
 
 ### Mixed-modality inputs

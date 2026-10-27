@@ -176,11 +176,6 @@ impl Config {
         ))
     }
 
-    /// Whether searching needs the embedding model (`hybrid_search`).
-    pub(super) const fn needs_embeddings(&self) -> bool {
-        self.hybrid.is_some()
-    }
-
     /// The ranking to force, if not the one the ranker selects.
     pub(super) const fn ranking(&self) -> Option<Ranking> {
         self.hybrid

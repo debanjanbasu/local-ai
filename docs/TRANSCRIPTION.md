@@ -2,10 +2,10 @@
 
 The server can transcribe and translate speech natively with OpenAI's
 **Whisper large-v3** (MIT, 1.55 B parameters), on Metal, beside the Bonsai
-checkpoint. It is optional and opt-in by installation: install the artifact
-below and `POST /v1/audio/transcriptions` and `POST /v1/audio/translations`
-appear and `GET /v1/models` lists `whisper-large-v3`; without it nothing
-changes and both routes are `404`.
+checkpoint. The artifact below is required: `serve` does not start without
+it, and it serves `POST /v1/audio/transcriptions` and
+`POST /v1/audio/translations` and lists `whisper-large-v3` in
+`GET /v1/models`.
 
 ## Why Whisper large-v3
 

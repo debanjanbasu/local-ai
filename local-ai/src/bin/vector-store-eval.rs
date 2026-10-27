@@ -292,8 +292,7 @@ fn main() -> Result<()> {
         "measure" => {}
         _ => return Err(usage.into()),
     }
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/embeddinggemma2-text is not installed (see docs/EMBEDDINGS.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     let model = EmbeddingModel::open(&dir)?;
     let embedder = Arc::new(ModelChunkEmbedder::new(
         Arc::new(Mutex::new(model)),

@@ -6,13 +6,23 @@ use super::*;
 #[test]
 fn installation_needs_the_artifact_and_the_tokenizer() {
     let dir = tempfile::tempdir().expect("tempdir");
-    assert!(installed_model(dir.path()).is_none());
     let model = dir.path().join(TRANSCRIPTION_MODEL_DIR);
+    let missing = |name: &str| {
+        let error = installed_model(dir.path()).expect_err("incomplete install");
+        assert!(
+            error
+                .to_string()
+                .contains(&model.join(name).display().to_string())
+                && error.to_string().contains("README Model install"),
+            "{error}"
+        );
+    };
+    missing(TRANSCRIPTION_ARTIFACT);
     std::fs::create_dir_all(&model).expect("mkdir");
     std::fs::write(model.join(TRANSCRIPTION_ARTIFACT), b"x").expect("write");
-    assert!(installed_model(dir.path()).is_none());
+    missing("tokenizer.json");
     std::fs::write(model.join("tokenizer.json"), b"{}").expect("write");
-    assert_eq!(installed_model(dir.path()), Some(model));
+    assert_eq!(installed_model(dir.path()).expect("installed"), model);
 }
 
 #[derive(serde::Deserialize)]

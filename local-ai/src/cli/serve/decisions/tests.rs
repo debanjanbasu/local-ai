@@ -10,7 +10,7 @@ use local_engine::judgment::{
     JUDGMENT_HEAD_FORMAT,
 };
 
-use super::{FLAG, ROUTE, answer, prepare, refusal_message, response_json};
+use super::{answer, prepare, response_json};
 
 /// SHA-256 through `ring`, already a dependency of this crate.
 mod sha2_free {
@@ -286,6 +286,19 @@ async fn message_inputs_and_bad_bodies() {
 }
 
 #[test]
+fn a_missing_artifact_stops_startup_naming_the_file() {
+    let models = tempfile::tempdir().unwrap();
+    let error = super::Decisions::start(models.path())
+        .err()
+        .expect("the artifact is required")
+        .to_string();
+    assert!(
+        error.contains("decisions-v2/calibration.json") && error.contains("README Model install"),
+        "{error}"
+    );
+}
+
+#[test]
 fn the_artifact_is_verified_before_serving() {
     let dir = tempfile::tempdir().unwrap();
     artifact(dir.path(), false);
@@ -307,27 +320,6 @@ fn the_artifact_is_verified_before_serving() {
         .expect("tampered head")
         .to_string();
     assert!(error.contains("head_sha256"), "{error}");
-}
-
-#[test]
-fn the_flag_is_explicit_and_the_route_explains_itself_without_it() {
-    use super::super::options::parse;
-    let args = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
-    assert_eq!(
-        parse(&args(&[])).expect("defaults").decisions_artifact,
-        None
-    );
-    let parsed = parse(&args(&[FLAG, "/tmp/artifact"])).expect("flag");
-    assert_eq!(
-        parsed.decisions_artifact.as_deref(),
-        Some(Path::new("/tmp/artifact"))
-    );
-    assert!(parse(&args(&[FLAG])).is_err());
-    assert!(parse(&args(&[FLAG, ""])).is_err());
-    let message = refusal_message();
-    for expected in [ROUTE, FLAG, "docs/DECISIONS_EVALUATION.md", "refusal"] {
-        assert!(message.contains(expected), "{message}");
-    }
 }
 
 #[tokio::test]

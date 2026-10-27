@@ -69,11 +69,16 @@ pub const VOICE_ALIASES: [(&str, &str); 13] = [
     ("cedar", "am_fenrir"),
 ];
 
-/// The installation directory inside `models_dir`, if the artifact is there.
-#[must_use]
-pub fn installed_model(models_dir: &Path) -> Option<PathBuf> {
+/// The installation directory inside `models_dir`.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidArgument`] naming the artifact when it is missing:
+/// it is required.
+pub fn installed_model(models_dir: &Path) -> crate::Result<PathBuf> {
     let dir = models_dir.join(SPEECH_MODEL_DIR);
-    dir.join(SPEECH_ARTIFACT).is_file().then_some(dir)
+    crate::resources::require_files("Kokoro-82M", &dir, &[SPEECH_ARTIFACT])?;
+    Ok(dir)
 }
 
 /// The American and British G2P of an installation, without loading the

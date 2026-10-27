@@ -24,18 +24,18 @@ target/release/local-ai chat 'What is 17 * 23?'
 The server listens on `127.0.0.1:8080` and implements a text, function-calling and
 JSON-constrained subset of the OpenAI Chat Completions and Responses HTTP
 contracts (not full OpenAI compatibility). The Bonsai model's id is
-`ternary-bonsai-2-27b`; `GET /v1/models` lists it with every installed
-optional model ([model ids](docs/BONSAI.md#model-ids)).
+`ternary-bonsai-2-27b`; `GET /v1/models` lists it with the embedding,
+moderation, speech and transcription models served beside it
+([model ids](docs/BONSAI.md#model-ids)).
 
 **Supported OpenAI APIs.** Only current OpenAI APIs are served: Chat
 Completions, Responses (with `input_tokens`, `compact`, retrieval,
 cancellation and input items), Models, Conversations, Files, Uploads,
-Batches, Vector Stores, Decisions and the Administration API
+Batches, Vector Stores, Decisions, the Administration API
 (`/v1/organization/*`: keys, projects, audit logs, usage; see
-[docs/ADMIN.md](docs/ADMIN.md)); with the optional models installed,
-Embeddings, Moderations, Audio speech (`/v1/audio/speech`) and Audio
-transcriptions and translations (`/v1/audio/transcriptions`,
-`/v1/audio/translations`). The legacy Completions API
+[docs/ADMIN.md](docs/ADMIN.md)), Embeddings, Moderations, Audio speech
+(`/v1/audio/speech`) and Audio transcriptions and translations
+(`/v1/audio/transcriptions`, `/v1/audio/translations`). The legacy Completions API
 (`POST /v1/completions`) is not served (a 404, and batches cannot target
 it). Only the current specification is served: of the members it marks
 deprecated, only Chat `max_tokens` (which opencode sends) is honoured, and
@@ -106,16 +106,14 @@ allowlisted `local_web_fetch` only when `serve` is started with explicit
 `--tools-*` permissions; by default none of those is available. The
 permission model, bounds and known gaps are in [docs/TOOLS.md](docs/TOOLS.md).
 
-`POST /v1/decisions` is served whenever
-a decisions artifact is installed as `models/decisions-v2` (or named with
-`--decisions-artifact DIR`): a head, gate and calibration artifact that passed
+`POST /v1/decisions` is served from the decisions artifact in
+`models/decisions-v2`: a head, gate and calibration artifact that passed
 the [pre-registered confidence and refusal evaluation](docs/DECISIONS_EVALUATION.md)
 (part 3), verified by hash at startup. Its scope is narrow: CommitPackFT-style
 "does this commit message describe this diff?" predicates over a rendered diff
 are answered with a calibrated probability; CodeReviewer "needs a reviewer
 comment?" is always refused (no threshold met the target risk); every other
-question is answered `refusal`. Without an artifact the route is a 404 with
-an explanation.
+question is answered `refusal`.
 
 The server also always opens a durable native services store at
 `~/Library/Application Support/local-ai/services` (owner-only SQLite plus file
@@ -352,37 +350,49 @@ Weights are not included. The runtime validates these pinned files:
 | File | Bytes | SHA256 | Needed |
 | --- | ---: | --- | --- |
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` | always |
-| `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | 931,145,856 | `e287342d92332fa3577ed1d42e921dac9370c08da58ba9337fa450f6cc76cfd7` | for image and video input to chat and responses |
+| `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | 931,145,856 | `e287342d92332fa3577ed1d42e921dac9370c08da58ba9337fa450f6cc76cfd7` | always |
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | always |
 | `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` | 2,054,275,072 | `f43f846c60fc3f83c18ab772006d55f3cd6287944b4989fe4ac8d774c7a955e8` | always |
-| `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | for `POST /v1/embeddings` |
-| `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
-| `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | for image/video embeddings (Rust API) |
-| `models/kokoro-82m/kokoro-82m-f32.bin` | 354,146,560 | `aa3b5c769b9fdcc9eac3d6068352610183e45c20542f1232d629ead82c695928` | for `POST /v1/audio/speech` |
-| `models/moderation/moderation-heads.json` | 105,507 | `b74727bf58afce5adad11dc3aa903388ad550fffc9c38b099d14995fc760bdc4` | for `POST /v1/moderations` (with the encoder) |
-| `models/whisper-large-v3/whisper-large-v3-f16.bin` | 3,093,458,432 | `cce7ae83d4a15146f356a9f3bb5169b0fb42a86dc2e6a0c6cf932766e6d1cb53` | for `POST /v1/audio/transcriptions` and `/translations` |
-| `models/whisper-large-v3/tokenizer.json` | 2,480,617 | `6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca` | for `POST /v1/audio/transcriptions` and `/translations` |
+| `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | always |
+| `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | always |
+| `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | always |
+| `models/embeddinggemma2-text/embeddinggemma2-audio-bf16.bin` | 611,720,448 | `3b3354a4df46fb2463d5b10b2d6bfa80e616aa07f1f87c658cdd184023dbe3bc` | always |
+| `models/kokoro-82m/kokoro-82m-f32.bin` | 354,146,560 | `aa3b5c769b9fdcc9eac3d6068352610183e45c20542f1232d629ead82c695928` | always |
+| `models/moderation/moderation-heads.json` | 105,507 | `b74727bf58afce5adad11dc3aa903388ad550fffc9c38b099d14995fc760bdc4` | always |
+| `models/whisper-large-v3/whisper-large-v3-f16.bin` | 3,093,458,432 | `cce7ae83d4a15146f356a9f3bb5169b0fb42a86dc2e6a0c6cf932766e6d1cb53` | always |
+| `models/whisper-large-v3/tokenizer.json` | 2,480,617 | `6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca` | always |
+| `models/decisions-v2/calibration.json` | 3,015 | `7e1100f9213f0da8053d4f5b0756d5452d0c55e5f719992c03b624b61402a8ff` | always |
+| `models/decisions-v2/head.safetensors` | 10,488,404 | `34d0708873125c09aa59f444d7c40e64ac2af8b81ca989c7970ace9e67c83b81` | always |
+| `models/decisions-v2/gate.safetensors` | 1,332,004 | `9a5a4eb811822e4d1c64dde6006b9d92f7f0d5ebeb757d8b99e113e7d21f4fb1` | always |
 
-The GGUF, the [mixed ternary/int8 MTP head](#mtp-head-artifact) and the
-[DFlash2 drafter](#dflash2-drafter-artifact) are required: startup stops with
-an error naming any that is missing, and the loaders refuse a corrupt one
-(`--no-speculation` is the only way to run without the head and drafter). The
-BF16 vision projector is optional: installed beside the
-GGUF, it adds image and video input to Chat Completions and Responses
-([docs/BONSAI.md](docs/BONSAI.md#image-input),
-[video](docs/BONSAI.md#video-input)); without it image and video parts are
-refused and the startup policy says why. The EmbeddingGemma 2 text encoder is optional too: it is
-converted from the Kaggle checkpoint by `tools/convert_embeddinggemma2.py`, and
-when installed the server adds `POST /v1/embeddings`
-([docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)). With it, copying the committed
-moderation heads (`local-engine/assets/moderation/`) into `models/moderation/`
-adds `POST /v1/moderations` for the categories that passed evaluation
-([docs/MODERATION.md](docs/MODERATION.md)). Kokoro-82M text to speech is
-optional too: converted by `tools/convert_kokoro.py` from a Kaggle CPU job's
-download, it adds `POST /v1/audio/speech` ([docs/SPEECH.md](docs/SPEECH.md)).
-So is Whisper large-v3: converted by `tools/convert_whisper.py`, it adds
-`POST /v1/audio/transcriptions` and `POST /v1/audio/translations`
-([docs/TRANSCRIPTION.md](docs/TRANSCRIPTION.md)).
+Every file is required. `serve` checks them all at startup, and `chat` and
+`bonsai` check the Bonsai files they use: a missing file stops startup with an
+error naming it and pointing here, and the loaders refuse a corrupt one (each
+artifact's digest is re-derived on load). Where each comes from:
+
+- the GGUF and the BF16 vision projector (image and video input to Chat
+  Completions and Responses; [docs/BONSAI.md](docs/BONSAI.md#image-input),
+  [video](docs/BONSAI.md#video-input)): the pinned Hugging Face revision
+  below;
+- the [mixed ternary/int8 MTP head](#mtp-head-artifact) and the
+  [DFlash2 drafter](#dflash2-drafter-artifact): below;
+- the EmbeddingGemma 2 text encoder (`POST /v1/embeddings`,
+  [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md)) and its vision and audio encoders
+  (Rust API, [docs/EMBEDDINGS_AUDIO.md](docs/EMBEDDINGS_AUDIO.md)): converted
+  from the Kaggle checkpoint by `tools/convert_embeddinggemma2.py`,
+  `tools/convert_embeddinggemma2_vision.py` and
+  `tools/convert_embeddinggemma2_audio.py`;
+- the moderation heads (`POST /v1/moderations` for the categories that passed
+  evaluation, [docs/MODERATION.md](docs/MODERATION.md)): copied from
+  `local-engine/assets/moderation/`;
+- Kokoro-82M (`POST /v1/audio/speech`, [docs/SPEECH.md](docs/SPEECH.md)):
+  converted by `tools/convert_kokoro.py` from a Kaggle CPU job's download;
+- Whisper large-v3 (`POST /v1/audio/transcriptions` and `/translations`,
+  [docs/TRANSCRIPTION.md](docs/TRANSCRIPTION.md)): converted by
+  `tools/convert_whisper.py`;
+- the decisions artifact (`POST /v1/decisions`): the head, gate and
+  calibration produced by the pre-registered evaluation
+  ([docs/DECISIONS_EVALUATION.md](docs/DECISIONS_EVALUATION.md), part 3).
 
 The GGUF repository is pinned. Its head has moved past `6ed5e12b`, so keep the
 pin rather than tracking the branch.
@@ -392,7 +402,7 @@ hf download prism-ml/Ternary-Bonsai-2-27B-gguf \
   --revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b \
   --include 'Ternary-Bonsai-2-27B-PTQ1_0.gguf' \
   --local-dir models/bonsai2-27b-ptq1
-# optional: image and video input
+# image and video input
 hf download prism-ml/Ternary-Bonsai-2-27B-gguf \
   --revision 6ed5e12bf84b7a63069882c91dd9e9218647d17b \
   --include 'Ternary-Bonsai-2-27B-mmproj-BF16.gguf' \
@@ -412,7 +422,8 @@ above are ever opened, and the rest are not merely unused:
 | `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | 629,246,976 | Lossy copy of the BF16 projector, which the runtime reads instead |
 
 The runtime resolves only `MODEL_RELATIVE`, the head's
-`MTP_DIRECTORY`/`MTP_HEAD_ARTIFACT` and the projector beside the GGUF
+`MTP_DIRECTORY`/`MTP_HEAD_ARTIFACT`, the drafter's
+`DFLASH_DIRECTORY`/`DFLASH_HEAD_ARTIFACT` and the projector beside the GGUF
 (`VISION_PROJECTOR_FILE`), all named in `local-engine/src/resources.rs` and
 `local-engine/src/bonsai_vision/tower.rs`.
 
@@ -441,7 +452,7 @@ python3 tools/fetch_mtp_head.py
 It streams the pinned asset into `models/bonsai2-27b-mtp/`, checks its size and
 SHA256, and never replaces an existing file.
 
-If you installed both files, verify them against the table above:
+Verify the GGUF and the head against the table above:
 
 ```bash
 shasum -a 256 \
@@ -473,9 +484,9 @@ The digest covers the 21 logical sections (nine matrices, seven folded
 norms) concatenated in order, skipping the 16 KiB alignment padding. Each load
 re-derives it from the file and compares it with the header. A corrupt,
 truncated, or renamed artifact is always a hard error naming the file and the
-reason; there is deliberately no fallback, because silently decoding without
-speculation looks like a healthy install rather than a broken one. A missing
-head turns MTP off and the startup policy records the reason.
+reason, and so is a missing one; there is deliberately no fallback, because
+silently decoding without speculation looks like a healthy install rather
+than a broken one.
 
 The head was distilled from the
 [community BF16 MTP head](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP)
@@ -566,21 +577,20 @@ ceiling is 1.074x and the best measured result 1.29%.
 - `local-engine`: GGUF reader, tokenizer, inference, caching, speculation, API.
 - `local-ai`: `chat`, `bonsai`, and `serve` commands and HTTP server.
 - `local-services`: durable conversations, files, uploads, batches and
-  vector stores (SQLite, Tantivy; BM25, or embeddings when the embedding
-  model is installed) and read-only workspace search; no model
-  required.
+  vector stores (SQLite, Tantivy; BM25, and embeddings from the server's
+  embedding model) and read-only workspace search.
 - `local-metal`, `shaders`: Metal dispatch code, kernels, and GPU tests.
 - `tools`: Kaggle staging and installation helpers and tests.
 - `docs/BONSAI.md`: technical reference and measurements.
-- `docs/EMBEDDINGS.md`: the optional native EmbeddingGemma 2 text encoder
-  and `POST /v1/embeddings`.
-- `docs/EMBEDDINGS_AUDIO.md`: the optional native EmbeddingGemma 2 audio
-  encoder (Rust API).
-- `docs/SPEECH.md`: the optional native Kokoro-82M text to speech and
+- `docs/EMBEDDINGS.md`: the native EmbeddingGemma 2 text encoder and
+  `POST /v1/embeddings`.
+- `docs/EMBEDDINGS_AUDIO.md`: the native EmbeddingGemma 2 audio encoder
+  (Rust API).
+- `docs/SPEECH.md`: the native Kokoro-82M text to speech and
   `POST /v1/audio/speech`.
 - `docs/MODERATION.md`: `POST /v1/moderations` heads, data, pre-registered
   criteria and results.
-- `docs/TRANSCRIPTION.md`: the optional native Whisper large-v3 speech model
+- `docs/TRANSCRIPTION.md`: the native Whisper large-v3 speech model
   and `POST /v1/audio/transcriptions` and `/translations`.
 
 ## Verification

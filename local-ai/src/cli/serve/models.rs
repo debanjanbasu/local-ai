@@ -66,7 +66,7 @@ pub(super) enum Served {
     Transcription,
 }
 
-/// Which model `name` names, by id or alias, installed or not; `bonsai` is
+/// Which model `name` names, by id or alias; `bonsai` is
 /// the loaded Bonsai id ([`BONSAI_MODEL_ID`] outside tests).
 pub(super) fn resolve(name: &str, bonsai: &str) -> Option<Served> {
     if name == bonsai {
@@ -129,17 +129,6 @@ const fn route_of(model: Served) -> &'static str {
     }
 }
 
-/// Which optional models this server runs beside Bonsai (independent
-/// installs, so independent flags).
-#[derive(Clone, Copy, Debug, Default)]
-#[expect(clippy::struct_excessive_bools)]
-pub(super) struct Installed {
-    pub(super) embeddings: bool,
-    pub(super) moderation: bool,
-    pub(super) speech: bool,
-    pub(super) transcription: bool,
-}
-
 /// The models this server serves, as `GET /v1/models` lists them.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Catalog<'a> {
@@ -149,39 +138,32 @@ pub(super) struct Catalog<'a> {
     pub(super) context: usize,
     /// Registration time of every model, stable for this server.
     pub(super) created: u64,
-    pub(super) installed: Installed,
 }
 
 impl Catalog<'_> {
-    /// The model object of `model`, or `None` when it is not installed.
+    /// The model object of `model`.
     ///
     /// Bonsai's `context_length` (the name `OpenRouter` and LM Studio read)
     /// and `max_model_len` (vLLM's) are both the per-request admission limit
     /// from `BonsaiInfo::context`, prompt plus output, not the checkpoint's
     /// training length: it is what a request can actually use on this
     /// machine.
-    fn entry(&self, model: Served) -> Option<Value> {
-        let (created, installed) = (self.created, self.installed);
+    fn entry(&self, model: Served) -> Value {
+        let created = self.created;
         match model {
-            Served::Bonsai => Some(json!({
+            Served::Bonsai => json!({
                 "id":self.bonsai,"object":"model","created":created,"owned_by":"local",
                 "context_length":self.context,"max_model_len":self.context
-            })),
-            Served::Embeddings => installed
-                .embeddings
-                .then(|| embeddings::model_json(created)),
-            Served::Moderation => installed
-                .moderation
-                .then(|| moderations::model_json(created)),
-            Served::Speech => installed.speech.then(|| speech::model_json(created)),
-            Served::Transcription => installed
-                .transcription
-                .then(|| transcription::model_json(created)),
+            }),
+            Served::Embeddings => embeddings::model_json(created),
+            Served::Moderation => moderations::model_json(created),
+            Served::Speech => speech::model_json(created),
+            Served::Transcription => transcription::model_json(created),
         }
     }
 
-    /// `GET /v1/models`: Bonsai, then every installed optional model (each
-    /// served by its own route).
+    /// `GET /v1/models`: Bonsai, then every other model (each served by its
+    /// own route).
     pub(super) fn list(&self) -> Value {
         let data: Vec<Value> = [
             Served::Bonsai,
@@ -191,7 +173,7 @@ impl Catalog<'_> {
             Served::Transcription,
         ]
         .into_iter()
-        .filter_map(|model| self.entry(model))
+        .map(|model| self.entry(model))
         .collect();
         json!({"object":"list","data":data})
     }
@@ -199,17 +181,17 @@ impl Catalog<'_> {
     /// `GET` and `DELETE /v1/models/{model}`, `model` being the rest of the
     /// path.
     ///
-    /// `GET` answers the model object of an installed model, by id or alias
+    /// `GET` answers the model object of a served model, by id or alias
     /// (an alias answers the model it stands for, under its own id), and 404
     /// for anything else. `DELETE` is for fine-tuned models, which this
-    /// server has none of: an installed model is refused with 403, since it
+    /// server has none of: a served model is refused with 403, since it
     /// is a base model that cannot be deleted, and any other name is 404.
     pub(super) fn answer(
         &self,
         method: &Method,
         model: &str,
     ) -> Result<Value, (StatusCode, String)> {
-        let entry = resolve(model, self.bonsai).and_then(|served| self.entry(served));
+        let entry = resolve(model, self.bonsai).map(|served| self.entry(served));
         let not_found = || {
             (
                 StatusCode::NOT_FOUND,
@@ -237,25 +219,17 @@ impl Catalog<'_> {
 mod tests {
     use super::*;
 
-    fn catalog(installed: Installed) -> Catalog<'static> {
+    const fn catalog() -> Catalog<'static> {
         Catalog {
             bonsai: BONSAI_MODEL_ID,
             context: 32768,
             created: 1234,
-            installed,
         }
     }
 
-    const ALL: Installed = Installed {
-        embeddings: true,
-        moderation: true,
-        speech: true,
-        transcription: true,
-    };
-
     #[test]
     fn every_listed_model_is_retrieved_by_its_id() {
-        let catalog = catalog(ALL);
+        let catalog = catalog();
         let list = catalog.list();
         let data = list["data"].as_array().expect("data");
         assert_eq!(data.len(), 5);
@@ -270,7 +244,7 @@ mod tests {
 
     #[test]
     fn aliases_retrieve_the_model_they_stand_for() {
-        let catalog = catalog(ALL);
+        let catalog = catalog();
         let whisper = catalog.answer(&Method::GET, "whisper-1").expect("alias");
         assert_eq!(whisper["id"], TRANSCRIPTION_MODEL_ID);
         for alias in MODERATION_ALIASES {
@@ -280,9 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn uninstalled_and_unknown_names_are_not_found() {
-        let catalog = catalog(Installed::default());
-        for name in [EMBEDDING_MODEL_ID, SPEECH_MODEL_ID, "whisper-1", "gpt-4o"] {
+    fn unknown_names_are_not_found() {
+        let catalog = catalog();
+        for name in ["gpt-4o", "anything", "ft:gpt-4o-mini:acme::abc"] {
             let (status, _) = catalog.answer(&Method::GET, name).expect_err(name);
             assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
         }
@@ -290,7 +264,7 @@ mod tests {
 
     #[test]
     fn deleting_refuses_base_models_and_misses_unknown_ones() {
-        let catalog = catalog(ALL);
+        let catalog = catalog();
         for name in [BONSAI_MODEL_ID, EMBEDDING_MODEL_ID, "whisper-1"] {
             let (status, message) = catalog.answer(&Method::DELETE, name).expect_err(name);
             assert_eq!(status, StatusCode::FORBIDDEN, "{name}");

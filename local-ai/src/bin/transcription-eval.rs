@@ -44,8 +44,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const PADDING: usize = 480_000;
 
 fn open() -> Result<TranscriptionModel> {
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/whisper-large-v3 is not installed (see docs/TRANSCRIPTION.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     let started = Instant::now();
     let model = TranscriptionModel::open(&dir)?;
     eprintln!("loaded {} in {:.2?}", dir.display(), started.elapsed());

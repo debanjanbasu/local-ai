@@ -1,10 +1,9 @@
 //! `POST /v1/audio/speech` on the native Kokoro-82M synthesizer
 //! ([`local_engine::speech`]).
 //!
-//! Served only when the artifact is installed beside the Bonsai checkpoint
-//! (`models/kokoro-82m/`, see `docs/SPEECH.md`); there is no flag. Without
-//! it the route answers `404` like any unknown route, and `/v1/models` does
-//! not list it.
+//! The artifact beside the Bonsai checkpoint (`models/kokoro-82m/`, see
+//! `docs/SPEECH.md`) is required: the server does not start without it, and
+//! there is no flag.
 //!
 //! The request follows the pinned `CreateSpeechRequest`:
 //!
@@ -82,14 +81,12 @@ pub(super) struct Speech {
 }
 
 impl Speech {
-    /// The service, when the model is installed in `models_dir`.
+    /// The service, from the required install in `models_dir`.
     pub(super) fn start(
         models_dir: &Path,
         activity: Arc<EngineActivity>,
-    ) -> crate::Result<Option<Arc<Self>>> {
-        let Some(dir) = installed_model(models_dir) else {
-            return Ok(None);
-        };
+    ) -> crate::Result<Arc<Self>> {
+        let dir = installed_model(models_dir)?;
         let model = SpeechModel::open(&dir).map_err(|error| {
             crate::Error::InvalidArgument(format!(
                 "cannot load the speech model in {}: {error}",
@@ -101,13 +98,13 @@ impl Speech {
             dir.display(),
             model.payload_sha256()
         );
-        Ok(Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             catalog: model.catalog(),
             model: Arc::new(Mutex::new(model)),
             slots: Arc::new(Semaphore::new(MAX_PENDING)),
             activity,
             requests: AtomicU64::new(0),
-        })))
+        }))
     }
 }
 
@@ -310,16 +307,13 @@ async fn busy(state: &AppState, headers: &HeaderMap) -> Response {
     response
 }
 
-#[expect(clippy::too_many_lines)]
 pub(super) async fn handle(
     state: &AppState,
     headers: &HeaderMap,
     body: Body,
     caller: &Caller,
 ) -> Response {
-    let Some(service) = state.speech.clone() else {
-        return error_response(StatusCode::NOT_FOUND, "route not found", state, headers).await;
-    };
+    let service = Arc::clone(&state.speech);
     let body = match http_body_util::Limited::new(body, MAX_REQUEST_BYTES)
         .collect()
         .await

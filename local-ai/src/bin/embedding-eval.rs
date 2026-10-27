@@ -51,8 +51,7 @@ struct Task {
 }
 
 fn open() -> Result<EmbeddingModel> {
-    let dir = installed_model(Path::new("models"))
-        .ok_or("models/embeddinggemma2-text is not installed (see docs/EMBEDDINGS.md)")?;
+    let dir = installed_model(Path::new("models"))?;
     let started = Instant::now();
     let model = EmbeddingModel::open(&dir)?;
     eprintln!("loaded {} in {:.2?}", dir.display(), started.elapsed());

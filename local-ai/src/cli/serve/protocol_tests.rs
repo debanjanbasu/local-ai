@@ -13,7 +13,7 @@ use local_engine::{
 };
 
 use super::chunked::{Body, Flow, absorb};
-use super::models::{Catalog, Installed};
+use super::models::Catalog;
 use super::prepare;
 use super::request::prepare_generation;
 use super::response::{Protocol, Reply};
@@ -1603,29 +1603,20 @@ fn models_report_the_admitted_context() {
         bonsai: "bonsai",
         context: 32768,
         created: 1234,
-        installed: Installed::default(),
     }
     .list();
     assert_eq!(models["data"][0]["id"], "bonsai");
     assert_eq!(models["data"][0]["created"], 1234);
     assert_eq!(models["data"][0]["context_length"], 32768);
     assert_eq!(models["data"][0]["max_model_len"], 32768);
-    assert_eq!(models["data"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]
-fn models_list_every_installed_model() {
-    let installed = Installed {
-        embeddings: true,
-        moderation: true,
-        speech: true,
-        transcription: true,
-    };
+fn models_list_every_served_model() {
     let models = Catalog {
         bonsai: "bonsai",
         context: 32768,
         created: 1234,
-        installed,
     }
     .list();
     let ids: Vec<&str> = models["data"]

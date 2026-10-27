@@ -1,14 +1,13 @@
-//! `POST /v1/decisions`: `OpenAI`'s `createDecision`, served only with
-//! `--decisions-artifact DIR` and only within a pre-registered, evaluated
-//! scope.
+//! `POST /v1/decisions`: `OpenAI`'s `createDecision`, served only within a
+//! pre-registered, evaluated scope.
 //!
-//! The directory holds a judgment head, its out-of-scope gate and the
-//! calibration artifact that passed the pre-registered acceptance criteria
-//! (`docs/DECISIONS_EVALUATION.md` part 3). [`CalibratedHead::open`]
-//! verifies the artifact's content hash, the head's and gate's file hashes,
-//! its acceptance and its declared scope at startup; any mismatch stops the
-//! server before the model loads. Without the flag the route is refused with
-//! an explanation.
+//! The required `models/decisions-v2` directory holds a judgment head, its
+//! out-of-scope gate and the calibration artifact that passed the
+//! pre-registered acceptance criteria (`docs/DECISIONS_EVALUATION.md` part
+//! 3). [`CalibratedHead::open`] verifies the artifact's content hash, the
+//! head's and gate's file hashes, its acceptance and its declared scope at
+//! startup; a missing file or any mismatch stops the server before the model
+//! loads.
 //!
 //! # What is answered
 //!
@@ -59,8 +58,8 @@ use super::{AppState, MAX_REQUEST_BYTES};
 /// `OpenAI`'s route.
 pub(super) const ROUTE: &str = "/v1/decisions";
 
-/// The CLI flag that enables [`ROUTE`].
-pub(super) const FLAG: &str = "--decisions-artifact";
+/// The artifact's directory inside the models directory.
+pub(super) const DIRECTORY: &str = "decisions-v2";
 
 /// Requests admitted at once: one per engine queue slot, so a full house
 /// of single-question requests can all be queued.
@@ -90,11 +89,14 @@ impl Decisions {
     /// Open and verify the artifact directory for a model of `width`.
     pub(super) fn open(dir: &Path, width: usize) -> crate::Result<Self> {
         let calibrated = CalibratedHead::open(dir).map_err(|error| {
-            crate::Error::InvalidArgument(format!("cannot open {FLAG} {}: {error}", dir.display()))
+            crate::Error::InvalidArgument(format!(
+                "cannot open the decisions artifact {}: {error}",
+                dir.display()
+            ))
         })?;
         if calibrated.head().width() != width {
             return Err(crate::Error::InvalidArgument(format!(
-                "{FLAG} {}: head width {} does not match the model width {width}",
+                "decisions artifact {}: head width {} does not match the model width {width}",
                 dir.display(),
                 calibrated.head().width()
             )));
@@ -102,12 +104,9 @@ impl Decisions {
         Ok(Self::new(calibrated))
     }
 
-    /// The service `--decisions-artifact` asks for, if any.
-    pub(super) fn start(dir: Option<&Path>) -> crate::Result<Option<Arc<Self>>> {
-        let Some(dir) = dir else {
-            return Ok(None);
-        };
-        let service = Self::open(dir, local_engine::bonsai::WIDTH)?;
+    /// The service, from the required [`DIRECTORY`] in `models_dir`.
+    pub(super) fn start(models_dir: &Path) -> crate::Result<Arc<Self>> {
+        let service = Self::open(&models_dir.join(DIRECTORY), local_engine::bonsai::WIDTH)?;
         eprintln!(
             "decisions at POST {ROUTE}: calibrated and scope-gated (CodeReviewer needs_comment, \
              always refused; CommitPackFT message_match), artifact {}, head {}, gate {}",
@@ -115,7 +114,7 @@ impl Decisions {
             service.calibrated.head_sha256(),
             service.calibrated.gate_sha256()
         );
-        Ok(Some(Arc::new(service)))
+        Ok(Arc::new(service))
     }
 
     /// Refuse new requests and end waiting ones; idempotent.
@@ -129,13 +128,6 @@ impl Decisions {
 
     fn admit(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.slots).try_acquire_owned().ok()
-    }
-}
-
-/// Close `service`, if the server has one.
-pub(super) fn close(service: Option<&Decisions>) {
-    if let Some(service) = service {
-        service.close();
     }
 }
 
@@ -341,21 +333,9 @@ pub(super) fn response_json(model: &str, answered: Answered) -> Value {
     })
 }
 
-/// Why `POST /v1/decisions` is not served on this server.
-pub(super) fn refusal_message() -> String {
-    format!(
-        "{ROUTE} is served only with {FLAG} DIR: a judgment head, its out-of-scope gate and a \
-         calibration artifact that passed the pre-registered evaluation in \
-         docs/DECISIONS_EVALUATION.md (part 3). Without one, answers would carry no calibrated \
-         probability and no refusal."
-    )
-}
-
 /// `POST /v1/decisions`.
 pub(super) async fn handle(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
-    let Some(service) = state.decisions.clone() else {
-        return error_response(StatusCode::NOT_FOUND, &refusal_message(), state, headers).await;
-    };
+    let service = Arc::clone(&state.decisions);
     if service.closing() {
         return shutting_down(state, headers).await;
     }

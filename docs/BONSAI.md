@@ -420,7 +420,7 @@ cancels its request even while nothing is being written to it.
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | readiness |
-| `GET` | `/v1/models` | the loaded Bonsai model, `ternary-bonsai-2-27b`, with its admitted `context_length`/`max_model_len`, then every installed optional model (`embeddinggemma-2`, `embeddinggemma-2-moderation-1`, `kokoro-82m`, `whisper-large-v3`) |
+| `GET` | `/v1/models` | the loaded Bonsai model, `ternary-bonsai-2-27b`, with its admitted `context_length`/`max_model_len`, then every other served model (`embeddinggemma-2`, `embeddinggemma-2-moderation-1`, `kokoro-82m`, `whisper-large-v3`) |
 | `GET`, `DELETE` | `/v1/models/{model}` | one served model by id or alias ([model ids](#model-ids)); `DELETE` is for fine-tuned models, so a served base model is a 403 and any other name a 404 |
 | `POST` | `/v1/chat/completions` | templated text and function calling |
 | `POST` | `/v1/responses` | text and function calling; stored by default (`--no-response-store` makes it stateless) |
@@ -439,7 +439,7 @@ cancels its request even while nothing is being written to it.
 | `POST` | `/v1/audio/speech` | Kokoro-82M text to speech (installed model only; [SPEECH.md](SPEECH.md)) |
 | `POST` | `/v1/audio/transcriptions`, `/v1/audio/translations` | Whisper large-v3 speech recognition and translation to English (installed model only; [TRANSCRIPTION.md](TRANSCRIPTION.md)) |
 | `GET`, `POST`, `DELETE` | `/v1/organization/*` | Administration API: admin keys, projects, service accounts, audit logs, usage (admin key only; [ADMIN.md](ADMIN.md)) |
-| `POST` | `/v1/decisions` | calibrated, scope-gated decisions (with `models/decisions-v2` or `--decisions-artifact`; 404 with an explanation otherwise) |
+| `POST` | `/v1/decisions` | calibrated, scope-gated decisions (from the required `models/decisions-v2`) |
 
 ### Model ids
 
@@ -469,9 +469,9 @@ answers with the model's own id) and 404 otherwise.
 The server implements only current OpenAI APIs, as the pinned OpenAPI
 specification defines them: Chat Completions, Responses (with
 `input_tokens`, `compact`, retrieval, cancellation and input items), Models,
-Conversations, Files, Uploads, Batches, Vector Stores, Decisions and the
-Administration API; with the optional models installed, Embeddings,
-Moderations, Audio speech, and Audio transcriptions and translations.
+Conversations, Files, Uploads, Batches, Vector Stores, Decisions, the
+Administration API, Embeddings, Moderations, Audio speech, and Audio
+transcriptions and translations.
 `/health` is this server's own.
 Only the current specification is served:
 
@@ -969,7 +969,7 @@ vector stores (BM25, or embedding-ranked with the embedding model) are implement
 compaction and reasoning summaries are implemented with the loaded model
 ([below](#compaction-and-reasoning-summaries)); decisions are served within one
 evaluated scope ([below](#decisions)); embeddings,
-moderations, text to speech and transcription run on optional native models
+moderations, text to speech and transcription run on required native models
 (EmbeddingGemma 2, its moderation heads, Kokoro-82M, Whisper large-v3; see the
 endpoint table); image input to generation runs on the checkpoint's own
 vision tower ([image input](#image-input)), while audio input still needs a
@@ -1143,12 +1143,13 @@ what one measured vanished client cost: 706 seconds of engine time.
 
 ### Image input
 
-With Prism's BF16 vision projector installed beside the GGUF
+With Prism's BF16 vision projector beside the GGUF
 (`Ternary-Bonsai-2-27B-mmproj-BF16.gguf`, see the README's model install;
 size and SHA-256 are checked when it loads, in about 0.6 s), Chat Completions
-and Responses take images; without it an image part is a 400 naming the
-missing file, and the startup policy's `vision_reason` says why. There is no
-flag: the projector is discovered like the MTP head. The lossy Q8_0
+and Responses take images. The projector is required: without it startup
+stops with an error naming the missing file, and the startup policy's
+`vision_reason` names the one loaded. There is no flag: the projector is
+discovered like the MTP head. The lossy Q8_0
 projector is not read.
 
 | API | Image parts |
@@ -1838,7 +1839,7 @@ preparation and generation blocking tasks, never on runtime workers.
   pagination, expiry, file status lifecycle, `auto`/`static` chunking,
   attributes and filters. Ranking is **lexical BM25** over one persistent
   Tantivy index derived from the SQLite rows (scores `s / (1 + s)` of the
-  BM25 score) or, when the EmbeddingGemma 2 artifact is installed,
+  BM25 score) or, with the server's EmbeddingGemma 2 encoder,
   **semantic** for `ranker: auto`: cosine similarity of chunk and query
   embeddings, which beat BM25 and its fusion with embeddings in the
   measurements (see [EMBEDDINGS.md](EMBEDDINGS.md#vector-stores));
@@ -1862,10 +1863,9 @@ provide no training or change to the model.
 
 ### Decisions
 
-`POST /v1/decisions` is served whenever the artifact is installed as
-`models/decisions-v2` or named with `--decisions-artifact DIR`
-(`head.safetensors`, `gate.safetensors`, `calibration.json`); without one the
-route is a 404 with an explanation. At startup the server checks the
+`POST /v1/decisions` is served from the required artifact in
+`models/decisions-v2` (`head.safetensors`, `gate.safetensors`,
+`calibration.json`); without it the server does not start. At startup the server checks the
 artifact's canonical-JSON content hash, the head and gate file hashes it
 pins, that its pre-registered acceptance passed and that its declared scope
 is the one the server implements; any mismatch stops it before the model
@@ -2305,8 +2305,8 @@ All choices and reasons are reported in startup JSON.
 - **Speculation:** suffix lookup, gated depth-3 drafting with the mixed
   ternary/int8 MTP head at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`, and
   KFlash trees with the DFlash2 drafter; both artifacts are required.
-- **Vision:** image input whenever the BF16 projector sits beside the GGUF
-  ([image input](#image-input)); otherwise `vision_reason` says why.
+- **Vision:** image input with the required BF16 projector beside the GGUF
+  ([image input](#image-input)); `vision_reason` names it.
 - **Prompt cache:** GPU checkpoint count (at most four) derives from
   working-set headroom. The disk budget is the smallest of the checkpoint's
   own size, an eighth of free disk and a quarter of physical memory; the
@@ -3812,7 +3812,7 @@ their own entry, not with current rates.
   query in 7 ms. Neither quality nor throughput is competitive, so pooled
   Bonsai states are not used as embeddings. A dedicated embedding model was
   the answer: vector stores now rank `ranker: auto` by EmbeddingGemma 2
-  embeddings when it is installed (see [EMBEDDINGS.md](EMBEDDINGS.md#vector-stores)).
+  embeddings (see [EMBEDDINGS.md](EMBEDDINGS.md#vector-stores)).
 - PTQ1 pipeline descriptor hints (32-thread maximum and the multiple-of-SIMD
   execution-width flag): outputs stayed bitwise identical, but timing shifts
   were within about 2% and moved with the repeated default control. No
