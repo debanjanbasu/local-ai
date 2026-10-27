@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::{ErrorKind, Read as _};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::Path;
+use std::time::Instant;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, MetadataExt as _};
@@ -32,10 +33,11 @@ use crate::workspace::{
     ListOptions, PatternMode, ReadOptions, SearchOptions, Truncation, relative_path,
 };
 
-/// Run a filesystem request. Blocking.
+/// Run a filesystem request. Blocking; walks and searches give up between
+/// files once `deadline` passes.
 // One flat dispatch over the request kinds, each a few lines of formatting.
 #[expect(clippy::too_many_lines)]
-pub(super) fn run(inner: &Inner, request: Request) -> Result<Output, ToolError> {
+pub(super) fn run(inner: &Inner, request: Request, deadline: Instant) -> Result<Output, ToolError> {
     let workspace = &inner.workspace;
     let max = inner.limits.max_output_bytes;
     match request {
@@ -45,6 +47,7 @@ pub(super) fn run(inner: &Inner, request: Request) -> Result<Output, ToolError> 
                     path,
                     max_entries: None,
                     max_output_bytes: Some(max),
+                    deadline: Some(deadline),
                 })
                 .map_err(service_error)?;
             let mut text = String::new();
@@ -98,7 +101,9 @@ pub(super) fn run(inner: &Inner, request: Request) -> Result<Output, ToolError> 
                     "ranked search covers the whole root; omit path".into(),
                 ));
             }
-            let ranked = workspace.search(&pattern).map_err(service_error)?;
+            let ranked = workspace
+                .search_until(&pattern, Some(deadline))
+                .map_err(service_error)?;
             let mut text = String::new();
             for file in &ranked.files {
                 let _ = writeln!(
@@ -131,6 +136,7 @@ pub(super) fn run(inner: &Inner, request: Request) -> Result<Output, ToolError> 
                     path,
                     max_results: None,
                     max_output_bytes: Some(max),
+                    deadline: Some(deadline),
                 })
                 .map_err(service_error)?;
             let mut text = String::new();

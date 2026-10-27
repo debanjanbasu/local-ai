@@ -30,8 +30,11 @@
 //! is read or written, so `store: true`, `previous_response_id` and
 //! `conversation` fail their line as they do on a server without those
 //! stores. Batch lines share the engine queue with interactive requests and
-//! count toward its depth; a full queue is retried with a capped backoff that
-//! cancellation, expiry and shutdown interrupt.
+//! count toward its depth; a full queue is retried as soon as one of this
+//! server's queue slots is released, and otherwise after a capped backoff
+//! (the engine takes its next job between steps, so a release can come just
+//! before the engine's queue has room); cancellation, expiry and shutdown
+//! interrupt the wait.
 //!
 //! The worker never polls the database. It scans for runnable batches when it
 //! starts (reclaiming those left by a stopped server whose lease is free),
@@ -79,7 +82,8 @@ use super::{Api, AppState, MAX_REQUEST_BYTES, QueueDepth, prepare_retaining};
 const PREFIX: &str = "/v1/batches";
 /// Store calls running on the blocking pool at once for HTTP requests.
 const MAX_BLOCKING: usize = 4;
-/// First wait after the engine queue was full.
+/// First wait after the engine queue was full, and after a queue slot was
+/// released while it still was.
 const QUEUE_RETRY_FIRST: Duration = Duration::from_millis(50);
 /// Longest wait between attempts on a full engine queue.
 const QUEUE_RETRY_MAX: Duration = Duration::from_secs(2);
@@ -188,6 +192,14 @@ impl Batches {
                 ..Control::default()
             }),
             wake: Condvar::new(),
+        });
+        let woken = Arc::downgrade(&worker);
+        worker.config.depth.on_release(move || {
+            let Some(worker) = woken.upgrade() else {
+                return false;
+            };
+            worker.released();
+            true
         });
         let (done, finished) = watch::channel(false);
         let running = Arc::clone(&worker);
@@ -359,6 +371,8 @@ struct Control {
     /// not started.
     cancelled: HashSet<String>,
     current: Option<Current>,
+    /// Queue slots released on this server so far.
+    releases: u64,
 }
 
 /// The line being generated.
@@ -406,6 +420,13 @@ impl Worker {
             interrupt(&control, Some(batch));
             control.pending = true;
         }
+        self.wake.notify_all();
+    }
+
+    fn released(&self) {
+        let mut control = self.lock();
+        control.releases = control.releases.wrapping_add(1);
+        drop(control);
         self.wake.notify_all();
     }
 
@@ -616,9 +637,10 @@ impl Worker {
         }
     }
 
-    /// Queue `request` on the engine, retrying a full queue with a capped
-    /// backoff. `Err(None)` when interrupted (or expired) first, `Err(Some)`
-    /// when the engine refused the request.
+    /// Queue `request` on the engine, retrying a full queue when a queue
+    /// slot is released or after a capped backoff. `Err(None)` when
+    /// interrupted (or expired) first, `Err(Some)` when the engine refused
+    /// the request.
     fn admit(
         &self,
         request: &ChatRequest,
@@ -627,6 +649,9 @@ impl Worker {
     ) -> Result<Generation, Option<LineOutcome>> {
         let mut wait = QUEUE_RETRY_FIRST;
         loop {
+            // Read before submitting, so a release right after a full queue
+            // is not missed.
+            let releases = self.lock().releases;
             match (self.submit)(request.clone()) {
                 Ok(generation) => {
                     {
@@ -649,18 +674,25 @@ impl Worker {
                     }
                     // Checked under the lock before waiting, so a wake-up
                     // that came first is not lost.
-                    let closing = self
+                    let control = self
                         .wake
                         .wait_timeout_while(self.lock(), wait.min(left), |control| {
-                            !control.closing && !interrupted.load(Ordering::SeqCst)
+                            !control.closing
+                                && !interrupted.load(Ordering::SeqCst)
+                                && control.releases == releases
                         })
                         .unwrap_or_else(PoisonError::into_inner)
-                        .0
-                        .closing;
+                        .0;
+                    let (closing, freed) = (control.closing, control.releases != releases);
+                    drop(control);
                     if closing || interrupted.load(Ordering::SeqCst) {
                         return Err(None);
                     }
-                    wait = wait.saturating_mul(2).min(QUEUE_RETRY_MAX);
+                    wait = if freed {
+                        QUEUE_RETRY_FIRST
+                    } else {
+                        wait.saturating_mul(2).min(QUEUE_RETRY_MAX)
+                    };
                 }
                 Err(error) => return Err(Some(failed(error_status(&error), &error.to_string()))),
             }

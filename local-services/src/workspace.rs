@@ -42,6 +42,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::ops::ControlFlow;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, MetadataExt as _};
@@ -192,6 +193,8 @@ pub struct ListOptions {
     pub max_entries: Option<usize>,
     /// Lower the output byte budget for this call.
     pub max_output_bytes: Option<usize>,
+    /// Give up once this passes (see [`Workspace::search_until`]).
+    pub deadline: Option<Instant>,
 }
 
 /// One regular file found by [`Workspace::list_files`].
@@ -299,6 +302,8 @@ pub struct SearchOptions {
     pub max_results: Option<usize>,
     /// Lower the output byte budget for this call.
     pub max_output_bytes: Option<usize>,
+    /// Give up once this passes (see [`Workspace::search_until`]).
+    pub deadline: Option<Instant>,
 }
 
 impl SearchOptions {
@@ -471,7 +476,7 @@ impl Workspace {
             "max_output_bytes",
         )?;
         let scope = self.scope(options.path.as_deref())?;
-        let (mut candidates, walk_truncated) = self.candidates(&scope);
+        let (mut candidates, walk_truncated) = self.candidates(&scope, options.deadline)?;
         candidates.sort_by(|a, b| a.display.cmp(&b.display));
 
         let mut truncation = walk_truncated.then_some(Truncation::WalkEntries);
@@ -564,6 +569,14 @@ impl Workspace {
     /// Binary files, files over the size cap, ignored, hidden and `.git`
     /// entries and symlinks are never indexed.
     pub fn search(&self, query: &str) -> Result<RankedResults> {
+        self.search_until(query, None)
+    }
+
+    /// [`Self::search`], giving up once `deadline` passes: the walk and the
+    /// indexing check it between entries and fail with a
+    /// [`io::ErrorKind::TimedOut`] error, so a caller that stopped waiting
+    /// (a timed-out tool call) does not leave the work running.
+    pub fn search_until(&self, query: &str, deadline: Option<Instant>) -> Result<RankedResults> {
         let query = query.trim();
         self.check_pattern(query, "search query")?;
         let rank = RankIndex::new();
@@ -584,7 +597,7 @@ impl Workspace {
             truncated: false,
             truncation: None,
         };
-        let docs = self.index_files(&rank, &mut results)?;
+        let docs = self.index_files(&rank, &mut results, deadline)?;
         let query = rank.query(query, &words);
         let searcher = rank
             .index
@@ -647,19 +660,21 @@ impl Workspace {
         &self,
         rank: &RankIndex,
         results: &mut RankedResults,
+        deadline: Option<Instant>,
     ) -> Result<Vec<(String, String)>> {
         let mut writer: IndexWriter = rank
             .index
             .writer_with_num_threads(1, INDEX_WRITER_MEMORY_BYTES)
             .map_err(index_error)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
-        let (mut candidates, walk_truncated) = self.candidates(Path::new(""));
+        let (mut candidates, walk_truncated) = self.candidates(Path::new(""), deadline)?;
         candidates.sort_by(|a, b| a.display.cmp(&b.display));
         results.truncation = walk_truncated.then_some(Truncation::WalkEntries);
 
         let max_bytes = self.limits.max_index_bytes as u64;
         let mut docs = Vec::new();
         for candidate in candidates {
+            check_deadline(deadline)?;
             if docs.len() == self.limits.max_index_files {
                 results.truncation.get_or_insert(Truncation::IndexFiles);
                 break;
@@ -753,7 +768,7 @@ impl Workspace {
         )?;
         let matcher = self.matcher(options)?;
         let scope = self.scope(options.path.as_deref())?;
-        let (mut candidates, walk_truncated) = self.candidates(&scope);
+        let (mut candidates, walk_truncated) = self.candidates(&scope, options.deadline)?;
         candidates.sort_by(|a, b| a.display.cmp(&b.display));
 
         let heap_limit = usize::try_from(self.limits.max_file_bytes)
@@ -777,6 +792,7 @@ impl Workspace {
         };
         let mut used = 0usize;
         for candidate in &candidates {
+            check_deadline(options.deadline)?;
             if candidate.size > self.limits.max_file_bytes {
                 results.skipped_large_files += 1;
                 continue;
@@ -981,10 +997,19 @@ impl Workspace {
     }
 
     /// Regular files under `scope`, in walk order, plus whether the walk was
-    /// cut short.
-    fn candidates(&self, scope: &Path) -> (Vec<Candidate>, bool) {
+    /// cut short; an error once `deadline` passes.
+    fn candidates(
+        &self,
+        scope: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<(Vec<Candidate>, bool)> {
         let mut candidates = Vec::new();
+        let mut expired = false;
         let truncated = self.walk(scope, |entry, rel| {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                expired = true;
+                return ControlFlow::Break(());
+            }
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
                 let size = entry.metadata().map_or(0, |metadata| metadata.len());
                 candidates.push(Candidate {
@@ -996,7 +1021,10 @@ impl Workspace {
             }
             ControlFlow::Continue(())
         });
-        (candidates, truncated)
+        if expired {
+            return Err(timed_out());
+        }
+        Ok((candidates, truncated))
     }
 
     /// Refuse a path that the discovery walk would not surface as a regular
@@ -1358,6 +1386,21 @@ fn open_error(display: &str, error: io::Error) -> Error {
         )),
         _ => Error::Io(error),
     }
+}
+
+/// Fail once `deadline` has passed.
+fn check_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(timed_out());
+    }
+    Ok(())
+}
+
+fn timed_out() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the deadline passed before the walk finished",
+    ))
 }
 
 fn binary_error(display: &str) -> Error {

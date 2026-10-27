@@ -303,11 +303,12 @@ fn remote(url: &str, kind: Kind) -> crate::Result<Arc<[u8]>> {
                 REQUEST_FETCH_TIMEOUT.as_secs()
             )));
         }
-        let download = block_on(async {
+        let owned = url.to_owned();
+        let download = block_on(async move {
             tokio::time::timeout(
                 timeout,
-                local_services::tools::fetch::download(url, MAX_MEDIA_BYTES, |content_type| {
-                    check_content_type(url, content_type, kind).is_ok()
+                local_services::tools::fetch::download(&owned, MAX_MEDIA_BYTES, |content_type| {
+                    check_content_type(&owned, content_type, kind).is_ok()
                 }),
             )
             .await
@@ -377,22 +378,15 @@ fn check_content_type(url: &str, content_type: Option<&str>, kind: Kind) -> crat
 }
 
 /// Run `future` to completion from synchronous request parsing, which runs
-/// on the blocking pool (or, in tests, anywhere): on a thread of its own
-/// with a private runtime, so it never needs the caller's.
-fn block_on<T: Send>(future: impl Future<Output = T> + Send) -> crate::Result<T> {
+/// on the blocking pool (or, in tests, anywhere): on the fetch client's own
+/// runtime, which also keeps its connections pooled across fetches, with
+/// this thread blocked until it ends.
+fn block_on<T: Send + 'static>(
+    future: impl Future<Output = T> + Send + 'static,
+) -> crate::Result<T> {
     let run = || {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map(|runtime| runtime.block_on(future))
-                        .map_err(|error| crate::Error::Generation(error.to_string()))
-                })
-                .join()
-                .unwrap_or_else(|_| Err(crate::Error::Generation("media fetch panicked".into())))
-        })
+        local_services::tools::fetch::block_on(future)
+            .map_err(|error| crate::Error::Generation(error.to_string()))
     };
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {

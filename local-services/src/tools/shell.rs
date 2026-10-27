@@ -380,6 +380,75 @@ impl Drop for Group {
     }
 }
 
+/// Resolves once `leader` (an unreaped child) has exited, without reaping
+/// it. A kqueue `EVFILT_PROC`/`NOTE_EXIT` event awaited on the reactor, so
+/// no thread waits for the command; a leader already exiting or exited
+/// fails the registration with `ESRCH`, which counts as exited. Should the
+/// kqueue be unavailable, a blocking `waitid(WEXITED | WNOWAIT)` on the
+/// blocking pool waits instead.
+async fn leader_exited(leader: Pid) {
+    use rustix::event::kqueue::{Event, EventFilter, EventFlags, ProcessEvents, kevent, kqueue};
+    use tokio::io::Interest;
+    use tokio::io::unix::AsyncFd;
+
+    let watch = || -> std::io::Result<Option<AsyncFd<rustix::fd::OwnedFd>>> {
+        let queue = kqueue()?;
+        let exit = Event::new(
+            EventFilter::Proc {
+                pid: leader,
+                flags: ProcessEvents::EXIT,
+            },
+            EventFlags::ADD | EventFlags::ONESHOT,
+            std::ptr::null_mut(),
+        );
+        // With no room for events, a failed change is the call's error.
+        let mut none: Vec<Event> = Vec::new();
+        // SAFETY: a process filter refers to no file descriptor.
+        #[expect(unsafe_code)]
+        match unsafe { kevent(&queue, &[exit], &mut none, Some(Duration::ZERO)) } {
+            Err(rustix::io::Errno::SRCH) => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        // SAFETY: the `AsyncFd` owns the descriptor, open until it drops.
+        #[expect(unsafe_code)]
+        let queue = unsafe { AsyncFd::register_with_interest(queue, Interest::READABLE) }
+            .map_err(|error| error.into_parts().1)?;
+        Ok(Some(queue))
+    };
+    match watch() {
+        Ok(None) => {}
+        // The queue turns readable when the exit event is pending.
+        Ok(Some(queue)) => drop(queue.readable().await),
+        Err(_) => {
+            let _ = tokio::task::spawn_blocking(move || {
+                rustix::process::waitid(
+                    WaitId::Pid(leader),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+                )
+                .map(drop)
+            })
+            .await;
+        }
+    }
+}
+
+/// The per-call scratch directory, removed on the blocking pool when
+/// dropped (it may hold [`MAX_SCRATCH_ENTRIES`] entries), never on the
+/// async thread that drops it.
+struct Scratch(Option<tempfile::TempDir>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => drop(runtime.spawn_blocking(move || drop(dir))),
+                Err(_) => drop(dir),
+            }
+        }
+    }
+}
+
 /// Bytes read from one stream: the first `cap`, and how many there were.
 struct Capture {
     kept: Vec<u8>,
@@ -499,15 +568,21 @@ pub async fn run(
 ) -> Result<CommandRun, ToolError> {
     check_command(command)?;
     let failed = |what: &str, error: std::io::Error| ToolError::Failed(format!("{what}: {error}"));
-    let scratch = tempfile::Builder::new()
-        .prefix("local-ai-tool-")
-        .tempdir()
-        .map_err(|error| failed("cannot create the scratch directory", error))?;
-    // Seatbelt matches resolved paths (`/var` is `/private/var`).
-    let scratch_path = std::fs::canonicalize(scratch.path())
-        .map_err(|error| failed("cannot resolve the scratch directory", error))?;
-    let root = std::fs::canonicalize(&policy.root)
-        .map_err(|error| failed("cannot resolve the tools root", error))?;
+    let policy_root = policy.root.clone();
+    let (scratch, scratch_path, root) = tokio::task::spawn_blocking(move || {
+        let scratch = tempfile::Builder::new()
+            .prefix("local-ai-tool-")
+            .tempdir()
+            .map_err(|error| failed("cannot create the scratch directory", error))?;
+        // Seatbelt matches resolved paths (`/var` is `/private/var`).
+        let scratch_path = std::fs::canonicalize(scratch.path())
+            .map_err(|error| failed("cannot resolve the scratch directory", error))?;
+        let root = std::fs::canonicalize(&policy_root)
+            .map_err(|error| failed("cannot resolve the tools root", error))?;
+        Ok::<_, ToolError>((Scratch(Some(scratch)), scratch_path, root))
+    })
+    .await
+    .map_err(|error| ToolError::Failed(format!("tool task failed: {error}")))??;
     let mut builder = sandboxed(policy, &root, &scratch_path, command)?;
     let mut child = builder
         .spawn()
@@ -529,15 +604,9 @@ pub async fn run(
     let drain_until = deadline + DRAIN_GRACE;
     let stdout = tokio::spawn(capture(child.stdout.take(), cap, drain_until));
     let stderr = tokio::spawn(capture(child.stderr.take(), cap, drain_until));
-    // Waits for the leader to exit without reaping it (`WNOWAIT`), so its
-    // PID, and with it the group ID, stays reserved until the group is killed.
-    let exited = tokio::task::spawn_blocking(move || {
-        rustix::process::waitid(
-            WaitId::Pid(leader),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-        )
-        .map(drop)
-    });
+    // Waits for the leader to exit without reaping it, so its PID, and with
+    // it the group ID, stays reserved until the group is killed.
+    let exited = leader_exited(leader);
     let ended = tokio::select! {
         exited = tokio::time::timeout_at(deadline, exited) => {
             if exited.is_err() { Ended::TimedOut } else { Ended::Exited }
@@ -547,7 +616,7 @@ pub async fn run(
     group.kill();
     if ended != Ended::Exited {
         // Also by PID, for a leader that left its group (`setpgid`). It is
-        // unreaped (`WNOWAIT`), so the PID cannot have been reused.
+        // unreaped, so the PID cannot have been reused.
         let _ = child.start_kill();
     }
     let stdout = stdout.await.unwrap_or(Capture {
@@ -564,6 +633,7 @@ pub async fn run(
         .map_err(|error| failed("cannot collect the shell's status", error))?;
     // Reaped: the group ID may now be reused, so it is never signalled again.
     group.armed = false;
+    // Removed on the blocking pool (it may hold MAX_SCRATCH_ENTRIES entries).
     drop(scratch);
     let outcome = match ended {
         Ended::TimedOut => Outcome::TimedOut,

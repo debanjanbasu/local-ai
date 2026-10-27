@@ -232,8 +232,9 @@ impl Toolbox {
     /// Run one request under the deadline `timeout` (never above the call
     /// limit). Dropping the future stops the work: a shell command's process
     /// group is killed, a fetch's connection is closed. Filesystem work is
-    /// synchronous and bounded by the workspace limits, so it finishes on its
-    /// blocking thread even when abandoned.
+    /// synchronous and bounded by the workspace limits; its walks and
+    /// searches also check the deadline between files, so a timed-out call
+    /// stops on its blocking thread too.
     pub async fn run(&self, request: Request, timeout: Duration) -> Result<Output, ToolError> {
         let timeout = timeout.min(self.inner.limits.call_timeout);
         if timeout.is_zero() {
@@ -270,7 +271,8 @@ impl Toolbox {
                 }
                 other => {
                     let inner = Arc::clone(&self.inner);
-                    tokio::task::spawn_blocking(move || fs::run(&inner, other))
+                    let deadline = std::time::Instant::now() + timeout;
+                    tokio::task::spawn_blocking(move || fs::run(&inner, other, deadline))
                         .await
                         .map_err(|error| ToolError::Failed(format!("tool task failed: {error}")))?
                 }

@@ -160,6 +160,9 @@ struct Depth {
     /// Told each time a slot is released, for resumptions the full queue
     /// deferred (see [`resume_interrupted`]).
     freed: tokio::sync::Notify,
+    /// Also called on each release, for synchronous waiters (the batch
+    /// worker); one that returns `false` is dropped.
+    released: std::sync::Mutex<Vec<Box<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl QueueDepth {
@@ -178,6 +181,16 @@ impl QueueDepth {
     /// for the next wait, so none is missed between a full queue and the wait.
     async fn freed(&self) {
         self.0.freed.notified().await;
+    }
+
+    /// Call `wake` on every slot release from now on, until it returns
+    /// `false`.
+    fn on_release(&self, wake: impl Fn() -> bool + Send + Sync + 'static) {
+        self.0
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Box::new(wake));
     }
 }
 
@@ -257,6 +270,11 @@ impl Drop for Admitted {
     fn drop(&mut self) {
         self.0.count.fetch_sub(1, Ordering::SeqCst);
         self.0.freed.notify_one();
+        self.0
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|wake| wake());
     }
 }
 

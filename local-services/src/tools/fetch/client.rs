@@ -29,9 +29,9 @@
 //!   checked again just before connecting.
 //! - **Runtime.** Connections and their tasks live on one small runtime of
 //!   their own, so a pooled connection outlives the runtime of the call that
-//!   opened it (media fetches run on a fresh runtime each); a caller's
-//!   deadline still bounds the whole exchange, and dropping the call
-//!   abandons it.
+//!   opened it; synchronous callers (media fetches) run whole downloads on
+//!   it ([`Client::block_on`]). A caller's deadline still bounds the whole
+//!   exchange, and dropping the call abandons it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -403,6 +403,27 @@ impl Client {
             return true;
         }
         super::is_public(ip)
+    }
+
+    /// Run `future` on the client's runtime and block until it ends (see
+    /// [`super::block_on`]); a client without a runtime of its own refuses.
+    pub fn block_on<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Result<T, ToolError> {
+        let Some(runtime) = &self.runtime else {
+            return Err(ToolError::Failed(
+                "the fetch client has no runtime to block on".into(),
+            ));
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(runtime.spawn(async move {
+            let _ = sender.send(future.await);
+        }));
+        // A task that panicked drops its sender.
+        receiver
+            .recv()
+            .map_err(|_| ToolError::Failed("fetch task failed".into()))
     }
 
     /// `GET` `target`, asking for `accept`, and return the response once its

@@ -30,12 +30,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # Hosted tools (`tools`): the sandboxed shell's child process, deadlines and
-# pipes; its `setrlimit`, `waitid` and process-group kill; the file tools'
+# pipes; its `setrlimit`, kqueue exit wait and process-group kill; the file tools'
 # `O_NOFOLLOW` open of the final component; one `sysctl` process count; per-call scratch directories; and web fetch over HTTP/3 (QUIC),
 # HTTP/2 and HTTP/1.1 with TLS verified by the platform trust store. All but
 # `tokio-rustls` are already in the lock through the server.
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["event", "fs", "process"] }
 libc = "0.2"
 tempfile.workspace = true
 bytes.workspace = true
