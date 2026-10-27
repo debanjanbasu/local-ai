@@ -717,6 +717,24 @@ fn drafter_lattices_on_captures() {
             draft_times.push(elapsed.as_secs_f64() * 1e3);
             let lattice = drafter.read_lattice();
             let tree = drafter.read_tree();
+            if position == n0 {
+                // The same pass with the anchor written on the GPU.
+                let anchor = MetalBuffer::from_slice(context.device(), &[0, tokens[position]])
+                    .expect("anchor buffer");
+                let device = DraftAnchor::Device {
+                    buffer: &anchor,
+                    offset: 4,
+                };
+                drafter
+                    .draft_and_wait(&context, &shared, &device, position, DFLASH_MAX_TREE_ROWS)
+                    .expect("device-anchor draft");
+                assert_eq!(
+                    bytemuck::bytes_of(&drafter.read_lattice()),
+                    bytemuck::bytes_of(&lattice),
+                    "{name}: a GPU anchor drafts what a host anchor does"
+                );
+                assert_eq!(drafter.read_tree(), tree);
+            }
             file.write_all(&(position as u32).to_le_bytes())
                 .expect("write");
             file.write_all(bytemuck::bytes_of(&lattice)).expect("write");
