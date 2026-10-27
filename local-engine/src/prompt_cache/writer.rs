@@ -1,6 +1,6 @@
 //! Background persistence for the disk tier.
 //!
-//! Persisting a snapshot hashes the whole payload with SHA-256, writes a
+//! Persisting a snapshot checksums the whole payload, writes a
 //! temporary, `fsync`s it, renames it into place and trims the directory to the
 //! budget. Measured on an M4 Pro for a ~152 MiB snapshot that is ~56–69 ms of
 //! hashing, ~15 ms of writing and ~30 ms of `fsync`, all of which used to run

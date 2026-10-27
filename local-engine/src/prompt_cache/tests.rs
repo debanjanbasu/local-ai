@@ -33,10 +33,7 @@ fn disk_snapshot_round_trip_and_corruption_rejection() {
     let loaded = load(&path, "model").expect("load snapshot");
     assert_eq!(loaded.position, snapshot.position);
     assert_eq!(*loaded.target_kv, *snapshot.target_kv);
-    let mut bytes = fs::read(&path).expect("read snapshot");
-    let last = bytes.last_mut().expect("non-empty snapshot");
-    *last ^= 1;
-    fs::write(&path, bytes).expect("corrupt snapshot");
+    corrupt_last_payload_byte(&path);
     assert!(load(&path, "model").is_err());
 }
 
@@ -58,16 +55,22 @@ fn a_background_load_verifies_exactly_as_a_load_does() {
             .wait()
             .is_err()
     );
-    let mut bytes = fs::read(&path).expect("read snapshot");
-    let last = bytes.last_mut().expect("non-empty snapshot");
-    *last ^= 1;
-    fs::write(&path, bytes).expect("corrupt snapshot");
+    corrupt_last_payload_byte(&path);
     assert!(
         Load::spawn(path, "model".into())
             .expect("spawn load")
             .wait()
             .is_err()
     );
+}
+
+/// Flip a bit of the last byte of the last section, which the padding after
+/// it would otherwise hide from a test that flips the file's last byte.
+fn corrupt_last_payload_byte(path: &Path) {
+    let (start, length) = *section_spans(path).last().expect("sections");
+    let mut bytes = fs::read(path).expect("read snapshot");
+    bytes[start + length - 1] ^= 1;
+    fs::write(path, bytes).expect("corrupt snapshot");
 }
 
 fn names_with_extension(dir: &Path, extension: &str) -> Vec<String> {
@@ -747,4 +750,199 @@ fn close_past_its_deadline_aborts_and_leaves_no_temporary() {
         names_with_extension(&dir.path().join("model"), ".tmp"),
         Vec::<String>::new()
     );
+}
+
+/// A snapshot whose sections span several checksum blocks and end mid-block
+/// and mid-page, filled with a position-dependent pattern.
+fn multi_block_fixture() -> PromptSnapshot {
+    let filled = |length: usize, seed: u8| {
+        let bytes = (0..length)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect::<Vec<_>>();
+        PageBytes::concat([bytes.as_slice()]).expect("bytes")
+    };
+    PromptSnapshot {
+        position: 5,
+        layout: "q8".into(),
+        recurrent: filled(blocks::BLOCK * 2 + 4_097, 1),
+        mtp_prev_hidden: filled(20_480, 2),
+        target_kv: filled(blocks::BLOCK + 3, 3),
+        mtp_kv: filled(0, 4),
+    }
+}
+
+#[test]
+fn crc32c_matches_the_reference() {
+    // The check value of CRC-32C (iSCSI), RFC 3720 B.4.
+    assert_eq!(blocks::crc32c(b"123456789"), 0xE306_9283);
+    assert_eq!(blocks::crc32c(&[0; 32]), 0x8A91_36AA);
+    assert_eq!(blocks::crc32c(&[]), 0);
+    let bytes = (0..4_099_u32)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect::<Vec<_>>();
+    for length in [1, 7, 8, 9, 63, 1_024, 4_099] {
+        assert_eq!(
+            blocks::crc32c(&bytes[..length]),
+            blocks::crc32c_bitwise(&bytes[..length]),
+            "{length} bytes"
+        );
+    }
+}
+
+#[test]
+fn a_block_snapshot_round_trips_aligned_and_sized_as_predicted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = multi_block_fixture();
+    let tokens = [7, 8, 9, 10, 11];
+    let path = store(dir.path(), "model", &tokens, Some("s"), &snapshot, true).expect("store");
+    let bytes = fs::read(&path).expect("read snapshot");
+    assert_eq!(
+        bytes.len() as u64,
+        stored_bytes("model", &tokens, Some("s"), &snapshot, true)
+    );
+    assert_eq!(bytes.len() % blocks::ALIGN, 0);
+    let header_bytes = u64::from_le_bytes(bytes[8..16].try_into().expect("length")) as usize;
+    assert_eq!((16 + header_bytes) % blocks::ALIGN, 0, "payload is aligned");
+    let entries = discover(dir.path(), "model");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].tokens, tokens);
+    let loaded = load(&path, "model").expect("load");
+    assert_eq!(loaded.position, snapshot.position);
+    assert_eq!(*loaded.recurrent, *snapshot.recurrent);
+    assert_eq!(*loaded.mtp_prev_hidden, *snapshot.mtp_prev_hidden);
+    assert_eq!(*loaded.target_kv, *snapshot.target_kv);
+    assert!(loaded.mtp_kv.is_empty());
+}
+
+/// Where each section starts in a stored block snapshot, and its length.
+fn section_spans(path: &Path) -> Vec<(usize, usize)> {
+    let mut file = File::open(path).expect("open");
+    let header = read_header(&mut file).expect("header");
+    let mut start = usize::try_from(file.stream_position().expect("position")).expect("offset");
+    [
+        header.token_count * 4,
+        header.recurrent,
+        header.mtp_hidden,
+        header.target_kv,
+        header.mtp_kv,
+    ]
+    .into_iter()
+    .map(|length| {
+        let span = (start, length);
+        start += blocks::padded(length);
+        span
+    })
+    .collect()
+}
+
+#[test]
+fn a_damaged_truncated_or_extended_block_snapshot_is_never_loaded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = multi_block_fixture();
+    let path = store(
+        dir.path(),
+        "model",
+        &[1, 2, 3, 4, 5],
+        None,
+        &snapshot,
+        false,
+    )
+    .expect("store");
+    let pristine = fs::read(&path).expect("read snapshot");
+    let rejects = |bytes: &[u8], what: &str| {
+        fs::write(&path, bytes).expect("rewrite snapshot");
+        assert!(load(&path, "model").is_err(), "{what} was loaded");
+        assert!(
+            Load::spawn(path.clone(), "model".into())
+                .expect("spawn load")
+                .wait()
+                .is_err(),
+            "{what} was loaded in the background"
+        );
+    };
+    // One flipped bit in the first, a middle and the last byte of every
+    // section that has bytes, the token ids included.
+    for (start, length) in section_spans(&path) {
+        for offset in [0, length / 2, length.saturating_sub(1)] {
+            if length == 0 {
+                continue;
+            }
+            let mut bytes = pristine.clone();
+            bytes[start + offset] ^= 0x10;
+            rejects(&bytes, &format!("a bit flipped at {}", start + offset));
+        }
+    }
+    // A damaged checksum digit in the header.
+    let text = String::from_utf8_lossy(&pristine[16..]).into_owned();
+    let digit = 16 + text.find("\"payload_crc32c\":\"").expect("checksums") + 18;
+    let mut bytes = pristine.clone();
+    bytes[digit] = if bytes[digit] == b'0' { b'1' } else { b'0' };
+    rejects(&bytes, "a damaged checksum");
+    // A header claiming a section of `usize::MAX` bytes, its padding
+    // shortened to keep the payload where it was.
+    let field = format!("\"recurrent\":{}", snapshot.recurrent.len());
+    let huge = format!("\"recurrent\":{}", usize::MAX);
+    let at = 16 + text.find(&field).expect("recurrent length");
+    let header_end = section_spans(&path)[0].0;
+    let mut bytes = pristine[..at].to_vec();
+    bytes.extend_from_slice(huge.as_bytes());
+    bytes.extend_from_slice(&pristine[at + field.len()..header_end - (huge.len() - field.len())]);
+    bytes.extend_from_slice(&pristine[header_end..]);
+    assert_eq!(bytes.len(), pristine.len());
+    rejects(&bytes, "an impossible section length");
+    // Cut short by a byte, by a page, and to the header alone; and extended.
+    rejects(&pristine[..pristine.len() - 1], "a file a byte short");
+    rejects(
+        &pristine[..pristine.len() - blocks::ALIGN],
+        "a file a page short",
+    );
+    rejects(&pristine[..section_spans(&path)[0].0], "the header alone");
+    let mut longer = pristine.clone();
+    longer.extend_from_slice(&[0; blocks::ALIGN]);
+    rejects(&longer, "a file a page long");
+    // Intact again, it loads.
+    fs::write(&path, &pristine).expect("restore snapshot");
+    assert!(load(&path, "model").is_ok());
+}
+
+/// A snapshot as stores before the block layout wrote it: a contiguous
+/// payload right after the header, checked by one SHA-256.
+fn store_sha256(dir: &Path, tokens: &[u32], snapshot: &PromptSnapshot) -> PathBuf {
+    let stored_tokens = token_bytes(tokens);
+    let mut payload = Vec::new();
+    for section in sections(&stored_tokens, snapshot) {
+        payload.extend_from_slice(section);
+    }
+    let mut header = header("model", tokens, None, snapshot, true, String::new());
+    header.payload_crc32c = None;
+    header.payload_sha256 = Some(hex(&Sha256::digest(&payload)));
+    let encoded = serde_json::to_vec(&header).expect("header");
+    let dir = dir.join("model");
+    fs::create_dir_all(&dir).expect("model dir");
+    let path = dir.join(format!("{}-legacy.bpc", snapshot.position));
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&encoded);
+    bytes.extend_from_slice(&payload);
+    fs::write(&path, bytes).expect("write legacy snapshot");
+    path
+}
+
+#[test]
+fn snapshots_written_with_sha256_still_load_and_are_still_checked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = multi_block_fixture();
+    let path = store_sha256(dir.path(), &[4, 5, 6, 7, 8], &snapshot);
+    assert_eq!(discover(dir.path(), "model")[0].tokens, [4, 5, 6, 7, 8]);
+    let loaded = load(&path, "model").expect("load legacy snapshot");
+    assert_eq!(*loaded.recurrent, *snapshot.recurrent);
+    assert_eq!(*loaded.target_kv, *snapshot.target_kv);
+    let pristine = fs::read(&path).expect("read");
+    let mut bytes = pristine.clone();
+    let middle = bytes.len() - blocks::BLOCK;
+    bytes[middle] ^= 1;
+    fs::write(&path, bytes).expect("corrupt");
+    assert!(load(&path, "model").is_err());
+    fs::write(&path, &pristine[..pristine.len() - 1]).expect("truncate");
+    assert!(load(&path, "model").is_err());
 }
