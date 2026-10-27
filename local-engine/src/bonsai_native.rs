@@ -42,10 +42,12 @@ pub mod capture;
 mod checkpoint;
 mod layers;
 mod speculation;
+mod tree;
 
 pub use self::batch::{
     BatchRow, HeadDraft, HeadLag, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState,
 };
+pub use self::tree::{DraftTree, MAX_TREE_ROWS, TestedNode, TreeAcceptance};
 
 /// What a loaded head costs, for the policy record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -772,6 +774,8 @@ pub struct BonsaiModel {
     batch: Option<batch::BatchScratch>,
     /// Images of the resident sequence's prompt (see [`SequenceState`]).
     images: Option<Arc<PromptImages>>,
+    /// Tree verify buffers, made by [`Self::enable_tree_verify`].
+    tree: Option<tree::TreeVerifier>,
 }
 
 impl BonsaiModel {
@@ -950,6 +954,7 @@ impl BonsaiModel {
             state_id: 0,
             batch: None,
             images: None,
+            tree: None,
             context,
             package,
         })
@@ -978,6 +983,7 @@ impl BonsaiModel {
         if let Some(speculation) = &self.speculation {
             speculation.mtp.reset();
         }
+        self.drop_tree_verify();
         // Attention reads only the newly written prefix; unused KV tails need
         // not be touched, even when a shorter request follows a longer one.
         self.position = 0;

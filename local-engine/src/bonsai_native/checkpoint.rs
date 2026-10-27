@@ -175,6 +175,23 @@ impl BonsaiModel {
         if committed == rows {
             return self.adopt_verified(verifier);
         }
+        self.encode_replay_verified(batch, verifier, committed)
+    }
+
+    /// Replay the first `committed` rows' compact recurrence inputs, which a
+    /// verify pass wrote to `verifier`, from the start state and history
+    /// the recurrent layers kept, into `batch`.
+    pub(super) fn encode_replay_verified(
+        &self,
+        batch: &mut CommandBatch,
+        verifier: &Verifier,
+        committed: usize,
+    ) -> crate::Result<()> {
+        if committed == 0 || committed > verifier.rows {
+            return Err(crate::Error::InvalidArgument(
+                "verify replay needs 1..=rows committed rows".into(),
+            ));
+        }
         if verifier.state_format != self.state_format {
             return Err(crate::Error::InvalidArgument(
                 "verifier state format differs from the model's".into(),

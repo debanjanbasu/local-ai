@@ -251,6 +251,134 @@ fn verification_preserves_target_samples_history_and_rng_at_every_rejection() {
     }
 }
 
+/// The tree walk emits plain decoding's tokens and leaves the sampler where
+/// plain decoding of them leaves it, wherever the accepted path sits among
+/// decoy siblings: one selection per accepted depth (siblings share it),
+/// a chain walks as `verify_greedy_drafts`, and every child of an accepted
+/// row is reported as tested.
+#[test]
+#[expect(clippy::too_many_lines)]
+fn tree_walk_preserves_target_samples_history_and_rng_at_every_depth() {
+    let logits = (0..5)
+        .map(|row| {
+            (0..32)
+                .map(|token| ((token * 17 + row * 23) % 47) as f32 / 13.0 - 2.0)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for temperature in [0.0, 0.8] {
+        for seed in 0..16 {
+            let mut initial = Sampler::new(
+                32,
+                SamplingParams {
+                    temperature,
+                    seed,
+                    eos_tokens: Vec::new(),
+                    ..params()
+                },
+            );
+            initial.observe(&[1, 2, 1, 31]);
+            let mut sequential = initial.clone();
+            let mut expected = Vec::new();
+            for row in &logits {
+                let result = sequential.sample(&mut row.clone()).expect("target");
+                expected.push((result, sequential.clone()));
+                sequential.observe(&[result.token_id]);
+            }
+            for accepted in 0..=3 {
+                for decoy_first in [false, true] {
+                    // Each depth up to `accepted` holds the target's token and
+                    // a decoy sibling; the next depth holds only decoys.
+                    let mut tokens = vec![7_u32];
+                    let mut parents = vec![-1_i32];
+                    let mut depths = vec![0_usize];
+                    let mut on_path = vec![0_usize];
+                    let mut parent = 0;
+                    for (depth, (result, _)) in expected.iter().enumerate().take(accepted + 1) {
+                        let target = result.token_id;
+                        let decoy = (target + 1 + depth as u32) % 32;
+                        let children = if depth == accepted {
+                            vec![(decoy, false), ((target + 5) % 32, false)]
+                        } else if decoy_first {
+                            vec![(decoy, false), (target, true)]
+                        } else {
+                            vec![(target, true), (decoy, false)]
+                        };
+                        let mut next = parent;
+                        for (token, correct) in children {
+                            tokens.push(token);
+                            parents.push((parent as u32).cast_signed());
+                            depths.push(depth + 1);
+                            if correct {
+                                next = tokens.len() - 1;
+                            }
+                        }
+                        if depth < accepted {
+                            on_path.push(next);
+                            parent = next;
+                        }
+                    }
+                    let mut speculative = initial.clone();
+                    let mut rows = Vec::new();
+                    let verified =
+                        verify_tree_drafts(&mut speculative, &tokens, &parents, |row, target| {
+                            rows.push(row);
+                            target.sample(&mut logits[depths[row]].clone())
+                        })
+                        .expect("tree verification");
+                    assert_eq!(verified.path, on_path);
+                    assert_eq!(rows, on_path);
+                    assert_eq!(
+                        verified.samples,
+                        expected
+                            .iter()
+                            .take(accepted + 1)
+                            .map(|(result, _)| *result)
+                            .collect::<Vec<_>>()
+                    );
+                    let taken = verified
+                        .tested
+                        .iter()
+                        .filter(|(_, accepted)| *accepted)
+                        .map(|(row, _)| *row)
+                        .collect::<Vec<_>>();
+                    assert_eq!(taken, on_path[1..]);
+                    assert_eq!(verified.tested.len(), 2 * (accepted + 1));
+                    let reference = &expected[accepted].1;
+                    assert_eq!(speculative.seen_tokens, reference.seen_tokens);
+                    assert_eq!(speculative.observed, reference.observed);
+                    assert_eq!(speculative.rng.0, reference.rng.0);
+                }
+            }
+            // A chain is the greedy-draft walk.
+            let drafts = expected
+                .iter()
+                .take(4)
+                .map(|(result, _)| result.token_id)
+                .collect::<Vec<_>>();
+            let tokens = std::iter::once(7)
+                .chain(drafts.iter().copied())
+                .collect::<Vec<_>>();
+            let parents = (0..tokens.len() as u32)
+                .map(|row| row.cast_signed() - 1)
+                .collect::<Vec<_>>();
+            let mut chain = initial.clone();
+            let verified = verify_tree_drafts(&mut chain, &tokens, &parents, |row, target| {
+                target.sample(&mut logits[row].clone())
+            })
+            .expect("chain walk");
+            let mut greedy = initial.clone();
+            let reference = verify_greedy_drafts(&mut greedy, &drafts, |row, target| {
+                target.sample(&mut logits[row].clone())
+            })
+            .expect("greedy walk");
+            assert_eq!(verified.samples, reference.samples);
+            assert_eq!(verified.path.len(), reference.accepted + 1);
+            assert_eq!(chain.rng.0, greedy.rng.0);
+        }
+    }
+}
+
 #[test]
 fn eos_stops_verification_without_observing_or_accepting_it() {
     for stop in 0..=4 {

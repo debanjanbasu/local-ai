@@ -23,7 +23,7 @@ pub(super) fn write_rope_rows(
 /// overlaps encoding the first layer; layers 1-3 keep the GPU busy while the
 /// host encodes the rest, which took 0.25-0.7 ms for one row and left the GPU
 /// idle 0.05-0.35 ms per token when the first buffer held only layer 0.
-const SUBMIT_BEFORE_LAYERS: [usize; 3] = [0, 1, 4];
+pub(super) const SUBMIT_BEFORE_LAYERS: [usize; 3] = [0, 1, 4];
 
 impl BonsaiModel {
     pub(super) fn forward(&mut self, token: u32, logits: bool) -> crate::Result<()> {
