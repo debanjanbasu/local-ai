@@ -182,6 +182,8 @@ pub struct DflashDrafter {
     tree: MetalBuffer,
     calibration: MetalBuffer,
     context_len: usize,
+    /// The first position the context holds (see [`Self::restart_at`]).
+    floor: usize,
     draft_gpu_time: Option<Duration>,
 }
 
@@ -217,6 +219,7 @@ impl DflashDrafter {
             tree: MetalBuffer::empty(context.device(), size_of::<DflashTree>())?,
             calibration,
             context_len: 0,
+            floor: 0,
             draft_gpu_time: None,
         })
     }
@@ -258,15 +261,54 @@ impl DflashDrafter {
         self.context_len
     }
 
+    /// The first position the context holds: 0, unless [`Self::restart_at`]
+    /// started it later.
+    #[must_use]
+    pub const fn context_floor(&self) -> usize {
+        self.floor
+    }
+
     /// Forget the context (a new sequence).
     pub const fn reset(&mut self) {
         self.context_len = 0;
+        self.floor = 0;
+    }
+
+    /// Forget the context and continue it from `position`: the next append
+    /// holds positions from `position` on, and drafts attend only the
+    /// positions appended since (at most the window), as a sequence that
+    /// started there would. For a target whose hidden taps exist only from
+    /// `position` on (a prompt longer than the window, a restored prefix, or
+    /// positions decoded without taps).
+    pub const fn restart_at(&mut self, position: usize) {
+        self.context_len = position;
+        self.floor = position;
+    }
+
+    /// Roll the context back to `len` positions, however far: the floor
+    /// rises past the positions the ring no longer holds (it holds the last
+    /// [`RING_CAPACITY`]), so drafts attend at most the window of what
+    /// remains. For a prefix of this context restored into the target from
+    /// a prompt cache. Fails when nothing below `len` would remain.
+    pub fn rewind_to(&mut self, len: usize) -> crate::Result<()> {
+        let floor = self
+            .floor
+            .max(self.context_len.saturating_sub(RING_CAPACITY));
+        if len > self.context_len || len <= floor {
+            return Err(crate::Error::InvalidArgument(format!(
+                "DFlash2 context of positions {floor}..{} cannot rewind to {len}",
+                self.context_len
+            )));
+        }
+        self.floor = floor;
+        self.context_len = len;
+        Ok(())
     }
 
     /// Roll the context back to `len` positions, at most [`MAX_ROLLBACK`]
     /// behind: the ring still holds every position the window needs.
     pub fn truncate_context(&mut self, len: usize) -> crate::Result<()> {
-        if len > self.context_len || self.context_len - len > MAX_ROLLBACK {
+        if len > self.context_len || self.context_len - len > MAX_ROLLBACK || len < self.floor {
             return Err(crate::Error::InvalidArgument(format!(
                 "DFlash2 context of {} positions cannot roll back to {len}",
                 self.context_len
@@ -430,7 +472,7 @@ impl DflashDrafter {
         let k = &self.kernels;
         let kernels = shared.kernels;
         let rows = DFLASH_BLOCK as u32;
-        let nctx = position.min(DFLASH_WINDOW - 1);
+        let nctx = (position - self.floor).min(DFLASH_WINDOW - 1);
         self.embed.embed_inverse(
             batch,
             shared.embedding,
