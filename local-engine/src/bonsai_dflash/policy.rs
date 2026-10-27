@@ -14,6 +14,16 @@ pub const DEFAULT_BONSAI_DFLASH_ARTIFACT: &str = concat!(
     "/../models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin"
 );
 
+/// Payload digest of the pinned drafter.
+///
+/// It is `ProCreations/Ternary-Bonsai-2-27B-DFlash2` at revision `4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b` (`model.safetensors`
+/// SHA256 `708e141bf4a33b09620c4f86263f1c7edcec7882f5dd39448e83e0c0defdc230`),
+/// converted by `local-ai bonsai --export dflash-head=DIR`. Any converted
+/// `DFlash2` checkpoint of this architecture loads; the policy reports
+/// whether the installed one is this.
+pub const PINNED_DFLASH_SHA256: &str =
+    "1b5dc3551406e677ec9f4321f8f5c20f7310eaae0cede95792ceaa2375dfc02a";
+
 /// How a caller wants `KFlash` drafting. There is no opt-in: `Auto` drafts
 /// whenever the artifact is installed.
 #[derive(Clone, Debug, PartialEq, Eq)]

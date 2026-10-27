@@ -56,6 +56,30 @@ the Apache License, Version 2.0
 (<https://www.apache.org/licenses/LICENSE-2.0>). They were modified to read this
 runtime's capture shards and frozen tables and to match its draft chain layout.
 
+## Bonsai DFlash2 drafter weights
+
+The optional KFlash drafter artifact (`models/bonsai2-27b-dflash2/`, not
+included; converted by `local-ai bonsai --export dflash-head=DIR`) is derived
+from [ProCreations/Ternary-Bonsai-2-27B-DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2/tree/4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b),
+revision `4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b`, licensed under the Apache
+License, Version 2.0 (<https://www.apache.org/licenses/LICENSE-2.0>). The
+conversion quantizes its dense matrices per row to int8. Its NOTICE reads:
+
+```text
+Independent Bonsai DFlash2 adaptation by ProCreations, September 2026. Derived
+model weights: z-lab Qwen3.8-27B-DFlash2 and frozen Prism
+Ternary-Bonsai-2-27B target; Apache-2.0. Runtime: Prism/llama.cpp with
+upstream DFlash2 contribution (PR27342), plus Bonsai rotation integration.
+Training: vendored SpecForge with noncausal block-mask correction. See
+included upstream model cards, licenses, exact source archives and manifest
+for provenance.
+```
+
+It derives from [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+(Apache-2.0) and was trained against the frozen
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+target (Apache-2.0). No runtime or training code from it is used here.
+
 ## llguidance, toktrie and derivre
 
 Schema-constrained generation and the native tool-call grammar (llguidance's

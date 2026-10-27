@@ -189,9 +189,13 @@ needs approval to publish.
 
 The optional KFlash drafter (Kapitsa's
 [KFlash](https://github.com/nace-ai/kapitsa/blob/main/docs/kflash.md)) is
-z-lab's `DFlash2DraftModel`, pinned as
-[`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
-at revision `015e795`. Five Qwen3 layers (32 query and 8 K/V heads of 128,
+z-lab's `DFlash2DraftModel`. The shipped weights are ProCreations'
+[`Ternary-Bonsai-2-27B-DFlash2`](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)
+at revision `4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b`: z-lab's
+[`Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+trained further against the frozen Ternary Bonsai 2 27B target (its PQ2_0
+packing rather than this PTQ1 GGUF), with the same 81 tensors and
+configuration. Five Qwen3 layers (32 query and 8 K/V heads of 128,
 FFN 17408), each attention and MLP wrapped in a grouped dynamic convolution
 (groups of 16 channels, kernel 2), draft an 8-row block in one pass: the
 anchor token and seven mask tokens (`mask_token_id` 248070) attend each
@@ -210,11 +214,23 @@ gathered, and shares the target's embedding and output matrix.
 
 ```text
 file           = models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin
-file_bytes     = 2054275072   (SHA256 4d6879b40236bfc0549761a25e7298158a6c5653d135016ae2230502079de8f1)
+file_bytes     = 2054275072   (SHA256 f43f846c60fc3f83c18ab772006d55f3cd6287944b4989fe4ac8d774c7a955e8)
 payload_bytes  = 2053443584
-payload_sha256 = 768b9f89dcdc09e9b3ccf11aac5baa6263ccad65168a75b0a1f5d0c18649614a
-source         = model.safetensors, 3848817896 bytes, SHA256 67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c
+payload_sha256 = 1b5dc3551406e677ec9f4321f8f5c20f7310eaae0cede95792ceaa2375dfc02a
+source         = ProCreations/Ternary-Bonsai-2-27B-DFlash2 @ 4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b
+                 model.safetensors, 3848817896 bytes BF16, SHA256 708e141bf4a33b09620c4f86263f1c7edcec7882f5dd39448e83e0c0defdc230
 ```
+
+It replaced the first pin, `incoai/Qwen3.8-27B-DFlash2` at revision
+`015e795` (payload SHA256 `768b9f89…614a`, source SHA256 `67fc76d6…b65c`),
+after a selection run over published DFlash2 fine-tunes: regenerating every
+lattice of the seven trace prompts and running `sim.py`'s leave-one-out
+calibrated 8-row tree, it yields 4.97 tokens per cycle against 4.68
+(bootstrap ratio 1.059, 95% CI 1.048–1.069) and 4.65 against 4.33 as a
+7-draft chain, at or above the first pin on every prompt and most on prose
+and essays, where trees were weakest. The measurements below that name no
+drafter were taken with the first pin; the architecture, kernels and costs
+are the same for both.
 
 The artifact is the MTP head's container under its own magic (`DFLSH2`) and
 a 16 KiB header page: 128 named, page-aligned sections (every dense matrix as

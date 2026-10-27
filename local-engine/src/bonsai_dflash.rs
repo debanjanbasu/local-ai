@@ -1,8 +1,10 @@
 //! `KFlash` drafting for Bonsai 2: a `DFlash2` block drafter, its GPU-resident
 //! candidate lattice, and a best-first tree the target verifies in one pass.
 //!
-//! The drafter is z-lab's `DFlash2DraftModel` (the pinned weights are
-//! `incoai/Qwen3.8-27B-DFlash2`): five bidirectional Qwen3 layers with
+//! The drafter is z-lab's `DFlash2DraftModel`; the pinned weights are
+//! ProCreations' `Ternary-Bonsai-2-27B-DFlash2` ([`PINNED_DFLASH_SHA256`]),
+//! z-lab's `Qwen3.8-27B-DFlash2` trained further against the frozen Bonsai
+//! target. It has five bidirectional Qwen3 layers with
 //! grouped dynamic convolutions, conditioned on the target's residual stream
 //! at layers 5, 19, 33, 47 and 61, drafting an 8-row block (the anchor and
 //! seven mask tokens) in one pass. Its rank-256 candidate selector scores
@@ -29,7 +31,11 @@
 //!    drafter keeps its own F16 context K/V in a ring covering the
 //!    2048-token sliding window; append only accepted positions, or roll
 //!    back up to [`MAX_ROLLBACK`] positions with
-//!    [`DflashDrafter::truncate_context`].
+//!    [`DflashDrafter::truncate_context`]. When taps exist only from some
+//!    position on (a prompt longer than the window, a restored prefix,
+//!    positions decoded in a batched pass), [`DflashDrafter::restart_at`]
+//!    starts the context there and drafts attend only what was appended
+//!    since.
 //! 3. **Draft.** [`DflashDrafter::draft`] encodes the drafting pass for an
 //!    anchor token at sequence position `P` (the context must hold exactly
 //!    positions `0..P`) onto the caller's `CommandBatch`, leaving the
@@ -74,7 +80,9 @@ pub use self::calibration::{
 pub use self::drafter::{
     DflashDrafter, DflashShared, DraftAnchor, MAX_ROLLBACK, RING_CAPACITY, TapFormat,
 };
-pub use self::policy::{DEFAULT_BONSAI_DFLASH_ARTIFACT, DflashMode, DflashResolution};
+pub use self::policy::{
+    DEFAULT_BONSAI_DFLASH_ARTIFACT, DflashMode, DflashResolution, PINNED_DFLASH_SHA256,
+};
 pub use self::tree::{TreeNode, build_tree_reference, tested_nodes};
 pub use local_metal::dflash::{
     DFLASH_BLOCK, DFLASH_MAX_TREE_ROWS, DFLASH_SLOTS, DFLASH_TOPK, DflashCalibration,
