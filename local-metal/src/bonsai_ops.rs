@@ -21,6 +21,8 @@ mod kv;
 mod matmul;
 mod norm;
 mod rows;
+mod tree;
+pub use tree::{TREE_DESCRIPTOR_WORDS, TREE_MASKS, TREE_PARENTS, TREE_PATH, TREE_ROWS};
 
 pub const MODEL_WIDTH: u32 = 5120;
 pub const Q_HEADS: u32 = 24;
@@ -399,6 +401,14 @@ impl BonsaiOps {
             // residual add, RMSNorm and rotation.
             "bo_gdn_post_fwht",
             "bo_add_rms_fwht",
+            // KFlash tree verify; `tree.rs` names their indexes.
+            "bo_conv_l2_decay_tree",
+            "bo_gdn_tree_rows_4",
+            "bo_gdn_tree_rows_4_f16",
+            "bo_gdn_tree_rows_4_bf16",
+            "bo_attn_tree_tail",
+            "bo_copy_rows",
+            "bo_gather_rows",
         ];
         // Quantized layouts with tensor kernels of their own (decode split and
         // causal prefill), each K/V tile dequantized to half in threadgroup
@@ -425,6 +435,9 @@ impl BonsaiOps {
                 "bo_attn_split_tensor_rows_q8_3",
                 "bo_attn_split_tensor_rows_q8_4",
                 "bo_attn_tensor_rows_q8",
+                "bo_attn_split_tensor_rows_q8_tree_2",
+                "bo_attn_split_tensor_rows_q8_tree_3",
+                "bo_attn_split_tensor_rows_q8_tree_4",
             ]
         } else {
             &[]

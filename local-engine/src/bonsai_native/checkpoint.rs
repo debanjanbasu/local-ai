@@ -127,7 +127,7 @@ impl BonsaiModel {
         rows: usize,
         committed: usize,
     ) -> crate::Result<()> {
-        if committed == rows {
+        if committed == rows && self.taps.is_none() {
             return self.adopt_verified(verifier);
         }
         let mut batch = CommandBatch::new(&self.context)?;
@@ -159,7 +159,7 @@ impl BonsaiModel {
 
     /// [`Self::commit_verified`] encoded into `batch`, so later work (the
     /// head's commit) shares its submission. Nothing is encoded when every
-    /// row is committed.
+    /// row is committed, but the committed rows' taps while taps are on.
     pub(super) fn encode_commit_verified(
         &mut self,
         batch: &mut CommandBatch,
@@ -172,8 +172,32 @@ impl BonsaiModel {
                 "verify commit needs 1..=rows committed rows of a verify block".into(),
             ));
         }
+        if self.taps.is_some() {
+            // The block advanced the position past all of its rows.
+            let start = self.position.checked_sub(rows).ok_or_else(|| {
+                crate::Error::InvalidArgument("verify commit before its block".into())
+            })?;
+            self.encode_tap_commit(batch, &(0..committed).collect::<Vec<_>>(), start)?;
+        }
         if committed == rows {
             return self.adopt_verified(verifier);
+        }
+        self.encode_replay_verified(batch, verifier, committed)
+    }
+
+    /// Replay the first `committed` rows' compact recurrence inputs, which a
+    /// verify pass wrote to `verifier`, from the start state and history
+    /// the recurrent layers kept, into `batch`.
+    pub(super) fn encode_replay_verified(
+        &self,
+        batch: &mut CommandBatch,
+        verifier: &Verifier,
+        committed: usize,
+    ) -> crate::Result<()> {
+        if committed == 0 || committed > verifier.rows {
+            return Err(crate::Error::InvalidArgument(
+                "verify replay needs 1..=rows committed rows".into(),
+            ));
         }
         if verifier.state_format != self.state_format {
             return Err(crate::Error::InvalidArgument(

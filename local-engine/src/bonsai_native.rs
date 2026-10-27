@@ -42,10 +42,14 @@ pub mod capture;
 mod checkpoint;
 mod layers;
 mod speculation;
+mod taps;
+mod tree;
 
 pub use self::batch::{
     BatchRow, HeadDraft, HeadLag, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState,
 };
+pub use self::taps::{TAP_LAYERS, TAP_ROW_FLOATS, TAP_WINDOW};
+pub use self::tree::{DraftTree, MAX_TREE_ROWS, TestedNode, TreeAcceptance};
 
 /// What a loaded head costs, for the policy record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -772,6 +776,10 @@ pub struct BonsaiModel {
     batch: Option<batch::BatchScratch>,
     /// Images of the resident sequence's prompt (see [`SequenceState`]).
     images: Option<Arc<PromptImages>>,
+    /// Tree verify buffers, made by [`Self::enable_tree_verify`].
+    tree: Option<tree::TreeVerifier>,
+    /// Residual taps for a block drafter, while [`Self::set_taps`] has them on.
+    taps: Option<taps::Taps>,
 }
 
 impl BonsaiModel {
@@ -950,6 +958,8 @@ impl BonsaiModel {
             state_id: 0,
             batch: None,
             images: None,
+            tree: None,
+            taps: None,
             context,
             package,
         })
@@ -978,6 +988,7 @@ impl BonsaiModel {
         if let Some(speculation) = &self.speculation {
             speculation.mtp.reset();
         }
+        self.drop_tree_verify();
         // Attention reads only the newly written prefix; unused KV tails need
         // not be touched, even when a shorter request follows a longer one.
         self.position = 0;
@@ -1398,6 +1409,25 @@ impl BonsaiModel {
         } else {
             usize::MAX
         };
+        // A prompt's last segment taps only its last `TAP_WINDOW` positions.
+        if let Some(taps) = self.taps.as_mut()
+            && logits
+        {
+            taps.floor = end.saturating_sub(TAP_WINDOW);
+        }
+        let result = self.prefill_blocks(prompt, end, progress);
+        if let Some(taps) = self.taps.as_mut() {
+            taps.floor = 0;
+        }
+        result
+    }
+
+    fn prefill_blocks(
+        &mut self,
+        prompt: &[u32],
+        end: usize,
+        progress: &mut dyn FnMut(PrefillProgress),
+    ) -> crate::Result<()> {
         for block in prompt.chunks(self.info.prefill_chunk_size) {
             if self.stop_for_cancel() {
                 return Ok(());

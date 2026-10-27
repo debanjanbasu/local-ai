@@ -1234,8 +1234,10 @@ kernel void bo_attn_gather_rows(
 }
 
 // Online softmax over one 32-key tile of packed score rows, eight rows per
-// pass (row r is token r / 6, which sees keys before first_prefix + r / 6).
-template <uint TOKENS>
+// pass (row r is token r / 6, which sees keys before first_prefix + STEP * r / 6:
+// STEP 1 for a verify block's consecutive rows, 0 for a tree verify's rows,
+// which all attend the same history).
+template <uint TOKENS, uint STEP>
 static inline void bonsai_attn_rows_softmax(
     threadgroup float *scores, threadgroup float *correction, threadgroup float *maximum,
     threadgroup float *denominator, uint first_prefix, uint begin, uint start, uint count,
@@ -1245,7 +1247,7 @@ static inline void bonsai_attn_rows_softmax(
     #pragma clang loop unroll(full)
     for (uint j = 0; j < nt; ++j) {
         const uint live = min(8u, 6 * TOKENS - 8 * j);
-        const uint prefix = first_prefix + (8 * j + row) / 6;
+        const uint prefix = first_prefix + STEP * ((8 * j + row) / 6);
         const bool active = row < live && begin < prefix;
         const uint limit = prefix > start ? min(count, prefix - start) : 0;
         threadgroup float *s = scores + j * nq * nk;
@@ -1276,7 +1278,7 @@ static inline void bonsai_attn_rows_softmax(
     }
 }
 
-template <uint TOKENS>
+template <uint TOKENS, uint STEP>
 static inline void bonsai_attn_split_rows_q8_impl(
     device float *query, device const uchar *key, device const uchar *value,
     device float *partials, uint first_prefix, uint splits, uint split_tokens,
@@ -1287,7 +1289,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
     constexpr uint nt = (6 * TOKENS + 7) / 8;
     const uint kv_head = group % 4, split = group / 4;
     const uint begin = split * split_tokens;
-    const uint end = min(begin + split_tokens, first_prefix + TOKENS - 1);
+    const uint end = min(begin + split_tokens, first_prefix + STEP * (TOKENS - 1));
     const uint row = tid / 16, lane = tid % 16;
     if (tid < nq * nt) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
     auto live = [](uint j) { return min(8u, 6 * TOKENS - 8 * j); };
@@ -1331,7 +1333,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        bonsai_attn_rows_softmax<TOKENS>(scores, correction, maximum, denominator,
+        bonsai_attn_rows_softmax<TOKENS, STEP>(scores, correction, maximum, denominator,
             first_prefix, begin, start, count, row, lane);
         bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1365,7 +1367,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
                 const auto index = acc.get_multidimensional_index(i);
                 const uint r = index[1];
                 if (r < live(j)) {
-                    const bool active = begin < first_prefix + (8 * j + r) / 6;
+                    const bool active = begin < first_prefix + STEP * ((8 * j + r) / 6);
                     record(j, r)[2 + index[0]] = active ? acc[i] : 0.0f;
                 }
             }
@@ -1377,7 +1379,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
     if (lane == 0) {
         for (uint j = 0; j < nt; ++j) {
             if (row < live(j)) {
-                const bool active = begin < first_prefix + (8 * j + row) / 6;
+                const bool active = begin < first_prefix + STEP * ((8 * j + row) / 6);
                 device float *out = record(j, row);
                 out[0] = active ? maximum[j * nq + row] : -INFINITY;
                 out[1] = active ? denominator[j * nq + row] : 0.0f;
@@ -1393,7 +1395,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
 // bitwise those of the per-tile form; split kernel time drops 3-11% at
 // 1K-262K tokens. Four rows keep the per-tile form: the joint form was 3-9%
 // faster from 2K to 32K tokens but 1-3% slower at 128K-262K.
-template <uint TOKENS>
+template <uint TOKENS, uint STEP>
 static inline void bonsai_attn_split_rows_q8_joint_impl(
     device float *query, device const uchar *key, device const uchar *value,
     device float *partials, uint first_prefix, uint splits, uint split_tokens,
@@ -1405,7 +1407,7 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
     constexpr int m = int(nq * nt), live_rows = int(6 * TOKENS);
     const uint kv_head = group % 4, split = group / 4;
     const uint begin = split * split_tokens;
-    const uint end = min(begin + split_tokens, first_prefix + TOKENS - 1);
+    const uint end = min(begin + split_tokens, first_prefix + STEP * (TOKENS - 1));
     const uint row = tid / 16, lane = tid % 16;
     if (tid < nq * nt) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
 
@@ -1436,7 +1438,7 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
         qk.run(q, k, products);
         products.store(tensor(scores, dextents<int32_t, 2>(nk, m)));
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        bonsai_attn_rows_softmax<TOKENS>(scores, correction, maximum, denominator,
+        bonsai_attn_rows_softmax<TOKENS, STEP>(scores, correction, maximum, denominator,
             first_prefix, begin, start, count, row, lane);
         bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1458,13 +1460,13 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
             const auto index = acc.get_multidimensional_index(i);
             const uint r = index[1];
             if (r < uint(live_rows)) {
-                record(r)[2 + index[0]] = begin < first_prefix + r / 6 ? acc[i] : 0.0f;
+                record(r)[2 + index[0]] = begin < first_prefix + STEP * (r / 6) ? acc[i] : 0.0f;
             }
         }
     }
     if (lane == 0) {
         for (uint r = row; r < uint(live_rows); r += nq) {
-            const bool active = begin < first_prefix + r / 6;
+            const bool active = begin < first_prefix + STEP * (r / 6);
             device float *out = record(r);
             out[0] = active ? maximum[r] : -INFINITY;
             out[1] = active ? denominator[r] : 0.0f;
@@ -1472,8 +1474,8 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
     }
 }
 
-#define BONSAI_ATTN_SPLIT_ROWS_Q8(TOKENS)                                            \
-kernel void bo_attn_split_tensor_rows_q8_##TOKENS(                                   \
+#define BONSAI_ATTN_SPLIT_ROWS_Q8(NAME, TOKENS, STEP)                                \
+kernel void NAME(                                                                    \
     device float *query [[buffer(0)]], device const uchar *key [[buffer(1)]],         \
     device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],    \
     constant uint &first_prefix [[buffer(4)]], constant uint &splits [[buffer(5)]],   \
@@ -1485,18 +1487,23 @@ kernel void bo_attn_split_tensor_rows_q8_##TOKENS(                              
     threadgroup float scores[nt * 8 * 32], correction[nt * 8], maximum[nt * 8],       \
         denominator[nt * 8];                                                       \
     if (TOKENS == 4) {                                                               \
-        bonsai_attn_split_rows_q8_impl<TOKENS>(query, key, value, partials,          \
+        bonsai_attn_split_rows_q8_impl<TOKENS, STEP>(query, key, value, partials,    \
             first_prefix, splits, split_tokens, group, tid, tile, scores, correction, \
             maximum, denominator);                                                   \
     } else {                                                                         \
-        bonsai_attn_split_rows_q8_joint_impl<TOKENS>(query, key, value, partials,    \
+        bonsai_attn_split_rows_q8_joint_impl<TOKENS, STEP>(query, key, value, partials, \
             first_prefix, splits, split_tokens, group, tid, tile, scores, correction, \
             maximum, denominator);                                                   \
     }                                                                                \
 }
-BONSAI_ATTN_SPLIT_ROWS_Q8(2)
-BONSAI_ATTN_SPLIT_ROWS_Q8(3)
-BONSAI_ATTN_SPLIT_ROWS_Q8(4)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_2, 2, 1)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_3, 3, 1)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_4, 4, 1)
+// A tree verify's history (bonsai_native/tree.rs): every row attends the keys
+// below the anchor, `first_prefix`, and nothing past it.
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_tree_2, 2, 0)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_tree_3, 3, 0)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_tree_4, 4, 0)
 
 
 // Causal Q8 prefill packed by KV head. bo_attn_tensor_q8 gives each query head
@@ -1638,3 +1645,260 @@ kernel void bo_attn_tensor_rows_q8(
 }
 
 #endif
+
+// ---- KFlash tree verify (local-engine bonsai_native/tree.rs) ----
+// A tree verify runs up to BONSAI_TREE_ROWS rows whose row t follows row
+// parent[t] (row 0, the anchor, follows the committed state) rather than row
+// t - 1. The tree descriptor holds int words: parents at [0, 8), each row's
+// ancestor-or-self bit mask at [8, 16) (bit j: row j), and a commit's accepted
+// path rows at [16, 25). Every kernel below computes a row from its own path
+// alone, in an order that does not depend on the other rows, so a row's
+// numbers do not depend on the tree it sits in.
+constant constexpr uint BONSAI_TREE_ROWS = 8;
+constant constexpr uint BONSAI_TREE_MASKS = 8;
+
+// bo_conv's arithmetic with each row's window taken from its parent: the
+// parent's window shifted by the parent's input. The anchor reads the
+// committed history; nothing writes it (the commit replays the accepted path).
+template<typename Input, typename Weights, typename History, typename Output>
+static inline void bonsai_conv_tree_impl(
+    Input input, Weights weights, History history, Output output,
+    device const int *tree, uint tokens, uint channel
+) {
+    if (channel >= 10240) return;
+    const uint h = channel * 3, w = channel * 4;
+    float after0[BONSAI_TREE_ROWS], after1[BONSAI_TREE_ROWS], after2[BONSAI_TREE_ROWS];
+    for (uint token = 0; token < tokens; ++token) {
+        float h0, h1, h2;
+        if (token == 0) {
+            h0 = history[h];
+            h1 = history[h + 1];
+            h2 = history[h + 2];
+        } else {
+            const uint parent = uint(tree[token]);
+            h0 = after0[parent];
+            h1 = after1[parent];
+            h2 = after2[parent];
+        }
+        const uint index = token * 10240 + channel;
+        float sum = weights[w] * h0;
+        sum = fma(weights[w + 1], h1, sum);
+        sum = fma(weights[w + 2], h2, sum);
+        sum = fma(weights[w + 3], input[index], sum);
+        after0[token] = h1;
+        after1[token] = h2;
+        after2[token] = input[index];
+        output[index] = bonsai_silu(sum);
+    }
+}
+
+// bo_conv_l2_decay for a tree: the convolution follows each row's path; the
+// Q/K normalization and decay/beta are per row, as there.
+kernel void bo_conv_l2_decay_tree(
+    device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
+    device const float *history [[buffer(2)]], device float *output [[buffer(3)]],
+    device const float *a [[buffer(4)]], device const float *alpha [[buffer(5)]],
+    device const float *dt [[buffer(6)]], device const float *raw_beta [[buffer(7)]],
+    device float *decay [[buffer(8)]], device float *beta [[buffer(9)]],
+    device const int *tree [[buffer(10)]],
+    constant uint &tokens [[buffer(11)]], constant float &epsilon [[buffer(12)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float partial[4];
+    if (group == 80) {
+        for (uint head = tid; head < 48 * tokens; head += 128) {
+            bonsai_decay_impl(a, alpha, dt, raw_beta, decay, beta, tokens, head);
+        }
+        return;
+    }
+    bonsai_conv_tree_impl(input, weights, history, output, tree, tokens, group * 128 + tid);
+    if (group >= 32) return;
+    for (uint token = 0; token < tokens; ++token) {
+        bonsai_l2_qk_impl(output, output, epsilon, token * 32 + group, tid, partial);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// bonsai_gdn_rows' recurrence where row t starts from its parent's state. A
+// row whose parent is the row before it continues from that row's state in
+// registers; any other row first rebuilds its parent's state from the start
+// state, replaying its ancestors' updates in path order with the step's own
+// operations (the decay multiply, then fma(k, correction, state)), so a state
+// reached by replay is bitwise the state reached in sequence. Each row's
+// correction is kept per value row for the replays. No final state is
+// written: the commit replays the accepted path from the untouched start.
+template<uint rows, typename State>
+static inline void bonsai_gdn_tree_rows(
+    device const float *qkv, device const float *decay, device const float *beta,
+    device const State *initial_state, device float *output, device const int *tree,
+    uint tokens, uint group, uint lane
+) {
+    const uint first_row = group * rows, head = first_row / 128, key_group = head % 16;
+    float start[rows][4], values[rows][4], corrections[BONSAI_TREE_ROWS][rows];
+    for (uint r = 0; r < rows; ++r) {
+        for (uint i = 0; i < 4; ++i) {
+            start[r][i] = float(initial_state[(first_row + r) * 128 + lane + i * 32]);
+            values[r][i] = start[r][i];
+        }
+    }
+    for (uint token = 0; token < tokens; ++token) {
+        if (token > 0 && tree[token] != int(token) - 1) {
+            const uint ancestors = uint(tree[BONSAI_TREE_MASKS + token]);
+            for (uint r = 0; r < rows; ++r) {
+                for (uint i = 0; i < 4; ++i) values[r][i] = start[r][i];
+            }
+            for (uint j = 0; j < token; ++j) {
+                if (((ancestors >> j) & 1u) == 0) continue;
+                const float d = decay[j * 48 + head];
+                float k[4];
+                for (uint i = 0; i < 4; ++i) {
+                    k[i] = qkv[j * 10240 + 2048 + key_group * 128 + lane + i * 32];
+                    for (uint r = 0; r < rows; ++r) values[r][i] *= d;
+                }
+                for (uint r = 0; r < rows; ++r) {
+                    for (uint i = 0; i < 4; ++i) {
+                        values[r][i] = fma(k[i], corrections[j][r], values[r][i]);
+                    }
+                }
+            }
+        }
+        const uint token_offset = token * 10240;
+        const float d = decay[token * 48 + head], b = beta[token * 48 + head];
+        float q[4], k[4], prediction[rows] = {};
+        for (uint i = 0; i < 4; ++i) {
+            const uint column = key_group * 128 + lane + i * 32;
+            q[i] = qkv[token_offset + column];
+            k[i] = qkv[token_offset + 2048 + column];
+            for (uint r = 0; r < rows; ++r) {
+                values[r][i] *= d;
+                prediction[r] = fma(values[r][i], k[i], prediction[r]);
+            }
+        }
+        for (uint r = 0; r < rows; ++r) {
+            const float correction =
+                (qkv[token_offset + 4096 + first_row + r] - simd_sum(prediction[r])) * b;
+            corrections[token][r] = correction;
+            float result = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                values[r][i] = fma(k[i], correction, values[r][i]);
+                result = fma(values[r][i], q[i], result);
+            }
+            result = simd_sum(result);
+            if (lane == 0) output[token * 6144 + first_row + r] = result * 0.08838834764831845f;
+        }
+    }
+}
+
+#define BONSAI_GDN_TREE(SUFFIX, STATE) \
+kernel void bo_gdn_tree_rows_4##SUFFIX( \
+    device const float *qkv [[buffer(0)]], device const float *decay [[buffer(1)]], \
+    device const float *beta [[buffer(2)]], device const STATE *state [[buffer(3)]], \
+    device float *output [[buffer(4)]], device const int *tree [[buffer(5)]], \
+    constant uint &tokens [[buffer(6)]], \
+    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]] \
+) { bonsai_gdn_tree_rows<4>(qkv, decay, beta, state, output, tree, tokens, group, lane); }
+
+BONSAI_GDN_TREE(, float)
+BONSAI_GDN_TREE(_f16, half)
+BONSAI_GDN_TREE(_bf16, bfloat)
+#undef BONSAI_GDN_TREE
+
+// The tree zone of a tree verify's attention: row t's keys among the pass's
+// rows (its ancestors and itself, cache rows position + j for the set bits j
+// of its mask, root to leaf), one key at a time in fp32 with
+// bonsai_attn_split_impl's arithmetic, written as the last partial record
+// (index splits - 1) of each (row, query head) for bo_attn_reduce; the
+// history below `position` fills the records before it. One SIMD group per
+// (row, query head).
+template <uint KF, uint VF>
+static inline void bonsai_attn_tree_tail_impl(
+    device const float *query, device const uchar *key, device const uchar *value,
+    device float *partials, device const int *tree, uint position, uint splits,
+    uint group, uint lane
+) {
+    const uint row = group / 24, head = group % 24, kv_head = head / 6;
+    float q[8], acc[8];
+    for (uint i = 0; i < 8; ++i) {
+        q[i] = query[(ulong(row) * 24 + head) * 256 + lane + i * 32];
+        acc[i] = 0.0f;
+    }
+    float maximum = -INFINITY, denominator = 0.0f;
+    const uint ancestors = uint(tree[BONSAI_TREE_MASKS + row]);
+    for (uint j = 0; j <= row; ++j) {
+        if (((ancestors >> j) & 1u) == 0) continue;
+        const ulong token = position + j;
+        float score = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            score = fma(q[i], bonsai_kv_load<KF>(key, token, kv_head, i, lane), score);
+        }
+        score = simd_sum(score) * (1.0f / 16.0f);
+        float v[8];
+        for (uint i = 0; i < 8; ++i) v[i] = bonsai_kv_load<VF>(value, token, kv_head, i, lane);
+        const float next_maximum = max(maximum, score);
+        const float old_scale = exp(maximum - next_maximum);
+        const float weight = exp(score - next_maximum);
+        denominator = denominator * old_scale + weight;
+        for (uint i = 0; i < 8; ++i) acc[i] = fma(weight, v[i], acc[i] * old_scale);
+        maximum = next_maximum;
+    }
+    device float *out = partials + (ulong(row) * 24 * splits + ulong(head) * splits + splits - 1) * 258;
+    if (lane == 0) { out[0] = maximum; out[1] = denominator; }
+    for (uint i = 0; i < 8; ++i) out[2 + lane + i * 32] = acc[i];
+}
+
+kernel void bo_attn_tree_tail(
+    device const float *query [[buffer(0)]], device const uchar *key [[buffer(1)]],
+    device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],
+    device const int *tree [[buffer(4)]], constant uint &position [[buffer(5)]],
+    constant uint &splits [[buffer(6)]], constant uint &k_format [[buffer(7)]],
+    constant uint &v_format [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
+) {
+    BONSAI_KV_DISPATCH(bonsai_attn_tree_tail_impl, k_format, v_format,
+        query, key, value, partials, tree, position, splits, group, lane);
+}
+
+// Copy `rows` rows of `width4` float4s from consecutive source rows to
+// destination rows (first + row) % capacity: the residual taps' ring writes.
+kernel void bo_copy_rows(
+    device const float4 *source [[buffer(0)]], device float4 *destination [[buffer(1)]],
+    constant uint &width4 [[buffer(2)]], constant uint &source_stride4 [[buffer(3)]],
+    constant uint &destination_stride4 [[buffer(4)]], constant uint &first [[buffer(5)]],
+    constant uint &capacity [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    device const float4 *from = source + ulong(row) * source_stride4;
+    device float4 *to = destination + ulong((first + row) % capacity) * destination_stride4;
+    for (uint i = tid; i < width4; i += 256) to[i] = from[i];
+}
+
+// Move rows path[i] to rows i (i = 1 .. count - 1) in place, in up to three
+// buffers of `words` 32-bit words per row: a tree commit's accepted rows into
+// consecutive positions. One thread owns one word column and walks the rows
+// in increasing i, so no row is overwritten before it is read (path[i] >= i,
+// and a path row below i was already moved).
+kernel void bo_gather_rows(
+    device uint *rows0 [[buffer(0)]], device uint *rows1 [[buffer(1)]],
+    device uint *rows2 [[buffer(2)]], device const int *path [[buffer(3)]],
+    constant uint &words0 [[buffer(4)]], constant uint &words1 [[buffer(5)]],
+    constant uint &words2 [[buffer(6)]], constant uint &count [[buffer(7)]],
+    uint word [[thread_position_in_grid]]
+) {
+    device uint *rows = rows0;
+    uint words = words0, column = word;
+    if (column >= words0) {
+        column -= words0;
+        rows = rows1;
+        words = words1;
+        if (column >= words1) {
+            column -= words1;
+            rows = rows2;
+            words = words2;
+            if (column >= words2) return;
+        }
+    }
+    for (uint i = 1; i < count; ++i) {
+        const uint from = uint(path[i]);
+        if (from != i) rows[ulong(i) * words + column] = rows[ulong(from) * words + column];
+    }
+}

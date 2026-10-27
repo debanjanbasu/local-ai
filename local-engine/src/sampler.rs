@@ -698,6 +698,75 @@ where
     })
 }
 
+/// What [`verify_tree_drafts`] found in a verified draft tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeVerification {
+    /// The target's selection after each accepted row, the last being the
+    /// bonus token: plain decoding's tokens, whatever the tree held.
+    pub samples: Vec<SamplingResult>,
+    /// The accepted rows, root first (`samples[i]` follows `path[i]`).
+    pub path: Vec<usize>,
+    /// Every row whose parent was accepted, in row order per parent, and
+    /// whether the target took it.
+    pub tested: Vec<(usize, bool)>,
+}
+
+/// [`verify_greedy_drafts`] over a tree of drafts: `tokens[r]` is row `r`'s
+/// token and `parents[r]` its parent row (row 0, the anchor, has -1; every
+/// parent comes before its children). Starting at the root, sample the
+/// target once at the current row and step into the child whose token equals
+/// the sample, for as long as one exists (the first such child in row order
+/// if two siblings repeat a token). One selection per accepted depth, so the
+/// sampler's random numbers, penalties and response format advance exactly
+/// as plain decoding of the accepted tokens advances them, and siblings share
+/// the selection made at their parent. A chain (`parents[r] = r - 1`) walks
+/// as [`verify_greedy_drafts`] does over `tokens[1..]`.
+pub fn verify_tree_drafts<F>(
+    sampler: &mut Sampler,
+    tokens: &[u32],
+    parents: &[i32],
+    mut sample: F,
+) -> crate::Result<TreeVerification>
+where
+    F: FnMut(usize, &mut Sampler) -> crate::Result<SamplingResult>,
+{
+    if tokens.is_empty() || tokens.len() != parents.len() || parents[0] != -1 {
+        return Err(crate::Error::InvalidArgument(
+            "a draft tree needs a root and one parent per row".into(),
+        ));
+    }
+    let mut selections = Vec::new();
+    let mut path = vec![0];
+    let mut tested = Vec::new();
+    let mut row = 0;
+    loop {
+        let next = sample(row, sampler)?;
+        selections.push(next);
+        let mut accepted = None;
+        for (child, &parent) in parents.iter().enumerate() {
+            if usize::try_from(parent).ok() != Some(row) {
+                continue;
+            }
+            let take = !next.is_eos && accepted.is_none() && tokens[child] == next.token_id;
+            if take {
+                accepted = Some(child);
+            }
+            tested.push((child, take));
+        }
+        let Some(child) = accepted else {
+            break;
+        };
+        sampler.observe(&[next.token_id]);
+        path.push(child);
+        row = child;
+    }
+    Ok(TreeVerification {
+        samples: selections,
+        path,
+        tested,
+    })
+}
+
 /// Push every token `mask` forbids to -inf, so no selection can reach it.
 /// Ids past either the mask or the logits are left alone. Works a mask word
 /// (32 ids) at a time: allowed words are skipped, forbidden words filled.
