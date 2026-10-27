@@ -77,6 +77,11 @@ impl KflashBudget {
         self.ready = ready;
     }
 
+    /// Whether the tree has not run since it last became available.
+    pub(super) const fn tree_untried(&self) -> bool {
+        self.runs[Source::Tree as usize] == 0
+    }
+
     fn rate(&self, source: Source) -> Option<f64> {
         let index = source as usize;
         (self.runs[index] > 0 && self.ms[index] > 0.0).then(|| self.tokens[index] / self.ms[index])

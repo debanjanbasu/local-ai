@@ -620,14 +620,17 @@ impl BonsaiEngine {
         }
         if source == Some(Source::Tree) {
             // A long catch-up (a prompt, or a context restarted after
-            // decoding without taps) is not this cycle's cost.
-            if let Some(rows) = self
-                .model
-                .kflash_pending()
-                .filter(|&rows| rows > crate::bonsai_native::KFLASH_CATCH_UP_ROWS)
-            {
-                self.model
-                    .kflash_catch_up(crate::bonsai_native::KFLASH_CATCH_UP_ROWS)?;
+            // decoding without taps) is not this cycle's cost; nor is any
+            // catch-up before the tree's first measured cycle (the rows
+            // batched passes tapped since the last batched draft), which
+            // would rank the tree behind for many cycles.
+            let threshold = if generation.kflash.tree_untried() {
+                0
+            } else {
+                crate::bonsai_native::KFLASH_CATCH_UP_ROWS
+            };
+            if let Some(rows) = self.model.kflash_pending().filter(|&rows| rows > threshold) {
+                self.model.kflash_catch_up(threshold)?;
                 generation.stats.kflash.catch_up_rows += rows;
                 generation.stats.kflash.catch_up += started.elapsed();
                 started = Instant::now();
