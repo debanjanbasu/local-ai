@@ -58,6 +58,10 @@ flate2 = { version = "1", default-features = false, features = ["zlib"] }
 brotli-decompressor = "6.2"
 encoding_rs = "0.8"
 html-to-markdown-rs = { version = "3.18.7", default-features = false }
+# Web fetch's main-content extraction (a Readability port on `dom_query`,
+# both MIT).
+dom_smoothie = "0.18.2"
+dom_query = "0.28"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -19,14 +19,16 @@
 //! - The body arrives in any of `zstd`, `br`, `gzip` and `deflate` and is
 //!   decoded while it streams ([`body`]), up to the byte limit (both decoded
 //!   and encoded bytes are bounded, so a decompression bomb stops at the
-//!   limit). HTML is converted to Markdown ([`markdown`]). A cut body says
-//!   so with a marker; the caller's deadline bounds the whole exchange,
-//!   conversion included, and dropping the future abandons the connection.
+//!   limit). HTML is reduced to its main content ([`extract`]) and
+//!   converted to Markdown ([`markdown`]). A cut body says so with a
+//!   marker; the caller's deadline bounds the whole exchange, conversion
+//!   included, and dropping the future abandons the connection.
 
 mod altsvc;
 mod body;
 mod client;
 mod dns;
+mod extract;
 mod markdown;
 #[cfg(test)]
 mod network_tests;
@@ -154,8 +156,9 @@ const HTML_INPUT_FACTOR: usize = 4;
 
 /// Fetch `url`, returning at most `max_bytes` of body text.
 ///
-/// HTML is converted to Markdown (from at most four times `max_bytes` of
-/// decoded HTML, the Markdown then capped at `max_bytes`); other text is
+/// HTML is reduced to its main content and converted to Markdown (from at
+/// most four times `max_bytes` of decoded HTML, the Markdown then capped at
+/// `max_bytes`); other text is
 /// decoded from its charset; anything else is shown as UTF-8 as before.
 pub async fn fetch(url: &str, max_bytes: usize) -> Result<Output, ToolError> {
     let target = target(url)?;
@@ -192,21 +195,28 @@ async fn fetch_target(
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
     );
-    let html = matches!(kind, markdown::Kind::Html { .. });
-    let limit = if html {
-        max_bytes.saturating_mul(HTML_INPUT_FACTOR)
-    } else {
-        max_bytes
+    let limit = match kind {
+        markdown::Kind::Html { .. } => max_bytes.saturating_mul(HTML_INPUT_FACTOR),
+        markdown::Kind::Text { .. } | markdown::Kind::Other => max_bytes,
     };
     let read = body::read(&mut response, limit).await?;
     drop(response);
     let truncated = match kind {
         markdown::Kind::Html { charset } => {
             // Milliseconds of CPU per page, off the async threads; bounded
-            // by the input limit and the converter's depth limit.
-            let converted =
-                markdown::convert_on_thread(read.bytes, charset, url_of(target)).await?;
-            text.push_str("[converted from HTML to Markdown]\n\n");
+            // by the input limit, the extraction's element and depth bounds
+            // and the converter's depth limit.
+            let base_url = url_of(target);
+            let (converted, how) =
+                on_thread(move |_| markdown::convert(&read.bytes, charset.as_deref(), &base_url))
+                    .await?;
+            text.push_str(match how {
+                markdown::How::MainContent => "[main content converted from HTML to Markdown]\n\n",
+                markdown::How::WholePage => "[converted from HTML to Markdown]\n\n",
+                markdown::How::PlainText => {
+                    "[converted from HTML to plain text: the Markdown conversion failed]\n\n"
+                }
+            });
             let mut end = converted.len().min(max_bytes);
             while !converted.is_char_boundary(end) {
                 end -= 1;
@@ -246,6 +256,27 @@ fn body_cut(text: &mut String, cut: bool, max_bytes: usize) -> bool {
         let _ = write!(text, "\n[truncated: the body was cut at {max_bytes} bytes]");
     }
     cut
+}
+
+/// `work` on a thread of its own, with the conversion stack, awaited
+/// without blocking. `work` gets a check that turns true once the caller
+/// stopped waiting (its deadline passed), to end early where it can;
+/// otherwise it finishes its bounded work.
+async fn on_thread<T: Send + 'static>(
+    work: impl FnOnce(&dyn Fn() -> bool) -> T + Send + 'static,
+) -> Result<T, ToolError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("local-ai-fetch-text".into())
+        .stack_size(markdown::CONVERSION_STACK)
+        .spawn(move || {
+            let result = work(&|| sender.is_closed());
+            let _ = sender.send(result);
+        })
+        .map_err(|error| ToolError::Failed(format!("cannot convert the response: {error}")))?;
+    receiver
+        .await
+        .map_err(|_| ToolError::Failed("the response could not be converted".into()))
 }
 
 /// `target` as a URL, for resolving the links of its page.
