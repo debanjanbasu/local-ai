@@ -46,6 +46,8 @@ pub use self::{
     },
 };
 
+pub use self::format::{Container, PAGE, align_page, read_container_with, write_container};
+
 /// One section of a head file: the name the loader binds it to and its exact
 /// byte length, in artifact order. A head file records both, so it names its own
 /// contents rather than relying on a bare `(offset, length)` table.
@@ -55,9 +57,7 @@ type Section = (String, usize);
 // other reader names, so those bindings exist only in test builds.
 #[cfg(test)]
 use self::{
-    format::{
-        HEADER_BYTES, PAGE, PTQ1_VERSION, align_page, read_head, read_head_with, write_artifact,
-    },
+    format::{HEADER_BYTES, PTQ1_VERSION, read_head, read_head_with, write_artifact},
     policy::{MTP_DEFAULT_OFF_REASON, MTP_OFF_REASON},
     ternary::{
         MTP_TERNARY_SOURCE, MatrixFormat, PTQ1_BLOCK_BYTES, PTQ1_BLOCK_ELEMENTS,

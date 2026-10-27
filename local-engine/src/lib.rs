@@ -7,6 +7,8 @@ pub mod speech;
 
 pub mod bonsai;
 #[doc(hidden)]
+pub mod bonsai_dflash;
+#[doc(hidden)]
 #[expect(clippy::must_use_candidate)]
 pub mod bonsai_model;
 mod bonsai_mtp;
@@ -46,6 +48,9 @@ pub use tools::{ToolCall, ToolCallDelta, ToolChoice, ToolDefinition};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub use bonsai_dflash::{
+    DEFAULT_BONSAI_DFLASH_ARTIFACT, DFLASH_HEAD_ARTIFACT, DflashHeadArtifact, export_dflash_head,
+};
 pub use bonsai_mtp::{
     DEFAULT_BONSAI_MTP_ARTIFACT, DEFAULT_MTP_DEPTH, DEFAULT_MTP_ENABLED, MAX_MTP_DEPTH,
     MTP_HEAD_ARTIFACT, MtpHeadArtifact, MtpMode, MtpResolution, MtpSettings, export_head,

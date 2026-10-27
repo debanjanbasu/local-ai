@@ -13,10 +13,36 @@ use sha2::{Digest, Sha256};
 use super::Section;
 
 /// Derives the spec a head file must match from its decoded section names.
-pub(super) type SpecBinder<'a> = dyn Fn(&[&str]) -> Result<Vec<Section>, String> + 'a;
+pub type SpecBinder<'a> = dyn Fn(&[&str]) -> Result<Vec<Section>, String> + 'a;
+
+/// One kind of file in this container: its magic, version, header page size,
+/// and the name its messages use. The MTP head and the `DFlash2` drafter share
+/// the framing (named page-aligned sections, payload digest) but not the
+/// magic, so neither loader can mistake the other's file for its own.
+pub struct Container {
+    pub magic: &'static [u8; MAGIC_BYTES],
+    pub version: u32,
+    /// Bytes of the header page; at most [`PAGE`], where the first section starts.
+    pub header_bytes: usize,
+    /// "MTP head", as messages name the file.
+    pub name: &'static str,
+    /// "an MTP head", for "is not an MTP head artifact".
+    pub a_name: &'static str,
+    /// Temporary-file prefix while writing.
+    pub temp_prefix: &'static str,
+}
+
+pub(super) const MTP_CONTAINER: Container = Container {
+    magic: PTQ1_MAGIC,
+    version: PTQ1_VERSION,
+    header_bytes: HEADER_BYTES,
+    name: "MTP head",
+    a_name: "an MTP head",
+    temp_prefix: ".mtp-head",
+};
 
 /// The width of a head file's magic, and so of the field it is read as.
-const MAGIC_BYTES: usize = 8;
+pub const MAGIC_BYTES: usize = 8;
 /// A head file: sections are its matrices, each packed `PTQ1_0` blocks
 /// (`<name>.ptq1`) or int8 rows and their F32 scales (`<name>.int8`,
 /// `<name>.row_scales`), then the folded norms. The section names record each
@@ -28,7 +54,7 @@ const PTQ1_MAGIC: &[u8; MAGIC_BYTES] = b"MTPT1\0\0\0";
 /// int8 sections rejects one by its section names rather than misreading it.
 pub(super) const PTQ1_VERSION: u32 = 1;
 pub(super) const HEADER_BYTES: usize = 4096;
-pub(super) const PAGE: usize = 16 * 1024;
+pub const PAGE: usize = 16 * 1024;
 /// The payload digest is stored as ASCII hex, so this is the header field width.
 const DIGEST_HEX: usize = 64;
 
@@ -47,22 +73,24 @@ pub const MTP_HEAD_ARTIFACT: &str = "mtp-head-ptq1-v1.bin";
 /// The sections stay in the file's own mapping, so loading costs no anonymous
 /// RAM: `from_bytes_no_copy` hands Metal pointers into pages the kernel
 /// demand-pages and reclaims.
-pub(super) struct HeadMap {
-    pub(super) map: Arc<Mmap>,
-    pub(super) sections: Vec<(usize, usize)>,
+pub struct HeadMap {
+    pub map: Arc<Mmap>,
+    pub sections: Vec<(usize, usize)>,
     /// The spec the file was validated against, as its names selected it.
-    pub(super) spec: Vec<Section>,
+    pub spec: Vec<Section>,
+    /// The payload digest the load re-derived (and found equal to the header's).
+    pub payload_sha256: String,
 }
 
 /// What one written head file ended up holding.
-pub(super) struct HeadFile {
-    pub(super) path: PathBuf,
-    pub(super) file_bytes: usize,
-    pub(super) payload_bytes: usize,
-    pub(super) payload_sha256: String,
+pub struct HeadFile {
+    pub path: PathBuf,
+    pub file_bytes: usize,
+    pub payload_bytes: usize,
+    pub payload_sha256: String,
 }
 
-pub(super) fn align_page(value: usize) -> Option<usize> {
+pub fn align_page(value: usize) -> Option<usize> {
     value.checked_add(PAGE - 1).map(|n| n / PAGE * PAGE)
 }
 
@@ -84,8 +112,11 @@ fn malformed(message: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
-fn widen(error: std::num::TryFromIntError) -> std::io::Error {
-    malformed(format!("MTP head layout is wider than 64 bits: {error}"))
+fn widen(error: std::num::TryFromIntError, container: &Container) -> std::io::Error {
+    malformed(format!(
+        "{} layout is wider than 64 bits: {error}",
+        container.name
+    ))
 }
 
 /// sha256 over the logical section bytes in order, skipping the inter-section
@@ -176,18 +207,28 @@ pub(super) fn read_head(path: &Path, spec: &[Section]) -> Result<HeadMap, String
 /// reason into a hard error: a broken install should not look like a healthy
 /// one decoding without speculation.
 pub(super) fn read_head_with(path: &Path, bind: &SpecBinder<'_>) -> Result<HeadMap, String> {
+    read_container_with(path, &MTP_CONTAINER, bind)
+}
+
+/// [`read_head_with`] for any [`Container`].
+pub fn read_container_with(
+    path: &Path,
+    container: &Container,
+    bind: &SpecBinder<'_>,
+) -> Result<HeadMap, String> {
+    let header_bytes = container.header_bytes;
     let open = |error: std::io::Error| reject(format!("{}: {error}", path.display()));
     let file = File::open(path).map_err(open)?;
     // SAFETY: immutable mapping retained by every no-copy Metal buffer.
     #[expect(unsafe_code)]
     let map = unsafe { MmapOptions::new().map(&file) }.map_err(open)?;
-    let header = map.get(..HEADER_BYTES).ok_or_else(|| {
+    let header = map.get(..header_bytes).ok_or_else(|| {
         reject(format!(
-            "{} is shorter than one {HEADER_BYTES}-byte header page",
+            "{} is shorter than one {header_bytes}-byte header page",
             path.display()
         ))
     })?;
-    let parsed = parse_header(header, path, bind)?;
+    let parsed = parse_header(header, path, container, bind)?;
     let map_len =
         u64::try_from(map.len()).map_err(|_| reject(format!("{} is enormous", path.display())))?;
     if parsed.file_bytes != map_len {
@@ -223,6 +264,7 @@ pub(super) fn read_head_with(path: &Path, bind: &SpecBinder<'_>) -> Result<HeadM
         map: Arc::new(map),
         sections: parsed.sections,
         spec: parsed.spec,
+        payload_sha256,
     })
 }
 
@@ -230,22 +272,30 @@ pub(super) fn read_head_with(path: &Path, bind: &SpecBinder<'_>) -> Result<HeadM
 /// byte is read here, so a file whose framing is wrong is rejected before
 /// anything is hashed.
 #[expect(clippy::too_many_lines)]
-fn parse_header(header: &[u8], path: &Path, bind: &SpecBinder<'_>) -> Result<HeadHeader, String> {
+fn parse_header(
+    header: &[u8],
+    path: &Path,
+    container: &Container,
+    bind: &SpecBinder<'_>,
+) -> Result<HeadHeader, String> {
     let mut cursor = HeaderReader {
         bytes: header,
         at: 0,
     };
-    if cursor.take(MAGIC_BYTES)? != PTQ1_MAGIC {
+    if cursor.take(MAGIC_BYTES)? != container.magic {
         return Err(reject(format!(
-            "{} is not an MTP head artifact",
-            path.display()
+            "{} is not {} artifact",
+            path.display(),
+            container.a_name
         )));
     }
     let version = cursor.u32()?;
-    if version != PTQ1_VERSION {
+    if version != container.version {
         return Err(reject(format!(
-            "{} is MTP head version {version}, this build reads version {PTQ1_VERSION}",
+            "{} is {} version {version}, this build reads version {}",
             path.display(),
+            container.name,
+            container.version
         )));
     }
     let count = cursor.u32()? as usize;
@@ -330,7 +380,7 @@ fn parse_header(header: &[u8], path: &Path, bind: &SpecBinder<'_>) -> Result<Hea
                 path.display()
             )));
         }
-        if offset < HEADER_BYTES {
+        if offset < container.header_bytes {
             return Err(reject(format!(
                 "{}: section {index} offset {offset} runs into the header page",
                 path.display()
@@ -386,21 +436,25 @@ fn image_end(sections: &[(usize, usize)], path: &Path) -> Result<usize, String> 
 /// starts one page in, so the header page and the alignment padding never
 /// overlap one, and every later section starts on a page boundary: identical
 /// payloads therefore produce identical files.
-fn layout(sections: &[Vec<u8>]) -> Result<(Vec<(usize, usize)>, usize), String> {
+fn layout(
+    sections: &[Vec<u8>],
+    container: &Container,
+) -> Result<(Vec<(usize, usize)>, usize), String> {
     let mut offsets = Vec::with_capacity(sections.len());
     let mut end = PAGE;
     for section in sections {
-        let padded =
-            align_page(section.len()).ok_or_else(|| reject("MTP head section size overflows"))?;
+        let padded = align_page(section.len())
+            .ok_or_else(|| reject(format!("{} section size overflows", container.name)))?;
         offsets.push((end, section.len()));
         end = end
             .checked_add(padded)
-            .ok_or_else(|| reject("MTP head file size overflows"))?;
+            .ok_or_else(|| reject(format!("{} file size overflows", container.name)))?;
     }
     Ok((offsets, end))
 }
 
 fn encode_header(
+    container: &Container,
     offsets: &[(usize, usize)],
     spec: &[Section],
     digest: &str,
@@ -412,8 +466,8 @@ fn encode_header(
         return Err(reject("payload digest is not 64 hex-encoded bytes"));
     }
     let mut out = HeaderWriter { bytes: Vec::new() };
-    out.raw(PTQ1_MAGIC);
-    out.u32(PTQ1_VERSION);
+    out.raw(container.magic);
+    out.u32(container.version);
     out.u32(u32::try_from(spec.len()).map_err(|_| reject("too many sections"))?);
     out.u64(u64::try_from(payload_bytes).map_err(|_| reject("payload length overflows"))?);
     out.u64(u64::try_from(file_bytes).map_err(|_| reject("file length overflows"))?);
@@ -434,13 +488,15 @@ fn encode_header(
         out.u64(u64::try_from(offset).map_err(|_| reject("offset overflows"))?);
         out.u64(u64::try_from(length).map_err(|_| reject("length overflows"))?);
     }
-    if out.bytes.len() > HEADER_BYTES {
+    if out.bytes.len() > container.header_bytes {
         return Err(reject(format!(
-            "MTP head header needs {} bytes, a page holds {HEADER_BYTES}",
-            out.bytes.len()
+            "{} header needs {} bytes, a page holds {}",
+            container.name,
+            out.bytes.len(),
+            container.header_bytes
         )));
     }
-    out.bytes.resize(HEADER_BYTES, 0);
+    out.bytes.resize(container.header_bytes, 0);
     Ok(out.bytes)
 }
 
@@ -449,6 +505,16 @@ fn encode_header(
 /// digest, which is what lets the file validate itself on every load.
 pub(super) fn write_artifact(
     path: &Path,
+    spec: &[Section],
+    sections: &[Vec<u8>],
+) -> std::io::Result<HeadFile> {
+    write_container(path, &MTP_CONTAINER, spec, sections)
+}
+
+/// [`write_artifact`] for any [`Container`].
+pub fn write_container(
+    path: &Path,
+    container: &Container,
     spec: &[Section],
     sections: &[Vec<u8>],
 ) -> std::io::Result<HeadFile> {
@@ -468,20 +534,28 @@ pub(super) fn write_artifact(
         }
     }
     let digest = digest_of(sections.iter().map(Vec::as_slice));
-    let (offsets, image_bytes) = layout(sections).map_err(malformed)?;
+    let (offsets, image_bytes) = layout(sections, container).map_err(malformed)?;
     let payload_bytes = sections
         .iter()
         .try_fold(0_usize, |total, section| total.checked_add(section.len()))
         .ok_or_else(|| malformed(reject("payload length overflows")))?;
-    let header =
-        encode_header(&offsets, spec, &digest, payload_bytes, image_bytes).map_err(malformed)?;
+    let header = encode_header(
+        container,
+        &offsets,
+        spec,
+        &digest,
+        payload_bytes,
+        image_bytes,
+    )
+    .map_err(malformed)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // A crashed writer can leave a temporary behind; the process id in the name
     // makes clearing it safe.
     let temp = path.with_file_name(format!(
-        ".mtp-head-{}-{}.tmp",
+        "{}-{}-{}.tmp",
+        container.temp_prefix,
         std::process::id(),
         digest.get(..16).unwrap_or(&digest)
     ));
@@ -491,6 +565,7 @@ pub(super) fn write_artifact(
             .write(true)
             .create_new(true)
             .open(&temp)?;
+        let widen = |error| widen(error, container);
         file.set_len(u64::try_from(image_bytes).map_err(widen)?)?;
         file.write_all(&header)?;
         for (&(offset, _), section) in offsets.iter().zip(sections) {

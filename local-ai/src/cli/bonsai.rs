@@ -21,6 +21,7 @@ use crate::{DEFAULT_MTP_DEPTH, MAX_MTP_DEPTH};
 enum ExportKind {
     Index,
     MtpHead { dir: PathBuf },
+    DflashHead { dir: PathBuf },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,13 +33,14 @@ enum OutputMode {
 }
 
 /// The kinds `--export` accepts, for every message that has to name them.
-const EXPORT_KINDS: &str = "index, mtp-head=DIR";
+const EXPORT_KINDS: &str = "index, mtp-head=DIR, dflash-head=DIR";
 
 /// How an [`OutputMode::Export`] is spelled, for its error messages.
 const fn export_flag(kind: &ExportKind) -> &'static str {
     match kind {
         ExportKind::Index => "--export index",
         ExportKind::MtpHead { .. } => "--export mtp-head=DIR",
+        ExportKind::DflashHead { .. } => "--export dflash-head=DIR",
     }
 }
 
@@ -57,6 +59,11 @@ fn parse_export(requested: &str) -> Result<ExportKind, String> {
         ("mtp-head", None) => Err("--export mtp-head requires =DIR".into()),
         ("mtp-head", Some("")) => Err("--export mtp-head requires a non-empty =DIR".into()),
         ("mtp-head", Some(dir)) => Ok(ExportKind::MtpHead {
+            dir: PathBuf::from(dir),
+        }),
+        ("dflash-head", None) => Err("--export dflash-head requires =DIR".into()),
+        ("dflash-head", Some("")) => Err("--export dflash-head requires a non-empty =DIR".into()),
+        ("dflash-head", Some(dir)) => Ok(ExportKind::DflashHead {
             dir: PathBuf::from(dir),
         }),
         (kind, _) => Err(format!(
@@ -100,6 +107,11 @@ fn usage() {
     eprintln!("                         DIR/model_mtp_ternary.safetensors into");
     eprintln!("                         DIR/mtp-head-ptq1-v1.bin (no engine, no");
     eprintln!("                         checkpoint: head file only)");
+    eprintln!("                       dflash-head=DIR");
+    eprintln!("                         convert a DFlash2 drafter from");
+    eprintln!("                         DIR/model.safetensors and DIR/config.json");
+    eprintln!("                         into DIR/dflash2-drafter-int8-v1.bin");
+    eprintln!("                         (per-row int8; no engine, no checkpoint)");
     eprintln!("  --no-speculation   A/B baseline: disable MTP and suffix lookup");
     eprintln!(
         "  --mtp-depth N      Drafts per speculative round (1-{MAX_MTP_DEPTH}, \
@@ -232,9 +244,9 @@ fn parse_mtp_depth(value: &str) -> Result<usize, String> {
     Ok(depth)
 }
 
-/// Writes the artifact an [`ExportKind`] names and returns. Neither kind opens
-/// the engine: `index` checks the GGUF, and `mtp-head` packs the head file
-/// alone.
+/// Writes the artifact an [`ExportKind`] names and returns. No kind opens
+/// the engine: `index` checks the GGUF, `mtp-head` packs the head file alone,
+/// and `dflash-head` converts the drafter checkpoint alone.
 fn export(resources: &Resources, kind: &ExportKind) -> crate::Result<()> {
     match kind {
         ExportKind::Index => {
@@ -245,6 +257,9 @@ fn export(resources: &Resources, kind: &ExportKind) -> crate::Result<()> {
         ExportKind::MtpHead { dir } => {
             // No engine and no checkpoint: this packs the head file alone.
             println!("{}", json!(local_engine::export_head(dir)?));
+        }
+        ExportKind::DflashHead { dir } => {
+            println!("{}", json!(local_engine::export_dflash_head(dir)?));
         }
     }
     Ok(())
@@ -449,6 +464,12 @@ mod tests {
                     dir: PathBuf::from("/tmp/head"),
                 },
             ),
+            (
+                "--export dflash-head=/tmp/drafter",
+                ExportKind::DflashHead {
+                    dir: PathBuf::from("/tmp/drafter"),
+                },
+            ),
         ] {
             let parsed = parse(&args(&command.split(' ').collect::<Vec<_>>())).expect(command);
             assert_eq!(parsed.output, OutputMode::Export(kind), "{command}");
@@ -471,32 +492,40 @@ mod tests {
                 "--export mtp-head requires a non-empty =DIR",
             ),
             (
+                vec!["--export", "dflash-head"],
+                "--export dflash-head requires =DIR",
+            ),
+            (
+                vec!["--export", "dflash-head="],
+                "--export dflash-head requires a non-empty =DIR",
+            ),
+            (
                 vec!["--export", "mtp-head-zstd=/tmp/head"],
-                "unknown --export kind: mtp-head-zstd (expected index, mtp-head=DIR)",
+                "unknown --export kind: mtp-head-zstd (expected index, mtp-head=DIR, dflash-head=DIR)",
             ),
             (
                 vec!["--export", "mtp-head-ternary=/tmp/head"],
-                "unknown --export kind: mtp-head-ternary (expected index, mtp-head=DIR)",
+                "unknown --export kind: mtp-head-ternary (expected index, mtp-head=DIR, dflash-head=DIR)",
             ),
             (
                 vec!["--export", "foo"],
-                "unknown --export kind: foo (expected index, mtp-head=DIR)",
+                "unknown --export kind: foo (expected index, mtp-head=DIR, dflash-head=DIR)",
             ),
             (
                 vec!["--export=foo"],
-                "unknown --export kind: foo (expected index, mtp-head=DIR)",
+                "unknown --export kind: foo (expected index, mtp-head=DIR, dflash-head=DIR)",
             ),
             (
                 vec!["--export="],
-                "--export requires a kind (index, mtp-head=DIR)",
+                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR)",
             ),
             (
                 vec!["--export"],
-                "--export requires a kind (index, mtp-head=DIR)",
+                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR)",
             ),
             (
                 vec!["--export", "--json"],
-                "--export requires a kind (index, mtp-head=DIR)",
+                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR)",
             ),
         ] {
             let error = parse(&args(&input)).expect_err(&format!("{input:?}"));
