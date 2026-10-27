@@ -6,7 +6,7 @@ use super::{
 /// Blocks up to this many rows (decode and speculative verification) take the
 /// fused convolution kernel, whose threadgroups normalize each row's heads in
 /// turn; prefill chunks keep one threadgroup per row and head.
-const SHORT_BLOCK: u32 = 32;
+pub(super) const SHORT_BLOCK: u32 = 32;
 
 /// A recurrent layer's 48-row BF16 alpha or beta projection. These sensitive
 /// projections read the unrotated input: they are NOT Hadamard-folded.
@@ -20,13 +20,14 @@ pub(super) const fn decay_projection(weights: &BonsaiMetalTensor) -> Bf16Matrix<
 }
 
 /// Where [`BonsaiModel::recurrent_inputs`] leaves what the recurrence and a
-/// later replay read.
+/// later replay read, and the tape rows it folds in first.
 #[derive(Clone, Copy)]
 struct RecurrentInputs<'a> {
     raw: &'a MetalBuffer,
     final_history: &'a MetalBuffer,
     decay: &'a MetalBuffer,
     beta: &'a MetalBuffer,
+    fold: Option<local_metal::bonsai_ops::TapeFold<'a>>,
 }
 
 impl BonsaiModel {
@@ -174,16 +175,19 @@ impl BonsaiModel {
     }
 
     /// During verification the layer keeps its start state and history: the
-    /// block writes its final ones, and the compact inputs a partial commit
-    /// replays, straight to `rollback` (see [`BonsaiModel::commit_verified`]).
+    /// block writes its final ones to `rollback`, and the compact inputs a
+    /// partial commit keeps to the tape (up to [`super::tape::TAPE_ROWS`]
+    /// rows) or to `rollback` (see [`BonsaiModel::commit_verified`]).
+    /// `index` is the layer's place among the recurrent layers.
     pub(super) fn recurrent(
         &self,
         batch: &mut CommandBatch,
         layer: &RecurrentLayer,
+        index: usize,
         tokens: u32,
         rollback: Option<&RollbackLayer>,
     ) -> crate::Result<()> {
-        self.recurrent_core(batch, layer, tokens, rollback)?;
+        self.recurrent_core(batch, layer, index, tokens, rollback)?;
         self.project(
             batch,
             &layer.output,
@@ -194,33 +198,51 @@ impl BonsaiModel {
     }
 
     /// [`Self::recurrent`] up to its output projection's rotated input in
-    /// `scratch.rotated_attention`.
+    /// `scratch.rotated_attention`. The resident sequence's pending tape rows
+    /// fold in first, which only blocks of up to [`SHORT_BLOCK`] rows do: a
+    /// longer block's caller settles the tape before it.
     pub(super) fn recurrent_core(
         &self,
         batch: &mut CommandBatch,
         layer: &RecurrentLayer,
+        index: usize,
         tokens: u32,
         rollback: Option<&RollbackLayer>,
     ) -> crate::Result<()> {
         let scratch = &self.scratch;
-        let (inputs, decay, beta, final_state, final_history) = rollback.map_or(
-            (
+        let (inputs, decay, beta, final_state, final_history) = match rollback {
+            None => (
                 &scratch.query_gate,
                 &scratch.decay,
                 &scratch.beta,
                 &layer.state,
                 &layer.history,
             ),
-            |rollback| {
+            Some(rollback) if tokens as usize <= super::tape::TAPE_ROWS => {
+                let step = self.tape.step(index);
                 (
-                    &rollback.inputs,
-                    &rollback.decay,
-                    &rollback.beta,
+                    &step.raw,
+                    &step.decay,
+                    &step.beta,
                     &rollback.state,
                     &rollback.history,
                 )
-            },
-        );
+            }
+            Some(rollback) => (
+                &rollback.inputs,
+                &rollback.decay,
+                &rollback.beta,
+                &rollback.state,
+                &rollback.history,
+            ),
+        };
+        let fold =
+            (self.tape.pending() > 0).then(|| self.tape.fold(index, (&self.tape_scratch, 0)));
+        if fold.is_some() && tokens > SHORT_BLOCK {
+            return Err(crate::Error::InvalidArgument(
+                "a long block needs the tape settled first".into(),
+            ));
+        }
         self.recurrent_inputs(
             batch,
             layer,
@@ -230,19 +252,31 @@ impl BonsaiModel {
                 final_history,
                 decay,
                 beta,
+                fold,
             },
         )?;
-        self.ops.gdn_sequence_into(
-            batch,
-            self.state_format,
-            &scratch.convolved,
-            decay,
-            beta,
-            &layer.state,
-            final_state,
-            &scratch.recurrent_output,
-            tokens,
-        )?;
+        match fold {
+            Some(fold) => self.ops.gdn_fold(
+                batch,
+                self.state_format,
+                [(&scratch.convolved, 0), (decay, 0), (beta, 0)],
+                [&layer.state, final_state],
+                (&scratch.recurrent_output, 0),
+                fold,
+                tokens,
+            )?,
+            None => self.ops.gdn_sequence_into(
+                batch,
+                self.state_format,
+                &scratch.convolved,
+                decay,
+                beta,
+                &layer.state,
+                final_state,
+                &scratch.recurrent_output,
+                tokens,
+            )?,
+        }
         // The output norm, gate and rotation in one dispatch, bitwise
         // `gdn_postprocess_rows` then `project_attention`'s rotation.
         self.ops.gdn_postprocess_transform(
@@ -305,7 +339,29 @@ impl BonsaiModel {
                 crate::Result::Ok(())
             })?;
         }
-        if tokens <= SHORT_BLOCK {
+        if let Some(fold) = out.fold {
+            self.ops.conv_l2_decay_fold(
+                batch,
+                &layer.convolution,
+                [&layer.history, out.final_history],
+                local_metal::bonsai_ops::ConvRows {
+                    input: (out.raw, 0),
+                    out: (&scratch.convolved, 0),
+                    decay_inputs: [
+                        (&layer.decay, 0),
+                        (&scratch.alpha, 0),
+                        (&layer.dt, 0),
+                        (&scratch.raw_beta, 0),
+                    ],
+                    decay: (out.decay, 0),
+                    beta: (out.beta, 0),
+                    raw_copy: None,
+                },
+                self.epsilon,
+                fold,
+                tokens,
+            )?;
+        } else if tokens <= SHORT_BLOCK {
             self.ops.conv_l2_decay_into(
                 batch,
                 out.raw,

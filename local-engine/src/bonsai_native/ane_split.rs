@@ -1502,6 +1502,8 @@ impl BonsaiModel {
         tokens: &[u32],
         output: BlockOutput<'_>,
     ) -> crate::Result<()> {
+        // Prefill blocks do not fold the tape.
+        self.settle_tape()?;
         let valid = !matches!(output, BlockOutput::Verify(_))
             && crate::bonsai_vision::check_tokens(tokens, self.position, self.images.as_deref())
                 .is_ok()
@@ -2101,7 +2103,7 @@ impl BonsaiModel {
         self.encode_taps_at(batch, index, half.rows as usize, half.hidden, half.position)?;
         match &layer.attention {
             AttentionLayer::Recurrent(recurrent) => {
-                self.recurrent_core(batch, recurrent, half.rows, None)?;
+                self.recurrent_core(batch, recurrent, 0, half.rows, None)?;
             }
             AttentionLayer::Full(full) => {
                 self.attention_core_at(batch, full, half.rows, half.rope, half.position)?;

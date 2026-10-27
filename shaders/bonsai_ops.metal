@@ -1902,3 +1902,187 @@ kernel void bo_gather_rows(
         if (from != i) rows[ulong(i) * words + column] = rows[ulong(from) * words + column];
     }
 }
+
+// ---- GDN tape (local-engine bonsai_native/tape.rs) ----
+// A verify step that keeps fewer rows than it ran leaves the rows it keeps on
+// its sequence's tape (their raw QKV projection rows, decay and beta) and the
+// state as it was before them; the sequence's next step folds them into the
+// state and convolution history before its own rows, instead of a replay pass
+// after the verify. The fold is the replay's arithmetic: bo_conv's window over
+// the kept rows from the committed history (which then holds the window they
+// leave), bo_l2_qk's key normalization, and the recurrence of bo_gdn, rounded
+// once to the state's storage type, so the folded state is bitwise the
+// replayed one. The *_fold kernels are their plain counterparts with this
+// prologue; `pending` 0 folds nothing.
+
+// The pending rows' convolution, from the committed history into
+// `pending_out`, keys normalized; the history then holds what the rows leave.
+// Every thread of a threadgroup runs it (it synchronizes the threadgroup).
+static inline void bonsai_tape_conv(
+    device const float *pending_raw, device const float *weights, device float *history,
+    device float *pending_out, uint pending, float epsilon, uint group, uint tid,
+    threadgroup float *partial
+) {
+    if (pending == 0) return;
+    bonsai_conv_impl(pending_raw, weights, history, pending_out, history, pending,
+                     group * 128 + tid);
+    // Only the keys (heads 16..31) feed the recurrence.
+    if (group < 16 || group >= 32) return;
+    for (uint token = 0; token < pending; ++token) {
+        bonsai_l2_qk_impl(pending_out, pending_out, epsilon, token * 32 + group, tid, partial);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// bo_conv_l2_decay with the pending rows folded in first; `copy_raw` also
+// copies the step's raw rows to `raw_out` (a batched sequence's tape).
+kernel void bo_conv_l2_decay_fold(
+    device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
+    device float *history [[buffer(2)]], device float *output [[buffer(3)]],
+    device const float *a [[buffer(4)]], device const float *alpha [[buffer(5)]],
+    device const float *dt [[buffer(6)]], device const float *raw_beta [[buffer(7)]],
+    device float *decay [[buffer(8)]], device float *beta [[buffer(9)]],
+    device float *final_history [[buffer(10)]], device const float *pending_raw [[buffer(11)]],
+    device float *pending_out [[buffer(12)]], device float *raw_out [[buffer(13)]],
+    constant uint &tokens [[buffer(14)]], constant uint &pending [[buffer(15)]],
+    constant uint &copy_raw [[buffer(16)]], constant float &epsilon [[buffer(17)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float partial[4];
+    if (group == 80) {
+        for (uint head = tid; head < 48 * tokens; head += 128) {
+            bonsai_decay_impl(a, alpha, dt, raw_beta, decay, beta, tokens, head);
+        }
+        return;
+    }
+    bonsai_tape_conv(pending_raw, weights, history, pending_out, pending, epsilon, group, tid,
+                     partial);
+    const uint channel = group * 128 + tid;
+    if (copy_raw != 0) {
+        for (uint token = 0; token < tokens; ++token) {
+            raw_out[token * 10240 + channel] = input[token * 10240 + channel];
+        }
+    }
+    bonsai_conv_impl(input, weights, history, output, final_history, tokens, channel);
+    if (group >= 32) return;
+    for (uint token = 0; token < tokens; ++token) {
+        bonsai_l2_qk_impl(output, output, epsilon, token * 32 + group, tid, partial);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// bo_conv_l2_decay_tree with the pending rows folded in first.
+kernel void bo_conv_l2_decay_tree_fold(
+    device const float *input [[buffer(0)]], device const float *weights [[buffer(1)]],
+    device float *history [[buffer(2)]], device float *output [[buffer(3)]],
+    device const float *a [[buffer(4)]], device const float *alpha [[buffer(5)]],
+    device const float *dt [[buffer(6)]], device const float *raw_beta [[buffer(7)]],
+    device float *decay [[buffer(8)]], device float *beta [[buffer(9)]],
+    device const int *tree [[buffer(10)]], device const float *pending_raw [[buffer(11)]],
+    device float *pending_out [[buffer(12)]],
+    constant uint &tokens [[buffer(13)]], constant uint &pending [[buffer(14)]],
+    constant float &epsilon [[buffer(15)]],
+    uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float partial[4];
+    if (group == 80) {
+        for (uint head = tid; head < 48 * tokens; head += 128) {
+            bonsai_decay_impl(a, alpha, dt, raw_beta, decay, beta, tokens, head);
+        }
+        return;
+    }
+    bonsai_tape_conv(pending_raw, weights, history, pending_out, pending, epsilon, group, tid,
+                     partial);
+    bonsai_conv_tree_impl(input, weights, history, output, tree, tokens, group * 128 + tid);
+    if (group >= 32) return;
+    for (uint token = 0; token < tokens; ++token) {
+        bonsai_l2_qk_impl(output, output, epsilon, token * 32 + group, tid, partial);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// The pending rows' recurrence over value rows first_row.. (bo_gdn's
+// arithmetic, outputs dropped), stored once in the state's type. The kernel
+// that follows reads the rows back in the same threads.
+template<uint rows, typename State>
+static inline void bonsai_tape_gdn(
+    device const float *qkv, device const float *decay, device const float *beta,
+    device State *state, uint pending, uint first_row, uint lane
+) {
+    if (pending == 0) return;
+    const uint head = first_row / 128, key_group = head % 16;
+    float values[rows][4];
+    for (uint r = 0; r < rows; ++r) {
+        for (uint i = 0; i < 4; ++i) {
+            values[r][i] = float(state[(first_row + r) * 128 + lane + i * 32]);
+        }
+    }
+    for (uint token = 0; token < pending; ++token) {
+        const uint token_offset = token * 10240;
+        const float d = decay[token * 48 + head], b = beta[token * 48 + head];
+        float k[4], prediction[rows] = {};
+        for (uint i = 0; i < 4; ++i) {
+            k[i] = qkv[token_offset + 2048 + key_group * 128 + lane + i * 32];
+            for (uint r = 0; r < rows; ++r) {
+                values[r][i] *= d;
+                prediction[r] = fma(values[r][i], k[i], prediction[r]);
+            }
+        }
+        for (uint r = 0; r < rows; ++r) {
+            const float correction =
+                (qkv[token_offset + 4096 + first_row + r] - simd_sum(prediction[r])) * b;
+            for (uint i = 0; i < 4; ++i) values[r][i] = fma(k[i], correction, values[r][i]);
+        }
+    }
+    for (uint r = 0; r < rows; ++r) {
+        for (uint i = 0; i < 4; ++i) {
+            bonsai_store_state(state[(first_row + r) * 128 + lane + i * 32], values[r][i]);
+        }
+    }
+}
+
+#define BONSAI_GDN_FOLD(SUFFIX, STATE) \
+kernel void bo_gdn_fold##SUFFIX( \
+    device const float *qkv [[buffer(0)]], device const float *decay [[buffer(1)]], \
+    device const float *beta [[buffer(2)]], device STATE *state [[buffer(3)]], \
+    device float *output [[buffer(4)]], device STATE *final_state [[buffer(5)]], \
+    device const float *pending_qkv [[buffer(6)]], device const float *pending_decay [[buffer(7)]], \
+    device const float *pending_beta [[buffer(8)]], \
+    constant uint &tokens [[buffer(9)]], constant uint &pending [[buffer(10)]], \
+    uint group [[threadgroup_position_in_grid]], \
+    uint simds [[simdgroups_per_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]] \
+) { \
+    const uint row = group * simds + simd; \
+    bonsai_tape_gdn<1>(pending_qkv, pending_decay, pending_beta, state, pending, row, lane); \
+    bonsai_gdn_row<STATE>(qkv, decay, beta, state, output, final_state, tokens, row, lane); \
+} \
+kernel void bo_gdn_rows_4_fold##SUFFIX( \
+    device const float *qkv [[buffer(0)]], device const float *decay [[buffer(1)]], \
+    device const float *beta [[buffer(2)]], device STATE *state [[buffer(3)]], \
+    device float *output [[buffer(4)]], device STATE *final_state [[buffer(5)]], \
+    device const float *pending_qkv [[buffer(6)]], device const float *pending_decay [[buffer(7)]], \
+    device const float *pending_beta [[buffer(8)]], \
+    constant uint &tokens [[buffer(9)]], constant uint &pending [[buffer(10)]], \
+    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]] \
+) { \
+    bonsai_tape_gdn<4>(pending_qkv, pending_decay, pending_beta, state, pending, group * 4, lane); \
+    bonsai_gdn_rows<4>(qkv, decay, beta, state, output, final_state, tokens, group, lane); \
+} \
+kernel void bo_gdn_tree_rows_4_fold##SUFFIX( \
+    device const float *qkv [[buffer(0)]], device const float *decay [[buffer(1)]], \
+    device const float *beta [[buffer(2)]], device STATE *state [[buffer(3)]], \
+    device float *output [[buffer(4)]], device const int *tree [[buffer(5)]], \
+    device const float *pending_qkv [[buffer(6)]], device const float *pending_decay [[buffer(7)]], \
+    device const float *pending_beta [[buffer(8)]], \
+    constant uint &tokens [[buffer(9)]], constant uint &pending [[buffer(10)]], \
+    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]] \
+) { \
+    bonsai_tape_gdn<4>(pending_qkv, pending_decay, pending_beta, state, pending, group * 4, lane); \
+    bonsai_gdn_tree_rows<4>(qkv, decay, beta, state, output, tree, tokens, group, lane); \
+}
+
+BONSAI_GDN_FOLD(, float)
+BONSAI_GDN_FOLD(_f16, half)
+BONSAI_GDN_FOLD(_bf16, bfloat)
+#undef BONSAI_GDN_FOLD

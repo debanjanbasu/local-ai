@@ -131,6 +131,10 @@ impl BonsaiModel {
             count,
             HadamardDirection::Inverse,
         )?;
+        if count > super::layers::SHORT_BLOCK {
+            // Only short blocks fold the tape in.
+            self.encode_settle(&mut batch)?;
+        }
         let mut recurrent_index = 0;
         for (index, layer) in self.layers.iter().enumerate() {
             if SUBMIT_BEFORE_LAYERS.contains(&index) {
@@ -158,8 +162,8 @@ impl BonsaiModel {
             match &layer.attention {
                 AttentionLayer::Recurrent(recurrent) => {
                     let rollback = verify.map(|verifier| &verifier.rollback[recurrent_index]);
+                    self.recurrent(&mut batch, recurrent, recurrent_index, count, rollback)?;
                     recurrent_index += 1;
-                    self.recurrent(&mut batch, recurrent, count, rollback)?;
                 }
                 AttentionLayer::Full(full) => {
                     self.full_attention(&mut batch, full, count, rope)?;
@@ -174,6 +178,8 @@ impl BonsaiModel {
             )?;
             self.feed_forward_branch(&mut batch, layer, count)?;
         }
+        // Every recurrent layer folded the tape's pending rows in.
+        self.tape.clear();
         if matches!(output, BlockOutput::None) {
             self.ops.residual_add(
                 &mut batch,

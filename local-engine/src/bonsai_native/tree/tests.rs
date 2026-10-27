@@ -625,3 +625,83 @@ fn tree_verify_cost_table() {
     }
     eprintln!("{:#}", serde_json::json!(table));
 }
+
+/// A verify's kept rows left on the tape and folded into the next step leave
+/// bitwise what the replay after the verify left, which `settle_tape` runs:
+/// after a partial chain, an off-chain tree path and a full chain, folded
+/// into a decode step, a chain verify and a tree verify, every logit row of
+/// that step and the recurrent state after it are the same bits.
+#[test]
+#[ignore = "requires the Bonsai GGUF and a Metal device"]
+fn tape_folds_are_bitwise_the_replay() {
+    let mut model = load(96);
+    let fixture = Fixture::new(&mut model, &PROMPT, 0);
+    let anchor = fixture.anchor;
+    let tree = |tokens: &[u32], parents: &[i32]| {
+        DraftTree::from_parents(tokens, parents).expect("draft tree")
+    };
+    let firsts = [
+        (DraftTree::chain(&[anchor, 11, 12, 13]), vec![0, 1]),
+        (
+            tree(&[anchor, 11, 12, 13, 14], &[-1, 0, 0, 2, 1]),
+            vec![0, 2, 3],
+        ),
+        (DraftTree::chain(&[anchor, 11, 12]), vec![0, 1, 2]),
+        (
+            tree(
+                &[anchor, 11, 12, 13, 14, 15, 16, 17],
+                &[-1, 0, 1, 2, 3, 4, 5, 0],
+            ),
+            vec![0, 1, 2, 3, 4, 5, 6],
+        ),
+    ];
+    let seconds = [
+        DraftTree::chain(&[21]),
+        DraftTree::chain(&[21, 22, 23]),
+        tree(&[21, 22, 23, 24], &[-1, 0, 0, 1]),
+    ];
+    let mut folded = 0;
+    for (first, path) in &firsts {
+        for second in &seconds {
+            let mut runs = Vec::new();
+            for settle in [false, true] {
+                fixture.restore(&mut model);
+                model.tree_verify(first).expect("first verify");
+                model.tree_commit(path).expect("first commit");
+                let pending = model.tape.pending();
+                assert_eq!(
+                    pending,
+                    if path.len() == first.len() && first.is_chain() {
+                        0
+                    } else {
+                        path.len()
+                    }
+                );
+                if settle {
+                    model.settle_tape().expect("settle");
+                    assert_eq!(model.tape.pending(), 0);
+                } else {
+                    folded += usize::from(pending > 0);
+                }
+                // The second step runs at the first's last kept row's successor.
+                let mut second = second.clone();
+                second.tokens[0] = first.tokens[*path.last().expect("path")];
+                model.tree_verify(&second).expect("second verify");
+                assert_eq!(model.tape.pending(), 0, "the second step folds the tape");
+                let logits = (0..second.len())
+                    .map(|row| bits(&model.tree_logits(row).expect("logits")))
+                    .collect::<Vec<_>>();
+                model.tree_commit(&[0]).expect("second commit");
+                let snapshot = model.prompt_snapshot().expect("snapshot");
+                runs.push((logits, snapshot.recurrent.to_vec()));
+            }
+            assert!(
+                runs[0] == runs[1],
+                "folding the tape differs from replaying it: first {:?} path {path:?}, second {:?}",
+                first.parents,
+                second.parents
+            );
+        }
+    }
+    assert!(folded >= 9, "only {folded} runs folded tape rows");
+}
