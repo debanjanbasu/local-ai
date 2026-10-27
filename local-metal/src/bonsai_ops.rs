@@ -435,6 +435,9 @@ impl BonsaiOps {
                 "bo_attn_split_tensor_rows_q8_3",
                 "bo_attn_split_tensor_rows_q8_4",
                 "bo_attn_tensor_rows_q8",
+                "bo_attn_split_tensor_rows_q8_tree_2",
+                "bo_attn_split_tensor_rows_q8_tree_3",
+                "bo_attn_split_tensor_rows_q8_tree_4",
             ]
         } else {
             &[]

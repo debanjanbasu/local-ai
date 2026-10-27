@@ -1234,8 +1234,10 @@ kernel void bo_attn_gather_rows(
 }
 
 // Online softmax over one 32-key tile of packed score rows, eight rows per
-// pass (row r is token r / 6, which sees keys before first_prefix + r / 6).
-template <uint TOKENS>
+// pass (row r is token r / 6, which sees keys before first_prefix + STEP * r / 6:
+// STEP 1 for a verify block's consecutive rows, 0 for a tree verify's rows,
+// which all attend the same history).
+template <uint TOKENS, uint STEP>
 static inline void bonsai_attn_rows_softmax(
     threadgroup float *scores, threadgroup float *correction, threadgroup float *maximum,
     threadgroup float *denominator, uint first_prefix, uint begin, uint start, uint count,
@@ -1245,7 +1247,7 @@ static inline void bonsai_attn_rows_softmax(
     #pragma clang loop unroll(full)
     for (uint j = 0; j < nt; ++j) {
         const uint live = min(8u, 6 * TOKENS - 8 * j);
-        const uint prefix = first_prefix + (8 * j + row) / 6;
+        const uint prefix = first_prefix + STEP * ((8 * j + row) / 6);
         const bool active = row < live && begin < prefix;
         const uint limit = prefix > start ? min(count, prefix - start) : 0;
         threadgroup float *s = scores + j * nq * nk;
@@ -1276,7 +1278,7 @@ static inline void bonsai_attn_rows_softmax(
     }
 }
 
-template <uint TOKENS>
+template <uint TOKENS, uint STEP>
 static inline void bonsai_attn_split_rows_q8_impl(
     device float *query, device const uchar *key, device const uchar *value,
     device float *partials, uint first_prefix, uint splits, uint split_tokens,
@@ -1287,7 +1289,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
     constexpr uint nt = (6 * TOKENS + 7) / 8;
     const uint kv_head = group % 4, split = group / 4;
     const uint begin = split * split_tokens;
-    const uint end = min(begin + split_tokens, first_prefix + TOKENS - 1);
+    const uint end = min(begin + split_tokens, first_prefix + STEP * (TOKENS - 1));
     const uint row = tid / 16, lane = tid % 16;
     if (tid < nq * nt) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
     auto live = [](uint j) { return min(8u, 6 * TOKENS - 8 * j); };
@@ -1331,7 +1333,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        bonsai_attn_rows_softmax<TOKENS>(scores, correction, maximum, denominator,
+        bonsai_attn_rows_softmax<TOKENS, STEP>(scores, correction, maximum, denominator,
             first_prefix, begin, start, count, row, lane);
         bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1365,7 +1367,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
                 const auto index = acc.get_multidimensional_index(i);
                 const uint r = index[1];
                 if (r < live(j)) {
-                    const bool active = begin < first_prefix + (8 * j + r) / 6;
+                    const bool active = begin < first_prefix + STEP * ((8 * j + r) / 6);
                     record(j, r)[2 + index[0]] = active ? acc[i] : 0.0f;
                 }
             }
@@ -1377,7 +1379,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
     if (lane == 0) {
         for (uint j = 0; j < nt; ++j) {
             if (row < live(j)) {
-                const bool active = begin < first_prefix + (8 * j + row) / 6;
+                const bool active = begin < first_prefix + STEP * ((8 * j + row) / 6);
                 device float *out = record(j, row);
                 out[0] = active ? maximum[j * nq + row] : -INFINITY;
                 out[1] = active ? denominator[j * nq + row] : 0.0f;
@@ -1393,7 +1395,7 @@ static inline void bonsai_attn_split_rows_q8_impl(
 // bitwise those of the per-tile form; split kernel time drops 3-11% at
 // 1K-262K tokens. Four rows keep the per-tile form: the joint form was 3-9%
 // faster from 2K to 32K tokens but 1-3% slower at 128K-262K.
-template <uint TOKENS>
+template <uint TOKENS, uint STEP>
 static inline void bonsai_attn_split_rows_q8_joint_impl(
     device float *query, device const uchar *key, device const uchar *value,
     device float *partials, uint first_prefix, uint splits, uint split_tokens,
@@ -1405,7 +1407,7 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
     constexpr int m = int(nq * nt), live_rows = int(6 * TOKENS);
     const uint kv_head = group % 4, split = group / 4;
     const uint begin = split * split_tokens;
-    const uint end = min(begin + split_tokens, first_prefix + TOKENS - 1);
+    const uint end = min(begin + split_tokens, first_prefix + STEP * (TOKENS - 1));
     const uint row = tid / 16, lane = tid % 16;
     if (tid < nq * nt) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
 
@@ -1436,7 +1438,7 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
         qk.run(q, k, products);
         products.store(tensor(scores, dextents<int32_t, 2>(nk, m)));
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        bonsai_attn_rows_softmax<TOKENS>(scores, correction, maximum, denominator,
+        bonsai_attn_rows_softmax<TOKENS, STEP>(scores, correction, maximum, denominator,
             first_prefix, begin, start, count, row, lane);
         bonsai_kv_tile<nk>(value, start, count, kv_head, tile, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1458,13 +1460,13 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
             const auto index = acc.get_multidimensional_index(i);
             const uint r = index[1];
             if (r < uint(live_rows)) {
-                record(r)[2 + index[0]] = begin < first_prefix + r / 6 ? acc[i] : 0.0f;
+                record(r)[2 + index[0]] = begin < first_prefix + STEP * (r / 6) ? acc[i] : 0.0f;
             }
         }
     }
     if (lane == 0) {
         for (uint r = row; r < uint(live_rows); r += nq) {
-            const bool active = begin < first_prefix + r / 6;
+            const bool active = begin < first_prefix + STEP * (r / 6);
             device float *out = record(r);
             out[0] = active ? maximum[r] : -INFINITY;
             out[1] = active ? denominator[r] : 0.0f;
@@ -1472,8 +1474,8 @@ static inline void bonsai_attn_split_rows_q8_joint_impl(
     }
 }
 
-#define BONSAI_ATTN_SPLIT_ROWS_Q8(TOKENS)                                            \
-kernel void bo_attn_split_tensor_rows_q8_##TOKENS(                                   \
+#define BONSAI_ATTN_SPLIT_ROWS_Q8(NAME, TOKENS, STEP)                                \
+kernel void NAME(                                                                    \
     device float *query [[buffer(0)]], device const uchar *key [[buffer(1)]],         \
     device const uchar *value [[buffer(2)]], device float *partials [[buffer(3)]],    \
     constant uint &first_prefix [[buffer(4)]], constant uint &splits [[buffer(5)]],   \
@@ -1485,18 +1487,23 @@ kernel void bo_attn_split_tensor_rows_q8_##TOKENS(                              
     threadgroup float scores[nt * 8 * 32], correction[nt * 8], maximum[nt * 8],       \
         denominator[nt * 8];                                                       \
     if (TOKENS == 4) {                                                               \
-        bonsai_attn_split_rows_q8_impl<TOKENS>(query, key, value, partials,          \
+        bonsai_attn_split_rows_q8_impl<TOKENS, STEP>(query, key, value, partials,    \
             first_prefix, splits, split_tokens, group, tid, tile, scores, correction, \
             maximum, denominator);                                                   \
     } else {                                                                         \
-        bonsai_attn_split_rows_q8_joint_impl<TOKENS>(query, key, value, partials,    \
+        bonsai_attn_split_rows_q8_joint_impl<TOKENS, STEP>(query, key, value, partials, \
             first_prefix, splits, split_tokens, group, tid, tile, scores, correction, \
             maximum, denominator);                                                   \
     }                                                                                \
 }
-BONSAI_ATTN_SPLIT_ROWS_Q8(2)
-BONSAI_ATTN_SPLIT_ROWS_Q8(3)
-BONSAI_ATTN_SPLIT_ROWS_Q8(4)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_2, 2, 1)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_3, 3, 1)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_4, 4, 1)
+// A tree verify's history (bonsai_native/tree.rs): every row attends the keys
+// below the anchor, `first_prefix`, and nothing past it.
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_tree_2, 2, 0)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_tree_3, 3, 0)
+BONSAI_ATTN_SPLIT_ROWS_Q8(bo_attn_split_tensor_rows_q8_tree_4, 4, 0)
 
 
 // Causal Q8 prefill packed by KV head. bo_attn_tensor_q8 gives each query head

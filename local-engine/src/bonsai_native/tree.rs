@@ -6,8 +6,10 @@
 //!
 //! - **Attention.** Its K/V row is written at cache row `start + r` with the
 //!   rotary position `start + depth[r]`; it attends the history below
-//!   `start` through the decode split kernel of that prefix, and its
-//!   ancestors and itself among the pass's rows key by key in path order
+//!   `start` through the decode split kernel of that prefix (or, from three
+//!   rows on a Q8 cache, the verify block's row kernel with every row's
+//!   prefix pinned at `start`), and its ancestors and itself among the
+//!   pass's rows key by key in path order
 //!   ([`local_metal::bonsai_ops::BonsaiOps::attention_tree_kv`]).
 //! - **Gated `DeltaNet`.** Its short convolution reads its ancestors' inputs,
 //!   and its recurrence starts from its parent's state: rebuilt from the
@@ -869,6 +871,7 @@ impl BonsaiModel {
             tokens,
             &state.descriptor,
             &state.partials,
+            &self.scratch.attention,
         )?;
         self.project_attention(batch, &layer.output, tokens)
     }

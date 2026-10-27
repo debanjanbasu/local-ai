@@ -7,9 +7,10 @@
 //! [`TREE_PATH`] for the commit.
 
 use super::{
-    AttentionKernel, BonsaiOps, CommandBatch, GdnStateFormat, KV_HEADS, KvLayout, MetalBuffer,
-    Q_HEADS, SPLIT, SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX, SPLIT_TENSOR_MIN_PREFIX,
-    SPLIT_TENSOR_SHORT, arg, need, no_alias, sequence_bytes, tensor_split_tokens,
+    AttentionKernel, AttentionWorkspace, BonsaiOps, CommandBatch, GdnStateFormat, KV_HEADS,
+    KvLayout, MetalBuffer, Q_HEADS, SPLIT, SPLIT_HEADS, SPLIT_TENSOR_LONG_MIN_PREFIX,
+    SPLIT_TENSOR_MIN_PREFIX, SPLIT_TENSOR_SHORT, arg, need, no_alias, sequence_bytes,
+    tensor_split_tokens,
 };
 
 /// Rows of the largest tree (`BONSAI_TREE_ROWS` in the shader).
@@ -214,11 +215,68 @@ impl BonsaiOps {
         Ok(())
     }
 
+    /// The history half of [`Self::attention_tree_kv`] on a Q8 cache: the
+    /// verify block's two-to-four-row kernel with every row's prefix pinned at
+    /// `position`, in groups of 4+4, 4+3, 4+2, 3+2, 4 or 3 rows. Each row
+    /// writes its own records, as the one-row form does.
+    fn attention_tree_rows_q8(
+        &self,
+        b: &mut CommandBatch,
+        [q, k_cache, v_cache, partials]: [&MetalBuffer; 4],
+        workspace: &AttentionWorkspace,
+        [position, tokens, splits, split_tokens]: [u32; 4],
+        rows_pipeline: usize,
+    ) -> crate::Result<()> {
+        need(&workspace.gathered, (4 * Q_HEADS * 256) as usize * 4)?;
+        let row_records = Q_HEADS as usize * splits as usize * 258 * 4;
+        let groups: &[u32] = match tokens {
+            8 => &[4, 4],
+            7 => &[4, 3],
+            6 => &[4, 2],
+            5 => &[3, 2],
+            _ => &[tokens],
+        };
+        let mut first = 0;
+        for &rows in groups {
+            self.go(
+                b,
+                rows_pipeline,
+                &[(q, first as usize * 6144 * 4), (&workspace.gathered, 0)],
+                &[rows],
+                &[],
+                (rows * Q_HEADS) as usize,
+                256,
+            );
+            // The tree kernels follow the gather, the three split kernels and
+            // the prefill kernel.
+            self.go(
+                b,
+                rows_pipeline + 3 + rows as usize,
+                &[
+                    (&workspace.gathered, 0),
+                    (k_cache, 0),
+                    (v_cache, 0),
+                    (partials, first as usize * row_records),
+                ],
+                &[position, splits, split_tokens],
+                &[],
+                (KV_HEADS * splits) as usize,
+                128,
+            );
+            first += rows;
+        }
+        Ok(())
+    }
+
     /// Full attention of a tree verify's `tokens` query rows, whose K/V rows
     /// sit at cache rows `position + row`: row `t` attends the history
     /// below `position` and, among the pass's rows, its ancestors and itself
     /// (`tree`, a tree descriptor). The history goes through the split kernel
-    /// a decode at prefix `position` uses, one row at a time; the tree zone
+    /// a decode at prefix `position` uses, one row at a time, or, for a Q8
+    /// cache on the tensor path, through the verify block's two-to-four-row
+    /// kernel with every row's prefix pinned at `position` (groups of 4+4,
+    /// 4+3, 4+2, 3+2, 4 or 3 rows; `workspace` holds the gathered queries).
+    /// The tree zone goes
     /// through `bo_attn_tree_tail`, key by key in path order, as the last
     /// partial record; `bo_attn_reduce` joins them. A row's numbers depend on
     /// `position`, its query and its path's keys alone, never on the other
@@ -236,6 +294,7 @@ impl BonsaiOps {
         tokens: u32,
         tree: &MetalBuffer,
         partials: &MetalBuffer,
+        workspace: &AttentionWorkspace,
     ) -> crate::Result<()> {
         check_rows(tokens)?;
         let end = position
@@ -257,8 +316,20 @@ impl BonsaiOps {
         let splits = self.tree_splits(layout, position);
         let row_records = Q_HEADS as usize * splits as usize * 258 * 4;
         let codes = layout.codes();
-        if position > 0 {
-            let history = self.tree_history(layout, position);
+        let history = self.tree_history(layout, position);
+        if let History::Tensor { split_tokens, .. } = history
+            && let Some(rows_pipeline) = self.tensor_rows
+            && layout == KvLayout::Q8
+            && tokens >= 3
+        {
+            self.attention_tree_rows_q8(
+                b,
+                [q, k_cache, v_cache, partials],
+                workspace,
+                [position, tokens, splits, split_tokens],
+                rows_pipeline,
+            )?;
+        } else if position > 0 {
             // Each row writes its own records; the split past the history is
             // empty and leaves (-inf, 0, zeros) for the tree zone to replace.
             b.independent(|b| {
