@@ -1374,11 +1374,11 @@ fn short_attention_splits_track_128_token_splits_next_token_distribution() {
 /// uneven wavefront block) and an 8,192-token one (eight full blocks) of
 /// this repository's text. Decode runs on the GPU in both, so only the
 /// prefill's ANE rounding differs. Measured on the M4 Pro: mean next-token
-/// KL about 7e-5 (5.5e-5 to 8.4e-5 across runs and splits; 1.4e-4 once with
-/// 3,584 output rows, beyond today's steps; Kapitsa gates its own at
-/// 3.84e-4). The bounds leave headroom over that: mean at most 2e-4, no row
-/// over 2e-3, and at least 60/64 top-1. A broken program or handoff lands
-/// far outside them.
+/// KL 6.3e-5 and 7.4e-5 (5.5e-5 to 8.4e-5 across earlier runs and splits;
+/// 1.4e-4 once with 3,584 output rows, beyond today's steps; Kapitsa gates
+/// its own at 3.84e-4). The bounds leave headroom over that: mean at most
+/// 2e-4, no row over 2e-3, and at least 60/64 top-1. A broken program or
+/// handoff lands far outside them.
 #[test]
 #[ignore = "requires the pinned model, a Metal device and the Neural Engine"]
 #[expect(clippy::cast_precision_loss)]
