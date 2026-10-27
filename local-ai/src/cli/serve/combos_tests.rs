@@ -18,7 +18,7 @@ use local_engine::{
     ChatMessage, ChatRequest, Event, EventStream, GenerationStats, PrefillProgress, Signal, Stats,
     ToolCall,
 };
-use local_services::tools::{Limits, Permissions, Toolbox};
+use local_services::tools::{Limits, Toolbox};
 
 use super::background::{Background, Pump, Resumed};
 use super::background_tests::{Scratch, Step, drained, event, script, stats, stopper, stored};
@@ -678,16 +678,7 @@ fn write_call(id: &str) -> Event {
 #[tokio::test]
 async fn the_hosted_tool_marker_is_recorded_once_before_any_call_runs() {
     let root = tempfile::tempdir().expect("root");
-    let toolbox = Toolbox::new(
-        Permissions {
-            root: Some(root.path().to_owned()),
-            write: true,
-            shell: false,
-            fetch_domains: Vec::new(),
-        },
-        Limits::default(),
-    )
-    .expect("toolbox");
+    let toolbox = Toolbox::new(root.path(), Limits::default()).expect("toolbox");
     let body = json!({"input":"hi","tools":[{"type":"function","name":"local_fs_write"}]});
     let make = |before: super::tool_loop::BeforeTools| {
         let prepared = prepare_responses(body.to_string().as_bytes()).expect("prepared");

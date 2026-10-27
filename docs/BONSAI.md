@@ -963,7 +963,7 @@ endpoint table); image input to generation runs on the checkpoint's own
 vision tower ([image input](#image-input)), while audio input still needs a
 multimodal generator.
 Client-executed `custom`/`local_shell`/`apply_patch` tools, `file_search` over
-the vector stores and opt-in sandboxed hosted tools are described in
+the vector stores and the always-on sandboxed hosted tools are described in
 [docs/TOOLS.md](TOOLS.md); other
 built-in tools and fine-tuning still need their own services; the
 Administration API is described in [docs/ADMIN.md](ADMIN.md). None is implemented by merely accepting its request fields.

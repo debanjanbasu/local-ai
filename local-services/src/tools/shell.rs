@@ -8,9 +8,8 @@
 //!   lookups (so nothing can ask `launchd` to start a process outside the
 //!   sandbox), file reads only of the system directories a shell needs, the
 //!   root and a per-call scratch directory (metadata is readable everywhere),
-//!   and file writes only to the scratch directory, `/dev/null` and, with the
-//!   `write` grant, the root outside any `.git` directory (at any depth, in
-//!   any case).
+//!   and file writes only to the scratch directory, `/dev/null` and the root
+//!   outside any `.git` directory (at any depth, in any case).
 //! - **`setrlimit`** in the child, before `exec`: `RLIMIT_CPU`,
 //!   `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, `RLIMIT_CORE` (zero) and
 //!   `RLIMIT_NPROC`, soft and hard alike so the command cannot raise them.
@@ -71,11 +70,10 @@ pub const DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// past which the caller abandons the call (killing it again on drop).
 pub const REAP_GRACE: Duration = Duration::from_secs(1);
 
-/// What one command may do, fixed by the server's grants.
+/// What one command may do, fixed by the server's limits.
 #[derive(Debug, Clone)]
 pub struct Policy {
     root: PathBuf,
-    write: bool,
     cpu_seconds: u64,
     file_bytes: u64,
     open_files: u64,
@@ -84,13 +82,11 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The policy for commands run in `root` (canonical), writing there only
-    /// with `write`.
+    /// The policy for commands run in, and writing to, `root` (canonical).
     #[must_use]
-    pub fn new(root: &Path, write: bool, limits: &Limits) -> Self {
+    pub fn new(root: &Path, limits: &Limits) -> Self {
         Self {
             root: root.to_owned(),
-            write,
             cpu_seconds: limits.shell_cpu_seconds,
             file_bytes: limits.shell_file_bytes,
             open_files: limits.shell_open_files,
@@ -212,7 +208,7 @@ pub async fn run_all(
 /// The Seatbelt profile. `ROOT` and `SCRATCH` are passed as parameters,
 /// never spliced into the text.
 #[must_use]
-pub fn profile(write: bool) -> String {
+pub fn profile() -> String {
     let mut profile = String::from(
         r#"(version 1)
 (deny default)
@@ -239,16 +235,14 @@ pub fn profile(write: bool) -> String {
 (allow file-write* (subpath (param "SCRATCH")))
 "#,
     );
-    if write {
-        // Never a `.git` component, at any depth and in any case, as the
-        // file tools refuse it (macOS file systems usually ignore case).
-        profile.push_str(
-            r#"(allow file-write*
+    // Never a `.git` component, at any depth and in any case, as the file
+    // tools refuse it (macOS file systems usually ignore case).
+    profile.push_str(
+        r#"(allow file-write*
   (require-all (subpath (param "ROOT"))
     (require-not (regex #"/\.[Gg][Ii][Tt](/|$)"))))
 "#,
-        );
-    }
+    );
     profile.push_str("(deny network*)\n");
     profile
 }
@@ -612,7 +606,7 @@ fn sandboxed(
     let mut builder = tokio::process::Command::new(SANDBOX_EXEC);
     builder
         .arg("-p")
-        .arg(profile(policy.write))
+        .arg(profile())
         .arg("-D")
         .arg(param("ROOT", root))
         .arg("-D")

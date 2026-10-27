@@ -86,7 +86,7 @@ pub struct VectorIndex {
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
     fields: Fields,
-    /// The embedding model, when installed (see [`Self::set_embedder`]).
+    /// The embedding model, set once after opening (see [`Self::set_embedder`]).
     embedder: RwLock<Option<Arc<dyn ChunkEmbedder>>>,
     /// Attachments whose backfill embedding failed in this process: tried
     /// again only once no other file waits (see [`Self::embed_next`]).

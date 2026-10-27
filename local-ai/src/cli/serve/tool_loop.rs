@@ -44,7 +44,7 @@ use local_engine::{
     CancelHandle, ChatMessage, ChatRequest, Event, EventRelay, EventStream, PrefillProgress,
     Signal, Stats, ToolCall, ToolChoice, ToolOutput,
 };
-use local_services::tools::{Output, ToolError, Toolbox, denial};
+use local_services::tools::{Output, ToolError, Toolbox};
 
 use super::admin::Meter;
 use super::file_search;
@@ -68,41 +68,28 @@ pub(super) struct Bounds {
     pub(super) call_timeout: Duration,
 }
 
-/// The hosted tools a server was started with: the toolbox's grants (none
-/// by default) and the loop's bounds, which `file_search` also runs within.
+/// The hosted tools of a server: the toolbox (every tool, rooted at the
+/// server's working directory) and the loop's bounds, which `file_search`
+/// also runs within.
 pub(super) struct Tools {
     pub(super) toolbox: Toolbox,
     pub(super) bounds: Bounds,
 }
 
-/// Refuse hosted tools in `kinds` that `tools` does not permit, and a
-/// `file_search` this server cannot run (`vector_stores` is `None` when it
-/// has none).
-pub(super) fn check(
-    tools: &Tools,
-    kinds: &Kinds,
-    vector_stores: Option<&VectorStores>,
-) -> Result<(), String> {
-    for hosted in kinds.all_hosted() {
-        match hosted.capability() {
-            Some(capability) if !tools.toolbox.allows(capability) => {
-                return Err(format!(
-                    "a declared tool is not permitted: {}",
-                    denial(capability)
-                ));
-            }
-            Some(_) => {}
-            None => {
-                if vector_stores.is_none() {
-                    return Err(
-                        "file_search is unavailable: this server has no vector stores \
-                                (no services store, or another local-ai process owns this data \
-                                directory's index)"
-                            .into(),
-                    );
-                }
-            }
-        }
+/// Refuse a `file_search` in `kinds` this server cannot run
+/// (`vector_stores` is `None` when another server owns the index); every
+/// other hosted tool always runs.
+pub(super) fn check(kinds: &Kinds, vector_stores: Option<&VectorStores>) -> Result<(), String> {
+    if vector_stores.is_none()
+        && kinds
+            .all_hosted()
+            .any(|hosted| hosted == Hosted::FileSearch)
+    {
+        return Err(
+            "file_search is unavailable: this server has no vector stores (another local-ai \
+             process owns this data directory's index)"
+                .into(),
+        );
     }
     Ok(())
 }

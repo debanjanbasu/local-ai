@@ -4,10 +4,10 @@ Durable native services shared by the `local-ai` server and native Rust
 callers: Conversations, Files and Uploads, Batches, Vector Stores
 (BM25, or embedding-ranked through a caller-supplied chunk embedder), the
 Administration API store (keys, projects, audit logs, usage), conversation compaction planning, sandboxed hosted tool executors
-(`tools`: workspace files, shell, allowlisted web fetch; see
+(`tools`: workspace files, shell, web fetch of public hosts; see
 [docs/TOOLS.md](../docs/TOOLS.md)) and a read-only repository Workspace.
 Nothing here loads or needs a model. Only the web fetch tool reaches the
-network, and only for domains the server was started with. Batches only queue
+network, and only public addresses. Batches only queue
 and record lines; the server's worker generates them on the one loaded model.
 
 These services follow the current OpenAI APIs only: batches target

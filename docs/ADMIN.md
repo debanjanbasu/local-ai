@@ -202,8 +202,8 @@ limits, data retention, model and hosted-tool permissions, external storage.
   it.
 - Projects share the one engine: its queue, and its prompt cache, so a
   response's `cached_tokens` (and its latency) can show that a recent request
-  of any project began with the same tokens. Hosted tools (`--tools-*`) act
-  on the same roots for every project. Do not give a project key to anyone
+  of any project began with the same tokens. Hosted tools (always on) act
+  on the same root, the server's working directory, for every project. Do not give a project key to anyone
   who must not learn that much; run a separate server for them, as another
   user (whose home holds its own data directory).
 - Work that runs after its request ended is attributed to the project key

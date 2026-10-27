@@ -36,10 +36,7 @@ use crate::workspace::{
 // One flat dispatch over the request kinds, each a few lines of formatting.
 #[expect(clippy::too_many_lines)]
 pub(super) fn run(inner: &Inner, request: Request) -> Result<Output, ToolError> {
-    let workspace = inner
-        .workspace
-        .as_ref()
-        .ok_or_else(|| ToolError::Denied("no tools root is configured".into()))?;
+    let workspace = &inner.workspace;
     let max = inner.limits.max_output_bytes;
     match request {
         Request::List { path } => {
@@ -226,11 +223,7 @@ fn check_size(len: usize, max: usize) -> Result<(), ToolError> {
 }
 
 fn root_dir(inner: &Inner) -> Result<Dir, ToolError> {
-    let root = inner
-        .root
-        .as_ref()
-        .ok_or_else(|| ToolError::Denied("no tools root is configured".into()))?;
-    Dir::open_ambient_dir(root, ambient_authority())
+    Dir::open_ambient_dir(&inner.root, ambient_authority())
         .map_err(|error| ToolError::Failed(format!("cannot open the tools root: {error}")))
 }
 

@@ -1,9 +1,8 @@
-//! Web fetch: one `GET` to an allowlisted public host ([`fetch`]), and the
-//! same checked transport for media a request names by URL ([`download`]).
+//! Web fetch: one `GET` to any public host ([`fetch`]), and the same checked
+//! transport for media a request names by URL ([`download`]).
 //!
 //! - The URL must be `http` or `https`, without user information, naming a
-//!   host by DNS name (IP literals are refused) that equals an allowlisted
-//!   domain or is a subdomain of one.
+//!   host by DNS name (IP literals are refused).
 //! - Every address the name resolves to must be public: loopback, private,
 //!   link-local, shared, documentation, multicast and other special-purpose
 //!   ranges (and IPv4-mapped forms of them) are refused. The connection goes
@@ -29,40 +28,6 @@ use super::{Output, ToolError};
 
 /// Characters of a URL accepted.
 const MAX_URL_BYTES: usize = 4096;
-
-/// Check one allowlist entry: a lowercase DNS name, not an IP address.
-pub fn check_domain(domain: &str) -> Result<(), ToolError> {
-    let valid = !domain.is_empty()
-        && domain.len() <= 253
-        && domain.parse::<IpAddr>().is_err()
-        && domain.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(ToolError::Invalid(format!(
-            "fetch domain {domain:?} must be a lowercase DNS name such as example.com"
-        )))
-    }
-}
-
-/// Whether `host` is `domain` or one of its subdomains, for some entry.
-#[must_use]
-pub fn allowed(host: &str, domains: &[String]) -> bool {
-    domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain.as_str())
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
-}
 
 /// Whether `ip` is an ordinary public unicast address.
 #[must_use]
@@ -156,19 +121,14 @@ fn parse(url: &str) -> Result<Target, ToolError> {
     })
 }
 
-/// Parse and check `url` against `domains`, before any network use.
-pub fn target(url: &str, domains: &[String]) -> Result<Target, ToolError> {
+/// Parse and check `url`, before any network use. Its addresses are checked
+/// when it is resolved ([`fetch`]).
+pub fn target(url: &str) -> Result<Target, ToolError> {
     let target = parse(url)?;
     if target.host.parse::<IpAddr>().is_ok() {
         return Err(ToolError::Denied(
-            "IP address hosts are refused; the allowlist names domains".into(),
+            "IP address hosts are refused; web fetch takes DNS names".into(),
         ));
-    }
-    if !allowed(&target.host, domains) {
-        return Err(ToolError::Denied(format!(
-            "{} is not on this server's fetch allowlist",
-            target.host
-        )));
     }
     Ok(target)
 }
@@ -242,8 +202,8 @@ async fn open(
 }
 
 /// Fetch `url`, reading at most `max_bytes` of body.
-pub async fn fetch(url: &str, domains: &[String], max_bytes: usize) -> Result<Output, ToolError> {
-    let target = target(url, domains)?;
+pub async fn fetch(url: &str, max_bytes: usize) -> Result<Output, ToolError> {
+    let target = target(url)?;
     let (response, _connection) = open(&target).await?;
     let status = response.status();
     let mut text = format!("HTTP {}\n", status.as_u16());
@@ -301,7 +261,7 @@ pub struct Download {
 /// `GET` `url` from any public host, for media a request names.
 ///
 /// A host by name or public IP literal, with the address checks of
-/// [`fetch`] but no allowlist. Up to five redirects are followed, each
+/// [`fetch`]. Up to five redirects are followed, each
 /// target checked anew, never from `https` to `http`. A status other than
 /// success, a `Content-Type` that `accept` refuses (it gets the header's
 /// value, or `None` without one; checked before any of the body is read),

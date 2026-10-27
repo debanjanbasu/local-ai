@@ -44,7 +44,7 @@ use serde_json::{Map, Value, json};
 
 use local_engine::{ToolCall, ToolChoice, ToolDefinition, ToolOutput};
 use local_services::tools::shell::{CommandRun, Outcome};
-use local_services::tools::{Capability, Output, Request, SearchMode, ToolError};
+use local_services::tools::{Output, Request, SearchMode, ToolError};
 
 use super::file_search;
 
@@ -95,17 +95,6 @@ impl Hosted {
             .iter()
             .find(|(candidate, _)| *candidate == name)
             .map(|(_, hosted)| *hosted)
-    }
-
-    /// The permission this operation needs, if any.
-    pub(super) const fn capability(self) -> Option<Capability> {
-        match self {
-            Self::List | Self::Read | Self::Search => Some(Capability::Read),
-            Self::Write | Self::Edit => Some(Capability::Write),
-            Self::Fetch => Some(Capability::Fetch),
-            Self::Shell => Some(Capability::Shell),
-            Self::FileSearch => None,
-        }
     }
 
     fn definition(self, name: &str) -> ToolDefinition {

@@ -16,7 +16,7 @@ use local_engine::{
 };
 use local_services::Store;
 use local_services::files::{CreateFile, FilePurpose};
-use local_services::tools::{Limits, Permissions, Toolbox};
+use local_services::tools::{Limits, Toolbox};
 use local_services::vector_stores::CreateVectorStore;
 
 use super::super::admin::Meter;
@@ -169,44 +169,19 @@ fn malformed_tool_declarations_are_refused() {
     }
 }
 
-fn toolbox(root: &std::path::Path, write: bool, shell: bool) -> Toolbox {
-    Toolbox::new(
-        Permissions {
-            root: Some(root.to_owned()),
-            write,
-            shell,
-            fetch_domains: Vec::new(),
-        },
-        Limits::default(),
-    )
-    .expect("toolbox")
+fn toolbox(root: &std::path::Path) -> Toolbox {
+    Toolbox::new(root, Limits::default()).expect("toolbox")
 }
 
 #[test]
-fn hosted_tools_need_server_permission() {
+fn hosted_tools_need_no_server_permission() {
+    // Every hosted tool is always on: the shell, file reads and writes and
+    // web fetch run without vector stores; a request without hosted tools
+    // needs nothing either.
     let prepared = prepare(TOOLS, &json!({}));
-    let kinds = prepared.echo.kinds();
-    let none = Tools {
-        toolbox: Toolbox::new(Permissions::default(), Limits::default()).expect("toolbox"),
-        bounds: bounds(4),
-    };
-    let error = check(&none, kinds, None).expect_err("no tools granted");
-    assert!(error.contains("--tools-root"), "{error}");
-    let root = tempfile::tempdir().expect("root");
-    let read_only = Tools {
-        toolbox: toolbox(root.path(), false, false),
-        bounds: bounds(4),
-    };
-    let error = check(&read_only, kinds, None).expect_err("shell and write refused");
-    assert!(error.contains("not permitted"), "{error}");
-    let everything = Tools {
-        toolbox: toolbox(root.path(), true, true),
-        bounds: bounds(4),
-    };
-    check(&everything, kinds, None).expect("permitted");
-    // A request without hosted tools needs nothing.
+    check(prepared.echo.kinds(), None).expect("always permitted");
     let plain = prepare(r#"[{"type":"local_shell"}]"#, &json!({}));
-    check(&none, plain.echo.kinds(), None).expect("client tools only");
+    check(plain.echo.kinds(), None).expect("client tools only");
 }
 
 #[test]
@@ -325,19 +300,22 @@ fn outputs(events: &[Event]) -> Vec<&local_engine::ToolOutput> {
 async fn the_loop_runs_hosted_calls_and_continues_generation() {
     let root = tempfile::tempdir().expect("root");
     std::fs::write(root.path().join("notes.txt"), "the answer is 42\n").expect("write");
+    std::fs::hard_link(root.path().join("notes.txt"), root.path().join("alias.txt"))
+        .expect("hard link");
     let (tool_loop, first, submitted) = fake_loop(
         TOOLS,
-        toolbox(root.path(), false, false),
+        toolbox(root.path()),
         bounds(4),
         vec![
             vec![
                 Event::Reasoning("look".into()),
                 Event::ToolCall(call("r1", "local_fs_read", json!({"path":"notes.txt"}))),
-                // Refused: this server grants no writes. Never run.
+                // Refused: a hard link to the file could lead outside the
+                // root, so it is never written. Never run.
                 Event::ToolCall(call(
                     "w1",
                     "local_fs_write",
-                    json!({"path":"notes.txt","content":"overwritten"}),
+                    json!({"path":"alias.txt","content":"overwritten"}),
                 )),
                 // Malformed for the tool even though the schema admits it.
                 Event::ToolCall(call(
@@ -405,7 +383,7 @@ async fn the_loop_renders_hosted_items_in_the_response() {
     std::fs::write(root.path().join("a.txt"), "alpha\n").expect("write");
     let (tool_loop, first, _) = fake_loop(
         TOOLS,
-        toolbox(root.path(), false, false),
+        toolbox(root.path()),
         bounds(4),
         vec![
             vec![
@@ -451,7 +429,7 @@ async fn iteration_bound_forces_a_final_answer() {
     let read = || Event::ToolCall(call("r", "local_fs_read", json!({"path":"a.txt"})));
     let (tool_loop, first, submitted) = fake_loop(
         TOOLS,
-        toolbox(root.path(), false, false),
+        toolbox(root.path()),
         bounds(1),
         vec![
             vec![read(), Event::Finished(stats(StopReason::Eos, 1))],
@@ -474,7 +452,7 @@ async fn a_turn_with_a_client_call_ends_after_its_hosted_calls() {
     std::fs::write(root.path().join("a.txt"), "alpha\n").expect("write");
     let (tool_loop, first, submitted) = fake_loop(
         TOOLS,
-        toolbox(root.path(), false, false),
+        toolbox(root.path()),
         bounds(4),
         vec![vec![
             Event::ToolCall(call("r", "local_fs_read", json!({"path":"a.txt"}))),
@@ -493,7 +471,7 @@ async fn a_token_limited_turn_runs_nothing() {
     let root = tempfile::tempdir().expect("root");
     let (tool_loop, first, submitted) = fake_loop(
         TOOLS,
-        toolbox(root.path(), true, false),
+        toolbox(root.path()),
         bounds(4),
         vec![vec![
             Event::ToolCall(call(
@@ -516,7 +494,7 @@ async fn cancelling_the_response_stops_a_running_tool() {
     let root = tempfile::tempdir().expect("root");
     let (tool_loop, first, submitted) = fake_loop(
         TOOLS,
-        toolbox(root.path(), false, true),
+        toolbox(root.path()),
         bounds(4),
         vec![vec![
             Event::ToolCall(call("s", "shell", json!({"commands":["sleep 30"]}))),
@@ -558,7 +536,7 @@ async fn the_loop_records_all_its_rounds_once_before_its_end() {
     std::fs::write(root.path().join("notes.txt"), "the answer is 42\n").expect("write");
     let (tool_loop, first, submitted) = fake_loop(
         TOOLS,
-        toolbox(root.path(), false, false),
+        toolbox(root.path()),
         bounds(4),
         vec![
             vec![
@@ -603,7 +581,7 @@ async fn hosted_shell_calls_render_as_shell_items() {
     std::fs::write(root.path().join("a.txt"), "hello\n").expect("write");
     let (tool_loop, first, _) = fake_loop(
         TOOLS,
-        toolbox(root.path(), false, true),
+        toolbox(root.path()),
         bounds(4),
         vec![
             vec![
@@ -658,36 +636,24 @@ async fn hosted_shell_calls_render_as_shell_items() {
 }
 
 #[test]
-fn hosted_tools_are_opt_in_server_flags() {
+fn hosted_tool_flags_are_gone_because_every_tool_is_always_on() {
     use super::super::options::parse;
     let args =
         |list: &[&str]| -> Vec<String> { list.iter().map(|arg| (*arg).to_owned()).collect() };
-    let parsed = parse(&args(&[])).expect("defaults");
-    assert!(parsed.tools.root.is_none() && parsed.tools.fetch_domains.is_empty());
-    assert!(!parsed.tools.write && !parsed.tools.shell);
-    let error = parse(&args(&["--tools-shell"])).expect_err("shell needs a root");
-    assert!(error.contains("--tools-root"), "{error}");
-    let error = parse(&args(&[
-        "--tools-root",
-        "/tmp",
-        "--tools-max-iterations",
-        "0",
-    ]))
-    .expect_err("bounded");
-    assert!(error.contains("from 1 to 64"), "{error}");
-    let parsed = parse(&args(&[
-        "--tools-root",
-        "/tmp",
-        "--tools-shell",
-        "--tools-fetch-domain",
-        "example.com",
-        "--tools-call-timeout",
-        "5",
-    ]))
-    .expect("granted");
-    assert!(parsed.tools.root.is_some() && parsed.tools.shell && !parsed.tools.write);
-    assert_eq!(parsed.tools.fetch_domains, ["example.com"]);
-    assert_eq!(parsed.tools.call_timeout, Duration::from_secs(5));
+    for removed in [
+        vec!["--tools-root", "/tmp"],
+        vec!["--tools-allow-write"],
+        vec!["--tools-shell"],
+        vec!["--tools-fetch-domain", "example.com"],
+        vec!["--tools-max-iterations", "8"],
+        vec!["--tools-call-timeout", "20"],
+        vec!["--tools-budget", "120"],
+    ] {
+        assert_eq!(
+            parse(&args(&removed)).expect_err(removed[0]),
+            format!("unknown option: {}", removed[0])
+        );
+    }
 }
 
 /// Codex 0.162.1's freeform `apply_patch` grammar, verbatim from the CLI.
@@ -906,12 +872,13 @@ async fn file_search_runs_without_permissions_and_answers_with_citations() {
         forced.request.tool_choice,
         ToolChoice::Function("file_search".into())
     );
+    let root = tempfile::tempdir().expect("root");
     let none = Tools {
-        toolbox: Toolbox::new(Permissions::default(), Limits::default()).expect("toolbox"),
+        toolbox: toolbox(root.path()),
         bounds: bounds(4),
     };
-    check(&none, prepared.echo.kinds(), Some(&service)).expect("no permission needed");
-    let error = check(&none, prepared.echo.kinds(), None).expect_err("no vector stores");
+    check(prepared.echo.kinds(), Some(&service)).expect("no permission needed");
+    let error = check(prepared.echo.kinds(), None).expect_err("no vector stores");
     assert!(error.contains("file_search is unavailable"), "{error}");
     let error = service
         .check_searchable(vec![store_id.clone(), "vs_missing".into()], None)
@@ -1099,9 +1066,10 @@ async fn file_search_runs_without_permissions_and_answers_with_citations() {
 async fn a_failed_search_is_reported_to_the_model_and_as_a_failed_item() {
     let (dir, service, store_id, _) = searchable(&[("a.md", "alpha")]);
     let tools = format!(r#"[{{"type":"file_search","vector_store_ids":["{store_id}"]}}]"#);
+    let root = tempfile::tempdir().expect("root");
     let (mut tool_loop, first, _) = fake_loop(
         &tools,
-        Toolbox::new(Permissions::default(), Limits::default()).expect("toolbox"),
+        toolbox(root.path()),
         bounds(4),
         vec![
             vec![

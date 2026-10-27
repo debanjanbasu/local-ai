@@ -1,24 +1,23 @@
-//! Hosted tools: native executors a server may run on the model's behalf,
-//! each only under an explicit, opt-in [`Permissions`] grant.
+//! Hosted tools: native executors a server runs on the model's behalf, every
+//! one of them always available inside one root directory.
 //!
-//! Nothing here is reachable by default: [`Permissions::default`] grants no
-//! capability at all, and every request names exactly one capability that is
-//! checked before anything is touched. The executors are:
+//! A [`Toolbox`] is opened on its root and runs every kind of request; the
+//! protection is in each executor, not in a grant. The executors are:
 //!
-//! - **Filesystem** ([`fs`]): list, read and search inside one authorized
-//!   root through the capability-rooted [`Workspace`](crate::workspace::Workspace)
-//!   (so `..`, absolute paths, `.git` and symlinks are refused), plus whole-file
-//!   writes and exact-text edits, which need the separate `write` grant.
+//! - **Filesystem** ([`fs`]): list, read and search inside the root through
+//!   the capability-rooted [`Workspace`](crate::workspace::Workspace) (so `..`,
+//!   absolute paths, `.git` and symlinks are refused), plus whole-file writes
+//!   and exact-text edits.
 //! - **Shell** ([`shell`]): `/bin/sh -c` under a macOS `sandbox-exec`
 //!   profile that denies all network access and every file write outside a
-//!   per-call scratch directory (and, with `write`, the root), with CPU-time,
+//!   per-call scratch directory and the root, with CPU-time,
 //!   file-size, open-file and process-count `setrlimit`s applied in the child
 //!   before `exec`, a wall-clock deadline, a scratch-directory quota, output
 //!   byte caps and termination of the child's own process group (and, at the
 //!   deadline, of the child itself).
-//! - **Web fetch** ([`fetch`]): one `GET` to a host on an explicit domain
-//!   allowlist, refusing private, loopback and other non-public addresses,
-//!   never following redirects, with time and size limits.
+//! - **Web fetch** ([`fetch`]): one `GET` to any public host by DNS name,
+//!   refusing private, loopback and other non-public addresses, never
+//!   following redirects, with time and size limits.
 //!
 //! Every result that was cut short says so with an explicit marker, so a
 //! truncated answer is never mistaken for a complete one.
@@ -44,21 +43,6 @@ use crate::workspace::Workspace;
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Default bytes of output one call may return to the model.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 32 * 1024;
-
-/// Which hosted capabilities a server grants. The default grants none.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Permissions {
-    /// The only directory filesystem tools and the shell may use. Without
-    /// it, neither is available.
-    pub root: Option<PathBuf>,
-    /// Allow writes and edits under `root` (and shell writes there).
-    pub write: bool,
-    /// Allow sandboxed shell commands, run in `root`.
-    pub shell: bool,
-    /// Hosts web fetch may contact (each also admits its subdomains). Empty
-    /// disables web fetch.
-    pub fetch_domains: Vec<String>,
-}
 
 /// Bounds applied to every hosted call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +120,7 @@ pub enum Request {
         /// Per-stream byte cap asked for; never above the output limit.
         max_output_bytes: Option<usize>,
     },
-    /// `GET` one URL on the allowlist.
+    /// `GET` one URL on a public host.
     Fetch { url: String },
 }
 
@@ -147,28 +131,6 @@ pub enum SearchMode {
     Literal,
     Regex,
     Ranked,
-}
-
-/// The capability a request needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Capability {
-    Read,
-    Write,
-    Shell,
-    Fetch,
-}
-
-impl Request {
-    /// The grant this request needs.
-    #[must_use]
-    pub const fn capability(&self) -> Capability {
-        match self {
-            Self::List { .. } | Self::Read { .. } | Self::Search { .. } => Capability::Read,
-            Self::Write { .. } | Self::Edit { .. } => Capability::Write,
-            Self::Shell { .. } => Capability::Shell,
-            Self::Fetch { .. } => Capability::Fetch,
-        }
-    }
 }
 
 /// A successful call's result.
@@ -195,7 +157,8 @@ impl Output {
 /// Why a hosted call produced no result.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToolError {
-    /// The server's permissions do not allow this. Nothing was run.
+    /// A protection refused this (a path outside the root, a non-public
+    /// address, a link that could escape). Nothing was run.
     #[error("refused: {0}")]
     Denied(String),
     /// The arguments are malformed or name something that does not exist.
@@ -217,18 +180,17 @@ pub struct Toolbox {
 
 #[derive(Debug)]
 struct Inner {
-    permissions: Permissions,
     limits: Limits,
-    /// The canonical root, when one was granted.
-    root: Option<PathBuf>,
-    workspace: Option<Workspace>,
+    /// The canonical root.
+    root: PathBuf,
+    workspace: Workspace,
 }
 
 impl Toolbox {
-    /// Validate `permissions` and open the root. A grant that needs a root
-    /// without one, or a root that is not a directory, is an error here,
-    /// before anything can run.
-    pub fn new(permissions: Permissions, limits: Limits) -> Result<Self, ToolError> {
+    /// Validate `limits` and open `root`, where the filesystem tools and the
+    /// shell work. A root that is not a directory is an error here, before
+    /// anything can run.
+    pub fn new(root: &Path, limits: Limits) -> Result<Self, ToolError> {
         if limits.call_timeout.is_zero()
             || limits.max_output_bytes == 0
             || limits.fetch_max_bytes == 0
@@ -240,26 +202,11 @@ impl Toolbox {
                 "tool limits must be non-zero (and allow at least 16 open files)".into(),
             ));
         }
-        if (permissions.write || permissions.shell) && permissions.root.is_none() {
-            return Err(ToolError::Invalid(
-                "write and shell permissions need a tools root directory".into(),
-            ));
-        }
-        for domain in &permissions.fetch_domains {
-            fetch::check_domain(domain)?;
-        }
-        let workspace = permissions
-            .root
-            .as_ref()
-            .map(Workspace::open)
-            .transpose()
+        let workspace = Workspace::open(root)
             .map_err(|error| ToolError::Invalid(format!("tools root: {error}")))?;
-        let root = workspace
-            .as_ref()
-            .map(|workspace| workspace.root().to_owned());
+        let root = workspace.root().to_owned();
         Ok(Self {
             inner: Arc::new(Inner {
-                permissions,
                 limits,
                 root,
                 workspace,
@@ -267,35 +214,10 @@ impl Toolbox {
         })
     }
 
-    /// Whether `capability` is granted.
+    /// The canonical root.
     #[must_use]
-    pub fn allows(&self, capability: Capability) -> bool {
-        let permissions = &self.inner.permissions;
-        match capability {
-            Capability::Read => self.inner.root.is_some(),
-            Capability::Write => self.inner.root.is_some() && permissions.write,
-            Capability::Shell => self.inner.root.is_some() && permissions.shell,
-            Capability::Fetch => !permissions.fetch_domains.is_empty(),
-        }
-    }
-
-    /// Whether any capability is granted.
-    #[must_use]
-    pub fn any(&self) -> bool {
-        [
-            Capability::Read,
-            Capability::Write,
-            Capability::Shell,
-            Capability::Fetch,
-        ]
-        .into_iter()
-        .any(|capability| self.allows(capability))
-    }
-
-    /// The canonical root, when one was granted.
-    #[must_use]
-    pub fn root(&self) -> Option<&Path> {
-        self.inner.root.as_deref()
+    pub fn root(&self) -> &Path {
+        &self.inner.root
     }
 
     #[must_use]
@@ -303,22 +225,12 @@ impl Toolbox {
         &self.inner.limits
     }
 
-    #[must_use]
-    pub fn permissions(&self) -> &Permissions {
-        &self.inner.permissions
-    }
-
     /// Run one request under the deadline `timeout` (never above the call
-    /// limit). Refused before anything happens when its capability is not
-    /// granted. Dropping the future stops the work: a shell command's process
+    /// limit). Dropping the future stops the work: a shell command's process
     /// group is killed, a fetch's connection is closed. Filesystem work is
     /// synchronous and bounded by the workspace limits, so it finishes on its
     /// blocking thread even when abandoned.
     pub async fn run(&self, request: Request, timeout: Duration) -> Result<Output, ToolError> {
-        let capability = request.capability();
-        if !self.allows(capability) {
-            return Err(ToolError::Denied(denial(capability)));
-        }
         let timeout = timeout.min(self.inner.limits.call_timeout);
         if timeout.is_zero() {
             return Err(ToolError::TimedOut(timeout));
@@ -333,8 +245,7 @@ impl Toolbox {
             // and the leader and keeping the output so far. The outer bound
             // only catches a command that outlives that kill: dropping the
             // run kills the group and, by PID, the leader again.
-            let root = self.root_path()?;
-            let policy = shell::Policy::new(root, self.inner.permissions.write, &self.inner.limits);
+            let policy = shell::Policy::new(&self.inner.root, &self.inner.limits);
             let per_command = asked.map_or(timeout, |asked| asked.min(timeout));
             let cap = max_output_bytes.map_or(self.inner.limits.max_output_bytes, |asked| {
                 asked.clamp(1, self.inner.limits.max_output_bytes)
@@ -351,12 +262,7 @@ impl Toolbox {
         let work = async {
             match request {
                 Request::Fetch { url } => {
-                    fetch::fetch(
-                        &url,
-                        &self.inner.permissions.fetch_domains,
-                        self.inner.limits.fetch_max_bytes,
-                    )
-                    .await
+                    fetch::fetch(&url, self.inner.limits.fetch_max_bytes).await
                 }
                 other => {
                     let inner = Arc::clone(&self.inner);
@@ -369,33 +275,6 @@ impl Toolbox {
         tokio::time::timeout(timeout, work)
             .await
             .unwrap_or(Err(ToolError::TimedOut(timeout)))
-    }
-
-    fn root_path(&self) -> Result<&Path, ToolError> {
-        self.inner
-            .root
-            .as_deref()
-            .ok_or_else(|| ToolError::Denied("no tools root is configured".into()))
-    }
-}
-
-/// Why `capability` is refused, naming the server flag that would grant it.
-#[must_use]
-pub fn denial(capability: Capability) -> String {
-    match capability {
-        Capability::Read => "filesystem tools are disabled on this server (no --tools-root)".into(),
-        Capability::Write => {
-            "file writes are disabled on this server (start it with --tools-root and \
-             --tools-allow-write)"
-                .into()
-        }
-        Capability::Shell => {
-            "the shell is disabled on this server (start it with --tools-root and --tools-shell)"
-                .into()
-        }
-        Capability::Fetch => {
-            "web fetch is disabled on this server (start it with --tools-fetch-domain)".into()
-        }
     }
 }
 

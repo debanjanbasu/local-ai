@@ -3,16 +3,6 @@ use std::time::Duration;
 
 use super::Args;
 
-/// Default rounds of hosted tool calls one Response may run.
-const DEFAULT_TOOL_ITERATIONS: usize = 8;
-const MAX_TOOL_ITERATIONS: usize = 64;
-/// Default seconds one hosted call may run.
-const DEFAULT_TOOL_CALL_SECONDS: u64 = 20;
-const MAX_TOOL_CALL_SECONDS: u64 = 300;
-/// Default seconds all hosted calls of one Response may run together.
-const DEFAULT_TOOL_BUDGET_SECONDS: u64 = 120;
-const MAX_TOOL_BUDGET_SECONDS: u64 = 3600;
-
 /// Where Responses are stored.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResponseStoreArg {
@@ -20,32 +10,6 @@ pub(super) enum ResponseStoreArg {
     Default,
     /// `--response-store DIR`, kept until deleted.
     Dir(PathBuf),
-}
-
-/// Hosted tool permissions and bounds. The default grants nothing.
-#[derive(Debug)]
-pub(super) struct ToolArgs {
-    pub(super) root: Option<PathBuf>,
-    pub(super) write: bool,
-    pub(super) shell: bool,
-    pub(super) fetch_domains: Vec<String>,
-    pub(super) max_iterations: usize,
-    pub(super) call_timeout: Duration,
-    pub(super) budget: Duration,
-}
-
-impl Default for ToolArgs {
-    fn default() -> Self {
-        Self {
-            root: None,
-            write: false,
-            shell: false,
-            fetch_domains: Vec::new(),
-            max_iterations: DEFAULT_TOOL_ITERATIONS,
-            call_timeout: Duration::from_secs(DEFAULT_TOOL_CALL_SECONDS),
-            budget: Duration::from_secs(DEFAULT_TOOL_BUDGET_SECONDS),
-        }
-    }
 }
 
 /// Default seconds a client may stop taking frames before its generation is
@@ -107,32 +71,10 @@ pub(super) fn usage() {
     );
     eprintln!();
     eprintln!(
-        "  Hosted tools (Responses API; default: none; file_search needs no flag; see docs/TOOLS.md):"
-    );
-    eprintln!(
-        "  --tools-root DIR   Let requests list, read and search files under DIR \
-         (local_fs_list/read/search)"
-    );
-    eprintln!("  --tools-allow-write  Also allow writes and edits under DIR (local_fs_write/edit)");
-    eprintln!(
-        "  --tools-shell      Allow sandboxed shell commands in DIR (the shell tool): no \
-         network, writes only with --tools-allow-write"
-    );
-    eprintln!(
-        "  --tools-fetch-domain DOMAIN  Allow local_web_fetch to DOMAIN and its subdomains \
-         (repeatable; public addresses only)"
-    );
-    eprintln!(
-        "  --tools-max-iterations N  Rounds of hosted calls per response \
-         (default: {DEFAULT_TOOL_ITERATIONS})"
-    );
-    eprintln!(
-        "  --tools-call-timeout SECONDS  Deadline of one hosted call \
-         (default: {DEFAULT_TOOL_CALL_SECONDS})"
-    );
-    eprintln!(
-        "  --tools-budget SECONDS  Combined time of a response's hosted calls \
-         (default: {DEFAULT_TOOL_BUDGET_SECONDS})"
+        "  Hosted tools (Responses API; see docs/TOOLS.md) are always on: file access and a \
+         sandboxed shell with writes, rooted at the working directory, and web fetch of any \
+         public host. A non-loopback --host therefore needs authentication (--api-key or \
+         `local-ai admin create-key`)."
     );
 }
 
@@ -144,7 +86,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         stall: Duration::from_secs(DEFAULT_STALL_SECONDS),
         response_store: ResponseStoreArg::Default,
         reasoning_key: None,
-        tools: ToolArgs::default(),
         allowed_origins: Vec::new(),
         allowed_hosts: Vec::new(),
     };
@@ -153,15 +94,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         let flag = args[index].as_str();
         if matches!(flag, "--help" | "-h") {
             return Err(String::new());
-        }
-        if matches!(flag, "--tools-allow-write" | "--tools-shell") {
-            if flag == "--tools-shell" {
-                parsed.tools.shell = true;
-            } else {
-                parsed.tools.write = true;
-            }
-            index += 1;
-            continue;
         }
         index += 1;
         // Recognise the flag before demanding its value, so an unknown option is
@@ -176,11 +108,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 | "--stall-timeout"
                 | "--response-store"
                 | "--reasoning-key"
-                | "--tools-root"
-                | "--tools-fetch-domain"
-                | "--tools-max-iterations"
-                | "--tools-call-timeout"
-                | "--tools-budget"
         ) {
             return Err(format!("unknown option: {flag}"));
         }
@@ -190,7 +117,12 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
         match flag {
             "--host" => parsed.host = value.parse().map_err(|_| "invalid --host")?,
             "--port" => parsed.port = value.parse().map_err(|_| "invalid --port")?,
-            "--api-key" => parsed.api_key = Some(value.clone()),
+            "--api-key" => {
+                if value.is_empty() {
+                    return Err("--api-key requires a non-empty key".into());
+                }
+                parsed.api_key = Some(value.clone());
+            }
             "--allow-origin" => parsed.allowed_origins.push(allowed_origin(value)?),
             "--allow-host" => parsed.allowed_hosts.push(allowed_host(value)?),
             "--stall-timeout" => parsed.stall = stall_timeout(value)?,
@@ -206,13 +138,9 @@ pub(super) fn parse(args: &[String]) -> Result<Args, String> {
                 }
                 parsed.response_store = ResponseStoreArg::Dir(value.into());
             }
-            tools if tools.starts_with("--tools-") => tool_value(&mut parsed.tools, flag, value)?,
             _ => return Err(format!("unknown option: {flag}")),
         }
         index += 1;
-    }
-    if (parsed.tools.write || parsed.tools.shell) && parsed.tools.root.is_none() {
-        return Err("--tools-allow-write and --tools-shell need --tools-root DIR".into());
     }
     Ok(parsed)
 }
@@ -254,40 +182,6 @@ fn allowed_host(value: &str) -> Result<String, String> {
              not {value:?}"
         ))
     }
-}
-
-/// Apply a hosted-tool flag that takes `value`.
-fn tool_value(tools: &mut ToolArgs, flag: &str, value: &str) -> Result<(), String> {
-    match flag {
-        "--tools-root" => {
-            if value.is_empty() {
-                return Err("--tools-root requires a directory".into());
-            }
-            tools.root = Some(value.into());
-        }
-        "--tools-fetch-domain" => tools.fetch_domains.push(value.to_owned()),
-        "--tools-max-iterations" => {
-            tools.max_iterations = bounded(flag, value, 1, MAX_TOOL_ITERATIONS as u64)? as usize;
-        }
-        "--tools-call-timeout" => {
-            tools.call_timeout =
-                Duration::from_secs(bounded(flag, value, 1, MAX_TOOL_CALL_SECONDS)?);
-        }
-        "--tools-budget" => {
-            tools.budget = Duration::from_secs(bounded(flag, value, 1, MAX_TOOL_BUDGET_SECONDS)?);
-        }
-        _ => return Err(format!("unknown option: {flag}")),
-    }
-    Ok(())
-}
-
-/// A whole number for `flag` between `min` and `max`.
-fn bounded(flag: &str, value: &str, min: u64, max: u64) -> Result<u64, String> {
-    value
-        .parse::<u64>()
-        .ok()
-        .filter(|number| (min..=max).contains(number))
-        .ok_or_else(|| format!("{flag} must be a whole number from {min} to {max}, not {value:?}"))
 }
 
 /// Parse a `--stall-timeout` value as whole seconds inside the useful range.

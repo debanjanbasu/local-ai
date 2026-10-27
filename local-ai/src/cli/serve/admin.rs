@@ -284,22 +284,40 @@ pub(super) async fn enabled(state: &AppState) -> bool {
         .unwrap_or(true)
 }
 
-/// Say at startup whether requests need a key, warning when anyone who can
-/// reach a non-loopback address may use the server.
-pub(super) fn announce(gate: &Gate, host: std::net::IpAddr) {
+/// Say at startup whether requests need a key (a non-loopback address
+/// without one was refused by [`refuse_unauthenticated_network`]).
+pub(super) fn announce(gate: &Gate) {
     if gate.enabled() {
         eprintln!("authentication: on (Authorization: Bearer <key> required)");
-    } else if host.is_loopback() {
+    } else {
         eprintln!(
             "authentication: off; any local process may use this server (enable it with \
              `local-ai admin create-key`)"
         );
-    } else {
-        eprintln!(
-            "warning: authentication is off on non-loopback address {host}; anyone who can \
-             reach it may use this server (enable it with `local-ai admin create-key`)"
-        );
     }
+}
+
+/// Refuse to serve `host` beyond loopback without `--api-key`.
+///
+/// The hosted tools are always on, so every caller may run shell commands
+/// and read and write files in the server's working directory: an
+/// unauthenticated server on a network address would hand that to anyone
+/// who can reach it. Admin-store keys do not count, since deleting the last
+/// one at runtime turns authentication off again; the fixed key cannot go
+/// away. Loopback without a key stays allowed, behind the DNS-rebinding and
+/// browser-origin protections ([`super::browser`]).
+pub(super) fn refuse_unauthenticated_network(
+    host: std::net::IpAddr,
+    api_key: Option<&str>,
+) -> crate::Result<()> {
+    if host.is_loopback() || api_key.is_some() {
+        return Ok(());
+    }
+    Err(crate::Error::InvalidArgument(format!(
+        "refusing to serve {host} without --api-key: the hosted tools are always on, so \
+         anyone who can reach this address could run shell commands and read and write files \
+         in the server's working directory. Start with --api-key KEY, or bind a loopback address"
+    )))
 }
 
 /// Authorize the request in `parts`, or the response refusing it.

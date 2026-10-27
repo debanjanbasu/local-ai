@@ -1,4 +1,5 @@
-//! Hosted tool permissions and limits.
+//! Hosted tools: every one always available inside its root, and the
+//! protections and limits that hold them there.
 //!
 //! Safety: every command run here is a fixed, harmless, strictly bounded one
 //! (`echo`, `wc`, `printf` of a fixed size, `ulimit` queries, `sleep` stopped
@@ -13,23 +14,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use local_services::tools::shell::{self, Outcome};
-use local_services::tools::{
-    Capability, Limits, Output, Permissions, Request, SearchMode, ToolError, Toolbox, fetch,
-};
+use local_services::tools::{Limits, Output, Request, SearchMode, ToolError, Toolbox, fetch};
 
 const SECOND: Duration = Duration::from_secs(1);
 
-fn toolbox(root: &Path, write: bool, shell: bool) -> Toolbox {
-    Toolbox::new(
-        Permissions {
-            root: Some(root.to_owned()),
-            write,
-            shell,
-            fetch_domains: Vec::new(),
-        },
-        Limits::default(),
-    )
-    .expect("toolbox")
+fn toolbox(root: &Path) -> Toolbox {
+    Toolbox::new(root, Limits::default()).expect("toolbox")
 }
 
 fn text(output: Output) -> String {
@@ -57,64 +47,13 @@ fn sh(commands: &[&str], timeout: Option<Duration>) -> Request {
     }
 }
 
-#[tokio::test]
-async fn default_permissions_grant_nothing() {
-    let tools = Toolbox::new(Permissions::default(), Limits::default()).expect("toolbox");
-    assert!(!tools.any());
-    for request in [
-        Request::List { path: None },
-        Request::Write {
-            path: "a.txt".into(),
-            content: "x".into(),
-        },
-        sh(&["echo never-run"], None),
-        Request::Fetch {
-            url: "https://example.com/".into(),
-        },
-    ] {
-        let error = tools.run(request, SECOND).await.expect_err("refused");
-        assert!(matches!(error, ToolError::Denied(_)), "{error}");
-    }
-}
-
-#[tokio::test]
-async fn read_only_root_refuses_writes_and_shell() {
-    let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), false, false);
-    assert!(tools.allows(Capability::Read));
-    assert!(!tools.allows(Capability::Write));
-    let error = tools
-        .run(
-            Request::Write {
-                path: "new.txt".into(),
-                content: "x".into(),
-            },
-            SECOND,
-        )
-        .await
-        .expect_err("write refused");
-    assert!(error.to_string().contains("--tools-allow-write"), "{error}");
-    assert!(!root.path().join("new.txt").exists());
-    let error = tools
-        .run(sh(&["echo never-run"], None), SECOND)
-        .await
-        .expect_err("shell refused");
-    assert!(matches!(error, ToolError::Denied(_)), "{error}");
-}
-
 #[test]
-fn write_and_shell_need_a_root() {
-    for (write, shell) in [(true, false), (false, true)] {
-        let error = Toolbox::new(
-            Permissions {
-                root: None,
-                write,
-                shell,
-                fetch_domains: Vec::new(),
-            },
-            Limits::default(),
-        )
-        .expect_err("needs a root");
+fn the_root_must_be_a_directory() {
+    let outer = tempfile::tempdir().expect("outer");
+    let file = outer.path().join("file.txt");
+    std::fs::write(&file, "x").expect("file");
+    for root in [file, outer.path().join("missing")] {
+        let error = Toolbox::new(&root, Limits::default()).expect_err("not a directory");
         assert!(error.to_string().contains("root"), "{error}");
     }
 }
@@ -125,7 +64,7 @@ async fn list_read_search_and_truncation() {
     std::fs::write(root.path().join("a.txt"), "alpha\nbeta\ngamma\n").expect("write");
     std::fs::create_dir(root.path().join("sub")).expect("dir");
     std::fs::write(root.path().join("sub/b.txt"), "beta again\n").expect("write");
-    let tools = toolbox(root.path(), false, false);
+    let tools = toolbox(root.path());
     let listed = text(
         tools
             .run(Request::List { path: None }, SECOND)
@@ -167,10 +106,7 @@ async fn list_read_search_and_truncation() {
 
     std::fs::write(root.path().join("big.txt"), "x".repeat(10_000)).expect("write");
     let small = Toolbox::new(
-        Permissions {
-            root: Some(root.path().to_owned()),
-            ..Permissions::default()
-        },
+        root.path(),
         Limits {
             max_output_bytes: 64,
             ..Limits::default()
@@ -204,7 +140,7 @@ async fn path_escapes_are_refused() {
     std::fs::create_dir(root.join(".git")).expect("git");
     std::os::unix::fs::symlink(&secret, root.join("link.txt")).expect("link");
     std::os::unix::fs::symlink(outer.path(), root.join("linkdir")).expect("linkdir");
-    let tools = toolbox(&root, true, false);
+    let tools = toolbox(&root);
     let escapes = [
         "../secret.txt",
         "sub/../../secret.txt",
@@ -255,7 +191,7 @@ async fn path_escapes_are_refused() {
 #[tokio::test]
 async fn write_and_edit_inside_the_root() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), true, false);
+    let tools = toolbox(root.path());
     tools
         .run(
             Request::Write {
@@ -340,7 +276,7 @@ async fn writes_never_follow_a_symlink_swapped_in_at_the_last_component() {
             }
         })
     };
-    let tools = toolbox(root.path(), true, false);
+    let tools = toolbox(root.path());
     for round in 0..10_000 {
         let request = if round % 2 == 0 {
             Request::Write {
@@ -368,7 +304,7 @@ async fn writes_never_follow_a_symlink_swapped_in_at_the_last_component() {
 async fn shell_runs_harmless_commands_in_the_root() {
     let root = tempfile::tempdir().expect("root");
     std::fs::write(root.path().join("a.txt"), "hello\n").expect("write");
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     let runs = runs(
         tools
             .run(sh(&["ls", "wc -c a.txt", "exit 3"], None), 10 * SECOND)
@@ -384,7 +320,7 @@ async fn shell_runs_harmless_commands_in_the_root() {
 #[tokio::test]
 async fn shell_deadline_kills_a_sleep() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     let started = Instant::now();
     let runs = runs(
         tools
@@ -399,7 +335,7 @@ async fn shell_deadline_kills_a_sleep() {
 #[tokio::test]
 async fn shell_output_is_capped_with_a_marker() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     let output = tools
         .run(
             Request::Shell {
@@ -431,15 +367,7 @@ async fn shell_rlimits_are_set_in_the_child() {
         shell_file_bytes: 512 * 1024,
         ..Limits::default()
     };
-    let tools = Toolbox::new(
-        Permissions {
-            root: Some(root.path().to_owned()),
-            shell: true,
-            ..Permissions::default()
-        },
-        limits,
-    )
-    .expect("toolbox");
+    let tools = Toolbox::new(root.path(), limits).expect("toolbox");
     let runs = runs(
         tools
             .run(
@@ -465,11 +393,7 @@ async fn shell_rlimits_are_set_in_the_child() {
 async fn shell_scratch_directory_is_bounded() {
     let root = tempfile::tempdir().expect("root");
     let tools = Toolbox::new(
-        Permissions {
-            root: Some(root.path().to_owned()),
-            shell: true,
-            ..Permissions::default()
-        },
+        root.path(),
         Limits {
             shell_scratch_bytes: 1024 * 1024,
             ..Limits::default()
@@ -505,7 +429,7 @@ async fn shell_scratch_directory_is_bounded() {
 #[tokio::test]
 async fn shell_has_no_network() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     // A connection attempt to a closed localhost port. Outside the sandbox
     // it is refused by the port; inside, the sandbox denies the connect
     // itself, which is what distinguishes the two.
@@ -535,21 +459,14 @@ async fn shell_writes_are_confined() {
         "echo x > inside.txt; echo x > .git/inside.txt; echo x > '{}'; echo x > \"$TMPDIR/scratch.txt\" && echo scratch-ok",
         outside.display()
     );
-    let read_only = toolbox(&root, false, true);
+    let writable = toolbox(&root);
     let run = runs(
-        read_only
+        writable
             .run(sh(&[&command], None), 10 * SECOND)
             .await
             .expect("shell"),
     );
     assert!(run[0].stdout.contains("scratch-ok"), "{:?}", run[0]);
-    assert!(!root.join("inside.txt").exists());
-    assert!(!outside.exists());
-    let writable = toolbox(&root, true, true);
-    writable
-        .run(sh(&[&command], None), 10 * SECOND)
-        .await
-        .expect("shell");
     assert!(root.join("inside.txt").exists());
     assert!(!root.join(".git/inside.txt").exists());
     assert!(!outside.exists());
@@ -593,7 +510,7 @@ async fn shell_writes_are_confined() {
 #[tokio::test]
 async fn shell_kills_its_process_group_when_the_command_exits() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     let started = Instant::now();
     // Two fixed background children keep stdout open. The call can only
     // return before its 10 s deadline if they were killed with the group.
@@ -614,7 +531,7 @@ async fn shell_kills_its_process_group_when_the_command_exits() {
 #[tokio::test]
 async fn shell_deadline_kills_a_leader_that_left_its_group() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     let started = Instant::now();
     // One escape attempt: the shell becomes perl (same PID, the group's
     // leader), which moves itself into this test process's group, out of
@@ -646,7 +563,7 @@ async fn shell_deadline_kills_a_leader_that_left_its_group() {
 #[tokio::test]
 async fn dropping_a_shell_call_kills_it() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), true, true);
+    let tools = toolbox(root.path());
     let call = tools.run(sh(&["echo $$ > pid.txt; exec sleep 30"], None), 20 * SECOND);
     let abandoned = tokio::time::timeout(Duration::from_millis(1500), call).await;
     assert!(abandoned.is_err(), "the call should still be running");
@@ -668,7 +585,7 @@ async fn dropping_a_shell_call_kills_it() {
 #[tokio::test]
 async fn malformed_shell_arguments_are_refused_before_running() {
     let root = tempfile::tempdir().expect("root");
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     let too_many: Vec<&str> = vec!["true"; shell::MAX_COMMANDS + 1];
     for request in [
         sh(&[], None),
@@ -683,8 +600,7 @@ async fn malformed_shell_arguments_are_refused_before_running() {
 
 #[test]
 fn fetch_targets_are_checked_without_network() {
-    let domains = vec!["example.com".to_owned()];
-    let target = fetch::target("https://docs.example.com/a?b=1", &domains).expect("allowed");
+    let target = fetch::target("https://docs.example.com/a?b=1").expect("any public name");
     assert_eq!(
         (
             target.https,
@@ -694,20 +610,22 @@ fn fetch_targets_are_checked_without_network() {
         ),
         (true, "docs.example.com", 443, "/a?b=1")
     );
+    // Any DNS name is a target; its addresses are checked when it resolves.
+    for url in ["https://example.org/", "http://badexample.com:8080/x"] {
+        assert!(fetch::target(url).is_ok(), "{url}");
+    }
     for url in [
-        "https://example.org/",
-        "https://badexample.com/",
         "https://127.0.0.1/",
         "http://[::1]/",
         "https://user@example.com/",
         "ftp://example.com/",
     ] {
         assert!(
-            matches!(fetch::target(url, &domains), Err(ToolError::Denied(_))),
+            matches!(fetch::target(url), Err(ToolError::Denied(_))),
             "{url}"
         );
     }
-    assert!(fetch::target("file:///etc/passwd", &domains).is_err());
+    assert!(fetch::target("file:///etc/passwd").is_err());
     for address in [
         "127.0.0.1",
         "10.1.2.3",
@@ -726,20 +644,12 @@ fn fetch_targets_are_checked_without_network() {
     for address in ["93.184.215.14", "2606:4700::6810:84e5"] {
         assert!(fetch::is_public(address.parse().expect("ip")), "{address}");
     }
-    assert!(fetch::check_domain("Example.com").is_err());
-    assert!(fetch::check_domain("10.0.0.1").is_err());
 }
 
 #[tokio::test]
 async fn fetch_refuses_names_resolving_to_loopback() {
-    let tools = Toolbox::new(
-        Permissions {
-            fetch_domains: vec!["localhost".into()],
-            ..Permissions::default()
-        },
-        Limits::default(),
-    )
-    .expect("toolbox");
+    let root = tempfile::tempdir().expect("root");
+    let tools = toolbox(root.path());
     let error = tools
         .run(
             Request::Fetch {
@@ -764,7 +674,7 @@ async fn shell_inherits_no_descriptors_beyond_its_standard_streams() {
     // SAFETY: `dup` of an open descriptor; the result is owned below.
     #[expect(unsafe_code)]
     let leaked = unsafe { OwnedFd::from_raw_fd(libc::dup(file.as_raw_fd())) };
-    let tools = toolbox(root.path(), false, true);
+    let tools = toolbox(root.path());
     let runs = runs(
         tools
             .run(sh(&["ls /dev/fd"], None), 10 * SECOND)

@@ -86,8 +86,6 @@ struct Args {
     /// Where Responses are kept: the user's data directory by default.
     response_store: options::ResponseStoreArg,
     reasoning_key: Option<PathBuf>,
-    /// Hosted tool permissions and bounds; none by default.
-    tools: options::ToolArgs,
     /// `--allow-origin` values: browser origins admitted while
     /// authentication is off (see [`browser`]).
     allowed_origins: Vec<String>,
@@ -133,8 +131,8 @@ struct AppState {
     services: Option<Arc<services::Services>>,
     batches: Option<Arc<batches::Batches>>,
     vector_stores: Option<Arc<vector_stores::VectorStores>>,
-    /// Hosted tools this server may run for Responses: the toolbox grants
-    /// (none without `--tools-*` flags) and the tool loop's bounds.
+    /// Hosted tools this server runs for Responses: every one, rooted at the
+    /// working directory, within the tool loop's fixed bounds.
     tools: Arc<tool_loop::Tools>,
     /// Native text embeddings.
     embeddings: Arc<embeddings::Embeddings>,
@@ -708,8 +706,8 @@ async fn dispatch(
     }
 }
 
-/// The tool loop for a Response that declared hosted tools, refusing one
-/// whose tools this server was not permitted to run.
+/// The tool loop for a Response that declared hosted tools, refusing a
+/// `file_search` this server has no vector stores for.
 fn hosted_loop(
     state: &AppState,
     reply: &Reply,
@@ -735,7 +733,7 @@ fn responses_loop(
         return Ok(None);
     }
     let tools = &state.tools;
-    tool_loop::check(tools, echo.kinds(), state.vector_stores.as_deref())?;
+    tool_loop::check(echo.kinds(), state.vector_stores.as_deref())?;
     let engine = state.engine.clone();
     // Every round renders the same growing conversation, so one prompt-cache
     // affinity lets each round reuse the previous one's prefix.
@@ -1254,7 +1252,16 @@ impl AppState {
 // Keep service startup and shutdown ownership together.
 #[expect(clippy::too_many_lines)]
 async fn run_async(args: Args) -> crate::Result<()> {
+    // The hosted tools are always on, so an address beyond loopback without
+    // --api-key is refused before anything else starts.
+    admin::refuse_unauthenticated_network(args.host, args.api_key.as_deref())?;
     let services = services::Services::open_default()?;
+    let auth = Arc::new(admin::Gate::new(
+        Some(Arc::new(local_services::admin::Admin::new(
+            services.store().clone(),
+        ))),
+        args.api_key.as_deref(),
+    )?);
     let vector_stores = match vector_stores::VectorStores::start(services.store()) {
         Ok(vector_stores) => Some(vector_stores),
         // Another server on this data directory owns the index: serve
@@ -1295,10 +1302,9 @@ async fn run_async(args: Args) -> crate::Result<()> {
             store
         }
     };
-    // Hosted tools are opened before the model loads too, so a bad root or
-    // domain fails in milliseconds; nothing on the machine is granted without
-    // a flag (file_search, which only reads the vector stores, needs none).
-    let tools = open_tools(&args.tools)?;
+    // Hosted tools are opened before the model loads too, so a working
+    // directory they cannot use fails in milliseconds.
+    let tools = open_tools()?;
     // Background `store: false` Responses are kept only in a private store of
     // this process; without one they are refused, and nothing else changes.
     let temporary = Temporary::create()
@@ -1330,7 +1336,21 @@ async fn run_async(args: Args) -> crate::Result<()> {
     let decisions = decisions::Decisions::start(&models_dir)?;
     let model: Arc<str> = models::BONSAI_MODEL_ID.into();
     let engine = Engine::from_resources(&resources)?;
-    eprintln!("{}", engine.info().json);
+    // The startup policy, with the hosted tools' fixed grants beside the
+    // engine's decisions.
+    let mut policy = engine.info().json.clone();
+    policy["experimental_bonsai"]["policy"]["hosted_tools"] = json!({
+        "root": tools.toolbox.root(),
+        "root_reason": "the server's working directory at startup, canonicalized",
+        "filesystem": ["local_fs_list", "local_fs_read", "local_fs_search", "local_fs_write",
+                       "local_fs_edit"],
+        "shell": "sandboxed, no network, writes in the root",
+        "web_fetch": "any public host by DNS name",
+        "max_iterations": tools.bounds.max_iterations,
+        "call_timeout_seconds": tools.bounds.call_timeout.as_secs(),
+        "budget_seconds": tools.bounds.budget.as_secs(),
+    });
+    eprintln!("{policy}");
     let context = engine.info().model.context;
     let engine = engine.into_handle();
     let prompt_cache = engine.clone();
@@ -1350,12 +1370,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
         model,
         created: response::unix_now(),
         context,
-        auth: Arc::new(admin::Gate::new(
-            Some(Arc::new(local_services::admin::Admin::new(
-                services.store().clone(),
-            ))),
-            args.api_key.as_deref(),
-        )?),
+        auth,
         browsers: Arc::new(browser::Browsers::new(
             args.host,
             args.allowed_origins,
@@ -1403,7 +1418,7 @@ async fn run_async(args: Args) -> crate::Result<()> {
     // Before serving, so a client finds every resumed job already running.
     let store = Arc::clone(&state.responses);
     resume_interrupted(&state, &store).await;
-    admin::announce(&state.auth, args.host);
+    admin::announce(&state.auth);
     eprintln!("Bonsai server listening on http://{address}");
     let background = Arc::clone(&state.background);
     let app_foreground = Arc::clone(&state.foreground);
@@ -1496,39 +1511,36 @@ const PROMPT_CACHE_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::fr
 /// shut down.
 const RUNTIME_EXIT_DEADLINE: Duration = Duration::from_secs(1);
 
-/// The hosted tools `args` grant (none without flags) and the tool loop's
-/// bounds, which tools needing no permission (`file_search`) run within.
-fn open_tools(args: &options::ToolArgs) -> crate::Result<Arc<tool_loop::Tools>> {
+/// Rounds of hosted tool calls one Response may run.
+const DEFAULT_TOOL_ITERATIONS: usize = 8;
+/// Seconds one hosted call may run.
+const DEFAULT_TOOL_CALL_SECONDS: u64 = 20;
+/// Seconds all hosted calls of one Response may run together.
+const DEFAULT_TOOL_BUDGET_SECONDS: u64 = 120;
+
+/// The hosted tools: every one, rooted at the working directory (the
+/// toolbox canonicalizes it), within the tool loop's fixed bounds, which
+/// `file_search` runs within too.
+fn open_tools() -> crate::Result<Arc<tool_loop::Tools>> {
+    let failed = |error: &dyn std::fmt::Display| {
+        crate::Error::InvalidArgument(format!("hosted tools: {error}"))
+    };
+    let root = std::env::current_dir().map_err(|error| failed(&error))?;
+    let call_timeout = Duration::from_secs(DEFAULT_TOOL_CALL_SECONDS);
     let toolbox = local_services::tools::Toolbox::new(
-        local_services::tools::Permissions {
-            root: args.root.clone(),
-            write: args.write,
-            shell: args.shell,
-            fetch_domains: args.fetch_domains.clone(),
-        },
+        &root,
         local_services::tools::Limits {
-            call_timeout: args.call_timeout,
+            call_timeout,
             ..local_services::tools::Limits::default()
         },
     )
-    .map_err(|error| crate::Error::InvalidArgument(format!("hosted tools: {error}")))?;
-    if toolbox.any() {
-        eprintln!(
-            "hosted tools enabled: root={} write={} shell={} fetch={:?}",
-            toolbox
-                .root()
-                .map_or_else(|| "none".to_owned(), |root| root.display().to_string()),
-            toolbox.permissions().write,
-            toolbox.permissions().shell,
-            toolbox.permissions().fetch_domains
-        );
-    }
+    .map_err(|error| failed(&error))?;
     Ok(Arc::new(tool_loop::Tools {
         toolbox,
         bounds: tool_loop::Bounds {
-            max_iterations: args.max_iterations,
-            budget: args.budget,
-            call_timeout: args.call_timeout,
+            max_iterations: DEFAULT_TOOL_ITERATIONS,
+            budget: Duration::from_secs(DEFAULT_TOOL_BUDGET_SECONDS),
+            call_timeout,
         },
     }))
 }

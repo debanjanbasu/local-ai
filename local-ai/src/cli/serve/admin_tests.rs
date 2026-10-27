@@ -18,7 +18,7 @@ use super::super::chunked::start_chunked;
 use super::super::response::{Protocol, Reply};
 use super::super::responses::prepare_responses_with;
 use super::super::sse::start_stream;
-use super::{Caller, Gate, Meter, dispatch};
+use super::{Caller, Gate, Meter, dispatch, refuse_unauthenticated_network};
 
 const SCHEMAS: &str = include_str!("fixtures/admin_schemas.json");
 
@@ -1230,4 +1230,23 @@ fn out_of_band_generations_are_recorded_as_completions() {
     assert_eq!(results[1]["project_id"], Value::Null);
     assert_eq!(results[1]["input_tokens"], 8);
     assert_eq!(results[1]["output_tokens"], 2);
+}
+
+/// The hosted tools are always on, so a network address without `--api-key`
+/// is refused at startup, saying why; loopback, with or without a key, and
+/// any address with a key start as before.
+#[test]
+fn a_network_address_without_an_api_key_is_refused() {
+    for host in ["0.0.0.0", "192.168.1.20", "::"] {
+        let error = refuse_unauthenticated_network(host.parse().unwrap(), None)
+            .expect_err(host)
+            .to_string();
+        for expected in ["--api-key", "shell commands", "files", host] {
+            assert!(error.contains(expected), "{error}");
+        }
+        refuse_unauthenticated_network(host.parse().unwrap(), Some("sk-local")).expect(host);
+    }
+    for host in ["127.0.0.1", "::1"] {
+        refuse_unauthenticated_network(host.parse().unwrap(), None).expect(host);
+    }
 }

@@ -1,11 +1,11 @@
 # Tools on the Responses API
 
 The model always chooses tools; Rust executes them, outside model execution.
-The client runs some; this server runs `file_search` (no permission needed)
-and, with explicit permission, the hosted tools. Tools are declared as
-Responses `tools`, or Chat Completions `tools` with `tool_choice`.
+The client runs some; this server runs `file_search` and the hosted tools,
+all of them always on. Tools are declared as Responses `tools`, or Chat
+Completions `tools` with `tool_choice`.
 
-## Client-executed tools (no permission needed)
+## Client-executed tools
 
 These are returned to the client, which runs them and sends the result back
 in the next request (or with `previous_response_id`):
@@ -54,21 +54,21 @@ tool) and `include: ["web_search_call.action.sources"]` are refused (400).
 `{"type":"custom","name":...}`, `{"type":"shell"}` and
 `{"type":"apply_patch"}` as well as the function forms.
 
-## File search (no permission needed)
+## File search
 
 `{"type":"file_search","vector_store_ids":[...]}` runs here, natively, over
 this server's [vector stores](BONSAI.md#native-services), in the same
-server-side loop as the hosted tools below. It needs no flag: it only reads
-the vector stores of the server's own data directory, which the same callers
-can already search with `POST /v1/vector_stores/{id}/search`.
+server-side loop as the hosted tools below. It only reads the vector stores
+of the server's own data directory, which the same callers can already
+search with `POST /v1/vector_stores/{id}/search`.
 
 | member | accepted |
 |---|---|
 | `vector_store_ids` | 1 to 16 store IDs; each must exist and not be expired, or the request is refused (400) before generation |
 | `max_num_results` | 1 to 50; **default 5** (results are chunks the model must read; see the cost below) |
-| `ranking_options.ranker` | `auto` (default: `EmbeddingGemma` 2 cosine ranking when the embedding model is installed, BM25 otherwise) or `none` (BM25 only, no GPU work); `default-2024-11-15` is refused |
+| `ranking_options.ranker` | `auto` (default: `EmbeddingGemma` 2 cosine ranking) or `none` (BM25 only, no GPU work); `default-2024-11-15` is refused |
 | `ranking_options.score_threshold` | 0 to 1, on the reported score |
-| `ranking_options.hybrid_search` | `embedding_weight` and `text_weight`: weighted reciprocal rank fusion of the two rankings (`k` = 60); needs the embedding model and ranker `auto` |
+| `ranking_options.hybrid_search` | `embedding_weight` and `text_weight`: weighted reciprocal rank fusion of the two rankings (`k` = 60); needs ranker `auto` |
 | `filters` | the vector store attribute filters (`eq` ... `nin`, `and`/`or`) |
 
 The model sees one strict function, `file_search(queries)`, taking 1 to 16
@@ -110,20 +110,27 @@ roughly 1,000 tokens of prefill (about 8 s at 125 tok/s), which is why the
 default is 5 results. A smaller `chunking_strategy` or `max_num_results`
 answers sooner.
 
-## Hosted tools (server permission required; default: none)
+## Hosted tools (always on)
 
 The server runs these itself, in the same loop: generation stops on the call,
 the tool runs, its result is appended and generation continues, all within
-one Response. A request declares them; the server must also have been
-started with the matching permission, or the request is refused with a 400
-naming the flag.
+one Response. A request declares them, and every one is always available:
+there is no flag to grant or withhold any of them. The filesystem tools and
+the shell are rooted at the directory `serve` was started in, canonicalized
+at startup and reported in the startup policy (`hosted_tools.root`).
 
-| request tool | needs | output items |
+| request tool | does | output items |
 |---|---|---|
-| `{"type":"shell"}` (environment omitted or `{"type":"local"}`) | `--tools-root DIR --tools-shell` | `shell_call`, `shell_call_output` |
-| `{"type":"function","name":"local_fs_list"}` / `local_fs_read` / `local_fs_search` | `--tools-root DIR` | `function_call`, `function_call_output` |
-| `{"type":"function","name":"local_fs_write"}` / `local_fs_edit` | `--tools-root DIR --tools-allow-write` | `function_call`, `function_call_output` |
-| `{"type":"function","name":"local_web_fetch"}` | `--tools-fetch-domain DOMAIN` (repeatable) | `function_call`, `function_call_output` |
+| `{"type":"shell"}` (environment omitted or `{"type":"local"}`) | sandboxed commands in the root, writes allowed | `shell_call`, `shell_call_output` |
+| `{"type":"function","name":"local_fs_list"}` / `local_fs_read` / `local_fs_search` | list, read and search under the root | `function_call`, `function_call_output` |
+| `{"type":"function","name":"local_fs_write"}` / `local_fs_edit` | write and edit files under the root | `function_call`, `function_call_output` |
+| `{"type":"function","name":"local_web_fetch"}` | one `GET` to any public host | `function_call`, `function_call_output` |
+
+Every caller can therefore run shell commands and change files in the root,
+so start `serve` in a directory you are willing to expose to its callers.
+`serve` refuses a non-loopback `--host` without `--api-key`; on loopback
+without a key, any local process may use the tools, and web pages are kept
+out by the [DNS-rebinding and browser-origin protections](ADMIN.md#browsers).
 
 The `local_*` names are reserved: declare them without `parameters` (the
 server supplies the schema). The OpenAI spec defines no hosted filesystem or
@@ -131,10 +138,8 @@ fetch tool (`file_search` is vector-store retrieval, `web_search` is search),
 so these are reported as what they are, a function call plus the output the
 server produced, not as a built-in tool they are not.
 
-Bounds (flags, which also bound `file_search`): `--tools-max-iterations`
-rounds of hosted calls per Response (default 8), `--tools-call-timeout`
-seconds per call (default 20),
-`--tools-budget` seconds of tool time per Response (default 120), and the
+Bounds (fixed, and they also bound `file_search`): 8 rounds of hosted calls
+per Response, 20 s per call, 120 s of tool time per Response, and the
 request's `max_tool_calls`. A call past a bound is not run, its output says
 so, and the model is asked once more with `tool_choice: none` for an answer.
 `max_output_tokens` covers all rounds together and `usage` is their sum.
@@ -170,9 +175,10 @@ history that replays a call to a tool no longer declared is accepted, since
 harnesses change their tool sets between turns. Only a malformed call layout
 still fails the Response.
 
-## Permission model and its limits
+## Protections and their limits
 
-All grants are explicit server flags; nothing is reachable by default.
+Nothing is granted or withheld per server: every tool is on, and these
+protections hold each one in.
 
 **Filesystem** (`local-services` `tools::fs`, reusing `workspace.rs`): every
 path is relative to the root. `..`, absolute paths, any `.git` component and
@@ -180,8 +186,7 @@ symlinks (at any component) are refused; files are opened through a
 capability handle on the root (`cap-std`), which cannot resolve outside it
 even if a component is swapped between check and open. Reads, listings and
 searches are bounded by the workspace limits and marked when truncated.
-Writes and edits need `--tools-allow-write`, create missing directories and
-are capped at 4 MiB; edits replace exactly one occurrence. The file itself is
+Writes and edits create missing directories and are capped at 4 MiB; edits replace exactly one occurrence. The file itself is
 opened with `O_NOFOLLOW` and checked through that handle (a regular file, the
 inode that was checked) before it is truncated, read and written through the
 same handle, so a symlink swapped in after the check is refused, not
@@ -194,8 +199,7 @@ deny-by-default profile: no network (`connect` fails with EPERM), no Mach
 lookups (so it cannot ask launchd to start anything outside the sandbox),
 reads limited to system directories, the root and a per-call scratch
 directory (metadata is readable everywhere), writes limited to the scratch
-directory, `/dev/null` and, only with `--tools-allow-write`, the root minus
-every `.git` directory (at any depth, matched case-insensitively, as the file
+directory, `/dev/null` and the root minus every `.git` directory (at any depth, matched case-insensitively, as the file
 tools refuse them). In the child before `exec`: `RLIMIT_CPU` 10 s, `RLIMIT_FSIZE` 16 MiB,
 `RLIMIT_NOFILE` 256, `RLIMIT_CORE` 0 and `RLIMIT_NPROC` set to the user's
 current process count plus 64 (the limit is per user on macOS). The child
@@ -216,15 +220,14 @@ environment is cleared (`PATH`, `HOME`/`TMPDIR` = scratch, `LANG`), stdin is
 `/dev/null`.
 
 **Web fetch** (`tools::fetch`): `http`/`https` only, no user info, DNS names
-only (IP literals refused), host must equal an allowlisted domain or be a
-subdomain. Every resolved address must be public (loopback, RFC 1918,
+only (IP literals refused), any host. Every resolved address must be public (loopback, RFC 1918,
 link-local, CGNAT, documentation, multicast, unique-local and IPv4-mapped
 forms are refused), and the connection goes to a checked address, so the
 name is not re-resolved. Redirects are reported, not followed. TLS is
 verified by the macOS trust store. The body is capped at 256 KiB.
 
 Remote image and video URLs in chat requests use the same transport
-(`tools::fetch::download`) with the same address checks but no allowlist,
+(`tools::fetch::download`) with the same address checks,
 public IP literals allowed, up to five redirects each checked anew (never
 from `https` to `http`), the media type checked before the body is read, and
 a 64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
@@ -238,8 +241,8 @@ a 64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
   the process group and survives the deadline kill; it stays inside the
   sandbox, its CPU limit and the process limit.
 - Disk use is bounded only in the scratch directory, and only to within what
-  a command writes in one 250 ms check interval. With
-  `--tools-allow-write`, writes to the root are bounded per file
+  a command writes in one 250 ms check interval. Writes to the root are
+  bounded per file
   (`RLIMIT_FSIZE`, 16 MiB) and by the deadline, CPU and process limits, not
   in total; and a process that escaped the group can keep writing after
   the call ends (to the root, or to scratch files it still holds open).
@@ -257,8 +260,9 @@ a 64 MiB cap ([docs/BONSAI.md](BONSAI.md#remote-media-urls)).
 
 ## Live check (2026-10-11, Apple M4 Pro, PTQ1 checkpoint)
 
-Server: `local-ai serve --tools-root SCRATCH --tools-shell` (no writes, no
-fetch), scratch root holding `notes.txt` (3 lines) and `docs/readme.md`.
+Server: `local-ai serve` with the shell and read-only file tools granted to
+a scratch root (the grant flags of the time, since removed: every tool is now
+always on), the root holding `notes.txt` (3 lines) and `docs/readme.md`.
 
 - Tool loop, one non-streaming Response (HTTP 200, 10.2 s): the model called
   `local_fs_list`, `local_fs_read {"path":"notes.txt"}` and `shell` with
@@ -268,8 +272,6 @@ fetch), scratch root holding `notes.txt` (3 lines) and `docs/readme.md`.
 - Streaming (HTTP 200): `response.shell_call_command.added/delta/done`,
   `response.shell_call_output_content.done` and the output item events, in
   order, for a `shell` call running `ls`.
-- Declaring `local_fs_write` or `local_web_fetch` on this server: 400 naming
-  the missing flag, before any generation.
 - Forced `local_fs_read {"path":"../outside/secret.txt"}`: the call's output
   is `error: invalid arguments: ... must be a relative path that stays inside
   the workspace` (status `incomplete`); the outside file's canary text
@@ -277,8 +279,7 @@ fetch), scratch root holding `notes.txt` (3 lines) and `docs/readme.md`.
 
 ## Live check: `file_search` (2026-10-19, Apple Silicon, PTQ1 checkpoint)
 
-Server: `local-ai serve` with no `--tools-*` flag and the `EmbeddingGemma` 2
-text model installed; one vector store of three small Markdown files
+Server: `local-ai serve` with the `EmbeddingGemma` 2 text model; one vector store of three small Markdown files
 (a fictional station handbook, a travel policy and bread notes; facts the
 model cannot know).
 

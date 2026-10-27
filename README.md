@@ -100,10 +100,16 @@ The Responses API also round-trips client-executed `custom` (text or regex
 grammar), `local_shell` and `apply_patch` tools, and runs tools itself in a
 server-side loop: `file_search` over the server's vector stores (BM25 or
 EmbeddingGemma 2 ranking, `file_search_call` items and `file_citation`
-annotations) always, and sandboxed `shell`, `local_fs_*` file access and
-allowlisted `local_web_fetch` only when `serve` is started with explicit
-`--tools-*` permissions; by default none of those is available. The
-permission model, bounds and known gaps are in [docs/TOOLS.md](docs/TOOLS.md).
+annotations), the sandboxed `shell` (no network, writes allowed),
+`local_fs_*` file listing, reading, searching, writing and editing, and
+`local_web_fetch` of any public host. All of them are always on, rooted at the
+directory `serve` is started in (canonicalized and reported in the startup
+policy), within fixed bounds: 8 rounds of hosted calls and 120 s of tool time
+per Response, 20 s per call. Because every caller can then run shell commands
+and change files there, start `serve` in a directory you are willing to
+expose to its callers, and note that `serve` refuses a non-loopback `--host`
+without `--api-key`. The protections, bounds and known gaps are in
+[docs/TOOLS.md](docs/TOOLS.md).
 
 `POST /v1/decisions` is served from the decisions artifact in
 `models/decisions-v2`: a head, gate and calibration artifact that passed
@@ -128,7 +134,8 @@ expired bytes are purged at startup. The same crate offers native repository sea
 [docs/BONSAI.md](docs/BONSAI.md#native-services).
 
 Authentication is off by default: on `127.0.0.1` any local process may use
-the server (and `serve` warns when bound elsewhere without it). Web pages a
+the server, including its hosted shell and file tools; `serve` refuses to
+bind anywhere else without `--api-key`. Web pages a
 local browser opens may not: requests addressed to a host name that is not
 local (DNS rebinding; `--allow-host` admits more names) and cross-site
 browser requests are refused with `403`; pages on loopback hosts and local
@@ -237,6 +244,7 @@ flag turns any of it off or tunes it.
 | Speculation | Lossless suffix lookup, gated depth-3 MTP and KFlash trees of up to 8 rows, each solo cycle going to the tree, the MTP chain or lookup by measured tokens per millisecond and the tree sized by E(n) − r·cost(n) |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Responses | Stored in `~/Library/Application Support/local-ai/responses` (or `--response-store DIR`) |
+| Hosted tools | All on, rooted at the canonicalized working directory of `serve`; 8 rounds, 20 s per call, 120 s per Response; a non-loopback `--host` needs `--api-key` |
 | Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache` |
 | Server | Up to eight requests decoded together in one batched pass per step, verifying lookup and MTP drafts where a cost model finds them worth their rows; a long prompt prefills 24 to 31 tokens per step inside that pass (32 in a pass of its own beside a single stream); eight more queued; HTTP/3 when its certificate and key are discovered |
 
