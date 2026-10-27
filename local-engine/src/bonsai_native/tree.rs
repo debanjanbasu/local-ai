@@ -795,60 +795,57 @@ impl BonsaiModel {
             crate::Result::Ok(())
         })?;
         let decay_inputs = [&layer.decay, &scratch.alpha, &layer.dt, &scratch.raw_beta];
-        match fold {
-            Some(fold) => {
-                self.ops.conv_l2_decay_tree_fold(
-                    batch,
-                    &rollback.raw,
-                    &layer.convolution,
-                    &layer.history,
-                    &scratch.convolved,
-                    self.epsilon,
-                    decay_inputs,
-                    [&rollback.decay, &rollback.beta],
-                    tree,
-                    fold,
-                    tokens,
-                )?;
-                self.ops.gdn_tree_fold(
-                    batch,
-                    self.state_format,
-                    &scratch.convolved,
-                    &rollback.decay,
-                    &rollback.beta,
-                    &layer.state,
-                    &scratch.recurrent_output,
-                    tree,
-                    fold,
-                    tokens,
-                )?;
-            }
-            None => {
-                self.ops.conv_l2_decay_tree(
-                    batch,
-                    &rollback.raw,
-                    &layer.convolution,
-                    &layer.history,
-                    &scratch.convolved,
-                    self.epsilon,
-                    decay_inputs,
-                    &rollback.decay,
-                    &rollback.beta,
-                    tree,
-                    tokens,
-                )?;
-                self.ops.gdn_tree(
-                    batch,
-                    self.state_format,
-                    &scratch.convolved,
-                    &rollback.decay,
-                    &rollback.beta,
-                    &layer.state,
-                    &scratch.recurrent_output,
-                    tree,
-                    tokens,
-                )?;
-            }
+        if let Some(fold) = fold {
+            self.ops.conv_l2_decay_tree_fold(
+                batch,
+                &rollback.raw,
+                &layer.convolution,
+                &layer.history,
+                &scratch.convolved,
+                self.epsilon,
+                decay_inputs,
+                [&rollback.decay, &rollback.beta],
+                tree,
+                fold,
+                tokens,
+            )?;
+            self.ops.gdn_tree_fold(
+                batch,
+                self.state_format,
+                &scratch.convolved,
+                &rollback.decay,
+                &rollback.beta,
+                &layer.state,
+                &scratch.recurrent_output,
+                tree,
+                fold,
+                tokens,
+            )?;
+        } else {
+            self.ops.conv_l2_decay_tree(
+                batch,
+                &rollback.raw,
+                &layer.convolution,
+                &layer.history,
+                &scratch.convolved,
+                self.epsilon,
+                decay_inputs,
+                &rollback.decay,
+                &rollback.beta,
+                tree,
+                tokens,
+            )?;
+            self.ops.gdn_tree(
+                batch,
+                self.state_format,
+                &scratch.convolved,
+                &rollback.decay,
+                &rollback.beta,
+                &layer.state,
+                &scratch.recurrent_output,
+                tree,
+                tokens,
+            )?;
         }
         self.ops.gdn_postprocess_transform(
             batch,

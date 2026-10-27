@@ -123,6 +123,11 @@ pub struct KflashStats {
     pub drafting: Duration,
     pub verification: Duration,
     pub commit: Duration,
+    /// Batched passes that verified this sequence's `DFlash2` chain, its
+    /// drafts and the accepted ones.
+    pub batched_cycles: usize,
+    pub batched_drafts: usize,
+    pub batched_accepted: usize,
 }
 
 /// Measurements from actual token IDs, not a re-tokenized output string.

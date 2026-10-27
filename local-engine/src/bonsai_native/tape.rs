@@ -37,7 +37,7 @@ pub(super) struct TapeLayer {
 
 /// A sequence's tape: two halves, so a step records its rows in one while it
 /// folds the pending rows of the other.
-pub(crate) struct Tape {
+pub struct Tape {
     halves: [Vec<TapeLayer>; 2],
     /// The half holding the pending rows.
     current: Cell<usize>,
@@ -74,7 +74,7 @@ impl Tape {
     }
 
     /// Rows the state does not hold yet.
-    pub(super) fn pending(&self) -> usize {
+    pub(super) const fn pending(&self) -> usize {
         self.pending.get()
     }
 

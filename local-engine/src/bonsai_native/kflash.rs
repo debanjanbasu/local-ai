@@ -110,6 +110,15 @@ impl KflashCosts {
     }
 }
 
+/// A sequence the drafter's context can follow: its buffer set and its
+/// committed position. Batched passes tap one such sequence's rows (see
+/// [`BonsaiModel::kflash_draft_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftSequence {
+    pub state: u64,
+    pub position: usize,
+}
+
 /// One verified `KFlash` cycle.
 pub struct KflashCycle {
     /// The target's own tokens: the accepted drafts and the bonus token.
@@ -142,6 +151,26 @@ pub fn expected_tokens(tree: &DflashTree, rows: &[usize]) -> f64 {
         .sum::<f64>()
 }
 
+/// The rows of `tree`'s most likely path, root first, at most `max_depth`
+/// deep: from each row, its child of the highest calibrated path
+/// probability. A batched pass verifies this chain.
+#[must_use]
+pub fn tree_chain(tree: &DflashTree, max_depth: usize) -> Vec<usize> {
+    let rows = (tree.rows as usize).min(DFLASH_MAX_TREE_ROWS);
+    let mut chain = vec![0];
+    while chain.len() <= max_depth {
+        let parent = chain[chain.len() - 1];
+        let child = (1..rows)
+            .filter(|&row| usize::try_from(tree.parent[row]) == Ok(parent))
+            .max_by(|&a, &b| tree.path_log_p[a].total_cmp(&tree.path_log_p[b]));
+        match child {
+            Some(child) => chain.push(child),
+            None => break,
+        }
+    }
+    chain
+}
+
 /// `tree` cut to `rows` (a prefix of [`tree_rows`]), parents renumbered.
 fn subtree(tree: &DflashTree, rows: &[usize]) -> DflashTree {
     let mut cut = *tree;
@@ -163,6 +192,27 @@ fn subtree(tree: &DflashTree, rows: &[usize]) -> DflashTree {
 }
 
 impl BonsaiModel {
+    /// Record a verified cut of a tree (`n` rows, the target's own tokens
+    /// `target`) in the calibration, refitting it when due.
+    fn learn(kflash: &mut Kflash, cut: &DflashTree, n: usize, target: &[u32]) {
+        let (_, refit) = kflash.calibrator.record_cycle(cut, n, target);
+        if refit {
+            kflash
+                .drafter
+                .set_calibration(kflash.calibrator.calibration());
+        }
+    }
+
+    /// Learn from the chain `rows` of `tree` (root first, a [`tree_chain`]
+    /// prefix) that a batched pass verified, the target's own tokens being
+    /// `target` (the accepted drafts, then its next token).
+    pub(crate) fn kflash_learn_chain(&mut self, tree: &DflashTree, rows: &[usize], target: &[u32]) {
+        if let Some(kflash) = self.kflash.as_mut() {
+            let cut = subtree(tree, rows);
+            Self::learn(kflash, &cut, rows.len(), target);
+        }
+    }
+
     /// Load the drafter at `path` for `KFlash` cycles: turn on the residual
     /// taps and tree verify, and measure the verify cost of 1 to 8 rows and
     /// the drafting pass on this machine. The calibration persists per
@@ -242,6 +292,14 @@ impl BonsaiModel {
         })
     }
 
+    /// The resident sequence, as the drafter's context sees it.
+    pub(crate) const fn resident_sequence(&self) -> DraftSequence {
+        DraftSequence {
+            state: self.state_id,
+            position: self.position,
+        }
+    }
+
     /// Whether the resident sequence can draft now: the drafter is loaded,
     /// the ring holds its newest committed positions, and the drafter's
     /// context continues them, would start at position 0, or would restart
@@ -249,7 +307,15 @@ impl BonsaiModel {
     /// decoding without taps (a batched pass, a restored prefix) waits until
     /// the head's or lookup's committed rows have tapped that many again.
     pub(crate) fn kflash_ready(&self) -> bool {
-        let (Some(kflash), Some(span)) = (self.kflash.as_ref(), self.tap_span()) else {
+        self.kflash_ready_of(self.resident_sequence())
+    }
+
+    /// [`Self::kflash_ready`] for `sequence`, resident or parked.
+    pub(crate) fn kflash_ready_of(&self, sequence: DraftSequence) -> bool {
+        let (Some(kflash), Some(span)) = (
+            self.kflash.as_ref(),
+            self.tap_span_of(sequence.state, sequence.position),
+        ) else {
             return false;
         };
         let start = Self::restart_position(span);
@@ -258,8 +324,13 @@ impl BonsaiModel {
 
     /// Positions the next drafting pass must append first.
     pub(crate) fn kflash_pending(&self) -> Option<usize> {
+        self.kflash_pending_of(self.resident_sequence())
+    }
+
+    /// [`Self::kflash_pending`] for `sequence`.
+    pub(crate) fn kflash_pending_of(&self, sequence: DraftSequence) -> Option<usize> {
         let kflash = self.kflash.as_ref()?;
-        let span = self.tap_span()?;
+        let span = self.tap_span_of(sequence.state, sequence.position)?;
         let len = kflash.drafter.context_len();
         Some(if Self::continues(kflash, span) {
             span.end - len
@@ -301,8 +372,17 @@ impl BonsaiModel {
     /// Append the positions the drafter lacks, in their own command buffer,
     /// when there are more than `threshold`.
     pub(crate) fn kflash_catch_up(&mut self, threshold: usize) -> crate::Result<()> {
+        self.kflash_catch_up_of(self.resident_sequence(), threshold)
+    }
+
+    /// [`Self::kflash_catch_up`] for `sequence`.
+    pub(crate) fn kflash_catch_up_of(
+        &mut self,
+        sequence: DraftSequence,
+        threshold: usize,
+    ) -> crate::Result<()> {
         if self
-            .kflash_pending()
+            .kflash_pending_of(sequence)
             .is_none_or(|pending| pending <= threshold)
         {
             return Ok(());
@@ -312,17 +392,25 @@ impl BonsaiModel {
         };
         let result = (|| {
             let mut batch = CommandBatch::new(&self.context)?;
-            self.encode_sync(&mut kflash, &mut batch)?;
+            self.encode_sync(&mut kflash, &mut batch, sequence)?;
             self.finish(batch)
         })();
         self.kflash = Some(kflash);
         result
     }
 
-    /// Encode the appends that bring the drafter's context to
-    /// [`Self::position`]; `false` when the ring holds no usable span.
-    fn encode_sync(&self, kflash: &mut Kflash, batch: &mut CommandBatch) -> crate::Result<bool> {
-        let (Some(span), Some(ring)) = (self.tap_span(), self.tap_ring()) else {
+    /// Encode the appends that bring the drafter's context to `sequence`'s
+    /// position; `false` when the ring holds no usable span.
+    fn encode_sync(
+        &self,
+        kflash: &mut Kflash,
+        batch: &mut CommandBatch,
+        sequence: DraftSequence,
+    ) -> crate::Result<bool> {
+        let (Some(span), Some(ring)) = (
+            self.tap_span_of(sequence.state, sequence.position),
+            self.tap_ring(),
+        ) else {
             return Ok(false);
         };
         if !Self::continues(kflash, span) {
@@ -359,17 +447,32 @@ impl BonsaiModel {
         if self.stop_for_cancel() {
             return Ok(None);
         }
+        self.kflash_draft_of(self.resident_sequence(), anchor)
+    }
+
+    /// [`Self::kflash_draft`] for `sequence`, resident or parked, whose rows
+    /// the ring holds: a batched sequence's tree, from its taps.
+    pub(crate) fn kflash_draft_of(
+        &mut self,
+        sequence: DraftSequence,
+        anchor: u32,
+    ) -> crate::Result<Option<DflashTree>> {
         let Some(mut kflash) = self.kflash.take() else {
             return Ok(None);
         };
-        let result = self.draft_tree(&mut kflash, anchor);
+        let result = self.draft_tree(&mut kflash, anchor, sequence);
         self.kflash = Some(kflash);
         result
     }
 
-    fn draft_tree(&self, kflash: &mut Kflash, anchor: u32) -> crate::Result<Option<DflashTree>> {
+    fn draft_tree(
+        &self,
+        kflash: &mut Kflash,
+        anchor: u32,
+        sequence: DraftSequence,
+    ) -> crate::Result<Option<DflashTree>> {
         let mut batch = CommandBatch::new(&self.context)?;
-        if !self.encode_sync(kflash, &mut batch)? {
+        if !self.encode_sync(kflash, &mut batch, sequence)? {
             return Ok(None);
         }
         let Kflash {
@@ -385,7 +488,7 @@ impl BonsaiModel {
             &mut batch,
             &shared,
             &DraftAnchor::Token(anchor),
-            self.position,
+            sequence.position,
         )?;
         drafter.build_tree(&mut batch, DFLASH_MAX_TREE_ROWS)?;
         let gpu = batch.commit_async().wait_with_gpu_time()?;
@@ -439,12 +542,7 @@ impl BonsaiModel {
                 .iter()
                 .map(|sample| sample.token_id)
                 .collect::<Vec<_>>();
-            let (_, refit) = kflash.calibrator.record_cycle(&cut, n, &target);
-            if refit {
-                kflash
-                    .drafter
-                    .set_calibration(kflash.calibrator.calibration());
-            }
+            Self::learn(kflash, &cut, n, &target);
         }
         Ok(Some(KflashCycle {
             accepted: acceptance.path.len() - 1,

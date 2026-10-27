@@ -66,6 +66,7 @@ fn trajectories(model: &mut BonsaiModel, count: usize, batched: bool) -> Vec<Vec
                     drafts: Vec::new(),
                     state: Some(state),
                     lag: None,
+                    taps: false,
                 })
                 .collect::<Vec<_>>();
             model.decode_batch(&mut rows).expect("batched step");
@@ -203,6 +204,7 @@ fn batched_step_timings() {
                     drafts: Vec::new(),
                     state: Some(state),
                     lag: None,
+                    taps: false,
                 })
                 .collect::<Vec<_>>();
             let started = Instant::now();
@@ -360,6 +362,7 @@ fn batched_verify_tracks_each_sequence_alone() {
             drafts: drafts[index].to_vec(),
             state: Some(state),
             lag: None,
+            taps: false,
         })
         .collect::<Vec<_>>();
     model.decode_batch(&mut rows).expect("batched verify");
@@ -392,6 +395,7 @@ fn batched_verify_tracks_each_sequence_alone() {
             drafts: Vec::new(),
             state: Some(state),
             lag: None,
+            taps: false,
         })
         .collect::<Vec<_>>();
     model.decode_batch(&mut rows).expect("batched step");
@@ -462,6 +466,7 @@ fn batched_verify_timings() {
                     drafts: (0..drafts).map(|draft| 2000 + draft as u32).collect(),
                     state: Some(state),
                     lag: None,
+                    taps: false,
                 })
                 .collect::<Vec<_>>();
             let started = Instant::now();
@@ -569,6 +574,7 @@ fn lagged(
                 drafts: Vec::new(),
                 state: Some(state),
                 lag: Some(lag),
+                taps: false,
             })
             .collect::<Vec<_>>();
         model.decode_batch(&mut rows).expect("batched step");
@@ -711,6 +717,7 @@ fn long_batched_runs_catch_their_heads_up() {
                 drafts: Vec::new(),
                 state: Some(state),
                 lag: Some(lag),
+                taps: false,
             })
             .collect::<Vec<_>>();
         model.decode_batch(&mut rows).expect("batched step");
@@ -779,6 +786,7 @@ fn batched_head_draft_timings() {
                             drafts: Vec::new(),
                             state: Some(state),
                             lag: Some(lag),
+                            taps: false,
                         })
                         .collect::<Vec<_>>();
                     model.decode_batch(&mut rows).expect("batched step");
@@ -893,6 +901,7 @@ fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
                 drafts: Vec::new(),
                 state: Some(state),
                 lag: Some(lag),
+                taps: false,
             })
             .collect::<Vec<_>>();
         model
@@ -917,6 +926,7 @@ fn prefill_rows_in_a_batched_pass_track_prefill_blocks() {
                 drafts: Vec::new(),
                 state: Some(state),
                 lag: Some(lag),
+                taps: false,
             })
             .collect::<Vec<_>>();
         model.decode_batch(&mut rows).expect("batched pass alone");
@@ -1000,6 +1010,7 @@ fn prefill_fold_timings() {
                         drafts: Vec::new(),
                         state: Some(state),
                         lag: None,
+                        taps: false,
                     })
                     .collect::<Vec<_>>();
                 let started = Instant::now();
