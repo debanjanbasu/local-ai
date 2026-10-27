@@ -11,7 +11,9 @@
 //! a few 8-row chunks rather than one pass per cycle. When the span the
 //! drafter continued ends (another sequence's rows, a batched pass, a
 //! restored prefix), the drafter restarts at the oldest position the ring
-//! still holds, at most a window back, and attends only what it has since.
+//! still holds, at most a window back, and attends only what it has since;
+//! unless that starts at position 0 it first waits for [`RESTART_ROWS`]
+//! tapped positions.
 
 use std::path::Path;
 use std::time::Duration;
@@ -29,10 +31,16 @@ use crate::sampler::{Sampler, SamplingResult};
 /// A catch-up longer than this many rows runs in a command buffer of its
 /// own before the cycle, so the cycle's measured time stays a cycle's.
 pub const CATCH_UP_ROWS: usize = 64;
+/// Positions a restarted drafter context needs before it drafts: with only
+/// the few positions tapped since a batched pass it would draft from almost
+/// no context, and its poor trees would leave the tree trailing in the
+/// budget for a long stretch.
+const RESTART_ROWS: usize = 64;
 /// Weight of each new measurement in the cost averages.
 const COST_WEIGHT: f64 = 0.125;
-/// Verify cost repetitions at load.
-const COST_REPETITIONS: usize = 2;
+/// Verify cost repetitions at load, after a warm-up pass of each size: the
+/// running drift corrects what two samples miss.
+const COST_REPETITIONS: usize = 1;
 
 /// Bytes `KFlash` allocates beside the drafter's mapped weights, for the
 /// memory plan: the drafter's context ring and pass scratch (about 60 MB),
@@ -234,10 +242,18 @@ impl BonsaiModel {
         })
     }
 
-    /// Whether the resident sequence can draft now: the drafter is loaded and
-    /// the ring holds its newest committed positions.
+    /// Whether the resident sequence can draft now: the drafter is loaded,
+    /// the ring holds its newest committed positions, and the drafter's
+    /// context continues them, would start at position 0, or would restart
+    /// with at least [`RESTART_ROWS`] of them. A context restarted after
+    /// decoding without taps (a batched pass, a restored prefix) waits until
+    /// the head's or lookup's committed rows have tapped that many again.
     pub(crate) fn kflash_ready(&self) -> bool {
-        self.kflash.is_some() && self.tap_span().is_some()
+        let (Some(kflash), Some(span)) = (self.kflash.as_ref(), self.tap_span()) else {
+            return false;
+        };
+        let start = Self::restart_position(span);
+        Self::continues(kflash, span) || start == 0 || span.end - start >= RESTART_ROWS
     }
 
     /// Positions the next drafting pass must append first.

@@ -60,9 +60,23 @@ pub(super) struct KflashBudget {
     rate_tokens: f64,
     rate_ms: f64,
     cycles: usize,
+    ready: bool,
 }
 
 impl KflashBudget {
+    /// Note whether the tree can draft this cycle. A tree that becomes
+    /// available again (its context rebuilt after a batched pass) counts as
+    /// untried: what it measured before came from another context.
+    pub(super) const fn set_ready(&mut self, ready: bool) {
+        if ready && !self.ready {
+            let index = Source::Tree as usize;
+            self.tokens[index] = 0.0;
+            self.ms[index] = 0.0;
+            self.runs[index] = 0;
+        }
+        self.ready = ready;
+    }
+
     fn rate(&self, source: Source) -> Option<f64> {
         let index = source as usize;
         (self.runs[index] > 0 && self.ms[index] > 0.0).then(|| self.tokens[index] / self.ms[index])
@@ -168,6 +182,20 @@ mod tests {
         // Lookup, available at last and never tried, runs at once.
         assert_eq!(budget.choose([true, true, true]), Some(Source::Lookup));
         assert_eq!(budget.choose([false, false, false]), None);
+    }
+
+    #[test]
+    fn a_tree_available_again_runs_as_untried() {
+        let mut budget = KflashBudget::default();
+        budget.set_ready(true);
+        budget.observe(Source::Tree, 1, 100.0);
+        budget.observe(Source::Mtp, 3, 60.0);
+        assert_eq!(budget.choose([true, true, false]), Some(Source::Mtp));
+        budget.set_ready(true);
+        assert_eq!(budget.choose([true, true, false]), Some(Source::Mtp));
+        budget.set_ready(false);
+        budget.set_ready(true);
+        assert_eq!(budget.choose([true, true, false]), Some(Source::Tree));
     }
 
     #[test]

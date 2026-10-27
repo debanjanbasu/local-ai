@@ -579,7 +579,24 @@ impl BonsaiEngine {
         }
         let drafts = Self::lookup_draft(self.ngram, self.info.context, generation);
         let kflash = self.model.kflash_costs().is_some();
-        let source = if self.model.kflash_ready() {
+        if kflash && self.kflash_owner != Some(generation.id) {
+            // A restored prefix of the previous owner's tokens continues its
+            // context rather than waiting to restart it past the prefix.
+            let prefix = generation.stats.reused_prompt_tokens;
+            if prefix > 0
+                && self
+                    .kflash_history
+                    .as_ref()
+                    .is_some_and(|history| history.get(..prefix) == generation.prompt.get(..prefix))
+                && self.model.kflash_adopt(prefix)
+            {
+                self.kflash_history = None;
+                self.kflash_owner = Some(generation.id);
+            }
+        }
+        let ready = self.model.kflash_ready();
+        generation.kflash.set_ready(ready);
+        let source = if ready {
             generation.kflash.choose([true, head, !drafts.is_empty()])
         } else if !drafts.is_empty() {
             Some(Source::Lookup)
@@ -590,15 +607,8 @@ impl BonsaiEngine {
         };
         let mut started = Instant::now();
         if source == Some(Source::Tree) && self.kflash_owner != Some(generation.id) {
-            // A restored prefix of the previous owner's tokens continues its
-            // context rather than restarting it at the first tapped position.
-            let prefix = generation.stats.reused_prompt_tokens;
-            if let Some(history) = self.kflash_history.take()
-                && prefix > 0
-                && history.get(..prefix) == generation.prompt.get(..prefix)
-            {
-                self.model.kflash_adopt(prefix);
-            }
+            // This cycle restarts the drafter's context on this sequence.
+            self.kflash_history = None;
             self.kflash_owner = Some(generation.id);
         }
         if source == Some(Source::Tree) {

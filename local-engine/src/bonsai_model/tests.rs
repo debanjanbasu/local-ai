@@ -897,11 +897,34 @@ fn deep_cancellation_stops_in_prefill_and_a_retry_restores_what_it_kept() {
     );
 }
 
-/// `KFlash` cycles emit exactly the tokens plain decoding emits: greedy on
-/// a code and a prose prompt over a few hundred tokens, including cycles
-/// whose accepted path took a branch off the tree's leading rows, and
-/// sampled with a fixed seed (each position draws the plain sampler's own
-/// random number).
+/// Largest logit margin between plain decoding's two best tokens that a
+/// verify pass of another row class may resolve the other way (rows of one
+/// to eight agree with plain decoding within 0.019; see docs/BONSAI.md, Tree
+/// verify).
+const NEAR_TIE: f32 = 0.03;
+
+/// Greedy `KFlash` tokens equal plain decoding's, or first differ where
+/// plain decoding's two best logits were within [`NEAR_TIE`].
+fn assert_matches_plain(kflash: &[u32], plain: &[u32], margins: &[f32], what: &str) {
+    match kflash.iter().zip(plain).position(|(a, b)| a != b) {
+        None => assert_eq!(kflash.len(), plain.len(), "{what}"),
+        Some(index) => {
+            let margin = margins[index];
+            eprintln!("{what}: first differs at token {index}, a {margin} logit near-tie");
+            assert!(
+                margin < NEAR_TIE,
+                "{what}: token {index} differs at a {margin} logit margin"
+            );
+        }
+    }
+}
+
+/// `KFlash` cycles emit the tokens plain decoding emits: greedy on a code
+/// and a prose prompt over a few hundred tokens (up to a near-tie that a
+/// verify of another row class resolves the other way, as the head's chain
+/// may), including cycles whose accepted path took a branch off the tree's
+/// leading rows, and exactly when sampled with a fixed seed (each position
+/// draws the plain sampler's own random number).
 #[test]
 #[ignore = "requires the Bonsai GGUF, the DFlash2 drafter, the MTP head and a Metal device"]
 #[expect(clippy::too_many_lines)]
@@ -915,6 +938,11 @@ fn kflash_generation_matches_plain_decoding() {
          with type hints, docstrings and a short usage example.",
         "List the planets of the solar system in order, one per line, with a one sentence \
          description of each.",
+        // Decoded first in a batch: a prompt the engine has not answered yet,
+        // since suffix lookup would finish an answered one inside the batch
+        // from its remembered output.
+        "Write a Rust function that parses an ISO 8601 date such as 2024-02-29 into year, \
+         month and day, with error handling and unit tests.",
     ];
     let greedy = GenerateParams {
         temperature: 0.0,
@@ -946,12 +974,35 @@ fn kflash_generation_matches_plain_decoding() {
         .expect("load plain model");
         cases
             .iter()
+            .chain([&(prompts[2], &greedy)])
             .map(|(prompt, params)| {
+                // Through the scheduler, for each token's two best logprobs.
                 let ids = engine.encode_prompt(prompt, false, false).expect("prompt");
+                let params = GenerateParams {
+                    logprobs: Some(2),
+                    ..(*params).clone()
+                };
                 engine
-                    .generate(&ids, params, |_| true)
-                    .expect("plain")
-                    .token_ids
+                    .admit(&ids, &params, None, CancelToken::new())
+                    .expect("admit plain");
+                let mut margins = Vec::new();
+                let mut tokens = None;
+                while engine.active_generations() > 0 {
+                    let finished = engine.step(
+                        &mut |_, _, logprobs| {
+                            margins.extend(logprobs.iter().map(|logprob| match &logprob.top[..] {
+                                [first, second, ..] => first.logprob - second.logprob,
+                                _ => f32::INFINITY,
+                            }));
+                            true
+                        },
+                        &mut |_, _| {},
+                    );
+                    for (_, result) in finished {
+                        tokens = Some(result.expect("plain").token_ids);
+                    }
+                }
+                (tokens.expect("plain finished"), margins)
             })
             .collect::<Vec<_>>()
     };
@@ -972,7 +1023,7 @@ fn kflash_generation_matches_plain_decoding() {
     assert!(engine.kflash_enabled());
     let mut cycles = 0;
     let mut off_chain = 0;
-    for ((prompt, params), plain) in cases.iter().zip(&plain) {
+    for ((prompt, params), (plain, margins)) in cases.iter().zip(&plain) {
         let ids = engine.encode_prompt(prompt, false, false).expect("prompt");
         let output = engine.generate(&ids, params, |_| true).expect("KFlash");
         let kflash = &output.stats.kflash;
@@ -988,21 +1039,24 @@ fn kflash_generation_matches_plain_decoding() {
         );
         cycles += kflash.cycles;
         off_chain += kflash.off_chain_cycles;
-        assert_eq!(&output.token_ids, plain, "{prompt}");
+        if params.temperature == 0.0 {
+            assert_matches_plain(&output.token_ids, plain, margins, prompt);
+        } else {
+            assert_eq!(&output.token_ids, plain, "{prompt}");
+        }
     }
     assert!(cycles > 20, "too few tree cycles: {cycles}");
     assert!(off_chain > 0, "no accepted path left the leading rows");
-    // Admitted together, the two greedy prompts decode in batched passes
-    // (no taps) until the shorter one ends; the other then runs solo cycles
-    // again, its drafter restarted at the first position tapped since.
+    // Admitted together, two greedy prompts decode in batched passes (no
+    // taps) until the shorter one ends; the other then runs solo cycles
+    // again, its drafter restarted at the first position tapped since once
+    // the head has tapped enough of them.
     let short = GenerateParams {
         max_tokens: 96,
         ..greedy.clone()
     };
-    let ids = cases[..2]
-        .iter()
-        .map(|(prompt, _)| engine.encode_prompt(prompt, false, false).expect("prompt"))
-        .collect::<Vec<_>>();
+    let ids = [prompts[2], prompts[1]]
+        .map(|prompt| engine.encode_prompt(prompt, false, false).expect("prompt"));
     let long = engine
         .admit(&ids[0], &greedy, None, CancelToken::new())
         .expect("admit long");
@@ -1016,8 +1070,27 @@ fn kflash_generation_matches_plain_decoding() {
         }
     }
     let long = &outputs[&long];
-    assert_eq!(long.token_ids, plain[0], "batched, then solo");
-    assert_eq!(outputs[&early].token_ids, plain[1][..96], "batched");
+    eprintln!(
+        "batched, then solo: {} batched tokens, {} tree cycles, {} declined, {} MTP and {} lookup \
+         cycles",
+        long.stats.batched_tokens,
+        long.stats.kflash.cycles,
+        long.stats.kflash.declined_trees,
+        long.stats.kflash.mtp_cycles,
+        long.stats.kflash.lookup_cycles,
+    );
+    assert_matches_plain(
+        &long.token_ids,
+        &plain[3].0,
+        &plain[3].1,
+        "batched, then solo",
+    );
+    assert_matches_plain(
+        &outputs[&early].token_ids,
+        &plain[1].0[..96],
+        &plain[1].1,
+        "batched",
+    );
     assert!(long.stats.batched_tokens > 0, "nothing decoded in a batch");
     assert!(
         long.stats.kflash.cycles > 0,
