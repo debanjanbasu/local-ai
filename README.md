@@ -235,7 +235,7 @@ Startup prints every decision and reason under `experimental_bonsai`.
 | Context | Largest value up to 262,144 whose fully grown state fits 90% of Metal's recommended working set |
 | K/V | Hadamard-rotated Q8 (8.5 bits/value); start at 1,024 tokens and grow on demand |
 | Kernels | Metal 4 tensor kernels where supported, SIMD fallbacks elsewhere |
-| Speculation | Lossless suffix lookup; gated depth-3 MTP when the mixed ternary/int8 head artifact is installed; with the DFlash2 drafter installed, KFlash trees of up to 8 rows, each solo cycle going to the tree, the MTP chain or lookup by measured tokens per millisecond and the tree sized by E(n) − r·cost(n) |
+| Speculation | Lossless suffix lookup, gated depth-3 MTP and KFlash trees of up to 8 rows, each solo cycle going to the tree, the MTP chain or lookup by measured tokens per millisecond and the tree sized by E(n) − r·cost(n) |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Disk | Smallest of the checkpoint's size, an eighth of free disk and a quarter of physical memory, under `~/Library/Caches/local-ai/prompt-cache` |
 | Server | Up to eight requests decoded together in one batched pass per step, verifying lookup and MTP drafts where a cost model finds them worth their rows; a long prompt prefills 24 to 31 tokens per step inside that pass (32 in a pass of its own beside a single stream); eight more queued; HTTP/3 when its certificate and key are discovered |
@@ -249,7 +249,7 @@ Startup prints every decision and reason under `experimental_bonsai`.
   measured 30–32 and 38–39 tok/s. Two 600-token copy-edit prompts reached
   about 90 tok/s with suffix lookup. Run-by-run provenance is in
   [docs/BONSAI.md](docs/BONSAI.md#performance).
-- KFlash, with the DFlash2 drafter installed: 50.4 tok/s geomean on the
+- KFlash: 50.4 tok/s geomean on the
   same six prompts against 39.9 for main in the same run (35–67: thinking
   66.5, arithmetic 63.3, code 58.5; essays stay on the MTP chain at 34.9),
   5.0 tokens per tree cycle, greedy text byte-identical to
@@ -353,8 +353,8 @@ Weights are not included. The runtime validates these pinned files:
 | --- | ---: | --- | --- |
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` | always |
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | 931,145,856 | `e287342d92332fa3577ed1d42e921dac9370c08da58ba9337fa450f6cc76cfd7` | for image and video input to chat and responses |
-| `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | for MTP speculation |
-| `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` | 2,054,275,072 | `f43f846c60fc3f83c18ab772006d55f3cd6287944b4989fe4ac8d774c7a955e8` | for KFlash tree drafting |
+| `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | always |
+| `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` | 2,054,275,072 | `f43f846c60fc3f83c18ab772006d55f3cd6287944b4989fe4ac8d774c7a955e8` | always |
 | `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | for `POST /v1/embeddings` |
 | `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | for image/video embeddings (Rust API) |
@@ -363,9 +363,11 @@ Weights are not included. The runtime validates these pinned files:
 | `models/whisper-large-v3/whisper-large-v3-f16.bin` | 3,093,458,432 | `cce7ae83d4a15146f356a9f3bb5169b0fb42a86dc2e6a0c6cf932766e6d1cb53` | for `POST /v1/audio/transcriptions` and `/translations` |
 | `models/whisper-large-v3/tokenizer.json` | 2,480,617 | `6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca` | for `POST /v1/audio/transcriptions` and `/translations` |
 
-The GGUF is required. The [mixed ternary/int8 MTP head](#mtp-head-artifact) is
-not: without it speculation falls back to suffix lookup alone and the startup
-policy says why. Neither is the BF16 vision projector: installed beside the
+The GGUF, the [mixed ternary/int8 MTP head](#mtp-head-artifact) and the
+[DFlash2 drafter](#dflash2-drafter-artifact) are required: startup stops with
+an error naming any that is missing, and the loaders refuse a corrupt one
+(`--no-speculation` is the only way to run without the head and drafter). The
+BF16 vision projector is optional: installed beside the
 GGUF, it adds image and video input to Chat Completions and Responses
 ([docs/BONSAI.md](docs/BONSAI.md#image-input),
 [video](docs/BONSAI.md#video-input)); without it image and video parts are
@@ -425,7 +427,7 @@ python3 tools/kaggle_bonsai_job.py \
 The tool produces digest-checked, no-clobber archives and retains upstream
 licenses.
 
-The optional MTP head is published as a release asset,
+The required MTP head is published as a release asset,
 [`mtp-head-mixed-v1`](https://github.com/debanjanbasu/local-ai/releases/tag/mtp-head-mixed-v1)
 (with its model card, license, notice and checksums), mirrored on Hugging Face
 as
@@ -513,7 +515,7 @@ Heads tried before the mixed one, and their measurements, are in
 
 ### DFlash2 drafter artifact
 
-The optional KFlash drafter is ProCreations'
+The required KFlash drafter is ProCreations'
 [`Ternary-Bonsai-2-27B-DFlash2`](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)
 at revision `4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b`: z-lab's
 `DFlash2DraftModel` (five layers conditioned on the target's residual
@@ -537,8 +539,7 @@ earlier pin, `incoai/Qwen3.8-27B-DFlash2` at `015e795` (bootstrap ratio
 
 As with the MTP head, every load re-derives the payload digest (128 named
 sections, padding skipped) and a corrupt, truncated or foreign file is a hard
-error; a missing file leaves speculation with the MTP head and the policy
-records why. The policy also reports whether the installed drafter is the
+error, as is a missing one. The policy also reports whether the installed drafter is the
 pinned one (`PINNED_DFLASH_SHA256`). Convert any DFlash2 checkpoint with this
 architecture (the published one or a fine-tune, BF16, F16 or F32) from a
 directory holding its `model.safetensors` and `config.json`:

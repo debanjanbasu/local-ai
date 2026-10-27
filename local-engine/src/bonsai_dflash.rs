@@ -20,10 +20,11 @@
 //! 1. **Load.** [`DflashMode::resolve`] finds the pinned artifact
 //!    ([`DEFAULT_BONSAI_DFLASH_ARTIFACT`], an exact file beside the target's
 //!    model directory, written by `local-ai bonsai --export dflash-head=DIR`).
-//!    Absent, it resolves to [`DflashResolution::Fallback`] with the reason,
-//!    and speculation stays with MTP. Present, [`DflashDrafter::load`]
-//!    re-derives the payload digest and fails hard on any corruption: there
-//!    is no silent fallback for a broken install. There is no opt-in flag.
+//!    Absent, it is an error: the drafter is required. Present,
+//!    [`DflashDrafter::load`] re-derives the payload digest and fails hard on
+//!    any corruption: there is no silent fallback for a broken install. Only
+//!    an explicit [`DflashMode::Off`] (a plain-decoding reference) resolves
+//!    to [`DflashResolution::Fallback`].
 //! 2. **Context.** [`DflashDrafter::append_context`] takes, for newly
 //!    committed positions, the target's residual-stream hidden states at the
 //!    five tap layers, `[n, 5, 5120]` F16 or F32 rows in a Metal buffer the

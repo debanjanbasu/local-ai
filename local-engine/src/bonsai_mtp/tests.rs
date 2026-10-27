@@ -164,7 +164,7 @@ fn settings_bound_depth() {
 }
 
 #[test]
-fn auto_speculates_only_with_an_installed_head() {
+fn auto_requires_an_installed_head() {
     let dir = tempfile::tempdir().expect("tempdir");
     let installed = dir.path().join(MTP_HEAD_ARTIFACT);
     let missing = dir.path().join("absent.bin");
@@ -176,19 +176,12 @@ fn auto_speculates_only_with_an_installed_head() {
             .expect("installed"),
         MtpResolution::Native(MtpSettings::new(installed.clone(), 3).expect("settings"))
     );
-    let MtpResolution::Disabled(reason) = auto
+    let error = auto
         .resolve_with_default(&missing, true)
-        .expect("missing head decodes plainly")
-    else {
-        unreachable!("a missing default head must not enable speculation");
-    };
-    assert!(reason.contains("absent.bin"), "{reason}");
+        .expect_err("a missing head must stop startup");
+    assert!(error.to_string().contains("absent.bin"), "{error}");
     // A directory at the default path is not a head.
-    assert!(matches!(
-        auto.resolve_with_default(dir.path(), true)
-            .expect("directory"),
-        MtpResolution::Disabled(_)
-    ));
+    assert!(auto.resolve_with_default(dir.path(), true).is_err());
     // The build default can turn an installed head off.
     assert_eq!(
         auto.resolve_with_default(&installed, false)
@@ -258,17 +251,16 @@ fn explicit_head_overrides_the_default() {
 /// `Off` carries the reason its own constructor recorded, so the record is
 /// carried rather than re-derived.
 ///
-/// A discoverer that finds no head builds `Off` exactly as an explicit opt-out
-/// does; a mode with no payload makes the two indistinguishable, and every
-/// report then names an opt-out the user never asked for.
+/// Discovery builds `Off` for `--no-speculation` with its own reason; a mode
+/// with no payload would report the generic opt-out text instead.
 #[test]
 fn off_reports_the_reason_it_carried() {
     let dir = tempfile::tempdir().expect("tempdir");
     let installed = dir.path().join(MTP_HEAD_ARTIFACT);
     std::fs::write(&installed, b"stub").expect("write head");
-    let absent = "no MTP head artifact installed beside the model";
+    let absent = "disabled by --no-speculation";
 
-    // A discoverer that found nothing beside the model says so, verbatim.
+    // The reason discovery recorded is reported verbatim.
     assert_eq!(
         MtpMode::Off(Some(absent.into()))
             .resolve_with_default(&installed, true)

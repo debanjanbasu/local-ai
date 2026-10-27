@@ -66,45 +66,41 @@ impl Resources {
         // is spawned once per discovery rather than once per consumer.
         let memory = physical_memory_bytes();
         let model_bytes = file_bytes(&model);
-        let head = model
-            .parent()
-            .and_then(Path::parent)
-            .map(|root| root.join(MTP_DIRECTORY).join(MTP_HEAD_ARTIFACT))
-            .filter(|path| path.is_file());
-        // The one head is the trained ternary artifact beside the model. An
-        // invalid one is reported by the loader instead of quietly costing
-        // throughput. Every branch below answers with a named head or with
-        // `Off`; discovery never constructs `MtpMode::Auto`, which stays the
-        // default for an embedder that has not called this.
-        let (mtp, mtp_reason) = if !speculation {
-            let reason = "disabled by --no-speculation";
-            (MtpMode::Off(Some(reason.into())), reason.into())
-        } else if let Some(path) = head {
-            let reason = format!("ternary PTQ1 MTP head artifact {}", path.display());
-            (MtpMode::Head(MtpSettings::new(path, mtp_depth)?), reason)
-        } else {
-            // Only what discovery can see: whether suffix/ngram lookup is on is
-            // decided by `--no-speculation`, which took the branch above.
-            let reason = "no MTP head artifact installed beside the model";
-            (MtpMode::Off(Some(reason.into())), reason.into())
+        // The MTP head and the DFlash2 drafter are required beside the
+        // model, like the checkpoint itself: a missing one stops startup
+        // here, and the loaders refuse a corrupt one. Only
+        // `--no-speculation` turns them off. Discovery never constructs
+        // `MtpMode::Auto`, which stays the default for an embedder that has
+        // not called this.
+        let root = model.parent().and_then(Path::parent);
+        let required = |directory: &str, file: &str, what: &str| {
+            let path = root.map(|root| root.join(directory).join(file));
+            match path {
+                Some(path) if path.is_file() => Ok(path),
+                path => Err(crate::Error::InvalidArgument(format!(
+                    "{what} not found{} (required; see README Model install)",
+                    path.map(|path| format!(": {}", path.display()))
+                        .unwrap_or_default()
+                ))),
+            }
         };
-        // KFlash whenever the drafter is installed beside the model; the
-        // loader verifies its digest and keeps the MTP head for fallback.
-        let drafter = model
-            .parent()
-            .and_then(Path::parent)
-            .map(|root| root.join(DFLASH_DIRECTORY).join(DFLASH_HEAD_ARTIFACT))
-            .filter(|path| path.is_file());
-        let (dflash, dflash_reason) = if !speculation {
-            let reason = "disabled by --no-speculation";
-            (DflashMode::Off(reason.into()), reason.into())
-        } else if let Some(path) = drafter {
-            let reason = format!("DFlash2 drafter artifact {}", path.display());
-            (DflashMode::Drafter(path), reason)
+        let (mtp, mtp_reason, dflash, dflash_reason) = if speculation {
+            let head = required(MTP_DIRECTORY, MTP_HEAD_ARTIFACT, "MTP head")?;
+            let drafter = required(DFLASH_DIRECTORY, DFLASH_HEAD_ARTIFACT, "DFlash2 drafter")?;
+            (
+                MtpMode::Head(MtpSettings::new(head.clone(), mtp_depth)?),
+                format!("ternary PTQ1 MTP head artifact {}", head.display()),
+                DflashMode::Drafter(drafter.clone()),
+                format!("DFlash2 drafter artifact {}", drafter.display()),
+            )
         } else {
-            let reason = "no DFlash2 drafter installed beside the model; speculating with \
-                          the MTP head and suffix lookup";
-            (DflashMode::Off(reason.into()), reason.into())
+            let reason = "disabled by --no-speculation";
+            (
+                MtpMode::Off(Some(reason.into())),
+                reason.into(),
+                DflashMode::Off(reason.into()),
+                reason.into(),
+            )
         };
         // Image input whenever the projector is installed beside the model;
         // the loader verifies it against the pinned export.

@@ -382,14 +382,12 @@ fn calibration_cache_path_names_model_drafter_and_chip() {
 }
 
 #[test]
-fn policy_falls_back_to_mtp_without_the_artifact() {
+fn policy_requires_the_artifact() {
     let missing = Path::new("/nonexistent/dflash2-drafter-int8-v1.bin");
-    match DflashMode::Auto.resolve_with_default(missing) {
-        Ok(DflashResolution::Fallback(reason)) => {
-            assert!(reason.contains("no DFlash2 drafter installed") && reason.contains("MTP"));
-        }
-        other => panic!("{other:?}"),
-    }
+    let error = DflashMode::Auto
+        .resolve_with_default(missing)
+        .expect_err("a missing drafter must stop startup");
+    assert!(error.to_string().contains("dflash2-drafter-int8-v1.bin"), "{error}");
     assert!(DflashMode::Drafter(missing.to_owned()).resolve().is_err());
     assert_eq!(
         DflashMode::Off("off by request".into()).resolve().ok(),

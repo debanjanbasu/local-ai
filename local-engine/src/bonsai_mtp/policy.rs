@@ -195,8 +195,8 @@ impl MtpMode {
             Self::Auto { depth } => {
                 let settings = MtpSettings::new(default_head.to_path_buf(), *depth)?;
                 if !default_head.is_file() {
-                    return Ok(MtpResolution::Disabled(format!(
-                        "no MTP head artifact installed at {}",
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "MTP head not found: {} (required; see README Model install)",
                         default_head.display()
                     )));
                 }

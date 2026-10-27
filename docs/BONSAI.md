@@ -23,7 +23,7 @@ emits the validated metadata and tokenizer index as JSON.
 
 ### MTP head
 
-The optional MTP head is a one-layer multi-token prediction head (one dense
+The required MTP head is a one-layer multi-token prediction head (one dense
 Qwen3.5 full-attention decoder layer). The shipped head is **mixed
 precision, trained for it**, the way Bonsai keeps a few tensors above ternary.
 All nine matrices live in the target's Hadamard-rotated basis; `q_proj`,
@@ -34,7 +34,7 @@ its kernels, while the sensitive `fc` (both halves), `k_proj`, `v_proj` and
 The installed file is `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`,
 166,969,344 bytes, mapped into Metal with no copy: 258 MB less resident memory
 than an all-int8 head at the same decode speed. Discovery looks for exactly this file beside the pinned checkpoint
-directory; when it is absent, MTP is off and the policy records why.
+directory; when it is absent, startup stops with an error naming it.
 
 ```text
 payload_bytes  = 166799360
@@ -187,7 +187,7 @@ needs approval to publish.
 
 ### DFlash2 drafter
 
-The optional KFlash drafter (Kapitsa's
+The required KFlash drafter (Kapitsa's
 [KFlash](https://github.com/nace-ai/kapitsa/blob/main/docs/kflash.md)) is
 z-lab's `DFlash2DraftModel`. The shipped weights are ProCreations'
 [`Ternary-Bonsai-2-27B-DFlash2`](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)
@@ -240,8 +240,8 @@ digest, which every load re-derives. `bonsai --export dflash-head=DIR`
 writes it from `DIR/model.safetensors` and `DIR/config.json` of any
 `DFlash2DraftModel` with this configuration (BF16, F16 or F32; the codebooks
 may carry a `.weight` suffix), so fine-tuned drafters convert the same way.
-Discovery looks for exactly this file; absent, speculation stays with the MTP
-head and the policy records why, and a corrupt file is a hard error.
+Discovery looks for exactly this file; a missing or corrupt file is a hard
+error that stops startup.
 
 #### Drafter precision
 
@@ -318,7 +318,7 @@ the fp32 lattices (report: 4.68):
 #### Interface
 
 `local-engine/src/bonsai_dflash.rs` documents the contract the verify side
-integrates against. In short: `DflashMode::resolve` finds or falls back;
+integrates against. In short: `DflashMode::resolve` finds the drafter or fails;
 `DflashDrafter::append_context` takes `[n, 5, 5120]` F16 or F32 taps from a
 Metal buffer into a 2,112-slot F16 K/V ring per layer (the 2,047-position
 window plus 64 positions of `truncate_context` rollback); `draft` encodes
@@ -2302,9 +2302,9 @@ All choices and reasons are reported in startup JSON.
   beside two or more decoding requests, a long prompt prefills 24 to 31
   tokens per step inside their batched pass, and 32 per step in a pass of its
   own beside one.
-- **Speculation:** suffix lookup is enabled; the mixed ternary/int8 MTP head
-  artifact, when installed at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`,
-  adds gated depth-3 drafting. Without it MTP is off and the policy says why.
+- **Speculation:** suffix lookup, gated depth-3 drafting with the mixed
+  ternary/int8 MTP head at `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin`, and
+  KFlash trees with the DFlash2 drafter; both artifacts are required.
 - **Vision:** image input whenever the BF16 projector sits beside the GGUF
   ([image input](#image-input)); otherwise `vision_reason` says why.
 - **Prompt cache:** GPU checkpoint count (at most four) derives from
@@ -2345,7 +2345,7 @@ what the rebuilt map drafted, and on a real edit (rename a field in 35 quoted
 lines of this repository's Rust, 265 greedy tokens) both builds ran 18 lookup
 rounds proposing 218 drafts and accepting 147 (67.4%), with identical text,
 at 57.06 and 57.31 tok/s best of two (lookup 0.28 and 0.23 µs per token).
-When the optional head is installed, it drafts up to three tokens. A gate
+The head drafts up to three tokens. A gate
 avoids head work where measured acceptance does not repay its cost.
 
 Both were re-swept on the current kernels (M4 Pro, six prompts including one
@@ -2492,10 +2492,10 @@ With the drafter installed, startup turns on the residual taps and tree
 verify beside the MTP head, loads the drafter, measures on this machine the
 verify cost of 1 to 8 rows (the faster of a warm-up pass and one timed pass of
 each size) and the drafting pass, and reports it all under `policy.kflash`
-(`resources.dflash_reason` says why when it is off). The context fit counts
+(`resources.dflash_reason` names the drafter it loaded). The context fit counts
 the drafter's 2.05 GB of mapped weights, its 67 MB of context ring and
 scratch, the 217 MB tap ring with its verify staging rows and the 105 MB tree
-verifier. Without the drafter nothing changes.
+verifier.
 
 Each solo round then picks one source for its cycle, before any drafting, by
 measured tokens per millisecond: the DFlash2 tree, the head's gated depth-3

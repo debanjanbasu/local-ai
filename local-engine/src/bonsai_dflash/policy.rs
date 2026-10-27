@@ -24,11 +24,11 @@ pub const DEFAULT_BONSAI_DFLASH_ARTIFACT: &str = concat!(
 pub const PINNED_DFLASH_SHA256: &str =
     "1b5dc3551406e677ec9f4321f8f5c20f7310eaae0cede95792ceaa2375dfc02a";
 
-/// How a caller wants `KFlash` drafting. There is no opt-in: `Auto` drafts
-/// whenever the artifact is installed.
+/// How a caller wants `KFlash` drafting. The drafter is required: `Auto`
+/// drafts with the installed artifact and refuses to start without it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DflashMode {
-    /// Use the installed drafter, if there is one.
+    /// Use the drafter at the default location; its absence is an error.
     Auto,
     /// Use this artifact; its absence is an error.
     Drafter(PathBuf),
@@ -43,7 +43,8 @@ pub enum DflashResolution {
     /// Load this artifact with [`super::DflashDrafter::load`]; a corrupt
     /// file is then a hard error.
     Drafter(PathBuf),
-    /// Speculate with the MTP head (or not at all), for the recorded reason.
+    /// Do not draft with `DFlash2`, for the reason an [`DflashMode::Off`]
+    /// carried.
     Fallback(String),
 }
 
@@ -54,18 +55,18 @@ impl DflashMode {
 
     /// [`Self::resolve`] with an explicit `Auto` location.
     pub fn resolve_with_default(&self, default: &Path) -> crate::Result<DflashResolution> {
-        match self {
-            Self::Off(reason) => Ok(DflashResolution::Fallback(reason.clone())),
-            Self::Drafter(path) if path.is_file() => Ok(DflashResolution::Drafter(path.clone())),
-            Self::Drafter(path) => Err(crate::Error::InvalidArgument(format!(
-                "DFlash2 drafter not found: {}",
+        let path = match self {
+            Self::Off(reason) => return Ok(DflashResolution::Fallback(reason.clone())),
+            Self::Drafter(path) => path.as_path(),
+            Self::Auto => default,
+        };
+        if path.is_file() {
+            Ok(DflashResolution::Drafter(path.to_owned()))
+        } else {
+            Err(crate::Error::InvalidArgument(format!(
+                "DFlash2 drafter not found: {} (required; see README Model install)",
                 path.display()
-            ))),
-            Self::Auto if default.is_file() => Ok(DflashResolution::Drafter(default.to_owned())),
-            Self::Auto => Ok(DflashResolution::Fallback(format!(
-                "no DFlash2 drafter installed at {}; speculating with the MTP head",
-                default.display()
-            ))),
+            )))
         }
     }
 }
