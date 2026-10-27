@@ -58,7 +58,7 @@ runtime's capture shards and frozen tables and to match its draft chain layout.
 
 ## Bonsai DFlash2 drafter weights
 
-The optional KFlash drafter artifact (`models/bonsai2-27b-dflash2/`, not
+The KFlash drafter artifact (`models/bonsai2-27b-dflash2/`, not
 included; converted by `local-ai bonsai --export dflash-head=DIR`) is derived
 from [ProCreations/Ternary-Bonsai-2-27B-DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2/tree/4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b),
 revision `4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b`, licensed under the Apache
@@ -79,6 +79,27 @@ It derives from [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8
 (Apache-2.0) and was trained against the frozen
 [prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
 target (Apache-2.0). No runtime or training code from it is used here.
+
+## Neural Engine prefill FFN (Kapitsa, Splash)
+
+The private `AppleNeuralEngine.framework` client in `local-metal/src/ane.rs`
+(its interface declarations and method-signature table, IOSurface layout, MIL
+program caching with purge-and-recompile, and the shared-event handoff with
+its watchdog), the pack, weight-staging and join kernels in
+`shaders/bonsai_ane.metal`, and the W8A8 FFN program, wavefront schedule and
+keepalive in `local-engine/src/bonsai_native/ane_split.rs` are adapted from
+[Kapitsa](https://github.com/nace-ai/kapitsa/tree/a6a7bcac98daedfeaea323baa86d3a28a59905d6)
+(Copyright 2026 Nace AI), revision
+`a6a7bcac98daedfeaea323baa86d3a28a59905d6`: `src/ane/ane.{h,mm}`,
+`src/ane/ffn_split.{h,cpp}`, `src/kernels/ane_ffn.metal` and
+`src/model/qwen35_ane.cpp`. Kapitsa adapted the interface declarations and
+signature table from [Splash](https://github.com/incoai/splash) (Inco). Both
+are licensed under the Apache License, Version 2.0
+(<https://www.apache.org/licenses/LICENSE-2.0>); these portions remain under
+it. They were rewritten in Rust and Metal for this runtime: Bonsai's
+activations and weights are already in the checkpoint's Hadamard basis, so
+nothing is rotated again; ternary weights become per-row int8 by new block
+scales; the whole FFN runs on the Neural Engine.
 
 ## llguidance, toktrie and derivre
 

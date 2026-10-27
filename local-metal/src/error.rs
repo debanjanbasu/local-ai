@@ -27,6 +27,9 @@ pub enum Error {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("Neural Engine: {0}")]
+    NeuralEngine(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

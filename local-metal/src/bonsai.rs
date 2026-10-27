@@ -130,6 +130,21 @@ impl<'a> Ptq1Matrix<'a> {
         self.columns
     }
 
+    /// Rows `first..first + count` as a matrix of their own.
+    pub fn row_slice(self, first: u32, count: u32) -> crate::Result<Self> {
+        if first.checked_add(count).is_none_or(|end| end > self.rows) {
+            return Err(Error::InvalidArgument(
+                "PTQ1_0 row slice exceeds its matrix".into(),
+            ));
+        }
+        Self::new(
+            self.buffer,
+            self.offset + first as usize * row_bytes(self.columns as usize)?,
+            count,
+            self.columns,
+        )
+    }
+
     /// The single-token kernels read each block's code bytes as aligned
     /// four-byte words.
     const fn word_aligned(self) -> bool {

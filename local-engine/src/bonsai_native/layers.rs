@@ -183,6 +183,25 @@ impl BonsaiModel {
         tokens: u32,
         rollback: Option<&RollbackLayer>,
     ) -> crate::Result<()> {
+        self.recurrent_core(batch, layer, tokens, rollback)?;
+        self.project(
+            batch,
+            &layer.output,
+            &self.scratch.rotated_attention,
+            &self.scratch.branch,
+            tokens,
+        )
+    }
+
+    /// [`Self::recurrent`] up to its output projection's rotated input in
+    /// `scratch.rotated_attention`.
+    pub(super) fn recurrent_core(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &RecurrentLayer,
+        tokens: u32,
+        rollback: Option<&RollbackLayer>,
+    ) -> crate::Result<()> {
         let scratch = &self.scratch;
         let (inputs, decay, beta, final_state, final_history) = rollback.map_or(
             (
@@ -236,13 +255,7 @@ impl BonsaiModel {
             self.epsilon,
             tokens,
         )?;
-        self.project(
-            batch,
-            &layer.output,
-            &scratch.rotated_attention,
-            &scratch.branch,
-            tokens,
-        )
+        Ok(())
     }
 
     /// The recurrence's per-row inputs: the raw QKV projection into
@@ -338,6 +351,33 @@ impl BonsaiModel {
         tokens: u32,
         rope: Rope<'_>,
     ) -> crate::Result<()> {
+        self.full_attention_at(batch, layer, tokens, rope, self.position)
+    }
+
+    /// [`Self::full_attention`] of rows starting at cache position
+    /// `position` (a half block of the Neural Engine wavefront).
+    pub(super) fn full_attention_at(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &FullAttentionLayer,
+        tokens: u32,
+        rope: Rope<'_>,
+        position: usize,
+    ) -> crate::Result<()> {
+        self.attention_core_at(batch, layer, tokens, rope, position)?;
+        self.project_attention(batch, &layer.output, tokens)
+    }
+
+    /// [`Self::full_attention_at`] up to its output projection: the gated
+    /// attention rows in `scratch.attention_output`.
+    pub(super) fn attention_core_at(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &FullAttentionLayer,
+        tokens: u32,
+        rope: Rope<'_>,
+        position: usize,
+    ) -> crate::Result<()> {
         let scratch = &self.scratch;
         let projections = [
             (&layer.query_gate, &scratch.query_gate),
@@ -373,7 +413,7 @@ impl BonsaiModel {
             &scratch.gate,
             &layer.key_cache,
             &layer.value_cache,
-            self.position as u32,
+            position as u32,
             self.kv_allocated as u32,
             self.epsilon,
             self.rope_base,
@@ -389,7 +429,7 @@ impl BonsaiModel {
                 &layer.value_cache,
                 Some(&scratch.gate),
                 &scratch.attention_output,
-                self.position as u32 + 1,
+                position as u32 + 1,
                 &scratch.attention,
                 0,
             )?;
@@ -402,18 +442,35 @@ impl BonsaiModel {
                 &layer.value_cache,
                 Some(&scratch.gate),
                 &scratch.attention_output,
-                self.position as u32,
+                position as u32,
                 tokens,
                 &scratch.attention,
             )?;
         }
-        self.project_attention(batch, &layer.output, tokens)
+        Ok(())
     }
 
     pub(super) fn project_attention(
         &self,
         batch: &mut CommandBatch,
         output: &BonsaiMetalTensor,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        self.rotate_attention(batch, tokens)?;
+        self.project(
+            batch,
+            output,
+            &self.scratch.rotated_attention,
+            &self.scratch.branch,
+            tokens,
+        )
+    }
+
+    /// `scratch.attention_output` rotated into `scratch.rotated_attention`,
+    /// the output projection's input.
+    pub(super) fn rotate_attention(
+        &self,
+        batch: &mut CommandBatch,
         tokens: u32,
     ) -> crate::Result<()> {
         self.kernels.transform(
@@ -424,12 +481,6 @@ impl BonsaiModel {
             tokens,
             HadamardDirection::Forward,
         )?;
-        self.project(
-            batch,
-            output,
-            &self.scratch.rotated_attention,
-            &self.scratch.branch,
-            tokens,
-        )
+        Ok(())
     }
 }

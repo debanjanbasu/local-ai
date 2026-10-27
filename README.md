@@ -241,6 +241,7 @@ flag turns any of it off or tunes it.
 | Context | Largest value up to 262,144 whose fully grown state fits 90% of Metal's recommended working set |
 | K/V | Hadamard-rotated Q8 (8.5 bits/value); start at 1,024 tokens and grow on demand |
 | Kernels | Metal 4 tensor kernels where supported, SIMD fallbacks elsewhere |
+| Prefill | On M4 and later, blocks of 192-1,024 tokens as two halves of up to 512 rows: the Neural Engine runs every layer's FFN and up to 3,072 leading rows of each mixer output projection (int8 weights x int8 activations, the split chosen from measured block times) while the GPU runs the rest of attention and Gated DeltaNet; 512-token GPU blocks elsewhere, and from the first block whose Neural Engine work fails (that block reruns on the GPU) |
 | Speculation | Lossless suffix lookup, gated depth-3 MTP and KFlash trees of up to 8 rows, each solo cycle going to the tree, the MTP chain or lookup by measured tokens per millisecond and the tree sized by E(n) − r·cost(n) |
 | Prompt cache | Purgeable GPU checkpoints and disk snapshots; host snapshots only below the 500 MiB/s storage threshold |
 | Responses | Stored in `~/Library/Application Support/local-ai/responses` (or `--response-store DIR`) |
@@ -273,16 +274,30 @@ flag turns any of it off or tunes it.
   suffix-lookup drafts inside the batch: 37.9 against 34.9 tok/s aggregate
   at four streams for the previous build, byte-identical to each request
   alone.
-- Prefill (cold, no speculation), 512-token blocks: 131 tok/s at 8K,
-  116 tok/s at 32K and 75 tok/s at 128K (126, 110 and 70 with the former
-  128-token blocks, interleaved in the same uncontended runs).
+- Prefill (cold, no speculation), the FFN and up to 3,072 rows of each mixer
+  output projection on the Neural Engine beside the GPU's mixers: 288 tok/s
+  at 510 tokens, 365 tok/s at 2K, 347 tok/s at 8K and 252 tok/s at 32K,
+  against 129, 133, 130 and 113 on the GPU alone (main `d25b277`) and 127,
+  358, 334 and 244 with the FFN alone on the Neural Engine, interleaved
+  under the shared GPU lock while other agents worked. Mean next-token KL
+  against GPU prefill about 7e-5, top-1 64/64
+  ([details](docs/BONSAI.md#neural-engine-prefill-ffn)). The GPU alone
+  measured 75 tok/s at 128K; 128K was not re-measured.
 - Prompt cache: follow-up turn 2.7 s versus 25 s; disk restore 0.69 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s. After a server restart a
   new session sharing a ~5.9K-token system prompt and tools reaches its first
-  token in about 1.0 s against 45-47 s cold (`tools/benchmark.py --ttft`).
+  token in about 1.0 s against 17.8 s cold (46.4 s before Neural Engine
+  prefill; `tools/benchmark.py --ttft`). A follow-up adding a 408-token tool
+  result to a 5.7K-token session reaches its first token in 2.30 s against
+  3.65 s when blocks under 512 tokens stayed on the GPU.
 - Memory: 0.8–0.9 GB peak for a short request and 2.09 GB peak footprint for
   a 16K-token prompt plus 500 generated tokens (F16 recurrent state, copy-free
-  verify rollback, 4K-step K/V growth). File-backed weights remain
+  verify rollback, 4K-step K/V growth). Neural Engine prefill adds about
+  0.8 GB once a prompt of 192 tokens or more uses it (two int8 weight sets
+  and the second half's rows): 1.51 → 2.32 GB at 8K, 0.82 → 1.65 GB for a
+  279-token prompt, and 2.68 → 3.41 GB at 16K plus 500 tokens with the FFN
+  alone on it (main measured 2.68 GB there in that A/B, against the
+  2.09 GB recorded earlier). File-backed weights remain
   demand-paged.
 
 ### Other hardware

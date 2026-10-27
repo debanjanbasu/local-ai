@@ -214,18 +214,37 @@ impl BonsaiModel {
                 taps.staging_rows,
             )?);
         }
-        let skip = taps.floor.saturating_sub(self.position).min(rows);
+        self.encode_taps_at(batch, layer, rows, &self.scratch.hidden, self.position)
+    }
+
+    /// [`Self::encode_taps`] for `rows` committed rows held in `source` from
+    /// `position`: a Neural Engine wavefront half, whose residual stream and
+    /// first position are its own. Halves must be tapped in position order,
+    /// so the ring's span grows contiguously.
+    pub(super) fn encode_taps_at(
+        &self,
+        batch: &mut CommandBatch,
+        layer: usize,
+        rows: usize,
+        source: &MetalBuffer,
+        position: usize,
+    ) -> crate::Result<()> {
+        let (Some(taps), Some(slot)) = (&self.taps, slot(layer)) else {
+            return Ok(());
+        };
+        let column = slot * WIDTH * size_of::<f32>();
+        let skip = taps.floor.saturating_sub(position).min(rows);
         if slot == 0 {
-            taps.note(self.state_id, self.position + skip, self.position + rows);
+            taps.note(self.state_id, position + skip, position + rows);
         }
         Ok(self.ops.copy_rows(
             batch,
-            (&self.scratch.hidden, skip * WIDTH * size_of::<f32>()),
+            (source, skip * WIDTH * size_of::<f32>()),
             (&taps.ring, column),
             WIDTH,
             rows - skip,
             [WIDTH, TAP_ROW_FLOATS],
-            (self.position + skip) % TAP_WINDOW,
+            (position + skip) % TAP_WINDOW,
             TAP_WINDOW,
         )?)
     }

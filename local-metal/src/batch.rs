@@ -10,7 +10,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
-    MTLComputeCommandEncoder, MTLDispatchType,
+    MTLComputeCommandEncoder, MTLDispatchType, MTLSharedEvent,
 };
 
 use crate::Error;
@@ -370,6 +370,46 @@ impl CommandBatch {
         self.encoder = compute_encoder(&self.cmd_buf, self.concurrent)?;
         self.encoder_open = true;
         result
+    }
+
+    /// Encode, in order with everything before and after it, a raise of
+    /// `event` to `value` once all earlier work in this batch has completed
+    /// (the GPU-to-Neural-Engine handoff).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CommandBuffer`] if Metal cannot renew the compute
+    /// encoder.
+    pub fn signal_event(
+        &mut self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> crate::Result<()> {
+        self.end_compute_encoding();
+        self.cmd_buf
+            .encodeSignalEvent_value(ProtocolObject::from_ref(event), value);
+        self.encoder = compute_encoder(&self.cmd_buf, self.concurrent)?;
+        self.encoder_open = true;
+        Ok(())
+    }
+
+    /// Encode a wait, before any later work in this batch starts, until
+    /// `event` reaches `value`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::signal_event`].
+    pub fn wait_event(
+        &mut self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> crate::Result<()> {
+        self.end_compute_encoding();
+        self.cmd_buf
+            .encodeWaitForEvent_value(ProtocolObject::from_ref(event), value);
+        self.encoder = compute_encoder(&self.cmd_buf, self.concurrent)?;
+        self.encoder_open = true;
+        Ok(())
     }
 
     fn submit_current_and_renew(

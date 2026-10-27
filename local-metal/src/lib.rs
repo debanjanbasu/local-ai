@@ -1,5 +1,7 @@
+pub mod ane;
 pub mod batch;
 pub mod bonsai;
+pub mod bonsai_ane;
 pub mod bonsai_ops;
 pub mod bonsai_vision;
 pub mod buffer;

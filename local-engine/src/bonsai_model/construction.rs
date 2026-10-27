@@ -151,6 +151,7 @@ impl BonsaiEngine {
                 },
                 "mtp": mtp_policy,
                 "kflash": kflash_policy,
+                "neural_engine_prefill": model.neural_engine_policy(),
                 "ngram": {
                     "enabled": ngram.enabled,
                     "max_drafts": ngram.max_drafts,

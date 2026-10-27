@@ -36,6 +36,7 @@ use crate::bonsai_vision::PromptImages;
 use crate::sampler::{Sampler, SamplingResult, verify_greedy_drafts};
 use crate::{MtpStats, NgramStats, PrefillProgress};
 
+mod ane_split;
 mod batch;
 mod block;
 pub mod capture;
@@ -46,6 +47,7 @@ mod speculation;
 mod taps;
 mod tree;
 
+use self::ane_split::AnePrefill;
 pub use self::batch::{
     BatchRow, HeadDraft, HeadLag, MAX_BATCH_SEQUENCES, PrefillRows, SequenceState,
 };
@@ -787,6 +789,8 @@ pub struct BonsaiModel {
     taps: Option<taps::Taps>,
     /// The `DFlash2` drafter, made by [`Self::enable_kflash`].
     kflash: Option<kflash::Kflash>,
+    /// The prefill FFN on the Neural Engine (see `ane_split`).
+    ane: AnePrefill,
 }
 
 impl BonsaiModel {
@@ -857,15 +861,20 @@ impl BonsaiModel {
             .transpose()?
             .unwrap_or(0);
         let caps = context.caps();
+        let ane = AnePrefill::start(&context, &package, prefill_chunk);
         let mut info = memory_plan(
             &package,
             capacity,
             prefill_chunk,
-            mtp_bytes + drafter_bytes,
+            mtp_bytes + drafter_bytes + ane.reserved_bytes(),
             mtp.is_some(),
             kv.layout,
             &caps,
         )?;
+        if ane.active() {
+            // Two GPU-sized halves per block, their FFNs on the ANE.
+            info.prefill_chunk_size = ane_split::WAVE_ROWS;
+        }
         let capacity = info.context;
         let kv_allocated = kv.initial_tokens.min(capacity);
         let block_rows = prefill_chunk.max(verify_depth + 1);
@@ -1000,6 +1009,7 @@ impl BonsaiModel {
             tree: None,
             taps: None,
             kflash: None,
+            ane,
             context,
             package,
         };
@@ -1475,7 +1485,7 @@ impl BonsaiModel {
         end: usize,
         progress: &mut dyn FnMut(PrefillProgress),
     ) -> crate::Result<()> {
-        for block in prompt.chunks(self.info.prefill_chunk_size) {
+        for block in prompt.chunks(self.prefill_rows()) {
             if self.stop_for_cancel() {
                 return Ok(());
             }
@@ -1493,14 +1503,7 @@ impl BonsaiModel {
             } else {
                 BlockOutput::None
             };
-            // Head ingestion rides in the same command batch as the target
-            // block: one GPU round trip per chunk instead of two.
-            let mut speculation = self.speculation.take();
-            let result = self.encode_block(block, output, speculation.as_mut());
-            if let Some(speculation) = speculation {
-                self.speculation = Some(speculation);
-            }
-            result?;
+            self.encode_prefill_block(block, output)?;
         }
         Ok(())
     }

@@ -1220,11 +1220,13 @@ fn large_batch_prefill_tracks_small_batch_next_token_distribution() {
 }
 
 /// A prompt prefilled in 512-row blocks leaves exactly the logits 128-row
-/// blocks leave: rows are independent in every projection and attention
-/// kernel, and the recurrence rounds its state every 128 rows whatever the
-/// block (as each 128-row block once did when it stored it). 2,600 tokens
-/// cross the K/V growth step, the head-packed attention threshold and a
-/// short remainder block.
+/// blocks leave on the GPU: rows are independent in every projection and
+/// attention kernel, and the recurrence rounds its state every 128 rows
+/// whatever the block (as each 128-row block once did when it stored it).
+/// 2,600 tokens cross the K/V growth step, the head-packed attention
+/// threshold and a short remainder block. The Neural Engine FFN rounds
+/// differently and has its own distribution test
+/// (`ane_prefill_tracks_gpu_prefill_next_token_distribution`).
 #[test]
 #[ignore = "requires the pinned model"]
 fn prefill_block_size_leaves_identical_logits() {
@@ -1243,6 +1245,7 @@ fn prefill_block_size_leaves_identical_logits() {
         KvOptions::default(),
     )
     .expect("load");
+    model.disable_ane("this test pins the GPU path");
     let mut logits = Vec::new();
     for chunk in [128, 512] {
         model.info.prefill_chunk_size = chunk;
@@ -1362,4 +1365,410 @@ fn short_attention_splits_track_128_token_splits_next_token_distribution() {
             assert!(agree >= 63, "{name} {length}: top-1 {agree}/{steps}");
         }
     }
+}
+
+/// Prefill with every FFN and up to 3,072 rows of each mixer output
+/// projection on the Neural Engine (int8 weights x int8 activations, the
+/// wavefront of two half blocks) against the same model's GPU prefill,
+/// teacher-forced over 64 greedy tokens after a 1,000-token prompt (one
+/// uneven wavefront block) and an 8,192-token one (eight full blocks) of
+/// this repository's text. Decode runs on the GPU in both, so only the
+/// prefill's ANE rounding differs. Measured on the M4 Pro: mean next-token
+/// KL 6.3e-5 and 7.4e-5 (5.5e-5 to 8.4e-5 across earlier runs and splits;
+/// 1.4e-4 once with 3,584 output rows, beyond today's steps; Kapitsa gates
+/// its own at 3.84e-4). The bounds leave headroom over that: mean at most
+/// 2e-4, no row over 2e-3, and at least 60/64 top-1. A broken program or
+/// handoff lands far outside them.
+#[test]
+#[ignore = "requires the pinned model, a Metal device and the Neural Engine"]
+#[expect(clippy::cast_precision_loss)]
+fn ane_prefill_tracks_gpu_prefill_next_token_distribution() {
+    // A fixed corpus (the opening 48,000 characters of this repository's
+    // docs and sources at the commit that set the bounds), so editing those
+    // files does not move the measurement.
+    let text = include_str!("fixtures/ane_kl_corpus.txt");
+    let steps = 64;
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let corpus = tokenizer.encode(text).expect("encode");
+    let mut model = BonsaiModel::load(
+        package,
+        8192 + steps,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions {
+            initial_tokens: 8192 + steps,
+            ..KvOptions::default()
+        },
+    )
+    .expect("load");
+    assert!(model.ane_active(), "{}", model.neural_engine_policy());
+    // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+    let logits =
+        |model: &BonsaiModel| unsafe { model.scratch.logits.as_slice::<f32>() }[..VOCAB].to_vec();
+    let log_softmax = |values: &[f32]| {
+        let peak = f64::from(values.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        let log_sum = values
+            .iter()
+            .map(|&v| (f64::from(v) - peak).exp())
+            .sum::<f64>()
+            .ln()
+            + peak;
+        values
+            .iter()
+            .map(|&v| f64::from(v) - log_sum)
+            .collect::<Vec<_>>()
+    };
+    let prompts = [1000, 8192];
+    // The ANE runs first (its greedy tokens are the forced sequence), then
+    // the same model without it.
+    let mut forced = Vec::new();
+    for prompt_tokens in prompts {
+        let prompt = &corpus[..prompt_tokens];
+        model.reset();
+        model.prefill(prompt, &mut |_| {}).expect("ANE prefill");
+        assert!(model.ane_active(), "{}", model.neural_engine_policy());
+        let mut rows = Vec::new();
+        let mut tokens = Vec::new();
+        for _ in 0..steps {
+            let current = logits(&model);
+            tokens.push(argmax(&current) as u32);
+            rows.push(log_softmax(&current));
+            model
+                .decode(*tokens.last().expect("token"))
+                .expect("decode");
+        }
+        forced.push((tokens, rows));
+    }
+    model.disable_ane("reference");
+    for (prompt_tokens, (tokens, candidate)) in prompts.into_iter().zip(&forced) {
+        model.reset();
+        model
+            .prefill(&corpus[..prompt_tokens], &mut |_| {})
+            .expect("GPU prefill");
+        let mut values = Vec::new();
+        let mut agree = 0;
+        for (step, &token) in tokens.iter().enumerate() {
+            let current = logits(&model);
+            let reference = log_softmax(&current);
+            values.push(
+                reference
+                    .iter()
+                    .zip(&candidate[step])
+                    .map(|(&p, &q)| p.exp() * (p - q))
+                    .sum::<f64>(),
+            );
+            agree += usize::from(argmax(&current) as u32 == token);
+            model.decode(token).expect("decode");
+        }
+        let mean = values.iter().sum::<f64>() / steps as f64;
+        let max = values.iter().copied().fold(0.0_f64, f64::max);
+        eprintln!(
+            "{prompt_tokens}-token prompt: ANE prefill mean KL {mean:.3e}, max {max:.3e}, top-1 {agree}/{steps}"
+        );
+        assert!(mean <= 2e-4, "{prompt_tokens}: mean KL {mean:.3e}");
+        assert!(max <= 2e-3, "{prompt_tokens}: max KL {max:.3e}");
+        assert!(agree >= 60, "{prompt_tokens}: top-1 {agree}/{steps}");
+    }
+}
+
+/// A Neural Engine wavefront writes the drafter's residual taps for both of
+/// its halves, at their own positions, tracking the GPU prefill's taps
+/// within the W8A8 error. The ANE runs first, on a fresh ring, so a half it
+/// failed to tap cannot pass on the GPU run's rows.
+#[test]
+#[ignore = "requires the pinned model, a Metal device and the Neural Engine"]
+fn ane_prefill_taps_both_halves_like_gpu_prefill() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let prompt = tokenizer.encode(&text).expect("encode")[..1024].to_vec();
+    let mut model = BonsaiModel::load(
+        package,
+        2048,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    assert!(model.ane_active(), "{}", model.neural_engine_policy());
+    assert_eq!(
+        model.prefill_rows(),
+        1024,
+        "one block of two 512-row halves"
+    );
+    model.set_taps(true).expect("taps on");
+    model.prefill(&prompt, &mut |_| {}).expect("ANE prefill");
+    assert!(model.ane_active(), "{}", model.neural_engine_policy());
+    let ane = model.tap_rows(0, prompt.len()).expect("ANE taps");
+    model.disable_ane("reference");
+    model.reset();
+    model.prefill(&prompt, &mut |_| {}).expect("GPU prefill");
+    let gpu = model.tap_rows(0, prompt.len()).expect("GPU taps");
+    // Relative L2 per row. A row the wavefront failed to tap reads zeros
+    // (1.0) or another position's residual (about 1.4); W8A8 numerics keep
+    // nearly every row within a few percent, a rare outlier token's deepest
+    // tap within tens of percent.
+    let mut worst = [0.0f64; 2];
+    let mut loose = 0;
+    let mut rows = 0;
+    for (position, (ane, gpu)) in ane
+        .chunks(TAP_ROW_FLOATS)
+        .zip(gpu.chunks(TAP_ROW_FLOATS))
+        .enumerate()
+    {
+        for (slot, (ane, gpu)) in ane.chunks(WIDTH).zip(gpu.chunks(WIDTH)).enumerate() {
+            let norm = |values: &mut dyn Iterator<Item = f32>| {
+                values.map(|v| f64::from(v).powi(2)).sum::<f64>().sqrt()
+            };
+            let relative =
+                norm(&mut ane.iter().zip(gpu).map(|(a, b)| a - b)) / norm(&mut gpu.iter().copied());
+            assert!(
+                relative < 0.5,
+                "position {position} tap {slot}: relative L2 difference {relative}"
+            );
+            rows += 1;
+            loose += usize::from(relative >= 0.1);
+            let half = &mut worst[position / 512];
+            *half = half.max(relative);
+        }
+    }
+    eprintln!(
+        "worst relative L2 tap difference: half A {}, half B {}; {loose}/{rows} rows at 0.1 or more",
+        worst[0], worst[1]
+    );
+    assert!(
+        loose * 100 <= rows,
+        "{loose}/{rows} tap rows differ by 10% or more"
+    );
+}
+
+/// An ANE evaluation that never answers is caught by the watchdog, the
+/// chunk is restored and rerun on the GPU, and prefill stays there: the
+/// logits are bitwise the GPU path's.
+#[test]
+#[ignore = "requires the pinned model, a Metal device and the Neural Engine"]
+fn ane_fault_reruns_the_chunk_on_the_gpu() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let prompt = tokenizer.encode(&text).expect("encode")[..1100].to_vec();
+    let mut model = BonsaiModel::load(
+        package,
+        2048,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    assert!(
+        model.inject_ane_fault(5),
+        "{}",
+        model.neural_engine_policy()
+    );
+    let started = std::time::Instant::now();
+    model.prefill(&prompt, &mut |_| {}).expect("prefill");
+    let faulted = model.last_logits();
+    assert!(!model.ane_active(), "the ANE should be retired");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+    model.reset();
+    model.prefill(&prompt, &mut |_| {}).expect("prefill");
+    let differing = faulted
+        .iter()
+        .zip(&model.last_logits())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(differing, 0, "{differing} of {VOCAB} logits differ");
+}
+
+/// MTP head ingestion rides in the wavefront: half B's embeddings are copied
+/// into the head's staging rows after half A's ingestion. The head's keys
+/// for each half and for a following GPU block must track GPU prefill's
+/// (only the target FFN's rounding differs), and the next draft must pick
+/// the same token. Leaving half A's embeddings in the head's staging rows
+/// for half B moved half B's keys by 0.47 (relative), far outside the bound.
+#[test]
+#[ignore = "requires the pinned model, the MTP head, a Metal device and the Neural Engine"]
+fn ane_prefill_feeds_the_head_like_gpu_prefill() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let prompt = tokenizer.encode(&text).expect("encode")[..1500].to_vec();
+    let settings = MtpSettings::new(pinned_head().into(), 1).expect("head settings");
+    let mut model = BonsaiModel::load(
+        package,
+        2048,
+        512,
+        None,
+        Some(&settings),
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    assert!(model.ane_active(), "{}", model.neural_engine_policy());
+    let cache_rows = KV_TOKEN_BYTES / 2;
+    let keys = |model: &BonsaiModel| {
+        let speculation = model.speculation.as_ref().expect("speculation");
+        let (keys, _) = speculation.mtp.kv_caches();
+        // SAFETY: no GPU work on this buffer is in flight and nothing else touches it meanwhile.
+        unsafe {
+            keys.as_slice::<half::f16>()[..prompt.len() * cache_rows]
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>()
+        }
+    };
+    model.prefill(&prompt, &mut |_| {}).expect("ANE prefill");
+    assert!(model.ane_active(), "{}", model.neural_engine_policy());
+    let seed = argmax(&model.last_logits()) as u32;
+    let ane_keys = keys(&model);
+    let ane_draft = draft_logits(&mut model, seed);
+    model.disable_ane("reference");
+    model.reset();
+    model.prefill(&prompt, &mut |_| {}).expect("GPU prefill");
+    let gpu_keys = keys(&model);
+    let gpu_draft = draft_logits(&mut model, seed);
+    assert_eq!(argmax(&ane_draft), argmax(&gpu_draft));
+    for (name, rows) in [
+        ("first half", 0..512),
+        ("second half", 512..1024),
+        ("GPU block", 1024..prompt.len()),
+    ] {
+        let range = rows.start * cache_rows..rows.end * cache_rows;
+        let (difference, reference) = ane_keys[range.clone()].iter().zip(&gpu_keys[range]).fold(
+            (0.0_f64, 0.0_f64),
+            |(difference, reference), (&a, &g)| {
+                let (a, g) = (f64::from(a), f64::from(g));
+                ((a - g).mul_add(a - g, difference), g.mul_add(g, reference))
+            },
+        );
+        let relative = (difference / reference).sqrt();
+        eprintln!("{name}: head keys differ by {relative:.4} (relative)");
+        assert!(relative < 0.05, "{name}: head keys differ by {relative:.4}");
+    }
+}
+
+/// Time of one prefill block of each size with the Neural Engine FFN
+/// wavefront (the minimum block lowered to 129 rows) and on the GPU alone,
+/// best of three after a warm-up: where the ANE starts to pay. Measurement
+/// only; nothing is asserted.
+#[test]
+#[ignore = "measurement; requires the pinned model, a Metal device and the Neural Engine"]
+fn ane_prefill_block_timings() {
+    use std::sync::atomic::Ordering;
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let corpus = tokenizer.encode(&text).expect("encode");
+    let mut model = BonsaiModel::load(
+        package,
+        2048,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    ane_split::WAVE_MIN_ROWS_OVERRIDE.store(129, Ordering::Relaxed);
+    let sizes = [160, 192, 256, 320, 384, 448, 512, 768, 1024];
+    let time = |model: &mut BonsaiModel, rows: usize| {
+        let mut best = f64::INFINITY;
+        for repeat in 0..4 {
+            model.reset();
+            let started = std::time::Instant::now();
+            model
+                .prefill(&corpus[..rows], &mut |_| {})
+                .expect("prefill");
+            if repeat > 0 {
+                best = best.min(started.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        best
+    };
+    let ane = sizes.map(|rows| time(&mut model, rows));
+    assert!(model.ane_active(), "{}", model.neural_engine_policy());
+    model.disable_ane("reference");
+    let gpu = sizes.map(|rows| time(&mut model, rows));
+    ane_split::WAVE_MIN_ROWS_OVERRIDE.store(0, Ordering::Relaxed);
+    for ((rows, ane), gpu) in sizes.iter().zip(ane).zip(gpu) {
+        println!(
+            "{}",
+            serde_json::json!({"rows": rows, "ane_ms": ane, "gpu_ms": gpu, "speedup": gpu / ane})
+        );
+    }
+}
+
+/// Cold prefill time of 4,096 tokens (four wavefront blocks; set
+/// `ANE_SPLIT_ROWS` for another length) with every layer's mixer output
+/// projection split at each fixed number of ANE rows (`ANE_SPLIT_STEPS`, a
+/// list of `OUT_STEPS` indices, for a subset), best of two after a warm-up
+/// (reported apart, with the model's first prefill paying for building the
+/// ANE path): what the split controller chooses between. Measurement only;
+/// nothing is asserted.
+#[test]
+#[ignore = "measurement; requires the pinned model, a Metal device and the Neural Engine"]
+fn ane_out_split_timings() {
+    use std::sync::atomic::Ordering;
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let text = std::fs::read_to_string(format!("{root}/docs/BONSAI.md")).expect("corpus");
+    let package = BonsaiPackage::open(DEFAULT_BONSAI_GGUF).expect("open");
+    let tokenizer = crate::bonsai_tokenizer::BonsaiTokenizer::from_package(&package).expect("tok");
+    let corpus = tokenizer.encode(&text).expect("encode");
+    let rows = std::env::var("ANE_SPLIT_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(4096);
+    let mut model = BonsaiModel::load(
+        package,
+        rows + 64,
+        512,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load");
+    // The first run of each split, which loads its ANE functions, apart.
+    let time = |model: &mut BonsaiModel| {
+        let mut runs = [0.0; 3];
+        for run in &mut runs {
+            model.reset();
+            let started = std::time::Instant::now();
+            model
+                .prefill(&corpus[..rows], &mut |_| {})
+                .expect("prefill");
+            *run = started.elapsed().as_secs_f64() * 1e3;
+        }
+        (runs[0], runs[1].min(runs[2]))
+    };
+    let steps = std::env::var("ANE_SPLIT_STEPS").map_or_else(
+        |_| (0..ane_split::OUT_STEPS.len()).collect::<Vec<usize>>(),
+        |steps| {
+            steps
+                .split(',')
+                .filter_map(|step| step.parse().ok())
+                .collect()
+        },
+    );
+    for step in steps {
+        ane_split::OUT_STEP_OVERRIDE.store(step + 1, Ordering::Relaxed);
+        let (first, ms) = time(&mut model);
+        assert!(model.ane_active(), "{}", model.neural_engine_policy());
+        println!(
+            "{}",
+            serde_json::json!({"rows": rows, "step": step, "first_ms": first, "ms": ms, "tok_s": rows as f64 / ms * 1e3})
+        );
+    }
+    ane_split::OUT_STEP_OVERRIDE.store(0, Ordering::Relaxed);
 }
