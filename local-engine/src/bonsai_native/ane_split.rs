@@ -12,13 +12,14 @@
 //!   the checkpoint's 17,408-wide forward rotation (a grouped convolution
 //!   whose weights are the program's only constant) and the down projection;
 //!   and per row count and split ([`OUT_STEPS`]) the leading output rows of
-//!   a mixer's 5,120 x 6,144 output projection.
+//!   a mixer's 5,120 x 6,144 output projection, and per row count a
+//!   full-attention layer's Q, K and V projections stacked (14,336 x 5,120).
 //!   Weights are int8 surfaces with one scale per row, activations int8 with
 //!   one scale per token (and the rotated intermediate re-quantized per
 //!   token), so the ANE returns a partial result and a scale row that the GPU
 //!   joins in F32.
 //! - **Weights.** No resident int8 copy: the GPU converts each layer's
-//!   ternary blocks into one of two weight sets (about 0.60 GB) while the ANE
+//!   ternary blocks into one of two weight sets (about 0.75 GB) while the ANE
 //!   runs the previous layer from the other. A ternary row is its trits
 //!   times block scales, so a row's codes are the trits times
 //!   `rint(127 s_b / max |s|)`.
@@ -33,8 +34,11 @@
 //!   than the GPU's mixer and staging (21-27 ms, growing with context), so
 //!   each half's output projection is split by output row: the ANE takes the
 //!   leading rows in its idle time between FFNs while the GPU computes the
-//!   rest, and the GPU joins both. [`OutSplit`] chooses the split per
-//!   half-block size from measured chunk times as prefill runs.
+//!   rest, and the GPU joins both. At the top step ([`QKV_STEP`]) the ANE
+//!   also projects each full-attention layer's Q, K and V for the second
+//!   half while the GPU finishes the first half's mixer. [`OutSplit`]
+//!   chooses the step per half-block size from measured chunk times as
+//!   prefill runs.
 //! - **Ordering.** Two `MTLSharedEvent`s ([`Handoff`]) carry GPU-to-ANE and
 //!   ANE-to-GPU order. A watchdog retires a handoff whose evaluation stops
 //!   answering, which releases every GPU wait.
@@ -57,9 +61,9 @@ use local_metal::bonsai_ane::AneKernels;
 
 use super::{
     AttentionLayer, BlockOutput, BonsaiMetalTensor, BonsaiModel, BonsaiPackage, BufferCopyRequest,
-    CommandBatch, Described, FFN, HadamardDirection, LAYERS, Layer, MetalBuffer, MetalContext,
-    PROMPT_CHECKPOINT_BYTES, PromptCheckpoint, Rope, Selection, ShaderLibrary, Speculation, WIDTH,
-    decode_embeddings,
+    CommandBatch, Described, FFN, FullAttentionLayer, HadamardDirection, LAYERS, Layer,
+    MetalBuffer, MetalContext, PROMPT_CHECKPOINT_BYTES, PromptCheckpoint, Rope, Selection,
+    ShaderLibrary, Speculation, WIDTH, decode_embeddings,
 };
 
 /// Rows of the program's functions: a half block of `r` rows runs the
@@ -116,8 +120,9 @@ const MIXED: usize = 6144;
 /// 373.8 tok/s against 357.6 with none); more int8 rows raise the KL, so
 /// the steps stop at 3,072.
 pub(super) const OUT_STEPS: [u32; 7] = [0, 512, 1024, 1536, 2048, 2560, 3072];
-/// Where [`OutSplit`] starts on a machine without a learned split.
-const OUT_START: usize = 6;
+/// Where [`OutSplit`] starts on a machine without a learned split:
+/// [`QKV_STEP`].
+const OUT_START: usize = OUT_STEPS.len();
 /// Blocks starting before this position take no output rows: there
 /// attention is cheapest and the GPU's half-block mixer about as short as
 /// the ANE's FFN, so output rows make the ANE the bottleneck. On the M4 Pro
@@ -133,6 +138,35 @@ const OUT_WAIT_LIMIT_MS: f64 = 0.5;
 /// The learned splits, under the program cache directory.
 const OUT_SPLIT_FILE: &str = "out-split.json";
 
+/// Rows of a full-attention layer's Q, K and V projections, stacked in that
+/// order on the ANE: the query and its gate (24 heads x 2 x 256), the key
+/// and the value (4 x 256 each).
+const QUERY_GATE: u32 = 12_288;
+const KEY_VALUE: u32 = 1024;
+const QKV: u32 = QUERY_GATE + 2 * KEY_VALUE;
+/// [`OutSplit`]'s top step: the largest output split, and each
+/// full-attention layer's second-half Q, K and V projections on the ANE
+/// while the GPU runs the first half's attention.
+const QKV_STEP: usize = OUT_STEPS.len();
+/// Steps [`OutSplit`] chooses between.
+#[cfg(test)]
+pub(super) const STEPS: usize = OUT_STEPS.len() + 1;
+/// Blocks starting before this position stop at the step below
+/// [`QKV_STEP`]: there the ANE already sets the pace in the recurrent
+/// layers. On the M4 Pro a 2,510-token prompt whose blocks from 1,024 took
+/// the Q/K/V ran 1.9% slower (332.3 against 338.6 tok/s), while a 1,024-row
+/// block at 4,096 ran 1.6% faster with them (2,916 against 2,870 ms).
+const QKV_MIN_POSITION: usize = 4096;
+
+/// Output projection rows the ANE takes at [`OutSplit`] step `step`.
+const fn out_rows(step: usize) -> u32 {
+    if step < OUT_STEPS.len() {
+        OUT_STEPS[step]
+    } else {
+        OUT_STEPS[OUT_STEPS.len() - 1]
+    }
+}
+
 const X: SurfaceLayout = SurfaceLayout::new(SEGMENT, HALF_ROWS as u32, false);
 const O: SurfaceLayout = SurfaceLayout::new(MIXED as u32 / 2, HALF_ROWS as u32, false);
 const OUT: SurfaceLayout = SurfaceLayout::new(WIDTH as u32, MIXED as u32 / 2, false);
@@ -141,6 +175,9 @@ const Y: SurfaceLayout = SurfaceLayout::new(WIDTH as u32 + 1, HALF_ROWS as u32, 
 const GATE: SurfaceLayout = SurfaceLayout::new(FFN as u32, SEGMENT, false);
 const FFN_SCALES: SurfaceLayout = SurfaceLayout::new(FFN as u32, 1, true);
 const DOWN_SCALES: SurfaceLayout = SurfaceLayout::new(WIDTH as u32, 1, true);
+const QKV_W: SurfaceLayout = SurfaceLayout::new(QKV, SEGMENT, false);
+const QKV_SCALES: SurfaceLayout = SurfaceLayout::new(QKV, 1, true);
+const QKV_Y: SurfaceLayout = SurfaceLayout::new(QKV, HALF_ROWS as u32, true);
 
 /// Layouts of the down projection's input-channel segments.
 fn down_layouts() -> impl Iterator<Item = SurfaceLayout> {
@@ -150,17 +187,20 @@ fn down_layouts() -> impl Iterator<Item = SurfaceLayout> {
 }
 
 /// Bytes the ANE path allocates once used: two weight sets, two lanes of
-/// surfaces, the second half's GPU rows and the rerun checkpoint.
+/// surfaces, the second half's Q/K/V output, the second half's GPU rows and
+/// the rerun checkpoint.
 fn reserved_bytes() -> u64 {
     let set = 4 * GATE.bytes
         + 2 * FFN_SCALES.bytes
         + down_layouts().map(|layout| layout.bytes).sum::<usize>()
         + 2 * DOWN_SCALES.bytes
-        + 2 * OUT.bytes;
+        + 2 * OUT.bytes
+        + 2 * QKV_W.bytes
+        + QKV_SCALES.bytes;
     let lane =
         2 * X.bytes + 2 * O.bytes + TX.bytes + Y.bytes + HALF_ROWS * WIDTH * size_of::<f32>();
     let rows = 3 * HALF_ROWS * WIDTH * size_of::<f32>() + HALF_ROWS * 4 * size_of::<u32>();
-    (2 * set + 2 * lane + rows + PROMPT_CHECKPOINT_BYTES) as u64
+    (2 * set + 2 * lane + QKV_Y.bytes + rows + PROMPT_CHECKPOINT_BYTES) as u64
 }
 
 /// `0x1.8p+6` style hexadecimal of a normal `value`, as MIL literals take.
@@ -399,49 +439,82 @@ fn function(rows: u32) -> String {
     )
 }
 
-/// The leading `split` output rows of a mixer's output projection for `rows`
-/// tokens: inputs `o0, o1` (int8 channel-major halves of the rotated mixer
-/// output), `tx` (its fp16 token scales times 128), the two input-channel
-/// halves of the weights and their row scales (surfaces of all
-/// [`WIDTH`] rows, of which the function reads the first `split`); output
-/// `y`, the projection before its token scales.
-fn out_function(rows: u32, split: u32) -> String {
-    let segment = MIXED as u32 / 2;
+/// The leading `split` output rows of a projection for `rows` tokens, as
+/// function `name`: inputs `{a}0, {a}1` (int8 channel-major halves of the
+/// rotated input, surfaces `input`), `tx` (its fp16 token scales times 128),
+/// the two input-channel halves of the weights `{w}0, {w}1` and their row
+/// scales `{s}` (surfaces `weights` and `scales`, of which the function reads
+/// the first `split` rows); output `y` (surface `output`), the projection
+/// before its token scales. `[(a, input), (w, weights), (s, scales)]` are
+/// `names`.
+fn projection_function(
+    name: &str,
+    rows: u32,
+    split: u32,
+    names: [(&str, SurfaceLayout); 3],
+    output: SurfaceLayout,
+) -> String {
+    let [(a, input), (w, weights), (s, scales)] = names;
+    let segment = input.rows;
     let mut f = Function {
         rows,
         params: Vec::new(),
         body: String::new(),
     };
     for k in 0..2 {
-        f.input(&format!("o{k}"), O, segment, rows);
+        f.input(&format!("{a}{k}"), input, segment, rows);
     }
     f.input("tx", TX, 1, rows);
     for k in 0..2 {
-        f.input(&format!("wo{k}"), OUT, split, segment);
+        f.input(&format!("{w}{k}"), weights, split, segment);
     }
-    f.input("so", DOWN_SCALES, split, 1);
+    f.input(s, scales, split, 1);
     for k in 0..2 {
-        f.dequantize(&format!("o{k}"), segment, rows);
-        f.dequantize(&format!("wo{k}"), split, segment);
+        f.dequantize(&format!("{a}{k}"), segment, rows);
+        f.dequantize(&format!("{w}{k}"), split, segment);
         f.matmul(
             &format!("om{k}"),
-            &format!("wo{k}_d"),
-            &format!("o{k}_d"),
+            &format!("{w}{k}_d"),
+            &format!("{a}{k}_d"),
             split,
         );
     }
     let total = f.sum("om", 2, split);
-    f.half("ys", split, rows, &format!("mul(x = {total}, y = so_t)"));
-    let stride = Y.stride / Y.element_bytes();
-    let plane = stride * Y.rows as usize;
+    f.half("ys", split, rows, &format!("mul(x = {total}, y = {s}_t)"));
+    let stride = output.stride / output.element_bytes();
+    let plane = stride * output.rows as usize;
     f.line(&format!(
         "{} y = tensor_to_tensor_buffer<ios17>(input = ys, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>([{plane}, {plane}, {stride}, 1]))",
-        Y.buffer_type(split, rows)
+        output.buffer_type(split, rows)
     ));
     format!(
-        "    func out{rows}_{split}<ios18>({}) {{\n{}    }} -> (y);\n",
+        "    func {name}<ios18>({}) {{\n{}    }} -> (y);\n",
         f.params.join(", "),
         f.body
+    )
+}
+
+/// The leading `split` output rows of a mixer's output projection (surfaces
+/// of all [`WIDTH`] rows) from its rotated input `o0, o1`.
+fn out_function(rows: u32, split: u32) -> String {
+    projection_function(
+        &format!("out{rows}_{split}"),
+        rows,
+        split,
+        [("o", O), ("wo", OUT), ("so", DOWN_SCALES)],
+        Y,
+    )
+}
+
+/// A full-attention layer's Q, K and V projections stacked, from the same
+/// packed input `x0, x1` as the FFN.
+fn qkv_function(rows: u32) -> String {
+    projection_function(
+        &format!("qkv{rows}"),
+        rows,
+        QKV,
+        [("x", X), ("wq", QKV_W), ("sq", QKV_SCALES)],
+        QKV_Y,
     )
 }
 
@@ -469,8 +542,19 @@ fn out_program_text() -> String {
     text
 }
 
-/// The output projections' program has no constants, but the compiler wants
-/// a weight file: one empty record.
+/// The attention Q/K/V program, a third, so the output projections'
+/// program text (and the daemon's compilation of it) stays as it was.
+fn qkv_program_text() -> String {
+    let mut text = String::from("program(1.3)\n{\n");
+    for rows in FUNCTION_ROWS {
+        text.push_str(&qkv_function(rows));
+    }
+    text.push_str("}\n");
+    text
+}
+
+/// The output projections' and Q/K/V programs have no constants, but the
+/// compiler wants a weight file: one empty record.
 fn placeholder_blob() -> Vec<u8> {
     let mut blob = vec![0_u8; 192];
     blob[0..4].copy_from_slice(&1_u32.to_le_bytes());
@@ -590,7 +674,7 @@ pub(super) enum AnePrefill {
     Off(String),
     /// The program compiles on a background thread started at load; the
     /// first prefill block that can use it waits for it.
-    Pending(mpsc::Receiver<crate::Result<[Program; 2]>>),
+    Pending(mpsc::Receiver<crate::Result<[Program; 3]>>),
     Ready(Box<AneSplit>),
     /// Taken by the block in flight.
     Busy,
@@ -630,13 +714,10 @@ impl AnePrefill {
                     COMPILE_LIMIT,
                 )
                 .and_then(|ffn| {
-                    let out = Program::compile(
-                        &out_program_text(),
-                        &placeholder_blob(),
-                        CACHE_TAG,
-                        COMPILE_LIMIT,
-                    )?;
-                    Ok([ffn, out])
+                    let [out, qkv] = [out_program_text(), qkv_program_text()].map(|text| {
+                        Program::compile(&text, &placeholder_blob(), CACHE_TAG, COMPILE_LIMIT)
+                    });
+                    Ok([ffn, out?, qkv?])
                 });
                 // The model may be gone; nothing waits then.
                 let _ = sender.send(programs.map_err(crate::Error::Metal));
@@ -667,6 +748,7 @@ impl AnePrefill {
                 "min_block_rows": wave_min_rows(),
                 "half_rows": FUNCTION_ROWS,
                 "mixer_output_rows": OUT_STEPS,
+                "attention_qkv_rows": QKV,
                 "reserved_bytes": reserved_bytes(),
             }),
         }
@@ -688,8 +770,9 @@ struct Lane {
     done: Cell<u64>,
 }
 
-/// One layer's int8 FFN weights and the ANE's rows of its mixer's output
-/// projection.
+/// One layer's int8 FFN weights, the ANE's rows of its mixer's output
+/// projection and, for a full-attention layer at [`QKV_STEP`], its stacked
+/// Q, K and V projections.
 struct WeightSet {
     gate: [Surface; 2],
     up: [Surface; 2],
@@ -699,6 +782,8 @@ struct WeightSet {
     down_scales: Surface,
     out: [Surface; 2],
     out_scales: Surface,
+    qkv: [Surface; 2],
+    qkv_scales: Surface,
 }
 
 impl WeightSet {
@@ -715,6 +800,9 @@ impl WeightSet {
             "wo0" => &self.out[0],
             "wo1" => &self.out[1],
             "so" => &self.out_scales,
+            "wq0" => &self.qkv[0],
+            "wq1" => &self.qkv[1],
+            "sq" => &self.qkv_scales,
             _ => self
                 .down
                 .get(name.strip_prefix("wd")?.parse::<usize>().ok()?)?,
@@ -736,6 +824,10 @@ pub(super) struct AneSplit {
     bindings: Vec<Arc<Binding>>,
     /// `[set][lane][function][split - 1]`: the output projection's.
     out_bindings: Vec<Binding>,
+    /// The second half's stacked Q/K/V projections (lane 1's inputs) and
+    /// their bindings, `[set][function]`.
+    qkv_y: Surface,
+    qkv_bindings: Vec<Binding>,
     /// The chunk's jobs in queue order, matching [`Handoff::take_timeline`].
     jobs: RefCell<Vec<Job>>,
     /// The output projection split, learned from the jobs' timing.
@@ -756,7 +848,11 @@ pub(super) struct AneSplit {
 }
 
 impl AneSplit {
-    fn new(context: &MetalContext, [program, out_program]: &[Program; 2]) -> crate::Result<Self> {
+    #[expect(clippy::too_many_lines)]
+    fn new(
+        context: &MetalContext,
+        [program, out_program, qkv_program]: &[Program; 3],
+    ) -> crate::Result<Self> {
         let shaders = ShaderLibrary::new(context.device())?;
         let surface = |layout| Surface::new(context, layout).map_err(crate::Error::Metal);
         let rows = |width: usize| {
@@ -784,46 +880,69 @@ impl AneSplit {
                 down_scales: surface(DOWN_SCALES)?,
                 out: [surface(OUT)?, surface(OUT)?],
                 out_scales: surface(DOWN_SCALES)?,
+                qkv: [surface(QKV_W)?, surface(QKV_W)?],
+                qkv_scales: surface(QKV_SCALES)?,
             })
         };
         let lanes = [lane()?, lane()?];
         let sets = [set()?, set()?];
-        let bind = |program: &Program, set: &WeightSet, lane: &Lane, name: &str| {
-            let procedure = program
-                .procedure(name)
-                .ok_or_else(|| crate::Error::Generation(format!("ANE program has no {name}")))?;
-            let inputs = program
-                .inputs(procedure)
-                .iter()
-                .map(|name| {
-                    match name.as_str() {
-                        "x0" => Some(&lane.x[0]),
-                        "x1" => Some(&lane.x[1]),
-                        "o0" => Some(&lane.o[0]),
-                        "o1" => Some(&lane.o[1]),
-                        "tx" => Some(&lane.tx),
-                        name => set.input(name),
-                    }
-                    .ok_or_else(|| crate::Error::Generation(format!("unknown ANE input {name}")))
-                })
-                .collect::<crate::Result<Vec<_>>>()?;
-            crate::Result::Ok(program.bind(procedure, &inputs, &lane.y)?)
-        };
+        let qkv_y = surface(QKV_Y)?;
+        let bind =
+            |program: &Program, set: &WeightSet, lane: &Lane, name: &str, output: &Surface| {
+                let procedure = program.procedure(name).ok_or_else(|| {
+                    crate::Error::Generation(format!("ANE program has no {name}"))
+                })?;
+                let inputs = program
+                    .inputs(procedure)
+                    .iter()
+                    .map(|name| {
+                        match name.as_str() {
+                            "x0" => Some(&lane.x[0]),
+                            "x1" => Some(&lane.x[1]),
+                            "o0" => Some(&lane.o[0]),
+                            "o1" => Some(&lane.o[1]),
+                            "tx" => Some(&lane.tx),
+                            name => set.input(name),
+                        }
+                        .ok_or_else(|| {
+                            crate::Error::Generation(format!("unknown ANE input {name}"))
+                        })
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                crate::Result::Ok(program.bind(procedure, &inputs, output)?)
+            };
         let mut bindings = Vec::with_capacity(2 * 2 * FUNCTION_ROWS.len());
         let mut out_bindings = Vec::with_capacity(bindings.capacity() * OUT_STEPS.len());
+        let mut qkv_bindings = Vec::with_capacity(2 * FUNCTION_ROWS.len());
         for set in &sets {
             for lane in &lanes {
                 for rows in FUNCTION_ROWS {
-                    bindings.push(Arc::new(bind(program, set, lane, &format!("ffn{rows}"))?));
+                    bindings.push(Arc::new(bind(
+                        program,
+                        set,
+                        lane,
+                        &format!("ffn{rows}"),
+                        &lane.y,
+                    )?));
                     for split in &OUT_STEPS[1..] {
                         out_bindings.push(bind(
                             out_program,
                             set,
                             lane,
                             &format!("out{rows}_{split}"),
+                            &lane.y,
                         )?);
                     }
                 }
+            }
+            for rows in FUNCTION_ROWS {
+                qkv_bindings.push(bind(
+                    qkv_program,
+                    set,
+                    &lanes[1],
+                    &format!("qkv{rows}"),
+                    &qkv_y,
+                )?);
             }
         }
         Ok(Self {
@@ -834,6 +953,8 @@ impl AneSplit {
             sets,
             bindings,
             out_bindings,
+            qkv_y,
+            qkv_bindings,
             jobs: RefCell::new(Vec::new()),
             out_split: RefCell::new(OutSplit::load()),
             status: MetalBuffer::empty(context.device(), 16)?,
@@ -852,7 +973,7 @@ impl AneSplit {
     }
 
     fn out_binding(&self, set: usize, lane: usize, function: usize, step: usize) -> &Binding {
-        let splits = OUT_STEPS.len() - 1;
+        let (splits, step) = (OUT_STEPS.len() - 1, step.min(OUT_STEPS.len() - 1));
         &self.out_bindings[((set * 2 + lane) * FUNCTION_ROWS.len() + function) * splits + step - 1]
     }
 
@@ -884,6 +1005,7 @@ impl AneSplit {
                 index as u32 * segment,
                 segment,
                 surface,
+                0,
                 (index == 0).then_some(&set.out_scales),
             )?;
         }
@@ -906,6 +1028,7 @@ impl AneSplit {
                     index as u32 * segment,
                     segment,
                     surface,
+                    0,
                     (index == 0).then_some(scales),
                 )?;
             }
@@ -920,11 +1043,67 @@ impl AneSplit {
                 first,
                 count,
                 surface,
+                0,
                 (index == 0).then_some(&set.down_scales),
             )?;
             first += count;
         }
         Ok(())
+    }
+
+    /// Convert a full-attention layer's Q, K and V projections into weight
+    /// set `set`, stacked by output row.
+    fn stage_qkv(
+        &self,
+        batch: &mut CommandBatch,
+        full: &FullAttentionLayer,
+        set: usize,
+    ) -> crate::Result<()> {
+        let set = &self.sets[set];
+        let segment = SEGMENT / 128;
+        let mut row = 0;
+        for weights in [&full.query_gate, &full.key, &full.value] {
+            let matrix = weights.ptq1_matrix()?;
+            if matrix.columns() != WIDTH as u32 {
+                return Err(crate::Error::InvalidArgument(
+                    "unexpected attention projection shape".into(),
+                ));
+            }
+            for (index, surface) in set.qkv.iter().enumerate() {
+                self.kernels.stage(
+                    batch,
+                    matrix,
+                    index as u32 * segment,
+                    segment,
+                    surface,
+                    row,
+                    (index == 0).then_some(&set.qkv_scales),
+                )?;
+            }
+            row += matrix.rows();
+        }
+        if row != QKV {
+            return Err(crate::Error::InvalidArgument(
+                "unexpected attention projection shape".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Convert what the ANE runs of `layer` at `step` into weight set `set`.
+    fn stage_layer(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &Layer,
+        set: usize,
+        step: usize,
+    ) -> crate::Result<()> {
+        self.stage(batch, layer, set)?;
+        self.stage_out(batch, layer.mixer_output(), set, out_rows(step))?;
+        match &layer.attention {
+            AttentionLayer::Full(full) if step == QKV_STEP => self.stage_qkv(batch, full, set),
+            _ => Ok(()),
+        }
     }
 
     /// Pack `rows` rows of `input` into `lane`'s surfaces and hand them to
@@ -952,15 +1131,48 @@ impl AneSplit {
             [&surfaces.x[0], &surfaces.x[1]],
         )?;
         let job = Job {
-            out: false,
+            work: Work::Ffn,
             lane,
             layer,
         };
         self.hand_over(batch, context, self.binding(set, lane, function), job)
     }
 
+    /// Pack the second half's `rows` rows of a full-attention layer's
+    /// normalized, rotated input `input` into lane 1's surfaces and hand its
+    /// Q, K and V projections (weight set `set`) to the ANE, submitting the
+    /// GPU work so far.
+    fn launch_qkv(
+        &self,
+        batch: &mut CommandBatch,
+        context: &MetalContext,
+        input: &MetalBuffer,
+        set: usize,
+        rows: u32,
+        layer: usize,
+    ) -> crate::Result<()> {
+        let function = function_for(rows)?;
+        let surfaces = &self.lanes[1];
+        self.kernels.pack(
+            batch,
+            input,
+            WIDTH as u32,
+            rows,
+            FUNCTION_ROWS[function],
+            &surfaces.tx,
+            [&surfaces.x[0], &surfaces.x[1]],
+        )?;
+        let job = Job {
+            work: Work::Qkv,
+            lane: 1,
+            layer,
+        };
+        let binding = &self.qkv_bindings[set * FUNCTION_ROWS.len() + function];
+        self.hand_over(batch, context, binding, job)
+    }
+
     /// Pack `rows` rows of a mixer's rotated output `input` into `lane`'s
-    /// surfaces and hand the first `OUT_STEPS[step]` rows of its output
+    /// surfaces and hand the first `out_rows(step)` rows of its output
     /// projection (weight set `set`) to the ANE, submitting the GPU work so
     /// far.
     #[expect(clippy::too_many_arguments)]
@@ -987,7 +1199,7 @@ impl AneSplit {
             [&surfaces.o[0], &surfaces.o[1]],
         )?;
         let job = Job {
-            out: true,
+            work: Work::Out,
             lane,
             layer,
         };
@@ -1010,10 +1222,11 @@ impl AneSplit {
         let ready = self.handoff.next_ready();
         let done = self.handoff.next_done();
         #[cfg(test)]
-        let skip = job.lane == 0 && !job.out && self.fault.get() == Some(job.layer) && {
-            self.fault.set(None);
-            true
-        };
+        let skip =
+            job.lane == 0 && job.work == Work::Ffn && self.fault.get() == Some(job.layer) && {
+                self.fault.set(None);
+                true
+            };
         #[cfg(not(test))]
         let skip = false;
         self.handoff.queue(binding, ready, done, skip);
@@ -1057,6 +1270,7 @@ impl AneSplit {
         self.kernels.join_split(
             batch,
             &surfaces.y,
+            0,
             &surfaces.tx,
             rest,
             output,
@@ -1065,6 +1279,37 @@ impl AneSplit {
             split,
             rows,
         )?;
+        Ok(())
+    }
+
+    /// Wait for the second half's Q/K/V projections and join its `rows`
+    /// tokens into `outputs` (the query and gate, the key, the value).
+    fn join_qkv(
+        &self,
+        batch: &mut CommandBatch,
+        rows: u32,
+        outputs: [&MetalBuffer; 3],
+    ) -> crate::Result<()> {
+        let surfaces = &self.lanes[1];
+        batch.wait_event(self.handoff.done_event(), surfaces.done.get())?;
+        let mut first = 0;
+        for (output, width) in outputs.into_iter().zip([QUERY_GATE, KEY_VALUE, KEY_VALUE]) {
+            // Every channel is the ANE's, so the GPU's rest (the surface's
+            // buffer here) is not read.
+            self.kernels.join_split(
+                batch,
+                &self.qkv_y,
+                first,
+                &surfaces.tx,
+                self.qkv_y.buffer(),
+                output,
+                &self.status,
+                width,
+                width,
+                rows,
+            )?;
+            first += width;
+        }
         Ok(())
     }
 
@@ -1103,11 +1348,20 @@ impl AneSplit {
     }
 }
 
+/// What an evaluation handed to the ANE computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Work {
+    Ffn,
+    /// The mixer's leading output projection rows.
+    Out,
+    /// A full-attention layer's Q, K and V projections.
+    Qkv,
+}
+
 /// One evaluation handed to the ANE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Job {
-    /// The mixer's output projection rather than the FFN.
-    out: bool,
+    work: Work,
     lane: usize,
     layer: usize,
 }
@@ -1115,22 +1369,33 @@ struct Job {
 /// How long the GPU waited, on average over a chunk's layers after the
 /// first, for the second half's previous FFN after handing over the first
 /// half's (ms), from the chunk's `jobs` and their release and report times
-/// in queue order: above zero when the ANE has no time to spare.
+/// in queue order: above zero when the ANE has no time to spare. Layers
+/// whose second half's Q, K and V went to the ANE join that FFN before the
+/// first half's handoff, so they do not count.
 fn mean_ffn_wait(
     jobs: &[Job],
     timeline: &[(Option<Instant>, Option<Instant>)],
     layers: usize,
 ) -> Option<f64> {
     let mut ffn = vec![[(None, None); 2]; layers];
+    let mut qkv = vec![false; layers];
     for (job, &(ready, done)) in jobs.iter().zip(timeline) {
-        if !job.out && job.layer < layers {
-            ffn[job.layer][job.lane] = (ready, done);
+        if job.layer < layers {
+            match job.work {
+                Work::Ffn => ffn[job.layer][job.lane] = (ready, done),
+                Work::Qkv => qkv[job.layer] = true,
+                Work::Out => {}
+            }
         }
     }
-    mean((1..layers).filter_map(|layer| {
-        let (done, ready): (Instant, Instant) = (ffn[layer - 1][1].1?, ffn[layer][0].0?);
-        Some(done.saturating_duration_since(ready).as_secs_f64() * 1e3)
-    }))
+    mean(
+        (1..layers)
+            .filter(|&layer| !qkv[layer])
+            .filter_map(|layer| {
+                let (done, ready): (Instant, Instant) = (ffn[layer - 1][1].1?, ffn[layer][0].0?);
+                Some(done.saturating_duration_since(ready).as_secs_f64() * 1e3)
+            }),
+    )
 }
 
 fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
@@ -1149,8 +1414,9 @@ struct Chunk {
 }
 
 /// How many leading rows of each mixer's output projection the ANE takes,
-/// per function (half-block rows), as an index into [`OUT_STEPS`], tuned
-/// online from measured chunk times. Contiguous chunks of a prompt
+/// per function (half-block rows), as an index into [`OUT_STEPS`] or
+/// [`QKV_STEP`] (the largest split and the attention layers' second-half
+/// Q, K and V as well), tuned online from measured chunk times. Contiguous chunks of a prompt
 /// alternate between the current split and a probe one step up or down
 /// (alternating by comparison); a probe chunk that ran faster per row than
 /// the mean of the equal-sized chunks on either side, by more than
@@ -1199,27 +1465,34 @@ impl OutSplit {
         let learned = Self::path()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-        if let Some(rows) = learned.as_ref().and_then(|value| value["rows"].as_array()) {
-            for (step, rows) in steps.iter_mut().zip(rows) {
-                if let Some(index) = rows
+        if let Some(learned) = learned
+            && let Some(rows) = learned["rows"].as_array()
+        {
+            for (index, (step, rows)) in steps.iter_mut().zip(rows).enumerate() {
+                if let Some(found) = rows
                     .as_u64()
                     .and_then(|rows| OUT_STEPS.iter().position(|&s| u64::from(s) == rows))
                 {
-                    *step = index;
+                    *step = found;
+                    // The largest split from a build without the Q/K/V step
+                    // was the top of its steps.
+                    if found == QKV_STEP - 1 && learned["attention_qkv"][index] != false {
+                        *step = QKV_STEP;
+                    }
                 }
             }
         }
         Self::new(steps)
     }
 
-    fn rows(&self) -> serde_json::Value {
-        serde_json::json!(self.steps.map(|step| OUT_STEPS[step]))
-    }
-
     /// Best effort: a split that cannot be saved is learned again.
     fn save(&self) {
         if let Some(path) = Self::path() {
-            let text = serde_json::json!({"rows": self.rows()}).to_string();
+            let text = serde_json::json!({
+                "rows": self.steps.map(out_rows),
+                "attention_qkv": self.steps.map(|step| step == QKV_STEP),
+            })
+            .to_string();
             let _ = std::fs::write(path, text);
         }
     }
@@ -1242,7 +1515,17 @@ impl OutSplit {
             self.current = None;
             return 0;
         }
+        let top = if start < QKV_MIN_POSITION {
+            QKV_STEP - 1
+        } else {
+            QKV_STEP
+        };
         let base = self.steps[function];
+        if base > top {
+            // Neither learns from nor teaches the top step.
+            self.current = None;
+            return top;
+        }
         let mut chunk = Chunk {
             function,
             rows,
@@ -1256,7 +1539,7 @@ impl OutSplit {
             .is_some_and(|last| !last.probe && last.function == function && last.rows == rows)
         {
             // At either end the probe goes the only way it can.
-            if base == OUT_STEPS.len() - 1 {
+            if base == top {
                 self.probe_up[function] = false;
             } else if base == 0 {
                 self.probe_up[function] = true;
@@ -1599,11 +1882,12 @@ impl BonsaiModel {
         }
     }
 
-    fn build_ane(&mut self, programs: &[Program; 2]) -> crate::Result<Box<AneSplit>> {
+    fn build_ane(&mut self, programs: &[Program; 3]) -> crate::Result<Box<AneSplit>> {
         let mut split = AneSplit::new(&self.context, programs)?;
         for (what, error) in [
             ("FFN", self.check_ane(&split)?),
             ("output projection", self.check_out(&split)?),
+            ("attention Q/K/V", self.check_qkv(&split)?),
         ] {
             if error.is_nan() || error > CHECK_TOLERANCE {
                 return Err(crate::Error::Generation(format!(
@@ -1771,6 +2055,98 @@ impl BonsaiModel {
             ));
         }
         Ok(relative_difference(gpu, ane))
+    }
+
+    /// Relative difference between the first full-attention layer's Q, K and
+    /// V projections on the ANE and on the GPU, on [`CHECK_ROWS`]
+    /// pseudo-random rows of unit variance.
+    #[expect(unsafe_code)]
+    fn check_qkv(&mut self, split: &AneSplit) -> crate::Result<f64> {
+        let rows = CHECK_ROWS as usize;
+        // SAFETY: no GPU work is in flight between blocks.
+        fill_check_rows(unsafe {
+            &mut self.scratch.rotated_hidden.as_mut_slice::<f32>()[..rows * WIDTH]
+        });
+        let Some((index, full)) =
+            self.layers
+                .iter()
+                .enumerate()
+                .find_map(|(index, layer)| match &layer.attention {
+                    AttentionLayer::Full(full) => Some((index, full)),
+                    AttentionLayer::Recurrent(_) => None,
+                })
+        else {
+            return Err(crate::Error::Generation(
+                "no full-attention layer for the Q/K/V check".into(),
+            ));
+        };
+        let scratch = &self.scratch;
+        // The ANE's rows land in the projections' own buffers, the GPU's in
+        // others that hold them (256 rows of 12,288 fill `query`) and alias
+        // neither.
+        let ane = [&scratch.query_gate, &scratch.key, &scratch.value];
+        let gpu_rows = [&scratch.query, &scratch.gate, &split.lanes[0].ffn];
+        split.status.copy_from_bytes(&[0; 4], 0);
+        split.jobs.borrow_mut().clear();
+        let mut batch = CommandBatch::new(&self.context)?;
+        let encoded = (|| -> crate::Result<()> {
+            split.stage_qkv(&mut batch, full, 0)?;
+            split.launch_qkv(
+                &mut batch,
+                &self.context,
+                &scratch.rotated_hidden,
+                0,
+                CHECK_ROWS,
+                index,
+            )?;
+            for (weights, output) in [&full.query_gate, &full.key, &full.value]
+                .into_iter()
+                .zip(gpu_rows)
+            {
+                self.project(
+                    &mut batch,
+                    weights,
+                    &scratch.rotated_hidden,
+                    output,
+                    CHECK_ROWS,
+                )?;
+            }
+            split.join_qkv(&mut batch, CHECK_ROWS, ane)
+        })();
+        let handoff = &split.handoff;
+        if let Err(error) = encoded {
+            handoff.retire("the start-up check failed to encode");
+            return Err(error);
+        }
+        self.finish(batch)?;
+        if !handoff.finish() {
+            return Err(crate::Error::Generation(
+                handoff
+                    .retired()
+                    .unwrap_or_else(|| "start-up evaluation failed".into()),
+            ));
+        }
+        let mut gpu = Vec::with_capacity(rows * QKV as usize);
+        let mut ane_rows = Vec::with_capacity(gpu.capacity());
+        // SAFETY: the batch has completed.
+        let status = unsafe {
+            for ((gpu_buffer, ane_buffer), width) in gpu_rows
+                .into_iter()
+                .zip(ane)
+                .zip([QUERY_GATE, KEY_VALUE, KEY_VALUE])
+            {
+                let count = rows * width as usize;
+                gpu.extend_from_slice(&gpu_buffer.as_slice::<f32>()[..count]);
+                ane_rows.extend_from_slice(&ane_buffer.as_slice::<f32>()[..count]);
+            }
+            split.status.as_slice::<u32>()[0]
+        };
+        if status != 0 {
+            return Err(crate::Error::Generation(
+                "start-up evaluation returned non-finite rows".into(),
+            ));
+        }
+        Ok(relative_difference(&gpu, &ane_rows))
     }
 
     /// A prefill block as a wavefront, restored and rerun on the GPU (which
@@ -1998,9 +2374,7 @@ impl BonsaiModel {
             (halves[0].rows + halves[1].rows) as usize,
             halves[0].position,
         );
-        let split_rows = OUT_STEPS[step];
-        split.stage(batch, &self.layers[0], 0)?;
-        split.stage_out(batch, self.layers[0].mixer_output(), 0, split_rows)?;
+        split.stage_layer(batch, &self.layers[0], 0, step)?;
         batch.submit_and_renew(&self.context)?;
         let launch = |batch: &mut CommandBatch, lane: usize, layer: usize| {
             split.launch(
@@ -2015,23 +2389,35 @@ impl BonsaiModel {
         };
         // Per layer, the ANE runs half A's FFN during half B's mixer and half
         // B's during half A's next mixer, and between them each half's
-        // leading output projection rows while the GPU computes the rest.
+        // leading output projection rows while the GPU computes the rest. At
+        // `QKV_STEP` a full-attention layer joins half B's previous FFN once
+        // half A's Q, K and V are projected, and the ANE projects half B's
+        // while the GPU runs half A's attention.
         for (index, layer) in self.layers.iter().enumerate() {
-            self.wave_mixer(batch, split, layer, index, &halves[0], 0, step)?;
-            launch(batch, 0, index)?;
-            if index > 0 {
-                split.join(batch, 1, halves[1].rows)?;
-            }
-            self.wave_mixer(batch, split, layer, index, &halves[1], 1, step)?;
+            let (head, tail) = (&halves[0], &halves[1]);
+            let next = self.layers.get(index + 1);
+            let staged = match &layer.attention {
+                AttentionLayer::Full(full) if step == QKV_STEP => {
+                    self.wave_attention_qkv(batch, split, layer, full, index, halves, step, next)?;
+                    true
+                }
+                _ => {
+                    self.wave_mixer(batch, split, layer, index, head, 0, step)?;
+                    launch(batch, 0, index)?;
+                    if index > 0 {
+                        split.join(batch, 1, tail.rows)?;
+                    }
+                    self.wave_mixer(batch, split, layer, index, tail, 1, step)?;
+                    false
+                }
+            };
             launch(batch, 1, index)?;
             // The other set's last readers (the previous layer's jobs) were
             // joined above.
-            if let Some(next) = self.layers.get(index + 1) {
-                let set = (index + 1) & 1;
-                split.stage(batch, next, set)?;
-                split.stage_out(batch, next.mixer_output(), set, split_rows)?;
+            if !staged && let Some(next) = next {
+                split.stage_layer(batch, next, (index + 1) & 1, step)?;
             }
-            split.join(batch, 0, halves[0].rows)?;
+            split.join(batch, 0, head.rows)?;
         }
         split.join(batch, 1, halves[1].rows)?;
         debug_assert_eq!(self.layers.len(), LAYERS);
@@ -2085,11 +2471,74 @@ impl BonsaiModel {
         Ok(())
     }
 
-    /// A layer's mixer for `half` in `lane`: the residual add of the
-    /// previous FFN with this layer's input normalization, the mixer with
-    /// the first `OUT_STEPS[step]` rows of its output projection on the
-    /// ANE, and the residual add with the FFN's normalization into
-    /// `scratch.rotated_hidden`.
+    /// Both halves' mixers of full-attention layer `index` at [`QKV_STEP`],
+    /// up to half B's FFN handoff. Half A's mixer runs as in
+    /// [`Self::wave_mixer`], except that once its output projection rows are
+    /// handed to the ANE, half B's previous FFN is joined (it returned
+    /// during half A's attention) and half B's input handed over for its Q,
+    /// K and V, which the ANE computes while the GPU finishes half A and
+    /// converts the `next` layer's weights (the other set's last reader,
+    /// half B's previous FFN, has been joined). Half B's attention then
+    /// reads the ANE's projections.
+    #[expect(clippy::too_many_arguments)]
+    fn wave_attention_qkv(
+        &self,
+        batch: &mut CommandBatch,
+        split: &AneSplit,
+        layer: &Layer,
+        full: &FullAttentionLayer,
+        index: usize,
+        halves: &[Half<'_>; 2],
+        step: usize,
+        next: Option<&Layer>,
+    ) -> crate::Result<()> {
+        let scratch = &self.scratch;
+        let (head, tail) = (&halves[0], &halves[1]);
+        self.wave_input(batch, split, layer, index, head, 0)?;
+        self.attention_core_at(batch, full, head.rows, head.rope, head.position)?;
+        self.rotate_attention(batch, head.rows)?;
+        self.wave_output(batch, split, layer, index, head, 0, step, |batch| {
+            // Into `scratch.normalized` and `scratch.rotated_hidden`, which
+            // half A no longer reads.
+            if index > 0 {
+                split.join(batch, 1, tail.rows)?;
+            }
+            self.wave_input(batch, split, layer, index, tail, 1)?;
+            split.launch_qkv(
+                batch,
+                &self.context,
+                &scratch.rotated_hidden,
+                index & 1,
+                tail.rows,
+                index,
+            )
+        })?;
+        split.launch(
+            batch,
+            &self.context,
+            &scratch.rotated_hidden,
+            0,
+            index & 1,
+            head.rows,
+            index,
+        )?;
+        if let Some(next) = next {
+            split.stage_layer(batch, next, (index + 1) & 1, step)?;
+        }
+        // The scratch Q/K/V rows alias half A's attention and output
+        // projection buffers, which are done with by now.
+        split.join_qkv(
+            batch,
+            tail.rows,
+            [&scratch.query_gate, &scratch.key, &scratch.value],
+        )?;
+        self.attention_from_projections_at(batch, full, tail.rows, tail.rope, tail.position)?;
+        self.rotate_attention(batch, tail.rows)?;
+        self.wave_output(batch, split, layer, index, tail, 1, step, |_| Ok(()))
+    }
+
+    /// A layer's mixer for `half` in `lane`: [`Self::wave_input`], the
+    /// mixer, then [`Self::wave_output`].
     #[expect(clippy::too_many_arguments)]
     fn wave_mixer(
         &self,
@@ -2101,26 +2550,7 @@ impl BonsaiModel {
         lane: usize,
         step: usize,
     ) -> crate::Result<()> {
-        let scratch = &self.scratch;
-        let ffn = &split.lanes[lane].ffn;
-        if index == 0 {
-            self.normalize_input(batch, half.hidden, &layer.attention_norm, half.rows)?;
-        } else {
-            self.ops.residual_normalize_transform(
-                batch,
-                &self.input_rotation,
-                half.hidden_alt,
-                ffn,
-                &layer.attention_norm,
-                [half.hidden, &scratch.normalized, &scratch.rotated_hidden],
-                half.rows,
-                self.epsilon,
-            )?;
-        }
-        // `half.hidden` now holds the half's residual stream after the
-        // previous layer, at positions from `half.position`: what
-        // `encode_block` exposes to per-layer readers at this point.
-        self.encode_taps_at(batch, index, half.rows as usize, half.hidden, half.position)?;
+        self.wave_input(batch, split, layer, index, half, lane)?;
         match &layer.attention {
             AttentionLayer::Recurrent(recurrent) => {
                 self.recurrent_core(batch, recurrent, 0, half.rows, None)?;
@@ -2130,8 +2560,64 @@ impl BonsaiModel {
                 self.rotate_attention(batch, half.rows)?;
             }
         }
-        let rows = OUT_STEPS[step];
+        self.wave_output(batch, split, layer, index, half, lane, step, |_| Ok(()))
+    }
+
+    /// The residual add of `half`'s previous FFN (in `lane`) with layer
+    /// `index`'s input normalization into `scratch.normalized` and
+    /// `scratch.rotated_hidden`, and the layer's taps.
+    fn wave_input(
+        &self,
+        batch: &mut CommandBatch,
+        split: &AneSplit,
+        layer: &Layer,
+        index: usize,
+        half: &Half<'_>,
+        lane: usize,
+    ) -> crate::Result<()> {
+        let scratch = &self.scratch;
+        if index == 0 {
+            self.normalize_input(batch, half.hidden, &layer.attention_norm, half.rows)?;
+        } else {
+            self.ops.residual_normalize_transform(
+                batch,
+                &self.input_rotation,
+                half.hidden_alt,
+                &split.lanes[lane].ffn,
+                &layer.attention_norm,
+                [half.hidden, &scratch.normalized, &scratch.rotated_hidden],
+                half.rows,
+                self.epsilon,
+            )?;
+        }
+        // `half.hidden` now holds the half's residual stream after the
+        // previous layer, at positions from `half.position`: what
+        // `encode_block` exposes to per-layer readers at this point.
+        self.encode_taps_at(batch, index, half.rows as usize, half.hidden, half.position)
+    }
+
+    /// The mixer's output projection of `half`'s rotated mixer output, with
+    /// its first `out_rows(step)` rows on the ANE in `lane`, and the residual
+    /// add with the FFN's normalization into `scratch.rotated_hidden`.
+    /// `handed` encodes after the ANE's rows are handed over (or first, with
+    /// none); it must leave `scratch.rotated_attention`, `scratch.ffn_gate`
+    /// and `half`'s rows alone.
+    #[expect(clippy::too_many_arguments)]
+    fn wave_output(
+        &self,
+        batch: &mut CommandBatch,
+        split: &AneSplit,
+        layer: &Layer,
+        index: usize,
+        half: &Half<'_>,
+        lane: usize,
+        step: usize,
+        handed: impl FnOnce(&mut CommandBatch) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let scratch = &self.scratch;
+        let rows = out_rows(step);
         if rows == 0 {
+            handed(batch)?;
             let weights = layer.mixer_output();
             self.project(
                 batch,
@@ -2158,6 +2644,7 @@ impl BonsaiModel {
             step,
             index,
         )?;
+        handed(batch)?;
         // The GPU's rows meanwhile, into a buffer the FFN alone uses.
         let matrix = layer.mixer_output().ptq1_matrix()?;
         self.kernels.matmul(
@@ -2253,11 +2740,13 @@ mod tests {
 
     #[test]
     fn program_declares_every_input_once() {
-        let text = program_text() + &out_program_text();
+        let text = program_text() + &out_program_text() + &qkv_program_text();
         let ffns = FUNCTION_ROWS.len();
         let outs = ffns * (OUT_STEPS.len() - 1);
+        let qkvs = ffns;
         for rows in FUNCTION_ROWS {
             assert!(text.contains(&format!("func ffn{rows}<ios18>(")));
+            assert!(text.contains(&format!("func qkv{rows}<ios18>(")));
             for split in &OUT_STEPS[1..] {
                 assert!(text.contains(&format!("func out{rows}_{split}<ios18>(")));
                 // The function reads the first `split` rows of the
@@ -2268,7 +2757,7 @@ mod tests {
                 )));
             }
         }
-        let ffn_inputs = ["x0", "x1", "wg0", "wu0", "wg1", "wu1", "sg", "su"]
+        let ffn_inputs = ["wg0", "wu0", "wg1", "wu1", "sg", "su"]
             .into_iter()
             .map(str::to_owned)
             .chain((0..7).map(|index| format!("wd{index}")))
@@ -2277,10 +2766,14 @@ mod tests {
         let out_inputs = ["o0", "o1", "wo0", "wo1", "so"]
             .into_iter()
             .map(|name| (name.to_owned(), outs));
-        for (name, count) in ffn_inputs
-            .chain(out_inputs)
-            .chain([("tx".to_owned(), ffns + outs)])
-        {
+        let qkv_inputs = ["wq0", "wq1", "sq"]
+            .into_iter()
+            .map(|name| (name.to_owned(), qkvs));
+        for (name, count) in ffn_inputs.chain(out_inputs).chain(qkv_inputs).chain([
+            ("x0".to_owned(), ffns + qkvs),
+            ("x1".to_owned(), ffns + qkvs),
+            ("tx".to_owned(), ffns + outs + qkvs),
+        ]) {
             let declared = text.matches(&format!("]> {name},")).count()
                 + text.matches(&format!("]> {name})")).count();
             assert_eq!(declared, count, "{name}");
@@ -2290,7 +2783,13 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(text.matches("-> (y);").count(), ffns + outs);
+        assert_eq!(text.matches("-> (y);").count(), ffns + outs + qkvs);
+        // The Q/K/V function reads all of its weight rows into the stacked
+        // output surface.
+        assert!(text.contains(&format!(
+            "shape=[1, 1, {QKV}, 2560], strides=[{}, ",
+            QKV_W.stride * QKV as usize
+        )));
     }
 
     /// Plan and learn a chunk at `start` past the first [`OUT_MIN_POSITION`]
@@ -2332,10 +2831,13 @@ mod tests {
         assert_eq!(finish(&mut split, 600, 2048, 100.0), (4, false));
         assert_eq!(split.steps[3], 4);
         // At either end the probe goes the only way it can.
-        let top = OUT_STEPS.len() - 1;
+        let top = STEPS - 1;
         let mut edge = OutSplit::new([top; FUNCTION_ROWS.len()]);
-        finish(&mut edge, 1024, 0, 2000.0);
-        assert_eq!(edge.plan(3, 1024, 1024 + OUT_MIN_POSITION), top - 1);
+        finish(&mut edge, 1024, QKV_MIN_POSITION, 2000.0);
+        assert_eq!(
+            edge.plan(3, 1024, 1024 + QKV_MIN_POSITION + OUT_MIN_POSITION),
+            top - 1
+        );
         let mut edge = OutSplit::new([0; FUNCTION_ROWS.len()]);
         edge.probe_up = [false; FUNCTION_ROWS.len()];
         finish(&mut edge, 1024, 0, 2000.0);
@@ -2349,6 +2851,22 @@ mod tests {
             4,
             "the next block is a base block"
         );
+    }
+
+    #[test]
+    fn out_split_takes_the_qkv_step_only_from_its_position() {
+        let mut split = OutSplit::new([QKV_STEP; FUNCTION_ROWS.len()]);
+        // Below the position the top step runs one below and teaches nothing.
+        assert_eq!(split.plan(3, 1024, QKV_MIN_POSITION - 1024), QKV_STEP - 1);
+        assert!(!split.learn(QKV_MIN_POSITION, 2000.0, Some(0.0)));
+        assert_eq!(split.plan(3, 1024, QKV_MIN_POSITION), QKV_STEP);
+        assert!(!split.learn(QKV_MIN_POSITION + 1024, 2000.0, Some(0.0)));
+        // Below it a split one below the top probes down, not up.
+        let mut below = OutSplit::new([QKV_STEP - 1; FUNCTION_ROWS.len()]);
+        assert_eq!(below.plan(3, 1024, OUT_MIN_POSITION), QKV_STEP - 1);
+        below.learn(2 * OUT_MIN_POSITION, 2000.0, Some(0.0));
+        assert_eq!(below.plan(3, 1024, 2 * OUT_MIN_POSITION), QKV_STEP - 2);
+        assert_eq!(out_rows(QKV_STEP), OUT_STEPS[OUT_STEPS.len() - 1]);
     }
 
     #[test]
@@ -2366,7 +2884,11 @@ mod tests {
     fn ffn_wait_pairs_each_layers_halves() {
         let base = Instant::now();
         let at = |ms: u64| Some(base + Duration::from_millis(ms));
-        let job = |out, lane, layer| Job { out, lane, layer };
+        let job = |out, lane, layer| Job {
+            work: if out { Work::Out } else { Work::Ffn },
+            lane,
+            layer,
+        };
         // Layer 0: out A, FFN A, out B, FFN B; layer 1 likewise.
         let jobs = [
             job(true, 0, 0),

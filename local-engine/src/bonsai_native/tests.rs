@@ -1367,15 +1367,16 @@ fn short_attention_splits_track_128_token_splits_next_token_distribution() {
     }
 }
 
-/// Prefill with every FFN and up to 3,072 rows of each mixer output
-/// projection on the Neural Engine (int8 weights x int8 activations, the
-/// wavefront of two half blocks) against the same model's GPU prefill,
-/// teacher-forced over 64 greedy tokens after a 1,000-token prompt (one
-/// uneven wavefront block) and an 8,192-token one (eight full blocks) of
-/// this repository's text. Decode runs on the GPU in both, so only the
+/// Prefill with every FFN, up to 3,072 rows of each mixer output projection
+/// and (at the top step) the attention layers' second-half Q, K and V on the
+/// Neural Engine (int8 weights x int8 activations, the wavefront of two half
+/// blocks) against the same model's GPU prefill, teacher-forced over 64
+/// greedy tokens after a 1,000-token prompt (one uneven wavefront block) and
+/// an 8,192-token one (eight full blocks) of this repository's text. Decode runs on the GPU in both, so only the
 /// prefill's ANE rounding differs. Measured on the M4 Pro: mean next-token
 /// KL 6.3e-5 and 7.4e-5 (5.5e-5 to 8.4e-5 across earlier runs and splits;
-/// 1.4e-4 once with 3,584 output rows, beyond today's steps; Kapitsa gates
+/// 1.4e-4 once with 3,584 output rows, beyond today's steps; 1.07e-4 and
+/// 1.12e-4 with every block fixed at the attention Q/K/V step; Kapitsa gates
 /// its own at 3.84e-4). The bounds leave headroom over that: mean at most
 /// 2e-4, no row over 2e-3, and at least 60/64 top-1. A broken program or
 /// handoff lands far outside them.
@@ -1712,10 +1713,11 @@ fn ane_prefill_block_timings() {
 /// Cold prefill time of 4,096 tokens (four wavefront blocks; set
 /// `ANE_SPLIT_ROWS` for another length) with every layer's mixer output
 /// projection split at each fixed number of ANE rows (`ANE_SPLIT_STEPS`, a
-/// list of `OUT_STEPS` indices, for a subset), best of two after a warm-up
-/// (reported apart, with the model's first prefill paying for building the
-/// ANE path): what the split controller chooses between. Measurement only;
-/// nothing is asserted.
+/// list of `OUT_STEPS` indices, or `OUT_STEPS.len()` for the largest split
+/// with the attention layers' second-half Q/K/V as well, for a subset),
+/// best of two after a warm-up (reported apart, with the model's first
+/// prefill paying for building the ANE path): what the split controller
+/// chooses between. Measurement only; nothing is asserted.
 #[test]
 #[ignore = "measurement; requires the pinned model, a Metal device and the Neural Engine"]
 fn ane_out_split_timings() {
@@ -1753,7 +1755,7 @@ fn ane_out_split_timings() {
         (runs[0], runs[1].min(runs[2]))
     };
     let steps = std::env::var("ANE_SPLIT_STEPS").map_or_else(
-        |_| (0..ane_split::OUT_STEPS.len()).collect::<Vec<usize>>(),
+        |_| (0..ane_split::STEPS).collect::<Vec<usize>>(),
         |steps| {
             steps
                 .split(',')

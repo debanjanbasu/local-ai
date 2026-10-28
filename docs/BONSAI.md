@@ -3862,9 +3862,10 @@ and full attention), as Kapitsa does
 never depends on it.
 
 - **Program.** One MIL program with FFN functions for 128, 256, 384 and
-  512 rows and a second with each mixer output projection's leading 512 to
-  3,072 rows (in steps of 512) for those row counts, compiled on a
-  background thread from model load through the private
+  512 rows, a second with each mixer output projection's leading 512 to
+  3,072 rows (in steps of 512) and a third with a full-attention layer's Q,
+  K and V (below), for those row counts, compiled on a background thread
+  from model load through the private
   `AppleNeuralEngine.framework` (every selector's type encoding checked
   before its first call) and cached by the daemon under
   `$(DARWIN_USER_CACHE_DIR)/local-ai-bonsai-ffn/<hash>`; a held compilation
@@ -3873,7 +3874,8 @@ never depends on it.
   `g/2 (1 + tanh(g/2))`.
 - **Precision: int8 weights x int8 activations.** Weights are surfaces with
   one fp16 scale per row; the GPU converts each layer's ternary blocks into
-  one of two weight sets (0.54 GB together) while the ANE runs the previous
+  one of two weight sets (0.54 GB together; the attention Q/K/V rows below
+  add 0.15 GB) while the ANE runs the previous
   layer from the other, so there is no resident int8 copy. A ternary row is
   its trits times block scales, so its codes are the trits times
   `rint(127 s_b / max |s|)`. Activations are packed int8 per token; the
@@ -3911,9 +3913,11 @@ never depends on it.
   bottleneck (a fresh 2,049-token prompt's first block took 3.02 s with
   3,072 rows against 2.74 s with none, its second 2.71 s with 2,560 rows
   against 2.79 s with 512; the ANE's jobs ran their usual time in both). It
-  starts at 3,072 rows and the learned splits persist in `out-split.json`
-  under the program cache. With every layer fixed at one split, 4,096-token
-  prompts measured (`ane_out_split_timings`, best of two):
+  starts at the top step (3,072 rows with the attention Q/K/V below; a
+  learned 3,072 from a build without that step reads as it) and the learned
+  splits persist in `out-split.json` under the program cache. With every
+  layer fixed at one split, 4,096-token prompts measured
+  (`ane_out_split_timings`, best of two):
 
   | ANE rows | 0 | 512 | 1,024 | 1,536 | 2,048 | 2,560 | 3,072 | 3,584 | 4,096 |
   | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -3923,14 +3927,32 @@ never depends on it.
   3,584, so the steps stop there. At 16K tokens 3,584 rows measured 306.4
   against 298.9 tok/s with none, but other agents' load moved the points in
   between by 5%, so that sweep only bounds the gain.
+- **Attention Q/K/V.** The split's top step (3,072 output rows and this)
+  adds each full-attention layer's Q, K and V projections for half B
+  (12,288 + 1,024 + 1,024 rows x 5,120 as one stacked weight surface pair,
+  converted with the layer's other weights)
+  to the ANE. In those 16 layers the GPU runs half A's mixer up to its
+  output projection handoff, then joins half B's previous FFN (which
+  returned during half A's attention), adds and normalizes half B's input
+  and hands it over; the ANE projects it (3.9 ms per 512-row half, behind
+  half A's output rows) while the GPU finishes half A's output projection
+  and FFN handoff and converts the next layer's weights (the other set's
+  last reader was that FFN), and half B's attention reads the joined
+  projections. The GPU skips 10.8 ms of projections per layer for 0.7 ms
+  of conversion and 0.3 ms of pack and join. Blocks starting before
+  position 4,096 stop one step below it: there the ANE already sets the
+  pace in the recurrent layers (a 2,510-token prompt whose blocks from
+  1,024 took the Q/K/V ran 332.3 against 338.6 tok/s, best of two), and
+  such blocks neither probe nor teach the top step.
 - **Ordering.** Two `MTLSharedEvent`s carry GPU-to-ANE and ANE-to-GPU order
   (set on each `_ANERequest`), so no host thread waits mid-block. A
   watchdog retires the handoff when an evaluation runs 2 s past its release
   (one takes about 19 ms) or a block runs 300 s, raising both events so
   every GPU wait passes.
 - **Fallback.** No M4-class chip, no framework, a failed compile or a
-  start-up check (layer 0's FFN, and its output projection with the largest
-  split, on 256 pseudo-random rows against the GPU's, at most 10% relative
+  start-up check (layer 0's FFN, its output projection with the largest
+  split and the first full-attention layer's Q/K/V, on 256 pseudo-random
+  rows against the GPU's, at most 10% relative
   difference; int8 x int8 measured 0.42% for the FFN) leaves
   prefill on the GPU with
   the reason in `neural_engine_prefill`. A block whose ANE work fails,
@@ -4129,6 +4151,60 @@ Starting from 3,072 rows everywhere, the learned split ended at 3,072 after
 fresh 2,052-, 8,202- and 16,404-token prompts on this build (16K: 276.5
 against 295.2 tok/s, one sample each); the previous build's 16K prompt
 ended with its 512-row halves at 2,560.
+
+**Attention Q/K/V on the Neural Engine** (the top step above) then moved
+the work the ANE could take from the GPU in the attention layers, where
+from a few thousand positions it waits on the GPU's attention. Same profile,
+M4 Pro on its 100 W adapter, 2026-10-28, other agents' builds running: half
+B's Q, K and V cost the GPU 10.78 ms per layer (9.04 + 0.87 + 0.87) and
+the ANE 3.9 ms (from the handoff timeline); conversion 0.72 ms, join
+0.21 ms, pack 0.07 ms. The mean GPU time of a 512-row half falls from
+1,313 to 1,234 ms at 4K, 1,844 to 1,765 at 16K and 2,669 to 2,590 at 32K.
+Whole 1,024-row wavefronts at the largest output split without and with the
+Q/K/V, alternating, best of two:
+
+| Position | 3,072 output rows | and the Q/K/V | Change |
+| ---: | ---: | ---: | ---: |
+| 4K | 2,916 ms | 2,870 ms | -1.6% |
+| 16K | 4,032 ms | 3,965 ms | -1.7% |
+| 32K | 5,549 ms | 5,404 ms | -2.6% |
+
+At 4K-16K the recurrent layers, at the ANE's pace, absorb part of the
+GPU's saving. Cold prefill (`tools/benchmark.py --prefill`, main `64a7293`
+against this build, interleaved, every process starting from 3,072 rows
+for every half-block size with `out-split.json` held read-only, other
+agents' jobs running, `--allow-busy`), the same 16 greedy tokens from both:
+
+| Prompt | Main | Q/K/V step | Cold TTFT |
+| ---: | ---: | ---: | ---: |
+| 2,052 tokens | 356.9 tok/s | 355.5 tok/s | 5.75 → 5.77 s |
+| 8,202 tokens | 340.6 tok/s | 339.5 tok/s | 24.08 → 24.16 s |
+| 32,742 tokens | 245.8, 249.5 tok/s | 249.0, 251.5 tok/s | 133.2 → 131.5, 131.2 → 130.2 s |
+
+2K and 8K are best of two rounds and within noise: a 2K prompt takes no
+Q/K/V (its blocks start before 4,096), and an 8K one takes them in at most
+four blocks, of which the controller probes one step down in every other.
+32K is two runs of one round in opposite orders (main first, then this
+build first): +1.3% and +0.8%. The controller's probing is why that is
+under the blocks' 2-2.6%: blocks alternate between the learned step and
+its neighbour, so about half of a long prompt's blocks run the Q/K/V.
+
+Next-token distribution with every block fixed at a step
+(`ane_prefill_tracks_gpu_prefill_next_token_distribution`, the override
+also covering the first block): 3,072 output rows measured mean KL 7.0e-5
+(max 4.3e-4) after 1,000 tokens and 9.2e-5 (max 5.7e-4) after 8,192; with
+the Q/K/V as well, 1.07e-4 (max 6.0e-4) and 1.12e-4 (max 5.5e-4); top-1
+64/64 in all four. As shipped (the controller starting from 3,072 rows,
+which reads as the top step, Q/K/V only from 4,096), 6.3e-5 (max 4.4e-4)
+and 9.5e-5 (max 6.9e-4), 64/64. The Q/K/V add about 3e-5 (the K and V
+they write stay in the cache for every later token), within the test's
+bounds. `ane_prefill_feeds_the_head_like_gpu_prefill` measured 0.8%, 1.05%
+and 1.1%. The start-up check now also compares the first full-attention
+layer's Q/K/V on 256 rows with the GPU's. Decode is unchanged: 38.12
+against 38.10 tok/s, best of two with the default speculation. Peak
+footprint (`/usr/bin/time -l`, a cold 10,260-token prompt, 16 tokens, two
+runs each) rose 3.23 → 3.42-3.43 GB; the two weight sets' Q/K/V rows are
+147 MB and the second half's projections 15 MB.
 
 Rejected or not adopted, from the same profile and Splash's kernels
 (`incoai/splash` `39a9738`), kernel time against the kernel of the time:
@@ -4372,11 +4448,37 @@ their own entry, not with current rates.
   other layer of a type probing a step, settled recurrent layers at 1,024
   rows while a uniform sweep put the best split at 3,072-3,584: a layer's
   extra ANE rows delay the FFN the next layer joins, so its cost lands on
-  its neighbour. The input projections (Gated `DeltaNet`'s QKV and gate,
-  attention's Q, K and V) were not moved: they would queue behind the other
-  half's FFN on the ANE while the GPU's recurrence or attention waits for
-  them, where the output projection's rows land in the ANE's idle time
-  after that FFN (not measured).
+  its neighbour. Gated `DeltaNet`'s QKV and gate projections stay on the
+  GPU: those layers do not grow with context and already run at the ANE's
+  pace (about 41 ms per layer on both at a 32K prefix; at 4K the GPU waits
+  about 2.5 ms per layer for half B's output rows behind half A's FFN), so
+  their 16,384 rows (about 4.5 ms per half on the ANE against 12.1 on the
+  GPU) would make them ANE-bound and slower (arithmetic from the measured
+  times, not built). Attention's Q, K and V moved for half B only (see
+  [Neural Engine prefill FFN](#neural-engine-prefill-ffn)); the other ways
+  measured or ruled out:
+
+  - Half B's input handed over before half A's attention (it waits for half
+    B's previous FFN): the GPU stalled about 5 ms per layer for it, as only
+    stage, input and half A's projections (about 15 ms) come before;
+    whole 1,024-row wavefronts 4K 2,934 → 2,923 ms, 32K 5,757 → 5,691 ms
+    (-0.4%, -1.2%) against the shipped order's -1.6% and -2.6%.
+  - The same handoff from a second Metal command queue, so the main queue
+    runs half A's attention instead of waiting: the side queue's 0.6 ms of
+    work completed only when half A's attention dispatch ended (96 ms after
+    the FFN returned, at a 32K prefix) and that dispatch ran up to 8 ms
+    longer; 4K 2,963 → 2,917 ms, 32K 5,818 → 5,737 ms (-1.6%, -1.4%).
+  - Handed over after half A's output rows but converting the next layer's
+    weights at the end of the layer as before: the GPU waited 1.5-3 ms per
+    layer on the projections; 4K 2,919 → 2,867 ms, 32K 5,516 → 5,438 ms
+    (-1.8%, -1.4%).
+  - Half A's Q, K and V: its input is ready only after half A's previous
+    FFN, behind which half B's (19 ms) is already queued, so the ANE would
+    return them about 23 ms after that handoff while the GPU has about 4 ms
+    of other work (the weight conversion) before needing them (not built).
+    Splitting a 512-row block's attention into two dispatches, to hand half
+    B over mid-attention, would change the attention kernels' choice and
+    was not tried.
 
 - 4-bit Neural Engine weights (October 2026, after the
   [Neural Engine prefill FFN](#neural-engine-prefill-ffn)). Ternary rows are
