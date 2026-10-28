@@ -354,6 +354,49 @@ struct DfLattice {
     float cond_logq[DF_SLOTS][DF_TOPK][DF_TOPK];
 };
 
+// Most added tokens the reduced head's merge takes (its 64 threads hold the
+// 16 candidates of the first rows and one added token each).
+constant constexpr uint DF_MAX_SPECIALS = 48;
+
+// `f32::total_cmp` order as a signed integer key (the top-k kernels' own).
+static inline int df_total_key(float logit) {
+    const int key = as_type<int>(logit);
+    return key ^ int(uint(key >> 31) >> 1);
+}
+
+// The drafter's reduced output head (grid 7, 64 threads): row s's top 16 of
+// the first token ids (`top`, rows `top_stride` candidates apart) merged with
+// the logits of the `specials` added tokens from id `special_first`
+// (`special`, [7, specials]) into row s of `merged` (same stride), best first
+// in `f32::total_cmp` order with ties to the lower id, as the top-k kernels
+// rank. Every id is distinct, so every rank is.
+kernel void dflash_head_merge(
+    device const DfCandidate *top [[buffer(0)]], device const float *special [[buffer(1)]],
+    device DfCandidate *merged [[buffer(2)]], constant uint &top_stride [[buffer(3)]],
+    constant uint &special_first [[buffer(4)]], constant uint &specials [[buffer(5)]],
+    uint s [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup int keys[DF_TOPK + DF_MAX_SPECIALS];
+    threadgroup uint ids[DF_TOPK + DF_MAX_SPECIALS];
+    const uint n = DF_TOPK + specials;
+    DfCandidate own = {0u, 0.0f};
+    if (tid < DF_TOPK) {
+        own = top[s * top_stride + tid];
+    } else if (tid < n) {
+        own = {special_first + tid - DF_TOPK, special[s * specials + tid - DF_TOPK]};
+    }
+    const int key = df_total_key(own.logit);
+    if (tid < n) {
+        keys[tid] = key;
+        ids[tid] = own.id;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid >= n) return;
+    uint rank = 0;
+    for (uint i = 0; i < n; ++i) rank += keys[i] > key || (keys[i] == key && ids[i] < own.id);
+    if (rank < DF_TOPK) merged[s * top_stride + rank] = own;
+}
+
 static inline float4 df_bf16x4(device const ushort4 *row, uint i) {
     const uint4 bits = uint4(row[i]) << 16;
     return as_type<float4>(bits);

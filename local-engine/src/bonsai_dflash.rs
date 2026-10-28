@@ -102,6 +102,34 @@ const HEAD_DIM: usize = 128;
 const RANK: usize = 256;
 const CONV_PROJECTION: usize = 1280;
 const VOCAB: usize = 248_320;
+/// Output-head rows the drafter scores: the lowest token ids, which for this
+/// byte-level BPE vocabulary are its earliest merges, the frequent tokens
+/// (Kapitsa's id-order cut). They hold 99.9% of the English text, code and
+/// tool calls Bonsai generates and draft like the full head in 2.1 ms less
+/// per pass (`docs/BONSAI.md#reduced-draft-head`); the target verifies over
+/// the full vocabulary, so output does not change.
+const HEAD_ROWS: usize = 98_304;
+/// The added tokens the drafter scores beside [`HEAD_ROWS`]:
+/// `<|endoftext|>` (248044) through `<|audio_pad|>` (248076), which include
+/// the end of turn, the think tags and the tool-call tags. The 243 rows
+/// after them are unused padding.
+const SPECIAL_FIRST: u32 = 248_044;
+const SPECIALS: usize = 33;
+/// Consecutive drafting anchors the reduced head must score before the
+/// drafter scores it instead of the full head. In a tree cycle a token the
+/// reduced head lacks can only enter the text as the target's correction,
+/// which is the next tree's anchor, so text made of such tokens (Chinese,
+/// Japanese, accented Latin script) keeps the full head, through head
+/// cycles too, while English text and code switch at their eighth tree and
+/// draft eight trees on the full head after a rare token (one in about a
+/// thousand).
+const REDUCED_HEAD_ANCHORS: usize = 8;
+
+/// Whether the reduced head scores `token`.
+const fn reduced_head_scores(token: u32) -> bool {
+    (token as usize) < HEAD_ROWS
+        || (token >= SPECIAL_FIRST && token < SPECIAL_FIRST + SPECIALS as u32)
+}
 /// The drafter's `mask_token_id`: every draft row after the anchor embeds it.
 pub const MASK_TOKEN: u32 = 248_070;
 const EPSILON: f32 = 1e-6;

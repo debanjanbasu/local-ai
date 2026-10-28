@@ -13,13 +13,14 @@ use local_metal::dflash::{
     attention_partial_bytes,
 };
 use local_metal::draft::DraftRows;
-use local_metal::sampling::TopKRows;
+use local_metal::sampling::{MAX_TOP_K, TopKCandidate, TopKRows};
 use local_metal::shaders::ShaderLibrary;
 
 use super::weights::Weights;
 use super::{
-    CONV_PROJECTION, EPSILON, FFN, KV_WIDTH, MASK_TOKEN, Q_WIDTH, RANK, ROPE_THETA, TAPS, VOCAB,
-    WIDTH,
+    CONV_PROJECTION, EPSILON, FFN, HEAD_ROWS, KV_WIDTH, MASK_TOKEN, Q_WIDTH, RANK,
+    REDUCED_HEAD_ANCHORS, ROPE_THETA, SPECIAL_FIRST, SPECIALS, TAPS, VOCAB, WIDTH,
+    reduced_head_scores,
 };
 
 /// Positions [`DflashDrafter::truncate_context`] can roll back. The ring
@@ -85,6 +86,7 @@ struct Scratch {
     rotated: MetalBuffer,
     selector: MetalBuffer,
     logits: MetalBuffer,
+    special_logits: MetalBuffer,
     partial_out: MetalBuffer,
     partial_stats: MetalBuffer,
     taps: MetalBuffer,
@@ -115,6 +117,7 @@ impl Scratch {
             rotated: floats(DFLASH_SLOTS * WIDTH)?,
             selector: floats(DFLASH_SLOTS * RANK)?,
             logits: floats(DFLASH_SLOTS * VOCAB)?,
+            special_logits: floats(DFLASH_SLOTS * SPECIALS)?,
             partial_out: MetalBuffer::empty(context.device(), out_bytes)?,
             partial_stats: MetalBuffer::empty(context.device(), stats_bytes)?,
             taps: floats(CONTEXT_CHUNK * TAPS * WIDTH)?,
@@ -143,6 +146,7 @@ impl Scratch {
             &self.rotated,
             &self.selector,
             &self.logits,
+            &self.special_logits,
             &self.partial_out,
             &self.partial_stats,
             &self.taps,
@@ -170,7 +174,15 @@ pub struct DflashDrafter {
     path: PathBuf,
     kernels: DflashKernels,
     embed: DraftRows,
+    /// Top 16 of the reduced head's first rows, and that merged with the
+    /// added tokens: the candidates the lattice reads.
     top: TopKRows,
+    head_top: MetalBuffer,
+    /// Top 16 of the full head.
+    full_top: TopKRows,
+    /// Consecutive host anchors the reduced head scores, up to
+    /// [`REDUCED_HEAD_ANCHORS`]; below that, passes score the full head.
+    scored_anchors: usize,
     rope: RopeTables,
     key_ring: Vec<MetalBuffer>,
     value_ring: Vec<MetalBuffer>,
@@ -209,7 +221,13 @@ impl DflashDrafter {
             path: path.to_owned(),
             kernels: DflashKernels::new(context, shaders)?,
             embed: DraftRows::new(context, shaders, VOCAB, DFLASH_BLOCK)?,
-            top: TopKRows::new(context, shaders, VOCAB, DFLASH_SLOTS)?,
+            top: TopKRows::new(context, shaders, HEAD_ROWS, DFLASH_SLOTS)?,
+            head_top: MetalBuffer::empty(
+                context.device(),
+                DFLASH_SLOTS * MAX_TOP_K * size_of::<TopKCandidate>(),
+            )?,
+            full_top: TopKRows::new(context, shaders, VOCAB, DFLASH_SLOTS)?,
+            scored_anchors: 0,
             rope: RopeTables::new(context, ROPE_THETA)?,
             key_ring: ring()?,
             value_ring: ring()?,
@@ -272,6 +290,7 @@ impl DflashDrafter {
     pub const fn reset(&mut self) {
         self.context_len = 0;
         self.floor = 0;
+        self.scored_anchors = 0;
     }
 
     /// Forget the context and continue it from `position`: the next append
@@ -439,6 +458,11 @@ impl DflashDrafter {
     /// Encode the drafting pass for `anchor` at sequence position `position`
     /// (which must equal [`Self::context_len`]), leaving the lattice in
     /// [`Self::lattice_buffer`]. Follow it with [`Self::build_tree`].
+    ///
+    /// The pass scores the reduced output head once the last
+    /// [`REDUCED_HEAD_ANCHORS`] host anchors since [`Self::reset`] were all
+    /// tokens it scores, and the full head otherwise; device anchors leave
+    /// that count as it is.
     #[expect(clippy::too_many_lines)]
     pub fn draft(
         &mut self,
@@ -456,7 +480,14 @@ impl DflashDrafter {
             )));
         }
         match anchor {
-            DraftAnchor::Token(token) => self.tokens.copy_from_bytes(&token.to_le_bytes(), 0),
+            DraftAnchor::Token(token) => {
+                self.tokens.copy_from_bytes(&token.to_le_bytes(), 0);
+                self.scored_anchors = if reduced_head_scores(*token) {
+                    (self.scored_anchors + 1).min(REDUCED_HEAD_ANCHORS)
+                } else {
+                    0
+                };
+            }
             DraftAnchor::Device { buffer, offset } => {
                 batch.blit_buffer_copies([BufferCopyRequest {
                     source: buffer,
@@ -590,7 +621,9 @@ impl DflashDrafter {
             k.add(batch, &s.x, &s.hc, DFLASH_BLOCK * WIDTH)?;
         }
         // Rows 1..8 are the drafts: final norm, then the selector's projection
-        // in the drafter's basis and the shared output head in the target's.
+        // in the drafter's basis and the shared output head in the target's:
+        // its first `HEAD_ROWS` rows and the added tokens, or every row while
+        // the recent anchors include a token those lack.
         let slots = DFLASH_SLOTS as u32;
         k.rms_rows(
             batch,
@@ -614,12 +647,34 @@ impl DflashDrafter {
             )?;
             Ok(())
         })?;
-        kernels.matmul(batch, shared.output, &s.rotated, &s.logits, slots)?;
-        self.top
-            .encode(batch, &s.logits, DFLASH_SLOTS, DFLASH_TOPK)?;
+        let candidates = if self.scored_anchors < REDUCED_HEAD_ANCHORS {
+            kernels.matmul(batch, shared.output, &s.rotated, &s.logits, slots)?;
+            self.full_top
+                .encode(batch, &s.logits, DFLASH_SLOTS, DFLASH_TOPK)?;
+            self.full_top.output_buffer()
+        } else {
+            let head = shared.output.row_slice(0, HEAD_ROWS as u32)?;
+            let special = shared.output.row_slice(SPECIAL_FIRST, SPECIALS as u32)?;
+            batch.independent(|batch| -> crate::Result<()> {
+                kernels.matmul(batch, head, &s.rotated, &s.logits, slots)?;
+                kernels.matmul(batch, special, &s.rotated, &s.special_logits, slots)?;
+                Ok(())
+            })?;
+            self.top
+                .encode(batch, &s.logits, DFLASH_SLOTS, DFLASH_TOPK)?;
+            k.head_merge(
+                batch,
+                self.top.output_buffer(),
+                &s.special_logits,
+                SPECIAL_FIRST,
+                SPECIALS,
+                &self.head_top,
+            )?;
+            &self.head_top
+        };
         k.lattice(
             batch,
-            self.top.output_buffer(),
+            candidates,
             &s.selector,
             &w.predecessor,
             &w.successor,
@@ -654,6 +709,18 @@ impl DflashDrafter {
     #[must_use]
     pub const fn tree_buffer(&self) -> &MetalBuffer {
         &self.tree
+    }
+
+    /// Whether the last pass scored the full head.
+    #[cfg(test)]
+    pub(super) const fn scored_full_head(&self) -> bool {
+        self.scored_anchors < REDUCED_HEAD_ANCHORS
+    }
+
+    /// The forward-rotated draft rows `[7, 5120]` the last pass scored.
+    #[cfg(test)]
+    pub(super) const fn rotated_rows(&self) -> &MetalBuffer {
+        &self.scratch.rotated
     }
 
     /// Copy of the last lattice; call only after its batch completed.
@@ -701,9 +768,11 @@ impl DflashDrafter {
     }
 
     /// Measure the drafting pass (draft and 8-row tree) at the current
-    /// context: `passes` passes, each in its own command buffer, after one
+    /// context, over the reduced head that English text and code draft
+    /// with: `passes` passes, each in its own command buffer, after one
     /// warm-up. Returns the median GPU time and records it as
-    /// [`Self::draft_gpu_time`]. The context is not changed.
+    /// [`Self::draft_gpu_time`]. Neither the context nor the head choice is
+    /// changed.
     pub fn measure_draft_time(
         &mut self,
         context: &MetalContext,
@@ -712,10 +781,12 @@ impl DflashDrafter {
     ) -> crate::Result<Duration> {
         let position = self.context_len;
         let anchor = DraftAnchor::Token(MASK_TOKEN);
-        self.draft_and_wait(context, shared, &anchor, position, DFLASH_MAX_TREE_ROWS)?;
-        let mut times = (0..passes.max(1))
+        let scored_anchors = std::mem::replace(&mut self.scored_anchors, REDUCED_HEAD_ANCHORS);
+        let times = (0..=passes.max(1))
             .map(|_| self.draft_and_wait(context, shared, &anchor, position, DFLASH_MAX_TREE_ROWS))
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>();
+        self.scored_anchors = scored_anchors;
+        let mut times = times?.split_off(1);
         times.sort();
         let median = times[times.len() / 2];
         self.draft_gpu_time = Some(median);

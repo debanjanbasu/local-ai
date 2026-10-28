@@ -204,7 +204,9 @@ context is the target's residual stream at layers 5, 19, 33, 47 and 61
 (standard Qwen basis, no unrotation), projected by `fc` (25600 to 5120) and
 `hidden_norm` into each layer's K/V. The seven draft rows go through the
 target's own `PTQ1_0` output matrix (forward-rotated first, as the target's
-hidden is) to the top 16 candidates per position, and a rank-256 candidate
+hidden is), its first 98,304 rows and the 33 added tokens only
+([Reduced draft head](#reduced-draft-head)), to the top 16 candidates per
+position, and a rank-256 candidate
 selector scores each candidate against each candidate of the position
 before it (the anchor for the first). Those scores make a first-order
 lattice; a best-first tree of up to 8 rows over it, scored with per-position
@@ -282,7 +284,9 @@ context, 12.44 ms at 500 and 13.23 ms at the full window; appending a
 2,048-row prompt costs 250 ms once (the int8 kernels take it in 8-row
 chunks). Of the pass, the int8 projections are 8.3 ms, the output head over
 seven rows 3.3 ms, top 16 0.14 ms, and block attention 0.03 ms per layer at
-60 context positions, 0.22 ms at the full window.
+60 context positions, 0.22 ms at the full window. Those figures predate the
+[reduced draft head](#reduced-draft-head), which takes about 2.1 ms off the
+pass: 10.27 ms against 12.39 ms on the anchors measured there.
 
 Parity against `drafter_lib.py` (fp32, itself within 6.5e-6 of z-lab's class)
 on the captured Bonsai hidden states, every anchor of the seven prompts:
@@ -314,6 +318,130 @@ the fp32 lattices (report: 4.68):
 | thinking | 6.021 | 6.021 | 6.289 |
 | agent | 6.905 | 6.724 | 6.724 |
 | geomean | 4.693 | 4.685 | 4.316 |
+
+#### Reduced draft head
+
+The drafter scores the shared output matrix over its first 98,304 rows and
+the 33 added tokens (`<|endoftext|>` 248044 through `<|audio_pad|>` 248076:
+end of turn, think and tool-call tags among them), not all 248,320, as
+Kapitsa's id-order cut (`kHeadRowsIdOrder`) does. In this byte-level BPE
+vocabulary a token's id is its merge order, so the lowest ids are the
+frequent ones; the 243 rows after the added tokens are unused padding. The
+98,304 rows are a contiguous prefix of the `PTQ1_0` matrix and the added
+tokens a contiguous 33-row slice, so both are views of the mapped
+checkpoint, multiplied as two independent matmuls with no weight copy. Top 16
+runs over the 98,304 logits, and `dflash_head_merge` (one 64-thread group per
+draft position) ranks those 16 with the 33 added-token logits, as the top-k
+kernels rank (`f32::total_cmp`, ties to the lower id), into real token ids
+for the lattice and the tree. The target still verifies over the full
+vocabulary, so output is unchanged.
+
+The cut drafts badly where the text's tokens lie above it, so the drafter
+scores the full head until eight consecutive anchors were tokens the
+reduced head scores, after a reset and after any anchor it lacks. In a
+tree cycle a token the reduced head lacks can only enter the text as the
+target's correction after the accepted drafts, which is the next tree's
+anchor, so the anchors see such text at once. Counting anchors rather than
+positions keeps the choice across the head cycles between trees: a first
+build that scored the full head for 64 positions after such an anchor
+drafted as well as the full head when every cycle was a tree, but in the
+engine the tree, behind after a few poor reduced-head drafts, came back
+after the 64 positions had passed and drafted from the reduced head again
+(Chinese, one round: 5 tree cycles against 77, 36.6 against 39.6 tok/s).
+Chinese and Japanese stay on the full head; English prose, code and tool
+calls take it for the first seven trees of a request and for eight after a
+rare token.
+
+Coverage of generated tokens (scored rows, added tokens counted as scored):
+
+| Text | Tokens | 65,536 | 81,920 | 98,304 | 131,072 | 163,840 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Agent runs: reasoning | 40,607 | 98.34% | 99.28% | 99.82% | 99.82% | 99.83% |
+| Agent runs: replies | 11,339 | 98.95% | 99.42% | 99.90% | 99.90% | 99.93% |
+| Agent runs: tool calls | 41,931 | 98.84% | 99.48% | 99.998% | 99.998% | 99.998% |
+| Eight prompts, greedy | 3,200 | 98.72% | 99.53% | 100% | 100% | 100% |
+| Chinese | 300 | 51.3% | 52.0% | 75.3% | 98.0% | 100% |
+| Japanese | 300 | 84.3% | 85.0% | 93.3% | 94.3% | 95.7% |
+| Spanish | 300 | 93.3% | 95.0% | 97.3% | 97.3% | 97.3% |
+| Russian | 300 | 95.0% | 99.0% | 100% | 100% | 100% |
+
+The agent runs are every distinct reasoning, reply and tool call of six
+`tools/agent_bench.py` runs (Codex and OpenCode against `serve`, sampled),
+rebuilt in the model's chat format with its added tokens and tokenized; the
+added tokens are 1.9% of them (576 `<|im_end|>`, 384 of each tool-call tag,
+230 `</think>`). Of their 86 tokens above 98,304, 57 are ` hered` (245083,
+the start of ` heredoc`); the ``` token (71093), which a 65,536 cut loses,
+is inside. The eight prompts (prose, explanation, arithmetic, code, essay,
+thinking, a Rust LRU cache, JSON) and the four languages are greedy answers
+of this engine, 400 and 300 tokens.
+
+Acceptance, measured without trace captures: the target prefills each
+answer with taps on, then the drafter, fed those taps one committed position
+at a time as decoding would, drafts the 8-row calibrated tree (the
+calibration fitted on this machine, fixed) at every position, and a tree
+accepts the longest path that follows the answer. Over the 13 English and
+agent texts (5,867 anchors, the agent texts 600-token stretches of the runs
+above), 8-row tree, tokens per cycle (geomean) and drafting-pass GPU time
+(median):
+
+| Head rows | Tokens per cycle | Against the full head | Drafting pass |
+| ---: | ---: | --- | ---: |
+| all 248,320 | 4.2605 | | 12.389 ms |
+| 131,072 + added | 4.2612 | ×1.0002 (95% CI 1.0000–1.0004) | 10.686 ms |
+| **98,304 + added** | 4.2612 | ×1.0002 (95% CI 1.0000–1.0004) | **10.268 ms** |
+| 98,304, no added tokens | 4.2300 | ×0.9928 (0.9907–0.9946) | 10.332 ms |
+| 81,920 + added | 4.2329 | ×0.9935 (0.9913–0.9957) | 10.136 ms |
+| 65,536 + added | 4.1801 | ×0.9811 (0.9777–0.9845) | 9.810 ms |
+
+At 98,304 the lattice differs from the full head's at 481 of 5,867 anchors
+(the 16th-place candidates) and the accepted length at 2, both longer.
+Walking the same texts as decoding does (each tree drafted at the position
+the previous one reached) gives the per-language picture, tokens per tree
+cycle:
+
+| Texts | Full head | 98,304 + added | Shipped | Shipped drafts on the full head |
+| --- | ---: | ---: | ---: | ---: |
+| Eight prompts | 4.092 | 4.092 | 4.092 | 56 of 796 |
+| Agent texts | 3.361 | 3.361 | 3.361 | 35 of 799 |
+| Chinese | 3.181 | 2.500 | 3.115 | 93 of 96 |
+| Japanese | 3.488 | 3.261 | 3.488 | 43 of 86 |
+| Spanish | 2.857 | 2.778 | 2.857 | 31 of 105 |
+| Russian | 2.609 | 2.609 | 2.609 | 7 of 115 |
+
+The shipped English drafts on the full head are each text's first seven.
+Through the engine (`bonsai --greedy --json`, 400 tokens, the twelve
+prompts, the same fitted calibration copied into a scratch `HOME` for every
+run, full head and shipped interleaved per prompt, two rounds, best tok/s;
+other agents shared the GPU), startup measured the drafting pass at 9.95 to
+11.59 ms against 11.99 to 13.61 ms for the full head:
+
+| Prompt | Full head | Shipped | Tree cycles, full / shipped | Tokens per tree cycle, full / shipped |
+| --- | ---: | ---: | --- | ---: |
+| prose | 34.3 | 35.6 | 152 / 102 | 3.03 / 3.19 |
+| explanation | 48.8 | 49.7 | 159 / 150 | 4.55 / 4.69 |
+| arithmetic | 45.1 | 45.4 | 6 / 5 | 2.33 / 2.20 |
+| code | 44.3 | 46.0 | 112 / 157 | 4.12 / 4.33 |
+| essay | 38.7 | 40.5 | 165 / 174 | 3.48 / 3.57 |
+| thinking | 47.7 | 49.1 | 158 / 156 | 4.44 / 4.45 |
+| rust | 38.3 | 39.1 | 107 / 143 | 3.60 / 3.57 |
+| json | 47.9 | 52.1 | 135 / 128 | 4.65 / 4.82 |
+| chinese | 38.9 | 38.6 | 152 / 125 | 3.53 / 3.35 |
+| spanish | 33.4 | 33.1 | 110 / 76 | 2.70 / 2.74 |
+| russian | 32.4 | 32.4 | 56 / 76 | 2.62 / 2.50 |
+| japanese | 39.1 | 38.5 | 106 / 92 | 3.76 / 3.67 |
+| geomean | 40.4 | **41.2** | 1,418 / 1,384 | 3.76 / 3.84 |
+
+The eight English prompts went from 42.8 to 44.3 tok/s and the four
+languages from 35.8 to 35.5. The engine's own source choice moves more than
+that from run to run (code ran 36 and 76 tree cycles in the full head's two
+rounds; Chinese 42 and 83 in the shipped ones, at 3.02 and 3.52 tokens per
+tree cycle), so the per-prompt rows are noise around the simulated
+acceptance above. 22 of the 24 pairs emitted the same text; the prose pair
+of one round and the Spanish pair of the other first differ at tokens 109
+and 300. The full head's own prose runs split at the same token 109 from
+round to round, so that is the cycle shape resolving a near-tie, which
+greedy speculation may (see [KFlash cycles](#kflash-cycles)), not the
+drafter's head.
 
 #### Interface
 
@@ -4586,6 +4714,25 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
 
+- Other cuts of the [reduced draft head](#reduced-draft-head) (October
+  2026), the 13 English and agent texts' 5,867 anchors, 8-row calibrated
+  tree, against the full head's 4.2605 tokens per cycle and 12.39 ms pass:
+  the first 65,536 ids, 0.46 ms cheaper than the shipped 98,304 but ×0.981
+  (95% CI 0.978–0.985), its texts losing ``` (71093), `."""`, ` Hmm` and
+  ` cryptography`, as Kapitsa measured on its 27B (4.52 against 4.78);
+  81,920 ids, 0.13 ms cheaper, ×0.994 (0.991–0.996); 131,072 ids, the same
+  acceptance as 98,304 for 0.42 ms more; 98,304 ids without the added tokens,
+  ×0.993 (0.991–0.995) at no measurable saving, since a draft can then never
+  close the thinking, a tool call or the turn. A fixed 163,840 cut would
+  have covered Chinese (100% of its tokens) but still lost 2.7% on Japanese
+  and 3.9% on Spanish for 0.96 ms more than 98,304; the fallback to the full
+  head covers every language at the 98,304 cost on English. A frequency-ranked
+  id list (Kapitsa's 65,536-row default) needs a gathered copy of the rows and
+  a corpus to rank by, and 98,304 rows in id order already draft like the
+  full head on English and code. Falling back to the full head for 64
+  positions after an anchor the reduced head lacks, rather than until eight
+  scored anchors, lost the fallback across head cycles (Chinese 36.6 against
+  39.6 tok/s).
 - Variants of the register prefill attention kernel `bo_attn_rows_q8`
   (October 2026, with [Neural Engine prefill FFN](#neural-engine-prefill-ffn)),
   kernel time per 512-row block against it at 8K and 32K prefixes: Q held in
