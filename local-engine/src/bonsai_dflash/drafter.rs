@@ -16,6 +16,7 @@ use local_metal::draft::DraftRows;
 use local_metal::sampling::{MAX_TOP_K, TopKCandidate, TopKRows};
 use local_metal::shaders::ShaderLibrary;
 
+use super::artifact::DflashPrecision;
 use super::weights::Weights;
 use super::{
     CONV_PROJECTION, EPSILON, FFN, HEAD_ROWS, KV_WIDTH, MASK_TOKEN, Q_WIDTH, RANK,
@@ -266,6 +267,12 @@ impl DflashDrafter {
         &self.weights.payload_sha256
     }
 
+    /// How the drafter's dense matrices are stored.
+    #[must_use]
+    pub const fn precision(&self) -> DflashPrecision {
+        self.weights.precision
+    }
+
     /// Mapped weight bytes.
     #[must_use]
     pub const fn weight_bytes(&self) -> u64 {
@@ -415,9 +422,7 @@ impl DflashDrafter {
             &s.taps,
             rows * TAPS * WIDTH,
         )?;
-        shared
-            .kernels
-            .int8_matmul(batch, w.fc.matrix()?, &s.taps, &s.context, tokens)?;
+        w.fc.matmul(shared.kernels, batch, &s.taps, &s.context, tokens)?;
         k.rms_rows(
             batch,
             &s.context,
@@ -434,16 +439,16 @@ impl DflashDrafter {
             .zip(self.key_ring.iter().zip(&self.value_ring))
         {
             batch.independent(|batch| -> crate::Result<()> {
-                shared.kernels.int8_matmul(
+                layer.k.matmul(
+                    shared.kernels,
                     batch,
-                    layer.k.matrix()?,
                     &s.context_normed,
                     &s.context_k,
                     tokens,
                 )?;
-                shared.kernels.int8_matmul(
+                layer.v.matmul(
+                    shared.kernels,
                     batch,
-                    layer.v.matrix()?,
                     &s.context_normed,
                     &s.context_v,
                     tokens,
@@ -536,13 +541,9 @@ impl DflashDrafter {
                 WIDTH,
                 EPSILON,
             )?;
-            kernels.int8_matmul(
-                batch,
-                layer.attention_kernels.matrix()?,
-                &s.h,
-                &s.kernels,
-                rows,
-            )?;
+            layer
+                .attention_kernels
+                .matmul(kernels, batch, &s.h, &s.kernels, rows)?;
             k.conv(
                 batch,
                 &s.h,
@@ -553,9 +554,9 @@ impl DflashDrafter {
                 DFLASH_BLOCK,
             )?;
             batch.independent(|batch| -> crate::Result<()> {
-                kernels.int8_matmul(batch, layer.q.matrix()?, &s.hc, &s.q, rows)?;
-                kernels.int8_matmul(batch, layer.k.matrix()?, &s.hc, &s.k, rows)?;
-                kernels.int8_matmul(batch, layer.v.matrix()?, &s.hc, &s.v, rows)?;
+                layer.q.matmul(kernels, batch, &s.hc, &s.q, rows)?;
+                layer.k.matmul(kernels, batch, &s.hc, &s.k, rows)?;
+                layer.v.matmul(kernels, batch, &s.hc, &s.v, rows)?;
                 Ok(())
             })?;
             k.qk_norm_rope(
@@ -582,7 +583,9 @@ impl DflashDrafter {
                 nctx,
                 RING_CAPACITY,
             )?;
-            kernels.int8_matmul(batch, layer.o.matrix()?, &s.attention, &s.branch, rows)?;
+            layer
+                .o
+                .matmul(kernels, batch, &s.attention, &s.branch, rows)?;
             k.conv(
                 batch,
                 &s.branch,
@@ -604,7 +607,9 @@ impl DflashDrafter {
                 WIDTH,
                 EPSILON,
             )?;
-            kernels.int8_matmul(batch, layer.mlp_kernels.matrix()?, &s.h, &s.kernels, rows)?;
+            layer
+                .mlp_kernels
+                .matmul(kernels, batch, &s.h, &s.kernels, rows)?;
             k.conv(
                 batch,
                 &s.h,
@@ -615,12 +620,14 @@ impl DflashDrafter {
                 DFLASH_BLOCK,
             )?;
             batch.independent(|batch| -> crate::Result<()> {
-                kernels.int8_matmul(batch, layer.gate.matrix()?, &s.hc, &s.gate, rows)?;
-                kernels.int8_matmul(batch, layer.up.matrix()?, &s.hc, &s.up, rows)?;
+                layer.gate.matmul(kernels, batch, &s.hc, &s.gate, rows)?;
+                layer.up.matmul(kernels, batch, &s.hc, &s.up, rows)?;
                 Ok(())
             })?;
             k.silu_mul(batch, &s.gate, &s.up, &s.product, DFLASH_BLOCK * FFN)?;
-            kernels.int8_matmul(batch, layer.down.matrix()?, &s.product, &s.branch, rows)?;
+            layer
+                .down
+                .matmul(kernels, batch, &s.product, &s.branch, rows)?;
             k.conv(
                 batch,
                 &s.branch,
@@ -648,7 +655,8 @@ impl DflashDrafter {
             EPSILON,
         )?;
         batch.independent(|batch| -> crate::Result<()> {
-            kernels.int8_matmul(batch, w.selector.matrix()?, &s.hidden, &s.selector, slots)?;
+            w.selector
+                .matmul(kernels, batch, &s.hidden, &s.selector, slots)?;
             kernels.transform(
                 batch,
                 shared.rotation,

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::bonsai::DEFAULT_BONSAI_GGUF;
-use crate::bonsai_dflash::{DFLASH_HEAD_ARTIFACT, DflashMode};
+use crate::bonsai_dflash::{DFLASH_HEAD_ARTIFACT, DFLASH_INT4_ARTIFACT, DflashMode};
 use crate::bonsai_mtp::{DEFAULT_MTP_DEPTH, MTP_HEAD_ARTIFACT, MtpMode, MtpSettings};
 
 const MODEL_RELATIVE: &str = "models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
@@ -88,7 +88,9 @@ impl Resources {
         };
         let (mtp, mtp_reason, dflash, dflash_reason) = if speculation {
             let head = required(MTP_DIRECTORY, MTP_HEAD_ARTIFACT, "MTP head")?;
-            let drafter = required(DFLASH_DIRECTORY, DFLASH_HEAD_ARTIFACT, "DFlash2 drafter")?;
+            // The 4-bit drafter when it is installed, the int8 one otherwise.
+            let drafter = required(DFLASH_DIRECTORY, DFLASH_INT4_ARTIFACT, "DFlash2 drafter")
+                .or_else(|_| required(DFLASH_DIRECTORY, DFLASH_HEAD_ARTIFACT, "DFlash2 drafter"))?;
             (
                 MtpMode::Head(MtpSettings::new(head.clone(), mtp_depth)?),
                 format!("ternary PTQ1 MTP head artifact {}", head.display()),

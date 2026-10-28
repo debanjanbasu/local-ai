@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use local_engine::DflashPrecision;
 use serde_json::json;
 
 use crate::GenerateParams;
@@ -19,8 +20,13 @@ use crate::resources::{PREFILL_CHUNK, Resources};
 #[derive(Debug, PartialEq, Eq)]
 enum ExportKind {
     Index,
-    MtpHead { dir: PathBuf },
-    DflashHead { dir: PathBuf },
+    MtpHead {
+        dir: PathBuf,
+    },
+    DflashHead {
+        dir: PathBuf,
+        precision: DflashPrecision,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,14 +38,21 @@ enum OutputMode {
 }
 
 /// The kinds `--export` accepts, for every message that has to name them.
-const EXPORT_KINDS: &str = "index, mtp-head=DIR, dflash-head=DIR";
+const EXPORT_KINDS: &str = "index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR";
 
 /// How an [`OutputMode::Export`] is spelled, for its error messages.
 const fn export_flag(kind: &ExportKind) -> &'static str {
     match kind {
         ExportKind::Index => "--export index",
         ExportKind::MtpHead { .. } => "--export mtp-head=DIR",
-        ExportKind::DflashHead { .. } => "--export dflash-head=DIR",
+        ExportKind::DflashHead {
+            precision: DflashPrecision::Int8,
+            ..
+        } => "--export dflash-head=DIR",
+        ExportKind::DflashHead {
+            precision: DflashPrecision::Int4,
+            ..
+        } => "--export dflash-head-int4=DIR",
     }
 }
 
@@ -60,10 +73,17 @@ fn parse_export(requested: &str) -> Result<ExportKind, String> {
         ("mtp-head", Some(dir)) => Ok(ExportKind::MtpHead {
             dir: PathBuf::from(dir),
         }),
-        ("dflash-head", None) => Err("--export dflash-head requires =DIR".into()),
-        ("dflash-head", Some("")) => Err("--export dflash-head requires a non-empty =DIR".into()),
+        ("dflash-head" | "dflash-head-int4", None) => Err(format!("--export {kind} requires =DIR")),
+        ("dflash-head" | "dflash-head-int4", Some("")) => {
+            Err(format!("--export {kind} requires a non-empty =DIR"))
+        }
         ("dflash-head", Some(dir)) => Ok(ExportKind::DflashHead {
             dir: PathBuf::from(dir),
+            precision: DflashPrecision::Int8,
+        }),
+        ("dflash-head-int4", Some(dir)) => Ok(ExportKind::DflashHead {
+            dir: PathBuf::from(dir),
+            precision: DflashPrecision::Int4,
         }),
         (kind, _) => Err(format!(
             "unknown --export kind: {kind} (expected {EXPORT_KINDS})"
@@ -105,6 +125,9 @@ fn usage() {
     eprintln!("                         DIR/model.safetensors and DIR/config.json");
     eprintln!("                         into DIR/dflash2-drafter-int8-v1.bin");
     eprintln!("                         (per-row int8; no engine, no checkpoint)");
+    eprintln!("                       dflash-head-int4=DIR");
+    eprintln!("                         the same into DIR/dflash2-drafter-int4-v1.bin");
+    eprintln!("                         (4-bit, a scale and bias per 64 columns)");
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
@@ -218,8 +241,11 @@ fn export(resources: &Resources, kind: &ExportKind) -> crate::Result<()> {
             // No engine and no checkpoint: this packs the head file alone.
             println!("{}", json!(local_engine::export_head(dir)?));
         }
-        ExportKind::DflashHead { dir } => {
-            println!("{}", json!(local_engine::export_dflash_head(dir)?));
+        ExportKind::DflashHead { dir, precision } => {
+            println!(
+                "{}",
+                json!(local_engine::export_dflash_head(dir, *precision)?)
+            );
         }
     }
     Ok(())
@@ -448,6 +474,14 @@ mod tests {
                 "--export dflash-head=/tmp/drafter",
                 ExportKind::DflashHead {
                     dir: PathBuf::from("/tmp/drafter"),
+                    precision: DflashPrecision::Int8,
+                },
+            ),
+            (
+                "--export dflash-head-int4=/tmp/drafter",
+                ExportKind::DflashHead {
+                    dir: PathBuf::from("/tmp/drafter"),
+                    precision: DflashPrecision::Int4,
                 },
             ),
         ] {
@@ -480,32 +514,36 @@ mod tests {
                 "--export dflash-head requires a non-empty =DIR",
             ),
             (
+                vec!["--export", "dflash-head-int4"],
+                "--export dflash-head-int4 requires =DIR",
+            ),
+            (
                 vec!["--export", "mtp-head-zstd=/tmp/head"],
-                "unknown --export kind: mtp-head-zstd (expected index, mtp-head=DIR, dflash-head=DIR)",
+                "unknown --export kind: mtp-head-zstd (expected index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR)",
             ),
             (
                 vec!["--export", "mtp-head-ternary=/tmp/head"],
-                "unknown --export kind: mtp-head-ternary (expected index, mtp-head=DIR, dflash-head=DIR)",
+                "unknown --export kind: mtp-head-ternary (expected index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR)",
             ),
             (
                 vec!["--export", "foo"],
-                "unknown --export kind: foo (expected index, mtp-head=DIR, dflash-head=DIR)",
+                "unknown --export kind: foo (expected index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR)",
             ),
             (
                 vec!["--export=foo"],
-                "unknown --export kind: foo (expected index, mtp-head=DIR, dflash-head=DIR)",
+                "unknown --export kind: foo (expected index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR)",
             ),
             (
                 vec!["--export="],
-                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR)",
+                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR)",
             ),
             (
                 vec!["--export"],
-                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR)",
+                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR)",
             ),
             (
                 vec!["--export", "--json"],
-                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR)",
+                "--export requires a kind (index, mtp-head=DIR, dflash-head=DIR, dflash-head-int4=DIR)",
             ),
         ] {
             let error = parse(&args(&input)).expect_err(&format!("{input:?}"));

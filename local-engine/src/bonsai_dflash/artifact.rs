@@ -4,14 +4,18 @@
 //! `local-ai bonsai --export dflash-head=DIR` reads `DIR/config.json` and
 //! `DIR/model.safetensors` (any `DFlash2DraftModel` with the pinned shapes,
 //! in BF16, F16 or F32: the published drafter or a fine-tuned one) and writes
-//! `DIR/dflash2-drafter-int8-v1.bin`: no GPU and no target checkpoint needed.
+//! `DIR/dflash2-drafter-int8-v1.bin`, and `--export dflash-head-int4=DIR`
+//! `DIR/dflash2-drafter-int4-v1.bin`: no GPU and no target checkpoint needed.
 //!
 //! Every dense matrix becomes per-row int8 (`row_scale = absmax / 127`,
-//! round to nearest), multiplied by the int8 kernels; norms and the
+//! round to nearest), multiplied by the int8 kernels, or 4-bit codes with an
+//! F16 scale and bias per [`INT4_GROUP`] columns of a row (`scale = (max -
+//! min) / 15`, `bias = min`), multiplied by the 4-bit kernels; norms and the
 //! convolutions' base kernels are F32; the selector's two codebooks, which
 //! are only gathered (16 rows per position), stay BF16. The file is the MTP
 //! head's container (named page-aligned sections and a payload digest every
-//! load re-derives) under its own magic.
+//! load re-derives) under its own magic; the matrices' section names say
+//! which precision a file holds.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -24,12 +28,39 @@ use super::{
     CONV_PROJECTION, FFN, HEAD_DIM, KV_WIDTH, LAYERS, MASK_TOKEN, Q_WIDTH, RANK, TAPS,
     TARGET_LAYER_IDS, VOCAB, WIDTH, invalid,
 };
-use crate::bonsai_mtp::{Container, PAGE, write_container};
+use crate::bonsai_mtp::{Container, PAGE, read_container_with, write_container};
 
 /// The distributable drafter, installed in `models/bonsai2-27b-dflash2/`.
 /// The format and version are in the name, so a future format is a
 /// different file rather than a misparse of this one.
 pub const DFLASH_HEAD_ARTIFACT: &str = "dflash2-drafter-int8-v1.bin";
+/// The same drafter with 4-bit matrices, installed beside it.
+pub const DFLASH_INT4_ARTIFACT: &str = "dflash2-drafter-int4-v1.bin";
+
+/// Columns per scale and bias of a 4-bit matrix.
+pub(super) const INT4_GROUP: usize = local_metal::bonsai::INT4_GROUP as usize;
+
+/// How the drafter's dense matrices are stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DflashPrecision {
+    /// Per-row int8 ([`DFLASH_HEAD_ARTIFACT`]).
+    Int8,
+    /// 4-bit codes with an F16 scale and bias per [`INT4_GROUP`] columns
+    /// ([`DFLASH_INT4_ARTIFACT`]).
+    Int4,
+}
+
+impl DflashPrecision {
+    /// The artifact file name of this precision.
+    #[must_use]
+    pub const fn artifact(self) -> &'static str {
+        match self {
+            Self::Int8 => DFLASH_HEAD_ARTIFACT,
+            Self::Int4 => DFLASH_INT4_ARTIFACT,
+        }
+    }
+}
 
 /// The source the exporter reads from its directory.
 const SOURCE_WEIGHTS: &str = "model.safetensors";
@@ -51,9 +82,12 @@ const SAFETENSORS_MAX_HEADER: u64 = 1 << 24;
 /// How one source tensor is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
-    /// `[rows, columns]` per-row int8: sections `<name>.int8` (row-major
-    /// int8 in [-127, 127]) and `<name>.row_scales` (F32 per row).
-    Int8 { rows: usize, columns: usize },
+    /// A `[rows, columns]` matrix the projection kernels multiply. Int8:
+    /// sections `<name>.int8` (row-major int8 in [-127, 127]) and
+    /// `<name>.row_scales` (F32 per row). 4-bit: `<name>.int4` (row-major
+    /// codes in [0, 15], column `2i` in the low nibble of byte `i`) and
+    /// `<name>.int4_g64` (F16 scale and bias per 64 columns, row-major).
+    Dense { rows: usize, columns: usize },
     /// `elements` F32 values: section `<name>.f32`.
     F32 { elements: usize },
     /// `[rows, columns]` BF16 bits: section `<name>.bf16`.
@@ -75,7 +109,7 @@ pub(super) const SUCCESSOR: &str = "candidate_selector.successor_codebook";
 pub(super) fn tensors() -> Vec<Tensor> {
     let int8 = |name: String, rows, columns| Tensor {
         name,
-        kind: Kind::Int8 { rows, columns },
+        kind: Kind::Dense { rows, columns },
         shape: vec![rows, columns],
     };
     let f32 = |name: String, shape: Vec<usize>| Tensor {
@@ -142,17 +176,32 @@ pub(super) fn tensors() -> Vec<Tensor> {
     all
 }
 
-/// The `(section name, bytes)` list every artifact must hold, in order.
-pub(super) fn spec() -> Vec<(String, usize)> {
+/// The 4-bit group section suffix.
+fn int4_groups() -> String {
+    format!("int4_g{INT4_GROUP}")
+}
+
+/// The `(section name, bytes)` list every artifact of `precision` must hold,
+/// in order.
+pub(super) fn spec(precision: DflashPrecision) -> Vec<(String, usize)> {
     let mut sections = Vec::new();
     for tensor in tensors() {
-        match tensor.kind {
-            Kind::Int8 { rows, columns } => {
+        match (tensor.kind, precision) {
+            (Kind::Dense { rows, columns }, DflashPrecision::Int8) => {
                 sections.push((format!("{}.int8", tensor.name), rows * columns));
                 sections.push((format!("{}.row_scales", tensor.name), rows * 4));
             }
-            Kind::F32 { elements } => sections.push((format!("{}.f32", tensor.name), elements * 4)),
-            Kind::Bf16 { rows, columns } => {
+            (Kind::Dense { rows, columns }, DflashPrecision::Int4) => {
+                sections.push((format!("{}.int4", tensor.name), rows * columns / 2));
+                sections.push((
+                    format!("{}.{}", tensor.name, int4_groups()),
+                    rows * columns / INT4_GROUP * 4,
+                ));
+            }
+            (Kind::F32 { elements }, _) => {
+                sections.push((format!("{}.f32", tensor.name), elements * 4));
+            }
+            (Kind::Bf16 { rows, columns }, _) => {
                 sections.push((format!("{}.bf16", tensor.name), rows * columns * 2));
             }
         }
@@ -160,11 +209,32 @@ pub(super) fn spec() -> Vec<(String, usize)> {
     sections
 }
 
+/// The precision a file's section names select, by its first matrix, and
+/// the spec it must then match.
+pub(super) fn bind(names: &[&str]) -> Result<(DflashPrecision, Vec<(String, usize)>), String> {
+    let precision = match names
+        .first()
+        .and_then(|name| name.strip_prefix("fc.weight."))
+    {
+        Some("int8") => DflashPrecision::Int8,
+        Some("int4") => DflashPrecision::Int4,
+        _ => {
+            return Err(format!(
+                "its first section is {:?}, neither an int8 nor a 4-bit fc.weight",
+                names.first().copied().unwrap_or_default()
+            ));
+        }
+    };
+    Ok((precision, spec(precision)))
+}
+
 /// What one exported drafter contains.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct DflashHeadArtifact {
     /// The artifact that was written.
     pub path: PathBuf,
+    /// How its dense matrices are stored.
+    pub precision: DflashPrecision,
     /// The safetensors it was converted from.
     pub source: PathBuf,
     /// Sections in artifact order; the header names every one of them.
@@ -351,22 +421,111 @@ fn quantize_int8(
     Ok((weights, scales))
 }
 
+/// Group-wise 4-bit of a `[rows, columns]` source matrix: per
+/// [`INT4_GROUP`] columns of a row, `scale = (max - min) / 15` and `bias =
+/// min`, both rounded to F16, then `code = round((x - bias) / scale)` against
+/// the rounded pair, clamped to [0, 15] (0 for a constant group). Rows run on
+/// every core.
+fn quantize_int4(
+    name: &str,
+    dtype: &str,
+    bytes: &[u8],
+    rows: usize,
+    columns: usize,
+) -> crate::Result<(Vec<u8>, Vec<u8>)> {
+    let element = bytes.len() / (rows * columns);
+    let groups = columns / INT4_GROUP;
+    let mut codes = vec![0_u8; rows * columns / 2];
+    let mut pairs = vec![0_u8; rows * groups * 4];
+    let threads = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
+    let per = rows.div_ceil(threads);
+    let finite = std::thread::scope(|scope| {
+        let workers: Vec<_> = codes
+            .chunks_mut(per * columns / 2)
+            .zip(pairs.chunks_mut(per * groups * 4))
+            .zip(bytes.chunks(per * columns * element))
+            .map(|((codes, pairs), bytes)| {
+                scope.spawn(move || {
+                    let mut row = vec![0.0_f32; columns];
+                    for ((codes, pairs), bytes) in codes
+                        .chunks_mut(columns / 2)
+                        .zip(pairs.chunks_mut(groups * 4))
+                        .zip(bytes.chunks(columns * element))
+                    {
+                        to_f32(dtype, bytes, &mut row);
+                        if row.iter().any(|value| !value.is_finite()) {
+                            return false;
+                        }
+                        for ((values, codes), pair) in row
+                            .chunks(INT4_GROUP)
+                            .zip(codes.chunks_mut(INT4_GROUP / 2))
+                            .zip(pairs.chunks_mut(4))
+                        {
+                            let (low, high) = values
+                                .iter()
+                                .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &v| {
+                                    (low.min(v), high.max(v))
+                                });
+                            let scale = half::f16::from_f32((high - low) / 15.0);
+                            let bias = half::f16::from_f32(low);
+                            let (step, base) = (scale.to_f32(), bias.to_f32());
+                            for (byte, two) in codes.iter_mut().zip(values.as_chunks::<2>().0) {
+                                let code = |value: f32| {
+                                    if step > 0.0 {
+                                        ((value - base) / step).round().clamp(0.0, 15.0) as u8
+                                    } else {
+                                        0
+                                    }
+                                };
+                                *byte = code(two[0]) | code(two[1]) << 4;
+                            }
+                            pair[..2].copy_from_slice(&scale.to_le_bytes());
+                            pair[2..].copy_from_slice(&bias.to_le_bytes());
+                        }
+                    }
+                    true
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .all(|worker| worker.join().unwrap_or(false))
+    });
+    if !finite {
+        return invalid(format!("DFlash2 tensor {name} holds non-finite values"));
+    }
+    Ok((codes, pairs))
+}
+
 /// Convert the `DFlash2` drafter at `<directory>/model.safetensors` (checked
-/// against `<directory>/config.json`) into `<directory>/dflash2-drafter-int8-v1.bin`.
+/// against `<directory>/config.json`) into `<directory>/` +
+/// [`DflashPrecision::artifact`].
 ///
 /// The checkpoint must hold exactly the drafter's 81 tensors (the selector
-/// codebooks with or without a `.weight` suffix) in BF16, F16 or F32. Install
-/// the result in `models/bonsai2-27b-dflash2/`.
+/// codebooks with or without a `.weight` suffix) in BF16, F16 or F32. A
+/// 4-bit export of a directory without a checkpoint converts the int8
+/// artifact there instead ([`DFLASH_HEAD_ARTIFACT`], validated as a load
+/// would), its matrices dequantized exactly first: the pinned 4-bit drafter
+/// is that conversion of the pinned int8 one. Install the result in
+/// `models/bonsai2-27b-dflash2/`.
 #[expect(clippy::too_many_lines)]
-pub fn export_dflash_head(directory: &Path) -> crate::Result<DflashHeadArtifact> {
+pub fn export_dflash_head(
+    directory: &Path,
+    precision: DflashPrecision,
+) -> crate::Result<DflashHeadArtifact> {
     #[derive(Deserialize)]
     struct Entry {
         dtype: String,
         shape: Vec<usize>,
         data_offsets: [usize; 2],
     }
-    check_config(&directory.join(SOURCE_CONFIG))?;
     let source = directory.join(SOURCE_WEIGHTS);
+    let int8 = directory.join(DFLASH_HEAD_ARTIFACT);
+    if precision == DflashPrecision::Int4 && !source.is_file() && int8.is_file() {
+        let sections = requantize_int8(&int8)?;
+        return write_artifact(directory, precision, int8, &sections);
+    }
+    check_config(&directory.join(SOURCE_CONFIG))?;
     let file = File::open(&source)?;
     // SAFETY: read-only mapping of an input file this process never writes.
     #[expect(unsafe_code)]
@@ -391,7 +550,7 @@ pub fn export_dflash_head(directory: &Path) -> crate::Result<DflashHeadArtifact>
             entries.len()
         ));
     }
-    let mut sections = Vec::with_capacity(spec().len());
+    let mut sections = Vec::with_capacity(spec(precision).len());
     for tensor in &expected {
         let value = entries
             .remove(&tensor.name)
@@ -426,9 +585,15 @@ pub fn export_dflash_head(directory: &Path) -> crate::Result<DflashHeadArtifact>
         }
         let bytes = &data[start..end];
         match tensor.kind {
-            Kind::Int8 { rows, columns } => {
-                let (weights, scales) =
-                    quantize_int8(&tensor.name, &entry.dtype, bytes, rows, columns)?;
+            Kind::Dense { rows, columns } => {
+                let (weights, scales) = match precision {
+                    DflashPrecision::Int8 => {
+                        quantize_int8(&tensor.name, &entry.dtype, bytes, rows, columns)?
+                    }
+                    DflashPrecision::Int4 => {
+                        quantize_int4(&tensor.name, &entry.dtype, bytes, rows, columns)?
+                    }
+                };
                 sections.push(weights);
                 sections.push(scales);
             }
@@ -463,12 +628,62 @@ pub fn export_dflash_head(directory: &Path) -> crate::Result<DflashHeadArtifact>
             }
         }
     }
+    write_artifact(directory, precision, source, &sections)
+}
+
+/// The sections of a 4-bit drafter converted from the int8 artifact at
+/// `path`: each matrix dequantized (`int8 · row_scale` in F32, exact) and
+/// quantized to 4 bits, the F32 and BF16 sections copied.
+fn requantize_int8(path: &Path) -> crate::Result<Vec<Vec<u8>>> {
+    let head = read_container_with(path, &DFLASH_CONTAINER, &|names| match bind(names)? {
+        (DflashPrecision::Int8, spec) => Ok(spec),
+        (DflashPrecision::Int4, _) => Err("it is already a 4-bit drafter".into()),
+    })
+    .map_err(|reason| {
+        crate::Error::InvalidFormat(format!("DFlash2 int8 drafter is unusable: {reason}"))
+    })?;
+    let section = |index: usize| {
+        let (offset, length) = head.sections[index];
+        &head.map[offset..offset + length]
+    };
+    let mut sections = Vec::with_capacity(head.sections.len());
+    let mut at = 0;
+    for tensor in tensors() {
+        if let Kind::Dense { rows, columns } = tensor.kind {
+            let scales = section(at + 1);
+            let mut values = Vec::with_capacity(rows * columns * 4);
+            for (row, scale) in section(at).chunks(columns).zip(scales.as_chunks::<4>().0) {
+                let scale = f32::from_le_bytes(*scale);
+                for &code in row {
+                    values
+                        .extend_from_slice(&(f32::from(code.cast_signed()) * scale).to_le_bytes());
+                }
+            }
+            let (codes, pairs) = quantize_int4(&tensor.name, "F32", &values, rows, columns)?;
+            sections.push(codes);
+            sections.push(pairs);
+            at += 2;
+        } else {
+            sections.push(section(at).to_vec());
+            at += 1;
+        }
+    }
+    Ok(sections)
+}
+
+/// Write `sections` as the `precision` artifact in `directory`.
+fn write_artifact(
+    directory: &Path,
+    precision: DflashPrecision,
+    source: PathBuf,
+    sections: &[Vec<u8>],
+) -> crate::Result<DflashHeadArtifact> {
     let count = sections.len();
     let written = write_container(
-        &directory.join(DFLASH_HEAD_ARTIFACT),
+        &directory.join(precision.artifact()),
         &DFLASH_CONTAINER,
-        &spec(),
-        &sections,
+        &spec(precision),
+        sections,
     )?;
     let widen = |bytes: usize| {
         u64::try_from(bytes)
@@ -476,6 +691,7 @@ pub fn export_dflash_head(directory: &Path) -> crate::Result<DflashHeadArtifact>
     };
     Ok(DflashHeadArtifact {
         path: written.path,
+        precision,
         source,
         sections: count,
         payload_bytes: widen(written.payload_bytes)?,

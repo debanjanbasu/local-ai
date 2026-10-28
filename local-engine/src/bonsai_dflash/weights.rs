@@ -5,31 +5,49 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use local_metal::bonsai::Int8Matrix;
+use local_metal::batch::CommandBatch;
+use local_metal::bonsai::{BonsaiKernels, Int4Matrix, Int8Matrix};
 use local_metal::buffer::MetalBuffer;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
 
-use super::artifact::{DFLASH_CONTAINER, Kind, PREDECESSOR, SUCCESSOR, spec, tensors};
+use super::artifact::{
+    DFLASH_CONTAINER, DflashPrecision, Kind, PREDECESSOR, SUCCESSOR, bind, tensors,
+};
 use super::{LAYERS, invalid};
 use crate::bonsai_mtp::{align_page, read_container_with};
 
-/// One per-row int8 matrix.
-pub(super) struct Int8 {
-    weights: MetalBuffer,
+/// One dense matrix: per-row int8 (codes and F32 row scales) or 4-bit
+/// (codes and F16 scale and bias pairs per 64 columns).
+pub(super) struct Dense {
+    precision: DflashPrecision,
+    codes: MetalBuffer,
     scales: MetalBuffer,
     rows: u32,
     columns: u32,
 }
 
-impl Int8 {
-    pub(super) fn matrix(&self) -> crate::Result<Int8Matrix<'_>> {
-        Ok(Int8Matrix::new(
-            &self.weights,
-            &self.scales,
-            self.rows,
-            self.columns,
-        )?)
+impl Dense {
+    /// Project `tokens` contiguous F32 rows of `input` into `output`.
+    pub(super) fn matmul(
+        &self,
+        kernels: &BonsaiKernels,
+        batch: &mut CommandBatch,
+        input: &MetalBuffer,
+        output: &MetalBuffer,
+        tokens: u32,
+    ) -> crate::Result<()> {
+        match self.precision {
+            DflashPrecision::Int8 => {
+                let matrix = Int8Matrix::new(&self.codes, &self.scales, self.rows, self.columns)?;
+                kernels.int8_matmul(batch, matrix, input, output, tokens)?;
+            }
+            DflashPrecision::Int4 => {
+                let matrix = Int4Matrix::new(&self.codes, &self.scales, self.rows, self.columns)?;
+                kernels.int4_matmul(batch, matrix, input, output, tokens)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -41,26 +59,28 @@ pub(super) struct Layer {
     /// `[2, 2, 5120]` F32 base kernels of the two convolutions.
     pub(super) attention_base: MetalBuffer,
     pub(super) mlp_base: MetalBuffer,
-    pub(super) attention_kernels: Int8,
-    pub(super) q: Int8,
-    pub(super) k: Int8,
-    pub(super) v: Int8,
-    pub(super) o: Int8,
-    pub(super) mlp_kernels: Int8,
-    pub(super) gate: Int8,
-    pub(super) up: Int8,
-    pub(super) down: Int8,
+    pub(super) attention_kernels: Dense,
+    pub(super) q: Dense,
+    pub(super) k: Dense,
+    pub(super) v: Dense,
+    pub(super) o: Dense,
+    pub(super) mlp_kernels: Dense,
+    pub(super) gate: Dense,
+    pub(super) up: Dense,
+    pub(super) down: Dense,
 }
 
 pub(super) struct Weights {
-    pub(super) fc: Int8,
+    pub(super) fc: Dense,
     pub(super) hidden_norm: MetalBuffer,
     pub(super) norm: MetalBuffer,
-    pub(super) selector: Int8,
+    pub(super) selector: Dense,
     /// `[vocab, 256]` BF16 codebooks.
     pub(super) predecessor: MetalBuffer,
     pub(super) successor: MetalBuffer,
     pub(super) layers: Vec<Layer>,
+    /// How the dense matrices are stored, as the file's section names say.
+    pub(super) precision: DflashPrecision,
     /// Payload bytes, which stay mapped (and resident once drafting runs).
     pub(super) bytes: u64,
     /// Every buffer above, for the drafter's residency set.
@@ -74,8 +94,9 @@ impl Weights {
     /// failure is a hard error naming the file.
     #[expect(clippy::too_many_lines)]
     pub(super) fn load(device: &ProtocolObject<dyn MTLDevice>, path: &Path) -> crate::Result<Self> {
-        let expected = spec();
-        let head = read_container_with(path, &DFLASH_CONTAINER, &|_| Ok(expected.clone()))
+        let head = read_container_with(path, &DFLASH_CONTAINER, &|names| {
+            bind(names).map(|(_, spec)| spec)
+        })
             .map_err(|reason| {
                 crate::Error::InvalidFormat(format!(
                     "DFlash2 drafter artifact {} is unusable: {reason}; re-export it with \
@@ -84,6 +105,14 @@ impl Weights {
                     path.display()
                 ))
             })?;
+        let (precision, _) = bind(
+            &head
+                .spec
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(crate::Error::InvalidFormat)?;
         let mut mapped = Vec::new();
         let mut buffer = |index: usize| -> crate::Result<MetalBuffer> {
             let (offset, length) = head.sections[index];
@@ -105,11 +134,12 @@ impl Weights {
         let mut at = 0;
         for tensor in tensors() {
             match tensor.kind {
-                Kind::Int8 { rows, columns } => {
+                Kind::Dense { rows, columns } => {
                     matrices.insert(
                         tensor.name,
-                        Int8 {
-                            weights: buffer(at)?,
+                        Dense {
+                            precision,
+                            codes: buffer(at)?,
                             scales: buffer(at + 1)?,
                             rows: rows as u32,
                             columns: columns as u32,
@@ -181,7 +211,8 @@ impl Weights {
             predecessor: codebooks.0,
             successor: codebooks.1,
             layers,
-            bytes: expected.iter().map(|(_, bytes)| *bytes as u64).sum(),
+            precision,
+            bytes: head.spec.iter().map(|(_, bytes)| *bytes as u64).sum(),
             mapped,
             payload_sha256: head.payload_sha256,
         })

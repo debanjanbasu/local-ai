@@ -221,7 +221,20 @@ payload_bytes  = 2053443584
 payload_sha256 = 1b5dc3551406e677ec9f4321f8f5c20f7310eaae0cede95792ceaa2375dfc02a
 source         = ProCreations/Ternary-Bonsai-2-27B-DFlash2 @ 4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b
                  model.safetensors, 3848817896 bytes BF16, SHA256 708e141bf4a33b09620c4f86263f1c7edcec7882f5dd39448e83e0c0defdc230
+
+file           = models/bonsai2-27b-dflash2/dflash2-drafter-int4-v1.bin
+file_bytes     = 1266483200   (SHA256 0a041ec815ce648d04426ab1557f026d294153ca68fb54555ebb02fd6150f3af)
+payload_bytes  = 1266160640
+payload_sha256 = 0b875f62c3550cd6c57245f8837fb4268340748343a6ac8078ffbac9ce5a0c96
+source         = the int8 artifact above, its matrices dequantized exactly (int8 x row scale, F32;
+                 re-exporting that to int8 reproduces payload 1b5dc355...), then
+                 `bonsai --export dflash-head-int4=DIR`
 ```
+
+Discovery uses the 4-bit drafter when it is installed and the int8 one
+otherwise ([Drafter precision](#drafter-precision)); either loads through the
+same checks, and the policy reports which (`policy.kflash.precision`) and
+whether it is a pinned one.
 
 It replaced the first pin, `incoai/Qwen3.8-27B-DFlash2` at revision
 `015e795` (payload SHA256 `768b9f89…614a`, source SHA256 `67fc76d6…b65c`),
@@ -236,48 +249,154 @@ are the same for both.
 
 The artifact is the MTP head's container under its own magic (`DFLSH2`) and
 a 16 KiB header page: 128 named, page-aligned sections (every dense matrix as
-`<name>.int8` and `<name>.row_scales`, norms and convolution base kernels as
+`<name>.int8` and `<name>.row_scales`, or in the 4-bit file as `<name>.int4`,
+row-major codes two to a byte, and `<name>.int4_g64`, an F16 scale and bias
+per 64 columns of a row; norms and convolution base kernels as
 `<name>.f32`, the two selector codebooks as `<name>.bf16`) and the payload
-digest, which every load re-derives. `bonsai --export dflash-head=DIR`
-writes it from `DIR/model.safetensors` and `DIR/config.json` of any
-`DFlash2DraftModel` with this configuration (BF16, F16 or F32; the codebooks
-may carry a `.weight` suffix), so fine-tuned drafters convert the same way.
-Discovery looks for exactly this file; a missing or corrupt file is a hard
-error that stops startup.
+digest, which every load re-derives. The first section's name selects the
+precision. `bonsai --export dflash-head=DIR` writes the int8 file and
+`--export dflash-head-int4=DIR` the 4-bit one from `DIR/model.safetensors`
+and `DIR/config.json` of any `DFlash2DraftModel` with this configuration
+(BF16, F16 or F32; the codebooks may carry a `.weight` suffix), so fine-tuned
+drafters convert the same way. Discovery looks for exactly these two files;
+both missing, or the one it picks corrupt, is a hard error that stops
+startup.
 
 #### Drafter precision
 
-Per-row int8 (`row_scale = absmax / 127`) through the existing int8 kernels.
-Output is lossless at any drafter precision, since the target verifies every
-token, so the choice is tokens per second. Acceptance of the formats, each
+Two formats load, through their own kernels: per-row int8 (`row_scale =
+absmax / 127`, `bonsai_int8.metal`) and 4-bit with an F16 scale and bias per
+64 columns of a row (`scale = (max - min) / 15`, `bias = min`, codes 0 to 15
+rounded against the stored F16 pair, `bonsai_int4.metal`). Discovery uses
+the 4-bit drafter when it is installed and the int8 one otherwise. Output is
+lossless at any drafter precision, since the target verifies every token, so
+the choice is tokens per second. Acceptance of the formats, each
 regenerating every lattice of the seven trace prompts (3,047 anchors) and
 running `sim.py`'s leave-one-out calibrated 8-row tree, tokens per cycle,
-geomean:
+geomean (the first pin's weights):
 
 | Drafter weights | Tokens per cycle | Top-1 = fp32 | Top-16 overlap |
 | --- | ---: | ---: | ---: |
 | fp32 reference (`drafter_lib.py`) | 4.685 | | |
-| int8 per row, Metal (shipped) | 4.693 | 98.97% | 98.25% |
+| int8 per row, Metal | 4.693 | 98.97% | 98.25% |
 | 4-bit affine, groups of 64 (CPU) | 4.665 | 92.5% | 88.6% |
 | ternary, TWN per 128 columns (CPU) | 1.436 | 7.1% | 15.7% |
 
 Ternary without training destroys the drafter, so the `PTQ1_0` kernels are
-out. 4-bit costs 0.6% of the tokens per cycle and would halve the bytes.
-It was first set aside because the 8-row int8 kernel seemed limited by its
-F32 multiplies rather than its bytes (the five layers' int8 projections took
-8.2 ms at 8 rows against 6.7 ms at one row), so a 4-bit kernel built the same
-way could have saved at most 0.7 ms of a 12.6 ms pass. That premise was the
-kernel's layout, not the hardware: with one 8-row tile per threadgroup, eight
-SIMD groups and 16-byte loads (`bonsai_int8.metal`, October 2026) the 8-row
-projections take 6.76 ms, what one row takes (6.71 ms, about 250 GB/s), with
-the same F32 multiplies and conversions, and the drafting pass fell by about
-the 1.46 ms the kernel timings predict. The int8 pass is now at its bytes
-(1.66 GB), so 4-bit weights would halve that floor to about 3.3 ms; the 13.3
-billion multiply-adds would then bound it, about 4.3 ms at the 3.1 T per
-second the ternary wide kernel reaches with its decode (3.4 ms at the 3.9 T
-peak). That is up to 2.4 ms of an 11.3 ms pass, about 2.8% of an 87 ms tree
-cycle, against the 0.6% acceptance loss and a new kernel and artifact: a
-candidate, not adopted.
+out. 4-bit was first set aside because the int8 kernels seemed limited by
+their F32 multiplies, then, after the October 2026 int8 rework put the int8
+pass at its bytes (1.66 GB at about 250 GB/s, 6.76 ms of projections), kept
+as a candidate worth up to 2.4 ms of an 11.3 ms pass.
+
+The 4-bit kernels follow the int8 ones. One activation row (appending a
+single committed position) takes a vector kernel: a lane reads 32
+consecutive codes of each of four rows (one 16-byte load inside one group)
+and applies the group's scale to `Σ code · x` and its bias to `Σ x`. Two to
+eight rows (drafting, the selector's seven, appending a tree's accepted
+positions, and 64-row prompt chunks in eight-row pieces) take the int8 wide
+layout, F32 8x8 simdgroup matrices with eight SIMD groups splitting the
+columns, each weight built as `scale · code + bias` in registers from an
+8-byte load; matrices of 4,096 rows or more put two 8-row tiles in a
+threadgroup, which share every activation load. Kernel time on the M4 Pro
+(`int4_and_int8_projection_throughput`, eight copies cycled so the system
+cache cannot serve them), microseconds:
+
+| Shape | int8, 1 row | 4-bit, 1 row | int8, 8 rows | 4-bit, 8 rows | int8, 64 rows | 4-bit, 64 rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 17408x5120 (gate, up) | 359 | 237 | 353 | 267 | 2,846 | 2,141 |
+| 5120x17408 (down) | 355 | 284 | 363 | 270 | 2,931 | 2,171 |
+| 5120x25600 (`fc`) | 524 | 432 | 535 | 395 | 4,320 | 3,164 |
+| 4096x5120 (q) | 99 | 64 | 89 | 69 | 666 | 551 |
+| 5120x4096 (o) | 126 | 62 | 86 | 66 | 656 | 539 |
+| 1024x5120 (k, v) | 26 | 18 | 28 | 25 | 204 | 177 |
+| 256x5120 (selector) | 8.5 | 8.4 | 9.3 | 9.0 | 70 | 68 |
+
+At eight rows the 4-bit kernel is limited by its multiplies, not its bytes
+(about 188 GB/s of 4-bit weights): with the activation loads and the
+dequantizing FMA removed, 17408x5120 still takes 244 us, so the F32
+simdgroup multiply-accumulates bound it near 2.9 T per second, short of the
+3.3 ms the 4-bit bytes alone would allow for the pass's projections. The
+vector kernel reaches 211 GB/s on 17408x5120 but only 171-176 GB/s on the
+long rows of `fc` and `down`. Rejected kernel variants are in
+[Tried and rejected](#tried-and-rejected).
+
+The 4-bit file is converted from the int8 one, not from the BF16
+checkpoint, which this machine could not download (a proxy refused Hugging
+Face): the int8 matrices dequantized exactly (re-exporting them to int8
+reproduces the pinned payload digest), then quantized to 4 bits, which is
+what `--export dflash-head-int4` does from a directory holding only the int8
+artifact. Over all dense matrices the 4-bit error against those int8
+weights is 9.0% of their RMS, and the int8 rounding (row step / √12, an
+estimate of its error against BF16) 1.0%, 11% of the 4-bit error: as
+independent errors, the double rounding adds about 0.6% to the 4-bit error
+a conversion from BF16 would have.
+
+Acceptance through the engine's kernels, without trace captures
+(`drafter_acceptance_on_greedy_answers`): the target answers eight prompts
+greedily, 300 tokens each (Python LRU cache, Rust date parser, a short
+story, a hash-map explanation, arithmetic reasoning with thinking, JSON,
+Chinese, an agent plan), with taps on; each drafter, fed those taps as
+decoding would and with the same fitted calibration, drafts the 8-row tree
+at every answer position (2,392 anchors) and walking the answer as decoding
+does (each tree where the last one's accepted path ended). A tree accepts
+the longest path that follows the answer, as a greedy verify does. Tokens per
+tree cycle, geomean over the prompts, and the median drafting pass over every
+anchor (both drafters in one run):
+
+| Drafter weights | Every anchor | Walking | Drafting pass | Payload |
+| --- | ---: | ---: | ---: | ---: |
+| int8 per row | 4.386 | 4.152 | 8.76 ms | 2,053 MB |
+| 4-bit, groups of 32 | 4.375 | 4.118 | | 1,378 MB |
+| **4-bit, groups of 64 (shipped)** | 4.363 | 4.128 | 7.12 ms | 1,266 MB |
+| 4-bit, groups of 128 | 4.355 | 4.130 | | 1,210 MB |
+
+| Prompt | int8, every anchor | 4-bit, every anchor | int8, walking | 4-bit, walking |
+| --- | ---: | ---: | ---: | ---: |
+| code | 5.796 | 5.766 | 5.642 | 5.537 |
+| rust | 5.485 | 5.448 | 5.246 | 5.246 |
+| prose | 2.732 | 2.739 | 2.623 | 2.556 |
+| explanation | 4.455 | 4.435 | 4.153 | 4.211 |
+| reasoning | 6.281 | 6.254 | 6.102 | 5.980 |
+| json | 6.615 | 6.595 | 6.362 | 6.362 |
+| chinese | 2.334 | 2.311 | 2.076 | 2.062 |
+| agent | 3.645 | 3.609 | 3.398 | 3.437 |
+
+The 4-bit drafter drafts 0.5% fewer tokens per anchor (0.6% walking, where
+a single anchor moves a text's count by a cycle), close to the CPU
+simulation's 0.6%, for a pass 1.64 ms (19%) shorter. Groups of 32 and 128
+measured their passes in runs of their own, within 0.06 ms of groups of 64
+there (the eight-row kernels are bound by multiplies, not bytes); groups of
+32 recover 0.25% of acceptance for 112 MB more, groups of 128 lose 0.2% for
+56 MB less, both within the spread of single prompts. Startup measures the
+pass (`policy.kflash.draft_ms`, the 0.83 ms one-row append included) at
+7.60-7.78 ms against 9.23-9.41 ms for int8 in the same session.
+
+Through the engine, `tools/benchmark.py --rounds 3 --max-tokens 300` (greedy,
+best tok/s, both builds interleaved, every pair emitting identical text), the
+build at `e2d664d` with the int8 drafter against this one with the 4-bit
+drafter installed, each with a fixed calibration copied into a scratch `HOME`
+before every prompt (int8: the fit persisted from its earlier runs; 4-bit:
+its fit after four warm-up requests), two runs with the builds in either
+order:
+
+| Prompt | int8 | 4-bit | Change | Second run, int8 | 4-bit | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| code | 39.19 | 40.03 | +2.1% | 37.92 | 37.97 | +0.1% |
+| prose | 35.18 | 35.25 | +0.2% | 35.87 | 35.69 | -0.5% |
+| reasoning | 58.50 | 59.40 | +1.5% | 58.40 | 59.38 | +1.7% |
+| chinese | 32.51 | 32.46 | -0.2% | 32.61 | 32.56 | -0.2% |
+| json | 56.89 | 57.73 | +1.5% | 57.22 | 57.81 | +1.0% |
+| explanation | 44.47 | 44.96 | +1.1% | 44.18 | 44.91 | +1.7% |
+| geomean | 43.35 | 43.80 | **+1.0%** | 43.25 | 43.53 | **+0.6%** |
+
+The prompts that run many trees (reasoning, JSON, explanation, code) gain
+1-2%, about the 1.64 ms of a roughly 80 ms tree cycle less the 0.5% of
+acceptance; prose and Chinese, which run few trees (Chinese drafts on the
+full head), are unchanged within their spread. The machine was shared and
+had other agents' work between runs, and the rates are below the quiet-machine
+figures elsewhere in this document; an earlier code pair with a one-tile
+4-bit kernel measured 38.89 against 39.71. The 787 MB less of resident
+drafter weights is the other gain.
 
 #### Drafting pass
 
@@ -311,7 +430,11 @@ k/v 36 to 26) saves about 0.23 ms a cycle, and the 64-row chunks of a prompt
 append about 1.6 ms each (`fc` 5,132 to 4,309 us, each k/v 258 to 181), about
 200 ms instead of 250 for 2,048 rows by the same timings; one committed
 position (the vector kernels) is unchanged. The figures above this paragraph
-predate it.
+predate it. The 4-bit drafter takes another 1.64 ms off the pass (8.76 to
+7.12 ms, median over 2,392 anchors in one run; see
+[Drafter precision](#drafter-precision)), and its kernels append a tree's
+accepted positions and 64-row prompt chunks in about three quarters of the
+int8 time (`fc` at eight rows 395 against 535 us).
 
 Parity against `drafter_lib.py` (fp32, itself within 6.5e-6 of z-lab's class)
 on the captured Bonsai hidden states, every anchor of the seven prompts:
@@ -485,7 +608,13 @@ path log p, plus `E(n)` for `n = 1..=8`. The first `n` rows are the best
 records (every node whose parent was accepted), refits `p = σ(α_d + β_d ·
 logit q)` every 16 cycles over the last 2,048 records per position, starting
 from `p = q`, and persists the fit to
-`~/Library/Caches/local-ai/dflash/<model>-<drafter>-<chip>.json`.
+`~/Library/Caches/local-ai/dflash/<model>-<drafter>-<chip>.json`. A refit
+whose coefficients pass 64 in magnitude keeps the previous fit: outcomes
+one threshold on `logit q` separates have no maximum-likelihood fit, and
+Newton's method runs away towards a step. A sequence of six sampled warm-up
+requests with the 4-bit drafter ended with depth 1 persisted as `α =
+-6.76e6, β = -1.04e7` (accepted below `logit q` -0.65, rejected above), and
+its last two requests ran one and two tree cycles.
 `draft_gpu_time` reports the measured pass time.
 
 ## Commands
@@ -524,7 +653,8 @@ local-ai bonsai [options] <prompt>
   --json             return token IDs and measured timings
   --tokenize         emit prompt token IDs without loading weights
   --export KIND      write an artifact instead of generating; takes no other
-                     options. Kinds: index, mtp-head=DIR, dflash-head=DIR
+                     options. Kinds: index, mtp-head=DIR, dflash-head=DIR,
+                     dflash-head-int4=DIR
 ```
 
 There is no model flag, and no flag turns off or tunes any part of the
@@ -549,7 +679,8 @@ writes no file and therefore takes no directory; `mtp-head=DIR` needs only
 `DIR/mtp-head-ptq1-v1.bin` (overwriting whatever was there), and prints the
 artifact record as JSON. `dflash-head=DIR` needs `DIR/model.safetensors` and
 `DIR/config.json` of a DFlash2 drafter, likewise starts no engine and opens no
-GGUF, and writes `DIR/dflash2-drafter-int8-v1.bin`
+GGUF, and writes `DIR/dflash2-drafter-int8-v1.bin`; `dflash-head-int4=DIR`
+reads the same and writes `DIR/dflash2-drafter-int4-v1.bin`
 ([DFlash2 drafter](#dflash2-drafter)).
 
 ## Server API
@@ -2701,7 +2832,8 @@ verify beside the MTP head, loads the drafter, measures on this machine the
 verify cost of 1 to 8 rows (the faster of a warm-up pass and one timed pass of
 each size) and the drafting pass, and reports it all under `policy.kflash`
 (`resources.dflash_reason` names the drafter it loaded). The context fit counts
-the drafter's 2.05 GB of mapped weights, its 67 MB of context ring and
+the drafter's mapped weights (1.27 GB for the 4-bit drafter, 2.05 GB for the
+int8 one), its 67 MB of context ring and
 scratch, the 217 MB tap ring with its verify staging rows and the 105 MB tree
 verifier.
 
@@ -3478,8 +3610,9 @@ that end-of-request readback (673 MB) on its way to the disk writer; a
 request that already wrote a boundary skips it when no host tier keeps the
 snapshot (see Prompt cache).
 
-With the DFlash2 drafter installed, its 2.05 GB of int8 weights are mapped
-and file-backed like the head's (held resident by a residency set, see
+With the DFlash2 drafter installed, its weights (1.27 GB 4-bit, or 2.05 GB
+int8 where only that is installed; the figures below were measured with the
+int8 drafter) are mapped and file-backed like the head's (held resident by a residency set, see
 [KFlash cycles](#kflash-cycles)), and KFlash adds about 380 MB that stays
 resident: the drafter's context ring and scratch (67 MB), the tap ring
 (210 MB) and the tree verifier (105 MB). The context fit counts all of it
@@ -4851,6 +4984,24 @@ their own entry, not with current rates.
   No residency set at all, as before the drafter's: 708-744 ms. The
   keepalive every 800 ms with the weights' set measured 652-657 ms at every
   pause, as the shipped one-second period does.
+- Other [4-bit drafter](#drafter-precision) groupings and kernels (October
+  2026). Groups of 32 columns: 0.25% more tokens per anchor than groups of 64
+  (4.375 against 4.363, int8 4.386) for 112 MB more and the same pass; groups
+  of 128: 0.2% fewer (4.355) for 56 MB less; both within single prompts'
+  spread, so the middle one ships. Kernels at eight rows, against the shipped
+  264 / 269 / 395 / 67 us (17408x5120 / 5120x17408 / 5120x25600 /
+  4096x5120): one 8-row tile per threadgroup, 291 / 326 / 493 / 72 (each
+  threadgroup reloads the activations, which miss the cache on long rows);
+  four tiles, 306 / 338 / 444 / 90 (registers spill); multiplying the codes
+  themselves in a chain per 64-column group, scaled and biased once per
+  group (`scale · Σ code · x + bias · Σ x`, Kapitsa's form), with 4-byte code
+  loads per row and group, 267 / 267 / 393 / 70, no faster since the
+  multiply-accumulates, not the dequantizing FMA, bound it; half operands
+  converted in registers, 275 against 244 for the same kernel stripped of
+  its loads (half activations would also need the target's residual taps,
+  the `fc` input, to stay inside the F16 range). A two-row vector kernel
+  took 300 us at 17408x5120 and 17 at 256x5120, against 264 and 9 for the
+  wide kernel, so two rows go wide.
 - Other cuts of the [reduced draft head](#reduced-draft-head) (October
   2026), the 13 English and agent texts' 5,867 anchors, 8-row calibrated
   tree, against the full head's 4.2605 tokens per cycle and 12.39 ms pass:
