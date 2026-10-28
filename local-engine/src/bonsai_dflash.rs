@@ -17,10 +17,12 @@
 //!
 //! # Contract for the integrator
 //!
-//! 1. **Load.** [`DflashMode::resolve`] finds the pinned artifact
-//!    ([`DEFAULT_BONSAI_DFLASH_ARTIFACT`], an exact file beside the target's
-//!    model directory, written by `local-ai bonsai --export dflash-head=DIR`).
-//!    Absent, it is an error: the drafter is required. Present,
+//! 1. **Load.** [`DflashMode::resolve`] finds the installed artifact: the
+//!    4-bit drafter ([`DEFAULT_BONSAI_DFLASH_INT4_ARTIFACT`]) when it is
+//!    there, the int8 one ([`DEFAULT_BONSAI_DFLASH_ARTIFACT`]) otherwise,
+//!    exact files beside the target's model directory, written by `local-ai
+//!    bonsai --export dflash-head-int4=DIR` and `--export dflash-head=DIR`.
+//!    Both absent, it is an error: the drafter is required. Present,
 //!    [`DflashDrafter::load`] re-derives the payload digest and fails hard on
 //!    any corruption: there is no silent fallback for a broken install. Only
 //!    an explicit [`DflashMode::Off`] (a plain-decoding reference) resolves
@@ -74,7 +76,10 @@ mod tests;
 mod tree;
 mod weights;
 
-pub use self::artifact::{DFLASH_HEAD_ARTIFACT, DflashHeadArtifact, export_dflash_head};
+pub use self::artifact::{
+    DFLASH_HEAD_ARTIFACT, DFLASH_INT4_ARTIFACT, DflashHeadArtifact, DflashPrecision,
+    export_dflash_head,
+};
 pub use self::calibration::{
     CALIBRATION_RECORDS, Calibrator, REFIT_CYCLES, calibration_cache_path, fit_depth,
 };
@@ -82,7 +87,8 @@ pub use self::drafter::{
     DflashDrafter, DflashShared, DraftAnchor, MAX_ROLLBACK, RING_CAPACITY, TapFormat,
 };
 pub use self::policy::{
-    DEFAULT_BONSAI_DFLASH_ARTIFACT, DflashMode, DflashResolution, PINNED_DFLASH_SHA256,
+    DEFAULT_BONSAI_DFLASH_ARTIFACT, DEFAULT_BONSAI_DFLASH_INT4_ARTIFACT, DflashMode,
+    DflashResolution, PINNED_DFLASH_INT4_SHA256, PINNED_DFLASH_SHA256, installed,
 };
 pub use self::tree::{TreeNode, build_tree_reference, tested_nodes};
 pub use local_metal::dflash::{

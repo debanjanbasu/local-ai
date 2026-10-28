@@ -58,12 +58,15 @@ runtime's capture shards and frozen tables and to match its draft chain layout.
 
 ## Bonsai DFlash2 drafter weights
 
-The KFlash drafter artifact (`models/bonsai2-27b-dflash2/`, not
-included; converted by `local-ai bonsai --export dflash-head=DIR`) is derived
+The KFlash drafter artifacts (`models/bonsai2-27b-dflash2/`, not
+included; converted by `local-ai bonsai --export dflash-head=DIR` and
+`--export dflash-head-int4=DIR`) are derived
 from [ProCreations/Ternary-Bonsai-2-27B-DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2/tree/4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b),
 revision `4cfb6ad03268fed0f60ca96c1a659c0b1c77e50b`, licensed under the Apache
 License, Version 2.0 (<https://www.apache.org/licenses/LICENSE-2.0>). The
-conversion quantizes its dense matrices per row to int8. Its NOTICE reads:
+conversion quantizes its dense matrices per row to int8, and the 4-bit
+artifact quantizes those int8 matrices to 4 bits with an F16 scale and bias
+per 64 columns. Its NOTICE reads:
 
 ```text
 Independent Bonsai DFlash2 adaptation by ProCreations, September 2026. Derived

@@ -6,7 +6,7 @@ use local_metal::context::MetalContext;
 use local_metal::dflash::DflashKernels;
 use local_metal::shaders::ShaderLibrary;
 
-use super::artifact::spec;
+use super::artifact::{bind, spec};
 use super::calibration::fit_depth;
 use super::tree::calibrated;
 use super::*;
@@ -400,11 +400,39 @@ fn policy_requires_the_artifact() {
         Path::new(DEFAULT_BONSAI_DFLASH_ARTIFACT).file_name(),
         Some(std::ffi::OsStr::new(DFLASH_HEAD_ARTIFACT))
     );
+    assert_eq!(
+        Path::new(DEFAULT_BONSAI_DFLASH_INT4_ARTIFACT).file_name(),
+        Some(std::ffi::OsStr::new(DFLASH_INT4_ARTIFACT))
+    );
+    // `Auto` prefers the 4-bit drafter when it is installed.
+    let expected = if Path::new(DEFAULT_BONSAI_DFLASH_INT4_ARTIFACT).is_file() {
+        DEFAULT_BONSAI_DFLASH_INT4_ARTIFACT
+    } else {
+        DEFAULT_BONSAI_DFLASH_ARTIFACT
+    };
+    assert_eq!(installed(), Path::new(expected));
 }
 
 #[test]
 fn artifact_spec_names_every_tensor_once() {
-    let sections = spec();
+    for (precision, payload) in [
+        (DflashPrecision::Int8, 2_053_443_584),
+        (DflashPrecision::Int4, 1_266_160_640),
+    ] {
+        artifact_spec_names_every_tensor_once_at(precision, payload);
+    }
+    // The section names select the spec; anything else is refused.
+    for precision in [DflashPrecision::Int8, DflashPrecision::Int4] {
+        let spec = spec(precision);
+        let names: Vec<&str> = spec.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(bind(&names), Ok((precision, spec.clone())));
+    }
+    assert!(bind(&["fc.weight.ptq1"]).is_err());
+    assert!(bind(&[]).is_err());
+}
+
+fn artifact_spec_names_every_tensor_once_at(precision: DflashPrecision, expected: usize) {
+    let sections = spec(precision);
     assert_eq!(sections.len(), 128);
     let mut names: Vec<_> = sections.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
@@ -425,7 +453,7 @@ fn artifact_spec_names_every_tensor_once() {
         + 16 * sections.len();
     assert!(header <= crate::bonsai_mtp::PAGE, "{header}");
     let payload: usize = sections.iter().map(|(_, bytes)| bytes).sum();
-    assert_eq!(payload, 2_053_443_584);
+    assert_eq!(payload, expected);
 }
 
 /// `None` when this machine has no Metal device.
@@ -621,7 +649,6 @@ fn head_merge_ranks_as_the_top_k_kernels() {
 /// reset and after an anchor the reduced head lacks.
 #[test]
 #[ignore = "requires the Bonsai GGUF, the installed drafter and a Metal device"]
-#[expect(clippy::too_many_lines)]
 fn draft_head_scores_the_full_heads_best_tokens() {
     use local_metal::bonsai::BonsaiKernels;
 
@@ -642,12 +669,7 @@ fn draft_head_scores_the_full_heads_best_tokens() {
         output: output.ptq1_matrix().expect("output matrix"),
         rotation: &rotation,
     };
-    let mut drafter = DflashDrafter::load(
-        &context,
-        &shaders,
-        Path::new(DEFAULT_BONSAI_DFLASH_ARTIFACT),
-    )
-    .expect("drafter");
+    let mut drafter = DflashDrafter::load(&context, &shaders, &installed()).expect("drafter");
     let logits = MetalBuffer::empty(context.device(), DFLASH_SLOTS * VOCAB * 4).expect("logits");
     // After a reset: `def`, ` the`, `<think>`, `</think>`, `<tool_call>`, the
     // end of turn, `def` and ` the` (the eighth scored anchor switches to the
@@ -736,60 +758,71 @@ fn trace_dir() -> Option<PathBuf> {
     std::env::var_os("DFLASH_TRACE").map(PathBuf::from)
 }
 
-/// The installed artifact loads, and a copy with one flipped payload byte or
-/// a truncated copy is refused with the reason.
+/// The installed artifacts (the int8 drafter, and the 4-bit one when it is
+/// installed) load, and a copy with one flipped payload byte or a truncated
+/// copy is refused with the reason; so is a file of another kind.
 #[test]
 #[ignore = "requires the installed DFlash2 drafter and a Metal device"]
 fn installed_drafter_loads_and_corruption_is_refused() {
     let (context, shaders) = gpu().expect("Metal");
-    let installed = Path::new(DEFAULT_BONSAI_DFLASH_ARTIFACT);
-    let drafter = DflashDrafter::load(&context, &shaders, installed).expect("installed drafter");
-    eprintln!(
-        "loaded {} ({} weight bytes, sha256 {})",
-        drafter.path().display(),
-        drafter.weight_bytes(),
-        drafter.payload_sha256()
-    );
-    drop(drafter);
-    let directory = tempfile::tempdir_in(installed.parent().expect("models dir")).expect("temp");
-    let corrupt = directory.path().join(DFLASH_HEAD_ARTIFACT);
-    // An APFS clone: one modified page, not a 2 GB copy.
-    let status = std::process::Command::new("cp")
-        .arg("-c")
-        .arg(installed)
-        .arg(&corrupt)
-        .status()
-        .expect("cp");
-    assert!(status.success());
-    {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&corrupt)
-            .expect("open clone");
-        let at = 1 << 30;
-        let mut byte = [0_u8];
-        file.seek(SeekFrom::Start(at)).expect("seek");
-        file.read_exact(&mut byte).expect("read");
-        file.seek(SeekFrom::Start(at)).expect("seek");
-        file.write_all(&[byte[0] ^ 0x40]).expect("write");
+    let int8 = Path::new(DEFAULT_BONSAI_DFLASH_ARTIFACT);
+    let int4 = Path::new(DEFAULT_BONSAI_DFLASH_INT4_ARTIFACT);
+    for (installed, precision) in [(int8, DflashPrecision::Int8), (int4, DflashPrecision::Int4)] {
+        if precision == DflashPrecision::Int4 && !installed.is_file() {
+            eprintln!("no 4-bit drafter installed at {}", installed.display());
+            continue;
+        }
+        let drafter =
+            DflashDrafter::load(&context, &shaders, installed).expect("installed drafter");
+        assert_eq!(drafter.precision(), precision);
+        eprintln!(
+            "loaded {} ({} weight bytes, sha256 {})",
+            drafter.path().display(),
+            drafter.weight_bytes(),
+            drafter.payload_sha256()
+        );
+        drop(drafter);
+        let directory =
+            tempfile::tempdir_in(installed.parent().expect("models dir")).expect("temp");
+        let corrupt = directory.path().join(precision.artifact());
+        // An APFS clone: one modified page, not a copy of the file.
+        let status = std::process::Command::new("cp")
+            .arg("-c")
+            .arg(installed)
+            .arg(&corrupt)
+            .status()
+            .expect("cp");
+        assert!(status.success());
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&corrupt)
+                .expect("open clone");
+            let at = 1 << 30;
+            let mut byte = [0_u8];
+            file.seek(SeekFrom::Start(at)).expect("seek");
+            file.read_exact(&mut byte).expect("read");
+            file.seek(SeekFrom::Start(at)).expect("seek");
+            file.write_all(&[byte[0] ^ 0x40]).expect("write");
+        }
+        let error = DflashDrafter::load(&context, &shaders, &corrupt)
+            .err()
+            .expect("corrupt drafter refused")
+            .to_string();
+        assert!(error.contains("payload hashes to"), "{error}");
+        let truncated = directory.path().join("truncated.bin");
+        let bytes = std::fs::read(installed)
+            .map(|bytes| bytes[..1 << 20].to_vec())
+            .expect("read head");
+        std::fs::write(&truncated, bytes).expect("write truncated");
+        let error = DflashDrafter::load(&context, &shaders, &truncated)
+            .err()
+            .expect("truncated drafter refused")
+            .to_string();
+        assert!(error.contains("header records"), "{error}");
     }
-    let error = DflashDrafter::load(&context, &shaders, &corrupt)
-        .err()
-        .expect("corrupt drafter refused")
-        .to_string();
-    assert!(error.contains("payload hashes to"), "{error}");
-    let truncated = directory.path().join("truncated.bin");
-    let bytes = std::fs::read(installed.parent().expect("dir").join(DFLASH_HEAD_ARTIFACT))
-        .map(|bytes| bytes[..1 << 20].to_vec())
-        .expect("read head");
-    std::fs::write(&truncated, bytes).expect("write truncated");
-    let error = DflashDrafter::load(&context, &shaders, &truncated)
-        .err()
-        .expect("truncated drafter refused")
-        .to_string();
-    assert!(error.contains("header records"), "{error}");
     let foreign = DflashDrafter::load(
         &context,
         &shaders,
@@ -802,6 +835,28 @@ fn installed_drafter_loads_and_corruption_is_refused() {
         foreign.contains("is not a DFlash2 drafter artifact"),
         "{foreign}"
     );
+}
+
+/// The 4-bit export of a directory holding only the installed int8 drafter
+/// requantizes it into the pinned 4-bit drafter, byte for byte.
+#[test]
+#[ignore = "requires the installed DFlash2 drafter"]
+fn int4_export_of_the_int8_drafter_is_the_pinned_one() {
+    let installed = Path::new(DEFAULT_BONSAI_DFLASH_ARTIFACT);
+    let directory = tempfile::tempdir_in(installed.parent().expect("models dir")).expect("temp");
+    let status = std::process::Command::new("cp")
+        .arg("-c")
+        .arg(installed)
+        .arg(directory.path().join(DFLASH_HEAD_ARTIFACT))
+        .status()
+        .expect("cp");
+    assert!(status.success());
+    let exported = export_dflash_head(directory.path(), DflashPrecision::Int4).expect("export");
+    assert_eq!(exported.precision, DflashPrecision::Int4);
+    assert_eq!(exported.payload_bytes, 1_266_160_640);
+    assert_eq!(exported.payload_sha256, PINNED_DFLASH_INT4_SHA256);
+    // An int8 export needs the checkpoint.
+    assert!(export_dflash_head(directory.path(), DflashPrecision::Int8).is_err());
 }
 
 /// The parity and acceptance harness: on every captured trace prompt
@@ -846,12 +901,7 @@ fn drafter_lattices_on_captures() {
         output: output.ptq1_matrix().expect("output matrix"),
         rotation: &rotation,
     };
-    let mut drafter = DflashDrafter::load(
-        &context,
-        &shaders,
-        Path::new(DEFAULT_BONSAI_DFLASH_ARTIFACT),
-    )
-    .expect("drafter");
+    let mut drafter = DflashDrafter::load(&context, &shaders, &installed()).expect("drafter");
     let captures = [
         ("caps/000", "prose"),
         ("caps/001", "explanation"),
@@ -968,4 +1018,253 @@ fn drafter_lattices_on_captures() {
         median(&mut draft_times),
         median(&mut append_times)
     );
+}
+
+/// The acceptance harness without trace captures: the target answers each
+/// prompt greedily (`DFLASH_TOKENS`, default 300) with taps on, then every
+/// drafter in `DFLASH_DRAFTERS` (comma-separated artifact paths; default
+/// the installed one), fed those taps as decoding would, drafts the 8-row
+/// tree with one calibration (`DFLASH_CALIBRATION`, a persisted fit, or
+/// `p = q`). A tree accepts the longest path that follows the answer, as a
+/// greedy verify would. Reports, per prompt and drafter, tokens per tree
+/// cycle walking the answer as decoding does (each tree drafted where the
+/// last one reached) and over every anchor, and the median drafting pass.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the drafters and a Metal device"]
+#[expect(clippy::too_many_lines)]
+fn drafter_acceptance_on_greedy_answers() {
+    use crate::bonsai_native::{BonsaiModel, KvOptions, TAP_ROW_FLOATS};
+    use crate::bonsai_ngram::NgramSettings;
+    use crate::bonsai_tokenizer::BonsaiTokenizer;
+    use local_metal::bonsai::BonsaiKernels;
+
+    let drafters: Vec<PathBuf> = std::env::var("DFLASH_DRAFTERS").map_or_else(
+        |_| vec![installed()],
+        |list| list.split(',').map(PathBuf::from).collect(),
+    );
+    let max_tokens: usize = std::env::var("DFLASH_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    let calibration = std::env::var_os("DFLASH_CALIBRATION")
+        .map_or_else(DflashCalibration::default, |path| {
+            *Calibrator::persistent(PathBuf::from(path)).calibration()
+        });
+    let prompts = [
+        (
+            "code",
+            "Write a Python class implementing an LRU cache with get and put methods in O(1) \
+             time, with type hints, docstrings and a short usage example.",
+            false,
+        ),
+        (
+            "rust",
+            "Write a Rust function that parses an ISO 8601 date such as 2024-02-29 into year, \
+             month and day, with error handling and unit tests.",
+            false,
+        ),
+        (
+            "prose",
+            "Write a short story about a lighthouse keeper who finds a message in a bottle.",
+            false,
+        ),
+        (
+            "explanation",
+            "Explain how a hash map works, including collisions and resizing.",
+            false,
+        ),
+        (
+            "reasoning",
+            "A train leaves at 9:40 and travels 210 km at 84 km/h, then waits 25 minutes and \
+             travels another 96 km at 64 km/h. When does it arrive? Think it through.",
+            true,
+        ),
+        (
+            "json",
+            "Return a JSON array of five fictional employees with name, age, department, \
+             skills and a nested address object.",
+            false,
+        ),
+        ("chinese", "用中文介绍一下长城的历史和它的重要意义。", false),
+        (
+            "agent",
+            "You are a coding agent. Plan the steps to add a --verbose flag to a Rust CLI built \
+             with clap, then show the exact code changes as a unified diff.",
+            false,
+        ),
+    ];
+    let package = crate::bonsai::BonsaiPackage::open(crate::bonsai::DEFAULT_BONSAI_GGUF)
+        .expect("open Bonsai GGUF");
+    let tokenizer = BonsaiTokenizer::from_package(&package).expect("tokenizer");
+    let eos = tokenizer.eos_ids().to_vec();
+    let mut model = BonsaiModel::load(
+        package,
+        4096,
+        crate::bonsai_model::DEFAULT_PREFILL_CHUNK,
+        None,
+        None,
+        NgramSettings::default(),
+        KvOptions::default(),
+    )
+    .expect("load model");
+    model.set_taps(true).expect("taps on");
+    // (name, tokens, prompt length, host taps of every position)
+    let mut texts = Vec::new();
+    for (name, prompt, thinking) in prompts {
+        let ids = tokenizer
+            .encode(&BonsaiTokenizer::chat_prompt(prompt, thinking).expect("chat"))
+            .expect("encode");
+        model.reset();
+        model.prefill(&ids, &mut |_| {}).expect("prefill");
+        let mut tokens = ids.clone();
+        for _ in 0..max_tokens {
+            let logits = model.last_logits();
+            let next = (0..logits.len())
+                .max_by(|&a, &b| logits[a].total_cmp(&logits[b]).then(b.cmp(&a)))
+                .expect("logits") as u32;
+            tokens.push(next);
+            if eos.contains(&next) {
+                break;
+            }
+            model.decode(next).expect("decode");
+        }
+        // The last token was never decoded, so it has no taps; it is only
+        // drafted against.
+        let taps = model
+            .tap_rows(0, tokens.len() - 1)
+            .expect("taps of every position");
+        eprintln!(
+            "{name}: {} prompt, {} answer tokens",
+            ids.len(),
+            tokens.len() - ids.len()
+        );
+        texts.push((name, tokens, ids.len(), taps));
+    }
+    drop(model);
+    let package = crate::bonsai::BonsaiPackage::open(crate::bonsai::DEFAULT_BONSAI_GGUF)
+        .expect("open Bonsai GGUF");
+    let (context, shaders) = gpu().expect("Metal");
+    let kernels = BonsaiKernels::new(&context, &shaders).expect("kernels");
+    let embedding = package
+        .metal_tensor(context.device(), "token_embd.weight")
+        .expect("embedding");
+    let output = package
+        .metal_tensor(context.device(), "output.weight")
+        .expect("output");
+    let rotation = package.hadamard().upload(&context, 5120).expect("signs");
+    let shared = DflashShared {
+        kernels: &kernels,
+        embedding: embedding.ptq1_matrix().expect("embedding matrix"),
+        output: output.ptq1_matrix().expect("output matrix"),
+        rotation: &rotation,
+    };
+    let row_bytes = TAP_ROW_FLOATS * 4;
+    // The longest path of `tree` (anchored at `position`) that `tokens` follows.
+    let accepted = |tree: &DflashTree, tokens: &[u32], position: usize| -> usize {
+        let mut row = 0;
+        let mut depth = 0;
+        while let Some(child) = (1..tree.rows as usize).find(|&child| {
+            usize::try_from(tree.parent[child]) == Ok(row)
+                && tokens.get(position + depth + 1) == Some(&tree.token[child])
+        }) {
+            row = child;
+            depth += 1;
+        }
+        depth
+    };
+    for path in &drafters {
+        let mut drafter = DflashDrafter::load(&context, &shaders, path).expect("drafter");
+        drafter.set_calibration(&calibration);
+        let (mut walk_log, mut every_log) = (0.0_f64, 0.0_f64);
+        let mut times = Vec::new();
+        eprintln!("{} ({})", path.display(), drafter.payload_sha256());
+        for (name, tokens, prompt_len, taps) in &texts {
+            let taps = MetalBuffer::from_slice(context.device(), taps).expect("taps");
+            // Every anchor: draft at each position of the answer.
+            drafter.reset();
+            let mut batch = CommandBatch::new(&context).expect("batch");
+            drafter
+                .append_context(&mut batch, &shared, &taps, 0, *prompt_len, TapFormat::F32)
+                .expect("prompt context");
+            batch.commit_and_wait().expect("prompt context");
+            let (mut every, mut anchors) = (0, 0);
+            for position in *prompt_len..tokens.len() - 1 {
+                let elapsed = drafter
+                    .draft_and_wait(
+                        &context,
+                        &shared,
+                        &DraftAnchor::Token(tokens[position]),
+                        position,
+                        DFLASH_MAX_TREE_ROWS,
+                    )
+                    .expect("draft");
+                times.push(elapsed.as_secs_f64() * 1e3);
+                every += 1 + accepted(&drafter.read_tree(), tokens, position);
+                anchors += 1;
+                let mut batch = CommandBatch::new(&context).expect("batch");
+                drafter
+                    .append_context(
+                        &mut batch,
+                        &shared,
+                        &taps,
+                        position * row_bytes,
+                        1,
+                        TapFormat::F32,
+                    )
+                    .expect("append");
+                batch.commit_and_wait().expect("append");
+            }
+            // The walk: each tree drafted where the last one's accepted path ended.
+            drafter.reset();
+            let mut batch = CommandBatch::new(&context).expect("batch");
+            drafter
+                .append_context(&mut batch, &shared, &taps, 0, *prompt_len, TapFormat::F32)
+                .expect("prompt context");
+            batch.commit_and_wait().expect("prompt context");
+            let (mut position, mut cycles) = (*prompt_len, 0);
+            while position < tokens.len() - 1 {
+                drafter
+                    .draft_and_wait(
+                        &context,
+                        &shared,
+                        &DraftAnchor::Token(tokens[position]),
+                        position,
+                        DFLASH_MAX_TREE_ROWS,
+                    )
+                    .expect("draft");
+                let step = (1 + accepted(&drafter.read_tree(), tokens, position))
+                    .min(tokens.len() - 1 - position);
+                cycles += 1;
+                let mut batch = CommandBatch::new(&context).expect("batch");
+                drafter
+                    .append_context(
+                        &mut batch,
+                        &shared,
+                        &taps,
+                        position * row_bytes,
+                        step,
+                        TapFormat::F32,
+                    )
+                    .expect("append");
+                batch.commit_and_wait().expect("append");
+                position += step;
+            }
+            let walk = (tokens.len() - 1 - prompt_len) as f64 / f64::from(cycles);
+            let every = every as f64 / f64::from(anchors);
+            walk_log += walk.ln();
+            every_log += every.ln();
+            eprintln!(
+                "  {name:<12} walk {walk:.3} tokens per tree cycle ({cycles} cycles), every \
+                 anchor {every:.3} ({anchors} anchors)"
+            );
+        }
+        times.sort_by(f64::total_cmp);
+        let count = texts.len() as f64;
+        eprintln!(
+            "  geomean      walk {:.3}, every anchor {:.3}; drafting pass median {:.3} ms",
+            (walk_log / count).exp(),
+            (every_log / count).exp(),
+            times[times.len() / 2]
+        );
+    }
 }

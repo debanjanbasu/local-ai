@@ -115,7 +115,9 @@ impl BonsaiEngine {
             (Some(kflash), _) => serde_json::json!({
                 "enabled": true,
                 "drafter": kflash.path,
-                "pinned": kflash.payload_sha256 == crate::bonsai_dflash::PINNED_DFLASH_SHA256,
+                "pinned": kflash.payload_sha256 == crate::bonsai_dflash::PINNED_DFLASH_SHA256
+                    || kflash.payload_sha256 == crate::bonsai_dflash::PINNED_DFLASH_INT4_SHA256,
+                "precision": kflash.precision,
                 "payload_sha256": kflash.payload_sha256,
                 "weight_bytes": kflash.weight_bytes,
                 "state_bytes": kflash.state_bytes,

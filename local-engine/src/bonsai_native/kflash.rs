@@ -22,8 +22,8 @@ use local_metal::dflash::DFLASH_WINDOW;
 
 use super::{BonsaiMetalTensor, BonsaiModel, CommandBatch, TAP_ROW_FLOATS, TAP_WINDOW};
 use crate::bonsai_dflash::{
-    Calibrator, DFLASH_MAX_TREE_ROWS, DflashDrafter, DflashShared, DflashTree, DraftAnchor,
-    TapFormat, calibration_cache_path,
+    Calibrator, DFLASH_MAX_TREE_ROWS, DflashDrafter, DflashPrecision, DflashShared, DflashTree,
+    DraftAnchor, TapFormat, calibration_cache_path,
 };
 use crate::bonsai_native::tree::{DraftTree, MAX_TREE_ROWS};
 use crate::sampler::{Sampler, SamplingResult};
@@ -80,6 +80,8 @@ pub(super) struct Kflash {
 pub struct KflashInfo {
     pub path: std::path::PathBuf,
     pub payload_sha256: String,
+    /// "int8" or "int4", how the drafter's matrices are stored.
+    pub precision: &'static str,
     pub weight_bytes: u64,
     pub state_bytes: usize,
     pub draft_ms: f64,
@@ -231,6 +233,10 @@ impl BonsaiModel {
         Some(KflashInfo {
             path: kflash.drafter.path().to_owned(),
             payload_sha256: kflash.drafter.payload_sha256().to_owned(),
+            precision: match kflash.drafter.precision() {
+                DflashPrecision::Int8 => "int8",
+                DflashPrecision::Int4 => "int4",
+            },
             weight_bytes: kflash.drafter.weight_bytes(),
             state_bytes: kflash.drafter.state_bytes(),
             draft_ms: kflash.draft_ms,

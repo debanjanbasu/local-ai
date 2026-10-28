@@ -26,8 +26,10 @@ use crate::buffer::MetalBuffer;
 use crate::context::MetalContext;
 use crate::shaders::ShaderLibrary;
 
+mod int4;
 mod int8;
 
+pub use self::int4::{INT4_COLUMN_MULTIPLE, INT4_GROUP, Int4Matrix};
 pub use self::int8::{INT8_CHUNK_TOKENS, INT8_COLUMN_MULTIPLE, INT8_VECTOR_TOKENS, Int8Matrix};
 
 pub const PTQ1_BLOCK_ELEMENTS: usize = 128;
@@ -256,6 +258,7 @@ pub struct BonsaiKernels {
     large_batch_min: u32,
     prefill_kernel: PrefillKernel,
     int8: int8::Int8Kernels,
+    int4: int4::Int4Kernels,
 }
 
 /// Largest activation-row count handled by one scalar small-batch dispatch.
@@ -439,6 +442,7 @@ impl BonsaiKernels {
             large_batch_min: DEFAULT_LARGE_BATCH_MIN,
             prefill_kernel,
             int8: int8::Int8Kernels::new(pipeline)?,
+            int4: int4::Int4Kernels::new(pipeline)?,
         })
     }
 

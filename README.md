@@ -266,7 +266,14 @@ flag turns any of it off or tunes it.
   14.35–15.27 → 11.02–11.28 ms per pass and took the same six prompts from
   36.55 to 38.17 tok/s geomean (−0.1% to +17.6%, five of six faster; best
   of three interleaved rounds on a GPU shared with a video call, so lower
-  absolute rates). Run-by-run provenance is in
+  absolute rates). The 4-bit drafter then took the pass from 8.76 to 7.12
+  ms (median over 2,392 anchors) at 0.5% fewer tokens per tree cycle, and
+  six 300-token prompts from 43.3 to 43.7 tok/s geomean (+1.0% and +0.6%
+  in two runs with the builds in either order; reasoning, JSON and
+  explanation +1.0 to +1.7%, prose and Chinese within ±0.5%), with
+  identical greedy text
+  ([drafter precision](docs/BONSAI.md#drafter-precision)). Run-by-run
+  provenance is in
   [docs/BONSAI.md](docs/BONSAI.md#performance).
 - KFlash: 50.4 tok/s geomean on the
   same six prompts against 39.9 for main in the same run (35–67: thinking
@@ -417,7 +424,8 @@ Weights are not included. The runtime validates these pinned files:
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` | always |
 | `models/bonsai2-27b-ptq1/Ternary-Bonsai-2-27B-mmproj-BF16.gguf` | 931,145,856 | `e287342d92332fa3577ed1d42e921dac9370c08da58ba9337fa450f6cc76cfd7` | always |
 | `models/bonsai2-27b-mtp/mtp-head-ptq1-v1.bin` | 166,969,344 | `83cc72279159c12255784f8a0a08ddc916519d466811276e4ff621eb7b88bd1b` | always |
-| `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` | 2,054,275,072 | `f43f846c60fc3f83c18ab772006d55f3cd6287944b4989fe4ac8d774c7a955e8` | always |
+| `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` | 2,054,275,072 | `f43f846c60fc3f83c18ab772006d55f3cd6287944b4989fe4ac8d774c7a955e8` | unless the 4-bit drafter is installed |
+| `models/bonsai2-27b-dflash2/dflash2-drafter-int4-v1.bin` | 1,266,483,200 | `0a041ec815ce648d04426ab1557f026d294153ca68fb54555ebb02fd6150f3af` | preferred; used when present |
 | `models/embeddinggemma2-text/embeddinggemma2-text-bf16.bin` | 542,996,480 | `dd745d5e7402ba8e3e654a978adb70ab4af97e780f000742d6a8a309773a492c` | always |
 | `models/embeddinggemma2-text/tokenizer.json` | 32,170,510 | `4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4` | always |
 | `models/embeddinggemma2-text/embeddinggemma2-vision-bf16.bin` | 335,642,624 | `c3f928d2a65aad2173f7ed6d8acac6e58d0a7336c9a03f0eb022f4a186909968` | always |
@@ -430,7 +438,8 @@ Weights are not included. The runtime validates these pinned files:
 | `models/decisions-v2/head.safetensors` | 10,488,404 | `34d0708873125c09aa59f444d7c40e64ac2af8b81ca989c7970ace9e67c83b81` | always |
 | `models/decisions-v2/gate.safetensors` | 1,332,004 | `9a5a4eb811822e4d1c64dde6006b9d92f7f0d5ebeb757d8b99e113e7d21f4fb1` | always |
 
-Every file is required. `serve` checks them all at startup, and `chat` and
+Every file is required, except that one of the two DFlash2 drafters is
+enough. `serve` checks them all at startup, and `chat` and
 `bonsai` check the Bonsai files they use: a missing file stops startup with an
 error naming it and pointing here, and the loaders refuse a corrupt one (each
 artifact's digest is re-derived on load). Where each comes from:
@@ -599,24 +608,29 @@ stream, an 8-row drafting block and a candidate selector) from
 [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2),
 trained further against the frozen Ternary Bonsai 2 27B target (Apache-2.0;
 attribution in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), converted
-to per-row int8. It shares the target's embedding and output matrix, so
-neither ships twice. In the acceptance simulation over the seven trace
+to per-row int8 and from that to 4-bit (an F16 scale and bias per 64
+columns), which the engine uses when it is installed: its drafting pass is
+about 1.6 ms (19%) shorter, its weights 787 MB smaller, at 0.5% fewer tokens
+per tree cycle, and decode was 0.8% faster over six prompts
+([docs/BONSAI.md](docs/BONSAI.md#drafter-precision)). It shares the target's
+embedding and output matrix, so neither ships twice. In the acceptance simulation over the seven trace
 prompts it yields 4.97 tokens per 8-row tree cycle against 4.68 for the
 earlier pin, `incoai/Qwen3.8-27B-DFlash2` at `015e795` (bootstrap ratio
 1.059, 95% CI 1.048–1.069), at or above it on every prompt.
 
-| Field | Value |
-| --- | --- |
-| File | `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` |
-| Bytes | 2,054,275,072 |
-| `payload_bytes` | 2,053,443,584 |
-| `payload_sha256` | `1b5dc3551406e677ec9f4321f8f5c20f7310eaae0cede95792ceaa2375dfc02a` |
-| Source `model.safetensors` | 3,848,817,896 bytes (BF16), SHA256 `708e141bf4a33b09620c4f86263f1c7edcec7882f5dd39448e83e0c0defdc230` |
+| Field | int8 | 4-bit |
+| --- | --- | --- |
+| File | `models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin` | `models/bonsai2-27b-dflash2/dflash2-drafter-int4-v1.bin` |
+| Bytes | 2,054,275,072 | 1,266,483,200 |
+| `payload_bytes` | 2,053,443,584 | 1,266,160,640 |
+| `payload_sha256` | `1b5dc3551406e677ec9f4321f8f5c20f7310eaae0cede95792ceaa2375dfc02a` | `0b875f62c3550cd6c57245f8837fb4268340748343a6ac8078ffbac9ce5a0c96` |
+| Source | `model.safetensors`, 3,848,817,896 bytes (BF16), SHA256 `708e141bf4a33b09620c4f86263f1c7edcec7882f5dd39448e83e0c0defdc230` | the int8 artifact |
 
 As with the MTP head, every load re-derives the payload digest (128 named
 sections, padding skipped) and a corrupt, truncated or foreign file is a hard
-error, as is a missing one. The policy also reports whether the installed drafter is the
-pinned one (`PINNED_DFLASH_SHA256`). Convert any DFlash2 checkpoint with this
+error, as is a missing one (both missing). The policy also reports which
+drafter it loaded, its precision, and whether it is a pinned one
+(`PINNED_DFLASH_SHA256`, `PINNED_DFLASH_INT4_SHA256`). Convert any DFlash2 checkpoint with this
 architecture (the published one or a fine-tune, BF16, F16 or F32) from a
 directory holding its `model.safetensors` and `config.json`:
 
@@ -630,7 +644,20 @@ cp DIR/dflash2-drafter-int8-v1.bin models/bonsai2-27b-dflash2/
 
 The conversion checks the config against the pinned architecture, quantizes
 every dense matrix per row to int8, keeps norms and convolution base kernels
-in F32 and the selector codebooks in BF16, and takes a few seconds. See
+in F32 and the selector codebooks in BF16, and takes a few seconds. The
+pinned 4-bit drafter is the 4-bit conversion of the pinned int8 one: from a
+directory holding only `dflash2-drafter-int8-v1.bin`,
+`--export dflash-head-int4` requantizes it (also a few seconds):
+
+```bash
+mkdir DIR8 && cp models/bonsai2-27b-dflash2/dflash2-drafter-int8-v1.bin DIR8/
+target/release/local-ai bonsai --export dflash-head-int4=DIR8
+cp DIR8/dflash2-drafter-int4-v1.bin models/bonsai2-27b-dflash2/
+```
+
+With a `model.safetensors` beside it, `--export dflash-head-int4` converts
+the checkpoint itself instead: that file loads the same way, with its own
+digest. See
 [docs/BONSAI.md](docs/BONSAI.md#dflash2-drafter) for the format, the
 precision choice and the measurements.
 

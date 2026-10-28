@@ -929,7 +929,7 @@ fn assert_matches_plain(kflash: &[u32], plain: &[u32], margins: &[f32], what: &s
 #[ignore = "requires the Bonsai GGUF, the DFlash2 drafter, the MTP head and a Metal device"]
 #[expect(clippy::too_many_lines)]
 fn kflash_generation_matches_plain_decoding() {
-    use crate::bonsai_dflash::{DEFAULT_BONSAI_DFLASH_ARTIFACT, DflashMode};
+    use crate::bonsai_dflash::{DflashMode, installed};
     use crate::bonsai_mtp::{DEFAULT_BONSAI_MTP_ARTIFACT, DEFAULT_MTP_DEPTH, MtpSettings};
 
     let path = String::from(crate::bonsai::DEFAULT_BONSAI_GGUF);
@@ -1015,7 +1015,7 @@ fn kflash_generation_matches_plain_decoding() {
             MtpSettings::new(DEFAULT_BONSAI_MTP_ARTIFACT.into(), DEFAULT_MTP_DEPTH)
                 .expect("head settings"),
         ),
-        &DflashMode::Drafter(DEFAULT_BONSAI_DFLASH_ARTIFACT.into()),
+        &DflashMode::Drafter(installed()),
         NgramSettings::default(),
         KvOptions::default(),
     )
