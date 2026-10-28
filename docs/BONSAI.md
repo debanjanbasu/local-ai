@@ -5091,6 +5091,21 @@ their own entry, not with current rates.
   request) at every end of sequence, a wasted pass at every stop, admission
   or lookup round that follows a pipelined one, and a settle before every
   other use of the model. Rejected.
+- Decode and verify projections on the Neural Engine (same machine, one
+  17408x5120 matrix per evaluation): int8 weights from a surface, as prefill
+  uses them, take 2.76 ms at 8 to 64 rows (about 32 GB/s of weights; the
+  GPU takes 0.23 ms at 8 rows), and int8 weights compiled in as constants
+  take the same, so the `dequantize` op is the limit. Fp16 constants take
+  1.10 ms (162 GB/s), and 2-bit `constexpr_lut_to_dense` constants with a
+  per-block {-s, 0, s} palette, which is exactly a ternary row, take
+  1.08 ms, the same, so they are expanded to dense fp16 when they are
+  loaded. A resident Neural Engine copy therefore costs 2 bytes per weight,
+  and even then runs 4.7 times slower than the GPU's 8-row kernel. A fifth
+  of every FFN on it would balance the GPU's share of an 8-row verify on
+  paper (about 18% off the FFN) for 6.5 GB of resident fp16, before 64
+  evaluations per step, each with two GPU handoffs, at 0.3 ms or more each
+  (a 4096x5120 evaluation takes 0.33 ms). Single-row decode is already
+  bound by memory bandwidth, which the two engines would share. Not built.
 
 ## Verification
 

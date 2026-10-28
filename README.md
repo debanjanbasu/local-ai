@@ -256,7 +256,11 @@ flag turns any of it off or tunes it.
   essay and thinking prompts) in the depth/margin sweep, with byte-identical
   greedy text; later best-of-two six-prompt A/B runs on newer kernels
   measured 30–32 and 38–39 tok/s. Two 600-token copy-edit prompts reached
-  about 90 tok/s with suffix lookup. Run-by-run provenance is in
+  about 90 tok/s with suffix lookup. Faster 2- to 8-row verify projections
+  and decode attention then took six 300-token prompts (planets, essay,
+  hash maps, arithmetic, Rust, history) from 40.4 to 42.0 tok/s geomean,
+  every prompt 2.5–6.0% faster with byte-identical text (default policy,
+  best of two interleaved rounds, 2026-10-28). Run-by-run provenance is in
   [docs/BONSAI.md](docs/BONSAI.md#performance).
 - KFlash: 50.4 tok/s geomean on the
   same six prompts against 39.9 for main in the same run (35–67: thinking
@@ -300,7 +304,12 @@ flag turns any of it off or tunes it.
   less attention kernel time at 32K-128K) then measured 228 against 219 tok/s
   at 32K with the Neural Engine and 114 against 105 on the GPU alone, best
   of two on a power-limited 20 W adapter where both builds ran slower than
-  above; 2K and 8K unchanged.
+  above; 2K and 8K unchanged. Register-tiled Q8 attention (24-29% less
+  prefill attention kernel time) and the attention layers' second-half
+  Q/K/V on the Neural Engine from position 4,096 then measured 254.0 →
+  285.1 tok/s at 32K (TTFT 128.9 → 114.9 s) and 345.2 → 353.9 at 8K, and
+  362.5 → 359.8 at 2K (TTFT 5.66 → 5.70 s in both rounds; cause not
+  isolated), best of two interleaved rounds (2026-10-28).
 - Prompt cache: follow-up turn 2.7 s versus 25 s;
   shared 6.7K-token prefix TTFT 1.2 s versus 73 s. A restarted process
   restoring a disk snapshot reaches its first token in 0.09–0.12 s at 6K
@@ -320,8 +329,9 @@ flag turns any of it off or tunes it.
   and the second half's rows): 1.51 → 2.32 GB at 8K, 0.82 → 1.65 GB for a
   279-token prompt, and 2.68 → 3.41 GB at 16K plus 500 tokens with the FFN
   alone on it (main measured 2.68 GB there in that A/B, against the
-  2.09 GB recorded earlier). File-backed weights remain
-  demand-paged.
+  2.09 GB recorded earlier). The attention Q/K/V weight surfaces add about
+  0.2 GB (3.23 → 3.43 GB for a 10,260-token prompt). File-backed weights
+  remain demand-paged.
 
 ### Other hardware
 
