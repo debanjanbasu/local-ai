@@ -3657,6 +3657,49 @@ builds: default speculative decode 36.05 to 38.06 tok/s geomean (+5.6%,
 every prompt +3.2% to +6.9%), plain decode 31.34 against 31.25 (unchanged
 kernels); text byte-identical across builds and modes.
 
+They then traded half their activation loads for shuffles, which changes
+their summation order. The four-row kernel (228 µs on 17408x5120) issues
+close to one instruction per lane-cycle rather than waiting on latency:
+padding each 32-thread group with 4 KB of threadgroup memory left it
+unchanged, 8 KB cost 13% and 16 KB 90%. Replacing a cost with one integer
+operation per value put the 64 scalar activation loads per lane and block at
+29 µs and the trit decode at 10. The loads cost per value delivered, not per
+instruction or per distinct address: `float2` loads, activations read from
+threadgroup memory, and two half-SIMDs reading the same addresses were no
+faster. Lane pairs now own four rows each and walk the same block parts
+(eight rows per SIMD group); for each pair of tokens a lane loads one input
+row and takes the other from its partner with `simd_shuffle_xor`, which does
+not compete with the loads. Kernel GPU time on an M4 Pro, µs, previous
+against new kernel interleaved in one process (a scratch harness loading
+both `.metallib`s, weights rotating through 512 MB as in
+`bonsai_throughput.rs`, best of two runs):
+
+| Projection | 2 rows | 3 rows | 4 rows |
+| --- | ---: | ---: | ---: |
+| 17408x5120 | 139.7 → 135.4 | 186.9 → 175.3 | 227.8 → 213.5 |
+| 5120x17408 | 142.1 → 143.2 | 188.6 → 181.2 | 233.8 → 222.7 |
+| 12288x5120 | 100.2 → 97.7 | 133.9 → 126.2 | 162.6 → 153.6 |
+| 10240x5120 | 84.5 → 81.8 | 112.6 → 105.2 | 136.8 → 127.6 |
+| 6144x5120 | 52.7 → 53.5 | 69.7 → 68.3 | 84.3 → 82.5 |
+| 5120x6144 | 52.3 → 52.3 | 69.0 → 66.5 | 83.4 → 80.2 |
+| 1024x5120 | 12.7 → 16.3 | 16.0 → 18.9 | 19.2 → 21.6 |
+| 248320x5120 output head | 1,918 → 1,819 | 2,591 → 2,375 | 3,170 → 2,920 |
+
+The output head runs at verify-block width, so it gains the most in absolute
+terms. The 1,024-row key and value projections lose 2-4 µs because half as
+many SIMD groups (128) cover them; in verify blocks they run beside the
+query projection. Each output is now the sum over sixteen lanes instead of
+32, so outputs differ from the previous kernels at rounding level (at most
+1.2e-7 to 2.3e-7 of the largest output on the shapes above, random weights
+and activations with 1% outliers 300 times larger; the wide kernel's gap is
+1.5e-7 to 2.2e-7); two, three and four rows still give the same bits as each
+other, so the three- and four-row tree schedules stay bitwise alike.
+`kflash_generation_matches_plain_decoding` matched plain decoding without
+even a near-tie, and the speculation, tree, batched-verify and prefill tests
+in `local-engine` pass unchanged
+(`large_batch_prefill_tracks_small_batch_next_token_distribution` mean KL
+2.3e-6, max 3.6e-5, 64/64 top-1).
+
 Verification itself got cheaper in two steps, measured on an M4 Pro. The scalar
 small-batch kernel now holds its decoded trits in half registers, exact for
 -1/0/+1 and widened into the same F32 FMAs, so outputs stay bit-identical:
@@ -4650,6 +4693,26 @@ their own entry, not with current rates.
   simdgroup matrices: one 8×8 half multiply costs what an F32 one does (272
   against 272 at five rows, inputs rounded to half), and exact inputs split
   into high and low halves need two, 499.
+- Small-batch variants after balanced prefixes, M4 Pro, µs on 17408×5120 at
+  four rows against 228 for the eight-lane kernel, A/B in one process. Five,
+  six, seven or eight rows per SIMD group: 249 / 274 / 355 / 383 (each value
+  loaded serves more rows, but the factors fall off the register cliff); the
+  two-row kernel with eight rows per SIMD group: 135-137 against 140-142 at
+  two rows, bitwise the old kernel, superseded by the lane pairs. `float2`
+  activation loads: 232; `float4` loads of a permuted (here invalid) layout,
+  364. Activations from threadgroup memory, even with no staging cost: 236
+  (`float4`) and 241 (scalar). Two half-SIMDs owning four rows each on the
+  same blocks, reduced within each half: 230, so loads sharing addresses
+  cost no less. Decoding one byte of every row at a time with per-row,
+  per-token totals carried across bytes: 258, and 411 at eight rows. One
+  output row per lane so every lane reads the same activations (device or
+  constant address space): 865-1,634. Lane quads that load one token and
+  shuffle three: 218-221 against the pairs' 214. 16-bit integer qh trits:
+  unchanged. Two rows per lane in the lane-pair kernel, which keeps the
+  1,024-row projections at 19.6 against the old 19.1 (four rows per lane:
+  21.6), but costs 4-8% on the 6,144- and 5,120-row projections and would
+  need a second set of pipelines; one row per lane did not even give the
+  same bits as two to four.
 - Wide-kernel layouts after the `float2` activation loads, M4 Pro, µs on
   17408×5120 / 5120×17408 against 237 / 281 at eight rows. Decoding the W
   tile once for two, three or four eight-row token tiles (bit-identical to

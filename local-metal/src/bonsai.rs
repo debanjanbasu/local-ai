@@ -261,7 +261,9 @@ pub struct BonsaiKernels {
 /// kernel's 340/345 us is no slower; five or more rows use the wide kernel.
 /// With the half-prefix trit decoder: 155/162, 198/200 and 235/244 us against
 /// the wide kernel's 280/286; with balanced prefixes and a two-row loop order
-/// that keeps both input rows in registers, 141/143, 188/189 and 228/233 us.
+/// that keeps both input rows in registers, 141/143, 188/189 and 228/233 us;
+/// with lane pairs that share input rows through shuffles, 135/143, 175/182
+/// and 214/223 us.
 pub const SMALL_BATCH_KERNEL_TOKENS: u32 = 4;
 
 /// Largest activation-row count handled by one wide small-batch dispatch.
@@ -1022,7 +1024,7 @@ impl BonsaiKernels {
                 set_u32(encoder, &matrix.columns, 4);
                 set_u32(encoder, &start, 5);
             }
-            dispatch(encoder, (matrix.rows as usize).div_ceil(4), 32);
+            dispatch(encoder, (matrix.rows as usize).div_ceil(8), 32);
             batch.record_dispatch();
         }
     }

@@ -5,7 +5,7 @@
 
 using namespace metal;
 
-#define BONSAI_SMALL_BATCH_KERNEL(tokens, impl) \
+#define BONSAI_SMALL_BATCH_KERNEL(tokens) \
 kernel void bonsai_ptq1_small_batch_##tokens( \
     device const BonsaiPtq1Block *weights [[buffer(0)]], \
     device const float *input [[buffer(1)]], \
@@ -16,17 +16,18 @@ kernel void bonsai_ptq1_small_batch_##tokens( \
     uint group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]] \
 ) { \
-    impl<tokens, 4>( \
+    bonsai_ptq1_small_batch_impl<tokens, 4>( \
         BonsaiNativePacked{weights}, input, output, rows, columns, first_token, group, lane); \
 }
 
 // Measured on M4 Pro (17408x5120): 0.19 / 0.24 / 0.28 ms for 2 / 3 / 4 tokens
 // and 0.34 ms at five, where the wide kernel below is no slower; with the
 // half-prefix trit decode 0.155 / 0.198 / 0.235 ms against the wide 0.28 ms,
-// and with balanced prefixes and the two-token loop order 0.141 / 0.188 / 0.228.
-BONSAI_SMALL_BATCH_KERNEL(2, bonsai_ptq1_small_batch_pair_impl)
-BONSAI_SMALL_BATCH_KERNEL(3, bonsai_ptq1_small_batch_impl)
-BONSAI_SMALL_BATCH_KERNEL(4, bonsai_ptq1_small_batch_impl)
+// with balanced prefixes and a two-token loop order 0.141 / 0.188 / 0.228, and
+// with lane pairs sharing input rows (eight rows per group) 0.136 / 0.175 / 0.214.
+BONSAI_SMALL_BATCH_KERNEL(2)
+BONSAI_SMALL_BATCH_KERNEL(3)
+BONSAI_SMALL_BATCH_KERNEL(4)
 
 // 0.233-0.237 ms on 17408x5120 and 0.236-0.281 ms on 5120x17408 for 5..8
 // tokens (0.28-0.30 ms with two activation loads per tile, 0.34 ms with floor
