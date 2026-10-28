@@ -260,7 +260,13 @@ flag turns any of it off or tunes it.
   and decode attention then took six 300-token prompts (planets, essay,
   hash maps, arithmetic, Rust, history) from 40.4 to 42.0 tok/s geomean,
   every prompt 2.5–6.0% faster with byte-identical text (default policy,
-  best of two interleaved rounds, 2026-10-28). Run-by-run provenance is in
+  best of two interleaved rounds, 2026-10-28). A cheaper drafting pass
+  (bandwidth-bound 3- to 8-row int8 kernel, a 98,304-token draft head with
+  a full-head fall-back, drafter buffers held resident) then measured
+  14.35–15.27 → 11.02–11.28 ms per pass and took the same six prompts from
+  36.55 to 38.17 tok/s geomean (−0.1% to +17.6%, five of six faster; best
+  of three interleaved rounds on a GPU shared with a video call, so lower
+  absolute rates). Run-by-run provenance is in
   [docs/BONSAI.md](docs/BONSAI.md#performance).
 - KFlash: 50.4 tok/s geomean on the
   same six prompts against 39.9 for main in the same run (35–67: thinking
