@@ -118,24 +118,33 @@ kernel void NAME( \
 BONSAI_INT8_MATMUL(bonsai_int8_matvec, 4, 1)
 BONSAI_INT8_MATMUL(bonsai_int8_matmul_2, 4, 2)
 
-// 2..8 activation rows with F32 8x8 simdgroup matrices,
-// C[token, row] += X[token, k] * W[k, row]. A threadgroup owns 32 output rows
-// as four 8-row W tiles sharing each X tile, so activation traffic per weight
-// byte stays at one F32 per int8 instead of growing with the row count; its
-// four SIMD groups split the 64-column chunks and add their partials through
-// threadgroup memory. Inside a chunk K is permuted so loads stay contiguous:
-// step j's k-slot s is column 8s + j, so each lane reads eight consecutive
-// int8 of two weight rows (8-byte loads) and sixteen consecutive activations
-// of one token per chunk. int8 values are exact in F32, the row scale is
-// applied once to the sum, and token rows past `tokens` contribute zeros and
-// are not stored. Dispatch ceil(rows / 32) threadgroups of 128 threads.
+// 3..8 activation rows with F32 8x8 simdgroup matrices,
+// C[token, row] += X[token, k] * W[k, row]. A threadgroup owns one 8-row W
+// tile; its eight SIMD groups split the 128-column chunks and add their
+// partials through threadgroup memory. Inside a chunk K is permuted so loads
+// stay contiguous: step j's k-slot s is column 16s + j, so each lane reads
+// sixteen consecutive int8 of two weight rows (16-byte loads) and 32
+// consecutive activations of one token per chunk. int8 values are exact in
+// F32 and the row scale is applied once to the sum. Token rows past `tokens`
+// repeat row fm mod tokens and are not stored: row fm of X only reaches row
+// fm of C. Dispatch ceil(rows / 8) threadgroups of 256 threads.
 //
-// On an M4 Pro its cost is flat from 3 to 8 rows at 201-216 GB/s (414 us for
-// 17408x5120), where the F32 multiplies, about 3.4 TFLOP/s, are the limit.
-// Larger blocks take even chunks of at most eight rows: at 40 and 128 rows
-// that was 1.0-1.6x faster than a 32-token F32 simdgroup-matrix tile reading
-// the matrix once per 32 rows, which is no less compute-bound (2.9 ms against
-// 2.1 ms for 17408x5120 at 40 rows).
+// On an M4 Pro, 3 to 8 rows cost what one row costs in the vector kernel,
+// the weight bytes at about 250 GB/s: at 8 rows, 17408x5120 / 5120x17408
+// 352 / 368 us, 5120x25600 537, 4096x5120 86, 1024x5120 25, 256x5120 8.7
+// (one row: 356 / 354, 521, 88, 23, 8.1). The previous layout, four 8-row
+// tiles sharing each X tile and four SIMD groups on 64-column chunks with
+// 8-byte loads, took 414 / 441, 639, 113, 36 and 28.5 at 201-216 GB/s with
+// the same multiplies and conversions, so its loads were the limit (16-byte
+// loads and eight SIMD groups with four tiles kept gave about 400 / 390 at
+// 17408x5120 / 5120x17408, one tile the rest). Feeding the
+// multiplies exact half weights built without integer-to-float conversion
+// (0x6400 | (q ^ 0x80) is 1152 + q as a half, minus 1152) measured within
+// 1% of this conversion, as did two tiles or sixteen SIMD groups. At three
+// rows the 5,120-row shapes cost 2-23% more than at four (cause unknown;
+// still at or below the previous layout).
+// Larger blocks take even chunks of at most eight rows (64 rows of
+// 17408x5120: 2,827 us, from 3,324).
 kernel void bonsai_int8_matmul_wide(
     device const char *weights [[buffer(0)]], device const float *scales [[buffer(1)]],
     device const float *input [[buffer(2)]], device float *output [[buffer(3)]],
@@ -144,78 +153,68 @@ kernel void bonsai_int8_matmul_wide(
     uint group [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    constexpr uint split = 4, tiles = 4;
-    threadgroup float shared[split * tiles * 64];
+    constexpr uint split = 8;
+    threadgroup float shared[split * 64];
     // Lane ownership of simdgroup_float8x8 thread_elements(): row fm,
     // columns fn and fn + 1.
     const uint quad = lane / 4;
     const uint fm = (quad & 4) + ((lane / 2) % 4);
     const uint fn = (quad & 2) * 2 + (lane % 2) * 2;
-    const uint first_row = group * 32;
-    const bool live = fm < tokens;
-    device const float *x_row = input + ulong(min(fm, tokens - 1)) * columns + 8 * fn;
-    device const char *w_rows[tiles][2];
+    const uint first_row = group * 8;
+    // Clamp to real rows and tokens: the values are discarded, nothing is read
+    // out of range.
+    device const float *x_row = input + ulong(fm % tokens) * columns + 16 * fn;
+    device const char *w_rows[2];
     #pragma clang loop unroll(full)
-    for (uint t = 0; t < tiles; ++t) {
+    for (uint r = 0; r < 2; ++r) {
+        w_rows[r] = weights + ulong(min(first_row + fn + r, rows - 1)) * columns + 16 * fm;
+    }
+    simdgroup_float8x8 sums = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint start = simd * 128; start < columns; start += split * 128) {
+        float w[2][16];
         #pragma clang loop unroll(full)
         for (uint r = 0; r < 2; ++r) {
-            const uint row = min(first_row + t * 8 + fn + r, rows - 1);
-            w_rows[t][r] = weights + ulong(row) * columns + 8 * fm;
-        }
-    }
-    simdgroup_float8x8 sums[tiles];
-    #pragma clang loop unroll(full)
-    for (uint t = 0; t < tiles; ++t) sums[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    for (uint start = simd * 64; start < columns; start += split * 64) {
-        const float4 a0 = *reinterpret_cast<device const float4 *>(x_row + start);
-        const float4 a1 = *reinterpret_cast<device const float4 *>(x_row + start + 4);
-        const float4 b0 = *reinterpret_cast<device const float4 *>(x_row + start + 8);
-        const float4 b1 = *reinterpret_cast<device const float4 *>(x_row + start + 12);
-        const float xa[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-        const float xb[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
-        float w[tiles][2][8];
-        #pragma clang loop unroll(full)
-        for (uint t = 0; t < tiles; ++t) {
+            const uint4 bits = *reinterpret_cast<device const uint4 *>(w_rows[r] + start);
             #pragma clang loop unroll(full)
-            for (uint r = 0; r < 2; ++r) {
-                const uint2 bits = *reinterpret_cast<device const uint2 *>(w_rows[t][r] + start);
-                const float4 lo = float4(as_type<char4>(bits.x));
-                const float4 hi = float4(as_type<char4>(bits.y));
-                w[t][r][0] = lo.x; w[t][r][1] = lo.y; w[t][r][2] = lo.z; w[t][r][3] = lo.w;
-                w[t][r][4] = hi.x; w[t][r][5] = hi.y; w[t][r][6] = hi.z; w[t][r][7] = hi.w;
+            for (uint q = 0; q < 4; ++q) {
+                const float4 v = float4(as_type<char4>(bits[q]));
+                #pragma clang loop unroll(full)
+                for (uint e = 0; e < 4; ++e) w[r][4 * q + e] = v[e];
+            }
+        }
+        float xa[16], xb[16];
+        #pragma clang loop unroll(full)
+        for (uint q = 0; q < 4; ++q) {
+            const float4 a = *reinterpret_cast<device const float4 *>(x_row + start + 4 * q);
+            const float4 b = *reinterpret_cast<device const float4 *>(x_row + start + 16 + 4 * q);
+            #pragma clang loop unroll(full)
+            for (uint e = 0; e < 4; ++e) {
+                xa[4 * q + e] = a[e];
+                xb[4 * q + e] = b[e];
             }
         }
         #pragma clang loop unroll(full)
-        for (uint j = 0; j < 8; ++j) {
+        for (uint j = 0; j < 16; ++j) {
             simdgroup_float8x8 x;
-            x.thread_elements()[0] = live ? xa[j] : 0.0f;
-            x.thread_elements()[1] = live ? xb[j] : 0.0f;
-            #pragma clang loop unroll(full)
-            for (uint t = 0; t < tiles; ++t) {
-                simdgroup_float8x8 b;
-                b.thread_elements()[0] = w[t][0][j];
-                b.thread_elements()[1] = w[t][1][j];
-                simdgroup_multiply_accumulate(sums[t], x, b, sums[t]);
-            }
+            x.thread_elements()[0] = xa[j];
+            x.thread_elements()[1] = xb[j];
+            simdgroup_float8x8 b;
+            b.thread_elements()[0] = w[0][j];
+            b.thread_elements()[1] = w[1][j];
+            simdgroup_multiply_accumulate(sums, x, b, sums);
         }
     }
-    #pragma clang loop unroll(full)
-    for (uint t = 0; t < tiles; ++t) {
-        shared[(simd * tiles + t) * 64 + lane * 2] = sums[t].thread_elements()[0];
-        shared[(simd * tiles + t) * 64 + lane * 2 + 1] = sums[t].thread_elements()[1];
-    }
+    shared[simd * 64 + lane * 2] = sums.thread_elements()[0];
+    shared[simd * 64 + lane * 2 + 1] = sums.thread_elements()[1];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd != 0 || !live) return;
+    if (simd != 0 || fm >= tokens) return;
     #pragma clang loop unroll(full)
-    for (uint t = 0; t < tiles; ++t) {
+    for (uint r = 0; r < 2; ++r) {
+        float total = 0.0f;
         #pragma clang loop unroll(full)
-        for (uint r = 0; r < 2; ++r) {
-            float total = 0.0f;
-            #pragma clang loop unroll(full)
-            for (uint s = 0; s < split; ++s) total += shared[(s * tiles + t) * 64 + lane * 2 + r];
-            const uint row = first_row + t * 8 + fn + r;
-            if (row < rows) output[ulong(fm) * rows + row] = total * scales[row];
-        }
+        for (uint s = 0; s < split; ++s) total += shared[s * 64 + lane * 2 + r];
+        const uint row = first_row + fn + r;
+        if (row < rows) output[ulong(fm) * rows + row] = total * scales[row];
     }
 }
 

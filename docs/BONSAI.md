@@ -98,9 +98,9 @@ Int8 matrices multiply the same rotated activations through their own kernels
 (`shaders/bonsai_int8.metal`): one and two activation rows use vector kernels
 reducing four weight rows per SIMD group with 16-byte weight loads (236-248
 GB/s on an M4 Pro, 360 us for 17408x5120 against 134 us in `PTQ1_0`); 3 to 8
-rows use one F32 simdgroup-matrix dispatch whose cost is flat in the row count
-(201-216 GB/s, 414 us for 17408x5120); larger blocks, such as K/V-only
-ingestion of prefill chunks, take even chunks of at most eight rows. Single-row groups are fused per format: the
+rows use one F32 simdgroup-matrix dispatch that costs what one row does
+(about 250 GB/s, 352 us for 17408x5120 at eight rows); larger blocks, such
+as K/V-only ingestion of prefill chunks, take even chunks of at most eight rows. Single-row groups are fused per format: the
 `PTQ1_0` members of q/k/v share one concatenated matvec and the int8 members
 another, and gate/up use one fused SwiGLU when both share a format; a mixed
 gate/up pair runs as two projections and the elementwise SwiGLU.
@@ -260,16 +260,22 @@ geomean:
 | ternary, TWN per 128 columns (CPU) | 1.436 | 7.1% | 15.7% |
 
 Ternary without training destroys the drafter, so the `PTQ1_0` kernels are
-out. 4-bit costs 0.6% of the tokens per cycle and would halve the bytes, but
-bytes are not what an 8-row pass is short of: the five layers' int8
-projections take 8.33 ms at 8 rows against 6.86 ms at one row (243 GB/s, the
-int8 bandwidth floor), and the 8-row simdgroup-matrix kernel is limited by
-its F32 multiplies, not by bytes: 26.6 GFLOP at 3.2 TFLOP/s, and on a
-cache-resident 2048x5120 matrix, where one row streams at 420 GB/s, it still
-tops out at 3.55 TFLOP/s (3.52 on 17408x5120 from memory), the limit
-`bonsai_int8.metal` documents. A 4-bit kernel built the same way keeps those
-multiplies, so it could save at most 0.7 ms of a 12.6 ms pass (under 1% of a
-cycle), against a new kernel and the 0.6% acceptance loss.
+out. 4-bit costs 0.6% of the tokens per cycle and would halve the bytes.
+It was first set aside because the 8-row int8 kernel seemed limited by its
+F32 multiplies rather than its bytes (the five layers' int8 projections took
+8.2 ms at 8 rows against 6.7 ms at one row), so a 4-bit kernel built the same
+way could have saved at most 0.7 ms of a 12.6 ms pass. That premise was the
+kernel's layout, not the hardware: with one 8-row tile per threadgroup, eight
+SIMD groups and 16-byte loads (`bonsai_int8.metal`, October 2026) the 8-row
+projections take 6.76 ms, what one row takes (6.71 ms, about 250 GB/s), with
+the same F32 multiplies and conversions, and the drafting pass fell by about
+the 1.46 ms the kernel timings predict. The int8 pass is now at its bytes
+(1.66 GB), so 4-bit weights would halve that floor to about 3.3 ms; the 13.3
+billion multiply-adds would then bound it, about 4.3 ms at the 3.1 T per
+second the ternary wide kernel reaches with its decode (3.4 ms at the 3.9 T
+peak). That is up to 2.4 ms of an 11.3 ms pass, about 2.8% of an 87 ms tree
+cycle, against the 0.6% acceptance loss and a new kernel and artifact: a
+candidate, not adopted.
 
 #### Drafting pass
 
@@ -283,6 +289,25 @@ context, 12.44 ms at 500 and 13.23 ms at the full window; appending a
 chunks). Of the pass, the int8 projections are 8.3 ms, the output head over
 seven rows 3.3 ms, top 16 0.14 ms, and block attention 0.03 ms per layer at
 60 context positions, 0.22 ms at the full window.
+
+The int8 kernel rework of October 2026 (see [Drafter precision](#drafter-precision))
+took the int8 projections of a pass from 8.22 to 6.76 ms by the kernel
+timings (eight rows: gate/up 414 to 352 us, down 441 to 368, q 113 to 86, o
+101 to 84, k/v 36 to 25, the two convolution-kernel projections 42 to 29, the
+selector 28.5 to 8.8) and the measured pass (`policy.kflash.draft_ms`, the
+startup median at an empty context) from 12.73-12.99 ms (eight runs, median
+12.85) to 11.26-11.40 (four runs, median 11.27), with identical greedy
+output. Tokens per tree cycle in `kflash_generation_matches_plain_decoding`,
+two runs of each build from the same persisted calibration: code 5.75 / 5.75
+before and 5.94 / 5.62 after, prose 3.65 / 3.54 and 3.67 / 3.75, sampled
+prose 3.25 / 3.25 and 3.25 / 3.24, within the run-to-run spread (the
+summation order changed; the products did not). Appending committed
+positions in tree cycles (a few rows: `fc` at five rows 641 to 514 us, each
+k/v 36 to 26) saves about 0.23 ms a cycle, and the 64-row chunks of a prompt
+append about 1.6 ms each (`fc` 5,132 to 4,309 us, each k/v 258 to 181), about
+200 ms instead of 250 for 2,048 rows by the same timings; one committed
+position (the vector kernels) is unchanged. The figures above this paragraph
+predate it.
 
 Parity against `drafter_lib.py` (fp32, itself within 6.5e-6 of z-lab's class)
 on the captured Bonsai hidden states, every anchor of the seven prompts:
@@ -4974,6 +4999,28 @@ their own entry, not with current rates.
   permutation that makes each lane's two tiles' activations contiguous (11
   loads per block instead of 16), 227-230 / 227 and 227-229 / 227, about
   0.7% and within run-to-run spread.
+- Int8 wide-kernel variants (October 2026) around the shipped one-tile
+  layout of `bonsai_int8.metal`, M4 Pro, µs, interleaved with it unless
+  noted. Exact half weights built without an integer-to-float conversion
+  (`0x6400 | (q ^ 0x80)` is 1152 + q as a half, minus 1152, as Kapitsa's
+  `verify8` feeds its codes) as the B operand: within 1% at 3-64 rows on
+  every drafter shape, the conversion 0-1% ahead (17408×5120 at eight rows
+  352.3 against 352.6), so the conversion is not what the kernel pays for.
+  Two row tiles per threadgroup sharing each activation load: equal on the
+  FFN shapes, 30.7 against 26.8 on 1024×5120. Sixteen SIMD groups: within
+  1%; four: 1-3% slower on the large shapes, 12.1 against 9.3 on 256×5120.
+  Dead token lanes skipping their activation loads instead of repeating a
+  live row: 485 / 739 at eight rows on 5120×17408 / 5120×25600 against 363 /
+  535 in neighbouring runs (the branch costs the loads' scheduling).
+  Clamping dead lanes to the last row instead of `fm mod tokens`: 98.5
+  against 85.0 at four rows on 5120×4096 (separate runs). The wide kernel
+  for one and two rows as well: 2-3% faster on 17408×5120 and 5120×25600,
+  8-19% slower on 256-1,280 rows (1024×5120 27.7 against 23.3). Two 8-token
+  tiles sharing each W tile for 16-row chunks: 624 against 714 at 16 rows
+  and 2,496 against 2,862 at 64 on 17408×5120 (13%; multiply-bound at about
+  2.3 T multiply-adds per second), but 496 against 358 at eight rows, so it
+  would need its own pipeline for a once-per-prompt saving of about 14 ms
+  per 2,048 rows of drafter context.
 - Narrower prefill operands (half or BF16 activations, int8 activations
   against the trits), as a way past the large-batch kernel. They cannot be
   faster on this GPU. Chains of 8x8 simdgroup multiplies with no loads

@@ -18,8 +18,8 @@ use crate::batch::CommandBatch;
 use crate::buffer::MetalBuffer;
 
 /// Column counts must be a multiple of this: the vector kernels give each lane
-/// 16 consecutive columns and the wide kernel walks 64-column chunks.
-pub const INT8_COLUMN_MULTIPLE: u32 = 64;
+/// 16 consecutive columns and the wide kernel walks 128-column chunks.
+pub const INT8_COLUMN_MULTIPLE: u32 = 128;
 
 /// Largest activation-row count one int8 dispatch handles; larger blocks are
 /// split into even chunks of at most this many rows, each reading the matrix
@@ -30,8 +30,9 @@ pub const INT8_CHUNK_TOKENS: u32 = 8;
 /// activation row in registers); larger ones the wide simdgroup-matrix kernel.
 pub const INT8_VECTOR_TOKENS: u32 = 2;
 
-/// Output rows per threadgroup of the wide kernel.
-const WIDE_ROWS: usize = 32;
+/// Output rows and threads per threadgroup of the wide kernel.
+const WIDE_ROWS: usize = 8;
+const WIDE_THREADS: usize = 256;
 
 /// Checked row-major int8 matrix with one F32 scale per row.
 ///
@@ -109,7 +110,7 @@ impl Int8Kernels {
                 pipeline("bonsai_int8_matvec", 32)?,
                 pipeline("bonsai_int8_matmul_2", 32)?,
             ],
-            wide: pipeline("bonsai_int8_matmul_wide", 128)?,
+            wide: pipeline("bonsai_int8_matmul_wide", WIDE_THREADS)?,
             concat: pipeline("bonsai_int8_matvec_concat", 32)?,
             swiglu: pipeline("bonsai_int8_matvec_swiglu", 32)?,
         })
@@ -187,7 +188,11 @@ impl BonsaiKernels {
                 }
             }
             if wide {
-                dispatch(encoder, (matrix.rows as usize).div_ceil(WIDE_ROWS), 128);
+                dispatch(
+                    encoder,
+                    (matrix.rows as usize).div_ceil(WIDE_ROWS),
+                    WIDE_THREADS,
+                );
             } else {
                 dispatch(encoder, (matrix.rows as usize).div_ceil(VECTOR_ROWS), 32);
             }

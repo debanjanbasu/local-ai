@@ -124,8 +124,11 @@ fn int8_projections_match_f64_reference() {
             .map(|count| Matrix::random(&context, &mut state, count, columns))
             .collect();
         for tokens in [1, 2, 3, 4, 5, 8, 12, 40, 128] {
+            // At eight rows the activations and sums exceed the F16 range: the
+            // wide kernel's half weight operands must not narrow them.
+            let magnitude = if tokens == 8 { 1e5 } else { 1.0 };
             let input: Vec<f32> = (0..tokens * columns)
-                .map(|_| (xorshift(&mut state) % 20_001) as f32 / 10_000.0 - 1.0)
+                .map(|_| ((xorshift(&mut state) % 20_001) as f32 / 10_000.0 - 1.0) * magnitude)
                 .collect();
             let input_buffer = MetalBuffer::from_slice(context.device(), &input).expect("input");
             let expected: Vec<f64> = (0..tokens)
@@ -197,10 +200,11 @@ fn int8_projections_match_f64_reference() {
     eprintln!("worst relative int8 projection error {worst:e}");
 
     // Shapes the kernels cannot serve are refused, not misread.
-    let small = Matrix::random(&context, &mut state, 4, 64);
-    assert!(Int8Matrix::new(&small.weights, &small.scale_buffer, 4, 32).is_err());
-    assert!(Int8Matrix::new(&small.weights, &small.scale_buffer, 5, 64).is_err());
-    assert!(Int8Matrix::new(&small.weights, &small.weights, 4, 64).is_err());
+    let small = Matrix::random(&context, &mut state, 4, 128);
+    assert!(Int8Matrix::new(&small.weights, &small.scale_buffer, 4, 128).is_ok());
+    assert!(Int8Matrix::new(&small.weights, &small.scale_buffer, 8, 64).is_err());
+    assert!(Int8Matrix::new(&small.weights, &small.scale_buffer, 5, 128).is_err());
+    assert!(Int8Matrix::new(&small.weights, &small.weights, 4, 128).is_err());
 }
 
 /// GPU time per projection for the head's matrix shapes: int8 against the
