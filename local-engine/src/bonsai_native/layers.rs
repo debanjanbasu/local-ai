@@ -457,6 +457,20 @@ impl BonsaiModel {
                 crate::Result::Ok(())
             })?;
         }
+        self.attention_from_projections_at(batch, layer, tokens, rope, position)
+    }
+
+    /// [`Self::attention_core_at`] after its Q, K and V projections: their
+    /// normalization, rotary embedding and cache writes, then attention.
+    pub(super) fn attention_from_projections_at(
+        &self,
+        batch: &mut CommandBatch,
+        layer: &FullAttentionLayer,
+        tokens: u32,
+        rope: Rope<'_>,
+        position: usize,
+    ) -> crate::Result<()> {
+        let scratch = &self.scratch;
         self.ops.prepare_attention_rows_kv(
             self.kv_layout,
             batch,

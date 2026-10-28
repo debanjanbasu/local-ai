@@ -41,9 +41,11 @@ fn gpu_ms(
 
 /// Per-operation GPU time of one 512-row block at each position of
 /// `PROFILE_POSITIONS` (default 4,096, 32,768 and 131,072), on the GPU path
-/// and as one half of a Neural Engine wavefront, plus the whole block's wall
-/// time both ways. The K/V caches hold a real 4,096-token prefix repeated up
-/// to the longest position.
+/// and as one half of a Neural Engine wavefront (and that half's mean at the
+/// attention Q/K/V step), plus the whole block's wall time on the GPU and as
+/// a wavefront at the largest output split without and with the Q/K/V. The
+/// K/V caches hold a real 4,096-token prefix repeated up to the longest
+/// position.
 #[test]
 #[ignore = "measurement; requires the pinned model, a Metal device and the Neural Engine"]
 #[expect(clippy::too_many_lines)]
@@ -297,6 +299,10 @@ fn prefill_op_timings() {
     time("ane.stage_out", &mut |b| {
         split.stage_out(b, &recurrent.output, 0, SPLIT_ROWS)
     });
+    time("ane.stage_qkv", &mut |b| split.stage_qkv(b, full, 0));
+    time("ane.join_qkv", &mut |b| {
+        split.join_qkv(b, rows, [&s.query_gate, &s.key, &s.value])
+    });
     time("ane.pack_ffn", &mut |b| {
         split.kernels.pack(
             b,
@@ -337,6 +343,7 @@ fn prefill_op_timings() {
         split.kernels.join_split(
             b,
             &lane.y,
+            0,
             &lane.tx,
             &s.ffn_gate,
             &s.branch,
@@ -418,6 +425,12 @@ fn prefill_op_timings() {
             ("packs_joins", 64.0 * wave_extra),
             ("weight_conversion_half", 32.0 * stage),
         ];
+        // The mean of a wavefront's halves at `QKV_STEP`: half B's attention
+        // layers take Q, K and V from the ANE (one more pack and the join)
+        // and their weights take converting.
+        let qkv_change = 8.0
+            * (sum(&["ane.stage_qkv", "ane.pack_ffn", "ane.join_qkv"])
+                - sum(&["attn.q", "attn.k", "attn.v"]));
         let total = |parts: &[(&str, f64)]| parts.iter().map(|&(_, ms)| ms).sum::<f64>();
         println!(
             "{}",
@@ -428,13 +441,16 @@ fn prefill_op_timings() {
                 "gpu_block": gpu.iter().map(|&(k, v)| (k, v)).collect::<std::collections::BTreeMap<_, _>>(),
                 "wave_half_gpu_ms": total(&wave),
                 "wave_half": wave.iter().map(|&(k, v)| (k, v)).collect::<std::collections::BTreeMap<_, _>>(),
+                "wave_half_qkv_ms": total(&wave) + qkv_change,
             })
         );
     }
     drop(fixed);
     model.ane = super::AnePrefill::Ready(split);
     // Whole blocks at each position: one GPU block of 512 rows and one
-    // wavefront of two halves, wall time and summed command-buffer GPU time.
+    // wavefront of two halves at the largest output split, without and with
+    // the attention Q/K/V on the ANE, wall time and summed command-buffer
+    // GPU time.
     for &position in &positions {
         let tokens = &corpus[seed..seed + WAVE_ROWS];
         model.position = position;
@@ -445,22 +461,39 @@ fn prefill_op_timings() {
             .expect("GPU block");
         let gpu_wall = started.elapsed().as_secs_f64() * 1e3;
         let gpu_busy = model.take_gpu_time().as_secs_f64() * 1e3;
-        model.position = position;
-        let started = Instant::now();
-        model
-            .encode_prefill_block(tokens, BlockOutput::None)
-            .expect("wavefront");
-        let wave_wall = started.elapsed().as_secs_f64() * 1e3;
-        let wave_busy = model.take_gpu_time().as_secs_f64() * 1e3;
-        assert!(model.ane_active(), "{}", model.neural_engine_policy());
+        let mut wave = |step: usize| {
+            OUT_STEP_OVERRIDE.store(step + 1, std::sync::atomic::Ordering::Relaxed);
+            model.position = position;
+            let started = Instant::now();
+            model
+                .encode_prefill_block(tokens, BlockOutput::None)
+                .expect("wavefront");
+            let wall = started.elapsed().as_secs_f64() * 1e3;
+            let busy = model.take_gpu_time().as_secs_f64() * 1e3;
+            assert!(model.ane_active(), "{}", model.neural_engine_policy());
+            (wall, busy)
+        };
+        // Each twice, alternating; the better of each.
+        let mut best = [(f64::INFINITY, 0.0); 2];
+        for _ in 0..2 {
+            for (slot, step) in [OUT_STEPS.len() - 1, QKV_STEP].into_iter().enumerate() {
+                let (wall, busy) = wave(step);
+                if wall < best[slot].0 {
+                    best[slot] = (wall, busy);
+                }
+            }
+        }
+        OUT_STEP_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
         println!(
             "{}",
             serde_json::json!({
                 "position": position,
                 "gpu_block_wall_ms": gpu_wall,
                 "gpu_block_busy_ms": gpu_busy,
-                "wave_block_wall_ms": wave_wall,
-                "wave_block_busy_ms": wave_busy,
+                "wave_block_wall_ms": best[0].0,
+                "wave_block_busy_ms": best[0].1,
+                "wave_qkv_block_wall_ms": best[1].0,
+                "wave_qkv_block_busy_ms": best[1].1,
             })
         );
     }

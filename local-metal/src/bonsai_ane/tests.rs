@@ -162,6 +162,7 @@ fn stage_converts_ternary_rows_to_per_row_int8() {
                 *first,
                 *count,
                 output,
+                0,
                 (index == 0).then_some(&scales),
             )
             .expect("stage");
@@ -271,6 +272,9 @@ fn join_applies_both_token_scales_and_flags_non_finite_rows() {
 fn join_split_takes_the_ane_channels_then_the_gpu_rest() {
     let (context, kernels) = setup();
     let (width, split, tokens) = (256_u32, 96_u32, 70_u32);
+    // The ANE's channels start at this partial row, as K and V do in the
+    // engine's stacked Q/K/V surface.
+    let first = 32_u32;
     let mut rng = Rng(4);
     // Taller than the split, as the engine's surfaces are.
     let partial = Surface::new(&context, SurfaceLayout::new(width, 128, true)).expect("y");
@@ -301,6 +305,7 @@ fn join_split_takes_the_ane_channels_then_the_gpu_rest() {
             .join_split(
                 &mut batch,
                 &partial,
+                first,
                 &scales,
                 &rest_buffer,
                 &output,
@@ -314,11 +319,11 @@ fn join_split_takes_the_ane_channels_then_the_gpu_rest() {
     };
     join(&status);
     let out = read::<f32>(&output);
-    let (width, split) = (width as usize, split as usize);
+    let (width, split, first) = (width as usize, split as usize, first as usize);
     for t in 0..tokens as usize {
         for c in 0..width {
             let expected = if c < split {
-                y[c * stride + t].to_f32() * tx[t].to_f32()
+                y[(first + c) * stride + t].to_f32() * tx[t].to_f32()
             } else {
                 rest[t * (width - split) + c - split]
             };
@@ -326,15 +331,16 @@ fn join_split_takes_the_ane_channels_then_the_gpu_rest() {
         }
     }
     assert_eq!(read::<u32>(&status)[0], 0);
-    // Rows past the split and tokens past the block are not read.
-    y[(split + 1) * stride + 3] = f16::NAN;
-    y[3 * stride + tokens as usize + 1] = f16::INFINITY;
+    // Rows outside the ANE's channels and tokens past the block are not read.
+    y[(first - 1) * stride + 3] = f16::NAN;
+    y[(first + split + 1) * stride + 3] = f16::NAN;
+    y[(first + 3) * stride + tokens as usize + 1] = f16::INFINITY;
     partial
         .buffer()
         .copy_from_bytes(bytemuck::cast_slice(&y), 0);
     join(&status);
     assert_eq!(read::<u32>(&status)[0], 0);
-    y[(split - 1) * stride + 5] = f16::NAN;
+    y[(first + split - 1) * stride + 5] = f16::NAN;
     partial
         .buffer()
         .copy_from_bytes(bytemuck::cast_slice(&y), 0);
