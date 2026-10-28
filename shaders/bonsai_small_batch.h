@@ -1,6 +1,6 @@
 // Small-batch PTQ1_0 projection for speculative verification blocks and short
 // prefill chunks. The 128-token tensor tile costs a full tile for any block of
-// 2..128 rows; here one SIMD group covers `rows_per_group` output rows and
+// 2..128 rows; here one SIMD group covers a few output rows and
 // streams each packed block exactly once, like bonsai_ptq1_matvec_reuse. The
 // block's actual -1/0/+1 trits are derived once and reused for every activation
 // row. Dot them directly against inputs: telescoping cumulative base-3 factors
@@ -17,25 +17,6 @@
 #define BONSAI_SMALL_BATCH_H
 
 #include "bonsai_projection.h"
-
-// Bytes 2*lane, 2*lane+1 and 16+lane contribute five trits each, then the
-// qh byte contributes one. The trits are exact in half (balanced-prefix
-// decode, bonsai_projection.h) before any floating-point activation
-// arithmetic. The qh trit keeps the F32 floor: half prefixes from per-lane
-// constants measured 1-3% slower at four rows.
-template<typename Packed>
-static inline void bonsai_ptq1_factors(
-    Packed packed, metal::ulong block, metal::uint lane, thread half (&factors)[16]
-) {
-    #pragma clang loop unroll(full)
-    for (metal::uint k = 0; k < 3; ++k) {
-        const metal::uint byte = k < 2 ? 2 * lane + k : 16 + lane;
-        bonsai_ptq1_trits(bonsai_ptq1_code(packed.code(block, byte)), &factors[5 * k]);
-    }
-    const float power = metal::float4(1.0f, 3.0f, 9.0f, 27.0f)[lane >> 1];
-    const float high = float(packed.code(block, 24 + (lane & 1))) * (1.0f / 256.0f) * power;
-    factors[15] = half(metal::floor(3.0f * high) - 3.0f * metal::floor(high) - 1.0f);
-}
 
 // Gather one activation row's sixteen elements in the decoded trit order.
 // Widen half inputs, but never narrow F32 operands or subtract an input sum.
@@ -69,21 +50,34 @@ static inline metal::float2 bonsai_ptq1_pair(Input input, metal::ulong index) {
     return metal::float2(float(input[index]), float(input[index + 1]));
 }
 
-// One threadgroup is one SIMD group of 32 lanes: lane / 8 selects the packed
-// block in flight, lane & 7 its sixteen-element part. Dispatch
-// ceil(rows / rows_per_group) groups; `first_token` selects the activation
-// rows [first_token, first_token + tokens) of the flattened handles. Each
-// output is the SIMD-group sum of every lane's block-ordered sum of
-// scale * (the sixteen trit * input products added in factor order), so the
-// two kernels below differ in loop order only and give the same bits.
+// One threadgroup is one SIMD group of 32 lanes in sixteen lane pairs
+// (lane, lane ^ 1). Lane & 1 selects which `rows_per_lane` of the group's
+// 2 * rows_per_lane output rows a lane owns; lane / 16 selects the packed block
+// in flight and (lane / 2) & 7 its sixteen-element part, so both lanes of a
+// pair walk the same elements. For each pair of tokens a lane loads one input
+// row and takes the other from its partner with a shuffle, which halves the
+// device loads per product: the kernel issues close to one instruction per
+// lane-cycle, and shuffles and loads do not compete for the same slots
+// (lane quads that load one token and shuffle three measured slower). On M4
+// Pro (17408x5120 / 5120x17408), 2/3/4 tokens went from 140/187/228 and
+// 142/189/234 us (eight lanes per block, four rows per group) to 135/175/214
+// and 143/181/223 us, the 248320x5120 output head from 1918/2591/3170 to
+// 1819/2375/2920 us; 1024-row projections, now covered by half as many
+// groups, from 12.7/16.0/19.2 to 16.3/18.9/21.6 us. Dispatch
+// ceil(rows / (2 * rows_per_lane)) groups; `first_token` selects the
+// activation rows [first_token, first_token + tokens) of the flattened handles.
 //
-// From three tokens, rows' factors are derived once per block and held while
-// tokens stream through one input row at a time, so register use is
-// 16 * rows_per_group + 16 + rows_per_group * tokens rather than growing by
-// sixteen per token (token-major arrays measured 0.44 ms at four tokens but
-// 2.44 ms at eight on the 17408x5120 projection).
+// Each output is the sum over its sixteen lanes of every lane's block-ordered
+// sum of scale * (the sixteen trit * input products added in factor order),
+// reduced by the same shuffles for every token count, so 2, 3 and 4 tokens give
+// the same bits. Rows' factors are derived once per block and held while tokens
+// stream through, so register use is 16 * rows_per_lane + 32 + rows_per_lane *
+// tokens rather than growing by sixteen per token (token-major arrays measured
+// 0.44 ms at four tokens but 2.44 ms at eight on the 17408x5120 projection);
+// five rows per lane, or holding every input row and decoding rows one at a
+// time, fall off a register cliff.
 template<
-    metal::uint tokens, metal::uint rows_per_group,
+    metal::uint tokens, metal::uint rows_per_lane,
     typename Packed, typename Input, typename Output>
 static inline void bonsai_ptq1_small_batch_impl(
     Packed packed,
@@ -95,34 +89,41 @@ static inline void bonsai_ptq1_small_batch_impl(
     metal::uint group,
     metal::uint lane
 ) {
-    const metal::uint first_row = group * rows_per_group;
+    constexpr metal::uint steps = (tokens + 1) / 2;
+    const metal::uint slice = lane & 1;
+    const metal::uint pair = lane >> 1;
+    const metal::uint part = pair & 7;
+    const metal::uint first_row = (2 * group + slice) * rows_per_lane;
     const metal::uint blocks = columns / 128;
-    const metal::uint part = lane & 7;
     const metal::ulong input_base = metal::ulong(first_token) * columns;
     const metal::ulong output_base = metal::ulong(first_token) * rows;
-    float sums[rows_per_group][tokens];
+    // sums[row][2 * step + m]: m = 0 the token this lane loads, m = 1 its partner's.
+    float sums[rows_per_lane][2 * steps];
     #pragma clang loop unroll(full)
-    for (metal::uint row = 0; row < rows_per_group; ++row) {
+    for (metal::uint row = 0; row < rows_per_lane; ++row) {
         #pragma clang loop unroll(full)
-        for (metal::uint t = 0; t < tokens; ++t) sums[row][t] = 0.0f;
+        for (metal::uint i = 0; i < 2 * steps; ++i) sums[row][i] = 0.0f;
     }
-    for (metal::uint block = lane / 8; block < blocks; block += 4) {
+    for (metal::uint block = pair / 8; block < blocks; block += 2) {
         // The trits are exact in half; holding them as half halves their
         // registers, and every use widens them back into an F32 FMA, so the
         // outputs are bit-identical to F32 factors. Measured on M4 Pro
         // (17408x5120 / 5120x17408), 2/3/4 tokens went from 200/256/324 and
         // 197/259/344 us to 191/235/281 and 194/237/286 us, and with the
         // half-prefix decoder (same trits) to 152/192/231 and 155/194/238 us.
-        half factors[rows_per_group][16];
-        float scales[rows_per_group];
+        half factors[rows_per_lane][16];
+        float scales[rows_per_lane];
         #pragma clang loop unroll(full)
-        for (metal::uint row = 0; row < rows_per_group; ++row) {
+        for (metal::uint row = 0; row < rows_per_lane; ++row) {
             // Clamp to a real row: the value is discarded below, nothing is
             // read out of range.
             const metal::uint source = metal::min(first_row + row, rows - 1);
             const metal::ulong packed_block = metal::ulong(source) * blocks + block;
-            // Decoded inline: through bonsai_ptq1_factors the same arithmetic
-            // measured 193 rather than 188 us at three tokens.
+            // Bytes 2 * part, 2 * part + 1 and 16 + part contribute five trits
+            // each, exact in half (balanced-prefix decode, bonsai_projection.h),
+            // then the qh byte contributes one. The qh trit keeps the F32
+            // floor: half prefixes from per-lane constants measured 1-3% slower
+            // at four rows, 16-bit integer digits the same.
             #pragma clang loop unroll(full)
             for (metal::uint k = 0; k < 3; ++k) {
                 const metal::uint byte = k < 2 ? 2 * part + k : 16 + part;
@@ -137,90 +138,48 @@ static inline void bonsai_ptq1_small_batch_impl(
             scales[row] = packed.scale(packed_block);
         }
         #pragma clang loop unroll(full)
-        for (metal::uint t = 0; t < tokens; ++t) {
-            float values[16];
-            bonsai_ptq1_values(input, input_base + metal::ulong(t) * columns, block, part, values);
+        for (metal::uint step = 0; step < steps; ++step) {
+            // An odd last token is loaded by both lanes of the pair.
+            const bool paired = 2 * step + 1 < tokens;
+            const metal::uint token = 2 * step + (paired ? slice : 0);
+            float own[16];
+            bonsai_ptq1_values(input, input_base + metal::ulong(token) * columns, block, part, own);
             #pragma clang loop unroll(full)
-            for (metal::uint row = 0; row < rows_per_group; ++row) {
-                float total = 0.0f;
+            for (metal::uint m = 0; m < (paired ? 2u : 1u); ++m) {
+                float values[16];
                 #pragma clang loop unroll(full)
-                for (metal::uint i = 0; i < 16; ++i) total += float(factors[row][i]) * values[i];
-                sums[row][t] += total * scales[row];
+                for (metal::uint i = 0; i < 16; ++i) {
+                    values[i] = m == 0 ? own[i] : metal::simd_shuffle_xor(own[i], 1);
+                }
+                #pragma clang loop unroll(full)
+                for (metal::uint row = 0; row < rows_per_lane; ++row) {
+                    float total = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (metal::uint i = 0; i < 16; ++i) {
+                        total += float(factors[row][i]) * values[i];
+                    }
+                    sums[row][2 * step + m] += total * scales[row];
+                }
             }
         }
     }
     #pragma clang loop unroll(full)
-    for (metal::uint row = 0; row < rows_per_group; ++row) {
+    for (metal::uint row = 0; row < rows_per_lane; ++row) {
         #pragma clang loop unroll(full)
-        for (metal::uint t = 0; t < tokens; ++t) {
-            const float total = metal::simd_sum(sums[row][t]);
-            if (lane == 0 && first_row + row < rows) {
-                output[output_base + metal::ulong(t) * rows + first_row + row] = total;
-            }
-        }
-    }
-}
-
-// Two tokens: both input rows stay in registers and each row is decoded and
-// used at once (16 * tokens + 16 live values per lane instead of
-// 16 * rows_per_group + 16). Same arithmetic in the same order as above, so
-// bit-identical. Each loop order falls off a register cliff in the other's
-// range: on M4 Pro (17408x5120) this one measured 140 / 236 / 360 us at
-// 2 / 3 / 4 tokens against 145 / 188 / 228 us for the kernel above.
-template<
-    metal::uint tokens, metal::uint rows_per_group,
-    typename Packed, typename Input, typename Output>
-static inline void bonsai_ptq1_small_batch_pair_impl(
-    Packed packed,
-    Input input,
-    Output output,
-    metal::uint rows,
-    metal::uint columns,
-    metal::uint first_token,
-    metal::uint group,
-    metal::uint lane
-) {
-    const metal::uint first_row = group * rows_per_group;
-    const metal::uint blocks = columns / 128;
-    const metal::uint part = lane & 7;
-    const metal::ulong input_base = metal::ulong(first_token) * columns;
-    const metal::ulong output_base = metal::ulong(first_token) * rows;
-    float sums[rows_per_group][tokens];
-    #pragma clang loop unroll(full)
-    for (metal::uint row = 0; row < rows_per_group; ++row) {
-        #pragma clang loop unroll(full)
-        for (metal::uint t = 0; t < tokens; ++t) sums[row][t] = 0.0f;
-    }
-    for (metal::uint block = lane / 8; block < blocks; block += 4) {
-        float values[tokens][16];
-        #pragma clang loop unroll(full)
-        for (metal::uint t = 0; t < tokens; ++t) {
-            bonsai_ptq1_values(
-                input, input_base + metal::ulong(t) * columns, block, part, values[t]);
-        }
-        #pragma clang loop unroll(full)
-        for (metal::uint row = 0; row < rows_per_group; ++row) {
-            const metal::uint source = metal::min(first_row + row, rows - 1);
-            const metal::ulong packed_block = metal::ulong(source) * blocks + block;
-            half factors[16];
-            bonsai_ptq1_factors(packed, packed_block, part, factors);
-            const float scale = packed.scale(packed_block);
+        for (metal::uint step = 0; step < steps; ++step) {
+            const bool paired = 2 * step + 1 < tokens;
             #pragma clang loop unroll(full)
-            for (metal::uint t = 0; t < tokens; ++t) {
-                float total = 0.0f;
+            for (metal::uint m = 0; m < (paired ? 2u : 1u); ++m) {
+                // Sum the sixteen lanes that share this lane's slice.
+                float total = sums[row][2 * step + m];
                 #pragma clang loop unroll(full)
-                for (metal::uint i = 0; i < 16; ++i) total += float(factors[i]) * values[t][i];
-                sums[row][t] += total * scale;
-            }
-        }
-    }
-    #pragma clang loop unroll(full)
-    for (metal::uint row = 0; row < rows_per_group; ++row) {
-        #pragma clang loop unroll(full)
-        for (metal::uint t = 0; t < tokens; ++t) {
-            const float total = metal::simd_sum(sums[row][t]);
-            if (lane == 0 && first_row + row < rows) {
-                output[output_base + metal::ulong(t) * rows + first_row + row] = total;
+                for (metal::uint distance = 2; distance < 32; distance *= 2) {
+                    total += metal::simd_shuffle_xor(total, distance);
+                }
+                const metal::uint token = 2 * step + (paired ? slice ^ m : 0);
+                if (pair == 0 && first_row + row < rows) {
+                    output[output_base + metal::ulong(token) * rows + first_row + row] = total;
+                }
             }
         }
     }
