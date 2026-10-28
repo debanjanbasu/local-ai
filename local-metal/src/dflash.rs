@@ -5,9 +5,9 @@
 //! ([`crate::bonsai::BonsaiKernels::int8_matmul`]) and its output head the
 //! target's `PTQ1_0` kernels; this module encodes the rest of the pass:
 //! norms, the grouped dynamic convolutions, rotary embeddings, the context
-//! K/V ring, block attention, the candidate lattice and the tree. Like every
-//! kernel set here, encoding only records work: the caller completes the
-//! batch before reading results.
+//! K/V ring, block attention, the reduced output head's candidate merge, the
+//! candidate lattice and the tree. Like every kernel set here, encoding only
+//! records work: the caller completes the batch before reading results.
 
 use core::ffi::c_void;
 use std::ptr::NonNull;
@@ -37,6 +37,8 @@ pub const DFLASH_BLOCK: usize = 8;
 pub const DFLASH_SLOTS: usize = DFLASH_BLOCK - 1;
 /// Candidates per draft position.
 pub const DFLASH_TOPK: usize = 16;
+/// Most added tokens [`DflashKernels::head_merge`] merges (`DF_MAX_SPECIALS`).
+pub const DFLASH_MAX_SPECIALS: usize = 48;
 /// Rank of the candidate selector's codebooks.
 pub const DFLASH_RANK: usize = 256;
 /// Width of one grouped-convolution kernel projection: two halves (before and
@@ -56,11 +58,12 @@ pub const DFLASH_MAX_POSITION: usize = 1 << 18;
 /// The candidate lattice of one drafting pass, as the GPU writes it.
 ///
 /// `cand[s][k]` is draft position `s`'s `k`-th best token (best first) by the
-/// drafter's logits through the shared output head, `logit[s][k]` that raw
-/// logit; `edges[s][j][k]` is the selector's pairwise score of candidate `k`
-/// after candidate `j` of position `s - 1` (after the anchor for `s = 0`,
-/// identical for every `j`), and `cond_logq[s][j][k]` the conditional log
-/// probability `log_softmax_k(logit[s][k] + edges[s][j][k])` the tree uses.
+/// drafter's logits through the rows of the shared output head it scores,
+/// `logit[s][k]` that raw logit; `edges[s][j][k]` is the selector's pairwise
+/// score of candidate `k` after candidate `j` of position `s - 1` (after the
+/// anchor for `s = 0`, identical for every `j`), and `cond_logq[s][j][k]` the
+/// conditional log probability `log_softmax_k(logit[s][k] + edges[s][j][k])`
+/// the tree uses.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct DflashLattice {
@@ -161,6 +164,7 @@ pub struct DflashKernels {
     ctx_store: Pipeline,
     attention_partial: Pipeline,
     attention_reduce: Pipeline,
+    head_merge: Pipeline,
     lattice: Pipeline,
     tree: Pipeline,
 }
@@ -222,6 +226,7 @@ impl DflashKernels {
             ctx_store: pipeline("dflash_ctx_store")?,
             attention_partial: pipeline("dflash_attention_partial")?,
             attention_reduce: pipeline("dflash_attention_reduce")?,
+            head_merge: pipeline("dflash_head_merge")?,
             lattice: pipeline("dflash_lattice")?,
             tree: pipeline("dflash_tree")?,
         })
@@ -527,6 +532,49 @@ impl DflashKernels {
             set(encoder, &chunks32, 3);
         }
         dispatch(encoder, (DFLASH_Q_HEADS, DFLASH_BLOCK), DFLASH_HEAD_DIM);
+        batch.record_dispatch();
+        Ok(())
+    }
+
+    /// The reduced output head's top 16 per draft position: the top-16
+    /// selections `top` of the first token ids (rows of [`MAX_TOP_K`]
+    /// `TopKCandidate`s) merged with the logits `special` `[7, specials]` of
+    /// the added tokens `special_first..special_first + specials`, into rows
+    /// of the same stride in `merged`, ranked as the top-k kernels rank.
+    #[expect(unsafe_code)]
+    pub fn head_merge(
+        &self,
+        batch: &mut CommandBatch,
+        top: &MetalBuffer,
+        special: &MetalBuffer,
+        special_first: u32,
+        specials: usize,
+        merged: &MetalBuffer,
+    ) -> crate::Result<()> {
+        need(top, 0, DFLASH_SLOTS * MAX_TOP_K * 8)?;
+        need(special, 0, DFLASH_SLOTS * specials * 4)?;
+        need(merged, 0, DFLASH_SLOTS * MAX_TOP_K * 8)?;
+        if !(1..=DFLASH_MAX_SPECIALS).contains(&specials) || same(top, merged) {
+            return Err(arg(
+                "added tokens must be 1..=48 and the merge must not alias",
+            ));
+        }
+        let (stride, specials) = (MAX_TOP_K as u32, specials as u32);
+        let encoder = batch.encoder();
+        encoder.setComputePipelineState(&self.head_merge);
+        unsafe {
+            bind(encoder, top, 0, 0);
+            bind(encoder, special, 0, 1);
+            bind(encoder, merged, 0, 2);
+            set(encoder, &stride, 3);
+            set(encoder, &special_first, 4);
+            set(encoder, &specials, 5);
+        }
+        dispatch(
+            encoder,
+            (DFLASH_SLOTS, 1),
+            DFLASH_TOPK + DFLASH_MAX_SPECIALS,
+        );
         batch.record_dispatch();
         Ok(())
     }

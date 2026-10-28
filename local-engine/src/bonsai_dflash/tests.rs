@@ -531,6 +531,207 @@ fn gpu_tree_matches_the_reference() {
     }
 }
 
+/// The merge of the reduced head ranks the first rows' top 16 and the added
+/// tokens' logits as the top-k kernels rank one row holding both: by
+/// `f32::total_cmp`, ties to the lower id, exact bits kept.
+#[test]
+fn head_merge_ranks_as_the_top_k_kernels() {
+    use local_metal::sampling::{MAX_TOP_K, TopKCandidate};
+    let Some((context, shaders)) = gpu() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let kernels = DflashKernels::new(&context, &shaders).expect("kernels");
+    let device = context.device();
+    let mut state = 0x5eed_0fbe_ad00_1234_u64;
+    for trial in 0..8 {
+        let mut top =
+            vec![<TopKCandidate as bytemuck::Zeroable>::zeroed(); DFLASH_SLOTS * MAX_TOP_K];
+        let mut special = vec![0.0_f32; DFLASH_SLOTS * SPECIALS];
+        let mut expected = Vec::new();
+        for s in 0..DFLASH_SLOTS {
+            // Coarse logits, so ties within and across the two sources occur.
+            let logit = |state: &mut u64| (uniform(state) * 8.0).round() - 2.0;
+            let mut row: Vec<TopKCandidate> = (0..DFLASH_TOPK)
+                .map(|k| TopKCandidate {
+                    token_id: (k as u32) * 6_000 + (xorshift(&mut state) % 6_000) as u32,
+                    logit: logit(&mut state),
+                })
+                .collect();
+            if trial == 0 && s == 0 {
+                row[3].logit = -0.0;
+                row[4].logit = 0.0;
+            }
+            row.sort_by(|a, b| {
+                b.logit
+                    .total_cmp(&a.logit)
+                    .then(a.token_id.cmp(&b.token_id))
+            });
+            top[s * MAX_TOP_K..s * MAX_TOP_K + DFLASH_TOPK].copy_from_slice(&row);
+            for (index, value) in special[s * SPECIALS..(s + 1) * SPECIALS]
+                .iter_mut()
+                .enumerate()
+            {
+                *value = if index % 5 == 0 {
+                    logit(&mut state)
+                } else {
+                    -30.0
+                };
+                row.push(TopKCandidate {
+                    token_id: SPECIAL_FIRST + index as u32,
+                    logit: *value,
+                });
+            }
+            row.sort_by(|a, b| {
+                b.logit
+                    .total_cmp(&a.logit)
+                    .then(a.token_id.cmp(&b.token_id))
+            });
+            expected.push(row[..DFLASH_TOPK].to_vec());
+        }
+        let top = MetalBuffer::from_slice(device, &top).expect("top");
+        let special = MetalBuffer::from_slice(device, &special).expect("special");
+        let merged = MetalBuffer::empty(
+            device,
+            DFLASH_SLOTS * MAX_TOP_K * size_of::<TopKCandidate>(),
+        )
+        .expect("merged");
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        kernels
+            .head_merge(&mut batch, &top, &special, SPECIAL_FIRST, SPECIALS, &merged)
+            .expect("encode merge");
+        batch.commit_and_wait().expect("merge");
+        // SAFETY: the batch completed; nothing else uses the buffer.
+        let merged = unsafe { merged.as_slice::<TopKCandidate>().to_vec() };
+        for (s, expected) in expected.iter().enumerate() {
+            assert_eq!(
+                &merged[s * MAX_TOP_K..s * MAX_TOP_K + DFLASH_TOPK],
+                expected.as_slice(),
+                "trial {trial}, slot {s}"
+            );
+        }
+    }
+}
+
+/// On the real head, the reduced head drafts what the full head would among
+/// the ids it scores: every candidate is a scored id carrying the full
+/// head's logit for it, and no scored id left out beats the 16th. The full
+/// head, which drafts the full head's best of every id, takes the passes
+/// until `REDUCED_HEAD_ANCHORS` consecutive anchors were scored ids, after a
+/// reset and after an anchor the reduced head lacks.
+#[test]
+#[ignore = "requires the Bonsai GGUF, the installed drafter and a Metal device"]
+#[expect(clippy::too_many_lines)]
+fn draft_head_scores_the_full_heads_best_tokens() {
+    use local_metal::bonsai::BonsaiKernels;
+
+    let package = crate::bonsai::BonsaiPackage::open(crate::bonsai::DEFAULT_BONSAI_GGUF)
+        .expect("open Bonsai GGUF");
+    let (context, shaders) = gpu().expect("Metal");
+    let kernels = BonsaiKernels::new(&context, &shaders).expect("kernels");
+    let embedding = package
+        .metal_tensor(context.device(), "token_embd.weight")
+        .expect("embedding");
+    let output = package
+        .metal_tensor(context.device(), "output.weight")
+        .expect("output");
+    let rotation = package.hadamard().upload(&context, 5120).expect("signs");
+    let shared = DflashShared {
+        kernels: &kernels,
+        embedding: embedding.ptq1_matrix().expect("embedding matrix"),
+        output: output.ptq1_matrix().expect("output matrix"),
+        rotation: &rotation,
+    };
+    let mut drafter = DflashDrafter::load(
+        &context,
+        &shaders,
+        Path::new(DEFAULT_BONSAI_DFLASH_ARTIFACT),
+    )
+    .expect("drafter");
+    let logits = MetalBuffer::empty(context.device(), DFLASH_SLOTS * VOCAB * 4).expect("logits");
+    // After a reset: `def`, ` the`, `<think>`, `</think>`, `<tool_call>`, the
+    // end of turn, `def` and ` the` (the eighth scored anchor switches to the
+    // reduced head), `\n\n` (reduced); ` hered`, which the reduced head lacks
+    // (full), `def` (full); after a reset, `def` (full).
+    let anchors = [
+        (727, true, true),
+        (279, false, true),
+        (248_068, false, true),
+        (248_069, false, true),
+        (248_058, false, true),
+        (248_046, false, true),
+        (727, false, true),
+        (279, false, false),
+        (271, false, false),
+        (245_083, false, true),
+        (727, false, true),
+        (727, true, true),
+    ];
+    for (anchor, reset, expect_full) in anchors {
+        if reset {
+            drafter.reset();
+        }
+        drafter
+            .draft_and_wait(
+                &context,
+                &shared,
+                &DraftAnchor::Token(anchor),
+                0,
+                DFLASH_MAX_TREE_ROWS,
+            )
+            .expect("draft");
+        assert_eq!(drafter.scored_full_head(), expect_full, "anchor {anchor}");
+        let scored = |id: u32| expect_full || reduced_head_scores(id);
+        let lattice = drafter.read_lattice();
+        let mut batch = CommandBatch::new(&context).expect("batch");
+        kernels
+            .matmul(
+                &mut batch,
+                shared.output,
+                drafter.rotated_rows(),
+                &logits,
+                DFLASH_SLOTS as u32,
+            )
+            .expect("full head");
+        batch.commit_and_wait().expect("full head");
+        // SAFETY: the batch completed; nothing else uses the buffer.
+        let full = unsafe { logits.as_slice::<f32>().to_vec() };
+        for s in 0..DFLASH_SLOTS {
+            let row = &full[s * VOCAB..(s + 1) * VOCAB];
+            let candidates = &lattice.cand[s];
+            for (k, &id) in candidates.iter().enumerate() {
+                assert!(
+                    scored(id),
+                    "anchor {anchor} slot {s}: id {id} is not scored"
+                );
+                let (logit, reference) = (lattice.logit[s][k], row[id as usize]);
+                if expect_full || (id as usize) < HEAD_ROWS {
+                    assert_eq!(
+                        logit.to_bits(),
+                        reference.to_bits(),
+                        "anchor {anchor} slot {s}"
+                    );
+                } else {
+                    assert!((logit - reference).abs() < 1e-3, "anchor {anchor} slot {s}");
+                }
+                if k > 0 {
+                    assert!(lattice.logit[s][k - 1] >= logit, "anchor {anchor} slot {s}");
+                }
+            }
+            let last = lattice.logit[s][DFLASH_TOPK - 1];
+            for (id, &logit) in row.iter().enumerate() {
+                let id = id as u32;
+                if scored(id) && !candidates.contains(&id) {
+                    assert!(
+                        logit <= last + 1e-3,
+                        "anchor {anchor} slot {s}: id {id} ({logit}) beats the 16th ({last})"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn trace_dir() -> Option<PathBuf> {
     std::env::var_os("DFLASH_TRACE").map(PathBuf::from)
 }
