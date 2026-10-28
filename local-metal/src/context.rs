@@ -1,11 +1,13 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::sel;
+use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLResidencySet, MTLResidencySetDescriptor,
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResourceOptions,
 };
 
 use crate::Error;
@@ -38,6 +40,7 @@ pub struct DeviceCaps {
 pub struct MetalContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    residency: QueueResidency,
 }
 
 impl MetalContext {
@@ -45,7 +48,16 @@ impl MetalContext {
     pub fn new() -> crate::Result<Self> {
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::NoMetalDevice)?;
         let queue = device.newCommandQueue().ok_or(Error::NoCommandQueue)?;
-        Ok(Self { device, queue })
+        let residency = QueueResidency {
+            device: device.clone(),
+            queue: queue.clone(),
+            sets: Arc::default(),
+        };
+        Ok(Self {
+            device,
+            queue,
+            residency,
+        })
     }
 
     /// Get the Metal device.
@@ -118,7 +130,8 @@ impl MetalContext {
     /// the returned set lives. Without one, Metal evicts an allocation no
     /// command buffer has used for about a second, and the next command
     /// buffer that uses it pays to make it resident again in the driver
-    /// before the GPU starts. `None` where residency sets are unavailable
+    /// before the GPU starts. A set only holds while the GPU stays in use
+    /// (see [`QueueResidency`]). `None` where residency sets are unavailable
     /// (before macOS 15).
     ///
     /// # Errors
@@ -146,12 +159,24 @@ impl MetalContext {
             set.addAllocation(ProtocolObject::from_ref(buffer.raw()));
         }
         set.commit();
-        set.requestResidency();
-        self.queue.addResidencySet(&set);
+        let mut sets = self.residency.lock();
+        if !sets.suspended {
+            set.requestResidency();
+            self.queue.addResidencySet(&set);
+        }
+        sets.sets.push(Set(set.clone()));
+        drop(sets);
         Ok(Some(ResidencySet {
             set,
-            queue: self.queue.clone(),
+            residency: self.residency.clone(),
         }))
+    }
+
+    /// The queue's residency sets, for a thread that keeps them resident
+    /// between requests or lets them go.
+    #[must_use]
+    pub fn residency(&self) -> QueueResidency {
+        self.residency.clone()
     }
 }
 
@@ -159,13 +184,119 @@ impl MetalContext {
 /// lets Metal evict them again.
 pub struct ResidencySet {
     set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    residency: QueueResidency,
 }
 
 impl Drop for ResidencySet {
     fn drop(&mut self) {
-        self.queue.removeResidencySet(&self.set);
-        self.set.endResidency();
+        let mut sets = self.residency.lock();
+        sets.sets
+            .retain(|set| Retained::as_ptr(&set.0) != Retained::as_ptr(&self.set));
+        if !sets.suspended {
+            self.residency.queue.removeResidencySet(&self.set);
+            self.set.endResidency();
+        }
+    }
+}
+
+/// Every residency set of one command queue, shareable with another thread.
+///
+/// A residency set holds only while the GPU is in use. After 2-3 s with no
+/// command buffer the driver lets the process's residency go (wired memory
+/// falls back), and the next command buffer makes every set on the queue
+/// resident again before it starts: 123-136 ms for Bonsai's target and
+/// drafter weights, which made a request after a 5 s pause slower than
+/// without the sets. [`Self::ping`] at a shorter period keeps the sets
+/// resident; [`Self::suspend`] takes them off the queue so Metal may evict
+/// and unwire them, and [`Self::resume`] puts them back.
+#[derive(Clone)]
+pub struct QueueResidency {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    sets: Arc<Mutex<Sets>>,
+}
+
+#[derive(Default)]
+struct Sets {
+    sets: Vec<Set>,
+    /// Whether the sets are off the queue.
+    suspended: bool,
+}
+
+struct Set(Retained<ProtocolObject<dyn MTLResidencySet>>);
+
+// SAFETY: Metal objects may be transferred between threads; a `Set` is only
+// used under the `Sets` mutex.
+#[expect(unsafe_code)]
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "Metal objects are thread-safe to transfer; access is serialized"
+)]
+unsafe impl Send for Set {}
+
+impl QueueResidency {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Sets> {
+        self.sets.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Commit a command buffer that clears 16 bytes, and wait for it. (An
+    /// empty one holds nothing: after it the next command buffer still
+    /// waited 122 ms.)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BufferAllocation`] or [`Error::CommandBuffer`] if
+    /// Metal cannot create the buffer or the command buffer, or reports an
+    /// error.
+    pub fn ping(&self) -> crate::Result<()> {
+        const BYTES: usize = 16;
+        let buffer = self
+            .device
+            .newBufferWithLength_options(BYTES, MTLResourceOptions::StorageModePrivate)
+            .ok_or_else(|| Error::BufferAllocation {
+                size: BYTES,
+                reason: "newBufferWithLength returned nil".to_owned(),
+            })?;
+        let cmd_buf = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| Error::CommandBuffer("Failed to create command buffer".to_owned()))?;
+        let encoder = cmd_buf
+            .blitCommandEncoder()
+            .ok_or_else(|| Error::CommandBuffer("Failed to create blit encoder".to_owned()))?;
+        encoder.fillBuffer_range_value(&buffer, NSRange::new(0, BYTES), 0);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        cmd_buf.error().map_or(Ok(()), |err| {
+            Err(Error::CommandBuffer(format!("GPU error: {err}")))
+        })
+    }
+
+    /// Take every set off the queue and end its residency.
+    pub fn suspend(&self) {
+        let mut sets = self.lock();
+        if sets.suspended {
+            return;
+        }
+        for set in &sets.sets {
+            self.queue.removeResidencySet(&set.0);
+            set.0.endResidency();
+        }
+        sets.suspended = true;
+    }
+
+    /// Put suspended sets back on the queue.
+    pub fn resume(&self) {
+        let mut sets = self.lock();
+        if !sets.suspended {
+            return;
+        }
+        for set in &sets.sets {
+            set.0.requestResidency();
+            self.queue.addResidencySet(&set.0);
+        }
+        sets.suspended = false;
     }
 }
 
@@ -208,5 +339,26 @@ mod tests {
     fn create_command_buffer() {
         let Some(ctx) = gpu_or_skip() else { return };
         let _cb = ctx.new_command_buffer().expect("create command buffer");
+    }
+
+    #[test]
+    fn sets_made_or_dropped_while_suspended_follow_the_queue() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        let buffer = MetalBuffer::empty(ctx.device(), 4096).expect("buffer");
+        let residency = ctx.residency();
+        let Some(kept) = ctx.keep_resident([&buffer]).expect("set") else {
+            return;
+        };
+        residency.suspend();
+        let later = ctx.keep_resident([&buffer]).expect("set");
+        assert_eq!(residency.lock().sets.len(), 2);
+        drop(kept);
+        assert_eq!(residency.lock().sets.len(), 1);
+        residency.ping().expect("ping while suspended");
+        residency.resume();
+        assert!(!residency.lock().suspended);
+        drop(later);
+        assert!(residency.lock().sets.is_empty());
+        residency.ping().expect("ping");
     }
 }

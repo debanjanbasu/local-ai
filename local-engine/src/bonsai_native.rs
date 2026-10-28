@@ -20,7 +20,7 @@ use local_metal::bonsai_ops::{
     MAX_PREFILL_TOKENS, Rope,
 };
 use local_metal::buffer::MetalBuffer;
-use local_metal::context::{DeviceCaps, MetalContext};
+use local_metal::context::{DeviceCaps, MetalContext, ResidencySet};
 use local_metal::draft::GreedyRows;
 use local_metal::sampling::{GpuTopK, LogprobRows, TopKCandidate, TopKRows};
 use local_metal::shaders::ShaderLibrary;
@@ -43,6 +43,7 @@ pub mod capture;
 mod checkpoint;
 mod kflash;
 mod layers;
+mod resident;
 mod speculation;
 mod tape;
 mod taps;
@@ -861,6 +862,11 @@ pub struct BonsaiModel {
     /// Where tape folds leave the pending rows convolved, a tape's rows per
     /// sequence of a batched step.
     tape_scratch: MetalBuffer,
+    /// The checkpoint's weights in a residency set on the queue; `None`
+    /// before macOS 15.
+    weights_resident: Option<ResidencySet>,
+    /// Keeps the queue's residency sets resident between requests.
+    resident: Option<resident::Resident>,
 }
 
 impl BonsaiModel {
@@ -1082,9 +1088,15 @@ impl BonsaiModel {
             ane,
             tape: tape::Tape::new(&context, RECURRENT_LAYERS)?,
             tape_scratch: MetalBuffer::empty(context.device(), TAPE_SCRATCH_BYTES)?,
+            weights_resident: None,
+            resident: None,
             context,
             package,
         };
+        model.weights_resident = model.context.keep_resident(model.weight_buffers())?;
+        if model.weights_resident.is_some() {
+            model.resident = Some(resident::Resident::start(model.context.residency())?);
+        }
         if let Some((path, name)) = drafter {
             model.enable_kflash(path, name)?;
         }
@@ -1096,7 +1108,46 @@ impl BonsaiModel {
     fn finish(&self, batch: CommandBatch) -> crate::Result<()> {
         let gpu = batch.commit_async().wait_with_gpu_time()?;
         self.gpu_time.set(self.gpu_time.get().saturating_add(gpu));
+        if let Some(resident) = &self.resident {
+            resident.touch();
+        }
         Ok(())
+    }
+
+    /// Every checkpoint tensor the layers and the output read.
+    fn weight_buffers(&self) -> Vec<&MetalBuffer> {
+        let mut buffers = vec![self.output.buffer(), &self.output_norm];
+        for layer in &self.layers {
+            buffers.extend([
+                &layer.attention_norm,
+                &layer.post_attention_norm,
+                layer.gate.buffer(),
+                layer.up.buffer(),
+                layer.down.buffer(),
+            ]);
+            match &layer.attention {
+                AttentionLayer::Full(full) => buffers.extend([
+                    full.query_gate.buffer(),
+                    full.key.buffer(),
+                    full.value.buffer(),
+                    &full.query_norm,
+                    &full.key_norm,
+                    full.output.buffer(),
+                ]),
+                AttentionLayer::Recurrent(recurrent) => buffers.extend([
+                    recurrent.qkv.buffer(),
+                    recurrent.gate.buffer(),
+                    recurrent.alpha.buffer(),
+                    recurrent.beta.buffer(),
+                    &recurrent.convolution,
+                    &recurrent.decay,
+                    &recurrent.dt,
+                    &recurrent.norm,
+                    recurrent.output.buffer(),
+                ]),
+            }
+        }
+        buffers
     }
 
     /// GPU-busy time accumulated since the previous call, then reset to zero.

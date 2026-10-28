@@ -2470,6 +2470,9 @@ All choices and reasons are reported in startup JSON.
 - **Host snapshots:** disabled when the startup write probe measures at least
   500 MiB/s, making the integrity-checked disk tier the first durable tier;
   otherwise capped at one quarter of remaining headroom or 4 GiB.
+- **Residency:** the target's weights and the drafter's buffers stay
+  resident, and wired, until 60 s after the model's last command buffer or
+  until the kernel reports memory pressure ([Memory](#memory)).
 - **Server:** queue capacity is eight. HTTP/3 is enabled only when its
   certificate and key are discovered.
 
@@ -2827,7 +2830,9 @@ best of four interleaved runs with a cold prompt cache), and through
 21-24 ms each request's first drafting pass no longer waits through `serve`,
 which also no longer counts against the tree's first measured cycle. The
 earlier residency-set trial (Tried and rejected) held the target's weights,
-which every decode step uses anyway.
+which every decode step uses anyway. A residency set holds only while the
+GPU stays in use; [Memory](#memory) describes how the target's weights and
+these sets are now kept resident between requests.
 
 Batched serving keeps its passes as they were: no taps, no trees, head and
 lookup drafts priced by the cost model. A sequence that becomes the only one
@@ -3486,6 +3491,65 @@ GB for a 2,573-token prompt and 128 tokens. Maximum resident set size,
 which counts the drafter's mapped pages, is 2.69 and 2.84 against
 0.64-0.67 and 0.77-0.80 GB. Loading takes 3.2-3.3 s against 0.3 s: the
 drafter's payload digest and the verify and drafting cost measurement.
+
+Between requests the weights stay resident, and wired, for a minute. Metal
+evicts an allocation no command buffer has used for about a second, and
+after 2-3 s with the GPU unused it lets the process's whole residency go,
+residency sets included: wired memory falls back to its idle level. The
+next command buffer that uses an evicted allocation waits in the driver
+(`kernelEndTime − kernelStartTime`, logged per command buffer beside its
+GPU time) while it is made resident again, with the GPU idle. Through
+`serve`, a 61-token request's first four command buffers (whose GPU time,
+about 510 ms, is all before its first token) waited 59-76 ms in all after a
+2 s pause and 85-120 ms after 5 or 30 s, against 7-17 ms with the change
+below. The target's weights (every checkpoint tensor the layers and the
+output read) now sit in a residency set on the command queue beside the
+drafter's, and within 60 s of the model's last command buffer a side thread
+commits one that clears 16 bytes a second after the later of that and its
+own previous one, which keeps every set on the queue resident
+(`bonsai_native/resident.rs`). Time to first token, greedy, 32 tokens, cold
+prompt cache, two interleaved server runs of each build, each pause
+three times per run:
+
+| Pause before the request | Before (median) | After (median) |
+| --- | ---: | ---: |
+| 2 s | 653-671 ms (665) | 642-654 ms (648) |
+| 5 s | 696-722 ms (706) | 648-661 ms (654) |
+| 30 s | 681-708 ms (691) | 646-655 ms (649) |
+| 70 s, past the window | 677-699 ms (688) | 685-710 ms (697) |
+
+Repeating one prompt, so that each request restores its GPU checkpoint and
+lookup drafts the whole previous answer into one verify block, one server
+run each: 444 and 452 ms after 2 s, 475 and 478 after 5 s and 463 after
+30 s became 383-397 ms. A prompt of about 1,000 tokens, prefilled with the
+Neural Engine, was unchanged (2.89-3.07 s against 2.89-3.09 s, measured
+with the 800 ms keepalive of Tried and rejected): its waiting overlaps the
+Neural Engine's work, which has its own keepalive.
+
+Past the window, or whenever the kernel reports memory pressure
+(`kern.memorystatus_vm_pressure_level` warning or critical, read before each
+clear), the thread takes every set off the queue and Metal unwires them;
+the model's next command buffer puts them back once it has run. Without
+that, the first command buffer after an idle release made every set
+resident at once before anything ran (see Tried and rejected), so the 70 s
+request waits as it did before. Decode is unchanged: 36.45, 36.14 and
+38.94 against 36.36, 38.58 and 36.45 tok/s for a 67-token prompt and 300
+tokens, the same tokens, as are loading (2.6-2.7 s) and maximum resident
+set size (2.64-2.65 GB); peak footprint measured 1.53-1.54 against 1.48-1.52
+GB. Through `serve` the peak footprint (5.69-5.71 GB) and maximum resident
+set size (11.1-11.2 GB, which count the embedding, speech and transcription
+models as well) are unchanged. The cost is wired memory while the window
+lasts. A request wires about 9.5 GB either way (system wired 2.8 to 12.3
+GB here, mostly the mapped checkpoint and the drafter); before, it fell
+back about 3 s after the request, and now it stays 8.1 GB above idle (10.9
+GB) until 60 s after the last command buffer, then falls back within 2 s of
+the window's end. The footprint also stays about 80 MB higher meanwhile
+(5.17 against 5.08-5.10 GB 5 s after a request): graphics memory
+`footprint` lists as owned and unmapped, 80 MB dirty, which it shows as
+36 MB reclaimable once the residency has gone. On a 16 GB Mac the
+window's wired memory is about half the machine; the pressure check gives
+it back within a second of the kernel reporting pressure, which was not
+measured on such a machine.
 
 The GDN tape (see [Lossless speculation](#lossless-speculation)) keeps
 31.8 MB per sequence, for the resident sequence and for each parked batched
@@ -4771,6 +4835,22 @@ of roughly 17–25 tok/s come from earlier kernels (17.5 tok/s plain decode at
 about 22 before the half-prefix decoder) and compare only within
 their own entry, not with current rates.
 
+- Holding the target resident between requests other ways (October 2026,
+  see [Memory](#memory)), a 61-token request through `serve` in one
+  session, against 718-754 ms to the first token before. A residency set
+  for the checkpoint's weights alone, without the keepalive, made a request
+  after 2 s faster (651 and 663 ms, its first four command buffers waiting
+  11-24 ms in the driver against 110-118) but one after 5 or 30 s slower
+  (774-792 ms): Metal had let the sets go, and the first command buffer, a
+  0.06 ms one, waited 123-136 ms while every set, the target's and the
+  drafter's, was made resident at once before anything ran, where evicted
+  allocations otherwise come back while earlier command buffers run. The
+  keepalive without the weights' set: 693-712 ms, the weights still evicted
+  after a second. An empty command buffer as the keepalive does not reach
+  the GPU: the first command buffer after 5 s still waited 122 ms (771 ms).
+  No residency set at all, as before the drafter's: 708-744 ms. The
+  keepalive every 800 ms with the weights' set measured 652-657 ms at every
+  pause, as the shipped one-second period does.
 - Other cuts of the [reduced draft head](#reduced-draft-head) (October
   2026), the 13 English and agent texts' 5,867 anchors, 8-row calibrated
   tree, against the full head's 4.2605 tokens per cycle and 12.39 ms pass:
@@ -4960,7 +5040,9 @@ their own entry, not with current rates.
   all.
 - Residency sets: 17.23/27.50/48.05 tok/s versus 17.17/27.51/47.98; neutral.
   That set held the target's weights, which plain decode uses every step;
-  the drafter's set ships (see [KFlash cycles](#kflash-cycles)).
+  the drafter's set ships (see [KFlash cycles](#kflash-cycles)), and the
+  weights' set now ships for the time between requests (see
+  [Memory](#memory)).
 - Spending less on `KFlash` trees declined to the head's chain (October
   2026, see [KFlash cycles](#kflash-cycles)): 11 to 22 per 300-token request,
   22-46% of drafted trees, each a 13.3 ms drafting pass for nothing.

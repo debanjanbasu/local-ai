@@ -337,7 +337,12 @@ flag turns any of it off or tunes it.
   alone on it (main measured 2.68 GB there in that A/B, against the
   2.09 GB recorded earlier). The attention Q/K/V weight surfaces add about
   0.2 GB (3.23 → 3.43 GB for a 10,260-token prompt). File-backed weights
-  remain demand-paged.
+  remain demand-paged. Between requests the weights stay resident, and
+  wired (8.1 GB above idle with the drafter's), until 60 s after the last
+  one or until the kernel reports memory pressure; through `serve` that
+  takes 17, 52 and 42 ms (medians) off the first token of a request after
+  a 2, 5 and 30 s pause
+  ([details](docs/BONSAI.md#memory)).
 
 ### Other hardware
 
