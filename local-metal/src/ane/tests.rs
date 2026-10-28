@@ -82,13 +82,21 @@ fn fixture() -> Option<Fixture> {
         })
         .collect();
     let source = program(x.layout(), w.layout(), y.layout());
-    let program = Program::compile(
+    // The client resolves on hosts without a Neural Engine (GitHub's macOS
+    // VMs); only compiling reports the missing hardware.
+    let program = match Program::compile(
         &source,
         &empty_blob(),
         "local-ai-ane-test",
         Duration::from_secs(120),
-    )
-    .expect("compile");
+    ) {
+        Ok(program) => program,
+        Err(error) if error.to_string().contains("ANE hardware not available") => {
+            eprintln!("skipping Neural Engine test: {error}");
+            return None;
+        }
+        Err(error) => panic!("compile: {error:?}"),
+    };
     Some(Fixture {
         context,
         x,
