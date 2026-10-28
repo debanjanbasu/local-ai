@@ -3777,6 +3777,42 @@ run the same kernels as before: six prompts, 300 greedy tokens, plain decode
 30.52 against 30.39 tok/s geomean and speculative 38.02 against 38.12, text
 byte-identical in both modes (the six chat prompts are 27-45 tokens).
 
+The wide kernel, which runs every 5- to 8-row verify block, tree verify
+and batched pass (and the 9- to 55-row blocks in eight-row chunks), then
+got cheaper on every shape, mostly 5120x17408 at eight rows. That shape cost
+235 / 238 / 248 / 281 us at 5 / 6 / 7 / 8 rows against 237 on 17408x5120,
+which has the same bytes and multiplies. Each threadgroup streams all of its
+activations, 512 bytes for every 28 bytes of weights: at eight tokens that
+is 557 KB for 17,408 columns against 164 KB for 5,120, which apparently no
+longer stays cached (token rows past the block repeat a row already loaded,
+hence the knee at seven and eight).
+Now each SIMD group multiplies two eight-row tiles, one activation load
+feeding both multiplies, so that traffic halves; eight SIMD groups split
+the blocks instead of four; and the one qh trit per lane is decoded with
+16-bit integers (`((q * 3^p) & 255) * 3 >> 8`) instead of two F32 floors.
+Matrices of at most 2,048 rows (the 1024-row K/V projections) keep one
+tile per threadgroup, since 64 sixteen-row groups spread unevenly over the
+GPU. Kernel GPU time, µs, best of three interleaved runs, weights rotating
+through 512 MB:
+
+| Projection | 5 rows | 8 rows |
+| --- | ---: | ---: |
+| 17408x5120 | 232.5 → 228.2 | 236.9 → 228.6 |
+| 5120x17408 | 235.3 → 228.3 | 283.3 → 228.6 |
+| 12288x5120 | 165.7 → 163.1 | 169.2 → 163.3 |
+| 10240x5120 | 138.6 → 134.8 | 141.7 → 134.9 |
+| 6144x5120 | 86.1 → 85.6 | 87.6 → 85.7 |
+| 5120x6144 | 84.9 → 82.7 | 85.1 → 82.8 |
+| 1024x5120 | 18.6 → 17.4 | 18.9 → 17.9 |
+
+Two tiles alone took 5120x17408 at eight rows from 281 to 237 with the
+other shapes within 1%; the integer qh trit then gave about 1% and eight
+SIMD groups 0.5-3%. With the trits replaced by constants the new layout takes
+205 us on 17408x5120 at eight rows, so the exact decode now adds about 12%
+to the multiplies and activation loads (3.1 T multiply-adds per second
+including it). The order of the F32 sums changes (eight block partials
+instead of four), not the products, which stay exact.
+
 If the SDK lacks the tensor kernels or the device rejects their attention
 pipelines, startup prints the reason to stderr (`metal: tensor attention
 kernels unavailable, ...`) and continues on the slower SIMD kernels, which
@@ -4854,6 +4890,27 @@ their own entry, not with current rates.
   266-281 at eight rows; the 266, one SIMD group per tile walking every
   block, costs 262 at five rows against 236. 5120×17408 is the one shape
   whose cost grows from five rows (236) to eight (281).
+- Wide-kernel variants around the shipped two-tile layout (each SIMD group
+  multiplies two row tiles off one activation load), M4 Pro, µs at 5 / 8
+  rows on 17408×5120 and 5120×17408. Against two tiles with four SIMD groups
+  (232 / 232 and 237 / 237): four tiles, 235 / 235 and 240 / 241 (registers);
+  a threadgroup lookup table from code byte to five trits for every byte,
+  254 / 260 and 262 / 268 with F32 entries, 224 / 232 and 230 / 236 with half
+  entries (with half W operands the same), so 3% at five rows and nothing at
+  eight, where the random threadgroup loads join the activation loads;
+  tables for one or two of the three qs bytes or for the qh byte alone,
+  within 1-2%; decoding the next block during this block's multiplies,
+  247 / 247 and 247 / 251 (with one tile and four SIMD groups 247 / 253 and
+  247 / 299, against 232 / 237 and 235 / 281); loading
+  the next block's code bytes and scales an iteration ahead, within 0.5%;
+  decoding each tile's trits just before its multiplies from held codes and
+  running prefixes, within 1%; half W operands, within 1%. Against the
+  shipped eight SIMD groups (228 / 229 and 228 / 230): sixteen, 232 / 232 and
+  228 / 228; the half-entry table, 228 / 234 and 227 / 231; one tile, 231 /
+  244 and 235 / 287; `float4` activation loads for tiles 0-9 through a K
+  permutation that makes each lane's two tiles' activations contiguous (11
+  loads per block instead of 16), 227-230 / 227 and 227-229 / 227, about
+  0.7% and within run-to-run spread.
 - Narrower prefill operands (half or BF16 activations, int8 activations
   against the trits), as a way past the large-batch kernel. They cannot be
   faster on this GPU. Chains of 8x8 simdgroup multiplies with no loads

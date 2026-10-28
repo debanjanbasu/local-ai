@@ -227,28 +227,47 @@ static inline void bonsai_ptq1_small_batch_pair_impl(
 }
 
 // Wide variant for 5..8 activation rows, one dispatch instead of two that
-// each re-stream the matrix. A threadgroup covers eight output rows with four
-// SIMD groups splitting the packed blocks; each SIMD group multiplies 8x8
-// simdgroup matrices C[token, row] += X[token, k] * W[k, row]. The W tile holds
-// exact trits (each lane decodes two, rows `fn` and `fn + 1` at element `fm`),
-// so every product is exact before the F32 MMA accumulation; a block's partial
-// sums are scaled once, as in the matvec, then the four SIMD groups' partials
-// are added through threadgroup memory. Token rows past `tokens` repeat the
-// last row and are not stored: row fm of X only reaches row fm of C. Dispatch
-// ceil(rows / 8) groups of 128 threads.
+// each re-stream the matrix. A threadgroup covers `tiles` eight-row tiles of
+// output rows (two, or one for short matrices), with eight SIMD groups
+// splitting the packed blocks; each SIMD group multiplies 8x8 simdgroup
+// matrices C[token, row] += X[token, k] * W[k, row] for every tile, so one
+// activation load feeds `tiles` multiplies. The W tiles hold exact trits
+// (each lane decodes rows `fn` and `fn + 1` of each tile at element `fm`),
+// so every product is exact before the F32 MMA accumulation; a block's
+// partial sums are scaled once, as in the matvec, then the eight SIMD
+// groups' partials are added through threadgroup memory.
+// Token rows past `tokens` repeat the last row and are not stored: row fm of
+// X only reaches row fm of C. Dispatch ceil(rows / (8 * tiles)) groups of
+// 256 threads.
 // The summation order differs from the scalar kernel, so outputs are not bit
 // identical: on random FFN-shaped weights the largest gap measured 1.5e-7 to
 // 2.2e-7 of the largest output magnitude. Half-prefix trit decoding took the
 // FFN shapes from 341-350 to 280-301 us with bit-identical outputs, and one
 // eight-byte activation load per tile (instead of two loads and two selects)
-// to 233-237 / 236-281 us on 17408x5120 / 5120x17408, also bit-identical;
-// the F32 8x8 multiplies remain the limit.
+// to 233-237 / 236-281 us on 17408x5120 / 5120x17408.
+//
+// With one eight-row tile and four SIMD groups per threadgroup, 5120x17408
+// cost 235 us at five rows but 281 at eight (248 at seven), against 237 on
+// 17408x5120 with the same bytes and multiplies: every threadgroup streams
+// all its activations (557 KB at eight tokens of 17,408 columns, 164 KB at
+// 5,120) for 28 bytes of weights per 512 activation bytes, and at eight
+// distinct token rows the wide matrix's activations apparently stop fitting
+// in cache (rows past `tokens` repeat a cached row, hence the knee). Sharing
+// each activation load between two row tiles halves that traffic: 5120x17408
+// at eight rows went from 281 to 237 us and the other shapes stayed within
+// 1%.
+// The qh trit's integer decode below then saved about 1% and eight SIMD
+// groups instead of four 0.5-3%: on M4 Pro, 5 / 8 rows now take 228 / 229 us
+// on both 17408x5120 and 5120x17408 (from 233 / 237 and 235 / 283), 163 / 163
+// on 12288x5120 (from 166 / 169) and 86 / 86 on 6144x5120 (from 86 / 88).
+// With the trits replaced by constants this layout takes 205 us at eight rows
+// on 17408x5120, so the decode adds about 12% to the multiplies and loads.
 //
 // Inside a block K is permuted: tile j holds elements 8j..8j+7, so the X tile
 // is eight contiguous activations per token and the W tile's element 8j + fm
 // comes from byte fm + 8 (j & 1) at power j >> 1 (j < 10), byte 16 + fm at
 // power j - 10 (j < 15), or qh byte 24 + (fm & 1) at power fm >> 1 (j = 15).
-template<typename Packed, typename Input, typename Output>
+template<metal::uint tiles, typename Packed, typename Input, typename Output>
 static inline void bonsai_ptq1_small_batch_wide_impl(
     Packed packed,
     Input input,
@@ -262,75 +281,102 @@ static inline void bonsai_ptq1_small_batch_wide_impl(
     metal::uint lane,
     threadgroup float *shared
 ) {
-    constexpr metal::uint split = 4;
+    constexpr metal::uint split = 8;
     // Lane ownership of simdgroup_float8x8 thread_elements(): row fm,
     // columns fn and fn + 1.
     const metal::uint quad = lane / 4;
     const metal::uint fm = (quad & 4) + ((lane / 2) % 4);
     const metal::uint fn = (quad & 2) * 2 + (lane % 2) * 2;
-    const metal::uint first_row = group * 8;
+    const metal::uint first_row = group * 8 * tiles;
     const metal::uint blocks = columns / 128;
     // Clamp to real rows and tokens: the values are discarded, nothing is read
     // out of range.
-    const metal::ulong row_base[2] = {
-        metal::ulong(metal::min(first_row + fn, rows - 1)) * blocks,
-        metal::ulong(metal::min(first_row + fn + 1, rows - 1)) * blocks};
-    const metal::ulong input_row =
-        metal::ulong(first_token + metal::min(fm, tokens - 1)) * columns + fn;
-    const float power = metal::float4(1.0f, 3.0f, 9.0f, 27.0f)[fm >> 1];
-    float sums[2] = {0.0f, 0.0f};
-    for (metal::uint block = simd; block < blocks; block += split) {
-        half trits[2][16];
-        float scales[2];
+    metal::ulong row_base[tiles][2];
+    #pragma clang loop unroll(full)
+    for (metal::uint t = 0; t < tiles; ++t) {
         #pragma clang loop unroll(full)
         for (metal::uint r = 0; r < 2; ++r) {
-            const metal::ulong packed_block = row_base[r] + block;
-            scales[r] = packed.scale(packed_block);
+            row_base[t][r] =
+                metal::ulong(metal::min(first_row + 8 * t + fn + r, rows - 1)) * blocks;
+        }
+    }
+    const metal::ulong input_row =
+        metal::ulong(first_token + metal::min(fm, tokens - 1)) * columns + fn;
+    // The qh trit at power p is ((q * 3^p) & 255) * 3 >> 8, minus one, in
+    // 16-bit integers: the value bonsai_ptq1_trit gives, the floor formula's
+    // trit without its two quarter-rate F32 floors.
+    const metal::ushort power = metal::ushort4(1, 3, 9, 27)[fm >> 1];
+    float sums[tiles][2] = {};
+    for (metal::uint block = simd; block < blocks; block += split) {
+        half trits[tiles][2][16];
+        float scales[tiles][2];
+        #pragma clang loop unroll(full)
+        for (metal::uint t = 0; t < tiles; ++t) {
             #pragma clang loop unroll(full)
-            for (metal::uint k = 0; k < 3; ++k) {
-                const metal::uint byte = k == 0 ? fm : (k == 1 ? fm + 8 : 16 + fm);
-                half f[5];
-                bonsai_ptq1_trits(bonsai_ptq1_code(packed.code(packed_block, byte)), f);
+            for (metal::uint r = 0; r < 2; ++r) {
+                const metal::ulong packed_block = row_base[t][r] + block;
+                scales[t][r] = packed.scale(packed_block);
                 #pragma clang loop unroll(full)
-                for (metal::uint n = 0; n < 5; ++n) trits[r][k < 2 ? 2 * n + k : 10 + n] = f[n];
+                for (metal::uint k = 0; k < 3; ++k) {
+                    const metal::uint byte = k == 0 ? fm : (k == 1 ? fm + 8 : 16 + fm);
+                    half f[5];
+                    bonsai_ptq1_trits(bonsai_ptq1_code(packed.code(packed_block, byte)), f);
+                    #pragma clang loop unroll(full)
+                    for (metal::uint n = 0; n < 5; ++n) {
+                        trits[t][r][k < 2 ? 2 * n + k : 10 + n] = f[n];
+                    }
+                }
+                const metal::ushort high =
+                    (metal::ushort(packed.code(packed_block, 24 + (fm & 1))) * power) & 255;
+                trits[t][r][15] = half((high * 3) >> 8) - 1.0h;
             }
-            const float high =
-                float(packed.code(packed_block, 24 + (fm & 1))) * (1.0f / 256.0f) * power;
-            trits[r][15] = half(metal::floor(3.0f * high) - 3.0f * metal::floor(high) - 1.0f);
         }
         const metal::ulong base = input_row + metal::ulong(block) * 128;
-        metal::simdgroup_float8x8 partial;
+        metal::simdgroup_float8x8 partial[tiles];
         #pragma clang loop unroll(full)
         for (metal::uint tile = 0; tile < 16; ++tile) {
             metal::simdgroup_float8x8 x;
-            metal::simdgroup_float8x8 w;
             // fn is even and rows are whole blocks, so the pair is aligned.
             const metal::float2 pair = bonsai_ptq1_pair(input, base + tile * 8);
             x.thread_elements()[0] = pair.x;
             x.thread_elements()[1] = pair.y;
-            w.thread_elements()[0] = float(trits[0][tile]);
-            w.thread_elements()[1] = float(trits[1][tile]);
-            if (tile == 0) {
-                metal::simdgroup_multiply(partial, x, w);
-            } else {
-                metal::simdgroup_multiply_accumulate(partial, x, w, partial);
+            #pragma clang loop unroll(full)
+            for (metal::uint t = 0; t < tiles; ++t) {
+                metal::simdgroup_float8x8 w;
+                w.thread_elements()[0] = float(trits[t][0][tile]);
+                w.thread_elements()[1] = float(trits[t][1][tile]);
+                if (tile == 0) {
+                    metal::simdgroup_multiply(partial[t], x, w);
+                } else {
+                    metal::simdgroup_multiply_accumulate(partial[t], x, w, partial[t]);
+                }
             }
         }
-        sums[0] = metal::fma(partial.thread_elements()[0], scales[0], sums[0]);
-        sums[1] = metal::fma(partial.thread_elements()[1], scales[1], sums[1]);
+        #pragma clang loop unroll(full)
+        for (metal::uint t = 0; t < tiles; ++t) {
+            sums[t][0] = metal::fma(partial[t].thread_elements()[0], scales[t][0], sums[t][0]);
+            sums[t][1] = metal::fma(partial[t].thread_elements()[1], scales[t][1], sums[t][1]);
+        }
     }
-    shared[simd * 64 + lane * 2] = sums[0];
-    shared[simd * 64 + lane * 2 + 1] = sums[1];
+    #pragma clang loop unroll(full)
+    for (metal::uint t = 0; t < tiles; ++t) {
+        shared[(t * split + simd) * 64 + lane * 2] = sums[t][0];
+        shared[(t * split + simd) * 64 + lane * 2 + 1] = sums[t][1];
+    }
     metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     if (simd != 0 || fm >= tokens) return;
     #pragma clang loop unroll(full)
-    for (metal::uint s = 1; s < split; ++s) {
-        sums[0] += shared[s * 64 + lane * 2];
-        sums[1] += shared[s * 64 + lane * 2 + 1];
+    for (metal::uint t = 0; t < tiles; ++t) {
+        #pragma clang loop unroll(full)
+        for (metal::uint s = 1; s < split; ++s) {
+            sums[t][0] += shared[(t * split + s) * 64 + lane * 2];
+            sums[t][1] += shared[(t * split + s) * 64 + lane * 2 + 1];
+        }
+        const metal::uint row = first_row + 8 * t + fn;
+        const metal::ulong out = metal::ulong(first_token + fm) * rows + row;
+        if (row < rows) output[out] = sums[t][0];
+        if (row + 1 < rows) output[out + 1] = sums[t][1];
     }
-    const metal::ulong out = metal::ulong(first_token + fm) * rows + first_row + fn;
-    if (first_row + fn < rows) output[out] = sums[0];
-    if (first_row + fn + 1 < rows) output[out + 1] = sums[1];
 }
 
 // Large-batch variant for prefill chunks: a threadgroup owns 64 output rows

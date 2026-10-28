@@ -28,26 +28,35 @@ BONSAI_SMALL_BATCH_KERNEL(2, bonsai_ptq1_small_batch_pair_impl)
 BONSAI_SMALL_BATCH_KERNEL(3, bonsai_ptq1_small_batch_impl)
 BONSAI_SMALL_BATCH_KERNEL(4, bonsai_ptq1_small_batch_impl)
 
-// 0.233-0.237 ms on 17408x5120 and 0.236-0.281 ms on 5120x17408 for 5..8
-// tokens (0.28-0.30 ms with two activation loads per tile, 0.34 ms with floor
-// decoding); dispatch ceil(rows / 8) threadgroups of 128 threads.
-kernel void bonsai_ptq1_small_batch_wide(
-    device const BonsaiPtq1Block *weights [[buffer(0)]],
-    device const float *input [[buffer(1)]],
-    device float *output [[buffer(2)]],
-    constant uint &rows [[buffer(3)]],
-    constant uint &columns [[buffer(4)]],
-    constant uint &first_token [[buffer(5)]],
-    constant uint &tokens [[buffer(6)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint simd [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {
-    threadgroup float shared[4 * 64];
-    bonsai_ptq1_small_batch_wide_impl(
-        BonsaiNativePacked{weights}, input, output, rows, columns, first_token, tokens,
-        group, simd, lane, shared);
+#define BONSAI_SMALL_BATCH_WIDE_KERNEL(name, tiles) \
+kernel void name( \
+    device const BonsaiPtq1Block *weights [[buffer(0)]], \
+    device const float *input [[buffer(1)]], \
+    device float *output [[buffer(2)]], \
+    constant uint &rows [[buffer(3)]], \
+    constant uint &columns [[buffer(4)]], \
+    constant uint &first_token [[buffer(5)]], \
+    constant uint &tokens [[buffer(6)]], \
+    uint group [[threadgroup_position_in_grid]], \
+    uint simd [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]] \
+) { \
+    threadgroup float shared[tiles * 8 * 64]; \
+    bonsai_ptq1_small_batch_wide_impl<tiles>( \
+        BonsaiNativePacked{weights}, input, output, rows, columns, first_token, tokens, \
+        group, simd, lane, shared); \
 }
+
+// 0.228-0.229 ms on 17408x5120 and on 5120x17408 for 5..8 tokens (0.233-0.237
+// and 0.236-0.281 ms with one row tile and four SIMD groups, 0.28-0.30 ms with
+// two activation loads per tile, 0.34 ms with floor decoding); dispatch
+// ceil(rows / 16) threadgroups of 256 threads.
+BONSAI_SMALL_BATCH_WIDE_KERNEL(bonsai_ptq1_small_batch_wide, 2)
+// One row tile per threadgroup for short matrices, where sixteen-row groups
+// leave too few threadgroups to spread evenly over the GPU: 1024x5120 took
+// 17.9 us at eight rows against 20.2 with two tiles (19.0 with one tile and
+// four SIMD groups). Dispatch ceil(rows / 8) threadgroups of 256 threads.
+BONSAI_SMALL_BATCH_WIDE_KERNEL(bonsai_ptq1_small_batch_wide_short, 1)
 
 // 64 tokens by 64 output rows per threadgroup; see
 // bonsai_ptq1_large_batch_impl. Dispatch (ceil(rows / 64), ceil(tokens / 64))

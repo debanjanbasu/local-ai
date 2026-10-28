@@ -244,8 +244,12 @@ pub struct BonsaiKernels {
     prefill_functions: Vec<Retained<ProtocolObject<dyn MTLFunction>>>,
     /// Exact-token kernels for 2..=`SMALL_BATCH_KERNEL_TOKENS` activation rows.
     small_batch: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    /// Simdgroup-matrix kernel for up to `SMALL_BATCH_WIDE_TOKENS` rows.
+    /// Simdgroup-matrix kernel for up to `SMALL_BATCH_WIDE_TOKENS` rows,
+    /// sixteen output rows per threadgroup.
     small_batch_wide: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// The same with eight output rows per threadgroup, for matrices of at
+    /// most `SMALL_BATCH_WIDE_SHORT_ROWS` rows.
+    small_batch_wide_short: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// 64-token by 64-row threadgroup tiles for blocks of `large_batch_min` rows or more.
     large_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     small_batch_max: u32,
@@ -268,12 +272,19 @@ pub const SMALL_BATCH_KERNEL_TOKENS: u32 = 4;
 ///
 /// The simdgroup-matrix kernel's cost is flat in the row count, 340-348 us on the
 /// two FFN shapes for 5 to 8 rows (280-301 us with half-prefix decoding,
-/// 233-281 us with eight-byte activation loads),
+/// 233-281 us with eight-byte activation loads, 228-229 us with two row tiles
+/// per SIMD group and eight SIMD groups per threadgroup),
 /// against 452-720 us for the former two scalar dispatches. A 16-row variant
 /// sharing the decoded trits across two token tiles measured 721-735 us, twice
 /// the 8-row cost: the F32 8x8 multiplies themselves, about 270 us per eight
 /// rows, are the limit, not trit decoding.
 pub const SMALL_BATCH_WIDE_TOKENS: u32 = 8;
+
+/// Matrices of at most this many rows take the wide kernel with eight output
+/// rows per threadgroup rather than sixteen: the K/V projections' 1024 rows
+/// make only 64 sixteen-row threadgroups, which spread unevenly over the GPU
+/// (1024x5120 at eight rows: 17.9 against 20.2 us on an M4 Pro).
+const SMALL_BATCH_WIDE_SHORT_ROWS: u32 = 2048;
 
 /// Token blocks up to this size (and below [`DEFAULT_LARGE_BATCH_MIN`]) use
 /// chunked small-batch dispatches.
@@ -419,7 +430,8 @@ impl BonsaiKernels {
             small_batch: (2..=SMALL_BATCH_KERNEL_TOKENS)
                 .map(|tokens| pipeline(&format!("bonsai_ptq1_small_batch_{tokens}"), 32))
                 .collect::<crate::Result<_>>()?,
-            small_batch_wide: pipeline("bonsai_ptq1_small_batch_wide", 128)?,
+            small_batch_wide: pipeline("bonsai_ptq1_small_batch_wide", 256)?,
+            small_batch_wide_short: pipeline("bonsai_ptq1_small_batch_wide_short", 256)?,
             large_batch: pipeline("bonsai_ptq1_large_batch", 128)?,
             small_batch_max: DEFAULT_SMALL_BATCH_MAX,
             large_batch_min: DEFAULT_LARGE_BATCH_MIN,
@@ -992,12 +1004,18 @@ impl BonsaiKernels {
         };
         let wide = tokens - tail;
         let chunks = wide.div_ceil(SMALL_BATCH_WIDE_TOKENS);
+        let (wide_pipeline, rows_per_group) = if matrix.rows <= SMALL_BATCH_WIDE_SHORT_ROWS {
+            (&self.small_batch_wide_short, 8)
+        } else {
+            (&self.small_batch_wide, 16)
+        };
+        let wide_groups = (matrix.rows as usize).div_ceil(rows_per_group);
         let mut start = first;
         for chunk in 0..chunks {
             let end = first + (wide * (chunk + 1)).div_ceil(chunks);
             let count = end - start;
             let encoder = batch.encoder();
-            encoder.setComputePipelineState(&self.small_batch_wide);
+            encoder.setComputePipelineState(wide_pipeline);
             unsafe {
                 bind(encoder, matrix.buffer, matrix.offset, 0);
                 bind(encoder, input, 0, 1);
@@ -1007,7 +1025,7 @@ impl BonsaiKernels {
                 set_u32(encoder, &start, 5);
                 set_u32(encoder, &count, 6);
             }
-            dispatch(encoder, (matrix.rows as usize).div_ceil(8), 128);
+            dispatch(encoder, wide_groups, 256);
             batch.record_dispatch();
             start = end;
         }
