@@ -1093,7 +1093,7 @@ impl BonsaiModel {
             context,
             package,
         };
-        model.weights_resident = model.context.keep_resident(model.weight_buffers())?;
+        model.weights_resident = model.context.keep_resident(model.weight_buffers());
         if model.weights_resident.is_some() {
             model.resident = Some(resident::Resident::start(model.context.residency())?);
         }

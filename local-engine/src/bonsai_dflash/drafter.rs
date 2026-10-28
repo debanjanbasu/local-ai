@@ -224,7 +224,7 @@ impl DflashDrafter {
         let key_ring = ring()?;
         let value_ring = ring()?;
         let resident =
-            context.keep_resident(weights.mapped.iter().chain(&key_ring).chain(&value_ring))?;
+            context.keep_resident(weights.mapped.iter().chain(&key_ring).chain(&value_ring));
         let tokens = MetalBuffer::from_slice(context.device(), &[0_u32, MASK_TOKEN])?;
         let calibration =
             MetalBuffer::from_slice(context.device(), &[DflashCalibration::default()])?;

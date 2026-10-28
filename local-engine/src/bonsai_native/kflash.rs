@@ -195,7 +195,7 @@ impl BonsaiModel {
             *cost = (*cost).min(warm);
         }
         self.reset();
-        let resident = self.context.keep_resident([embedding.buffer()])?;
+        let resident = self.context.keep_resident([embedding.buffer()]);
         let mut kflash = Kflash {
             drafter,
             calibrator,

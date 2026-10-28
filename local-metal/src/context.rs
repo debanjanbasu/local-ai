@@ -131,30 +131,25 @@ impl MetalContext {
     /// command buffer has used for about a second, and the next command
     /// buffer that uses it pays to make it resident again in the driver
     /// before the GPU starts. A set only holds while the GPU stays in use
-    /// (see [`QueueResidency`]). `None` where residency sets are unavailable
-    /// (before macOS 15).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::BufferAllocation`] if Metal cannot create the set.
+    /// (see [`QueueResidency`]). `None` where residency sets are unavailable:
+    /// before macOS 15, or where the device declines to make one (the
+    /// paravirtual GPU of a macOS VM). Residency is only a speed-up, so that
+    /// is not an error.
     pub fn keep_resident<'a>(
         &self,
         buffers: impl IntoIterator<Item = &'a MetalBuffer>,
-    ) -> crate::Result<Option<ResidencySet>> {
+    ) -> Option<ResidencySet> {
         if !self
             .device
             .respondsToSelector(sel!(newResidencySetWithDescriptor:error:))
         {
-            return Ok(None);
+            return None;
         }
         let descriptor = MTLResidencySetDescriptor::new();
         let set = self
             .device
             .newResidencySetWithDescriptor_error(&descriptor)
-            .map_err(|error| Error::BufferAllocation {
-                size: 0,
-                reason: format!("newResidencySetWithDescriptor failed: {error}"),
-            })?;
+            .ok()?;
         for buffer in buffers {
             set.addAllocation(ProtocolObject::from_ref(buffer.raw()));
         }
@@ -166,10 +161,10 @@ impl MetalContext {
         }
         sets.sets.push(Set(set.clone()));
         drop(sets);
-        Ok(Some(ResidencySet {
+        Some(ResidencySet {
             set,
             residency: self.residency.clone(),
-        }))
+        })
     }
 
     /// The queue's residency sets, for a thread that keeps them resident
@@ -346,7 +341,7 @@ mod tests {
         let Some(ctx) = gpu_or_skip() else { return };
         let buffer = MetalBuffer::empty(ctx.device(), 4096).expect("buffer");
         let residency = ctx.residency();
-        let Some(kept) = ctx.keep_resident([&buffer]).expect("set") else {
+        let Some(kept) = ctx.keep_resident([&buffer]) else {
             return;
         };
         residency.suspend();
