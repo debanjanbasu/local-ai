@@ -56,6 +56,10 @@ pub(super) fn resident_bytes(verify_depth: usize) -> usize {
 
 /// The drafter, its calibration and the measured cycle costs.
 pub(super) struct Kflash {
+    /// Keeps `embedding`, which only the drafter reads on the GPU, resident
+    /// beside the drafter's own set (see [`DflashDrafter`]); dropped
+    /// first.
+    _resident: Option<local_metal::context::ResidencySet>,
     drafter: DflashDrafter,
     calibrator: Calibrator,
     /// The target's `token_embd`, bound for the drafter's anchor gather.
@@ -189,6 +193,7 @@ impl BonsaiModel {
             *cost = (*cost).min(warm);
         }
         self.reset();
+        let resident = self.context.keep_resident([embedding.buffer()])?;
         let mut kflash = Kflash {
             drafter,
             calibrator,
@@ -197,6 +202,7 @@ impl BonsaiModel {
             verify_ms: costs.map(|cost| cost.as_secs_f64() * 1e3),
             row_drift_ms: 0.0,
             draft_ms: 0.0,
+            _resident: resident,
         };
         let draft = {
             let Kflash {

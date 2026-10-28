@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2::sel;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
+    MTLResidencySet, MTLResidencySetDescriptor,
 };
 
 use crate::Error;
+use crate::buffer::MetalBuffer;
 
 /// Capabilities of the active GPU, queried once at startup.
 ///
@@ -109,6 +112,60 @@ impl MetalContext {
     #[must_use]
     pub fn queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         &self.queue
+    }
+
+    /// Keep `buffers` resident for every command buffer of the queue while
+    /// the returned set lives. Without one, Metal evicts an allocation no
+    /// command buffer has used for about a second, and the next command
+    /// buffer that uses it pays to make it resident again in the driver
+    /// before the GPU starts. `None` where residency sets are unavailable
+    /// (before macOS 15).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BufferAllocation`] if Metal cannot create the set.
+    pub fn keep_resident<'a>(
+        &self,
+        buffers: impl IntoIterator<Item = &'a MetalBuffer>,
+    ) -> crate::Result<Option<ResidencySet>> {
+        if !self
+            .device
+            .respondsToSelector(sel!(newResidencySetWithDescriptor:error:))
+        {
+            return Ok(None);
+        }
+        let descriptor = MTLResidencySetDescriptor::new();
+        let set = self
+            .device
+            .newResidencySetWithDescriptor_error(&descriptor)
+            .map_err(|error| Error::BufferAllocation {
+                size: 0,
+                reason: format!("newResidencySetWithDescriptor failed: {error}"),
+            })?;
+        for buffer in buffers {
+            set.addAllocation(ProtocolObject::from_ref(buffer.raw()));
+        }
+        set.commit();
+        set.requestResidency();
+        self.queue.addResidencySet(&set);
+        Ok(Some(ResidencySet {
+            set,
+            queue: self.queue.clone(),
+        }))
+    }
+}
+
+/// Allocations [`MetalContext::keep_resident`] keeps resident; dropping it
+/// lets Metal evict them again.
+pub struct ResidencySet {
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+}
+
+impl Drop for ResidencySet {
+    fn drop(&mut self) {
+        self.queue.removeResidencySet(&self.set);
+        self.set.endResidency();
     }
 }
 

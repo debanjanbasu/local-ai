@@ -63,6 +63,8 @@ pub(super) struct Weights {
     pub(super) layers: Vec<Layer>,
     /// Payload bytes, which stay mapped (and resident once drafting runs).
     pub(super) bytes: u64,
+    /// Every buffer above, for the drafter's residency set.
+    pub(super) mapped: Vec<MetalBuffer>,
     pub(super) payload_sha256: String,
 }
 
@@ -82,7 +84,8 @@ impl Weights {
                     path.display()
                 ))
             })?;
-        let buffer = |index: usize| -> crate::Result<MetalBuffer> {
+        let mut mapped = Vec::new();
+        let mut buffer = |index: usize| -> crate::Result<MetalBuffer> {
             let (offset, length) = head.sections[index];
             let pointer = NonNull::new(head.map[offset..].as_ptr().cast_mut())
                 .ok_or_else(|| crate::Error::InvalidFormat("empty DFlash2 mapping".into()))?;
@@ -92,11 +95,10 @@ impl Weights {
             // SAFETY: sections begin on VM pages, their padded ranges are
             // validated within the immutable mapping, and `owner` retains it.
             #[expect(unsafe_code)]
-            unsafe {
-                Ok(MetalBuffer::from_bytes_no_copy(
-                    device, pointer, padded, owner,
-                )?)
-            }
+            let buffer =
+                unsafe { MetalBuffer::from_bytes_no_copy(device, pointer, padded, owner) }?;
+            mapped.push(buffer.clone());
+            Ok(buffer)
         };
         let mut plain = HashMap::new();
         let mut matrices = HashMap::new();
@@ -180,6 +182,7 @@ impl Weights {
             successor: codebooks.1,
             layers,
             bytes: expected.iter().map(|(_, bytes)| *bytes as u64).sum(),
+            mapped,
             payload_sha256: head.payload_sha256,
         })
     }

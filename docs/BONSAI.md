@@ -2758,7 +2758,11 @@ history the rows attend as the context grows; `r` is the request's recent
 tokens per millisecond over all sources (before four cycles,
 `E(n) / (draft + cost(n))`). A tree whose best size is the anchor alone is
 handed to the head's chain instead of a bare decode step, which costs at most
-one head step when the head is no surer than the drafter.
+one head step when the head is no surer than the drafter. That happens to 22
+to 46% of drafted trees (11 to 22 per 300-token request on five prompts), and
+their drafting passes, 1.7-4.6% of decode time, are spent for nothing. Neither
+predicting such a tree before drafting nor any other use of the decline
+measured better (see Tried and rejected).
 
 Splash encodes a whole decode cycle as one command buffer (`decodeAsync`):
 draft, a fixed verify of every drafted row, acceptance and the row choice on
@@ -2797,6 +2801,33 @@ conversation) continues that request's context from the prefix instead, at
 once, provided the drafter's ring still holds it. A disk snapshot restored
 in a new process has no drafter context: those requests draft once they
 have tapped 64 positions past it.
+
+Metal evicts an allocation that no command buffer has used for about a
+second, and the next command buffer that uses it waits in the driver
+(`kernelEndTime − kernelStartTime`) while it is made resident again, with
+the GPU idle. A run of head cycles, or the pause between two requests, left
+the drafter's mapped weights, its context rings and the target's
+`token_embd` (which only the drafter's anchor gather reads on the GPU)
+unused that long. Over five 300-token prompts 4 of 310 drafting passes
+waited 22 to 51 ms, each after 26 to 37 consecutive head or lookup cycles
+(none after 20 or fewer). Through `serve`, the first drafting pass of each
+of two requests 4 s apart waited 21.5-21.8 ms, and its catch-up 2.3-2.5 ms
+more. The drafter now keeps its weights and rings in a residency set on the
+command queue (`MetalContext::keep_resident`), and `KFlash` the embedding:
+no pass waited more than 0.45 ms (373 passes, after runs of up to 122
+non-tree cycles), and the two requests' first passes 0.26-0.30 ms (catch-up
+0.18-0.20). A set holding the weights alone still left 4.4-4.7 ms. Peak
+footprint (1.49-1.54 GB), maximum resident set (2.65 GB), load time
+(2.6 s) and the drafting pass's median GPU time (13.2 ms) are unchanged.
+End to end a 300-token CLI request waits like this at most a few times, and
+the A/B was within noise: 41.66 against 41.70 tok/s geomean (five prompts,
+best of four interleaved runs with a cold prompt cache), and through
+`tools/benchmark.py` 38.95, 33.55, 35.02 and 38.88 against 38.51, 33.55,
+34.80 and 39.06 on code, essay, prose and explanation. The gain is the
+21-24 ms each request's first drafting pass no longer waits through `serve`,
+which also no longer counts against the tree's first measured cycle. The
+earlier residency-set trial (Tried and rejected) held the target's weights,
+which every decode step uses anyway.
 
 Batched serving keeps its passes as they were: no taps, no trees, head and
 lookup drafts priced by the cost model. A sequence that becomes the only one
@@ -3443,7 +3474,8 @@ request that already wrote a boundary skips it when no host tier keeps the
 snapshot (see Prompt cache).
 
 With the DFlash2 drafter installed, its 2.05 GB of int8 weights are mapped
-and file-backed like the head's, and KFlash adds about 380 MB that stays
+and file-backed like the head's (held resident by a residency set, see
+[KFlash cycles](#kflash-cycles)), and KFlash adds about 380 MB that stays
 resident: the drafter's context ring and scratch (67 MB), the tap ring
 (210 MB) and the tree verifier (105 MB). The context fit counts all of it
 (`state_bytes` 389 MB higher, estimated working set 20.47 against 18.03 GB)
@@ -4927,6 +4959,32 @@ their own entry, not with current rates.
   849,400,392 to 355,837,652 bytes, and cannot be a decode-throughput result at
   all.
 - Residency sets: 17.23/27.50/48.05 tok/s versus 17.17/27.51/47.98; neutral.
+  That set held the target's weights, which plain decode uses every step;
+  the drafter's set ships (see [KFlash cycles](#kflash-cycles)).
+- Spending less on `KFlash` trees declined to the head's chain (October
+  2026, see [KFlash cycles](#kflash-cycles)): 11 to 22 per 300-token request,
+  22-46% of drafted trees, each a 13.3 ms drafting pass for nothing.
+  Predicting a decline before drafting found no signal in what is known
+  then: after a declined tree the next was declined 11-41% of the time
+  against 12-29% overall, by going rate 14-19% below 0.045 tokens/ms and
+  25-45% above, and the previous cycle's source and tokens separated no
+  better, while skipping the pass for a tree that would have verified eight
+  rows costs more than the pass. Three changes to the decline, against the
+  shipped rule (cold prompt cache, five prompts, 300 tokens, interleaved,
+  geomean of the best of two): verifying the anchor alone as a decode step
+  instead of the head's chain, 40.29 against 41.14 tok/s (per token the same:
+  44.9 ms either way per declined cycle on arithmetic, 45.1 against 47.5 on
+  code, where the declined head steps emitted 1.23-1.41 tokens for about
+  47 ms); never declining (the one-row verify priced at 39 ms, so every tree
+  verifies at least two rows), 41.29 against 41.42, with 0-3 declines instead
+  of 12-26 and more trees on the essay, prose and explanation but fewer on
+  code (22 against 33-64); and the going rate averaged at weight 0.1 instead
+  of 0.25, 41.41 against 41.42. All sit inside the 5-15% by which the source
+  mix alone moves a prompt from run to run. The second also settles the
+  startup cost table: a cold GPU once measured the one-row verify at 39 ms
+  instead of about 30, which prices out every decline and still leaves
+  throughput unchanged, so the table keeps one warm-up and one timed pass
+  (the one-row cost measured 29.4-32.0 ms over 16 loads here).
 - Untracked hazards: 17.25 versus 17.25 tok/s plain and incorrect speculative tokens.
 - Folding the residual addition into the down and attention-output matvec
   stores: 21.58 tok/s fused versus 21.69 separate, plain decode.

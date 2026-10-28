@@ -6,7 +6,7 @@ use std::time::Duration;
 use local_metal::batch::{BufferCopyRequest, CommandBatch};
 use local_metal::bonsai::{BonsaiKernels, HadamardDirection, Ptq1Matrix, SignedHadamard};
 use local_metal::buffer::MetalBuffer;
-use local_metal::context::MetalContext;
+use local_metal::context::{MetalContext, ResidencySet};
 use local_metal::dflash::{
     DFLASH_BLOCK, DFLASH_MAX_TREE_ROWS, DFLASH_SLOTS, DFLASH_TOPK, DFLASH_WINDOW,
     DflashCalibration, DflashKernels, DflashLattice, DflashTree, RopeTables,
@@ -170,6 +170,13 @@ impl Scratch {
 /// share scratch, and [`Self::draft`] with [`DraftAnchor::Token`] and
 /// [`Self::set_calibration`] write host-visible buffers at encode time.
 pub struct DflashDrafter {
+    /// Keeps the mapped weights and the context rings resident between
+    /// drafting passes. Without it, a second with no drafting pass (a run
+    /// of head cycles, or the gap between two requests) let Metal evict
+    /// them, and the next pass waited 22 to 51 ms in the driver before the
+    /// GPU started. Declared first, so it is dropped before the buffers it
+    /// holds.
+    _resident: Option<ResidencySet>,
     weights: Weights,
     path: PathBuf,
     kernels: DflashKernels,
@@ -213,6 +220,10 @@ impl DflashDrafter {
                 .map(|_| MetalBuffer::empty(context.device(), RING_CAPACITY * KV_WIDTH * 2))
                 .collect::<local_metal::Result<Vec<_>>>()
         };
+        let key_ring = ring()?;
+        let value_ring = ring()?;
+        let resident =
+            context.keep_resident(weights.mapped.iter().chain(&key_ring).chain(&value_ring))?;
         let tokens = MetalBuffer::from_slice(context.device(), &[0_u32, MASK_TOKEN])?;
         let calibration =
             MetalBuffer::from_slice(context.device(), &[DflashCalibration::default()])?;
@@ -229,8 +240,8 @@ impl DflashDrafter {
             full_top: TopKRows::new(context, shaders, VOCAB, DFLASH_SLOTS)?,
             scored_anchors: 0,
             rope: RopeTables::new(context, ROPE_THETA)?,
-            key_ring: ring()?,
-            value_ring: ring()?,
+            key_ring,
+            value_ring,
             scratch: Scratch::new(context)?,
             tokens,
             lattice: MetalBuffer::empty(context.device(), size_of::<DflashLattice>())?,
@@ -239,6 +250,7 @@ impl DflashDrafter {
             context_len: 0,
             floor: 0,
             draft_gpu_time: None,
+            _resident: resident,
         })
     }
 
