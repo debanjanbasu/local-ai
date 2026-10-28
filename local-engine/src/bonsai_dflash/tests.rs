@@ -315,6 +315,15 @@ fn calibration_fit_recovers_a_logistic() {
     assert_eq!(fit_depth(&records[..40], (0.3, 0.9)), (0.3, 0.9));
     let all_hits: Vec<_> = records.iter().map(|&(x, _)| (x, true)).collect();
     assert_eq!(fit_depth(&all_hits, (0.0, 1.0)), (0.0, 1.0));
+    // Outcomes one threshold separates have no maximum-likelihood fit:
+    // Newton's method runs away towards a step (falling, here to about
+    // `α = -1.2e8, β = -1.9e8`), which keeps the current fit.
+    for threshold in [-0.65_f32, 1.5] {
+        let falling: Vec<_> = records.iter().map(|&(x, _)| (x, x < threshold)).collect();
+        assert_eq!(fit_depth(&falling, (0.3, 0.9)), (0.3, 0.9), "{threshold}");
+        let rising: Vec<_> = records.iter().map(|&(x, _)| (x, x > threshold)).collect();
+        assert_eq!(fit_depth(&rising, (0.3, 0.9)), (0.3, 0.9), "{threshold}");
+    }
 }
 
 #[test]

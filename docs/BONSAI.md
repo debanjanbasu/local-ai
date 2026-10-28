@@ -608,7 +608,13 @@ path log p, plus `E(n)` for `n = 1..=8`. The first `n` rows are the best
 records (every node whose parent was accepted), refits `p = σ(α_d + β_d ·
 logit q)` every 16 cycles over the last 2,048 records per position, starting
 from `p = q`, and persists the fit to
-`~/Library/Caches/local-ai/dflash/<model>-<drafter>-<chip>.json`.
+`~/Library/Caches/local-ai/dflash/<model>-<drafter>-<chip>.json`. A refit
+whose coefficients pass 64 in magnitude keeps the previous fit: outcomes
+one threshold on `logit q` separates have no maximum-likelihood fit, and
+Newton's method runs away towards a step. A sequence of six sampled warm-up
+requests with the 4-bit drafter ended with depth 1 persisted as `α =
+-6.76e6, β = -1.04e7` (accepted below `logit q` -0.65, rejected above), and
+its last two requests ran one and two tree cycles.
 `draft_gpu_time` reports the measured pass time.
 
 ## Commands

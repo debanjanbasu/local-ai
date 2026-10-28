@@ -25,9 +25,17 @@ pub const CALIBRATION_RECORDS: usize = 2048;
 const MIN_RECORDS: usize = 50;
 const MIN_OUTCOMES: usize = 5;
 
+/// Largest `|α|` and `|β|` a fit may have. Outcomes that one threshold on
+/// `logit q` separates have no maximum-likelihood fit, and Newton's method
+/// runs away towards a step (an engine run reached `β` of about -1e7); sane
+/// fits stay within a few units.
+const MAX_COEFFICIENT: f64 = 64.0;
+
 /// Fit `p = σ(α + β x)` to `(x = logit q, accepted)` records by Newton's
 /// method (a 1e-6 ridge keeps it defined), as `sim.py`'s `fit_logistic`.
-/// Too few records, or of one outcome, return `current`.
+///
+/// Too few records, or of one outcome, return `current`, as does a fit that
+/// ran away (beyond [`MAX_COEFFICIENT`]).
 #[must_use]
 pub fn fit_depth(records: &[(f32, bool)], current: (f32, f32)) -> (f32, f32) {
     let hits = records.iter().filter(|(_, hit)| *hit).count();
@@ -63,6 +71,9 @@ pub fn fit_depth(records: &[(f32, bool)], current: (f32, f32)) -> (f32, f32) {
         if step0.abs().max(step1.abs()) < 1e-8 {
             break;
         }
+    }
+    if alpha.abs().max(beta.abs()) > MAX_COEFFICIENT {
+        return current;
     }
     (alpha as f32, beta as f32)
 }
